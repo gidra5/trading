@@ -1,11 +1,16 @@
 import os
 import csv
 import itertools
-from tagged_union import make_tagged_union
+import statistics
+
+import matplotlib
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 
 file_directory = os.path.dirname(__file__)
 
-# timestamp,
+# timestamp, ns
 # buy price - i can buy at this price,
 # sell price - i can sell at this price,
 # buy volume - i can buy this volume at buy price immediately,
@@ -15,46 +20,84 @@ type Entry = tuple[float, float, float, float, float]
 # price, volume
 type AssetVolume = tuple[float, float]
 
-# total price below, total volume below, current price, current volume
-type CumulativeAssetVolume = tuple[float, float, float, float]
-
 
 def loadData(directory: str):
   entries_directory = os.path.abspath(directory)
   day_csvs = os.listdir(entries_directory)
   day_csvs.sort()
+
   entries: list[Entry] = []
-  for day_csv in day_csvs:
-    with open(os.path.join(entries_directory, day_csv)) as file:
-      reader = csv.reader(file)
-      day_entries = (
-        (
-          int(x[0]) / 1000,
-          float(x[1]),
-          float(x[2]),
-          float(x[3]),
-          float(x[4]),
-        )
-        for x in reader
+  # for day_csv in day_csvs:
+  day_csv = day_csvs[0]
+  with open(os.path.join(entries_directory, day_csv)) as file:
+    reader = csv.reader(file)
+    day_entries = (
+      (
+        int(x[0]) / 1000,
+        float(x[1]),
+        float(x[2]),
+        float(x[3]),
+        float(x[4]),
       )
-      entries.extend(day_entries)
+      for x in reader
+    )
+    entries.extend(day_entries)
 
   return entries
-  # xs = [x[0] for x in entries]
-  # ask = [x[1] for x in entries]
-  # bid = [x[2] for x in entries]
-  # plt.plot(xs, ask)  # Plot some data on the Axes.
+
+
+def averagedData(data: list[Entry], range: float):
+  window: list[Entry] = []
+  entries: list[Entry] = []
+
+  # avg_buy = 0
+  # avg_sell = 0
+  # avg_buy_count = 0
+  # avg_sell_count = 0
+  for entry in data:
+    # for _entry in window:
+    # if _entry[0] + range < entry[0]:
+    #   window.remove(_entry)
+    window = [_entry for _entry in window if _entry[0] + range >= entry[0]]
+    window.append(entry)
+
+    avgBuy = statistics.fmean([x[1] for x in window])
+    avgSell = statistics.fmean([x[2] for x in window])
+    entries.append((entry[0], avgBuy, avgSell))
+    # entries.append((entry[0], avg_buy, avg_sell))
+
+  xs = [x[0] for x in data]
+  ask = [x[1] for x in data]
+  # bid = [x[2] for x in data]
+  askAvg = [x[1] for x in entries]
+  # bidAvg = [x[2] for x in entries]
+  plt.plot(xs, ask)  # Plot some data on the Axes.
   # plt.plot(xs, bid)  # Plot some data on the Axes.
+  plt.plot(xs, askAvg)  # Plot some data on the Axes.
+  # plt.plot(xs, bidAvg)  # Plot some data on the Axes.
+
+  return entries
 
 
-eur_data = loadData("./data/EUR-USD")
-eth_data = loadData("./data/ETH-USD")
+print("loading historic data")
+# eur_data = loadData("./data/EUR-USD")
+# eth_data = loadData("./data/ETH-USD")
 btc_data = loadData("./data/BTC-USD")
 
-convert_fee = 0.005  # 0.5%
-base_asset = "usd"
+print("averaging historic data")
+range = 1
+avg_btc_data = averagedData(btc_data, range)
+
+plt.show()
 
 
-def simulate(assets_data: dict[str, list[Entry]], initial: dict[str, float]):
-  assets = initial
-  startTime = max((data[0][0] for data in assets_data.values()))
+def simulate(history: list[Entry], initial: float):
+  buyFraction = 0.5
+  minBuy = 5
+  commision = 0.005
+  sellFraction = 0.5
+  minSell = 5
+
+  base_asset_amount = initial
+  asset_amount = 0
+  startTime = min((data[0][0] for data in history.values()))
