@@ -1,7 +1,7 @@
+from bisect import bisect_left
+import math
 import os
 import csv
-import itertools
-import statistics
 
 import matplotlib
 
@@ -68,15 +68,51 @@ def averagedData(data: list[Entry], range: float):
     avg_sell = sum_sell / len(window)
     entries.append((entry[0], avg_buy, avg_sell))
 
-  xs = [x[0] for x in data]
-  ask = [x[1] for x in data]
-  # bid = [x[2] for x in data]
-  askAvg = [x[1] for x in entries]
-  # bidAvg = [x[2] for x in entries]
-  plt.plot(xs, ask)  # Plot some data on the Axes.
-  # plt.plot(xs, bid)  # Plot some data on the Axes.
-  plt.plot(xs, askAvg)  # Plot some data on the Axes.
-  # plt.plot(xs, bidAvg)  # Plot some data on the Axes.
+  return entries
+
+
+def sampleData(data: list[Entry], ts: float, **kwargs):
+  _timestamps = kwargs.get("timestamps", None)
+  timestamps = [x[0] for x in data] if _timestamps is None else _timestamps
+  i = bisect_left(timestamps, ts)
+  if i == 0:
+    return data[i]
+  i = i - 1
+  entry = data[i]
+  next_entry = data[i + 1]
+  next_ts = next_entry[0]
+  prev_ts = entry[0]
+  delta = next_ts - prev_ts
+  prev_delta = ts - prev_ts
+  next_delta = next_ts - ts
+  sum_buy = entry[1] * next_delta + next_entry[1] * prev_delta
+  sum_sell = entry[2] * next_delta + next_entry[2] * prev_delta
+  return (ts, sum_buy / delta, sum_sell / delta)
+  # return entry
+
+
+def dataDerivative(data: list[Entry], step: float):
+  entries: list[Entry] = []
+  window: list[Entry] = []
+  range = step * 2
+
+  for entry in data:
+    ts = entry[0]
+
+    for _entry in window.copy():
+      if _entry[0] + range < ts:
+        window.remove(_entry)
+      else:
+        break
+    window.append(entry)
+
+    p1 = entry
+    p2 = sampleData(window, ts - step)
+    p3 = sampleData(window, ts - step * 2)
+
+    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * step)
+    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * step)
+    entries.append((ts, buy_derivative, sell_derivative))
 
   return entries
 
@@ -85,11 +121,31 @@ print("loading historic data")
 # eur_data = loadData("./data/EUR-USD")
 # eth_data = loadData("./data/ETH-USD")
 btc_data = loadData("./data/BTC-USD")
+timestamps = [x[0] for x in btc_data]
+span = (min(timestamps), max(timestamps))
 
 print("averaging historic data")
-range = 1000
-avg_btc_data = averagedData(btc_data, range)
+_range = 1000
+avg_btc_data = averagedData(btc_data, _range)
 
+print("computing derivative of average historic data")
+avg_derivative_btc_data = dataDerivative(avg_btc_data, 0.01)
+
+print("sampling of average historic data")
+even_xs = [x * 0.01 for x in range(math.ceil(span[0] * 100), math.floor(span[1] * 100))]
+sampled_avg_btc_data = [sampleData(avg_btc_data, ts, timestamps=timestamps) for ts in even_xs]
+
+
+# ask = [x[1] for x in btc_data]
+askAvg = [x[1] for x in avg_btc_data]
+askAvgSampled = [x[1] for x in sampled_avg_btc_data]
+askDerivative = [x[1] for x in avg_derivative_btc_data]
+
+_, (ax1, ax2) = plt.subplots(2)
+# ax1.plot(timestamps, ask)  # Plot some data on the Axes.
+ax1.plot(timestamps, askAvg)  # Plot some data on the Axes.
+ax1.plot(even_xs, askAvgSampled)  # Plot some data on the Axes.
+ax2.plot(timestamps, askDerivative)  # Plot some data on the Axes.
 plt.show()
 
 
