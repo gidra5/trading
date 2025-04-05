@@ -129,22 +129,22 @@ _range = 1000
 avg_btc_data = averagedData(btc_data, _range)
 
 print("computing derivative of average historic data")
-avg_derivative_btc_data = dataDerivative(avg_btc_data, 0.01)
+avg_derivative_btc_data = dataDerivative(avg_btc_data, _range)
 
-print("sampling of average historic data")
-even_xs = [x * 0.01 for x in range(math.ceil(span[0] * 100), math.floor(span[1] * 100))]
-sampled_avg_btc_data = [sampleData(avg_btc_data, ts, timestamps=timestamps) for ts in even_xs]
+# print("sampling of average historic data")
+# even_xs = [x * 0.01 for x in range(math.ceil(span[0] * 100), math.floor(span[1] * 100))]
+# sampled_avg_btc_data = [sampleData(avg_btc_data, ts, timestamps=timestamps) for ts in even_xs]
 
 
 # ask = [x[1] for x in btc_data]
 askAvg = [x[1] for x in avg_btc_data]
-askAvgSampled = [x[1] for x in sampled_avg_btc_data]
+# askAvgSampled = [x[1] for x in sampled_avg_btc_data]
 askDerivative = [x[1] for x in avg_derivative_btc_data]
 
 _, (ax1, ax2) = plt.subplots(2)
 # ax1.plot(timestamps, ask)  # Plot some data on the Axes.
 ax1.plot(timestamps, askAvg)  # Plot some data on the Axes.
-ax1.plot(even_xs, askAvgSampled)  # Plot some data on the Axes.
+# ax1.plot(even_xs, askAvgSampled)  # Plot some data on the Axes.
 ax2.plot(timestamps, askDerivative)  # Plot some data on the Axes.
 plt.show()
 
