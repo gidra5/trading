@@ -1,4 +1,5 @@
 from bisect import bisect_left
+import math
 import os
 import csv
 
@@ -121,9 +122,9 @@ def findLast(mapper, list):
 
 
 def simulateStep(
-  tradeList, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
+  trade_list, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
 ):
-  buyFraction = 0.5
+  buyFraction = 0.1
   minBuy = 5
   sellFraction = 0.5
   sellCheckpointFraction = 0.5
@@ -131,32 +132,43 @@ def simulateStep(
 
   sell_rate = entry[2] / (1 + commision)
   buy_rate = entry[1] * (1 + commision)
-  favorable_trade = findLast(lambda x: entry[2] > x[0], tradeList)
+  favorable_trade = findLast(lambda x: entry[2] > x[0], trade_list)
 
-  if entry_derivative[1] > 0 and prev_entry_derivative[1] < 0:
+  if math.isnan(base_asset_amount) or math.isnan(asset_amount):
+    return (checkpoint, base_asset_amount, asset_amount)
+
+  if entry_derivative[1] > 0 and prev_entry_derivative[1] <= 0:
     # buy asset
     buy_amount_price = (
       base_asset_amount if base_asset_amount * (1 - buyFraction) < minBuy else base_asset_amount * buyFraction
     )
     buy_amount = buy_amount_price / buy_rate
+    print("buy", buy_amount, buy_amount_price)
     base_asset_amount = base_asset_amount - buy_amount_price
     asset_amount = asset_amount + buy_amount
 
-    tradeList.append((buy_rate, buy_amount))
+    trade_list.append(list((buy_rate, buy_amount)))
 
-  if (entry_derivative[1] < 0 and checkpoint is not None and checkpoint > sell_rate) or (
-    entry_derivative[1] < 0 and prev_entry_derivative[1] > 0 and favorable_trade is not None
-  ):
+  if (
+    (entry_derivative[2] < 0 and checkpoint is not None and checkpoint > sell_rate)
+    or (entry_derivative[2] < 0 and prev_entry_derivative[2] >= 0)
+  ) and favorable_trade is not None:
     # sell asset
     trade_amount = favorable_trade[1]
     sell_amount_price = (
       trade_amount if trade_amount * sell_rate * (1 - sellFraction) < minSell else trade_amount * sellFraction
     )
     sell_amount = sell_amount_price * sell_rate
+    print("sell", sell_amount, sell_amount_price)
     base_asset_amount = base_asset_amount + sell_amount
     asset_amount = asset_amount - sell_amount_price
-    favorable_trade[1] = favorable_trade[1] - sell_amount
-    checkpoint = sell_rate * (1 - sellCheckpointFraction) + favorable_trade[0] * sellCheckpointFraction
+    if trade_amount != favorable_trade[1]:
+      favorable_trade[1] = favorable_trade[1] - sell_amount_price
+      checkpoint = sell_rate * (1 - sellCheckpointFraction) + favorable_trade[0] * sellCheckpointFraction
+    else:
+      checkpoint = None
+      trade_list.remove(favorable_trade)
+
   return (checkpoint, base_asset_amount, asset_amount)
 
 
@@ -202,10 +214,14 @@ avg_derivative_btc_data = dataDerivative(avg_btc_data, _range)
 # sampled_avg_btc_data = [sampleData(avg_btc_data, ts, timestamps=timestamps) for ts in even_xs]
 
 
-balance = []
+print("simulating trade")
+initial = 1000
+balance = [initial]
+base_balance = [initial]
+asset_balance = [0]
 commision = 0.005
 
-base_asset_amount = 1000
+base_asset_amount = initial
 asset_amount = 0
 trade_list = []
 checkpoint = None
@@ -223,18 +239,21 @@ for i in range(1, len(avg_derivative_history)):
     trade_list, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
   )
 
-  balance.append(base_asset_amount + asset_amount * entry[2] / (1 + commision))
-
+  balance.append(max(-1, base_asset_amount + asset_amount * entry[2] / (1 + commision)))
+  base_balance.append(max(-1, base_asset_amount))
+  asset_balance.append(max(-1, asset_amount))
 
 # ask = [x[1] for x in btc_data]
 askAvg = [x[1] for x in avg_btc_data]
 # askAvgSampled = [x[1] for x in sampled_avg_btc_data]
 askDerivative = [x[1] for x in avg_derivative_btc_data]
 
-_, (ax1, ax2, ax2) = plt.subplots(3)
+_, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5)
 # ax1.plot(timestamps, ask)  # Plot some data on the Axes.
 ax1.plot(timestamps, askAvg)  # Plot some data on the Axes.
 # ax1.plot(even_xs, askAvgSampled)  # Plot some data on the Axes.
 ax2.plot(timestamps, askDerivative)  # Plot some data on the Axes.
-ax2.plot(timestamps, balance)  # Plot some data on the Axes.
+ax3.plot(timestamps, balance)  # Plot some data on the Axes.
+ax4.plot(timestamps, asset_balance)  # Plot some data on the Axes.
+ax5.plot(timestamps, base_balance)  # Plot some data on the Axes.
 plt.show()
