@@ -50,21 +50,23 @@ def averagedData(data: list[Entry], range: float):
   window: list[Entry] = []
   entries: list[Entry] = []
 
-  # avg_buy = 0
-  # avg_sell = 0
-  # avg_buy_count = 0
-  # avg_sell_count = 0
+  sum_buy = 0
+  sum_sell = 0
   for entry in data:
-    # for _entry in window:
-    # if _entry[0] + range < entry[0]:
-    #   window.remove(_entry)
-    window = [_entry for _entry in window if _entry[0] + range >= entry[0]]
+    for _entry in window.copy():
+      if _entry[0] + range < entry[0]:
+        window.remove(_entry)
+        sum_buy = sum_buy - _entry[1]
+        sum_sell = sum_sell - _entry[1]
+      else:
+        break
     window.append(entry)
 
-    avgBuy = statistics.fmean([x[1] for x in window])
-    avgSell = statistics.fmean([x[2] for x in window])
-    entries.append((entry[0], avgBuy, avgSell))
-    # entries.append((entry[0], avg_buy, avg_sell))
+    sum_buy = sum_buy + entry[1]
+    sum_sell = sum_sell + entry[1]
+    avg_buy = sum_buy / len(window)
+    avg_sell = sum_sell / len(window)
+    entries.append((entry[0], avg_buy, avg_sell))
 
   xs = [x[0] for x in data]
   ask = [x[1] for x in data]
@@ -85,7 +87,7 @@ print("loading historic data")
 btc_data = loadData("./data/BTC-USD")
 
 print("averaging historic data")
-range = 1
+range = 1000
 avg_btc_data = averagedData(btc_data, range)
 
 plt.show()
