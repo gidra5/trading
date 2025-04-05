@@ -143,7 +143,7 @@ def simulateStep(
       base_asset_amount if base_asset_amount * (1 - buyFraction) < minBuy else base_asset_amount * buyFraction
     )
     buy_amount = buy_amount_price / buy_rate
-    print("buy", buy_amount, buy_amount_price)
+    print("buy", buy_amount, "<-", buy_amount_price)
     base_asset_amount = base_asset_amount - buy_amount_price
     asset_amount = asset_amount + buy_amount
 
@@ -159,7 +159,7 @@ def simulateStep(
       trade_amount if trade_amount * sell_rate * (1 - sellFraction) < minSell else trade_amount * sellFraction
     )
     sell_amount = sell_amount_price * sell_rate
-    print("sell", sell_amount, sell_amount_price)
+    print("sell", sell_amount, "<-", sell_amount_price)
     base_asset_amount = base_asset_amount + sell_amount
     asset_amount = asset_amount - sell_amount_price
     if trade_amount != favorable_trade[1]:
