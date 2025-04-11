@@ -157,33 +157,33 @@ class Simulation:
   def compute_next_averages(self, entry):
     for window_state in self.avg_windows:
       range = window_state[0]
-      entries_window = window_state[1]
-      avg_window = window_state[4]
+      avg_window = window_state[1]
+      deriv_window = window_state[4]
       ts = entry[0]
 
-      for _entry in entries_window.copy():
+      for _entry in avg_window.copy():
         if _entry[0] + range < entry[0]:
-          entries_window.remove(_entry)
+          avg_window.remove(_entry)
           window_state[2] -= _entry[1]
           window_state[3] -= _entry[2]
         else:
           break
-      entries_window.append(entry)
+      avg_window.append(entry)
 
       window_state[2] += entry[1]
       window_state[3] += entry[2]
-      avg_buy = window_state[2] / len(entries_window)
-      avg_sell = window_state[3] / len(entries_window)
+      avg_buy = window_state[2] / len(avg_window)
+      avg_sell = window_state[3] / len(avg_window)
 
-      for _entry in avg_window.copy():
+      for _entry in deriv_window.copy():
         if _entry[0] + range <= ts:
-          avg_window.remove(_entry)
+          deriv_window.remove(_entry)
         else:
           break
       avg_entry = list((ts, avg_buy, avg_sell))
-      avg_window.append(avg_entry)
+      deriv_window.append(avg_entry)
 
-      delta = (avg_window[-1][0] - avg_window[0][0]) / 2
+      delta = (deriv_window[-1][0] - deriv_window[0][0]) / 2
       if delta == 0:
         window_state[5] = window_state[7]
         window_state[6] = window_state[8]
@@ -192,8 +192,8 @@ class Simulation:
         continue
 
       p1 = avg_entry
-      p2 = sampleData(avg_window, ts - delta)
-      p3 = avg_window[-1]
+      p2 = sampleData(deriv_window, ts - delta)
+      p3 = deriv_window[-1]
 
       buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
       sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
