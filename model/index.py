@@ -167,8 +167,18 @@ def findLast(mapper, list):
 
 class Simulation:
   def __init__(
-    self, initial, commision, buyFraction, buyCheckpointFraction, minBuy, sellFraction, sellCheckpointFraction, minSell
+    self,
+    window_range,
+    initial,
+    commision,
+    buyFraction,
+    buyCheckpointFraction,
+    minBuy,
+    sellFraction,
+    sellCheckpointFraction,
+    minSell,
   ):
+    self.window_range = window_range
     self.sell_list = []
     self.buy_list = []
     self.buyCheckpoint = None
@@ -189,12 +199,14 @@ class Simulation:
   # we should buy if current rate is higher enough than the current rate
   # and we should buy not more than total amount sold before
   def getFavorableSellTrades(self, rate):
-    favorable_trades = list(filter(lambda x: x[0] > rate, self.sell_list))
-    return itertools.accumulate(
-      favorable_trades,
-      lambda acc, trade: trade if acc is None else list((max(acc[0], trade[0]), acc[1] + trade[1])),
-      None,
-    )
+    favorable_trade = next(filter(lambda x: x[0] > rate, self.sell_list), None)
+    return favorable_trade
+    # favorable_trades = list(filter(lambda x: x[0] > rate, self.sell_list))
+    # return itertools.accumulate(
+    #   favorable_trades,
+    #   lambda acc, trade: trade if acc is None else list((max(acc[0], trade[0]), acc[1] + trade[1])),
+    #   None,
+    # )
 
   # out of all active buy trades
   # find the ones that bought for less than current rate
@@ -202,12 +214,14 @@ class Simulation:
   # we should sell if current rate is lower enough than the current rate
   # and we should sell not more than total amount bought before
   def getFavorableBuyTrades(self, rate):
-    favorable_trades = list(filter(lambda x: x[0] < rate, self.buy_list))
-    return itertools.accumulate(
-      favorable_trades,
-      lambda acc, trade: trade if acc is None else list((min(acc[0], trade[0]), acc[1] + trade[1])),
-      None,
-    )
+    favorable_trade = next(filter(lambda x: x[0] < rate, self.buy_list), None)
+    return favorable_trade
+    # favorable_trades = list(filter(lambda x: x[0] < rate, self.buy_list))
+    # return itertools.accumulate(
+    #   favorable_trades,
+    #   lambda acc, trade: trade if acc is None else list((min(acc[0], trade[0]), acc[1] + trade[1])),
+    #   None,
+    # )
 
   def buyAmount(self, trade_amount: float = None):
     if trade_amount is None:
@@ -226,6 +240,7 @@ class Simulation:
     self.baseAsset = self.baseAsset - price
     self.otherAsset = self.otherAsset + amount
     self.buy_list.append(list((rate, amount)))
+    self.buy_list.sort(lambda x: x[0], True)
 
   def sell(self, price, rate):
     amount = price * rate
@@ -233,12 +248,13 @@ class Simulation:
     self.baseAsset = self.baseAsset + amount
     self.otherAsset = self.otherAsset - price
     self.sell_list.append(list((rate, amount)))
+    self.sell_list.sort(lambda x: x[0], True)
 
   def nextCheckpoint(self, rate, target_rate):
     return rate * (1 - self.sellCheckpointFraction) + target_rate * self.sellCheckpointFraction
 
   def simulateStep(self, entry, prev_entry_derivative, entry_derivative):
-    if math.isnan(self.base_asset_amount) or math.isnan(self.asset_amount):
+    if math.isnan(self.baseAsset) or math.isnan(self.otherAsset):
       return
 
     sell_rate = entry[2] / self.commisionCoeff
@@ -252,9 +268,45 @@ class Simulation:
     has_base_asset = self.baseAsset > 0
     has_other_asset = self.otherAsset > 0
 
-    # if (is_buy_checkpoint or is_peak) and favorable_sell_trade is not None and has_base_asset:
-    #   trade_amount = favorable_sell_trade[1]
+    if is_peak:
+      # buy asset
+      buy_amount_price = (
+        self.baseAsset if self.baseAsset * (1 - self.buyFraction) < self.minBuy else self.baseAsset * self.buyFraction
+      )
+      buy_amount = buy_amount_price / buy_rate
+      # print("buy", entry[0], buy_amount, "<-", buy_amount_price, entry_derivative[1], prev_entry_derivative[1])
+      self.baseAsset = self.baseAsset - buy_amount_price
+      self.otherAsset = self.otherAsset + buy_amount
+
+      self.buy_list.append(list((buy_rate, buy_amount)))
+
+    if (is_sell_checkpoint or is_valley) and favorable_buy_trade is not None:
+      # sell asset
+      trade_amount = favorable_buy_trade[1]
+      sell_amount_price = (
+        trade_amount
+        if trade_amount * sell_rate * (1 - self.sellFraction) < self.minSell
+        else trade_amount * self.sellFraction
+      )
+      sell_amount = sell_amount_price * sell_rate
+      # print(
+      #   "sell", entry[0], sell_amount, "<-", sell_amount_price, entry_derivative[2], prev_entry_derivative[2], checkpoint
+      # )
+      self.baseAsset = self.baseAsset + sell_amount
+      self.otherAsset = self.otherAsset - sell_amount_price
+      if sell_amount_price != trade_amount:
+        favorable_buy_trade[1] = favorable_buy_trade[1] - sell_amount_price
+        self.sellCheckpoint = (
+          sell_rate * (1 - self.sellCheckpointFraction) + favorable_buy_trade[0] * self.sellCheckpointFraction
+        )
+      else:
+        self.sellCheckpoint = None
+        self.buy_list.remove(favorable_buy_trade)
+
+    # if (is_buy_checkpoint or is_peak) and has_base_asset:
+    #   trade_amount = favorable_sell_trade[1] if favorable_sell_trade is not None else None
     #   buy_amount_price = self.buyAmount(trade_amount)
+    #   is_full_price = buy_amount_price == trade_amount
     #   self.buy(buy_amount_price, buy_rate)
 
     # if buy_amount_price != trade_amount:
@@ -276,80 +328,16 @@ class Simulation:
     #   self.checkpoint = None
     #   self.buy_list.remove(favorable_buy_trade)
 
+  def simulate(self, history: list[Entry]):
+    avg_history = averagedData(history, self.window_range)
+    avg_derivative_history = dataDerivative(avg_history, self.window_range)
 
-def simulateStep(
-  trade_list, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
-):
-  buyFraction = 0.1
-  minBuy = 5
-  sellFraction = 1
-  sellCheckpointFraction = 0.5
-  minSell = 5
+    for i in range(1, len(avg_derivative_history)):
+      entry = history[i]
+      prev_entry_derivative = avg_derivative_history[i - 1]
+      entry_derivative = avg_derivative_history[i]
 
-  if math.isnan(base_asset_amount) or math.isnan(asset_amount):
-    return (checkpoint, base_asset_amount, asset_amount)
-
-  sell_rate = entry[2] / (1 + commision)
-  buy_rate = entry[1] * (1 + commision)
-  favorable_trade = findLast(lambda x: entry[2] > x[0], trade_list)
-  is_peak = entry_derivative[1] > 0 and prev_entry_derivative[1] <= 0
-  is_valley = entry_derivative[2] < 0 and prev_entry_derivative[2] >= 0
-  is_checkpoint = checkpoint is not None and checkpoint > sell_rate
-
-  if is_peak:
-    # buy asset
-    buy_amount_price = (
-      base_asset_amount if base_asset_amount * (1 - buyFraction) < minBuy else base_asset_amount * buyFraction
-    )
-    buy_amount = buy_amount_price / buy_rate
-    print("buy", entry[0], buy_amount, "<-", buy_amount_price, entry_derivative[1], prev_entry_derivative[1])
-    base_asset_amount = base_asset_amount - buy_amount_price
-    asset_amount = asset_amount + buy_amount
-
-    trade_list.append(list((buy_rate, buy_amount)))
-
-  if (is_checkpoint or is_valley) and favorable_trade is not None:
-    # sell asset
-    trade_amount = favorable_trade[1]
-    sell_amount_price = (
-      trade_amount if trade_amount * sell_rate * (1 - sellFraction) < minSell else trade_amount * sellFraction
-    )
-    sell_amount = sell_amount_price * sell_rate
-    print(
-      "sell", entry[0], sell_amount, "<-", sell_amount_price, entry_derivative[2], prev_entry_derivative[2], checkpoint
-    )
-    base_asset_amount = base_asset_amount + sell_amount
-    asset_amount = asset_amount - sell_amount_price
-    if sell_amount_price != trade_amount:
-      favorable_trade[1] = favorable_trade[1] - sell_amount_price
-      checkpoint = sell_rate * (1 - sellCheckpointFraction) + favorable_trade[0] * sellCheckpointFraction
-    else:
-      checkpoint = None
-      trade_list.remove(favorable_trade)
-
-  return (checkpoint, base_asset_amount, asset_amount)
-
-
-def simulate(history: list[Entry], initial: float):
-  window_range = 1000
-  commision = 0.005
-
-  base_asset_amount = initial
-  asset_amount = 0
-  trade_list = []
-  checkpoint = None
-
-  avg_history = averagedData(history, window_range)
-  avg_derivative_history = dataDerivative(avg_history, window_range)
-
-  for i in range(1, len(avg_derivative_history)):
-    entry = history[i]
-    prev_entry_derivative = avg_derivative_history[i - 1]
-    entry_derivative = avg_derivative_history[i]
-
-    (checkpoint, base_asset_amount, asset_amount) = simulateStep(
-      trade_list, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
-    )
+      self.simulateStep(entry, prev_entry_derivative, entry_derivative)
 
 
 print("loading historic data")
@@ -378,16 +366,13 @@ btc_data_valleys = dataValleys(avg_derivative_btc_data)
 
 
 print("simulating trade")
+
 initial = 1000
+simulation = Simulation(_range, initial, 0.005, 0.1, 0.5, 5, 1, 0.5, 5)
+
 balance = [initial]
 base_balance = [initial]
 asset_balance = [0]
-commision = 0.005
-
-base_asset_amount = initial
-asset_amount = 0
-trade_list = []
-checkpoint = None
 
 history = btc_data
 avg_history = avg_btc_data
@@ -398,13 +383,11 @@ for i in range(1, len(avg_derivative_history)):
   prev_entry_derivative = avg_derivative_history[i - 1]
   entry_derivative = avg_derivative_history[i]
 
-  (checkpoint, base_asset_amount, asset_amount) = simulateStep(
-    trade_list, checkpoint, base_asset_amount, asset_amount, entry, prev_entry_derivative, entry_derivative, commision
-  )
+  simulation.simulateStep(entry, prev_entry_derivative, entry_derivative)
 
-  balance.append(max(-1, base_asset_amount + asset_amount * entry[2] / (1 + commision)))
-  base_balance.append(max(-1, base_asset_amount))
-  asset_balance.append(max(-1, asset_amount))
+  balance.append(max(-1, simulation.baseAsset + simulation.otherAsset * entry[2] / simulation.commisionCoeff))
+  base_balance.append(max(-1, simulation.baseAsset))
+  asset_balance.append(max(-1, simulation.otherAsset))
 
 askAvg = [x[1] for x in avg_btc_data]
 askDerivative = [x[1] for x in avg_derivative_btc_data]
@@ -434,10 +417,10 @@ plt.grid(True)
 # plt.title("btc_data_peaks")
 # plt.grid(True)
 
-plt.subplot(5, 2, 5)
-plt.plot(timestamps, [x[1] for x in btc_data_valleys])  # Plot some data on the Axes.
-plt.title("btc_data_valleys")
-plt.grid(True)
+# plt.subplot(5, 2, 5)
+# plt.plot(timestamps, [x[1] for x in btc_data_valleys])  # Plot some data on the Axes.
+# plt.title("btc_data_valleys")
+# plt.grid(True)
 
 plt.subplot(5, 2, 6)
 plt.plot(timestamps, base_balance)  # Plot some data on the Axes.
