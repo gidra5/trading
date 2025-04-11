@@ -28,7 +28,7 @@ def loadData(directory: str):
   day_csvs.sort()
 
   entries: list[Entry] = []
-  for day_csv in day_csvs[0:2]:
+  for day_csv in day_csvs[0:1]:
     with open(os.path.join(entries_directory, day_csv)) as file:
       reader = csv.reader(file)
       day_entries = (
@@ -42,31 +42,6 @@ def loadData(directory: str):
         for x in reader
       )
       entries.extend(day_entries)
-
-  return entries
-
-
-def averagedData(data: list[Entry], range: float):
-  window: list[Entry] = []
-  entries: list[Entry] = []
-
-  sum_buy = 0
-  sum_sell = 0
-  for entry in data:
-    for _entry in window.copy():
-      if _entry[0] + range < entry[0]:
-        window.remove(_entry)
-        sum_buy = sum_buy - _entry[1]
-        sum_sell = sum_sell - _entry[1]
-      else:
-        break
-    window.append(entry)
-
-    sum_buy = sum_buy + entry[1]
-    sum_sell = sum_sell + entry[1]
-    avg_buy = sum_buy / len(window)
-    avg_sell = sum_sell / len(window)
-    entries.append((entry[0], avg_buy, avg_sell))
 
   return entries
 
@@ -89,33 +64,6 @@ def sampleData(data: list[Entry], ts: float, **kwargs):
   sum_sell = entry[2] * next_delta + next_entry[2] * prev_delta
   return (ts, sum_buy / delta, sum_sell / delta)
   # return entry
-
-
-def dataDerivative(data: list[Entry], step: float):
-  entries: list[Entry] = []
-  window: list[Entry] = []
-  range = step * 2
-
-  for entry in data:
-    ts = entry[0]
-
-    for _entry in window.copy():
-      if _entry[0] + range <= ts:
-        window.remove(_entry)
-      else:
-        break
-    window.append(entry)
-
-    delta = (window[-1][0] - window[0][0]) / 2
-    p1 = entry
-    p2 = sampleData(window, ts - delta)
-    p3 = window[-1]
-
-    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * step)
-    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * step)
-    entries.append((ts, buy_derivative, sell_derivative))
-
-  return entries
 
 
 def dataPeaks(data: list[Entry], threshold: float = 0):
@@ -165,9 +113,7 @@ def findLast(mapper, list):
 
 
 class Simulation:
-  buy_sums = 0
-  sell_sums = 0
-  window = []
+  avg_windows: list[list[int, list[Entry], float, float, list[Entry], float, float, float, float]] = []
   sell_list = []
   buy_list = []
   buyCheckpoint = None
@@ -189,8 +135,7 @@ class Simulation:
     maxSell=float("inf"),
     maxBuy=float("inf"),
   ):
-    self.averaging_windows = averaging_ranges
-    self.window_range = max(averaging_ranges)
+    self.avg_windows = list(map(lambda range: [range, [], 0, 0, [], 0, 0, 0, 0], averaging_ranges))
     self.baseAsset = initial
     self.otherAsset = 0
 
@@ -209,21 +154,53 @@ class Simulation:
     self.maxSellPrice = maxSell
     self.maxBuyPrice = maxBuy
 
-  def averaging(self, entry):
-    for _entry in self.window.copy():
-      if _entry[0] + self.window_range < entry[0]:
-        self.window.remove(_entry)
-        self.buy_sums -= _entry[1]
-        self.sell_sums -= _entry[2]
-      else:
-        break
-    self.window.append(entry)
+  def compute_next_averages(self, entry):
+    for window_state in self.avg_windows:
+      range = window_state[0]
+      entries_window = window_state[1]
+      avg_window = window_state[4]
+      ts = entry[0]
 
-    self.buy_sums += entry[1]
-    self.sell_sums += entry[2]
-    avg_buy = self.buy_sums / len(self.window)
-    avg_sell = self.sell_sums / len(self.window)
-    self.avg_entry = (entry[0], avg_buy, avg_sell)
+      for _entry in entries_window.copy():
+        if _entry[0] + range < entry[0]:
+          entries_window.remove(_entry)
+          window_state[2] -= _entry[1]
+          window_state[3] -= _entry[2]
+        else:
+          break
+      entries_window.append(entry)
+
+      window_state[2] += entry[1]
+      window_state[3] += entry[2]
+      avg_buy = window_state[2] / len(entries_window)
+      avg_sell = window_state[3] / len(entries_window)
+
+      for _entry in avg_window.copy():
+        if _entry[0] + range <= ts:
+          avg_window.remove(_entry)
+        else:
+          break
+      avg_entry = list((ts, avg_buy, avg_sell))
+      avg_window.append(avg_entry)
+
+      delta = (avg_window[-1][0] - avg_window[0][0]) / 2
+      if delta == 0:
+        window_state[5] = window_state[7]
+        window_state[6] = window_state[8]
+        window_state[7] = 0
+        window_state[8] = 0
+        continue
+
+      p1 = avg_entry
+      p2 = sampleData(avg_window, ts - delta)
+      p3 = avg_window[-1]
+
+      buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
+      sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
+      window_state[5] = window_state[7]
+      window_state[6] = window_state[8]
+      window_state[7] = buy_derivative
+      window_state[8] = sell_derivative
 
   def total(self, sell_rate):
     return self.baseAsset + self.otherAsset * sell_rate / self.commisionCoeff
@@ -406,7 +383,11 @@ class Simulation:
     rate = favorable_buy_trade[0] / favorable_buy_trade[1]
     self.sellCheckpoint = self.nextCheckpoint(sell_rate, rate, self.sellCheckpointFraction)
 
-  def simulateStep(self, entry, prev_entry_derivative, entry_derivative):
+  def simulateStep(self, entry):
+    self.compute_next_averages(entry)
+    ts = entry[0]
+    prev_entry_derivative = (ts, self.avg_windows[1][5], self.avg_windows[1][6])
+    entry_derivative = (ts, self.avg_windows[1][7], self.avg_windows[1][8])
     self.simulateStepBuy(entry, prev_entry_derivative, entry_derivative)
     self.simulateStepSell(entry, prev_entry_derivative, entry_derivative)
 
@@ -417,28 +398,11 @@ print("loading historic data")
 btc_data = loadData("./data/BTC-USD")
 timestamps = [x[0] for x in btc_data]
 span = (min(timestamps), max(timestamps))
-
-print("averaging historic data")
-_range = 500
-avg_btc_data = averagedData(btc_data, _range)
-
-print("computing derivative of average historic data")
-avg_derivative_btc_data = dataDerivative(avg_btc_data, _range)
-
-print("computing peaks")
-btc_data_peaks = dataPeaks(avg_derivative_btc_data)
-
-print("computing valleys")
-btc_data_valleys = dataValleys(avg_derivative_btc_data)
-
-# print("sampling of average historic data")
-# even_xs = [x * 0.01 for x in range(math.ceil(span[0] * 100), math.floor(span[1] * 100))]
-# sampled_avg_btc_data = [sampleData(avg_btc_data, ts, timestamps=timestamps) for ts in even_xs]
-
+timestamps = [x - span[0] for x in timestamps]
 
 print("simulating trade")
 
-initial = 100
+initial = 1000
 simulation = Simulation(
   initial=initial,
   commision=0.005,
@@ -453,55 +417,57 @@ simulation = Simulation(
 balance = [initial]
 base_balance = [initial]
 asset_balance = [0]
+sim_avg = ([], [], [], [], [])
+sim_avg_deriv = ([], [], [], [], [])
 
-history = btc_data
-avg_history = avg_btc_data
-avg_derivative_history = avg_derivative_btc_data
+for i in range(0, len(btc_data)):
+  entry = btc_data[i]
+  ts = entry[0]
 
-for i in range(1, len(avg_derivative_history)):
-  entry = history[i]
-  entry_derivative = avg_derivative_history[i]
-  # prev_entry_derivative = sampleData(avg_derivative_history, entry_derivative[0] - 100)
-  prev_entry_derivative = avg_derivative_history[i - 1]
+  if i == 0:
+    simulation.compute_next_averages(entry)
 
-  simulation.simulateStep(entry, prev_entry_derivative, entry_derivative)
+    for i, window_state in enumerate(simulation.avg_windows):
+      w = window_state[1]
+      sim_avg[i].append((ts, window_state[2] / len(w), window_state[3] / len(w)))
+      sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
+    continue
+  simulation.simulateStep(entry)
 
+  for i, window_state in enumerate(simulation.avg_windows):
+    w = window_state[1]
+    sim_avg[i].append((ts, window_state[2] / len(w), window_state[3] / len(w)))
+    sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
   balance.append(simulation.total(entry[2]))
   base_balance.append(simulation.baseAsset)
   asset_balance.append(simulation.otherAsset)
 
-askAvg = [x[1] for x in avg_btc_data]
-askDerivative = [x[1] for x in avg_derivative_btc_data]
-
 plt.subplot(5, 2, 1)
-plt.plot(timestamps, askAvg)  # Plot some data on the Axes.
+plt.plot(timestamps, [x[1] for x in btc_data])  # Plot some data on the Axes.
 plt.title("askAvg")
 plt.grid(True)
+
+for data in sim_avg:
+  plt.subplot(5, 2, 1)
+  plt.plot(timestamps, [x[1] for x in data])  # Plot some data on the Axes.
+  plt.title("askAvg")
+  plt.grid(True)
 
 plt.subplot(5, 2, 2)
 plt.plot(timestamps, balance)  # Plot some data on the Axes.
 plt.title("balance")
 plt.grid(True)
 
-plt.subplot(5, 2, 3)
-plt.plot(timestamps, askDerivative)  # Plot some data on the Axes.
-plt.title("askDerivative")
-plt.grid(True)
+for data in sim_avg_deriv:
+  plt.subplot(5, 2, 3)
+  plt.plot(timestamps, [x[1] for x in data])  # Plot some data on the Axes.
+  plt.title("askDerivative")
+  plt.grid(True)
 
 plt.subplot(5, 2, 4)
 plt.plot(timestamps, asset_balance)  # Plot some data on the Axes.
 plt.title("asset_balance")
 plt.grid(True)
-
-# plt.subplot(5, 2, 5)
-# plt.plot(timestamps, [x[1] for x in btc_data_peaks])  # Plot some data on the Axes.
-# plt.title("btc_data_peaks")
-# plt.grid(True)
-
-# plt.subplot(5, 2, 5)
-# plt.plot(timestamps, [x[1] for x in btc_data_valleys])  # Plot some data on the Axes.
-# plt.title("btc_data_valleys")
-# plt.grid(True)
 
 plt.subplot(5, 2, 6)
 plt.plot(timestamps, base_balance)  # Plot some data on the Axes.
