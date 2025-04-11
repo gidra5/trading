@@ -43,7 +43,7 @@ def loadData(directory: str):
       )
       entries.extend(day_entries)
 
-  return entries
+  return entries[0 : math.floor(len(entries) / 24)]
 
 
 def sampleData(data: list[Entry], ts: float, **kwargs):
@@ -112,8 +112,71 @@ def findLast(mapper, list):
   return next(filter(mapper, reversed(list)), None)
 
 
+class Data:
+  avg_window = []
+  sum_buy = 0
+  sum_sell = 0
+  # deriv_window = []
+  # deriv_buy = 0
+  # deriv_sell = 0
+  # prev_deriv_buy = 0
+  # prev_deriv_sell = 0
+
+  def __init__(self, range):
+    self.range = range
+
+  def compute_next_averages(self, entry):
+    for _entry in self.avg_window.copy():
+      if _entry[0] + self.range < entry[0]:
+        self.avg_window.remove(_entry)
+        self.sum_buy -= _entry[1]
+        self.sum_sell -= _entry[2]
+      else:
+        break
+    self.avg_window.append(entry)
+
+    self.sum_buy += entry[1]
+    self.sum_sell += entry[2]
+    # ts = entry[0]
+
+    # for _entry in self.avg_window.copy():
+    #   if _entry[0] + self.range < entry[0]:
+    #     self.avg_window.remove(_entry)
+    #     self.sum_buy -= _entry[1]
+    #     self.sum_sell -= _entry[2]
+    #   else:
+    #     break
+    # self.avg_window.append(entry)
+
+    # self.sum_buy += entry[1]
+    # self.sum_sell += entry[2]
+    # avg_buy = self.sum_buy / len(self.avg_window)
+    # avg_sell = self.sum_sell / len(self.avg_window)
+
+    # for _entry in self.deriv_window.copy():
+    #   if _entry[0] + self.range <= ts:
+    #     self.deriv_window.remove(_entry)
+    #   else:
+    #     break
+    # avg_entry = list((ts, avg_buy, avg_sell))
+    # self.deriv_window.append(avg_entry)
+
+    # delta = (self.deriv_window[-1][0] - self.deriv_window[0][0]) / 2
+    # if delta == 0:
+    #   return
+
+    # p1 = avg_entry
+    # p2 = sampleData(self.deriv_window, ts - delta)
+    # p3 = self.deriv_window[-1]
+
+    # self.prev_deriv_buy = self.deriv_buy
+    # self.prev_deriv_sell = self.deriv_sell
+    # self.deriv_buy = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
+    # self.deriv_sell = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
+
+
 class Simulation:
-  avg_windows: list[list[int, list[Entry], float, float, list[Entry], float, float, float, float]] = []
+  avg_windows: list[list[int, list[Entry], float, float, list[Entry], float, float, float, float, Data]] = []
   sell_list = []
   buy_list = []
   buyCheckpoint = None
@@ -135,7 +198,7 @@ class Simulation:
     maxSell=float("inf"),
     maxBuy=float("inf"),
   ):
-    self.avg_windows = list(map(lambda range: [range, [], 0, 0, [], 0, 0, 0, 0], averaging_ranges))
+    self.avg_windows = list(map(lambda range: [range, [], 0, 0, [], 0, 0, 0, 0, Data(range)], averaging_ranges))
     self.baseAsset = initial
     self.otherAsset = 0
 
@@ -156,6 +219,7 @@ class Simulation:
 
   def compute_next_averages(self, entry):
     for window_state in self.avg_windows:
+      window_state[9].compute_next_averages(entry)
       range = window_state[0]
       avg_window = window_state[1]
       deriv_window = window_state[4]
@@ -386,6 +450,8 @@ class Simulation:
   def simulateStep(self, entry):
     self.compute_next_averages(entry)
     ts = entry[0]
+    # prev_entry_derivative = (ts, self.avg_windows[1].prev_deriv_buy, self.avg_windows[1].prev_deriv_sell)
+    # entry_derivative = (ts, self.avg_windows[1].deriv_buy, self.avg_windows[1].deriv_sell)
     prev_entry_derivative = (ts, self.avg_windows[1][5], self.avg_windows[1][6])
     entry_derivative = (ts, self.avg_windows[1][7], self.avg_windows[1][8])
     self.simulateStepBuy(entry, prev_entry_derivative, entry_derivative)
@@ -428,16 +494,23 @@ for i in range(0, len(btc_data)):
     simulation.compute_next_averages(entry)
 
     for i, window_state in enumerate(simulation.avg_windows):
-      w = window_state[1]
-      sim_avg[i].append((ts, window_state[2] / len(w), window_state[3] / len(w)))
+      w = window_state[9].avg_window
+      sim_avg[i].append((ts, window_state[9].sum_buy / len(w), window_state[9].sum_sell / len(w)))
       sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
+
+      # w = window_state.avg_window
+      # sim_avg[i].append((ts, window_state.sum_buy / len(w), window_state.sum_sell / len(w)))
+      # sim_avg_deriv[i].append((ts, window_state.deriv_buy, window_state.deriv_sell))
     continue
   simulation.simulateStep(entry)
 
   for i, window_state in enumerate(simulation.avg_windows):
-    w = window_state[1]
-    sim_avg[i].append((ts, window_state[2] / len(w), window_state[3] / len(w)))
+    w = window_state[9].avg_window
+    sim_avg[i].append((ts, window_state[9].sum_buy / len(w), window_state[9].sum_sell / len(w)))
     sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
+    # w = window_state.avg_window
+    # sim_avg[i].append((ts, window_state.sum_buy / len(w), window_state.sum_sell / len(w)))
+    # sim_avg_deriv[i].append((ts, window_state.deriv_buy, window_state.deriv_sell))
   balance.append(simulation.total(entry[2]))
   base_balance.append(simulation.baseAsset)
   asset_balance.append(simulation.otherAsset)
