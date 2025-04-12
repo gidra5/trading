@@ -55,9 +55,19 @@ def interpolate(prev_value, next_value, prev_ts, next_ts, ts):
   return sum_buy / delta
 
 
-def sampleData(data: list[Entry], ts: float, **kwargs):
-  _timestamps = kwargs.get("timestamps", None)
-  timestamps = [x[0] for x in data] if _timestamps is None else _timestamps
+def sampleData(data: list[Entry], ts: float, timestamps, prev_i=None):
+  if prev_i is None or prev_i >= len(data):
+    i = bisect_left(timestamps, ts)
+    if i == 0:
+      return (i, data[i])
+    i = i - 1
+  else:
+    i = prev_i
+    while i >= 0 and data[i][0] >= ts:
+      i -= 1
+    while i < len(data) and data[i + 1][0] < ts:
+      i += 1
+
   prev_entry = data[i]
   next_entry = data[i + 1]
   next_ts = next_entry[0]
@@ -67,53 +77,11 @@ def sampleData(data: list[Entry], ts: float, **kwargs):
   return (i, (ts, buy, sell))
 
 
-def dataPeaks(data: list[Entry], threshold: float = 0):
-  entries: list[Entry] = [(data[0][0], 0, 0)]
-  prev: Entry = data[0]
-
-  for entry in data:
-    if entry == prev:
-      continue
-
-    ts = entry[0]
-
-    b = prev[1] >= 0 and entry[1] <= -threshold
-
-    if b:
-      entries.append((ts, 1, 1))
-    else:
-      entries.append((ts, 0, 0))
-    prev = entry
-
-  return entries
-
-
-def dataValleys(data: list[Entry], threshold: float = 0):
-  entries: list[Entry] = [(data[0][0], 0, 0)]
-  prev: Entry = data[0]
-
-  for entry in data:
-    if entry == prev:
-      continue
-
-    ts = entry[0]
-
-    b = prev[1] <= 0 and entry[1] >= threshold
-
-    if b:
-      entries.append((ts, 1, 1))
-    else:
-      entries.append((ts, 0, 0))
-    prev = entry
-
-  return entries
-
-
 def findLast(mapper, list):
   return next(filter(mapper, reversed(list)), None)
 
 
-class Data:
+class DataAverage:
   def __init__(self, range):
     self.range = range
     self.entries_window = []
@@ -125,8 +93,9 @@ class Data:
     self.deriv_sell = 0
     self.prev_deriv_buy = 0
     self.prev_deriv_sell = 0
+    self.prev_sample_index = None
 
-  def compute_next_averages(self, entry):
+  def update(self, entry):
     ts = entry[0]
 
     while len(self.window_ts) > 0:
@@ -154,8 +123,9 @@ class Data:
       return
 
     p1 = avg_entry
-    p2 = sampleData(self.deriv_window, ts - delta, timestamps=self.window_ts)
-    p3 = self.deriv_window[-1]
+    (i, p2) = sampleData(self.avg_window, ts - delta, self.window_ts, prev_i=self.prev_sample_index)
+    self.prev_sample_index = i
+    p3 = self.avg_window[-1]
 
     buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
     sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
@@ -165,55 +135,51 @@ class Data:
     self.deriv_sell = sell_derivative
 
 
-class Simulation:
-  avg_windows: list[Data]
-
+class Balance:
   def __init__(
     self,
     initial,
-    commision,
-    panicBuyFraction,
-    buyCheckpointFraction,
     minBuy,
-    panicSellFraction,
-    sellCheckpointFraction,
     minSell,
-    averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
-    buyFraction=1,
-    sellFraction=1,
     maxSell=float("inf"),
     maxBuy=float("inf"),
   ):
-    self.avg_windows = list(map(lambda range: Data(range), averaging_ranges))
-    self.saturation_point = max(averaging_ranges)
     self.sell_list = []
     self.buy_list = []
-    self.buyCheckpoint = None
-    self.sellCheckpoint = None
     self.baseAsset = initial
     self.otherAsset = 0
-
-    self.commisionCoeff = 1 + commision
-
-    self.buyFraction = buyFraction
-    self.panicBuyFraction = panicBuyFraction
-    self.buyCheckpointFraction = buyCheckpointFraction
-
-    self.sellFraction = sellFraction
-    self.panicSellFraction = panicSellFraction
-    self.sellCheckpointFraction = sellCheckpointFraction
 
     self.minBuyPrice = minBuy
     self.minSellPrice = minSell
     self.maxSellPrice = maxSell
     self.maxBuyPrice = maxBuy
 
-  def compute_next_averages(self, entry):
-    for window_state in self.avg_windows:
-      window_state.compute_next_averages(entry)
-
   def total(self, sell_rate):
-    return self.baseAsset + self.otherAsset * sell_rate / self.commisionCoeff
+    return self.baseAsset + self.otherAsset * sell_rate
+
+  def buy(self, price, amount):
+    assert price >= self.minBuyPrice
+    assert price <= self.maxBuyPrice
+
+    print("buy", amount, "<-", price)
+    self.baseAsset -= price
+    self.otherAsset += amount
+    assert self.baseAsset >= 0
+
+    self.buy_list.append(list((price, amount)))
+    self.buy_list.sort(key=lambda x: x[0] / x[1], reverse=True)
+
+  def sell(self, price, amount):
+    assert price >= self.minSellPrice
+    assert price <= self.maxSellPrice
+
+    print("sell", price, "<-", amount)
+    self.baseAsset += price
+    self.otherAsset -= amount
+    assert self.otherAsset >= 0
+
+    self.sell_list.append(list((price, amount)))
+    self.sell_list.sort(key=lambda x: x[0] / x[1])
 
   # out of all active sell trades
   # find the ones that sold for more than current rate
@@ -245,96 +211,111 @@ class Simulation:
     #   None,
     # )
 
+
+class Simulation:
+  avg_data: list[DataAverage]
+
+  def __init__(
+    self,
+    balance,
+    commision,
+    panicBuyFraction,
+    buyCheckpointFraction,
+    panicSellFraction,
+    sellCheckpointFraction,
+    averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
+    buyFraction=1,
+    sellFraction=1,
+  ):
+    self.balance = balance
+    self.avg_data = list(map(lambda range: DataAverage(range), averaging_ranges))
+    self.saturation_point = max(averaging_ranges)
+    self.buyCheckpoint = None
+    self.sellCheckpoint = None
+
+    self.commisionCoeff = 1 + commision
+
+    self.buyFraction = buyFraction
+    self.panicBuyFraction = panicBuyFraction
+    self.buyCheckpointFraction = buyCheckpointFraction
+
+    self.sellFraction = sellFraction
+    self.panicSellFraction = panicSellFraction
+    self.sellCheckpointFraction = sellCheckpointFraction
+
+  def update_averages(self, entry):
+    for window_state in self.avg_data:
+      window_state.update(entry)
+
+  def total(self, sell_rate):
+    return self.balance.total(sell_rate / self.commisionCoeff)
+
   # amount of base asset we are ready to give to buy any amount of other asset
   def buyAmountPrice(self, favorable_price: float = None):
     if favorable_price is None:
-      price = self.baseAsset
+      price = self.balance.baseAsset
       buy_price = price * self.panicBuyFraction
     else:
       price = favorable_price
       buy_price = price * self.buyFraction
 
-    buy_price = min(self.maxBuyPrice, buy_price)
+    buy_price = min(self.balance.maxBuyPrice, buy_price)
 
     amount_after_trade = price - buy_price
-    if amount_after_trade < self.minBuyPrice:
+    if amount_after_trade < self.balance.minBuyPrice:
       return price
     return buy_price
 
   # amount of other asset we are ready to give to sell for any amount of base asset
   def sellAmount(self, rate, favorable_amount: float = None):
     if favorable_amount is None:
-      amount = self.otherAsset
+      amount = self.balance.otherAsset
       sell_amount = amount * self.panicSellFraction
     else:
       amount = favorable_amount
       sell_amount = amount * self.sellFraction
 
-    sell_amount = min(self.maxSellPrice / rate, sell_amount)
+    sell_amount = min(self.balance.maxSellPrice / rate, sell_amount)
 
     amount_after_trade = amount - sell_amount
-    if amount_after_trade < self.minSellPrice / rate:
+    if amount_after_trade < self.balance.minSellPrice / rate:
       return amount
     return sell_amount
-
-  def buy(self, price, amount):
-    assert price >= self.minBuyPrice
-    assert price <= self.maxBuyPrice
-
-    print("buy", amount, "<-", price)
-    self.baseAsset -= price
-    self.otherAsset += amount
-    assert self.baseAsset >= 0
-
-    self.buy_list.append(list((price, amount)))
-    self.buy_list.sort(key=lambda x: x[0] / x[1], reverse=True)
-
-  def sell(self, amount, price):
-    assert price >= self.minSellPrice
-    assert price <= self.maxSellPrice
-
-    print("sell", price, "<-", amount)
-    self.baseAsset += price
-    self.otherAsset -= amount
-    assert self.otherAsset >= 0
-
-    self.sell_list.append(list((price, amount)))
-    self.sell_list.sort(key=lambda x: x[0] / x[1])
 
   def nextCheckpoint(self, rate, target_rate, fraction):
     return rate * (1 - fraction) + target_rate * fraction
 
   def simulateStepBuy(self, entry):
-    if self.baseAsset <= 0:
+    if self.balance.baseAsset <= 0:
       return
 
-    data = self.avg_windows[2]
+    data = self.avg_data[2]
     is_valley = data.deriv_buy > 0 and data.prev_deriv_buy <= 0
     buy_rate = entry[1] * self.commisionCoeff
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
     if not (is_buy_checkpoint or is_valley):
       return
 
-    favorable_sell_trade = self.getFavorableSellTrades(buy_rate)
+    favorable_sell_trade = self.balance.getFavorableSellTrades(buy_rate)
     if favorable_sell_trade is None:
       buy_amount_price = self.buyAmountPrice()
-      if buy_amount_price < self.minBuyPrice:
+      if buy_amount_price < self.balance.minBuyPrice:
         return
 
-      self.buy(buy_amount_price, buy_amount_price / buy_rate)
+      self.balance.buy(buy_amount_price, buy_amount_price / buy_rate)
       return
 
     trade_price = favorable_sell_trade[0]
     buy_amount_price = self.buyAmountPrice(trade_price)
-    if buy_amount_price < self.minBuyPrice:
+    if buy_amount_price < self.balance.minBuyPrice:
       return
 
     amount = buy_amount_price / buy_rate
-    self.buy(buy_amount_price, amount)
+    self.balance.buy(buy_amount_price, amount)
 
     if buy_amount_price == trade_price:
       self.buyCheckpoint = None
-      self.sell_list.remove(favorable_sell_trade)
+      self.balance.sell_list.remove(favorable_sell_trade)
       return
 
     favorable_sell_trade[0] -= buy_amount_price
@@ -346,10 +327,10 @@ class Simulation:
     self.buyCheckpoint = self.nextCheckpoint(buy_rate, rate, self.buyCheckpointFraction)
 
   def simulateStepSell(self, entry):
-    if self.otherAsset <= 0:
+    if self.balance.otherAsset <= 0:
       return
 
-    data = self.avg_windows[2]
+    data = self.avg_data[2]
     is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
     sell_rate = entry[2] / self.commisionCoeff
     is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
@@ -363,28 +344,28 @@ class Simulation:
     # we could look at a bigger averaging window to see if it is still rising there
     # or we could measure our belief in it to rise even higher
     # or sell only a fraction
-    favorable_buy_trade = self.getFavorableBuyTrades(sell_rate)
+    favorable_buy_trade = self.balance.getFavorableBuyTrades(sell_rate)
 
     if favorable_buy_trade is None:
       sell_amount = self.sellAmount(sell_rate)
       price = sell_amount * sell_rate
-      if price < self.minSellPrice:
+      if price < self.balance.minSellPrice:
         return
 
-      self.sell(sell_amount, price)
+      self.balance.sell(price, sell_amount)
       return
 
     trade_amount = favorable_buy_trade[1]
     sell_amount = self.sellAmount(sell_rate, trade_amount)
     price = sell_amount * sell_rate
-    if price < self.minSellPrice:
+    if price < self.balance.minSellPrice:
       return
 
-    self.sell(sell_amount, price)
+    self.balance.sell(price, sell_amount)
 
     if sell_amount == trade_amount:
       self.sellCheckpoint = None
-      self.buy_list.remove(favorable_buy_trade)
+      self.balance.buy_list.remove(favorable_buy_trade)
       return
 
     favorable_buy_trade[0] -= price
@@ -396,7 +377,7 @@ class Simulation:
     self.sellCheckpoint = self.nextCheckpoint(sell_rate, rate, self.sellCheckpointFraction)
 
   def simulateStep(self, entry):
-    self.compute_next_averages(entry)
+    self.update_averages(entry)
     if entry[0] < self.saturation_point:
       return
 
@@ -416,10 +397,8 @@ print("simulating trade")
 
 initial = 1000
 simulation = Simulation(
-  initial=initial,
+  balance=Balance(initial, minBuy=5, minSell=5),
   commision=0.005,
-  minBuy=5,
-  minSell=5,
   panicBuyFraction=0.01,
   panicSellFraction=0.01,
   buyCheckpointFraction=0.5,
@@ -437,9 +416,9 @@ for i in range(0, len(btc_data)):
   ts = entry[0]
 
   if i == 0:
-    simulation.compute_next_averages(entry)
+    simulation.update_averages(entry)
 
-    for i, data in enumerate(simulation.avg_windows):
+    for i, data in enumerate(simulation.avg_data):
       count = len(data.window_ts)
 
       sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
@@ -447,13 +426,13 @@ for i in range(0, len(btc_data)):
     continue
   simulation.simulateStep(entry)
 
-  for i, data in enumerate(simulation.avg_windows):
+  for i, data in enumerate(simulation.avg_data):
     count = len(data.window_ts)
     sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
     sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
   balance.append(simulation.total(entry[2]))
-  base_balance.append(simulation.baseAsset)
-  asset_balance.append(simulation.otherAsset)
+  base_balance.append(simulation.balance.baseAsset)
+  asset_balance.append(simulation.balance.otherAsset)
 
 plt.subplot(5, 2, 1)
 plt.plot(timestamps, [x[1] for x in btc_data])  # Plot some data on the Axes.
