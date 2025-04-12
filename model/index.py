@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 file_directory = os.path.dirname(__file__)
 
-# timestamp, ns
+# timestamp, s
 # buy price - i can buy at this price,
 # sell price - i can sell at this price,
 # buy volume - i can buy this volume at buy price immediately,
@@ -44,6 +44,7 @@ def loadData(directory: str):
       entries.extend(day_entries)
 
   return entries[0 : math.floor(len(entries) / 24)]
+  # return entries
 
 
 def sampleData(data: list[Entry], ts: float, **kwargs):
@@ -113,19 +114,20 @@ def findLast(mapper, list):
 
 
 class Data:
-  avg_window = []
-  sum_buy = 0
-  sum_sell = 0
-  # deriv_window = []
-  # deriv_buy = 0
-  # deriv_sell = 0
-  # prev_deriv_buy = 0
-  # prev_deriv_sell = 0
-
   def __init__(self, range):
     self.range = range
+    self.avg_window = []
+    self.sum_buy = 0
+    self.sum_sell = 0
+    self.deriv_window = []
+    self.deriv_buy = 0
+    self.deriv_sell = 0
+    self.prev_deriv_buy = 0
+    self.prev_deriv_sell = 0
 
   def compute_next_averages(self, entry):
+    ts = entry[0]
+
     for _entry in self.avg_window.copy():
       if _entry[0] + self.range < entry[0]:
         self.avg_window.remove(_entry)
@@ -137,46 +139,39 @@ class Data:
 
     self.sum_buy += entry[1]
     self.sum_sell += entry[2]
-    # ts = entry[0]
+    avg_buy = self.sum_buy / len(self.avg_window)
+    avg_sell = self.sum_sell / len(self.avg_window)
 
-    # for _entry in self.avg_window.copy():
-    #   if _entry[0] + self.range < entry[0]:
-    #     self.avg_window.remove(_entry)
-    #     self.sum_buy -= _entry[1]
-    #     self.sum_sell -= _entry[2]
-    #   else:
-    #     break
-    # self.avg_window.append(entry)
+    for _entry in self.deriv_window.copy():
+      if _entry[0] + self.range <= ts:
+        self.deriv_window.remove(_entry)
+      else:
+        break
+    avg_entry = list((ts, avg_buy, avg_sell))
+    self.deriv_window.append(avg_entry)
 
-    # self.sum_buy += entry[1]
-    # self.sum_sell += entry[2]
-    # avg_buy = self.sum_buy / len(self.avg_window)
-    # avg_sell = self.sum_sell / len(self.avg_window)
+    delta = (self.deriv_window[-1][0] - self.deriv_window[0][0]) / 2
+    if delta == 0:
+      self.prev_deriv_buy = self.deriv_buy
+      self.prev_deriv_sell = self.deriv_sell
+      self.deriv_buy = 0
+      self.deriv_sell = 0
+      return
 
-    # for _entry in self.deriv_window.copy():
-    #   if _entry[0] + self.range <= ts:
-    #     self.deriv_window.remove(_entry)
-    #   else:
-    #     break
-    # avg_entry = list((ts, avg_buy, avg_sell))
-    # self.deriv_window.append(avg_entry)
+    p1 = avg_entry
+    p2 = sampleData(self.deriv_window, ts - delta)
+    p3 = self.deriv_window[-1]
 
-    # delta = (self.deriv_window[-1][0] - self.deriv_window[0][0]) / 2
-    # if delta == 0:
-    #   return
-
-    # p1 = avg_entry
-    # p2 = sampleData(self.deriv_window, ts - delta)
-    # p3 = self.deriv_window[-1]
-
-    # self.prev_deriv_buy = self.deriv_buy
-    # self.prev_deriv_sell = self.deriv_sell
-    # self.deriv_buy = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
-    # self.deriv_sell = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
+    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
+    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
+    self.prev_deriv_buy = self.deriv_buy
+    self.prev_deriv_sell = self.deriv_sell
+    self.deriv_buy = buy_derivative
+    self.deriv_sell = sell_derivative
 
 
 class Simulation:
-  avg_windows: list[list[int, list[Entry], float, float, list[Entry], float, float, float, float, Data]] = []
+  avg_windows: list[Data] = []
   sell_list = []
   buy_list = []
   buyCheckpoint = None
@@ -192,13 +187,13 @@ class Simulation:
     panicSellFraction,
     sellCheckpointFraction,
     minSell,
-    averaging_ranges=[100, 500, 1000, 2000, 5000],
+    averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
     buyFraction=1,
     sellFraction=1,
     maxSell=float("inf"),
     maxBuy=float("inf"),
   ):
-    self.avg_windows = list(map(lambda range: [range, [], 0, 0, [], 0, 0, 0, 0, Data(range)], averaging_ranges))
+    self.avg_windows = list(map(lambda range: Data(range), averaging_ranges))
     self.baseAsset = initial
     self.otherAsset = 0
 
@@ -219,52 +214,7 @@ class Simulation:
 
   def compute_next_averages(self, entry):
     for window_state in self.avg_windows:
-      window_state[9].compute_next_averages(entry)
-      range = window_state[0]
-      avg_window = window_state[1]
-      deriv_window = window_state[4]
-      ts = entry[0]
-
-      for _entry in avg_window.copy():
-        if _entry[0] + range < entry[0]:
-          avg_window.remove(_entry)
-          window_state[2] -= _entry[1]
-          window_state[3] -= _entry[2]
-        else:
-          break
-      avg_window.append(entry)
-
-      window_state[2] += entry[1]
-      window_state[3] += entry[2]
-      avg_buy = window_state[2] / len(avg_window)
-      avg_sell = window_state[3] / len(avg_window)
-
-      for _entry in deriv_window.copy():
-        if _entry[0] + range <= ts:
-          deriv_window.remove(_entry)
-        else:
-          break
-      avg_entry = list((ts, avg_buy, avg_sell))
-      deriv_window.append(avg_entry)
-
-      delta = (deriv_window[-1][0] - deriv_window[0][0]) / 2
-      if delta == 0:
-        window_state[5] = window_state[7]
-        window_state[6] = window_state[8]
-        window_state[7] = 0
-        window_state[8] = 0
-        continue
-
-      p1 = avg_entry
-      p2 = sampleData(deriv_window, ts - delta)
-      p3 = deriv_window[-1]
-
-      buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
-      sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
-      window_state[5] = window_state[7]
-      window_state[6] = window_state[8]
-      window_state[7] = buy_derivative
-      window_state[8] = sell_derivative
+      window_state.compute_next_averages(entry)
 
   def total(self, sell_rate):
     return self.baseAsset + self.otherAsset * sell_rate / self.commisionCoeff
@@ -358,11 +308,11 @@ class Simulation:
   def nextCheckpoint(self, rate, target_rate, fraction):
     return rate * (1 - fraction) + target_rate * fraction
 
-  def simulateStepBuy(self, entry, prev_entry_derivative, entry_derivative):
+  def simulateStepBuy(self, entry):
     if self.baseAsset <= 0:
       return
 
-    is_valley = entry_derivative[1] > 0 and prev_entry_derivative[1] <= 0
+    is_valley = self.avg_windows[2].deriv_buy > 0 and self.avg_windows[2].prev_deriv_buy <= 0
     buy_rate = entry[1] * self.commisionCoeff
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
     if not (is_buy_checkpoint or is_valley):
@@ -398,11 +348,11 @@ class Simulation:
     rate = favorable_sell_trade[0] / favorable_sell_trade[1]
     self.buyCheckpoint = self.nextCheckpoint(buy_rate, rate, self.buyCheckpointFraction)
 
-  def simulateStepSell(self, entry, prev_entry_derivative, entry_derivative):
+  def simulateStepSell(self, entry):
     if self.otherAsset <= 0:
       return
 
-    is_peak = entry_derivative[2] < 0 and prev_entry_derivative[2] >= 0
+    is_peak = self.avg_windows[2].deriv_sell < 0 and self.avg_windows[2].prev_deriv_sell >= 0
     sell_rate = entry[2] / self.commisionCoeff
     is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
     if not (is_sell_checkpoint or is_peak):
@@ -449,13 +399,8 @@ class Simulation:
 
   def simulateStep(self, entry):
     self.compute_next_averages(entry)
-    ts = entry[0]
-    # prev_entry_derivative = (ts, self.avg_windows[1].prev_deriv_buy, self.avg_windows[1].prev_deriv_sell)
-    # entry_derivative = (ts, self.avg_windows[1].deriv_buy, self.avg_windows[1].deriv_sell)
-    prev_entry_derivative = (ts, self.avg_windows[1][5], self.avg_windows[1][6])
-    entry_derivative = (ts, self.avg_windows[1][7], self.avg_windows[1][8])
-    self.simulateStepBuy(entry, prev_entry_derivative, entry_derivative)
-    self.simulateStepSell(entry, prev_entry_derivative, entry_derivative)
+    self.simulateStepBuy(entry)
+    self.simulateStepSell(entry)
 
 
 print("loading historic data")
@@ -494,23 +439,19 @@ for i in range(0, len(btc_data)):
     simulation.compute_next_averages(entry)
 
     for i, window_state in enumerate(simulation.avg_windows):
-      w = window_state[9].avg_window
-      sim_avg[i].append((ts, window_state[9].sum_buy / len(w), window_state[9].sum_sell / len(w)))
-      sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
+      data = window_state
+      w = data.avg_window
 
-      # w = window_state.avg_window
-      # sim_avg[i].append((ts, window_state.sum_buy / len(w), window_state.sum_sell / len(w)))
-      # sim_avg_deriv[i].append((ts, window_state.deriv_buy, window_state.deriv_sell))
+      sim_avg[i].append((ts, data.sum_buy / len(w), data.sum_sell / len(w)))
+      sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
     continue
   simulation.simulateStep(entry)
 
   for i, window_state in enumerate(simulation.avg_windows):
-    w = window_state[9].avg_window
-    sim_avg[i].append((ts, window_state[9].sum_buy / len(w), window_state[9].sum_sell / len(w)))
-    sim_avg_deriv[i].append((ts, window_state[7], window_state[8]))
-    # w = window_state.avg_window
-    # sim_avg[i].append((ts, window_state.sum_buy / len(w), window_state.sum_sell / len(w)))
-    # sim_avg_deriv[i].append((ts, window_state.deriv_buy, window_state.deriv_sell))
+    data = window_state
+    w = data.avg_window
+    sim_avg[i].append((ts, data.sum_buy / len(w), data.sum_sell / len(w)))
+    sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
   balance.append(simulation.total(entry[2]))
   base_balance.append(simulation.baseAsset)
   asset_balance.append(simulation.otherAsset)
