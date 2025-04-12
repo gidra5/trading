@@ -127,8 +127,8 @@ class DataAverage:
     self.prev_sample_index = i
     p3 = self.avg_window[-1]
 
-    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
-    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / (2 * delta)
+    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / self.range
+    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / self.range
     self.prev_deriv_buy = self.deriv_buy
     self.prev_deriv_sell = self.deriv_sell
     self.deriv_buy = buy_derivative
@@ -223,7 +223,8 @@ class Simulation:
     buyCheckpointFraction,
     panicSellFraction,
     sellCheckpointFraction,
-    averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
+    # averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
+    averaging_ranges=[3600],  # 1s, 1m, 10m, 30m, 1h averages
     buyFraction=1,
     sellFraction=1,
   ):
@@ -289,7 +290,7 @@ class Simulation:
     if self.balance.baseAsset <= 0:
       return
 
-    data = self.avg_data[2]
+    data = self.avg_data[0]
     is_valley = data.deriv_buy > 0 and data.prev_deriv_buy <= 0
     buy_rate = entry[1] * self.commisionCoeff
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
@@ -330,7 +331,7 @@ class Simulation:
     if self.balance.otherAsset <= 0:
       return
 
-    data = self.avg_data[2]
+    data = self.avg_data[0]
     is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
     sell_rate = entry[2] / self.commisionCoeff
     is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
@@ -408,8 +409,8 @@ simulation = Simulation(
 balance = [initial]
 base_balance = [initial]
 asset_balance = [0]
-sim_avg = ([], [], [], [], [])
-sim_avg_deriv = ([], [], [], [], [])
+sim_avg = [[] for _ in simulation.avg_data]
+sim_avg_deriv = [[] for _ in simulation.avg_data]
 
 for i in range(0, len(btc_data)):
   entry = btc_data[i]
