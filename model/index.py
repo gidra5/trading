@@ -43,7 +43,7 @@ def loadData(directory: str):
       )
       entries.extend(day_entries)
 
-  return entries[0 : math.floor(len(entries) / 24)]
+  return entries[0 : math.floor(len(entries) / 6)]
   # return entries
 
 
@@ -120,6 +120,7 @@ class Data:
     self.sum_buy = 0
     self.sum_sell = 0
     self.deriv_window = []
+    self.window_ts = []
     self.deriv_buy = 0
     self.deriv_sell = 0
     self.prev_deriv_buy = 0
@@ -128,26 +129,24 @@ class Data:
   def compute_next_averages(self, entry):
     ts = entry[0]
 
-    for _entry in self.avg_window.copy():
-      if _entry[0] + self.range < entry[0]:
-        self.avg_window.remove(_entry)
-        self.sum_buy -= _entry[1]
-        self.sum_sell -= _entry[2]
-      else:
+    while len(self.window_ts) > 0:
+      _entry = self.avg_window[0]
+      if _entry[0] + self.range >= ts:
         break
-    self.avg_window.append(entry)
+      self.sum_buy -= _entry[1]
+      self.sum_sell -= _entry[2]
+      self.avg_window.pop(0)
+      self.deriv_window.pop(0)
+      self.window_ts.pop(0)
+    self.window_ts.append(ts)
+    self.avg_window.append((ts, entry[1], entry[2]))
 
     self.sum_buy += entry[1]
     self.sum_sell += entry[2]
     avg_buy = self.sum_buy / len(self.avg_window)
     avg_sell = self.sum_sell / len(self.avg_window)
 
-    for _entry in self.deriv_window.copy():
-      if _entry[0] + self.range <= ts:
-        self.deriv_window.remove(_entry)
-      else:
-        break
-    avg_entry = list((ts, avg_buy, avg_sell))
+    avg_entry = (ts, avg_buy, avg_sell)
     self.deriv_window.append(avg_entry)
 
     delta = (self.deriv_window[-1][0] - self.deriv_window[0][0]) / 2
@@ -159,7 +158,7 @@ class Data:
       return
 
     p1 = avg_entry
-    p2 = sampleData(self.deriv_window, ts - delta)
+    p2 = sampleData(self.deriv_window, ts - delta, timestamps=self.window_ts)
     p3 = self.deriv_window[-1]
 
     buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / (2 * delta)
@@ -171,11 +170,7 @@ class Data:
 
 
 class Simulation:
-  avg_windows: list[Data] = []
-  sell_list = []
-  buy_list = []
-  buyCheckpoint = None
-  sellCheckpoint = None
+  avg_windows: list[Data]
 
   def __init__(
     self,
@@ -194,6 +189,11 @@ class Simulation:
     maxBuy=float("inf"),
   ):
     self.avg_windows = list(map(lambda range: Data(range), averaging_ranges))
+    self.saturation_point = max(averaging_ranges)
+    self.sell_list = []
+    self.buy_list = []
+    self.buyCheckpoint = None
+    self.sellCheckpoint = None
     self.baseAsset = initial
     self.otherAsset = 0
 
@@ -399,6 +399,9 @@ class Simulation:
 
   def simulateStep(self, entry):
     self.compute_next_averages(entry)
+    if entry[0] < self.saturation_point:
+      return
+
     self.simulateStepBuy(entry)
     self.simulateStepSell(entry)
 
@@ -407,9 +410,9 @@ print("loading historic data")
 # eur_data = loadData("./data/EUR-USD")
 # eth_data = loadData("./data/ETH-USD")
 btc_data = loadData("./data/BTC-USD")
+span = (btc_data[0][0], btc_data[-1][0])
+btc_data = [(x[0] - span[0], x[1], x[2], x[3], x[4]) for x in btc_data]
 timestamps = [x[0] for x in btc_data]
-span = (min(timestamps), max(timestamps))
-timestamps = [x - span[0] for x in timestamps]
 
 print("simulating trade")
 
@@ -438,19 +441,17 @@ for i in range(0, len(btc_data)):
   if i == 0:
     simulation.compute_next_averages(entry)
 
-    for i, window_state in enumerate(simulation.avg_windows):
-      data = window_state
-      w = data.avg_window
+    for i, data in enumerate(simulation.avg_windows):
+      count = len(data.window_ts)
 
-      sim_avg[i].append((ts, data.sum_buy / len(w), data.sum_sell / len(w)))
+      sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
       sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
     continue
   simulation.simulateStep(entry)
 
-  for i, window_state in enumerate(simulation.avg_windows):
-    data = window_state
-    w = data.avg_window
-    sim_avg[i].append((ts, data.sum_buy / len(w), data.sum_sell / len(w)))
+  for i, data in enumerate(simulation.avg_windows):
+    count = len(data.window_ts)
+    sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
     sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
   balance.append(simulation.total(entry[2]))
   base_balance.append(simulation.baseAsset)
