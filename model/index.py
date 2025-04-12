@@ -47,24 +47,24 @@ def loadData(directory: str):
   # return entries
 
 
-def sampleData(data: list[Entry], ts: float, **kwargs):
-  _timestamps = kwargs.get("timestamps", None)
-  timestamps = [x[0] for x in data] if _timestamps is None else _timestamps
-  i = bisect_left(timestamps, ts)
-  if i == 0:
-    return data[i]
-  i = i - 1
-  entry = data[i]
-  next_entry = data[i + 1]
-  next_ts = next_entry[0]
-  prev_ts = entry[0]
+def interpolate(prev_value, next_value, prev_ts, next_ts, ts):
   delta = next_ts - prev_ts
   prev_delta = ts - prev_ts
   next_delta = next_ts - ts
-  sum_buy = entry[1] * next_delta + next_entry[1] * prev_delta
-  sum_sell = entry[2] * next_delta + next_entry[2] * prev_delta
-  return (ts, sum_buy / delta, sum_sell / delta)
-  # return entry
+  sum_buy = prev_value * next_delta + next_value * prev_delta
+  return sum_buy / delta
+
+
+def sampleData(data: list[Entry], ts: float, **kwargs):
+  _timestamps = kwargs.get("timestamps", None)
+  timestamps = [x[0] for x in data] if _timestamps is None else _timestamps
+  prev_entry = data[i]
+  next_entry = data[i + 1]
+  next_ts = next_entry[0]
+  prev_ts = prev_entry[0]
+  buy = interpolate(prev_entry[1], next_entry[1], prev_ts, next_ts, ts)
+  sell = interpolate(prev_entry[2], next_entry[2], prev_ts, next_ts, ts)
+  return (i, (ts, buy, sell))
 
 
 def dataPeaks(data: list[Entry], threshold: float = 0):
@@ -116,10 +116,10 @@ def findLast(mapper, list):
 class Data:
   def __init__(self, range):
     self.range = range
-    self.avg_window = []
+    self.entries_window = []
     self.sum_buy = 0
     self.sum_sell = 0
-    self.deriv_window = []
+    self.avg_window = []
     self.window_ts = []
     self.deriv_buy = 0
     self.deriv_sell = 0
@@ -130,31 +130,27 @@ class Data:
     ts = entry[0]
 
     while len(self.window_ts) > 0:
-      _entry = self.avg_window[0]
+      _entry = self.entries_window[0]
       if _entry[0] + self.range >= ts:
         break
       self.sum_buy -= _entry[1]
       self.sum_sell -= _entry[2]
+      self.entries_window.pop(0)
       self.avg_window.pop(0)
-      self.deriv_window.pop(0)
       self.window_ts.pop(0)
     self.window_ts.append(ts)
-    self.avg_window.append((ts, entry[1], entry[2]))
+    self.entries_window.append((ts, entry[1], entry[2]))
 
     self.sum_buy += entry[1]
     self.sum_sell += entry[2]
-    avg_buy = self.sum_buy / len(self.avg_window)
-    avg_sell = self.sum_sell / len(self.avg_window)
+    avg_buy = self.sum_buy / len(self.entries_window)
+    avg_sell = self.sum_sell / len(self.entries_window)
 
     avg_entry = (ts, avg_buy, avg_sell)
-    self.deriv_window.append(avg_entry)
+    self.avg_window.append(avg_entry)
 
-    delta = (self.deriv_window[-1][0] - self.deriv_window[0][0]) / 2
+    delta = (self.avg_window[-1][0] - self.avg_window[0][0]) / 2
     if delta == 0:
-      self.prev_deriv_buy = self.deriv_buy
-      self.prev_deriv_sell = self.deriv_sell
-      self.deriv_buy = 0
-      self.deriv_sell = 0
       return
 
     p1 = avg_entry
@@ -312,7 +308,8 @@ class Simulation:
     if self.baseAsset <= 0:
       return
 
-    is_valley = self.avg_windows[2].deriv_buy > 0 and self.avg_windows[2].prev_deriv_buy <= 0
+    data = self.avg_windows[2]
+    is_valley = data.deriv_buy > 0 and data.prev_deriv_buy <= 0
     buy_rate = entry[1] * self.commisionCoeff
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
     if not (is_buy_checkpoint or is_valley):
@@ -352,7 +349,8 @@ class Simulation:
     if self.otherAsset <= 0:
       return
 
-    is_peak = self.avg_windows[2].deriv_sell < 0 and self.avg_windows[2].prev_deriv_sell >= 0
+    data = self.avg_windows[2]
+    is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
     sell_rate = entry[2] / self.commisionCoeff
     is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
     if not (is_sell_checkpoint or is_peak):
