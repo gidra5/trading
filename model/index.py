@@ -28,7 +28,7 @@ def loadData(directory: str):
   day_csvs.sort()
 
   entries: list[Entry] = []
-  for day_csv in day_csvs:
+  for day_csv in day_csvs[0:7]:
     with open(os.path.join(entries_directory, day_csv)) as file:
       reader = csv.reader(file)
       day_entries = (
@@ -151,6 +151,8 @@ class Balance:
     self.buy_list = []
     self.baseAsset = initial
     self.otherAsset = 0
+    self.sell_sum = [0, 0]
+    self.buy_sum = [0, 0]
 
     self.minBuyPrice = minBuy
     self.minSellPrice = minSell
@@ -171,6 +173,8 @@ class Balance:
 
     self.buy_list.append(list((price, amount)))
     self.buy_list.sort(key=lambda x: x[0] / x[1], reverse=True)
+    self.buy_sum[0] += price
+    self.buy_sum[1] += amount
 
   def sell(self, price, amount):
     assert price >= self.minSellPrice
@@ -183,6 +187,8 @@ class Balance:
 
     self.sell_list.append(list((price, amount)))
     self.sell_list.sort(key=lambda x: x[0] / x[1])
+    self.sell_sum[0] += price
+    self.sell_sum[1] += amount
 
   # out of all active sell trades
   # find the ones that sold for more than current rate
@@ -289,6 +295,14 @@ class Simulation:
   def nextCheckpoint(self, rate, target_rate, fraction):
     return rate * (1 - fraction) + target_rate * fraction
 
+  def setBuyCheckpoint(self, rate, target_rate):
+    fraction = self.buyCheckpointFraction
+    self.buyCheckpoint = rate * (1 - fraction) + target_rate * fraction
+
+  def setSellCheckpoint(self, rate, target_rate):
+    fraction = self.sellCheckpointFraction
+    self.sellCheckpoint = rate * (1 - fraction) + target_rate * fraction
+
   def simulateStepBuy(self, entry):
     if self.balance.baseAsset <= 0:
       return
@@ -301,6 +315,7 @@ class Simulation:
       return
 
     favorable_sell_trade = self.balance.getFavorableSellTrades(buy_rate)
+    # favorable_sell_trade = self.balance.sell_sum
     if favorable_sell_trade is None:
       buy_amount_price = self.buyAmountPrice()
       if buy_amount_price < self.balance.minBuyPrice:
@@ -311,6 +326,7 @@ class Simulation:
 
     trade_price = favorable_sell_trade[0]
     buy_amount_price = self.buyAmountPrice(trade_price)
+    # print(self.balance.sell_sum, buy_amount_price)
     if buy_amount_price < self.balance.minBuyPrice:
       return
 
@@ -320,11 +336,13 @@ class Simulation:
     if buy_amount_price == trade_price:
       self.buyCheckpoint = None
       self.balance.sell_list.remove(favorable_sell_trade)
+      # self.balance.sell_sum = [0, 0]
       return
 
     if amount > favorable_sell_trade[1]:
       self.buyCheckpoint = None
       self.balance.sell_list.remove(favorable_sell_trade)
+      # self.balance.sell_sum = [0, 0]
       return
 
     favorable_sell_trade[0] -= buy_amount_price
@@ -333,7 +351,7 @@ class Simulation:
     assert favorable_sell_trade[1] > 0
 
     rate = favorable_sell_trade[0] / favorable_sell_trade[1]
-    self.buyCheckpoint = self.nextCheckpoint(buy_rate, rate, self.buyCheckpointFraction)
+    self.setBuyCheckpoint(buy_rate, rate)
 
   def simulateStepSell(self, entry):
     if self.balance.otherAsset <= 0:
@@ -354,6 +372,7 @@ class Simulation:
     # or we could measure our belief in it to rise even higher
     # or sell only a fraction
     favorable_buy_trade = self.balance.getFavorableBuyTrades(sell_rate)
+    # favorable_buy_trade = self.balance.buy_sum
 
     if favorable_buy_trade is None:
       sell_amount = self.sellAmount(sell_rate)
@@ -375,11 +394,13 @@ class Simulation:
     if sell_amount == trade_amount:
       self.sellCheckpoint = None
       self.balance.buy_list.remove(favorable_buy_trade)
+      # self.balance.buy_sum = [0, 0]
       return
 
     if price > favorable_buy_trade[0]:
       self.buyCheckpoint = None
       self.balance.buy_list.remove(favorable_buy_trade)
+      # self.balance.buy_sum = [0, 0]
       return
 
     favorable_buy_trade[0] -= price
@@ -388,7 +409,7 @@ class Simulation:
     assert favorable_buy_trade[1] > 0
 
     rate = favorable_buy_trade[0] / favorable_buy_trade[1]
-    self.sellCheckpoint = self.nextCheckpoint(sell_rate, rate, self.sellCheckpointFraction)
+    self.setSellCheckpoint(sell_rate, rate)
 
   def simulateStep(self, entry):
     self.update_averages(entry)
@@ -423,7 +444,8 @@ simulation = Simulation(
   sellCheckpointFraction=0.5,
 )
 
-simulation.balance.sell_list.append(list((initial, 1 / 1e9)))
+simulation.balance.sell_list.append([initial, 1 / 1e9])
+simulation.balance.sell_sum = [initial, 1 / 1e9]
 
 balance = [initial]
 base_balance = [initial]
