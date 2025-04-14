@@ -28,7 +28,7 @@ def loadData(directory: str):
   day_csvs.sort()
 
   entries: list[Entry] = []
-  for day_csv in day_csvs[0:1]:
+  for day_csv in day_csvs:
     with open(os.path.join(entries_directory, day_csv)) as file:
       reader = csv.reader(file)
       day_entries = (
@@ -43,8 +43,8 @@ def loadData(directory: str):
       )
       entries.extend(day_entries)
 
-  return entries[0 : math.floor(len(entries) / 6)]
-  # return entries
+  # return entries[0 : math.floor(len(entries) / 6)]
+  return entries
 
 
 def interpolate(prev_value, next_value, prev_ts, next_ts, ts):
@@ -122,17 +122,20 @@ class DataAverage:
     if delta == 0:
       return
 
-    p1 = avg_entry
+    p1 = self.avg_window[0]
     (i, p2) = sampleData(self.avg_window, ts - delta, self.window_ts, prev_i=self.prev_sample_index)
     self.prev_sample_index = i
     p3 = self.avg_window[-1]
 
     buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / self.range
     sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / self.range
+    # buy_derivative = (p3[1] - p1[1]) / self.range
+    # sell_derivative = (p3[2] - p1[2]) / self.range
     self.prev_deriv_buy = self.deriv_buy
     self.prev_deriv_sell = self.deriv_sell
     self.deriv_buy = buy_derivative
     self.deriv_sell = sell_derivative
+    # print(self, p3, p1)
 
 
 class Balance:
@@ -161,7 +164,7 @@ class Balance:
     assert price >= self.minBuyPrice
     assert price <= self.maxBuyPrice
 
-    print("buy", amount, "<-", price)
+    print(f"buy {amount} <- {price} ({price / amount})")
     self.baseAsset -= price
     self.otherAsset += amount
     assert self.baseAsset >= 0
@@ -173,7 +176,7 @@ class Balance:
     assert price >= self.minSellPrice
     assert price <= self.maxSellPrice
 
-    print("sell", price, "<-", amount)
+    print(f"sell {price} <- {amount} ({price / amount})")
     self.baseAsset += price
     self.otherAsset -= amount
     assert self.otherAsset >= 0
@@ -217,14 +220,14 @@ class Simulation:
 
   def __init__(
     self,
-    balance,
+    balance: Balance,
     commision,
     panicBuyFraction,
     buyCheckpointFraction,
     panicSellFraction,
     sellCheckpointFraction,
-    # averaging_ranges=[1, 60, 600, 1800, 3600],  # 1s, 1m, 10m, 30m, 1h averages
-    averaging_ranges=[3600],  # 1s, 1m, 10m, 30m, 1h averages
+    # averaging_ranges=[1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
+    averaging_ranges=[600],
     buyFraction=1,
     sellFraction=1,
   ):
@@ -319,6 +322,11 @@ class Simulation:
       self.balance.sell_list.remove(favorable_sell_trade)
       return
 
+    if amount > favorable_sell_trade[1]:
+      self.buyCheckpoint = None
+      self.balance.sell_list.remove(favorable_sell_trade)
+      return
+
     favorable_sell_trade[0] -= buy_amount_price
     favorable_sell_trade[1] -= amount
     assert favorable_sell_trade[0] > 0
@@ -369,6 +377,11 @@ class Simulation:
       self.balance.buy_list.remove(favorable_buy_trade)
       return
 
+    if price > favorable_buy_trade[0]:
+      self.buyCheckpoint = None
+      self.balance.buy_list.remove(favorable_buy_trade)
+      return
+
     favorable_buy_trade[0] -= price
     favorable_buy_trade[1] -= sell_amount
     assert favorable_buy_trade[0] > 0
@@ -382,7 +395,9 @@ class Simulation:
     if entry[0] < self.saturation_point:
       return
 
-    self.simulateStepBuy(entry)
+    if len(self.balance.buy_list) == 0:
+      self.simulateStepBuy(entry)
+
     self.simulateStepSell(entry)
 
 
@@ -400,11 +415,15 @@ initial = 1000
 simulation = Simulation(
   balance=Balance(initial, minBuy=5, minSell=5),
   commision=0.005,
-  panicBuyFraction=0.01,
-  panicSellFraction=0.01,
+  buyFraction=0.1,
+  sellFraction=0.5,
+  panicBuyFraction=0,
+  panicSellFraction=0,
   buyCheckpointFraction=0.5,
   sellCheckpointFraction=0.5,
 )
+
+simulation.balance.sell_list.append(list((initial, 1 / 1e9)))
 
 balance = [initial]
 base_balance = [initial]
@@ -435,35 +454,44 @@ for i in range(0, len(btc_data)):
   base_balance.append(simulation.balance.baseAsset)
   asset_balance.append(simulation.balance.otherAsset)
 
-plt.subplot(5, 2, 1)
+plt.figure()
+
+plt.subplot(2, 1, 1)
 plt.plot(timestamps, [x[1] for x in btc_data])  # Plot some data on the Axes.
 plt.title("askAvg")
 plt.grid(True)
 
 for data in sim_avg:
-  plt.subplot(5, 2, 1)
-  plt.plot(timestamps, [x[1] for x in data])  # Plot some data on the Axes.
+  plt.subplot(2, 1, 1)
+  plt.plot([x[0] for x in data], [x[1] for x in data])  # Plot some data on the Axes.
   plt.title("askAvg")
   plt.grid(True)
 
-plt.subplot(5, 2, 2)
-plt.plot(timestamps, balance)  # Plot some data on the Axes.
-plt.title("balance")
-plt.grid(True)
-
 for data in sim_avg_deriv:
-  plt.subplot(5, 2, 3)
+  plt.subplot(2, 1, 2)
   plt.plot(timestamps, [x[1] for x in data])  # Plot some data on the Axes.
   plt.title("askDerivative")
   plt.grid(True)
 
-plt.subplot(5, 2, 4)
+plt.tight_layout()
+
+plt.figure()
+
+plt.subplot(3, 1, 1)
+plt.plot(timestamps, balance)  # Plot some data on the Axes.
+plt.title("balance")
+plt.grid(True)
+
+plt.subplot(3, 1, 2)
 plt.plot(timestamps, asset_balance)  # Plot some data on the Axes.
 plt.title("asset_balance")
 plt.grid(True)
 
-plt.subplot(5, 2, 6)
+plt.subplot(3, 1, 3)
 plt.plot(timestamps, base_balance)  # Plot some data on the Axes.
 plt.title("base_balance")
 plt.grid(True)
+
+plt.tight_layout()
+
 plt.show()
