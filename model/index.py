@@ -47,12 +47,15 @@ def loadData(directory: str):
   return entries
 
 
-def interpolate(prev_value, next_value, prev_ts, next_ts, ts):
+def interpolate(next_value, prev_value, fraction):
+  return next_value * (1 - fraction) + prev_value * fraction
+
+
+def interpolateByTime(prev_value, next_value, prev_ts, next_ts, ts):
   delta = next_ts - prev_ts
-  prev_delta = ts - prev_ts
   next_delta = next_ts - ts
-  sum_buy = prev_value * next_delta + next_value * prev_delta
-  return sum_buy / delta
+  fraction = next_delta / delta
+  return interpolate(next_value, prev_value, fraction)
 
 
 def sampleData(data: list[Entry], ts: float, timestamps, prev_i=None):
@@ -72,8 +75,8 @@ def sampleData(data: list[Entry], ts: float, timestamps, prev_i=None):
   next_entry = data[i + 1]
   next_ts = next_entry[0]
   prev_ts = prev_entry[0]
-  buy = interpolate(prev_entry[1], next_entry[1], prev_ts, next_ts, ts)
-  sell = interpolate(prev_entry[2], next_entry[2], prev_ts, next_ts, ts)
+  buy = interpolateByTime(prev_entry[1], next_entry[1], prev_ts, next_ts, ts)
+  sell = interpolateByTime(prev_entry[2], next_entry[2], prev_ts, next_ts, ts)
   return (i, (ts, buy, sell))
 
 
@@ -147,12 +150,8 @@ class Balance:
     maxSell=float("inf"),
     maxBuy=float("inf"),
   ):
-    self.sell_list = []
-    self.buy_list = []
     self.baseAsset = initial
     self.otherAsset = 0
-    self.sell_sum = [0, 0]
-    self.buy_sum = [0, 0]
 
     self.minBuyPrice = minBuy
     self.minSellPrice = minSell
@@ -189,36 +188,6 @@ class Balance:
     self.sell_list.sort(key=lambda x: x[0] / x[1])
     self.sell_sum[0] += price
     self.sell_sum[1] += amount
-
-  # out of all active sell trades
-  # find the ones that sold for more than current rate
-  # out of those collect the largest rate and total amount sold
-  # we should buy if current rate is higher enough than the current rate
-  # and we should buy not more than total amount sold before
-  def getFavorableSellTrades(self, rate):
-    favorable_trade = next(filter(lambda x: x[0] / x[1] > rate, self.sell_list), None)
-    return favorable_trade
-    # favorable_trades = list(filter(lambda x: x[0] / x[1] > rate, self.sell_list))
-    # return itertools.accumulate(
-    #   favorable_trades,
-    #   lambda acc, trade: trade if acc is None else list((max(acc[0], trade[0]), acc[1] + trade[1])),
-    #   None,
-    # )
-
-  # out of all active buy trades
-  # find the ones that bought for less than current rate
-  # out of those collect the smallest rate and total amount bought
-  # we should sell if current rate is lower enough than the current rate
-  # and we should sell not more than total amount bought before
-  def getFavorableBuyTrades(self, rate):
-    favorable_trade = next(filter(lambda x: rate > x[0] / x[1], self.buy_list), None)
-    return favorable_trade
-    # favorable_trades = list(filter(lambda x: x[0] / x[1] < rate, self.buy_list))
-    # return itertools.accumulate(
-    #   favorable_trades,
-    #   lambda acc, trade: trade if acc is None else list((min(acc[0], trade[0]), acc[1] + trade[1])),
-    #   None,
-    # )
 
 
 class Simulation:
@@ -292,16 +261,13 @@ class Simulation:
       return amount
     return sell_amount
 
-  def nextCheckpoint(self, rate, target_rate, fraction):
-    return rate * (1 - fraction) + target_rate * fraction
-
   def setBuyCheckpoint(self, rate, target_rate):
     fraction = self.buyCheckpointFraction
-    self.buyCheckpoint = rate * (1 - fraction) + target_rate * fraction
+    self.buyCheckpoint = interpolate(rate, target_rate, fraction)
 
   def setSellCheckpoint(self, rate, target_rate):
     fraction = self.sellCheckpointFraction
-    self.sellCheckpoint = rate * (1 - fraction) + target_rate * fraction
+    self.sellCheckpoint = interpolate(rate, target_rate, fraction)
 
   def simulateStepBuy(self, entry):
     if self.balance.baseAsset <= 0:
