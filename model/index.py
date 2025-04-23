@@ -244,7 +244,7 @@ class Simulation:
     buyRate=1,
     sellRate=1,
     buySigma=0.1,
-    sellSigma=0.0001,
+    sellSigma=0.1,
     fixationPeriod=3600 * 24,
   ):
     self.balance = balance
@@ -297,7 +297,7 @@ class Simulation:
     return clamp(amount, _min, _max)
 
   # amount of other asset we are ready to give to sell for any amount of base asset
-  def sellAmount(self, rate, data_index=2):
+  def sellAmount(self, rate, data_index=3):
     data = self.avg_data[data_index][1]
     amount = self.balance.otherAsset * self.sellRate * (gaussian(data.rate(), 0, self.sellSigma))
     _min = self.balance.minSellPrice / rate
@@ -322,7 +322,7 @@ class Simulation:
       return True
 
     data = self.avg_data[data_index][0]
-    is_valley = data.data[-1][2] >= 0 and data.data[-2][2] < 0
+    is_valley = data.rate_clamped() >= 0 and data.rate_clamped(-2) < 0
     if not is_valley:
       return False
 
@@ -354,8 +354,7 @@ class Simulation:
       return True
 
     data = self.avg_data[data_index][1]
-    # is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
-    is_peak = data.data[-1][2] <= 0 and data.data[-2][2] > 0
+    is_peak = data.rate_clamped() <= 0 and data.rate_clamped(-2) > 0
     if not is_peak:
       return False
 
@@ -522,7 +521,7 @@ plt.grid(True)
 
 for i, data in enumerate(simulation.avg_data):
   plt.subplot(4, 1, 4)
-  plt.plot(timestamps, [x[2] for x in data[0].data], color=colors2[i])
+  plt.plot(timestamps, [1 if x[2] > 0 else -1 if x[2] < 0 else 0 for x in data[0].data], color=colors2[i])
 
 plt.title("rising")
 plt.grid(True)
