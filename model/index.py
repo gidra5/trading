@@ -3,6 +3,7 @@ import math
 import os
 import csv
 import itertools
+import functools
 
 import matplotlib
 
@@ -28,7 +29,12 @@ def loadData(directory: str):
   day_csvs.sort()
 
   entries: list[Entry] = []
-  for day_csv in day_csvs[0:7]:
+  for day_csv in day_csvs[0:1]:
+    # for day_csv in day_csvs[0:2]:
+    # for day_csv in day_csvs[0:7]:
+    # for day_csv in day_csvs[0:14]:
+    # for day_csv in day_csvs[0:30]:
+    # for day_csv in day_csvs:
     with open(os.path.join(entries_directory, day_csv)) as file:
       reader = csv.reader(file)
       day_entries = (
@@ -43,8 +49,12 @@ def loadData(directory: str):
       )
       entries.extend(day_entries)
 
-  # return entries[0 : math.floor(len(entries) / 6)]
+  # return entries[0 : math.floor(len(entries) * 0.5)]
   return entries
+
+
+def clamp(x, _min, _max):
+  return min(max(x, _min), _max)
 
 
 def interpolate(next_value, prev_value, fraction):
@@ -58,7 +68,7 @@ def interpolateByTime(prev_value, next_value, prev_ts, next_ts, ts):
   return interpolate(next_value, prev_value, fraction)
 
 
-def sampleData(data: list[Entry], ts: float, timestamps, prev_i=None):
+def sampleData(data: list[(float, float)], ts: float, timestamps, prev_i=None):
   if prev_i is None or prev_i >= len(data):
     i = bisect_left(timestamps, ts)
     if i == 0:
@@ -73,30 +83,43 @@ def sampleData(data: list[Entry], ts: float, timestamps, prev_i=None):
 
   prev_entry = data[i]
   next_entry = data[i + 1]
-  next_ts = next_entry[0]
-  prev_ts = prev_entry[0]
-  buy = interpolateByTime(prev_entry[1], next_entry[1], prev_ts, next_ts, ts)
-  sell = interpolateByTime(prev_entry[2], next_entry[2], prev_ts, next_ts, ts)
-  return (i, (ts, buy, sell))
+  delta = next_entry[0] - prev_entry[0]
+  next_delta = next_entry[0] - ts
+  fraction = next_delta / delta
+  return (i, interpolate(prev_entry[1], next_entry[1], fraction))
 
 
 def findLast(mapper, list):
   return next(filter(mapper, reversed(list)), None)
 
 
+def sigmoid(x):
+  return 1 / (1 + math.exp(x))
+
+
+def gaussian(x, mu=0, sigma=1):
+  return math.exp(-((x - mu) ** 2) / (2 * sigma**2))
+
+
 class DataAverage:
-  def __init__(self, range):
+  data: list[(float, float, float)]
+
+  def __init__(self, range, ratio=1):
     self.range = range
     self.entries_window = []
-    self.sum_buy = 0
-    self.sum_sell = 0
+    self.sum = 0
     self.avg_window = []
     self.window_ts = []
-    self.deriv_buy = 0
-    self.deriv_sell = 0
-    self.prev_deriv_buy = 0
-    self.prev_deriv_sell = 0
+    self.rate = 0
+    self.prev_rate = 0
     self.prev_sample_index = None
+    self.derivative_ratio = ratio
+    self.deriv_threshold = 0.25
+
+    self.data = []
+
+  def record(self, avg, derivative=0, rising=0):
+    self.data.append((avg, derivative, rising))
 
   def update(self, entry):
     ts = entry[0]
@@ -105,43 +128,61 @@ class DataAverage:
       _entry = self.entries_window[0]
       if _entry[0] + self.range >= ts:
         break
-      self.sum_buy -= _entry[1]
-      self.sum_sell -= _entry[2]
+      self.sum -= _entry[1]
       self.entries_window.pop(0)
       self.avg_window.pop(0)
       self.window_ts.pop(0)
     self.window_ts.append(ts)
-    self.entries_window.append((ts, entry[1], entry[2]))
+    self.entries_window.append((ts, entry[1]))
 
-    self.sum_buy += entry[1]
-    self.sum_sell += entry[2]
-    avg_buy = self.sum_buy / len(self.entries_window)
-    avg_sell = self.sum_sell / len(self.entries_window)
+    self.sum += entry[1]
+    avg = self.sum / len(self.entries_window)
 
-    avg_entry = (ts, avg_buy, avg_sell)
+    avg_entry = (ts, avg)
     self.avg_window.append(avg_entry)
 
-    delta = (self.avg_window[-1][0] - self.avg_window[0][0]) / 2
-    if delta == 0:
+    if len(self.avg_window) < 2:
+      self.record(avg)
       return
 
-    p1 = self.avg_window[0]
-    (i, p2) = sampleData(self.avg_window, ts - delta, self.window_ts, prev_i=self.prev_sample_index)
+    window_size = self.avg_window[-1][0] - self.avg_window[0][0]
+    point_ts = ts - window_size * self.derivative_ratio
+    (i, p1) = sampleData(self.avg_window, point_ts, self.window_ts, prev_i=self.prev_sample_index)
     self.prev_sample_index = i
     p3 = self.avg_window[-1]
 
-    buy_derivative = (p3[1] - 4 * p2[1] + 3 * p1[1]) / self.range
-    sell_derivative = (p3[2] - 4 * p2[2] + 3 * p1[2]) / self.range
-    # buy_derivative = (p3[1] - p1[1]) / self.range
-    # sell_derivative = (p3[2] - p1[2]) / self.range
-    self.prev_deriv_buy = self.deriv_buy
-    self.prev_deriv_sell = self.deriv_sell
-    self.deriv_buy = buy_derivative
-    self.deriv_sell = sell_derivative
+    delta = p3[0] - point_ts
+    if delta == 0:
+      self.record(avg)
+      return
+
+    derivative = (p3[1] - p1) / delta
+    self.prev_rate = self.rate
+    self.rate = derivative
     # print(self, p3, p1)
+
+    rising = self.data[-1][2]
+    if derivative >= self.deriv_threshold:
+      rising = 1
+    elif rising < 0 and derivative >= 0:
+      rising = 0
+
+    if derivative <= -self.deriv_threshold:
+      rising = -1
+    elif rising > 0 and derivative <= 0:
+      rising = 0
+
+    self.record(avg, derivative, rising)
 
 
 class Balance:
+  baseAsset: float
+  otherAsset: float
+  minBuyPrice: float
+  minSellPrice: float
+  maxSellPrice: float
+  maxBuyPrice: float
+
   def __init__(
     self,
     initial,
@@ -164,102 +205,105 @@ class Balance:
   def buy(self, price, amount):
     assert price >= self.minBuyPrice
     assert price <= self.maxBuyPrice
-
     print(f"buy {amount} <- {price} ({price / amount})")
+
     self.baseAsset -= price
     self.otherAsset += amount
     assert self.baseAsset >= 0
 
-    self.buy_list.append(list((price, amount)))
-    self.buy_list.sort(key=lambda x: x[0] / x[1], reverse=True)
-    self.buy_sum[0] += price
-    self.buy_sum[1] += amount
-
   def sell(self, price, amount):
     assert price >= self.minSellPrice
     assert price <= self.maxSellPrice
-
     print(f"sell {price} <- {amount} ({price / amount})")
+
     self.baseAsset += price
     self.otherAsset -= amount
     assert self.otherAsset >= 0
 
-    self.sell_list.append(list((price, amount)))
-    self.sell_list.sort(key=lambda x: x[0] / x[1])
-    self.sell_sum[0] += price
-    self.sell_sum[1] += amount
-
 
 class Simulation:
-  avg_data: list[DataAverage]
+  avg_data: list[tuple[DataAverage, DataAverage]]
+
+  buyPoints: list[float]
+  sellPoints: list[float]
+  balanceData: list[float]
+  assetData: list[float]
+  baseData: list[float]
 
   def __init__(
     self,
     balance: Balance,
-    commision,
+    fee,
     panicBuyFraction,
     buyCheckpointFraction,
     panicSellFraction,
     sellCheckpointFraction,
     # averaging_ranges=[1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
-    averaging_ranges=[600],
-    buyFraction=1,
-    sellFraction=1,
+    averaging_ranges=[1, 60, 600, 1800],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
+    # averaging_ranges=[600],
+    averaging_thresholds=[0.0, 0.5, 0.1, 0.05, 0.1, 0.1, 0.1],
+    buyRate=1,
+    sellRate=1,
+    buySigma=0.1,
+    sellSigma=0.0001,
+    fixationPeriod=3600 * 24,
   ):
     self.balance = balance
-    self.avg_data = list(map(lambda range: DataAverage(range), averaging_ranges))
+    self.avg_data = list(
+      map(
+        lambda range: (
+          DataAverage(range[1], averaging_thresholds[range[0]]),
+          DataAverage(range[1], averaging_thresholds[range[0]]),
+        ),
+        enumerate(averaging_ranges),
+      )
+    )
     self.saturation_point = max(averaging_ranges)
     self.buyCheckpoint = None
     self.sellCheckpoint = None
+    self.trade = [0, 0]
+    self.buyPoints = []
+    self.sellPoints = []
+    self.balanceData = []
+    self.baseData = []
+    self.assetData = []
 
-    self.commisionCoeff = 1 + commision
+    self.fee = fee
 
-    self.buyFraction = buyFraction
+    self.buyRate = buyRate
+    self.buySigma = buySigma
     self.panicBuyFraction = panicBuyFraction
     self.buyCheckpointFraction = buyCheckpointFraction
 
-    self.sellFraction = sellFraction
+    self.sellRate = sellRate
+    self.sellSigma = sellSigma
     self.panicSellFraction = panicSellFraction
     self.sellCheckpointFraction = sellCheckpointFraction
 
   def update_averages(self, entry):
     for window_state in self.avg_data:
-      window_state.update(entry)
+      window_state[0].update((entry[0], entry[1]))
+      window_state[1].update((entry[0], entry[2]))
 
   def total(self, sell_rate):
-    return self.balance.total(sell_rate / self.commisionCoeff)
+    return self.balance.total(sell_rate * (1 - self.fee))
 
   # amount of base asset we are ready to give to buy any amount of other asset
-  def buyAmountPrice(self, favorable_price: float = None):
-    if favorable_price is None:
-      price = self.balance.baseAsset
-      buy_price = price * self.panicBuyFraction
-    else:
-      price = favorable_price
-      buy_price = price * self.buyFraction
-
-    buy_price = min(self.balance.maxBuyPrice, buy_price)
-
-    amount_after_trade = price - buy_price
-    if amount_after_trade < self.balance.minBuyPrice:
-      return price
-    return buy_price
+  def buyAmountPrice(self, data_index=3):
+    data = self.avg_data[data_index][0]
+    amount = self.balance.baseAsset * self.buyRate * gaussian(data.rate, 0, self.buySigma)
+    # amount = self.balance.minBuyPrice,
+    _min = self.balance.minBuyPrice
+    _max = min(self.balance.maxBuyPrice, self.balance.baseAsset)
+    return clamp(amount, _min, _max)
 
   # amount of other asset we are ready to give to sell for any amount of base asset
-  def sellAmount(self, rate, favorable_amount: float = None):
-    if favorable_amount is None:
-      amount = self.balance.otherAsset
-      sell_amount = amount * self.panicSellFraction
-    else:
-      amount = favorable_amount
-      sell_amount = amount * self.sellFraction
-
-    sell_amount = min(self.balance.maxSellPrice / rate, sell_amount)
-
-    amount_after_trade = amount - sell_amount
-    if amount_after_trade < self.balance.minSellPrice / rate:
-      return amount
-    return sell_amount
+  def sellAmount(self, rate, data_index=2):
+    data = self.avg_data[data_index][1]
+    amount = self.balance.otherAsset * self.sellRate * (gaussian(data.rate, 0, self.sellSigma))
+    _min = self.balance.minSellPrice / rate
+    _max = min(self.balance.maxSellPrice / rate, self.balance.otherAsset)
+    return clamp(amount, _min, _max)
 
   def setBuyCheckpoint(self, rate, target_rate):
     fraction = self.buyCheckpointFraction
@@ -269,123 +313,109 @@ class Simulation:
     fraction = self.sellCheckpointFraction
     self.sellCheckpoint = interpolate(rate, target_rate, fraction)
 
-  def simulateStepBuy(self, entry):
+  def shouldBuy(self, entry, data_index=2):
     if self.balance.baseAsset <= 0:
-      return
+      return False
 
-    data = self.avg_data[0]
-    is_valley = data.deriv_buy > 0 and data.prev_deriv_buy <= 0
-    buy_rate = entry[1] * self.commisionCoeff
+    buy_rate = entry[1]
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
-    if not (is_buy_checkpoint or is_valley):
-      return
+    if is_buy_checkpoint:
+      return True
 
-    favorable_sell_trade = self.balance.getFavorableSellTrades(buy_rate)
-    # favorable_sell_trade = self.balance.sell_sum
-    if favorable_sell_trade is None:
-      buy_amount_price = self.buyAmountPrice()
-      if buy_amount_price < self.balance.minBuyPrice:
-        return
+    data = self.avg_data[data_index][0]
+    is_valley = data.data[-1][2] >= 0 and data.data[-2][2] < 0
+    if not is_valley:
+      return False
 
-      self.balance.buy(buy_amount_price, buy_amount_price / buy_rate)
-      return
+    data2 = self.avg_data[data_index + 1][0]
+    is_fake_valley = data2.data[-1][2] >= 0
+    if is_fake_valley:
+      return False
 
-    trade_price = favorable_sell_trade[0]
-    buy_amount_price = self.buyAmountPrice(trade_price)
-    # print(self.balance.sell_sum, buy_amount_price)
-    if buy_amount_price < self.balance.minBuyPrice:
-      return
+    if self.trade[1] == 0:
+      return True
 
-    amount = buy_amount_price / buy_rate
-    self.balance.buy(buy_amount_price, amount)
+    favorable_rate = self.trade[0] / self.trade[1]
 
-    if buy_amount_price == trade_price:
-      self.buyCheckpoint = None
-      self.balance.sell_list.remove(favorable_sell_trade)
-      # self.balance.sell_sum = [0, 0]
-      return
+    if buy_rate > favorable_rate:
+      return False
 
-    if amount > favorable_sell_trade[1]:
-      self.buyCheckpoint = None
-      self.balance.sell_list.remove(favorable_sell_trade)
-      # self.balance.sell_sum = [0, 0]
-      return
+    if self.balance.baseAsset * self.buyRate < self.balance.minBuyPrice:
+      return False
 
-    favorable_sell_trade[0] -= buy_amount_price
-    favorable_sell_trade[1] -= amount
-    assert favorable_sell_trade[0] > 0
-    assert favorable_sell_trade[1] > 0
+    return True
 
-    rate = favorable_sell_trade[0] / favorable_sell_trade[1]
-    self.setBuyCheckpoint(buy_rate, rate)
+  def shouldSell(self, entry, data_index=2):
+    if self.balance.otherAsset <= 0:
+      return False
+
+    sell_rate = entry[2]
+    is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
+    if is_sell_checkpoint:
+      return True
+
+    data = self.avg_data[data_index][1]
+    # is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
+    is_peak = data.data[-1][2] <= 0 and data.data[-2][2] > 0
+    if not is_peak:
+      return False
+
+    data2 = self.avg_data[data_index + 1][1]
+    is_fake_peak = data2.data[-1][2] <= 0
+    if is_fake_peak:
+      return False
+
+    if self.trade[1] == 0:
+      return True
+
+    favorable_rate = self.trade[0] / self.trade[1]
+
+    if sell_rate < favorable_rate:
+      return False
+
+    if self.balance.otherAsset * self.sellRate < self.balance.minSellPrice / sell_rate:
+      return False
+
+    return True
+
+  def simulateStepBuy(self, entry):
+    buy_rate = entry[1]
+    price = self.buyAmountPrice()
+    amount = price / buy_rate
+    self.balance.buy(price, amount)
+    self.buyPoints.append(entry[0])
+    self.trade[0] += price
+    self.trade[1] += amount
+    return
 
   def simulateStepSell(self, entry):
-    if self.balance.otherAsset <= 0:
-      return
-
-    data = self.avg_data[0]
-    is_peak = data.deriv_sell < 0 and data.prev_deriv_sell >= 0
-    sell_rate = entry[2] / self.commisionCoeff
-    is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
-    if not (is_sell_checkpoint or is_peak):
-      return
-
-    # if there are no favorable buy trades yet
-    # and thats a peak in sell rate
-    # should we sell everything potentially for a loss
-    # or should we wait for a better deal?
-    # we could look at a bigger averaging window to see if it is still rising there
-    # or we could measure our belief in it to rise even higher
-    # or sell only a fraction
-    favorable_buy_trade = self.balance.getFavorableBuyTrades(sell_rate)
-    # favorable_buy_trade = self.balance.buy_sum
-
-    if favorable_buy_trade is None:
-      sell_amount = self.sellAmount(sell_rate)
-      price = sell_amount * sell_rate
-      if price < self.balance.minSellPrice:
-        return
-
-      self.balance.sell(price, sell_amount)
-      return
-
-    trade_amount = favorable_buy_trade[1]
-    sell_amount = self.sellAmount(sell_rate, trade_amount)
-    price = sell_amount * sell_rate
-    if price < self.balance.minSellPrice:
-      return
-
-    self.balance.sell(price, sell_amount)
-
-    if sell_amount == trade_amount:
-      self.sellCheckpoint = None
-      self.balance.buy_list.remove(favorable_buy_trade)
-      # self.balance.buy_sum = [0, 0]
-      return
-
-    if price > favorable_buy_trade[0]:
-      self.buyCheckpoint = None
-      self.balance.buy_list.remove(favorable_buy_trade)
-      # self.balance.buy_sum = [0, 0]
-      return
-
-    favorable_buy_trade[0] -= price
-    favorable_buy_trade[1] -= sell_amount
-    assert favorable_buy_trade[0] > 0
-    assert favorable_buy_trade[1] > 0
-
-    rate = favorable_buy_trade[0] / favorable_buy_trade[1]
-    self.setSellCheckpoint(sell_rate, rate)
+    sell_rate = entry[2]
+    amount = self.sellAmount(sell_rate)
+    price = amount * sell_rate
+    self.balance.sell(price, amount)
+    self.sellPoints.append(entry[0])
+    self.trade[0] -= price
+    self.trade[1] -= amount
+    return
 
   def simulateStep(self, entry):
     self.update_averages(entry)
     if entry[0] < self.saturation_point:
+      self.balanceData.append(self.total(entry[2]))
+      self.baseData.append(self.balance.baseAsset)
+      self.assetData.append(self.balance.otherAsset)
       return
+    fee_adjusted_entry = (entry[0], entry[1] / (1 - self.fee), entry[2] * (1 - self.fee), entry[3], entry[4])
 
-    if len(self.balance.buy_list) == 0:
-      self.simulateStepBuy(entry)
+    if self.shouldBuy(fee_adjusted_entry):
+      self.simulateStepBuy(fee_adjusted_entry)
 
-    self.simulateStepSell(entry)
+    if self.shouldSell(fee_adjusted_entry):
+      self.simulateStepSell(fee_adjusted_entry)
+
+    self.balanceData.append(self.total(entry[2]))
+    self.baseData.append(self.balance.baseAsset)
+    self.assetData.append(self.balance.otherAsset)
 
 
 print("loading historic data")
@@ -401,82 +431,118 @@ print("simulating trade")
 initial = 1000
 simulation = Simulation(
   balance=Balance(initial, minBuy=5, minSell=5),
-  commision=0.005,
-  buyFraction=0.1,
-  sellFraction=0.5,
+  fee=0.005,
+  buyRate=1,
+  sellRate=1,
   panicBuyFraction=0,
   panicSellFraction=0,
   buyCheckpointFraction=0.5,
   sellCheckpointFraction=0.5,
 )
 
-simulation.balance.sell_list.append([initial, 1 / 1e9])
-simulation.balance.sell_sum = [initial, 1 / 1e9]
-
-balance = [initial]
-base_balance = [initial]
-asset_balance = [0]
-sim_avg = [[] for _ in simulation.avg_data]
-sim_avg_deriv = [[] for _ in simulation.avg_data]
-
 for i in range(0, len(btc_data)):
   entry = btc_data[i]
   ts = entry[0]
 
-  if i == 0:
-    simulation.update_averages(entry)
-
-    for i, data in enumerate(simulation.avg_data):
-      count = len(data.window_ts)
-
-      sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
-      sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
-    continue
   simulation.simulateStep(entry)
 
-  for i, data in enumerate(simulation.avg_data):
-    count = len(data.window_ts)
-    sim_avg[i].append((ts, data.sum_buy / count, data.sum_sell / count))
-    sim_avg_deriv[i].append((ts, data.deriv_buy, data.deriv_sell))
-  balance.append(simulation.total(entry[2]))
-  base_balance.append(simulation.balance.baseAsset)
-  asset_balance.append(simulation.balance.otherAsset)
+sim_sell_points = simulation.sellPoints
+sim_buy_points = simulation.buyPoints
+sim_sell_prices = [sampleData(btc_data, x, timestamps)[1] for x in sim_sell_points]
+sim_buy_prices = [sampleData(btc_data, x, timestamps)[1] for x in sim_buy_points]
 
-plt.figure()
+# assuming the graph is mostly monotone and rising
+current = simulation.balanceData[-1] / initial - 1
+(max_sell_price, max_sell_price_ts) = functools.reduce(
+  lambda acc, x: (x[2], x[0]) if acc is None else (acc if acc[0] > x[2] else (x[2], x[0])), btc_data, None
+)
+(min_buy_price, min_buy_price_ts) = functools.reduce(
+  lambda acc, x: (x[2], x[0]) if acc is None else (acc if acc[0] < x[2] else (x[2], x[0])),
+  (x for x in btc_data if x[0] < max_sell_price_ts),
+  None,
+)
+best = max_sell_price / min_buy_price * ((1 - simulation.fee) ** 2) - 1
+perf = current / best
+acceptable = perf > 0.5
 
-plt.subplot(2, 1, 1)
-plt.plot(timestamps, [x[1] for x in btc_data])  # Plot some data on the Axes.
+print(f"min: {min_buy_price} at {min_buy_price_ts}\nmax: {max_sell_price} at {max_sell_price_ts}\n\n")
+print(f"current profit: {current}\nbest profit: {best}\nperf: {perf}\nacceptable: {acceptable}")
+
+
+colors = [
+  "#cccccc22",
+  "#aaaaaa",
+  "#8888aa",
+  "#aa6644aa",
+  "#44446622",
+  "#22224422",
+  "#00004422",
+]
+
+colors2 = [
+  "#cccccc22",
+  "#aaaaaa22",
+  "#8888aa",
+  "#aa6644",
+  "#44446622",
+  "#22224422",
+  "#00004422",
+]
+
+plt.figure(figsize=(12, 12))
+
+prices = [x[1] for x in btc_data]
+plt.subplot(4, 1, 1)
+
+plt.plot(timestamps, prices, color="#dddddd", zorder=1)
+
+for i, data in enumerate(simulation.avg_data):
+  plt.plot(timestamps, [x[0] for x in data[0].data], color=colors[i], zorder=1)
+
+# scatter plot showing buy and sell points
+plt.scatter(sim_buy_points, sim_buy_prices, color="red", zorder=2, alpha=0.5)
+plt.scatter(sim_sell_points, sim_sell_prices, color="blue", zorder=2, alpha=0.5)
+
 plt.title("askAvg")
 plt.grid(True)
 
-for data in sim_avg:
-  plt.subplot(2, 1, 1)
-  plt.plot([x[0] for x in data], [x[1] for x in data])  # Plot some data on the Axes.
-  plt.title("askAvg")
-  plt.grid(True)
+for i, data in enumerate(simulation.avg_data):
+  plt.subplot(4, 1, 2)
+  plt.plot(timestamps, [x[1] for x in data[0].data], color=colors2[i])
 
-for data in sim_avg_deriv:
-  plt.subplot(2, 1, 2)
-  plt.plot(timestamps, [x[1] for x in data])  # Plot some data on the Axes.
-  plt.title("askDerivative")
-  plt.grid(True)
+plt.title("askDerivative")
+plt.grid(True)
+
+for i, data in enumerate(simulation.avg_data):
+  plt.subplot(4, 1, 3)
+  plt.plot(timestamps, [gaussian(x[1], 0, 0.1) for x in data[1].data], color=colors2[i])
+
+plt.title("gaussian(askDerivative)")
+plt.grid(True)
+
+for i, data in enumerate(simulation.avg_data):
+  plt.subplot(4, 1, 4)
+  plt.plot(timestamps, [x[2] for x in data[0].data], color=colors2[i])
+
+plt.title("rising")
+plt.grid(True)
 
 plt.tight_layout()
 
-plt.figure()
+plt.figure(figsize=(12, 12))
 
 plt.subplot(3, 1, 1)
-plt.plot(timestamps, balance)  # Plot some data on the Axes.
+plt.plot(timestamps, simulation.balanceData)
 plt.title("balance")
 plt.grid(True)
 
 plt.subplot(3, 1, 2)
-plt.plot(timestamps, asset_balance)  # Plot some data on the Axes.
+plt.plot(timestamps, simulation.assetData)
 plt.title("asset_balance")
 plt.grid(True)
 
 plt.subplot(3, 1, 3)
-plt.plot(timestamps, base_balance)  # Plot some data on the Axes.
+plt.plot(timestamps, simulation.baseData)
 plt.title("base_balance")
 plt.grid(True)
 
