@@ -99,8 +99,8 @@ class DataAverage:
     self.entries_window = []
     self.sum = 0
     self.avg_window = []
+    self.rate_window = []
     self.window_ts = []
-    self.prev_rate = 0
     self.prev_sample_index = None
     self.derivative_ratio = ratio
     self.deriv_threshold_low = threshold_low
@@ -108,17 +108,17 @@ class DataAverage:
 
     self.data = []
 
-  def avg(self):
-    return self.data[-1][0]
+  def avg(self, i=-1):
+    return self.data[i][0]
 
-  def rate(self):
-    return self.data[-1][1]
+  def rate(self, i=-1):
+    return self.data[i][1]
 
-  def rate_clamped(self):
-    return self.data[-1][2]
+  def rate_clamped(self, i=-1):
+    return self.data[i][2]
 
-  def rate_change(self):
-    return self.data[-1][3]
+  def rate_change(self, i=-1):
+    return self.data[i][3]
 
   def record(self, avg, rate=0, rising=0, rate_change=0):
     self.data.append((avg, rate, rising, rate_change))
@@ -140,7 +140,6 @@ class DataAverage:
 
     self.sum += entry[1]
     avg = self.sum / len(self.window_ts)
-
     self.avg_window.append(avg)
 
     if len(self.avg_window) < 2:
@@ -159,9 +158,9 @@ class DataAverage:
       return
 
     derivative = (p3 - p1) / delta
-    # print(self, p3, p1)
+    self.rate_window.append(derivative)
 
-    rising = self.data[-1][2]
+    rising = self.rate_clamped()
     if derivative >= self.deriv_threshold_high:
       rising = derivative
     elif rising < 0 and derivative >= 0:
