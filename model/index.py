@@ -30,6 +30,7 @@ def loadData(directory: str):
 
   entries: list[Entry] = []
   for day_csv in day_csvs[0:1]:
+    # for day_csv in day_csvs[1:2]:
     # for day_csv in day_csvs[0:2]:
     # for day_csv in day_csvs[0:7]:
     # for day_csv in day_csvs[0:14]:
@@ -49,7 +50,7 @@ def loadData(directory: str):
       )
       entries.extend(day_entries)
 
-  # return entries[0 : math.floor(len(entries) * 0.5)]
+  # return entries[math.floor(len(entries) * 0.3) : math.floor(len(entries) * 0.8)]
   return entries
 
 
@@ -160,16 +161,12 @@ class DataAverage:
     derivative = (p3 - p1) / delta
     self.rate_window.append(derivative)
 
-    rising = self.rate_clamped()
+    rising = 0
     if derivative >= self.deriv_threshold_high:
       rising = derivative
-    elif rising < 0 and derivative >= 0:
-      rising = 0
 
     if derivative <= -self.deriv_threshold_low:
       rising = derivative
-    elif rising > 0 and derivative <= 0:
-      rising = 0
 
     self.record(avg, derivative, rising)
 
@@ -237,10 +234,13 @@ class Simulation:
     buyCheckpointFraction,
     panicSellFraction,
     sellCheckpointFraction,
-    # averaging_ranges=[1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
-    averaging_ranges=[1, 60, 600, 1800],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
+    averaging_ranges=[1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
+    # averaging_ranges=[1, 60, 600, 1800],  # 1s, 1m, 10m, 30m, 1h, 4h, 12h averages
+    # averaging_ranges=[600, 1800],
     # averaging_ranges=[600],
-    averaging_thresholds=[0.0, 0.5, 0.1, 0.05, 0.1, 0.1, 0.1],
+    rate_ratios=[0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
+    rate_thresholds_low=[0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
+    rate_thresholds_high=[0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
     buyRate=1,
     sellRate=1,
     buySigma=0.1,
@@ -251,13 +251,24 @@ class Simulation:
     self.avg_data = list(
       map(
         lambda range: (
-          DataAverage(range[1], averaging_thresholds[range[0]]),
-          DataAverage(range[1], averaging_thresholds[range[0]]),
+          DataAverage(
+            range[1],
+            rate_ratios[range[0]],
+            rate_thresholds_low[range[0]],
+            rate_thresholds_high[range[0]],
+          ),
+          DataAverage(
+            range[1],
+            rate_ratios[range[0]],
+            rate_thresholds_low[range[0]],
+            rate_thresholds_high[range[0]],
+          ),
         ),
         enumerate(averaging_ranges),
       )
     )
-    self.saturation_point = max(averaging_ranges)
+    # self.saturation_point = max(averaging_ranges)
+    self.saturation_point = 3600
     self.buyCheckpoint = None
     self.sellCheckpoint = None
     self.trade = [0, 0]
@@ -312,9 +323,9 @@ class Simulation:
     fraction = self.sellCheckpointFraction
     self.sellCheckpoint = interpolate(rate, target_rate, fraction)
 
-  def shouldBuy(self, entry, data_index=2):
-    if self.balance.baseAsset <= 0:
-      return False
+  def shouldBuy(self, entry, data_index=0):
+    # if self.balance.baseAsset <= 0:
+    #   return False
 
     buy_rate = entry[1]
     is_buy_checkpoint = self.buyCheckpoint is not None and self.buyCheckpoint < buy_rate
@@ -326,27 +337,42 @@ class Simulation:
     if not is_valley:
       return False
 
-    data2 = self.avg_data[data_index + 1][0]
-    is_fake_valley = data2.data[-1][2] >= 0
+    data2 = self.avg_data[data_index + 6][0]
+    is_fake_valley = data2.rate_clamped() >= 0
     if is_fake_valley:
       return False
 
-    if self.trade[1] == 0:
-      return True
+    # data2 = self.avg_data[data_index + 3][0]
+    # is_fake_valley = data2.rate_clamped() >= 0
+    # if is_fake_valley:
+    #   return False
 
-    favorable_rate = self.trade[0] / self.trade[1]
+    # data2 = self.avg_data[data_index + 2][0]
+    # is_fake_valley = data2.rate_clamped() >= 0
+    # if is_fake_valley:
+    #   return False
 
-    if buy_rate > favorable_rate:
-      return False
+    # data2 = self.avg_data[data_index + 1][0]
+    # is_fake_valley = data2.rate_clamped() >= 0
+    # if is_fake_valley:
+    #   return False
 
-    if self.balance.baseAsset * self.buyRate < self.balance.minBuyPrice:
-      return False
+    # if self.trade[1] == 0:
+    #   return True
+
+    # favorable_rate = self.trade[0] / self.trade[1]
+
+    # if buy_rate > favorable_rate:
+    #   return False
+
+    # if self.balance.baseAsset * self.buyRate < self.balance.minBuyPrice:
+    #   return False
 
     return True
 
-  def shouldSell(self, entry, data_index=2):
-    if self.balance.otherAsset <= 0:
-      return False
+  def shouldSell(self, entry, data_index=1):
+    # if self.balance.otherAsset <= 0:
+    #   return False
 
     sell_rate = entry[2]
     is_sell_checkpoint = self.sellCheckpoint is not None and self.sellCheckpoint > sell_rate
@@ -358,21 +384,31 @@ class Simulation:
     if not is_peak:
       return False
 
-    data2 = self.avg_data[data_index + 1][1]
-    is_fake_peak = data2.data[-1][2] <= 0
+    # data2 = self.avg_data[data_index + 3][1]
+    # is_fake_peak = data2.rate_clamped() <= 0
+    # if is_fake_peak:
+    #   return False
+
+    data2 = self.avg_data[data_index + 2][1]
+    is_fake_peak = data2.rate_clamped() <= 0
     if is_fake_peak:
       return False
 
-    if self.trade[1] == 0:
-      return True
-
-    favorable_rate = self.trade[0] / self.trade[1]
-
-    if sell_rate < favorable_rate:
+    data2 = self.avg_data[data_index + 1][1]
+    is_fake_peak = data2.rate_clamped() <= 0
+    if is_fake_peak:
       return False
 
-    if self.balance.otherAsset * self.sellRate < self.balance.minSellPrice / sell_rate:
-      return False
+    # if self.trade[1] == 0:
+    #   return True
+
+    # favorable_rate = self.trade[0] / self.trade[1]
+
+    # if sell_rate < favorable_rate:
+    #   return False
+
+    # if self.balance.otherAsset * self.sellRate < self.balance.minSellPrice / sell_rate:
+    #   return False
 
     return True
 
@@ -380,20 +416,20 @@ class Simulation:
     buy_rate = entry[1]
     price = self.buyAmountPrice()
     amount = price / buy_rate
-    self.balance.buy(price, amount)
+    # self.balance.buy(price, amount)
     self.buyPoints.append(entry[0])
-    self.trade[0] += price
-    self.trade[1] += amount
+    # self.trade[0] += price
+    # self.trade[1] += amount
     return
 
   def simulateStepSell(self, entry):
     sell_rate = entry[2]
     amount = self.sellAmount(sell_rate)
     price = amount * sell_rate
-    self.balance.sell(price, amount)
+    # self.balance.sell(price, amount)
     self.sellPoints.append(entry[0])
-    self.trade[0] -= price
-    self.trade[1] -= amount
+    # self.trade[0] -= price
+    # self.trade[1] -= amount
     return
 
   def simulateStep(self, entry):
@@ -469,9 +505,9 @@ print(f"current profit: {current}\nbest profit: {best}\nperf: {perf}\nacceptable
 
 
 colors = [
-  "#cccccc22",
+  "#cccccc",
   "#aaaaaa",
-  "#8888aa",
+  "#8888aa22",
   "#aa6644aa",
   "#44446622",
   "#22224422",
@@ -479,10 +515,10 @@ colors = [
 ]
 
 colors2 = [
-  "#cccccc22",
-  "#aaaaaa22",
-  "#8888aa",
-  "#aa6644",
+  "#cccccc",
+  "#aaaaaa",
+  "#8888aa22",
+  "#aa664422",
   "#44446622",
   "#22224422",
   "#00004422",
@@ -490,10 +526,9 @@ colors2 = [
 
 plt.figure(figsize=(12, 12))
 
-prices = [x[1] for x in btc_data]
 plt.subplot(4, 1, 1)
 
-plt.plot(timestamps, prices, color="#dddddd", zorder=1)
+plt.plot(timestamps, btc_buy_prices, color="#dddddd", zorder=1)
 
 for i, data in enumerate(simulation.avg_data):
   plt.plot(timestamps, [x[0] for x in data[0].data], color=colors[i], zorder=1)
