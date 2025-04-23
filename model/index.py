@@ -61,14 +61,7 @@ def interpolate(next_value, prev_value, fraction):
   return next_value * (1 - fraction) + prev_value * fraction
 
 
-def interpolateByTime(prev_value, next_value, prev_ts, next_ts, ts):
-  delta = next_ts - prev_ts
-  next_delta = next_ts - ts
-  fraction = next_delta / delta
-  return interpolate(next_value, prev_value, fraction)
-
-
-def sampleData(data: list[(float, float)], ts: float, timestamps, prev_i=None):
+def sampleData(data: list[float], ts: float, timestamps: list[float], prev_i=None):
   if prev_i is None or prev_i >= len(data):
     i = bisect_left(timestamps, ts)
     if i == 0:
@@ -76,21 +69,17 @@ def sampleData(data: list[(float, float)], ts: float, timestamps, prev_i=None):
     i = i - 1
   else:
     i = prev_i
-    while i >= 0 and data[i][0] >= ts:
+    while i >= 0 and timestamps[i] >= ts:
       i -= 1
-    while i < len(data) and data[i + 1][0] < ts:
+    while i < len(timestamps) and timestamps[i + 1] < ts:
       i += 1
 
   prev_entry = data[i]
   next_entry = data[i + 1]
-  delta = next_entry[0] - prev_entry[0]
-  next_delta = next_entry[0] - ts
+  delta = timestamps[i + 1] - timestamps[i]
+  next_delta = timestamps[i + 1] - ts
   fraction = next_delta / delta
-  return (i, interpolate(prev_entry[1], next_entry[1], fraction))
-
-
-def findLast(mapper, list):
-  return next(filter(mapper, reversed(list)), None)
+  return (i, interpolate(prev_entry, next_entry, fraction))
 
 
 def sigmoid(x):
@@ -98,77 +87,88 @@ def sigmoid(x):
 
 
 def gaussian(x, mu=0, sigma=1):
-  return math.exp(-((x - mu) ** 2) / (2 * sigma**2))
+  w = (x - mu) / sigma
+  return math.exp(-(w**2) / 2)
 
 
 class DataAverage:
-  data: list[(float, float, float)]
+  data: list[(float, float, float, float)]
 
-  def __init__(self, range, ratio=1):
+  def __init__(self, range, ratio=1, threshold_low=0.25, threshold_high=0.25):
     self.range = range
     self.entries_window = []
     self.sum = 0
     self.avg_window = []
     self.window_ts = []
-    self.rate = 0
     self.prev_rate = 0
     self.prev_sample_index = None
     self.derivative_ratio = ratio
-    self.deriv_threshold = 0.25
+    self.deriv_threshold_low = threshold_low
+    self.deriv_threshold_high = threshold_high
 
     self.data = []
 
-  def record(self, avg, derivative=0, rising=0):
-    self.data.append((avg, derivative, rising))
+  def avg(self):
+    return self.data[-1][0]
+
+  def rate(self):
+    return self.data[-1][1]
+
+  def rate_clamped(self):
+    return self.data[-1][2]
+
+  def rate_change(self):
+    return self.data[-1][3]
+
+  def record(self, avg, rate=0, rising=0, rate_change=0):
+    self.data.append((avg, rate, rising, rate_change))
 
   def update(self, entry):
     ts = entry[0]
 
     while len(self.window_ts) > 0:
       _entry = self.entries_window[0]
-      if _entry[0] + self.range >= ts:
+      _ts = self.window_ts[0]
+      if _ts + self.range >= ts:
         break
-      self.sum -= _entry[1]
+      self.sum -= _entry
       self.entries_window.pop(0)
       self.avg_window.pop(0)
       self.window_ts.pop(0)
     self.window_ts.append(ts)
-    self.entries_window.append((ts, entry[1]))
+    self.entries_window.append(entry[1])
 
     self.sum += entry[1]
-    avg = self.sum / len(self.entries_window)
+    avg = self.sum / len(self.window_ts)
 
-    avg_entry = (ts, avg)
-    self.avg_window.append(avg_entry)
+    self.avg_window.append(avg)
 
     if len(self.avg_window) < 2:
       self.record(avg)
       return
 
-    window_size = self.avg_window[-1][0] - self.avg_window[0][0]
+    window_size = self.window_ts[-1] - self.window_ts[0]
     point_ts = ts - window_size * self.derivative_ratio
     (i, p1) = sampleData(self.avg_window, point_ts, self.window_ts, prev_i=self.prev_sample_index)
     self.prev_sample_index = i
     p3 = self.avg_window[-1]
 
-    delta = p3[0] - point_ts
+    delta = self.window_ts[-1] - point_ts
     if delta == 0:
       self.record(avg)
       return
 
-    derivative = (p3[1] - p1) / delta
-    self.prev_rate = self.rate
-    self.rate = derivative
+    derivative = (p3 - p1) / delta
     # print(self, p3, p1)
 
     rising = self.data[-1][2]
-    if derivative >= self.deriv_threshold:
-      rising = 1
+    if derivative >= self.deriv_threshold_high:
+      rising = derivative
     elif rising < 0 and derivative >= 0:
       rising = 0
 
-    if derivative <= -self.deriv_threshold:
-      rising = -1
+    if derivative <= -self.deriv_threshold_low:
+      rising = derivative
     elif rising > 0 and derivative <= 0:
       rising = 0
 
@@ -291,7 +291,7 @@ class Simulation:
   # amount of base asset we are ready to give to buy any amount of other asset
   def buyAmountPrice(self, data_index=3):
     data = self.avg_data[data_index][0]
-    amount = self.balance.baseAsset * self.buyRate * gaussian(data.rate, 0, self.buySigma)
+    amount = self.balance.baseAsset * self.buyRate * gaussian(data.rate(), 0, self.buySigma)
     # amount = self.balance.minBuyPrice,
     _min = self.balance.minBuyPrice
     _max = min(self.balance.maxBuyPrice, self.balance.baseAsset)
@@ -300,7 +300,7 @@ class Simulation:
   # amount of other asset we are ready to give to sell for any amount of base asset
   def sellAmount(self, rate, data_index=2):
     data = self.avg_data[data_index][1]
-    amount = self.balance.otherAsset * self.sellRate * (gaussian(data.rate, 0, self.sellSigma))
+    amount = self.balance.otherAsset * self.sellRate * (gaussian(data.rate(), 0, self.sellSigma))
     _min = self.balance.minSellPrice / rate
     _max = min(self.balance.maxSellPrice / rate, self.balance.otherAsset)
     return clamp(amount, _min, _max)
@@ -448,8 +448,9 @@ for i in range(0, len(btc_data)):
 
 sim_sell_points = simulation.sellPoints
 sim_buy_points = simulation.buyPoints
-sim_sell_prices = [sampleData(btc_data, x, timestamps)[1] for x in sim_sell_points]
-sim_buy_prices = [sampleData(btc_data, x, timestamps)[1] for x in sim_buy_points]
+btc_buy_prices = [x[1] for x in btc_data]
+sim_sell_prices = [sampleData(btc_buy_prices, x, timestamps)[1] for x in sim_sell_points]
+sim_buy_prices = [sampleData(btc_buy_prices, x, timestamps)[1] for x in sim_buy_points]
 
 # assuming the graph is mostly monotone and rising
 current = simulation.balanceData[-1] / initial - 1
