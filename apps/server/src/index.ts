@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { BacktestPreset, StrategyConfig } from "@trading/bot-algo";
+import type { BacktestPreset, ManualTradeInput, StrategyConfig } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
 import { TradingRuntime } from "./runtime.js";
@@ -77,6 +77,18 @@ server.put("/api/bot/config", async (request) => {
   await runtime.updateBotConfig(body);
   broadcastState();
   return runtime.snapshot();
+});
+
+server.post("/api/bot/manual-trade", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as ManualTradeInput;
+    await runtime.recordManualTrade(body);
+    broadcastState();
+    return runtime.snapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Manual trade failed";
+    return reply.code(400).send({ error: message });
+  }
 });
 
 server.post("/api/backtest", async (request, reply) => {

@@ -5,6 +5,7 @@ import type {
   Candle,
   OrderBookSnapshot,
   PaperBotState,
+  PositionLedger,
 } from "@trading/bot-algo";
 
 export interface RuntimeSnapshot {
@@ -19,6 +20,7 @@ export interface RuntimeSnapshot {
     orderBook?: OrderBookSnapshot;
   };
   bot: PaperBotState;
+  positions: PositionLedger;
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
 }

@@ -1,5 +1,6 @@
 import {
   SimulatedTradingBot,
+  analyzePositions,
   createStrategyConfig,
   runBacktestFromCandles,
   runBacktestFromOrderBook,
@@ -8,9 +9,11 @@ import {
   type BacktestResult,
   type BotEvent,
   type Candle,
+  type ManualTradeInput,
   type OrderBookSnapshot,
   type PaperBotState,
   type PriceTick,
+  type PositionLedger,
   type StrategyConfig,
 } from "@trading/bot-algo";
 import type { MarketStreamStatus } from "./binance-stream.js";
@@ -29,6 +32,7 @@ export interface RuntimeSnapshot {
     orderBook?: OrderBookSnapshot;
   };
   bot: PaperBotState;
+  positions: PositionLedger;
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
 }
@@ -45,6 +49,7 @@ export class TradingRuntime {
   };
   private recentEvents: BotEvent[] = [];
   private saveTimer?: NodeJS.Timeout;
+  private stateSaveQueue: Promise<void> = Promise.resolve();
   private lastSavedOrderBookAt = 0;
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
 
@@ -103,6 +108,7 @@ export class TradingRuntime {
   }
 
   snapshot(): RuntimeSnapshot {
+    const bot = this.bot.snapshot();
     return {
       market: {
         symbol: this.config.symbol,
@@ -110,11 +116,12 @@ export class TradingRuntime {
         connected: this.status.connected,
         statusMessage: this.status.message,
         lastEventAt: this.status.lastEventAt,
-        lastPrice: this.bot.snapshot().lastPrice,
+        lastPrice: bot.lastPrice,
         candles: this.candles,
         orderBook: this.orderBook,
       },
-      bot: this.bot.snapshot(),
+      bot,
+      positions: analyzePositions(bot),
       recentEvents: this.recentEvents,
       backtest: this.backtest,
     };
@@ -152,8 +159,49 @@ export class TradingRuntime {
         ...this.config.legacyValleyPeak,
         ...(patch.legacyValleyPeak ?? {}),
       },
+      positionRisk: {
+        ...this.config.positionRisk,
+        ...(patch.positionRisk ?? {}),
+      },
     });
     const events = this.bot.reset(this.config);
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  async recordManualTrade(input: ManualTradeInput): Promise<BotEvent[]> {
+    const quantity = Number(input.quantity);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error("Manual trade quantity must be positive.");
+    }
+    if (input.price !== undefined && (!Number.isFinite(input.price) || input.price <= 0)) {
+      throw new Error("Manual trade price must be positive.");
+    }
+    if (input.side !== "buy" && input.side !== "sell") {
+      throw new Error("Manual trade side must be buy or sell.");
+    }
+
+    if (input.targetPositionId) {
+      const positions = analyzePositions(this.bot.snapshot());
+      const target =
+        input.side === "sell"
+          ? positions.longs.find((lot) => lot.id === input.targetPositionId)
+          : positions.shorts.find((lot) => lot.id === input.targetPositionId);
+
+      if (!target || target.status === "pending") {
+        throw new Error("Target position is no longer open.");
+      }
+      if (quantity > target.remainingQuantity + 0.00000001) {
+        throw new Error("Close quantity is larger than the target position.");
+      }
+    }
+
+    const events = this.bot.recordManualTrade({
+      ...input,
+      quantity,
+      price: input.price === undefined ? undefined : Number(input.price),
+    });
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -203,7 +251,12 @@ export class TradingRuntime {
       this.saveTimer = undefined;
     }
 
-    await this.storage.saveBotState(this.bot.snapshot());
+    const snapshot = this.bot.snapshot();
+    this.stateSaveQueue = this.stateSaveQueue.then(
+      () => this.storage.saveBotState(snapshot),
+      () => this.storage.saveBotState(snapshot),
+    );
+    await this.stateSaveQueue;
   }
 
   private scheduleStateSave(): void {

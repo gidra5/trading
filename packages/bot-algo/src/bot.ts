@@ -4,6 +4,7 @@ import type {
   BotStatus,
   BotMetrics,
   Candle,
+  ManualTradeInput,
   PaperBotState,
   PriceTick,
   StrategyConfig,
@@ -17,6 +18,10 @@ import {
   evaluateLegacyValleyPeak,
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
+import {
+  createPositionRiskConfig,
+  defaultPositionRiskConfig,
+} from "./position-ledger.js";
 
 export const defaultStrategyConfig: StrategyConfig = {
   symbol: "BTCUSDT",
@@ -38,6 +43,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   stopLossBps: 35,
   minOrderQuote: 25,
   legacyValleyPeak: defaultLegacyValleyPeakConfig,
+  positionRisk: defaultPositionRiskConfig,
 };
 
 export type PartialStrategyConfig = Partial<StrategyConfig> &
@@ -55,6 +61,10 @@ export function createStrategyConfig(
     legacyValleyPeak: createLegacyValleyPeakConfig({
       ...defaultStrategyConfig.legacyValleyPeak,
       ...(overrides.legacyValleyPeak ?? {}),
+    }),
+    positionRisk: createPositionRiskConfig({
+      ...defaultStrategyConfig.positionRisk,
+      ...(overrides.positionRisk ?? {}),
     }),
   };
 
@@ -156,6 +166,123 @@ export class SimulatedTradingBot {
         type: "state_reset",
         at,
         message: "Paper bot state reset",
+        state: this.snapshot(),
+      },
+    ];
+  }
+
+  recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
+    const price = cleanPositive(input.price) || this.state.lastPrice || this.state.avgEntryPrice;
+    const quantity = roundAsset(input.quantity);
+
+    if (price <= 0) {
+      throw new Error("Manual trade price must be positive.");
+    }
+    if (quantity <= 0) {
+      throw new Error("Manual trade quantity must be positive.");
+    }
+    if (input.side !== "buy" && input.side !== "sell") {
+      throw new Error("Manual trade side must be buy or sell.");
+    }
+
+    const config = this.state.config;
+    const feeRate = config.feeBps / 10_000;
+    const quoteQuantity = roundQuote(price * quantity);
+    const feeQuote = roundQuote(quoteQuantity * feeRate);
+    const reason = input.reason?.trim() || "manual position fill";
+    const orderId = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
+    let realizedPnl = 0;
+
+    if (input.side === "buy") {
+      const spent = roundQuote(quoteQuantity + feeQuote);
+      const oldBase = this.state.baseFree + this.state.baseReserved;
+      const newBase = oldBase + quantity;
+      this.state.quoteFree = roundQuote(this.state.quoteFree - spent);
+      this.state.baseFree = roundAsset(this.state.baseFree + quantity);
+
+      if (oldBase >= 0) {
+        const oldCost = this.state.avgEntryPrice * oldBase;
+        this.state.avgEntryPrice = newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
+      } else if (newBase > 0) {
+        const leftoverRatio = Math.min(1, newBase / quantity);
+        this.state.avgEntryPrice = roundQuote((spent * leftoverRatio) / newBase);
+      } else {
+        this.state.avgEntryPrice = 0;
+      }
+    } else {
+      const proceeds = roundQuote(quoteQuantity - feeQuote);
+      const oldBase = this.state.baseFree + this.state.baseReserved;
+      const closedLongQuantity = Math.max(0, Math.min(quantity, oldBase));
+      this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
+      this.state.baseFree = roundAsset(this.state.baseFree - quantity);
+
+      if (closedLongQuantity > 0 && this.state.avgEntryPrice > 0) {
+        const feeForClosedQuantity = feeQuote * (closedLongQuantity / quantity);
+        realizedPnl = roundQuote(
+          (price - this.state.avgEntryPrice) * closedLongQuantity - feeForClosedQuantity,
+        );
+      }
+
+      const remainingBase = this.state.baseFree + this.state.baseReserved;
+      if (remainingBase <= 0.00000001) {
+        this.state.avgEntryPrice = 0;
+      }
+    }
+
+    this.state.feesPaid = roundQuote(this.state.feesPaid + feeQuote);
+    this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
+    if (realizedPnl > 0) {
+      this.state.winningTrades += 1;
+    } else if (realizedPnl < 0) {
+      this.state.losingTrades += 1;
+    }
+
+    const order: TradingOrder = {
+      id: orderId,
+      side: input.side,
+      type: "limit",
+      status: "filled",
+      price: roundQuote(price),
+      quantity,
+      filledQuantity: quantity,
+      estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
+      createdAt: at,
+      updatedAt: at,
+      filledAt: at,
+      reason,
+      realizedPnl,
+      feeQuote,
+      targetPositionId: input.targetPositionId,
+      manual: true,
+    };
+    const fill: TradeFill = {
+      id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
+      orderId,
+      side: input.side,
+      price: roundQuote(price),
+      quantity,
+      quoteQuantity,
+      feeQuote,
+      realizedPnl,
+      filledAt: at,
+      reason,
+      targetPositionId: input.targetPositionId,
+      manual: true,
+    };
+
+    this.state.orders.push(order);
+    this.state.fills.push(fill);
+    this.state.lastPrice = roundQuote(price);
+    this.state.updatedAt = at;
+    recalculateMetrics(this.state);
+
+    return [
+      {
+        type: "order_filled",
+        at,
+        message: `Manual ${input.side.toUpperCase()} fill recorded`,
+        order: structuredClone(order),
+        fill: structuredClone(fill),
         state: this.snapshot(),
       },
     ];
@@ -684,4 +811,8 @@ function averageLast(values: number[], count: number): number {
   const start = Math.max(0, values.length - count);
   const slice = values.slice(start);
   return slice.reduce((sum, value) => sum + value, 0) / slice.length;
+}
+
+function cleanPositive(value: number | undefined): number {
+  return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
 }

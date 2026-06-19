@@ -73,6 +73,17 @@ export interface StrategyConfig {
   stopLossBps: number;
   minOrderQuote: number;
   legacyValleyPeak: LegacyValleyPeakConfig;
+  positionRisk: PositionRiskConfig;
+}
+
+export interface PositionRiskConfig {
+  lowerPriceExpectation: number;
+  lowerBaselinePrice: number;
+  upperPriceExpectation: number;
+  upperBaselinePrice: number;
+  maxLossPct: number;
+  marketSlippageBps: number;
+  quantityFloor: number;
 }
 
 export interface LegacyValleyPeakConfig {
@@ -130,6 +141,8 @@ export interface TradingOrder {
   reason: string;
   realizedPnl: number;
   feeQuote: number;
+  targetPositionId?: string;
+  manual?: boolean;
 }
 
 export interface TradeFill {
@@ -143,6 +156,16 @@ export interface TradeFill {
   realizedPnl: number;
   filledAt: number;
   reason: string;
+  targetPositionId?: string;
+  manual?: boolean;
+}
+
+export interface ManualTradeInput {
+  side: OrderSide;
+  price?: number;
+  quantity: number;
+  reason?: string;
+  targetPositionId?: string;
 }
 
 export interface StrategyMemory {
@@ -195,6 +218,85 @@ export interface PaperBotState {
   memory: StrategyMemory;
   metrics: BotMetrics;
   config: StrategyConfig;
+}
+
+export type PositionLotSide = "long" | "short";
+
+export type PositionLotStatus = "pending" | "open" | "partially-closed" | "closed";
+
+export interface PositionLotBase {
+  id: string;
+  side: PositionLotSide;
+  status: PositionLotStatus;
+  sourceOrderId: string;
+  openedAt: number;
+  originalQuantity: number;
+  filledQuantity: number;
+  pendingQuantity: number;
+  pendingQuote: number;
+  pendingLimitPrice: number;
+  closedQuantity: number;
+  closedQuote: number;
+  averagePrice: number;
+}
+
+export interface LongPositionLot extends PositionLotBase {
+  side: "long";
+  costQuote: number;
+  remainingQuantity: number;
+  remainingCostQuote: number;
+  breakEvenSellPrice: number;
+  maxLossSellPrice: number;
+  recommendedSellQuote: number;
+  recommendedSellQuantity: number;
+  projectedRemainingQuantity: number;
+  projectedRemainingCostQuote: number;
+  projectedBreakEvenSellPrice: number;
+  canReachLowerBaseline: boolean;
+}
+
+export interface ShortPositionLot extends PositionLotBase {
+  side: "short";
+  proceedsQuote: number;
+  remainingQuantity: number;
+  remainingProceedsQuote: number;
+  breakEvenBuyPrice: number;
+  maxLossBuyPrice: number;
+  recommendedBuyQuote: number;
+  recommendedBuyQuantity: number;
+  projectedRemainingQuantity: number;
+  projectedRemainingProceedsQuote: number;
+  projectedBreakEvenBuyPrice: number;
+  canReachUpperBaseline: boolean;
+}
+
+export type PositionLot = LongPositionLot | ShortPositionLot;
+
+export interface PositionLedgerSummary {
+  currentPrice: number;
+  netMarketSellPrice: number;
+  grossMarketBuyPrice: number;
+  lowerBaselinePrice: number;
+  upperBaselinePrice: number;
+  lowerPriceExpectation: number;
+  upperPriceExpectation: number;
+  maxLossPct: number;
+  feeAndSlippageRate: number;
+  longQuantity: number;
+  shortQuantity: number;
+  longRemainingCostQuote: number;
+  shortRemainingProceedsQuote: number;
+  pendingLongQuantity: number;
+  pendingShortQuantity: number;
+  pendingLongQuote: number;
+  pendingShortQuote: number;
+  realizedQuotePnl: number;
+}
+
+export interface PositionLedger {
+  summary: PositionLedgerSummary;
+  longs: LongPositionLot[];
+  shorts: ShortPositionLot[];
 }
 
 export interface BotEvent {

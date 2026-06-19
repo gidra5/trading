@@ -96,7 +96,7 @@ async function readJson<T>(filePath: string): Promise<T | undefined> {
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.tmp`;
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
   await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`);
   await fs.rename(tempPath, filePath);
 }

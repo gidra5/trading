@@ -1,6 +1,26 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { Activity, Play, RefreshCw, RotateCcw, Save, Square } from "lucide-solid";
-import type { BotEvent, StrategyConfig, TradeFill, TradingOrder } from "@trading/bot-algo";
+import {
+  Activity,
+  Check,
+  MinusCircle,
+  Play,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Square,
+  X,
+} from "lucide-solid";
+import type {
+  BotEvent,
+  LongPositionLot,
+  ManualTradeInput,
+  PositionLedger,
+  ShortPositionLot,
+  StrategyConfig,
+  TradeFill,
+  TradingOrder,
+} from "@trading/bot-algo";
 import { CandleChart } from "./components/CandleChart";
 import { EquityChart } from "./components/EquityChart";
 import {
@@ -33,6 +53,7 @@ export function App() {
   const [backtestError, setBacktestError] = createSignal<string>();
   const [configDraft, setConfigDraft] = createSignal<StrategyConfig>();
   const [configError, setConfigError] = createSignal<string>();
+  const [manualTradeError, setManualTradeError] = createSignal<string>();
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
 
@@ -138,6 +159,25 @@ export function App() {
     setConfigDraft(structuredClone((payload as RuntimeSnapshot).bot.config));
   };
 
+  const recordManualTrade = async (input: ManualTradeInput): Promise<boolean> => {
+    setManualTradeError(undefined);
+    const response = await fetch(`${apiBase}/api/bot/manual-trade`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setManualTradeError(payload.error ?? "Manual trade failed");
+      return false;
+    }
+
+    setSnapshot(payload as RuntimeSnapshot);
+    return true;
+  };
+
   onMount(() => {
     void loadInitial().catch(() => setConnection("offline"));
     connect();
@@ -232,13 +272,22 @@ export function App() {
           </div>
         </section>
 
-        <section class="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
-          <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <section class="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <div class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
             <OrdersPanel title="Open Orders" orders={openOrders()} />
             <FillsPanel fills={fills()} />
           </div>
           <EventsPanel events={events()} />
         </section>
+
+        <PositionLedgerPanel
+          ledger={snapshot()?.positions}
+          baseAsset={bot()?.baseAsset ?? "Base"}
+          quoteAsset={bot()?.quoteAsset ?? "USDT"}
+          currentPrice={market()?.lastPrice ?? bot()?.lastPrice ?? 0}
+          error={manualTradeError()}
+          onRecordTrade={recordManualTrade}
+        />
 
         <BacktestPanel
           preset={backtestPreset()}
@@ -326,6 +375,22 @@ function AlgorithmPanel(props: {
       },
     });
   };
+  const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
+    key: K,
+    value: StrategyConfig["positionRisk"][K],
+  ) => {
+    if (!props.config) {
+      return;
+    }
+
+    props.onChange({
+      ...props.config,
+      positionRisk: {
+        ...props.config.positionRisk,
+        [key]: value,
+      },
+    });
+  };
 
   return (
     <section class="panel">
@@ -352,7 +417,7 @@ function AlgorithmPanel(props: {
 
       <Show when={props.config}>
         {(config) => (
-          <div class="grid grid-cols-1 gap-4 xl:grid-cols-3">
+          <div class="grid grid-cols-1 gap-4 xl:grid-cols-4">
             <div class="rounded-2 bg-ink-800 p-3">
               <label class="muted-label block" for="algorithm-select">
                 Strategy
@@ -487,6 +552,61 @@ function AlgorithmPanel(props: {
                 />
               </div>
             </div>
+
+            <div class="rounded-2 bg-ink-800 p-3">
+              <div class="muted-label">Position Risk</div>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <NumberField
+                  label="Lower Range"
+                  value={config().positionRisk.lowerPriceExpectation}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateRisk("lowerPriceExpectation", value)}
+                />
+                <NumberField
+                  label="Long Base"
+                  value={config().positionRisk.lowerBaselinePrice}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateRisk("lowerBaselinePrice", value)}
+                />
+                <NumberField
+                  label="Upper Range"
+                  value={config().positionRisk.upperPriceExpectation}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateRisk("upperPriceExpectation", value)}
+                />
+                <NumberField
+                  label="Short Base"
+                  value={config().positionRisk.upperBaselinePrice}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateRisk("upperBaselinePrice", value)}
+                />
+                <NumberField
+                  label="Max Loss %"
+                  value={config().positionRisk.maxLossPct * 100}
+                  min={0}
+                  step={0.1}
+                  onInput={(value) => updateRisk("maxLossPct", value / 100)}
+                />
+                <NumberField
+                  label="Slip bps"
+                  value={config().positionRisk.marketSlippageBps}
+                  min={0}
+                  step={0.1}
+                  onInput={(value) => updateRisk("marketSlippageBps", value)}
+                />
+                <NumberField
+                  label="Qty Floor"
+                  value={config().positionRisk.quantityFloor}
+                  min={0}
+                  step={0.00000001}
+                  onInput={(value) => updateRisk("quantityFloor", value)}
+                />
+              </div>
+            </div>
           </div>
         )}
       </Show>
@@ -604,12 +724,12 @@ function OrderBookPanel(props: { snapshot?: RuntimeSnapshot }) {
 
 function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
   return (
-    <div class="panel overflow-hidden">
+    <div class="panel min-w-0 overflow-hidden">
       <div class="mb-3">
         <div class="muted-label">Orders</div>
         <h2 class="text-lg font-semibold">{props.title}</h2>
       </div>
-      <div class="overflow-x-auto">
+      <div class="max-w-full overflow-x-auto">
         <table class="w-full min-w-130">
           <thead>
             <tr>
@@ -643,12 +763,12 @@ function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
 
 function FillsPanel(props: { fills: TradeFill[] }) {
   return (
-    <div class="panel overflow-hidden">
+    <div class="panel min-w-0 overflow-hidden">
       <div class="mb-3">
         <div class="muted-label">Executions</div>
         <h2 class="text-lg font-semibold">Recent Fills</h2>
       </div>
-      <div class="overflow-x-auto">
+      <div class="max-w-full overflow-x-auto">
         <table class="w-full min-w-130">
           <thead>
             <tr>
@@ -686,6 +806,465 @@ function FillsPanel(props: { fills: TradeFill[] }) {
         </table>
       </div>
     </div>
+  );
+}
+
+function PositionLedgerPanel(props: {
+  ledger?: PositionLedger;
+  baseAsset: string;
+  quoteAsset: string;
+  currentPrice: number;
+  error?: string;
+  onRecordTrade: (input: ManualTradeInput) => Promise<boolean>;
+}) {
+  const summary = () => props.ledger?.summary;
+  const longs = () => props.ledger?.longs ?? [];
+  const shorts = () => props.ledger?.shorts ?? [];
+  const [draft, setDraft] = createSignal<ManualTradeDraft>();
+  const [submitting, setSubmitting] = createSignal(false);
+  const currentPrice = () => props.currentPrice || summary()?.currentPrice || 0;
+  const openDraft = (draft: ManualTradeDraft) => {
+    setDraft({
+      ...draft,
+      price: draft.price || currentPrice(),
+    });
+  };
+  const submitDraft = async () => {
+    const value = draft();
+    if (!value || submitting()) {
+      return;
+    }
+
+    setSubmitting(true);
+    const ok = await props.onRecordTrade({
+      side: value.side,
+      price: value.price,
+      quantity: value.quantity,
+      reason: value.reason,
+      targetPositionId: value.targetPositionId,
+    });
+    setSubmitting(false);
+    if (ok) {
+      setDraft(undefined);
+    }
+  };
+
+  return (
+    <section class="panel min-w-0 overflow-hidden">
+      <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div class="muted-label">Positions</div>
+          <h2 class="text-lg font-semibold">Break-even Ledger</h2>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <div class="mr-1 text-sm text-ink-300">
+            Fee + slip {formatPercent((summary()?.feeAndSlippageRate ?? 0) * 100)}
+          </div>
+          <button
+            class="btn"
+            onClick={() =>
+              openDraft({
+                title: "Add Long",
+                side: "buy",
+                quantity: 0,
+                price: currentPrice(),
+                reason: "manual long position",
+              })
+            }
+          >
+            <Plus size={16} />
+            Long
+          </button>
+          <button
+            class="btn"
+            onClick={() =>
+              openDraft({
+                title: "Add Short",
+                side: "sell",
+                quantity: 0,
+                price: currentPrice(),
+                reason: "manual short position",
+              })
+            }
+          >
+            <Plus size={16} />
+            Short
+          </button>
+        </div>
+      </div>
+
+      <Show when={props.error}>
+        {(message) => (
+          <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>
+        )}
+      </Show>
+
+      <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
+        <SmallMetric label="Net Sell" value={`$${formatQuote(summary()?.netMarketSellPrice, 2)}`} />
+        <SmallMetric label="Gross Buy" value={`$${formatQuote(summary()?.grossMarketBuyPrice, 2)}`} />
+        <SmallMetric label="Long Base" value={`$${formatQuote(summary()?.lowerBaselinePrice, 2)}`} />
+        <SmallMetric label="Short Base" value={`$${formatQuote(summary()?.upperBaselinePrice, 2)}`} />
+        <SmallMetric label="Long Left" value={formatAsset(summary()?.longQuantity)} />
+        <SmallMetric label="Short Left" value={formatAsset(summary()?.shortQuantity)} />
+        <SmallMetric label="Pending Buy" value={formatAsset(summary()?.pendingLongQuantity)} />
+        <SmallMetric label="Pending Sell" value={formatAsset(summary()?.pendingShortQuantity)} />
+      </div>
+
+      <Show when={draft()}>
+        {(value) => (
+          <ManualTradeForm
+            draft={value()}
+            baseAsset={props.baseAsset}
+            quoteAsset={props.quoteAsset}
+            submitting={submitting()}
+            onChange={setDraft}
+            onCancel={() => setDraft(undefined)}
+            onSubmit={() => void submitDraft()}
+          />
+        )}
+      </Show>
+
+      <div class="grid min-w-0 grid-cols-1 gap-4 2xl:grid-cols-2">
+        <PositionLongTable
+          lots={longs()}
+          baseAsset={props.baseAsset}
+          quoteAsset={props.quoteAsset}
+          onClose={(lot) =>
+            openDraft({
+              title: "Close Long",
+              side: "sell",
+              quantity: lot.remainingQuantity,
+              price: currentPrice(),
+              targetPositionId: lot.id,
+              reason: `manual close ${lot.sourceOrderId}`,
+            })
+          }
+        />
+        <PositionShortTable
+          lots={shorts()}
+          baseAsset={props.baseAsset}
+          quoteAsset={props.quoteAsset}
+          onClose={(lot) =>
+            openDraft({
+              title: "Close Short",
+              side: "buy",
+              quantity: lot.remainingQuantity,
+              price: currentPrice(),
+              targetPositionId: lot.id,
+              reason: `manual close ${lot.sourceOrderId}`,
+            })
+          }
+        />
+      </div>
+    </section>
+  );
+}
+
+type ManualTradeDraft = ManualTradeInput & {
+  title: string;
+  price: number;
+  reason: string;
+};
+
+function ManualTradeForm(props: {
+  draft: ManualTradeDraft;
+  baseAsset: string;
+  quoteAsset: string;
+  submitting: boolean;
+  onChange: (draft: ManualTradeDraft) => void;
+  onCancel: () => void;
+  onSubmit: () => void;
+}) {
+  const update = <K extends keyof ManualTradeDraft>(key: K, value: ManualTradeDraft[K]) => {
+    props.onChange({
+      ...props.draft,
+      [key]: value,
+    });
+  };
+
+  return (
+    <form
+      class="mb-4 rounded-2 bg-ink-800 p-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        props.onSubmit();
+      }}
+    >
+      <div class="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div class="muted-label">Manual Fill</div>
+          <div class="flex items-center gap-2">
+            <h3 class="text-base font-semibold">{props.draft.title}</h3>
+            <Side side={props.draft.side} />
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button class="btn-primary" type="submit" disabled={props.submitting}>
+            <Check size={16} />
+            Record
+          </button>
+          <button class="btn" type="button" onClick={props.onCancel}>
+            <X size={16} />
+            Cancel
+          </button>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <NumberField
+          label={`${props.baseAsset} Qty`}
+          value={props.draft.quantity}
+          min={0}
+          step={0.00000001}
+          onInput={(value) => update("quantity", value)}
+        />
+        <NumberField
+          label={`${props.quoteAsset} Price`}
+          value={props.draft.price}
+          min={0}
+          step={0.01}
+          onInput={(value) => update("price", value)}
+        />
+        <label class="block">
+          <span class="muted-label">Reason</span>
+          <input
+            class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100"
+            value={props.draft.reason}
+            onInput={(event) => update("reason", event.currentTarget.value)}
+          />
+        </label>
+      </div>
+    </form>
+  );
+}
+
+function PositionLongTable(props: {
+  lots: LongPositionLot[];
+  baseAsset: string;
+  quoteAsset: string;
+  onClose: (lot: LongPositionLot) => void;
+}) {
+  return (
+    <div class="min-w-0 overflow-hidden rounded-2 bg-ink-800 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Long Lots</div>
+        <h3 class="text-base font-semibold">Buy Positions</h3>
+      </div>
+      <div class="max-w-full overflow-x-auto">
+        <table class="w-full min-w-280">
+          <thead>
+            <tr>
+              <th class="table-head pb-2">Status</th>
+              <th class="table-head pb-2">Order</th>
+              <th class="table-head pb-2">Bought</th>
+              <th class="table-head pb-2">Pending</th>
+              <th class="table-head pb-2">Closed</th>
+              <th class="table-head pb-2">Cost</th>
+              <th class="table-head pb-2">Avg</th>
+              <th class="table-head pb-2">Left Sell</th>
+              <th class="table-head pb-2">Left Cost</th>
+              <th class="table-head pb-2">Break Even</th>
+              <th class="table-head pb-2">Max Loss</th>
+              <th class="table-head pb-2">Sell Now</th>
+              <th class="table-head pb-2">Possible</th>
+              <th class="table-head pb-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.lots} fallback={<EmptyRow columns={14} label="No long lots" />}>
+              {(lot) => (
+                <tr>
+                  <td class="td-cell">
+                    <StatusBadge status={lot.status} />
+                  </td>
+                  <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
+                  <td class="td-cell">{formatAsset(lot.filledQuantity || lot.originalQuantity)}</td>
+                  <td class="td-cell">
+                    <PendingCell
+                      quantity={lot.pendingQuantity}
+                      quote={lot.pendingQuote}
+                      price={lot.pendingLimitPrice}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
+                  <td class="td-cell">
+                    <ActionAmount quantity={lot.closedQuantity} quote={lot.closedQuote} />
+                  </td>
+                  <td class="td-cell">${formatQuote(lot.costQuote, 2)}</td>
+                  <td class="td-cell">${formatQuote(lot.averagePrice, 4)}</td>
+                  <td class="td-cell">{formatAsset(lot.remainingQuantity)}</td>
+                  <td class="td-cell">${formatQuote(lot.remainingCostQuote, 2)}</td>
+                  <td class="td-cell">${formatQuote(lot.breakEvenSellPrice, 4)}</td>
+                  <td class="td-cell">${formatQuote(lot.maxLossSellPrice, 4)}</td>
+                  <td class="td-cell">
+                    <ActionAmount quantity={lot.recommendedSellQuantity} quote={lot.recommendedSellQuote} />
+                  </td>
+                  <td class="td-cell">
+                    <PossibleBadge possible={lot.canReachLowerBaseline} />
+                  </td>
+                  <td class="td-cell">
+                    <button
+                      class="btn px-2 py-1 text-xs"
+                      disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
+                      onClick={() => props.onClose(lot)}
+                    >
+                      <MinusCircle size={14} />
+                      Close
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function PositionShortTable(props: {
+  lots: ShortPositionLot[];
+  baseAsset: string;
+  quoteAsset: string;
+  onClose: (lot: ShortPositionLot) => void;
+}) {
+  return (
+    <div class="min-w-0 overflow-hidden rounded-2 bg-ink-800 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Short Lots</div>
+        <h3 class="text-base font-semibold">Sell Positions</h3>
+      </div>
+      <div class="max-w-full overflow-x-auto">
+        <table class="w-full min-w-280">
+          <thead>
+            <tr>
+              <th class="table-head pb-2">Status</th>
+              <th class="table-head pb-2">Order</th>
+              <th class="table-head pb-2">Sold</th>
+              <th class="table-head pb-2">Pending</th>
+              <th class="table-head pb-2">Closed</th>
+              <th class="table-head pb-2">Proceeds</th>
+              <th class="table-head pb-2">Avg</th>
+              <th class="table-head pb-2">Left Buy</th>
+              <th class="table-head pb-2">Left Proceeds</th>
+              <th class="table-head pb-2">Break Even</th>
+              <th class="table-head pb-2">Max Loss</th>
+              <th class="table-head pb-2">Buy Now</th>
+              <th class="table-head pb-2">Possible</th>
+              <th class="table-head pb-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.lots} fallback={<EmptyRow columns={14} label="No short lots" />}>
+              {(lot) => (
+                <tr>
+                  <td class="td-cell">
+                    <StatusBadge status={lot.status} />
+                  </td>
+                  <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
+                  <td class="td-cell">{formatAsset(lot.filledQuantity || lot.originalQuantity)}</td>
+                  <td class="td-cell">
+                    <PendingCell
+                      quantity={lot.pendingQuantity}
+                      quote={lot.pendingQuote}
+                      price={lot.pendingLimitPrice}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
+                  <td class="td-cell">
+                    <ActionAmount quantity={lot.closedQuantity} quote={lot.closedQuote} />
+                  </td>
+                  <td class="td-cell">${formatQuote(lot.proceedsQuote, 2)}</td>
+                  <td class="td-cell">${formatQuote(lot.averagePrice, 4)}</td>
+                  <td class="td-cell">{formatAsset(lot.remainingQuantity)}</td>
+                  <td class="td-cell">${formatQuote(lot.remainingProceedsQuote, 2)}</td>
+                  <td class="td-cell">${formatQuote(lot.breakEvenBuyPrice, 4)}</td>
+                  <td class="td-cell">${formatQuote(lot.maxLossBuyPrice, 4)}</td>
+                  <td class="td-cell">
+                    <ActionAmount quantity={lot.recommendedBuyQuantity} quote={lot.recommendedBuyQuote} />
+                  </td>
+                  <td class="td-cell">
+                    <PossibleBadge possible={lot.canReachUpperBaseline} />
+                  </td>
+                  <td class="td-cell">
+                    <button
+                      class="btn px-2 py-1 text-xs"
+                      disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
+                      onClick={() => props.onClose(lot)}
+                    >
+                      <MinusCircle size={14} />
+                      Close
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function PendingCell(props: {
+  quantity: number;
+  quote: number;
+  price: number;
+  quoteAsset: string;
+}) {
+  if (props.quantity <= 0) {
+    return <span class="text-ink-500">-</span>;
+  }
+
+  return (
+    <span>
+      {formatAsset(props.quantity)} @ ${formatQuote(props.price, 4)}
+      <span class="ml-1 text-ink-400">
+        {formatQuote(props.quote, 2)} {props.quoteAsset}
+      </span>
+    </span>
+  );
+}
+
+function ActionAmount(props: { quantity: number; quote: number }) {
+  if (props.quantity <= 0 || props.quote <= 0) {
+    return <span class="text-ink-500">-</span>;
+  }
+
+  return (
+    <span>
+      {formatAsset(props.quantity)}
+      <span class="ml-1 text-ink-400">${formatQuote(props.quote, 2)}</span>
+    </span>
+  );
+}
+
+function StatusBadge(props: { status: string }) {
+  return (
+    <span
+      class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+      classList={{
+        "bg-accent/12 text-accent": props.status === "open",
+        "bg-warn/12 text-warn": props.status === "pending",
+        "bg-gain/12 text-gain": props.status === "closed",
+        "bg-ink-700 text-ink-200": props.status === "partially-closed",
+      }}
+    >
+      {props.status.replace("-", " ")}
+    </span>
+  );
+}
+
+function PossibleBadge(props: { possible: boolean }) {
+  return (
+    <span
+      class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+      classList={{
+        "bg-gain/12 text-gain": props.possible,
+        "bg-loss/12 text-loss": !props.possible,
+      }}
+    >
+      {props.possible ? "yes" : "no"}
+    </span>
   );
 }
 

@@ -32,6 +32,7 @@ npm start
 
 Algorithm behavior is summarized in [docs/algorithms.md](docs/algorithms.md).
 Backtesting behavior and current performance debt are tracked in [docs/backtesting.md](docs/backtesting.md).
+Spreadsheet-derived position ledger formulas are documented in [docs/position-ledger.md](docs/position-ledger.md).
 
 ## Environment
 
