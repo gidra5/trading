@@ -1384,6 +1384,13 @@ function BacktestPanel(props: {
           <SmallMetric label="Trades" value={formatQuote(summary()?.tradeCount, 0)} />
           <SmallMetric label="Win Rate" value={formatPercent(summary()?.winRate)} />
           <SmallMetric label="Candles" value={processedLabel()} />
+          <SmallMetric
+            label="Speed"
+            value={`${formatQuote(
+              props.progress?.candlesPerSecond ?? summary()?.candlesPerSecond,
+              0,
+            )}/s`}
+          />
           <SmallMetric label="Drawdown" value={formatPercent(summary()?.maxDrawdownPct)} />
           <SmallMetric label="Requests" value={formatQuote(props.progress?.requests, 0)} />
           <SmallMetric

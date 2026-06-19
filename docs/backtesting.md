@@ -21,12 +21,31 @@ TRADING_HISTORY_CACHE_MIN_FREE_BYTES=512mb
 
 When the cache is over budget or disk free space falls below the configured floor, the server evicts the oldest cache shards first. Shards needed by the currently running backtest are protected; if the requested range alone is larger than the configured cache limit, the backtest fails with a clear cache-limit error instead of repeatedly refetching data.
 
-## Performance Work Needed
+## Performance Notes
 
-Backtest performance is still a known weak point. The current replay path feeds synthetic OHLC ticks through the same paper bot used for live simulation, and the bot still scans accumulated order arrays while replaying. Before relying on year-scale tests heavily, improve this path:
+The replay path is optimized for long candle runs:
 
-- keep an indexed open-order collection instead of filtering all historical orders on every tick
+- backtests use the same paper bot state machine but disable event cloning during replay
+- metrics are marked to market only at sampled candle boundaries instead of every synthetic tick
+- equity curves are capped to roughly 800 points by default
+- returned backtest orders/fills are capped to the latest 2,000 each by default; summary metrics still count the full run
+- open order bookkeeping uses indexed set entries instead of scanning all historical orders on every fill
+
+The original synthetic benchmark was too optimistic because it did not match the active
+dashboard path. With the default `legacy-valley-peak` algorithm and cached Binance
+one-minute candles, the API-backed dashboard path currently processes roughly:
+
+- 32k candles/s over a cached month backtest
+- 35k candles/s over a cached year backtest
+
+The in-memory replay path for the same cached month is closer to 40k candles/s. Simpler
+synthetic strategy benchmarks can still be much faster, but they should not be treated as
+representative of the live dashboard backtest path.
+
+Remaining work before treating year-scale runs as cheap:
+
 - improve the historical cache importer with resume/checkpoint metadata and batch verification
-- store long historical data in a queryable format instead of large JSON arrays
+- store long historical data in a queryable binary or columnar format instead of JSONL
+- reduce remaining strategy/accounting overhead enough to reach 100k+ candles/s on real cached data
 - run long backtests in a dedicated worker/job queue so UI and live trading remain isolated
-- sample equity curves and persisted fills intentionally instead of writing very large result payloads
+- add optional full trade-log export for cases where the latest 2,000 returned fills are not enough

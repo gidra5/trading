@@ -38,6 +38,8 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   maxTradeQuote: 750,
 };
 
+const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;
+
 export function createLegacyValleyPeakConfig(
   overrides: Partial<LegacyValleyPeakConfig> = {},
 ): LegacyValleyPeakConfig {
@@ -244,34 +246,47 @@ function updateRollingAverage(
     thresholdHigh: number;
   },
 ): void {
-  while (memory.timestamps.length > 0 && memory.timestamps[0] + options.rangeSec < options.tsSec) {
-    memory.sum -= memory.entries.shift() ?? 0;
-    memory.averages.shift();
-    memory.timestamps.shift();
-    if (memory.previousSampleIndex !== undefined) {
-      memory.previousSampleIndex = Math.max(0, memory.previousSampleIndex - 1);
-    }
+  let startIndex = memory.startIndex ?? 0;
+  startIndex = clampInt(startIndex, 0, memory.timestamps.length);
+
+  while (
+    startIndex < memory.timestamps.length &&
+    memory.timestamps[startIndex] + options.rangeSec < options.tsSec
+  ) {
+    memory.sum -= memory.entries[startIndex] ?? 0;
+    startIndex += 1;
   }
+  memory.startIndex = startIndex;
 
   memory.timestamps.push(options.tsSec);
   memory.entries.push(options.value);
   memory.sum += options.value;
-  const avg = memory.sum / memory.timestamps.length;
+  const activeCount = memory.timestamps.length - startIndex;
+  const avg = memory.sum / activeCount;
   memory.averages.push(avg);
 
-  if (memory.averages.length < 2) {
+  if (activeCount < 2) {
     recordPoint(memory, { avg, rate: 0, rateClamped: 0 });
+    compactRollingAverage(memory);
     return;
   }
 
-  const windowSize = memory.timestamps[memory.timestamps.length - 1] - memory.timestamps[0];
+  const lastIndex = memory.timestamps.length - 1;
+  const windowSize = memory.timestamps[lastIndex] - memory.timestamps[startIndex];
   const pointTs = options.tsSec - windowSize * options.derivativeRatio;
-  const sample = sampleData(memory.averages, memory.timestamps, pointTs, memory.previousSampleIndex);
+  const sample = sampleData(
+    memory.averages,
+    memory.timestamps,
+    pointTs,
+    memory.previousSampleIndex,
+    startIndex,
+  );
   memory.previousSampleIndex = sample.index;
 
   const delta = options.tsSec - pointTs;
   if (delta === 0) {
     recordPoint(memory, { avg, rate: 0, rateClamped: 0 });
+    compactRollingAverage(memory);
     return;
   }
 
@@ -284,6 +299,7 @@ function updateRollingAverage(
   }
 
   recordPoint(memory, { avg, rate: derivative, rateClamped });
+  compactRollingAverage(memory);
 }
 
 function sampleData(
@@ -291,18 +307,20 @@ function sampleData(
   timestamps: number[],
   ts: number,
   previousIndex?: number,
+  startIndex = 0,
 ): { index: number; value: number } {
-  if (data.length === 1 || ts <= timestamps[0]) {
-    return { index: 0, value: data[0] };
+  const lastIndex = timestamps.length - 1;
+  if (lastIndex <= startIndex || ts <= timestamps[startIndex]) {
+    return { index: startIndex, value: data[startIndex] };
   }
 
-  let index = previousIndex ?? binarySearchLeft(timestamps, ts) - 1;
-  index = clampInt(index, 0, Math.max(0, timestamps.length - 2));
+  let index = previousIndex ?? binarySearchLeft(timestamps, ts, startIndex, timestamps.length) - 1;
+  index = clampInt(index, startIndex, Math.max(startIndex, lastIndex - 1));
 
-  while (index > 0 && timestamps[index] >= ts) {
+  while (index > startIndex && timestamps[index] >= ts) {
     index -= 1;
   }
-  while (index < timestamps.length - 2 && timestamps[index + 1] < ts) {
+  while (index < lastIndex - 1 && timestamps[index + 1] < ts) {
     index += 1;
   }
 
@@ -354,6 +372,7 @@ function createRollingAverageMemory(): RollingAverageMemory {
     averages: [],
     timestamps: [],
     sum: 0,
+    startIndex: 0,
     points: [],
   };
 }
@@ -366,11 +385,18 @@ function normalizeAverageList(
 }
 
 function normalizeAverage(memory: RollingAverageMemory | undefined): RollingAverageMemory {
+  const entries = memory?.entries ?? [];
+  const averages = memory?.averages ?? [];
+  const timestamps = memory?.timestamps ?? [];
+  const maxStartIndex = Math.min(entries.length, averages.length, timestamps.length);
+  const startIndex = clampInt(memory?.startIndex ?? 0, 0, maxStartIndex);
+
   return {
-    entries: memory?.entries ?? [],
-    averages: memory?.averages ?? [],
-    timestamps: memory?.timestamps ?? [],
+    entries,
+    averages,
+    timestamps,
     sum: memory?.sum ?? 0,
+    startIndex,
     previousSampleIndex: memory?.previousSampleIndex,
     points: memory?.points ?? [],
   };
@@ -385,9 +411,30 @@ function interpolate(nextValue: number, prevValue: number, fraction: number): nu
   return nextValue * (1 - fraction) + prevValue * fraction;
 }
 
-function binarySearchLeft(values: number[], target: number): number {
-  let low = 0;
-  let high = values.length;
+function compactRollingAverage(memory: RollingAverageMemory): void {
+  const startIndex = memory.startIndex ?? 0;
+  if (
+    startIndex < ROLLING_AVERAGE_COMPACT_EXPIRED ||
+    startIndex < memory.timestamps.length / 2
+  ) {
+    return;
+  }
+
+  memory.entries.splice(0, startIndex);
+  memory.averages.splice(0, startIndex);
+  memory.timestamps.splice(0, startIndex);
+  if (memory.previousSampleIndex !== undefined) {
+    memory.previousSampleIndex = Math.max(0, memory.previousSampleIndex - startIndex);
+  }
+  memory.startIndex = 0;
+}
+
+function binarySearchLeft(
+  values: number[],
+  target: number,
+  low = 0,
+  high = values.length,
+): number {
   while (low < high) {
     const mid = Math.floor((low + high) / 2);
     if (values[mid] < target) {

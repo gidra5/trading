@@ -28,6 +28,11 @@ export interface PriceTick {
   quantity?: number;
 }
 
+export interface TickProcessingOptions {
+  collectEvents?: boolean;
+  updateMetrics?: boolean;
+}
+
 export interface Candle {
   symbol: string;
   interval: string;
@@ -115,6 +120,7 @@ export interface RollingAverageMemory {
   averages: number[];
   timestamps: number[];
   sum: number;
+  startIndex?: number;
   previousSampleIndex?: number;
   points: RollingAveragePoint[];
 }
@@ -333,6 +339,8 @@ export interface BacktestSummary {
   stopReason?: BacktestStopReason;
   survivedMs?: number;
   durationMs?: number;
+  candlesPerSecond?: number;
+  replayDurationMs?: number;
   finalEquity: number;
   netPnl: number;
   returnPct: number;
@@ -380,6 +388,7 @@ export interface BacktestProgressSnapshot {
   returnPct: number;
   stopReason?: BacktestStopReason;
   survivedMs?: number;
+  candlesPerSecond?: number;
   message: string;
   error?: string;
   result?: BacktestResult;

@@ -14,11 +14,17 @@ import {
   type PaperBotState,
   type PriceTick,
   type PositionLedger,
+  type StrategyMemory,
   type StrategyConfig,
+  type TradingOrder,
 } from "@trading/bot-algo";
 import type { MarketStreamStatus } from "./binance-stream.js";
 import { runHistoricalCandleBacktest } from "./historical-backtest.js";
 import type { TradingStorage } from "./storage.js";
+
+const PUBLIC_ORDER_LIMIT = 500;
+const PUBLIC_FILL_LIMIT = 500;
+const PUBLIC_PRICE_MEMORY_LIMIT = 100;
 
 export interface RuntimeSnapshot {
   market: {
@@ -108,7 +114,8 @@ export class TradingRuntime {
   }
 
   snapshot(): RuntimeSnapshot {
-    const bot = this.bot.snapshot();
+    const bot = this.bot.view();
+    const publicBot = compactPublicBotState(bot);
     return {
       market: {
         symbol: this.config.symbol,
@@ -120,8 +127,8 @@ export class TradingRuntime {
         candles: this.candles,
         orderBook: this.orderBook,
       },
-      bot,
-      positions: analyzePositions(bot),
+      bot: publicBot,
+      positions: analyzePositions(bot as PaperBotState),
       recentEvents: this.recentEvents,
       backtest: this.backtest,
     };
@@ -361,6 +368,41 @@ export class TradingRuntime {
     result.summary.requests = 0;
     return result;
   }
+}
+
+function compactPublicBotState(state: Readonly<PaperBotState>): PaperBotState {
+  return {
+    ...state,
+    orders: compactPublicOrders(state.orders).map((order) => ({ ...order })),
+    fills: state.fills.slice(-PUBLIC_FILL_LIMIT).map((fill) => ({ ...fill })),
+    memory: compactPublicMemory(state.memory, state.config),
+    metrics: { ...state.metrics },
+    config: structuredClone(state.config),
+  };
+}
+
+function compactPublicMemory(
+  memory: Readonly<StrategyMemory>,
+  config: Readonly<StrategyConfig>,
+): StrategyMemory {
+  return {
+    prices: memory.prices
+      .slice(-Math.max(PUBLIC_PRICE_MEMORY_LIMIT, config.slowWindow * 2))
+      .slice(),
+    lastSignal: memory.lastSignal,
+    lastActionAt: memory.lastActionAt,
+    previousFastAvg: memory.previousFastAvg,
+    previousSlowAvg: memory.previousSlowAvg,
+  };
+}
+
+function compactPublicOrders(orders: readonly TradingOrder[]): readonly TradingOrder[] {
+  const recentStart = Math.max(0, orders.length - PUBLIC_ORDER_LIMIT);
+  const openBeforeRecent = orders
+    .slice(0, recentStart)
+    .filter((order) => order.status === "open");
+
+  return [...openBeforeRecent, ...orders.slice(recentStart)];
 }
 
 function createIdleBacktest(): BacktestProgressSnapshot {

@@ -8,6 +8,7 @@ import type {
   PaperBotState,
   PriceTick,
   StrategyConfig,
+  TickProcessingOptions,
   TradeFill,
   TradingOrder,
 } from "./types.js";
@@ -137,6 +138,15 @@ export class SimulatedTradingBot {
 
   snapshot(): PaperBotState {
     return structuredClone(this.state);
+  }
+
+  view(): Readonly<PaperBotState> {
+    return this.state;
+  }
+
+  markToMarket(): Readonly<BotMetrics> {
+    recalculateMetrics(this.state);
+    return this.state.metrics;
   }
 
   setStatus(status: BotStatus, at = Date.now()): BotEvent[] {
@@ -297,37 +307,49 @@ export class SimulatedTradingBot {
     });
   }
 
-  onTick(tick: PriceTick): BotEvent[] {
+  onTick(tick: PriceTick, options: TickProcessingOptions = {}): BotEvent[] {
     if (tick.symbol !== this.state.symbol || tick.price <= 0) {
       return [];
     }
 
-    const events: BotEvent[] = [];
+    const collectEvents = options.collectEvents ?? true;
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
     this.state.lastPrice = tick.price;
     this.state.updatedAt = tick.eventTime;
 
-    events.push(...this.cancelStaleOrders(tick.eventTime));
-    events.push(...this.fillOpenOrders(tick));
+    if (events) {
+      events.push(...this.cancelStaleOrders(tick.eventTime, collectEvents));
+      events.push(...this.fillOpenOrders(tick, collectEvents));
+    } else {
+      this.cancelStaleOrders(tick.eventTime, collectEvents);
+      this.fillOpenOrders(tick, collectEvents);
+    }
     this.rememberPrice(tick.price);
 
     if (this.state.status === "running") {
-      events.push(...this.evaluateStrategy(tick));
+      if (events) {
+        events.push(...this.evaluateStrategy(tick, collectEvents));
+      } else {
+        this.evaluateStrategy(tick, collectEvents);
+      }
     }
 
-    recalculateMetrics(this.state);
-    return events;
+    if (options.updateMetrics ?? true) {
+      recalculateMetrics(this.state);
+    }
+    return events ?? [];
   }
 
-  private evaluateStrategy(tick: PriceTick): BotEvent[] {
+  private evaluateStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const config = this.state.config;
     if (config.algorithm === "legacy-valley-peak") {
-      return this.evaluateLegacyValleyPeakStrategy(tick);
+      return this.evaluateLegacyValleyPeakStrategy(tick, collectEvents);
     }
 
-    return this.evaluateMovingAverageStrategy(tick);
+    return this.evaluateMovingAverageStrategy(tick, collectEvents);
   }
 
-  private evaluateMovingAverageStrategy(tick: PriceTick): BotEvent[] {
+  private evaluateMovingAverageStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const config = this.state.config;
     const prices = this.state.memory.prices;
     if (prices.length < config.slowWindow) {
@@ -398,6 +420,10 @@ export class SimulatedTradingBot {
     this.state.memory.lastSignal = signal;
     this.state.memory.lastActionAt = tick.eventTime;
 
+    if (!collectEvents) {
+      return [];
+    }
+
     return [
       {
         type: "order_created",
@@ -408,7 +434,7 @@ export class SimulatedTradingBot {
     ];
   }
 
-  private evaluateLegacyValleyPeakStrategy(tick: PriceTick): BotEvent[] {
+  private evaluateLegacyValleyPeakStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const config = this.state.config;
 
     if (this.openOrderIndexes.size >= config.maxOpenOrders) {
@@ -454,6 +480,10 @@ export class SimulatedTradingBot {
 
     this.state.memory.lastSignal = decision.signal;
     this.state.memory.lastActionAt = tick.eventTime;
+
+    if (!collectEvents) {
+      return [];
+    }
 
     return [
       {
@@ -556,10 +586,16 @@ export class SimulatedTradingBot {
     };
   }
 
-  private fillOpenOrders(tick: PriceTick): BotEvent[] {
+  private fillOpenOrders(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const events: BotEvent[] = [];
 
-    for (const order of this.openOrders()) {
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (order?.status !== "open") {
+        this.openOrderIndexes.delete(index);
+        continue;
+      }
+
       const canFill =
         order.side === "buy" ? tick.price <= order.price : tick.price >= order.price;
 
@@ -567,7 +603,10 @@ export class SimulatedTradingBot {
         continue;
       }
 
-      const fill = this.fillOrder(order, tick.eventTime);
+      const fill = this.fillOrder(order, index, tick.eventTime);
+      if (!collectEvents) {
+        continue;
+      }
       events.push({
         type: "order_filled",
         at: tick.eventTime,
@@ -580,7 +619,7 @@ export class SimulatedTradingBot {
     return events;
   }
 
-  private fillOrder(order: TradingOrder, filledAt: number): TradeFill {
+  private fillOrder(order: TradingOrder, index: number, filledAt: number): TradeFill {
     const config = this.state.config;
     const feeRate = config.feeBps / 10_000;
     const quoteQuantity = roundQuote(order.price * order.quantity);
@@ -633,7 +672,7 @@ export class SimulatedTradingBot {
     order.updatedAt = filledAt;
     order.realizedPnl = realizedPnl;
     order.feeQuote = feeQuote;
-    this.openOrderIndexes.delete(this.state.orders.indexOf(order));
+    this.openOrderIndexes.delete(index);
 
     const fill: TradeFill = {
       id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
@@ -652,10 +691,15 @@ export class SimulatedTradingBot {
     return fill;
   }
 
-  private cancelStaleOrders(at: number): BotEvent[] {
+  private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
     const events: BotEvent[] = [];
 
-    for (const order of this.openOrders()) {
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (order?.status !== "open") {
+        this.openOrderIndexes.delete(index);
+        continue;
+      }
       if (at - order.createdAt < this.state.config.staleOrderMs) {
         continue;
       }
@@ -664,14 +708,16 @@ export class SimulatedTradingBot {
       order.status = "cancelled";
       order.cancelledAt = at;
       order.updatedAt = at;
-      this.openOrderIndexes.delete(this.state.orders.indexOf(order));
+      this.openOrderIndexes.delete(index);
 
-      events.push({
-        type: "order_cancelled",
-        at,
-        message: `${order.side.toUpperCase()} order cancelled after waiting too long`,
-        order: structuredClone(order),
-      });
+      if (collectEvents) {
+        events.push({
+          type: "order_cancelled",
+          at,
+          message: `${order.side.toUpperCase()} order cancelled after waiting too long`,
+          order: structuredClone(order),
+        });
+      }
     }
 
     return events;
@@ -694,7 +740,7 @@ export class SimulatedTradingBot {
   private rememberPrice(price: number): void {
     const maxPrices = this.state.config.slowWindow * 8;
     this.state.memory.prices.push(price);
-    if (this.state.memory.prices.length > maxPrices) {
+    if (this.state.memory.prices.length > maxPrices * 2) {
       this.state.memory.prices.splice(0, this.state.memory.prices.length - maxPrices);
     }
   }
@@ -809,8 +855,11 @@ function emptyMetrics(startingQuote: number): BotMetrics {
 
 function averageLast(values: number[], count: number): number {
   const start = Math.max(0, values.length - count);
-  const slice = values.slice(start);
-  return slice.reduce((sum, value) => sum + value, 0) / slice.length;
+  let sum = 0;
+  for (let index = start; index < values.length; index += 1) {
+    sum += values[index];
+  }
+  return sum / (values.length - start);
 }
 
 function cleanPositive(value: number | undefined): number {

@@ -1,5 +1,6 @@
 import {
   SimulatedTradingBot,
+  compactBacktestState,
   createInitialBotState,
   createStrategyConfig,
   type BacktestPreset,
@@ -18,6 +19,7 @@ import {
 
 const KLINE_LIMIT = 1000;
 const WIPEOUT_EQUITY_FRACTION = 0.01;
+const WIPEOUT_CHECK_CANDLES = 100;
 const MAX_EQUITY_POINTS = 800;
 
 const periodDurations: Record<Extract<BacktestPreset, "week" | "month" | "year">, number> = {
@@ -64,7 +66,8 @@ export async function runHistoricalCandleBacktest(
     minFreeBytes: options.cache.minFreeBytes,
   });
   const equityCurve: EquityPoint[] = [];
-  const sampleEvery = Math.max(1, Math.floor(estimatedCandles / MAX_EQUITY_POINTS));
+  const sampleEvery = Math.max(1, Math.ceil(estimatedCandles / MAX_EQUITY_POINTS));
+  const metricsEvery = Math.max(1, Math.min(sampleEvery, WIPEOUT_CHECK_CANDLES));
   const startedAt = Date.now();
   const wipeoutEquity = config.startingQuote * WIPEOUT_EQUITY_FRACTION;
 
@@ -73,7 +76,7 @@ export async function runHistoricalCandleBacktest(
   let processedStartTime: number | undefined;
   let processedEndTime: number | undefined;
   let stopReason: "completed" | "wiped_out" = "completed";
-  let finalState = bot.snapshot();
+  let latestMetrics = bot.view().metrics;
   let survivedMs: number | undefined;
 
   emitProgress("running", "Checking historical candle cache");
@@ -102,6 +105,8 @@ export async function runHistoricalCandleBacktest(
     },
   );
 
+  const replayStartedAt = Date.now();
+
   outer: for await (const candles of cache.readRangeBatches(targetStartTime, targetEndTime)) {
     for (const candle of candles) {
       if (candle.openTime < targetStartTime || candle.openTime > targetEndTime) {
@@ -111,24 +116,30 @@ export async function runHistoricalCandleBacktest(
       processedStartTime ??= candle.openTime;
       processedEndTime = candle.closeTime;
 
-      for (const tick of candleToSyntheticTicks(candle)) {
-        bot.onTick(tick);
+      replayCandle(bot, candle);
+      processedCandles += 1;
+      const shouldSample = processedCandles % sampleEvery === 0;
+      const shouldCheckMetrics =
+        shouldSample ||
+        processedCandles % metricsEvery === 0 ||
+        processedCandles >= estimatedCandles;
+
+      if (shouldCheckMetrics) {
+        latestMetrics = bot.markToMarket();
       }
 
-      processedCandles += 1;
-      finalState = bot.snapshot();
-
-      if (processedCandles % sampleEvery === 0) {
+      if (shouldSample) {
         equityCurve.push({
           time: candle.closeTime,
-          equity: finalState.metrics.equity,
+          equity: latestMetrics.equity,
           price: candle.close,
         });
       }
 
       if (
+        shouldCheckMetrics &&
         processedCandles >= config.slowWindow &&
-        finalState.metrics.equity <= wipeoutEquity
+        latestMetrics.equity <= wipeoutEquity
       ) {
         stopReason = "wiped_out";
         break outer;
@@ -138,7 +149,8 @@ export async function runHistoricalCandleBacktest(
     emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
   }
 
-  finalState = bot.snapshot();
+  latestMetrics = bot.markToMarket();
+  const finalState = compactBacktestState(bot.view());
   if (processedEndTime && equityCurve.at(-1)?.time !== processedEndTime) {
     equityCurve.push({
       time: processedEndTime,
@@ -148,6 +160,7 @@ export async function runHistoricalCandleBacktest(
   }
 
   const durationMs = Date.now() - startedAt;
+  const replayDurationMs = Date.now() - replayStartedAt;
   survivedMs =
     processedStartTime && processedEndTime
       ? processedEndTime - processedStartTime
@@ -173,6 +186,9 @@ export async function runHistoricalCandleBacktest(
       stopReason,
       survivedMs,
       durationMs,
+      replayDurationMs,
+      candlesPerSecond:
+        replayDurationMs > 0 ? (processedCandles / replayDurationMs) * 1000 : undefined,
       finalEquity: finalState.metrics.equity,
       netPnl: finalState.metrics.netPnl,
       returnPct: finalState.metrics.returnPct,
@@ -192,7 +208,6 @@ export async function runHistoricalCandleBacktest(
     status: BacktestProgressSnapshot["status"],
     message: string,
   ): void {
-    const state = finalState;
     const currentSurvivedMs =
       processedStartTime && processedEndTime
         ? processedEndTime - processedStartTime
@@ -218,44 +233,67 @@ export async function runHistoricalCandleBacktest(
       cacheEvictedBytes: cacheStats.cacheEvictedBytes,
       cacheEvictedFiles: cacheStats.cacheEvictedFiles,
       percent: Math.min(100, (processedCandles / estimatedCandles) * 100),
-      equity: state.metrics.equity,
-      returnPct: state.metrics.returnPct,
+      equity: latestMetrics.equity,
+      returnPct: latestMetrics.returnPct,
       stopReason: status === "completed" ? stopReason : undefined,
       survivedMs: currentSurvivedMs,
+      candlesPerSecond: currentCandlesPerSecond(),
       message,
     });
   }
+
+  function currentCandlesPerSecond(): number | undefined {
+    if (processedCandles <= 0) {
+      return undefined;
+    }
+
+    const replayDurationMs = Date.now() - replayStartedAt;
+    return replayDurationMs > 0 ? (processedCandles / replayDurationMs) * 1000 : undefined;
+  }
 }
 
-function candleToSyntheticTicks(candle: Candle): PriceTick[] {
+function replayCandle(bot: SimulatedTradingBot, candle: Candle): void {
   const duration = Math.max(1, candle.closeTime - candle.openTime);
-
-  return [
+  const options = {
+    collectEvents: false,
+    updateMetrics: false,
+  };
+  bot.onTick(
     {
       symbol: candle.symbol,
       eventTime: candle.openTime,
       price: candle.open,
       quantity: candle.volume * 0.2,
     },
+    options,
+  );
+  bot.onTick(
     {
       symbol: candle.symbol,
       eventTime: candle.openTime + duration * 0.33,
       price: candle.high,
       quantity: candle.volume * 0.25,
     },
+    options,
+  );
+  bot.onTick(
     {
       symbol: candle.symbol,
       eventTime: candle.openTime + duration * 0.66,
       price: candle.low,
       quantity: candle.volume * 0.25,
     },
+    options,
+  );
+  bot.onTick(
     {
       symbol: candle.symbol,
       eventTime: candle.closeTime,
       price: candle.close,
       quantity: candle.volume * 0.3,
     },
-  ];
+    options,
+  );
 }
 
 function parseKline(symbol: string, interval: string, row: unknown[]): Candle {

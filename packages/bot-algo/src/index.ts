@@ -5,6 +5,7 @@ export {
   defaultStrategyConfig,
 } from "./bot.js";
 export {
+  compactBacktestState,
   runBacktestFromCandles,
   runBacktestFromOrderBook,
   runBacktestFromTicks,
