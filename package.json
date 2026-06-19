@@ -1,0 +1,25 @@
+{
+  "name": "trading",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Handmade Binance trading interface with a Fastify backend, SolidJS UI, and reusable bot package.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c green,cyan \"npm run dev -w @trading/server\" \"npm run dev -w @trading/web\"",
+    "build": "npm run build -w @trading/bot-algo && npm run build -w @trading/server && npm run build -w @trading/web",
+    "typecheck": "npm run typecheck -w @trading/bot-algo && npm run typecheck -w @trading/server && npm run typecheck -w @trading/web",
+    "start": "npm run start -w @trading/server"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  }
+}

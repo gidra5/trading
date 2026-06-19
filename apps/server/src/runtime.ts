@@ -1,0 +1,388 @@
+import {
+  SimulatedTradingBot,
+  createStrategyConfig,
+  runBacktestFromCandles,
+  runBacktestFromOrderBook,
+  type BacktestPreset,
+  type BacktestProgressSnapshot,
+  type BacktestResult,
+  type BotEvent,
+  type Candle,
+  type OrderBookSnapshot,
+  type PaperBotState,
+  type PriceTick,
+  type StrategyConfig,
+} from "@trading/bot-algo";
+import type { MarketStreamStatus } from "./binance-stream.js";
+import { runHistoricalCandleBacktest } from "./historical-backtest.js";
+import type { TradingStorage } from "./storage.js";
+
+export interface RuntimeSnapshot {
+  market: {
+    symbol: string;
+    interval: string;
+    connected: boolean;
+    statusMessage: string;
+    lastEventAt: number;
+    lastPrice: number;
+    candles: Candle[];
+    orderBook?: OrderBookSnapshot;
+  };
+  bot: PaperBotState;
+  recentEvents: BotEvent[];
+  backtest: BacktestProgressSnapshot;
+}
+
+export class TradingRuntime {
+  private bot!: SimulatedTradingBot;
+  private candles: Candle[] = [];
+  private orderBook?: OrderBookSnapshot;
+  private status: MarketStreamStatus = {
+    connected: false,
+    message: "Starting",
+    lastEventAt: Date.now(),
+    reconnectAttempt: 0,
+  };
+  private recentEvents: BotEvent[] = [];
+  private saveTimer?: NodeJS.Timeout;
+  private lastSavedOrderBookAt = 0;
+  private backtest: BacktestProgressSnapshot = createIdleBacktest();
+
+  constructor(
+    private readonly storage: TradingStorage,
+    private config: StrategyConfig,
+    private readonly interval: string,
+    private readonly historicalCache: {
+      dataDir: string;
+      maxBytes: number;
+      minFreeBytes: number;
+    },
+  ) {}
+
+  async init(): Promise<void> {
+    await this.storage.ensureReady();
+    this.candles = await this.storage.loadCandles(500);
+    const savedState = await this.storage.loadBotState();
+    if (savedState?.config) {
+      this.config = createStrategyConfig({
+        ...savedState.config,
+        symbol: this.config.symbol,
+        baseAsset: this.config.baseAsset,
+        quoteAsset: this.config.quoteAsset,
+      });
+    }
+    this.bot = new SimulatedTradingBot(savedState, this.config);
+  }
+
+  handleStatus(status: MarketStreamStatus): void {
+    this.status = status;
+  }
+
+  async handleTick(tick: PriceTick): Promise<BotEvent[]> {
+    const events = this.bot.onTick(tick);
+    this.recordEvents(events);
+    this.scheduleStateSave();
+    return events;
+  }
+
+  async handleCandle(candle: Candle): Promise<void> {
+    upsertCandle(this.candles, candle, 500);
+
+    if (candle.closed) {
+      await this.storage.appendCandle(candle);
+    }
+  }
+
+  async handleOrderBook(snapshot: OrderBookSnapshot): Promise<void> {
+    this.orderBook = snapshot;
+
+    if (snapshot.eventTime - this.lastSavedOrderBookAt >= 5_000) {
+      this.lastSavedOrderBookAt = snapshot.eventTime;
+      await this.storage.appendOrderBookSnapshot(snapshot);
+    }
+  }
+
+  snapshot(): RuntimeSnapshot {
+    return {
+      market: {
+        symbol: this.config.symbol,
+        interval: this.interval,
+        connected: this.status.connected,
+        statusMessage: this.status.message,
+        lastEventAt: this.status.lastEventAt,
+        lastPrice: this.bot.snapshot().lastPrice,
+        candles: this.candles,
+        orderBook: this.orderBook,
+      },
+      bot: this.bot.snapshot(),
+      recentEvents: this.recentEvents,
+      backtest: this.backtest,
+    };
+  }
+
+  async startBot(): Promise<BotEvent[]> {
+    const events = this.bot.setStatus("running");
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  async stopBot(): Promise<BotEvent[]> {
+    const events = this.bot.setStatus("stopped");
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  async resetBot(): Promise<BotEvent[]> {
+    const events = this.bot.reset(this.config);
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  async updateBotConfig(patch: Partial<StrategyConfig>): Promise<BotEvent[]> {
+    this.config = createStrategyConfig({
+      ...this.config,
+      ...patch,
+      symbol: this.config.symbol,
+      baseAsset: this.config.baseAsset,
+      quoteAsset: this.config.quoteAsset,
+      legacyValleyPeak: {
+        ...this.config.legacyValleyPeak,
+        ...(patch.legacyValleyPeak ?? {}),
+      },
+    });
+    const events = this.bot.reset(this.config);
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  startBacktest(
+    options: {
+      preset: BacktestPreset;
+      limit: number;
+      startingQuote?: number;
+    },
+    onUpdate: () => void,
+  ): BacktestProgressSnapshot {
+    if (this.backtest.status === "running") {
+      throw new Error("A backtest is already running.");
+    }
+
+    const id = `bt_${Date.now()}`;
+    const source = options.preset === "saved-orderbook" ? "orderbook-mid" : "candles";
+    const now = Date.now();
+    this.backtest = {
+      id,
+      preset: options.preset,
+      status: "running",
+      source,
+      startedAt: now,
+      updatedAt: now,
+      targetStartTime: 0,
+      targetEndTime: now,
+      processedCandles: 0,
+      estimatedCandles: 0,
+      requests: 0,
+      percent: 0,
+      equity: this.config.startingQuote,
+      returnPct: 0,
+      message: "Starting backtest",
+    };
+    onUpdate();
+
+    void this.executeBacktest(id, options, onUpdate);
+    return this.backtest;
+  }
+
+  async flushState(): Promise<void> {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+
+    await this.storage.saveBotState(this.bot.snapshot());
+  }
+
+  private scheduleStateSave(): void {
+    if (this.saveTimer) {
+      return;
+    }
+
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      void this.flushState();
+    }, 2_000);
+  }
+
+  private recordEvents(events: BotEvent[]): void {
+    if (events.length === 0) {
+      return;
+    }
+
+    this.recentEvents = [...events, ...this.recentEvents].slice(0, 60);
+  }
+
+  private async executeBacktest(
+    id: string,
+    options: {
+      preset: BacktestPreset;
+      limit: number;
+      startingQuote?: number;
+    },
+    onUpdate: () => void,
+  ): Promise<void> {
+    try {
+      const result = await this.runBacktestNow(id, options, onUpdate);
+      await this.storage.saveBacktest(result);
+      this.backtest = buildCompletedProgress(
+        this.backtest,
+        result,
+        result.summary.stoppedEarly
+          ? "Stopped early after portfolio wipeout"
+          : "Backtest completed",
+      );
+      onUpdate();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Backtest failed";
+      this.backtest = {
+        ...this.backtest,
+        status: "failed",
+        stopReason: "error",
+        updatedAt: Date.now(),
+        error: message,
+        message,
+      };
+      onUpdate();
+    }
+  }
+
+  private async runBacktestNow(
+    id: string,
+    options: {
+      preset: BacktestPreset;
+      limit: number;
+      startingQuote?: number;
+    },
+    onUpdate: () => void,
+  ): Promise<BacktestResult> {
+    const config = {
+      ...this.config,
+      ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
+    };
+
+    if (options.preset === "week" || options.preset === "month" || options.preset === "year") {
+      return runHistoricalCandleBacktest(
+        {
+          id,
+          preset: options.preset,
+          symbol: this.config.symbol,
+          interval: this.interval,
+          config,
+          cache: this.historicalCache,
+        },
+        (progress) => {
+          this.backtest = progress;
+          onUpdate();
+        },
+      );
+    }
+
+    const startedAt = Date.now();
+    const result =
+      options.preset === "saved-orderbook"
+        ? runBacktestFromOrderBook(await this.storage.loadOrderBookSnapshots(options.limit), {
+            config,
+          })
+        : runBacktestFromCandles(await this.storage.loadCandles(options.limit), {
+            config,
+          });
+    const durationMs = Date.now() - startedAt;
+    result.summary.durationMs = durationMs;
+    result.summary.stopReason = "completed";
+    result.summary.stoppedEarly = false;
+    result.summary.candlesProcessed =
+      options.preset === "saved-candles" ? result.summary.eventsProcessed / 4 : undefined;
+    result.summary.requests = 0;
+    return result;
+  }
+}
+
+function createIdleBacktest(): BacktestProgressSnapshot {
+  const now = Date.now();
+  return {
+    id: "idle",
+    preset: "saved-candles",
+    status: "idle",
+    source: "candles",
+    startedAt: now,
+    updatedAt: now,
+    targetStartTime: 0,
+    targetEndTime: 0,
+    processedCandles: 0,
+    estimatedCandles: 0,
+    requests: 0,
+    percent: 0,
+    equity: 0,
+    returnPct: 0,
+    message: "No backtest has run yet",
+  };
+}
+
+function buildCompletedProgress(
+  progress: BacktestProgressSnapshot,
+  result: BacktestResult,
+  message: string,
+): BacktestProgressSnapshot {
+  const processedCandles =
+    result.summary.candlesProcessed ??
+    (result.summary.source === "candles"
+      ? Math.round(result.summary.eventsProcessed / 4)
+      : result.summary.eventsProcessed);
+
+  return {
+    ...progress,
+    status: "completed",
+    updatedAt: Date.now(),
+    targetStartTime: result.summary.targetStartTime ?? result.summary.startTime,
+    targetEndTime: result.summary.targetEndTime ?? result.summary.endTime,
+    processedStartTime: result.summary.startTime,
+    processedEndTime: result.summary.endTime,
+    processedCandles,
+    estimatedCandles: progress.estimatedCandles || processedCandles,
+    requests: result.summary.requests ?? progress.requests,
+    cacheHitCandles: result.summary.cacheHitCandles ?? progress.cacheHitCandles,
+    cacheMissCandles: result.summary.cacheMissCandles ?? progress.cacheMissCandles,
+    cacheFetchedCandles: result.summary.cacheFetchedCandles ?? progress.cacheFetchedCandles,
+    cacheSizeBytes: result.summary.cacheSizeBytes ?? progress.cacheSizeBytes,
+    cacheEvictedBytes: result.summary.cacheEvictedBytes ?? progress.cacheEvictedBytes,
+    cacheEvictedFiles: result.summary.cacheEvictedFiles ?? progress.cacheEvictedFiles,
+    percent: result.summary.stoppedEarly ? progress.percent : 100,
+    equity: result.summary.finalEquity,
+    returnPct: result.summary.returnPct,
+    stopReason: result.summary.stopReason ?? "completed",
+    survivedMs: result.summary.survivedMs,
+    message,
+    result,
+  };
+}
+
+function upsertCandle(candles: Candle[], candle: Candle, maxCandles: number): void {
+  const existingIndex = candles.findIndex(
+    (item) => item.openTime === candle.openTime && item.interval === candle.interval,
+  );
+
+  if (existingIndex >= 0) {
+    candles[existingIndex] = candle;
+  } else {
+    candles.push(candle);
+  }
+
+  candles.sort((a, b) => a.openTime - b.openTime);
+
+  if (candles.length > maxCandles) {
+    candles.splice(0, candles.length - maxCandles);
+  }
+}
