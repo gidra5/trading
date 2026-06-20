@@ -1,37 +1,55 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStrategyConfig } from "@trading/bot-algo";
+import { createConfiguredMarketListing, type MarketVenue } from "./binance-markets.js";
 
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(sourceDir, "../../..");
 
 const symbol = (process.env.TRADING_SYMBOL ?? "BTCUSDT").toUpperCase();
 const interval = process.env.TRADING_INTERVAL ?? "1m";
+const market = createConfiguredMarketListing({
+  marketId: process.env.TRADING_MARKET_ID,
+  venue: parseMarketVenue(process.env.TRADING_MARKET_VENUE),
+  symbol,
+  baseAsset: process.env.TRADING_BASE_ASSET,
+  quoteAsset: process.env.TRADING_QUOTE_ASSET,
+});
 
 export const appConfig = {
   host: process.env.HOST ?? "0.0.0.0",
   port: Number(process.env.PORT ?? 3001),
-  symbol,
-  streamSymbol: symbol.toLowerCase(),
+  symbol: market.symbol,
+  market,
   interval,
-  dataDir: process.env.TRADING_DATA_DIR
-    ? path.resolve(process.env.TRADING_DATA_DIR)
-    : path.join(repoRoot, "data"),
+  binanceApiKey: process.env.BINANCE_API_KEY,
+  dataDir: process.env.TRADING_DATA_DIR ? path.resolve(process.env.TRADING_DATA_DIR) : path.join(repoRoot, "data"),
   webDistDir: path.join(repoRoot, "apps/web/dist"),
   historicalCache: {
-    maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 512 * 1024 * 1024),
-    minFreeBytes: parseBytes(
-      process.env.TRADING_HISTORY_CACHE_MIN_FREE_BYTES,
-      512 * 1024 * 1024,
-    ),
+    maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 1024 * 1024 * 1024),
+    minFreeBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MIN_FREE_BYTES, 1024 * 1024 * 1024),
   },
   strategy: createStrategyConfig({
-    symbol,
-    baseAsset: process.env.TRADING_BASE_ASSET ?? symbol.replace(/USDT$/, "") ?? "BTC",
-    quoteAsset: process.env.TRADING_QUOTE_ASSET ?? "USDT",
+    symbol: market.symbol,
+    baseAsset: market.baseAsset,
+    quoteAsset: market.quoteAsset,
     startingQuote: Number(process.env.TRADING_STARTING_QUOTE ?? 10_000),
   }),
 };
+
+function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
+  if (
+    value === "spot" ||
+    value === "usdm-futures" ||
+    value === "coinm-futures" ||
+    value === "options" ||
+    value === "predictions"
+  ) {
+    return value;
+  }
+
+  return undefined;
+}
 
 function parseBytes(value: string | undefined, fallback: number): number {
   if (!value) {

@@ -8,6 +8,7 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  Search,
   Square,
   X,
 } from "lucide-solid";
@@ -35,6 +36,9 @@ import {
 import type {
   BacktestProgressSnapshot,
   BacktestSelection,
+  BinanceMarketCatalog,
+  BinanceMarketListing,
+  MarketGroup,
   RuntimeSnapshot,
 } from "./types";
 
@@ -43,6 +47,24 @@ const apiBase =
   (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
 const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
 
+interface BacktestSettings {
+  historicalDays: number;
+  randomSampleCount: number;
+  randomWindowDays: number;
+  randomMinWindowDays: number;
+  randomMaxWindowDays: number;
+  randomLookbackDays: number;
+}
+
+const defaultBacktestSettings: BacktestSettings = {
+  historicalDays: 30,
+  randomSampleCount: 40,
+  randomWindowDays: 7,
+  randomMinWindowDays: 1,
+  randomMaxWindowDays: 30,
+  randomLookbackDays: 365,
+};
+
 export function App() {
   const [snapshot, setSnapshot] = createSignal<RuntimeSnapshot>();
   const [connection, setConnection] = createSignal<"connecting" | "live" | "offline">(
@@ -50,10 +72,16 @@ export function App() {
   );
   const [backtestPreset, setBacktestPreset] =
     createSignal<BacktestSelection>("saved-candles");
+  const [backtestSettings, setBacktestSettings] = createSignal<BacktestSettings>({
+    ...defaultBacktestSettings,
+  });
   const [backtestError, setBacktestError] = createSignal<string>();
   const [configDraft, setConfigDraft] = createSignal<StrategyConfig>();
   const [configError, setConfigError] = createSignal<string>();
   const [manualTradeError, setManualTradeError] = createSignal<string>();
+  const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog>();
+  const [marketError, setMarketError] = createSignal<string>();
+  const [switchingMarketId, setSwitchingMarketId] = createSignal<string>();
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
 
@@ -69,7 +97,7 @@ export function App() {
 
   createEffect(() => {
     const config = bot()?.config;
-    if (config && !configDraft()) {
+    if (config && (!configDraft() || configDraft()?.symbol !== config.symbol)) {
       setConfigDraft(structuredClone(config));
     }
   });
@@ -80,6 +108,18 @@ export function App() {
       throw new Error(`State request failed: ${response.status}`);
     }
     setSnapshot((await response.json()) as RuntimeSnapshot);
+  };
+
+  const loadMarkets = async (refresh = false) => {
+    setMarketError(undefined);
+    const response = await fetch(`${apiBase}/api/markets${refresh ? "?refresh=1" : ""}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      setMarketError(payload.error ?? "Market list request failed");
+      return;
+    }
+
+    setMarketCatalog(payload as BinanceMarketCatalog);
   };
 
   const connect = () => {
@@ -114,17 +154,79 @@ export function App() {
     }
   };
 
+  const selectMarket = async (marketId: string) => {
+    if (!marketId || marketId === market()?.id || switchingMarketId()) {
+      return;
+    }
+
+    const listing = marketCatalog()?.markets.find((item) => item.id === marketId);
+    if (listing && !listing.supportsLiveStream) {
+      setMarketError(listing.unavailableReason ?? "This market is not live-streamable yet.");
+      return;
+    }
+
+    setMarketError(undefined);
+    setSwitchingMarketId(marketId);
+    const response = await fetch(`${apiBase}/api/market`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ marketId }),
+    });
+    const payload = await response.json();
+    setSwitchingMarketId(undefined);
+    if (!response.ok) {
+      setMarketError(payload.error ?? "Market switch failed");
+      return;
+    }
+
+    const nextSnapshot = payload as RuntimeSnapshot;
+    setSnapshot(nextSnapshot);
+    setConfigDraft(structuredClone(nextSnapshot.bot.config));
+  };
+
   const runBacktest = async () => {
     setBacktestError(undefined);
+    const preset = backtestPreset();
+    const settings = backtestSettings();
+    const body: {
+      preset: BacktestSelection;
+      limit: number;
+      historicalDays?: number;
+      randomSampleCount?: number;
+      randomWindowDays?: number;
+      randomMinWindowDays?: number;
+      randomMaxWindowDays?: number;
+      randomLookbackDays?: number;
+    } = {
+      preset,
+      limit: preset === "saved-orderbook" ? 3_000 : 1_000,
+    };
+
+    if (preset === "last-x") {
+      body.historicalDays = settings.historicalDays;
+    }
+
+    if (preset === "random-windows") {
+      body.randomSampleCount = settings.randomSampleCount;
+      body.randomWindowDays = settings.randomWindowDays;
+      body.randomLookbackDays = settings.randomLookbackDays;
+    }
+
+    if (preset === "random-length-windows") {
+      body.randomSampleCount = settings.randomSampleCount;
+      body.randomMinWindowDays = settings.randomMinWindowDays;
+      body.randomMaxWindowDays = settings.randomMaxWindowDays;
+      body.randomLookbackDays = settings.randomLookbackDays;
+    }
+
     const response = await fetch(`${apiBase}/api/backtest`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({
-        preset: backtestPreset(),
-        limit: backtestPreset() === "saved-orderbook" ? 3_000 : 1_000,
-      }),
+      body: JSON.stringify(body),
     });
     const payload = await response.json();
     if (!response.ok) {
@@ -178,8 +280,35 @@ export function App() {
     return true;
   };
 
+  const updateBacktestSetting = <K extends keyof BacktestSettings>(
+    key: K,
+    value: BacktestSettings[K],
+  ) => {
+    setBacktestSettings((current) => {
+      const next = {
+        ...current,
+        [key]: value,
+      };
+
+      if (key === "randomMinWindowDays" && next.randomMaxWindowDays < value) {
+        next.randomMaxWindowDays = value;
+      }
+      if (
+        (key === "randomMinWindowDays" || key === "randomMaxWindowDays") &&
+        next.randomLookbackDays < next.randomMaxWindowDays
+      ) {
+        next.randomLookbackDays = next.randomMaxWindowDays;
+      }
+
+      return next;
+    });
+  };
+
   onMount(() => {
     void loadInitial().catch(() => setConnection("offline"));
+    void loadMarkets().catch((error) =>
+      setMarketError(error instanceof Error ? error.message : "Market list request failed"),
+    );
     connect();
   });
 
@@ -194,17 +323,25 @@ export function App() {
     <main class="min-h-screen bg-ink-950 text-ink-100">
       <div class="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-4 lg:px-6">
         <header class="flex flex-col gap-3 border-b border-line pb-4 lg:flex-row lg:items-center lg:justify-between">
-          <div class="flex flex-wrap items-center gap-3">
-            <div>
-              <div class="muted-label">Trading Pair</div>
-              <h1 class="text-2xl font-semibold tabular-nums">{market()?.symbol ?? "BTCUSDT"}</h1>
-            </div>
-            <StatusPill label={connection()} active={connection() === "live"} />
-            <StatusPill
-              label={market()?.connected ? "Binance live" : "Binance offline"}
-              active={Boolean(market()?.connected)}
+          <div class="flex min-w-0 flex-col gap-3">
+            <AssetSelector
+              catalog={marketCatalog()}
+              selectedMarketId={market()?.id}
+              selectedSymbol={market()?.symbol ?? "BTCUSDT"}
+              disabled={Boolean(switchingMarketId())}
+              error={marketError()}
+              onSelect={(marketId) => void selectMarket(marketId)}
+              onRefresh={() => void loadMarkets(true)}
             />
-            <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
+            <div class="flex flex-wrap items-center gap-2">
+              <StatusPill label={market()?.venue ?? "spot"} active />
+              <StatusPill label={connection()} active={connection() === "live"} />
+              <StatusPill
+                label={market()?.connected ? "Binance live" : "Binance offline"}
+                active={Boolean(market()?.connected)}
+              />
+              <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
+            </div>
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
@@ -224,7 +361,10 @@ export function App() {
         </header>
 
         <section class="grid grid-cols-2 gap-3 lg:grid-cols-6">
-          <MetricCard label="Last Price" value={`$${formatQuote(market()?.lastPrice, 2)}`} />
+          <MetricCard
+            label="Last Price"
+            value={`${formatQuote(market()?.lastPrice, 2)} ${market()?.quoteAsset ?? "USDT"}`}
+          />
           <MetricCard label="Equity" value={`$${formatQuote(metrics()?.equity, 2)}`} />
           <MetricCard
             label="Return"
@@ -292,6 +432,8 @@ export function App() {
         <BacktestPanel
           preset={backtestPreset()}
           onPresetChange={setBacktestPreset}
+          settings={backtestSettings()}
+          onSettingChange={updateBacktestSetting}
           progress={backtest()}
           error={backtestError()}
           onRun={() => void runBacktest()}
@@ -341,6 +483,165 @@ function StatusPill(props: { label: string; active: boolean }) {
       {props.label}
     </span>
   );
+}
+
+const marketGroupFilters: Array<MarketGroup | "all"> = [
+  "all",
+  "spot",
+  "bstocks",
+  "futures",
+  "tradfi",
+  "options",
+  "predictions",
+];
+
+function AssetSelector(props: {
+  catalog?: BinanceMarketCatalog;
+  selectedMarketId?: string;
+  selectedSymbol: string;
+  disabled?: boolean;
+  error?: string;
+  onSelect: (marketId: string) => void;
+  onRefresh: () => void;
+}) {
+  const [query, setQuery] = createSignal("");
+  const [group, setGroup] = createSignal<MarketGroup | "all">("all");
+  const selected = createMemo(() =>
+    props.catalog?.markets.find((market) => market.id === props.selectedMarketId),
+  );
+  const filteredMarkets = createMemo(() => {
+    const normalizedQuery = query().trim().toLowerCase();
+    const selectedMarket = selected();
+    const filtered =
+      props.catalog?.markets.filter((market) => {
+        if (group() !== "all" && market.group !== group()) {
+          return false;
+        }
+        if (normalizedQuery && !market.searchable.includes(normalizedQuery)) {
+          return false;
+        }
+        return true;
+      }) ?? [];
+
+    if (selectedMarket && !filtered.some((market) => market.id === selectedMarket.id)) {
+      return [selectedMarket, ...filtered];
+    }
+
+    return filtered;
+  });
+  const countForGroup = (value: MarketGroup | "all") =>
+    value === "all"
+      ? props.catalog?.markets.length ?? 0
+      : props.catalog?.counts[value] ?? 0;
+
+  return (
+    <div class="min-w-0 lg:min-w-150">
+      <div class="flex items-center justify-between gap-3">
+        <div class="min-w-0">
+          <div class="muted-label">Asset</div>
+          <h1 class="truncate text-2xl font-semibold tabular-nums">
+            {selected()?.displaySymbol ?? props.selectedSymbol}
+          </h1>
+        </div>
+        <button class="btn px-2.5" onClick={props.onRefresh} disabled={props.disabled}>
+          <RefreshCw size={16} />
+        </button>
+      </div>
+
+      <div class="mt-2 flex flex-wrap gap-1.5">
+        <For each={marketGroupFilters}>
+          {(item) => (
+            <button
+              class="rounded-2 border px-2.5 py-1 text-xs uppercase tracking-wide transition"
+              classList={{
+                "border-accent bg-accent/18 text-ink-100": group() === item,
+                "border-line bg-ink-800 text-ink-300 hover:border-accent": group() !== item,
+              }}
+              onClick={() => setGroup(item)}
+              type="button"
+            >
+              {marketGroupLabel(item)} {countForGroup(item)}
+            </button>
+          )}
+        </For>
+      </div>
+
+      <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,240px)_minmax(0,1fr)]">
+        <label class="relative min-w-0">
+          <span class="sr-only">Search markets</span>
+          <Search size={15} class="pointer-events-none absolute left-2.5 top-2.5 text-ink-300" />
+          <input
+            class="w-full rounded-2 border border-line bg-ink-800 py-2 pl-8 pr-2 text-sm text-ink-100"
+            value={query()}
+            placeholder="Search BTC, TSLA, XAU..."
+            onInput={(event) => setQuery(event.currentTarget.value)}
+          />
+        </label>
+        <select
+          class="w-full rounded-2 border border-line bg-ink-800 px-3 py-2 text-sm text-ink-100 disabled:opacity-60"
+          value={props.selectedMarketId ?? ""}
+          disabled={props.disabled || !props.catalog}
+          onInput={(event) => props.onSelect(event.currentTarget.value)}
+        >
+          <Show when={props.catalog} fallback={<option value="">Loading Binance markets...</option>}>
+            <For each={filteredMarkets()}>
+              {(market) => (
+                <option
+                  value={market.id}
+                  disabled={!market.supportsLiveStream}
+                  title={market.unavailableReason}
+                >
+                  {marketOptionLabel(market)}
+                </option>
+              )}
+            </For>
+          </Show>
+        </select>
+      </div>
+
+      <Show when={props.error ?? firstCatalogWarning(props.catalog)}>
+        {(message) => <div class="mt-2 text-xs text-warn">{message()}</div>}
+      </Show>
+    </div>
+  );
+}
+
+function firstCatalogWarning(catalog: BinanceMarketCatalog | undefined): string | undefined {
+  return catalog?.warnings[0];
+}
+
+function marketGroupLabel(group: MarketGroup | "all"): string {
+  if (group === "all") {
+    return "All";
+  }
+  if (group === "tradfi") {
+    return "TradFi";
+  }
+  if (group === "bstocks") {
+    return "bStocks";
+  }
+
+  return group[0].toUpperCase() + group.slice(1);
+}
+
+function marketOptionLabel(market: BinanceMarketListing): string {
+  const unavailable = market.supportsLiveStream ? "" : " unavailable";
+  const contract = market.contractType ? ` ${market.contractType.replace("_", " ")}` : "";
+  return `${market.displaySymbol} | ${venueLabel(market.venue)} | ${market.symbol}${contract}${unavailable}`;
+}
+
+function venueLabel(venue: BinanceMarketListing["venue"]): string {
+  if (venue === "usdm-futures") {
+    return "USD-M";
+  }
+  if (venue === "coinm-futures") {
+    return "COIN-M";
+  }
+  if (venue === "predictions") {
+    return "Prediction";
+  }
+
+  return venue[0].toUpperCase() + venue.slice(1);
 }
 
 function AlgorithmPanel(props: {
@@ -1301,6 +1602,11 @@ function EventsPanel(props: { events: BotEvent[] }) {
 function BacktestPanel(props: {
   preset: BacktestSelection;
   onPresetChange: (preset: BacktestSelection) => void;
+  settings: BacktestSettings;
+  onSettingChange: <K extends keyof BacktestSettings>(
+    key: K,
+    value: BacktestSettings[K],
+  ) => void;
   progress?: BacktestProgressSnapshot;
   error?: string;
   onRun: () => void;
@@ -1336,9 +1642,12 @@ function BacktestPanel(props: {
           >
             <option value="saved-candles">Saved candles</option>
             <option value="saved-orderbook">Saved order book</option>
+            <option value="last-x">Last X days</option>
             <option value="week">Last week</option>
             <option value="month">Last month</option>
             <option value="year">Last year</option>
+            <option value="random-windows">Random weeks</option>
+            <option value="random-length-windows">Random lengths</option>
           </select>
           <button class="btn-primary" disabled={isRunning()} onClick={props.onRun}>
             <RefreshCw size={16} class={isRunning() ? "animate-spin" : ""} />
@@ -1346,6 +1655,85 @@ function BacktestPanel(props: {
           </button>
         </div>
       </div>
+
+      <Show when={props.preset === "last-x"}>
+        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-3">
+          <BacktestNumberInput
+            label="Days"
+            value={props.settings.historicalDays}
+            min={1}
+            max={3650}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("historicalDays", value)}
+          />
+        </div>
+      </Show>
+
+      <Show when={props.preset === "random-windows"}>
+        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-3">
+          <BacktestNumberInput
+            label="Samples"
+            value={props.settings.randomSampleCount}
+            min={1}
+            max={200}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomSampleCount", value)}
+          />
+          <BacktestNumberInput
+            label="Window Days"
+            value={props.settings.randomWindowDays}
+            min={1}
+            max={365}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomWindowDays", value)}
+          />
+          <BacktestNumberInput
+            label="Lookback Days"
+            value={props.settings.randomLookbackDays}
+            min={1}
+            max={3650}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomLookbackDays", value)}
+          />
+        </div>
+      </Show>
+
+      <Show when={props.preset === "random-length-windows"}>
+        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-2 xl:grid-cols-4">
+          <BacktestNumberInput
+            label="Samples"
+            value={props.settings.randomSampleCount}
+            min={1}
+            max={200}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomSampleCount", value)}
+          />
+          <BacktestNumberInput
+            label="Min Days"
+            value={props.settings.randomMinWindowDays}
+            min={1}
+            max={365}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomMinWindowDays", value)}
+          />
+          <BacktestNumberInput
+            label="Max Days"
+            value={props.settings.randomMaxWindowDays}
+            min={Math.max(1, props.settings.randomMinWindowDays)}
+            max={365}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomMaxWindowDays", value)}
+          />
+          <BacktestNumberInput
+            label="Lookback Days"
+            value={props.settings.randomLookbackDays}
+            min={Math.max(1, props.settings.randomMaxWindowDays)}
+            max={3650}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomLookbackDays", value)}
+          />
+        </div>
+      </Show>
 
       <Show when={error()}>
         {(message) => (
@@ -1392,6 +1780,37 @@ function BacktestPanel(props: {
             )}/s`}
           />
           <SmallMetric label="Drawdown" value={formatPercent(summary()?.maxDrawdownPct)} />
+          <Show when={summary()?.sampleCount ?? props.progress?.sampleCount}>
+            <SmallMetric
+              label="Samples"
+              value={`${formatQuote(
+                summary()?.samplesProcessed ?? props.progress?.currentSample,
+                0,
+              )} / ${formatQuote(summary()?.sampleCount ?? props.progress?.sampleCount, 0)}`}
+            />
+            <SmallMetric label="Best" value={formatPercent(summary()?.bestReturnPct)} />
+            <SmallMetric label="Worst" value={formatPercent(summary()?.worstReturnPct)} />
+            <SmallMetric
+              label="Profit/day"
+              value={`$${formatQuote(
+                summary()?.netPnlPerDay ?? props.progress?.netPnlPerDay,
+                2,
+              )}`}
+            />
+            <SmallMetric
+              label="Return/day"
+              value={formatPercent(
+                summary()?.returnPctPerDay ?? props.progress?.returnPctPerDay,
+              )}
+            />
+            <SmallMetric
+              label="Profitable"
+              value={`${formatQuote(summary()?.profitableSamples, 0)} / ${formatQuote(
+                summary()?.sampleCount,
+                0,
+              )}`}
+            />
+          </Show>
           <SmallMetric label="Requests" value={formatQuote(props.progress?.requests, 0)} />
           <SmallMetric
             label="Survived"
@@ -1433,11 +1852,60 @@ function BacktestPanel(props: {
             <Show when={item().stopReason}>
               <span>{item().stopReason}</span>
             </Show>
+            <Show when={item().sampleCount}>
+              <span>
+                avg of {formatQuote(item().sampleCount, 0)} x{" "}
+                {item().sampleWindowMs
+                  ? formatDuration(item().sampleWindowMs)
+                  : `${formatDuration(item().sampleMinWindowMs)}-${formatDuration(
+                      item().sampleMaxWindowMs,
+                    )}`}{" "}
+                windows
+              </span>
+            </Show>
           </div>
         )}
       </Show>
     </section>
   );
+}
+
+function BacktestNumberInput(props: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled?: boolean;
+  onChange: (value: number) => void;
+}) {
+  const handleInput = (rawValue: string) => {
+    const value = Number(rawValue);
+    if (!Number.isFinite(value)) {
+      return;
+    }
+
+    props.onChange(clampNumber(Math.round(value), props.min, props.max));
+  };
+
+  return (
+    <label class="block min-w-0">
+      <span class="muted-label">{props.label}</span>
+      <input
+        class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100 tabular-nums disabled:opacity-60"
+        type="number"
+        min={props.min}
+        max={props.max}
+        step={1}
+        value={props.value}
+        disabled={props.disabled}
+        onInput={(event) => handleInput(event.currentTarget.value)}
+      />
+    </label>
+  );
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function Side(props: { side: "buy" | "sell" }) {

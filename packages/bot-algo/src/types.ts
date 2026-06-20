@@ -13,9 +13,12 @@ export type StrategyAlgorithm = "moving-average" | "legacy-valley-peak";
 export type BacktestPreset =
   | "saved-candles"
   | "saved-orderbook"
+  | "last-x"
   | "week"
   | "month"
-  | "year";
+  | "year"
+  | "random-windows"
+  | "random-length-windows";
 
 export type BacktestRunStatus = "idle" | "running" | "completed" | "failed";
 
@@ -335,6 +338,22 @@ export interface BacktestSummary {
   cacheSizeBytes?: number;
   cacheEvictedBytes?: number;
   cacheEvictedFiles?: number;
+  sampleCount?: number;
+  samplesProcessed?: number;
+  sampleWindowMs?: number;
+  sampleMinWindowMs?: number;
+  sampleMaxWindowMs?: number;
+  sampleLookbackMs?: number;
+  profitableSamples?: number;
+  wipedOutSamples?: number;
+  bestReturnPct?: number;
+  worstReturnPct?: number;
+  netPnlPerDay?: number;
+  returnPctPerDay?: number;
+  bestNetPnlPerDay?: number;
+  worstNetPnlPerDay?: number;
+  bestReturnPctPerDay?: number;
+  worstReturnPctPerDay?: number;
   stoppedEarly?: boolean;
   stopReason?: BacktestStopReason;
   survivedMs?: number;
@@ -349,6 +368,26 @@ export interface BacktestSummary {
   winRate: number;
 }
 
+export interface BacktestSampleSummary {
+  index: number;
+  startTime: number;
+  endTime: number;
+  durationMs: number;
+  eventsProcessed: number;
+  candlesProcessed?: number;
+  finalEquity: number;
+  netPnl: number;
+  returnPct: number;
+  netPnlPerDay: number;
+  returnPctPerDay: number;
+  maxDrawdownPct: number;
+  tradeCount: number;
+  winRate: number;
+  stoppedEarly?: boolean;
+  stopReason?: BacktestStopReason;
+  survivedMs?: number;
+}
+
 export interface EquityPoint {
   time: number;
   equity: number;
@@ -361,6 +400,7 @@ export interface BacktestResult {
   orders: TradingOrder[];
   fills: TradeFill[];
   finalState: PaperBotState;
+  samples?: BacktestSampleSummary[];
 }
 
 export interface BacktestProgressSnapshot {
@@ -383,6 +423,14 @@ export interface BacktestProgressSnapshot {
   cacheSizeBytes?: number;
   cacheEvictedBytes?: number;
   cacheEvictedFiles?: number;
+  currentSample?: number;
+  sampleCount?: number;
+  sampleWindowMs?: number;
+  sampleMinWindowMs?: number;
+  sampleMaxWindowMs?: number;
+  sampleLookbackMs?: number;
+  netPnlPerDay?: number;
+  returnPctPerDay?: number;
   percent: number;
   equity: number;
   returnPct: number;

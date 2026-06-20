@@ -6,6 +6,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface HistoricalCandleCacheOptions {
   dataDir: string;
+  marketKey: string;
   symbol: string;
   interval: string;
   intervalMs: number;
@@ -39,6 +40,7 @@ export class HistoricalCandleCache {
     this.rootDir = path.join(
       options.dataDir,
       "historical",
+      safePathPart(options.marketKey),
       safePathPart(options.symbol),
       safePathPart(options.interval),
     );

@@ -10,6 +10,7 @@ import type {
 export class TradingStorage {
   constructor(
     private readonly dataDir: string,
+    private readonly marketKey: string,
     private readonly symbol: string,
     private readonly interval: string,
   ) {}
@@ -54,7 +55,7 @@ export class TradingStorage {
   }
 
   private get marketDir(): string {
-    return path.join(this.dataDir, "market");
+    return path.join(this.dataDir, "market", safePathPart(this.marketKey));
   }
 
   private get stateDir(): string {
@@ -62,7 +63,7 @@ export class TradingStorage {
   }
 
   private get backtestDir(): string {
-    return path.join(this.dataDir, "backtests");
+    return path.join(this.dataDir, "backtests", safePathPart(this.marketKey));
   }
 
   private get candlePath(): string {
@@ -77,8 +78,15 @@ export class TradingStorage {
   }
 
   private get botStatePath(): string {
-    return path.join(this.stateDir, `paper-bot-${this.symbol.toLowerCase()}.json`);
+    return path.join(
+      this.stateDir,
+      `paper-bot-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
+    );
   }
+}
+
+function safePathPart(value: string): string {
+  return value.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
 }
 
 async function readJson<T>(filePath: string): Promise<T | undefined> {

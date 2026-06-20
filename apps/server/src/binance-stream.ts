@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import type { Candle, OrderBookSnapshot, PriceTick } from "@trading/bot-algo";
+import type { StreamVenue } from "./binance-markets.js";
 
 export interface MarketStreamStatus {
   connected: boolean;
@@ -15,17 +16,37 @@ export interface MarketStreamHandlers {
   onStatus: (status: MarketStreamStatus) => void;
 }
 
-export class BinanceMarketStream {
-  private socket?: WebSocket;
-  private reconnectTimer?: NodeJS.Timeout;
-  private reconnectAttempt = 0;
-  private stopped = true;
+export interface BinanceMarketStreamOptions {
+  symbol: string;
+  venue: StreamVenue;
+  interval: string;
+  handlers: MarketStreamHandlers;
+}
 
-  constructor(
-    private readonly streamSymbol: string,
-    private readonly interval: string,
-    private readonly handlers: MarketStreamHandlers,
-  ) {}
+interface StreamSocketSpec {
+  label: string;
+  url: string;
+}
+
+export class BinanceMarketStream {
+  private sockets = new Map<string, WebSocket>();
+  private reconnectTimers = new Map<string, NodeJS.Timeout>();
+  private reconnectAttempts = new Map<string, number>();
+  private openSockets = new Set<string>();
+  private stopped = true;
+  private readonly symbol: string;
+  private readonly streamSymbol: string;
+  private readonly venue: StreamVenue;
+  private readonly interval: string;
+  private readonly handlers: MarketStreamHandlers;
+
+  constructor(options: BinanceMarketStreamOptions) {
+    this.symbol = options.symbol.toUpperCase();
+    this.streamSymbol = options.symbol.toLowerCase();
+    this.venue = options.venue;
+    this.interval = options.interval;
+    this.handlers = options.handlers;
+  }
 
   start(): void {
     if (!this.stopped) {
@@ -33,73 +54,67 @@ export class BinanceMarketStream {
     }
 
     this.stopped = false;
-    this.connect();
+    for (const spec of this.buildSocketSpecs()) {
+      this.connect(spec);
+    }
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+    for (const timer of this.reconnectTimers.values()) {
+      clearTimeout(timer);
     }
 
-    this.socket?.close();
-    this.socket = undefined;
+    this.reconnectTimers.clear();
+    this.reconnectAttempts.clear();
+    this.openSockets.clear();
+
+    for (const socket of this.sockets.values()) {
+      socket.close();
+    }
+    this.sockets.clear();
   }
 
-  private connect(): void {
-    const streams = [
-      `${this.streamSymbol}@trade`,
-      `${this.streamSymbol}@kline_${this.interval}`,
-      `${this.streamSymbol}@depth10@1000ms`,
-    ].join("/");
-    const url = `wss://stream.binance.com:9443/stream?streams=${streams}`;
+  private connect(spec: StreamSocketSpec): void {
+    const socket = new WebSocket(spec.url);
+    this.sockets.set(spec.label, socket);
 
-    this.socket = new WebSocket(url);
-
-    this.socket.on("open", () => {
-      this.reconnectAttempt = 0;
-      this.handlers.onStatus({
-        connected: true,
-        message: "Connected to Binance market streams",
-        lastEventAt: Date.now(),
-        reconnectAttempt: this.reconnectAttempt,
-      });
+    socket.on("open", () => {
+      this.openSockets.add(spec.label);
+      this.reconnectAttempts.set(spec.label, 0);
+      this.emitStatus(`Connected to Binance ${this.venue} ${spec.label} stream`);
     });
 
-    this.socket.on("message", (raw) => {
+    socket.on("message", (raw) => {
       this.handleMessage(raw.toString());
     });
 
-    this.socket.on("close", () => {
-      this.handlers.onStatus({
-        connected: false,
-        message: "Binance stream closed",
-        lastEventAt: Date.now(),
-        reconnectAttempt: this.reconnectAttempt,
-      });
-      this.scheduleReconnect();
+    socket.on("close", () => {
+      this.openSockets.delete(spec.label);
+      this.emitStatus(`Binance ${this.venue} ${spec.label} stream closed`);
+      this.scheduleReconnect(spec);
     });
 
-    this.socket.on("error", (error) => {
-      this.handlers.onStatus({
-        connected: false,
-        message: `Binance stream error: ${error.message}`,
-        lastEventAt: Date.now(),
-        reconnectAttempt: this.reconnectAttempt,
-      });
+    socket.on("error", (error) => {
+      this.openSockets.delete(spec.label);
+      this.emitStatus(`Binance ${this.venue} ${spec.label} stream error: ${error.message}`);
     });
   }
 
   private handleMessage(raw: string): void {
     const payload = JSON.parse(raw) as { stream?: string; data?: unknown };
-    const stream = payload.stream ?? "";
+    const stream = (payload.stream ?? "").toLowerCase();
     const data = payload.data as Record<string, unknown> | undefined;
 
     if (!data) {
       return;
     }
 
-    if (stream.includes("@trade")) {
+    if (
+      stream.includes("@trade") ||
+      stream.includes("@aggtrade") ||
+      stream.includes("@optiontrade")
+    ) {
       const tick = parseTrade(data);
       if (tick) {
         void this.handlers.onTick(tick);
@@ -116,21 +131,99 @@ export class BinanceMarketStream {
     }
 
     if (stream.includes("@depth")) {
-      const snapshot = parseDepth(this.streamSymbol.toUpperCase(), data);
+      const snapshot = parseDepth(this.symbol, data);
       if (snapshot) {
         void this.handlers.onOrderBook(snapshot);
       }
     }
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(spec: StreamSocketSpec): void {
     if (this.stopped) {
       return;
     }
 
-    this.reconnectAttempt += 1;
-    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(5, this.reconnectAttempt));
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    const reconnectAttempt = (this.reconnectAttempts.get(spec.label) ?? 0) + 1;
+    this.reconnectAttempts.set(spec.label, reconnectAttempt);
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(5, reconnectAttempt));
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(spec.label);
+      this.connect(spec);
+    }, delay);
+    this.reconnectTimers.set(spec.label, timer);
+  }
+
+  private emitStatus(message: string): void {
+    const expectedSockets = this.buildSocketSpecs().length;
+    const reconnectAttempt = Math.max(0, ...this.reconnectAttempts.values());
+    this.handlers.onStatus({
+      connected: this.openSockets.size > 0 && this.openSockets.size === expectedSockets,
+      message,
+      lastEventAt: Date.now(),
+      reconnectAttempt,
+    });
+  }
+
+  private buildSocketSpecs(): StreamSocketSpec[] {
+    const depthStream = `${this.streamSymbol}@depth10@500ms`;
+    const spotDepthStream = `${this.streamSymbol}@depth10@1000ms`;
+    const klineStream = `${this.streamSymbol}@kline_${this.interval}`;
+
+    if (this.venue === "spot") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://stream.binance.com:9443", [
+            `${this.streamSymbol}@trade`,
+            klineStream,
+            spotDepthStream,
+          ]),
+        },
+      ];
+    }
+
+    if (this.venue === "usdm-futures") {
+      return [
+        {
+          label: "market",
+          url: combinedStreamUrl("wss://fstream.binance.com/market", [
+            `${this.streamSymbol}@aggTrade`,
+            klineStream,
+          ]),
+        },
+        {
+          label: "public",
+          url: combinedStreamUrl("wss://fstream.binance.com/public", [depthStream]),
+        },
+      ];
+    }
+
+    if (this.venue === "coinm-futures") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://dstream.binance.com", [
+            `${this.streamSymbol}@aggTrade`,
+            klineStream,
+            depthStream,
+          ]),
+        },
+      ];
+    }
+
+    return [
+      {
+        label: "market",
+        url: combinedStreamUrl("wss://fstream.binance.com/market", [klineStream]),
+      },
+      {
+        label: "public",
+        url: combinedStreamUrl("wss://fstream.binance.com/public", [
+          `${this.streamSymbol}@optionTrade`,
+          depthStream,
+        ]),
+      },
+    ];
   }
 }
 
@@ -181,8 +274,8 @@ function parseDepth(
   symbol: string,
   data: Record<string, unknown>,
 ): OrderBookSnapshot | undefined {
-  const rawBids = data.bids as [string, string][] | undefined;
-  const rawAsks = data.asks as [string, string][] | undefined;
+  const rawBids = (data.bids ?? data.b) as [string, string][] | undefined;
+  const rawAsks = (data.asks ?? data.a) as [string, string][] | undefined;
 
   if (!rawBids?.length || !rawAsks?.length) {
     return undefined;
@@ -200,4 +293,8 @@ function parseDepth(
       quantity: Number(quantity),
     })),
   };
+}
+
+function combinedStreamUrl(baseUrl: string, streams: string[]): string {
+  return `${baseUrl}/stream?streams=${streams.join("/")}`;
 }

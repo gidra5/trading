@@ -6,6 +6,12 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type { BacktestPreset, ManualTradeInput, StrategyConfig } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
+import {
+  BinanceMarketCatalog,
+  getMarketStorageKey,
+  isStreamVenue,
+  type BinanceMarketListing,
+} from "./binance-markets.js";
 import { TradingRuntime } from "./runtime.js";
 import { TradingStorage } from "./storage.js";
 
@@ -26,25 +32,60 @@ if (fs.existsSync(appConfig.webDistDir)) {
   });
 }
 
-const storage = new TradingStorage(
-  appConfig.dataDir,
-  appConfig.symbol,
-  appConfig.interval,
-);
-const runtime = new TradingRuntime(storage, appConfig.strategy, appConfig.interval, {
-  dataDir: appConfig.dataDir,
-  maxBytes: appConfig.historicalCache.maxBytes,
-  minFreeBytes: appConfig.historicalCache.minFreeBytes,
+const marketCatalog = new BinanceMarketCatalog({
+  apiKey: appConfig.binanceApiKey,
 });
+const runtime = new TradingRuntime(
+  createStorage(appConfig.market),
+  appConfig.market,
+  appConfig.strategy,
+  appConfig.interval,
+  {
+    dataDir: appConfig.dataDir,
+    maxBytes: appConfig.historicalCache.maxBytes,
+    minFreeBytes: appConfig.historicalCache.minFreeBytes,
+  },
+);
 await runtime.init();
 
 server.get("/health", async () => ({
   ok: true,
-  symbol: appConfig.symbol,
+  market: appConfig.market.id,
+  symbol: appConfig.market.symbol,
   dataDir: appConfig.dataDir,
 }));
 
 server.get("/api/state", async () => runtime.snapshot());
+
+server.get("/api/markets", async (request) => {
+  const query = request.query as { refresh?: string };
+  return marketCatalog.list(query.refresh === "1" || query.refresh === "true");
+});
+
+server.post("/api/market", async (request, reply) => {
+  const body = (request.body ?? {}) as { marketId?: string };
+  if (!body.marketId) {
+    return reply.code(400).send({ error: "marketId is required." });
+  }
+
+  const market = await marketCatalog.find(body.marketId);
+  if (!market) {
+    return reply.code(404).send({ error: "Market is not listed by Binance." });
+  }
+  if (!market.supportsLiveStream || !isStreamVenue(market.venue)) {
+    return reply.code(400).send({
+      error: market.unavailableReason ?? "This market is not supported by the live dashboard yet.",
+    });
+  }
+
+  streamGeneration += 1;
+  stream.stop();
+  await runtime.switchMarket(market, createStorage(market));
+  stream = createStream(market, streamGeneration);
+  stream.start();
+  broadcastState();
+  return runtime.snapshot();
+});
 
 server.get("/api/history", async (request) => {
   const query = request.query as { limit?: string };
@@ -97,6 +138,12 @@ server.post("/api/backtest", async (request, reply) => {
     source?: "candles" | "orderbook-mid";
     limit?: number;
     startingQuote?: number;
+    historicalDays?: number;
+    randomSampleCount?: number;
+    randomWindowDays?: number;
+    randomMinWindowDays?: number;
+    randomMaxWindowDays?: number;
+    randomLookbackDays?: number;
   };
   const preset =
     body.preset ??
@@ -107,6 +154,30 @@ server.post("/api/backtest", async (request, reply) => {
       preset,
       limit: clampInt(Number(body.limit ?? 1_000), 10, 10_000),
       startingQuote: body.startingQuote,
+      historicalDays:
+        body.historicalDays === undefined
+          ? undefined
+          : clampInt(Number(body.historicalDays), 1, 3650),
+      randomSampleCount:
+        body.randomSampleCount === undefined
+          ? undefined
+          : clampInt(Number(body.randomSampleCount), 1, 200),
+      randomWindowDays:
+        body.randomWindowDays === undefined
+          ? undefined
+          : clampInt(Number(body.randomWindowDays), 1, 365),
+      randomMinWindowDays:
+        body.randomMinWindowDays === undefined
+          ? undefined
+          : clampInt(Number(body.randomMinWindowDays), 1, 365),
+      randomMaxWindowDays:
+        body.randomMaxWindowDays === undefined
+          ? undefined
+          : clampInt(Number(body.randomMaxWindowDays), 1, 365),
+      randomLookbackDays:
+        body.randomLookbackDays === undefined
+          ? undefined
+          : clampInt(Number(body.randomLookbackDays), 1, 3650),
     }, broadcastState);
     broadcastState();
     return runtime.snapshot();
@@ -123,32 +194,63 @@ server.setErrorHandler((error, _request, reply) => {
   });
 });
 
-const stream = new BinanceMarketStream(
-  appConfig.streamSymbol,
-  appConfig.interval,
-  {
-    onStatus: (status) => {
-      runtime.handleStatus(status);
-      scheduleBroadcast();
-    },
-    onTick: async (tick) => {
-      const events = await runtime.handleTick(tick);
-      if (events.length > 0) {
-        broadcastState();
-      } else {
+let streamGeneration = 0;
+let stream = createStream(appConfig.market, streamGeneration);
+
+function createStream(market: BinanceMarketListing, generation: number): BinanceMarketStream {
+  if (!isStreamVenue(market.venue)) {
+    throw new Error(`${market.displaySymbol} is not a streamable Binance market.`);
+  }
+
+  return new BinanceMarketStream({
+    symbol: market.symbol,
+    venue: market.venue,
+    interval: appConfig.interval,
+    handlers: {
+      onStatus: (status) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        runtime.handleStatus(status);
         scheduleBroadcast();
-      }
+      },
+      onTick: async (tick) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        const events = await runtime.handleTick(tick);
+        if (events.length > 0) {
+          broadcastState();
+        } else {
+          scheduleBroadcast();
+        }
+      },
+      onCandle: async (candle) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        await runtime.handleCandle(candle);
+        scheduleBroadcast();
+      },
+      onOrderBook: async (snapshot) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        await runtime.handleOrderBook(snapshot);
+        scheduleBroadcast();
+      },
     },
-    onCandle: async (candle) => {
-      await runtime.handleCandle(candle);
-      scheduleBroadcast();
-    },
-    onOrderBook: async (snapshot) => {
-      await runtime.handleOrderBook(snapshot);
-      scheduleBroadcast();
-    },
-  },
-);
+  });
+}
+
+function createStorage(market: BinanceMarketListing): TradingStorage {
+  return new TradingStorage(
+    appConfig.dataDir,
+    getMarketStorageKey(market),
+    market.symbol,
+    appConfig.interval,
+  );
+}
 
 const address = await server.listen({
   host: appConfig.host,
@@ -211,6 +313,7 @@ function clampInt(value: number, min: number, max: number): number {
 }
 
 async function shutdown(): Promise<void> {
+  streamGeneration += 1;
   stream.stop();
   await runtime.flushState();
   await server.close();

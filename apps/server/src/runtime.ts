@@ -19,6 +19,7 @@ import {
   type TradingOrder,
 } from "@trading/bot-algo";
 import type { MarketStreamStatus } from "./binance-stream.js";
+import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
 import { runHistoricalCandleBacktest } from "./historical-backtest.js";
 import type { TradingStorage } from "./storage.js";
 
@@ -26,9 +27,27 @@ const PUBLIC_ORDER_LIMIT = 500;
 const PUBLIC_FILL_LIMIT = 500;
 const PUBLIC_PRICE_MEMORY_LIMIT = 100;
 
+interface BacktestStartOptions {
+  preset: BacktestPreset;
+  limit: number;
+  startingQuote?: number;
+  historicalDays?: number;
+  randomSampleCount?: number;
+  randomWindowDays?: number;
+  randomMinWindowDays?: number;
+  randomMaxWindowDays?: number;
+  randomLookbackDays?: number;
+}
+
 export interface RuntimeSnapshot {
   market: {
+    id: string;
+    group: string;
+    venue: string;
     symbol: string;
+    displaySymbol: string;
+    baseAsset: string;
+    quoteAsset: string;
     interval: string;
     connected: boolean;
     statusMessage: string;
@@ -60,7 +79,8 @@ export class TradingRuntime {
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
 
   constructor(
-    private readonly storage: TradingStorage,
+    private storage: TradingStorage,
+    private market: BinanceMarketListing,
     private config: StrategyConfig,
     private readonly interval: string,
     private readonly historicalCache: {
@@ -74,14 +94,33 @@ export class TradingRuntime {
     await this.storage.ensureReady();
     this.candles = await this.storage.loadCandles(500);
     const savedState = await this.storage.loadBotState();
-    if (savedState?.config) {
-      this.config = createStrategyConfig({
-        ...savedState.config,
-        symbol: this.config.symbol,
-        baseAsset: this.config.baseAsset,
-        quoteAsset: this.config.quoteAsset,
-      });
-    }
+    this.config = this.createMarketConfig(savedState);
+    this.bot = new SimulatedTradingBot(savedState, this.config);
+  }
+
+  async switchMarket(
+    market: BinanceMarketListing,
+    storage: TradingStorage,
+  ): Promise<void> {
+    await this.flushState();
+    this.market = market;
+    this.storage = storage;
+    this.candles = [];
+    this.orderBook = undefined;
+    this.recentEvents = [];
+    this.lastSavedOrderBookAt = 0;
+    this.backtest = createIdleBacktest();
+    this.status = {
+      connected: false,
+      message: `Switching to ${market.displaySymbol}`,
+      lastEventAt: Date.now(),
+      reconnectAttempt: 0,
+    };
+
+    await this.storage.ensureReady();
+    this.candles = await this.storage.loadCandles(500);
+    const savedState = await this.storage.loadBotState();
+    this.config = this.createMarketConfig(savedState);
     this.bot = new SimulatedTradingBot(savedState, this.config);
   }
 
@@ -118,7 +157,13 @@ export class TradingRuntime {
     const publicBot = compactPublicBotState(bot);
     return {
       market: {
+        id: this.market.id,
+        group: this.market.group,
+        venue: this.market.venue,
         symbol: this.config.symbol,
+        displaySymbol: this.market.displaySymbol,
+        baseAsset: this.config.baseAsset,
+        quoteAsset: this.config.quoteAsset,
         interval: this.interval,
         connected: this.status.connected,
         statusMessage: this.status.message,
@@ -159,9 +204,9 @@ export class TradingRuntime {
     this.config = createStrategyConfig({
       ...this.config,
       ...patch,
-      symbol: this.config.symbol,
-      baseAsset: this.config.baseAsset,
-      quoteAsset: this.config.quoteAsset,
+      symbol: this.market.symbol,
+      baseAsset: this.market.baseAsset,
+      quoteAsset: this.market.quoteAsset,
       legacyValleyPeak: {
         ...this.config.legacyValleyPeak,
         ...(patch.legacyValleyPeak ?? {}),
@@ -215,11 +260,7 @@ export class TradingRuntime {
   }
 
   startBacktest(
-    options: {
-      preset: BacktestPreset;
-      limit: number;
-      startingQuote?: number;
-    },
+    options: BacktestStartOptions,
     onUpdate: () => void,
   ): BacktestProgressSnapshot {
     if (this.backtest.status === "running") {
@@ -287,11 +328,7 @@ export class TradingRuntime {
 
   private async executeBacktest(
     id: string,
-    options: {
-      preset: BacktestPreset;
-      limit: number;
-      startingQuote?: number;
-    },
+    options: BacktestStartOptions,
     onUpdate: () => void,
   ): Promise<void> {
     try {
@@ -321,11 +358,7 @@ export class TradingRuntime {
 
   private async runBacktestNow(
     id: string,
-    options: {
-      preset: BacktestPreset;
-      limit: number;
-      startingQuote?: number;
-    },
+    options: BacktestStartOptions,
     onUpdate: () => void,
   ): Promise<BacktestResult> {
     const config = {
@@ -333,15 +366,43 @@ export class TradingRuntime {
       ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
     };
 
-    if (options.preset === "week" || options.preset === "month" || options.preset === "year") {
+    if (isHistoricalBacktestPreset(options.preset)) {
+      const venue = this.market.venue;
+      if (!this.market.supportsHistoricalCandles || !isHistoricalVenue(venue)) {
+        throw new Error(`${this.market.displaySymbol} does not support candle backtests yet.`);
+      }
+
       return runHistoricalCandleBacktest(
         {
           id,
           preset: options.preset,
+          marketKey: this.market.id,
+          venue,
           symbol: this.config.symbol,
           interval: this.interval,
           config,
           cache: this.historicalCache,
+          historicalRangeMs:
+            options.historicalDays === undefined
+              ? undefined
+              : options.historicalDays * 24 * 60 * 60 * 1000,
+          randomSampleCount: options.randomSampleCount,
+          randomWindowMs:
+            options.randomWindowDays === undefined
+              ? undefined
+              : options.randomWindowDays * 24 * 60 * 60 * 1000,
+          randomMinWindowMs:
+            options.randomMinWindowDays === undefined
+              ? undefined
+              : options.randomMinWindowDays * 24 * 60 * 60 * 1000,
+          randomMaxWindowMs:
+            options.randomMaxWindowDays === undefined
+              ? undefined
+              : options.randomMaxWindowDays * 24 * 60 * 60 * 1000,
+          randomLookbackMs:
+            options.randomLookbackDays === undefined
+              ? undefined
+              : options.randomLookbackDays * 24 * 60 * 60 * 1000,
         },
         (progress) => {
           this.backtest = progress;
@@ -368,6 +429,40 @@ export class TradingRuntime {
     result.summary.requests = 0;
     return result;
   }
+
+  private createMarketConfig(savedState?: PaperBotState): StrategyConfig {
+    return createStrategyConfig({
+      ...(savedState?.config ?? this.config),
+      symbol: this.market.symbol,
+      baseAsset: this.market.baseAsset,
+      quoteAsset: this.market.quoteAsset,
+    });
+  }
+}
+
+function isHistoricalVenue(venue: string): venue is StreamVenue {
+  return (
+    venue === "spot" ||
+    venue === "usdm-futures" ||
+    venue === "coinm-futures" ||
+    venue === "options"
+  );
+}
+
+function isHistoricalBacktestPreset(
+  preset: BacktestPreset,
+): preset is Extract<
+  BacktestPreset,
+  "last-x" | "week" | "month" | "year" | "random-windows" | "random-length-windows"
+> {
+  return (
+    preset === "last-x" ||
+    preset === "week" ||
+    preset === "month" ||
+    preset === "year" ||
+    preset === "random-windows" ||
+    preset === "random-length-windows"
+  );
 }
 
 function compactPublicBotState(state: Readonly<PaperBotState>): PaperBotState {
