@@ -20,6 +20,7 @@ import {
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
 import {
+  analyzePositions,
   createPositionRiskConfig,
   defaultPositionRiskConfig,
 } from "./position-ledger.js";
@@ -30,6 +31,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   quoteAsset: "USDT",
   algorithm: "moving-average",
   startingQuote: 10_000,
+  maxLeverage: 1,
   feeBps: 7.5,
   orderQuoteSize: 750,
   maxPositionQuote: 4_500,
@@ -76,6 +78,7 @@ export function createStrategyConfig(
     config.algorithm = defaultStrategyConfig.algorithm;
   }
   config.maxOpenOrders = Math.max(1, Math.round(config.maxOpenOrders));
+  config.maxLeverage = clamp(cleanPositive(config.maxLeverage) || 1, 1, 999);
   config.orderQuoteSize = Math.max(config.minOrderQuote, config.orderQuoteSize);
   config.maxPositionQuote = Math.max(config.minOrderQuote, config.maxPositionQuote);
   config.limitOffsetBps = Math.max(0, config.limitOffsetBps);
@@ -184,6 +187,11 @@ export class SimulatedTradingBot {
   recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
     const price = cleanPositive(input.price) || this.state.lastPrice || this.state.avgEntryPrice;
     const quantity = roundAsset(input.quantity);
+    const positionEffect = input.targetPositionId
+      ? "close"
+      : input.positionEffect === "open" || input.positionEffect === "close"
+        ? input.positionEffect
+        : "auto";
 
     if (price <= 0) {
       throw new Error("Manual trade price must be positive.");
@@ -195,107 +203,124 @@ export class SimulatedTradingBot {
       throw new Error("Manual trade side must be buy or sell.");
     }
 
-    const config = this.state.config;
-    const feeRate = config.feeBps / 10_000;
-    const quoteQuantity = roundQuote(price * quantity);
-    const feeQuote = roundQuote(quoteQuantity * feeRate);
-    const reason = input.reason?.trim() || "manual position fill";
-    const orderId = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
-    let realizedPnl = 0;
+    const previousState = structuredClone(this.state);
+    try {
+      const config = this.state.config;
+      const feeRate = config.feeBps / 10_000;
+      const quoteQuantity = roundQuote(price * quantity);
+      const feeQuote = roundQuote(quoteQuantity * feeRate);
+      const reason = input.reason?.trim() || "manual position fill";
+      const orderId = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
+      let realizedPnl = 0;
+      const opensPosition = positionEffect === "open";
 
-    if (input.side === "buy") {
-      const spent = roundQuote(quoteQuantity + feeQuote);
-      const oldBase = this.state.baseFree + this.state.baseReserved;
-      const newBase = oldBase + quantity;
-      this.state.quoteFree = roundQuote(this.state.quoteFree - spent);
-      this.state.baseFree = roundAsset(this.state.baseFree + quantity);
+      if (input.side === "buy") {
+        const spent = roundQuote(quoteQuantity + feeQuote);
+        const oldBase = this.state.baseFree + this.state.baseReserved;
+        const newBase = oldBase + quantity;
+        this.state.quoteFree = roundQuote(this.state.quoteFree - spent);
+        this.state.baseFree = roundAsset(this.state.baseFree + quantity);
 
-      if (oldBase >= 0) {
-        const oldCost = this.state.avgEntryPrice * oldBase;
-        this.state.avgEntryPrice = newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
-      } else if (newBase > 0) {
-        const leftoverRatio = Math.min(1, newBase / quantity);
-        this.state.avgEntryPrice = roundQuote((spent * leftoverRatio) / newBase);
+        if (opensPosition) {
+          const oldLongBase = Math.max(0, oldBase);
+          const oldCost = this.state.avgEntryPrice * oldLongBase;
+          const newLongBase = oldLongBase + quantity;
+          this.state.avgEntryPrice =
+            newLongBase > 0 ? roundQuote((oldCost + spent) / newLongBase) : 0;
+        } else if (oldBase >= 0) {
+          const oldCost = this.state.avgEntryPrice * oldBase;
+          this.state.avgEntryPrice = newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
+        } else if (newBase > 0) {
+          const leftoverRatio = Math.min(1, newBase / quantity);
+          this.state.avgEntryPrice = roundQuote((spent * leftoverRatio) / newBase);
+        } else {
+          this.state.avgEntryPrice = 0;
+        }
       } else {
-        this.state.avgEntryPrice = 0;
-      }
-    } else {
-      const proceeds = roundQuote(quoteQuantity - feeQuote);
-      const oldBase = this.state.baseFree + this.state.baseReserved;
-      const closedLongQuantity = Math.max(0, Math.min(quantity, oldBase));
-      this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
-      this.state.baseFree = roundAsset(this.state.baseFree - quantity);
+        const proceeds = roundQuote(quoteQuantity - feeQuote);
+        const oldBase = this.state.baseFree + this.state.baseReserved;
+        const closedLongQuantity = Math.max(0, Math.min(quantity, oldBase));
+        this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
+        this.state.baseFree = roundAsset(this.state.baseFree - quantity);
 
-      if (closedLongQuantity > 0 && this.state.avgEntryPrice > 0) {
-        const feeForClosedQuantity = feeQuote * (closedLongQuantity / quantity);
-        realizedPnl = roundQuote(
-          (price - this.state.avgEntryPrice) * closedLongQuantity - feeForClosedQuantity,
-        );
+        if (!opensPosition && closedLongQuantity > 0 && this.state.avgEntryPrice > 0) {
+          const feeForClosedQuantity = feeQuote * (closedLongQuantity / quantity);
+          realizedPnl = roundQuote(
+            (price - this.state.avgEntryPrice) * closedLongQuantity - feeForClosedQuantity,
+          );
+        }
+
+        const remainingBase = this.state.baseFree + this.state.baseReserved;
+        if (!opensPosition && remainingBase <= 0.00000001) {
+          this.state.avgEntryPrice = 0;
+        }
       }
 
-      const remainingBase = this.state.baseFree + this.state.baseReserved;
-      if (remainingBase <= 0.00000001) {
-        this.state.avgEntryPrice = 0;
+      this.state.feesPaid = roundQuote(this.state.feesPaid + feeQuote);
+      this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
+      if (realizedPnl > 0) {
+        this.state.winningTrades += 1;
+      } else if (realizedPnl < 0) {
+        this.state.losingTrades += 1;
       }
+
+      const order: TradingOrder = {
+        id: orderId,
+        side: input.side,
+        type: "limit",
+        status: "filled",
+        price: roundQuote(price),
+        quantity,
+        filledQuantity: quantity,
+        estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
+        createdAt: at,
+        updatedAt: at,
+        filledAt: at,
+        reason,
+        realizedPnl,
+        feeQuote,
+        targetPositionId: input.targetPositionId,
+        positionEffect,
+        manual: true,
+      };
+      const fill: TradeFill = {
+        id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
+        orderId,
+        side: input.side,
+        price: roundQuote(price),
+        quantity,
+        quoteQuantity,
+        feeQuote,
+        realizedPnl,
+        filledAt: at,
+        reason,
+        targetPositionId: input.targetPositionId,
+        positionEffect,
+        manual: true,
+      };
+
+      this.state.orders.push(order);
+      this.state.fills.push(fill);
+      this.state.lastPrice = roundQuote(price);
+      this.state.updatedAt = at;
+      recalculateMetrics(this.state);
+      this.assertLeverageLimit();
+
+      return [
+        {
+          type: "order_filled",
+          at,
+          message: `Manual ${input.side.toUpperCase()} fill recorded`,
+          order: structuredClone(order),
+          fill: structuredClone(fill),
+          state: this.snapshot(),
+        },
+      ];
+    } catch (error) {
+      this.state = previousState;
+      this.rebuildOpenOrderIndex();
+      throw error;
     }
-
-    this.state.feesPaid = roundQuote(this.state.feesPaid + feeQuote);
-    this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
-    if (realizedPnl > 0) {
-      this.state.winningTrades += 1;
-    } else if (realizedPnl < 0) {
-      this.state.losingTrades += 1;
-    }
-
-    const order: TradingOrder = {
-      id: orderId,
-      side: input.side,
-      type: "limit",
-      status: "filled",
-      price: roundQuote(price),
-      quantity,
-      filledQuantity: quantity,
-      estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
-      createdAt: at,
-      updatedAt: at,
-      filledAt: at,
-      reason,
-      realizedPnl,
-      feeQuote,
-      targetPositionId: input.targetPositionId,
-      manual: true,
-    };
-    const fill: TradeFill = {
-      id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
-      orderId,
-      side: input.side,
-      price: roundQuote(price),
-      quantity,
-      quoteQuantity,
-      feeQuote,
-      realizedPnl,
-      filledAt: at,
-      reason,
-      targetPositionId: input.targetPositionId,
-      manual: true,
-    };
-
-    this.state.orders.push(order);
-    this.state.fills.push(fill);
-    this.state.lastPrice = roundQuote(price);
-    this.state.updatedAt = at;
-    recalculateMetrics(this.state);
-
-    return [
-      {
-        type: "order_filled",
-        at,
-        message: `Manual ${input.side.toUpperCase()} fill recorded`,
-        order: structuredClone(order),
-        fill: structuredClone(fill),
-        state: this.snapshot(),
-      },
-    ];
   }
 
   onCandle(candle: Candle): BotEvent[] {
@@ -603,7 +628,21 @@ export class SimulatedTradingBot {
         continue;
       }
 
-      const fill = this.fillOrder(order, index, tick.eventTime);
+      const result = this.tryFillOrder(order, index, tick.eventTime);
+      if (result.cancelled) {
+        if (collectEvents) {
+          events.push({
+            type: "order_cancelled",
+            at: tick.eventTime,
+            message: `${order.side.toUpperCase()} order cancelled by leverage limit`,
+            order: structuredClone(result.cancelled),
+          });
+        }
+        continue;
+      }
+      if (!result.fill) {
+        continue;
+      }
       if (!collectEvents) {
         continue;
       }
@@ -612,11 +651,44 @@ export class SimulatedTradingBot {
         at: tick.eventTime,
         message: `${order.side.toUpperCase()} order filled at ${order.price}`,
         order: structuredClone(order),
-        fill: structuredClone(fill),
+        fill: structuredClone(result.fill),
       });
     }
 
     return events;
+  }
+
+  private tryFillOrder(
+    order: TradingOrder,
+    index: number,
+    filledAt: number,
+  ): { fill?: TradeFill; cancelled?: TradingOrder } {
+    const previousState = structuredClone(this.state);
+
+    try {
+      const fill = this.fillOrder(order, index, filledAt);
+      this.assertLeverageLimit();
+      return { fill };
+    } catch (error) {
+      if (!isLeverageLimitError(error)) {
+        throw error;
+      }
+
+      this.state = previousState;
+      this.rebuildOpenOrderIndex();
+      const restoredOrder = this.state.orders[index];
+      if (restoredOrder?.status !== "open") {
+        return {};
+      }
+
+      this.releaseOrderReserve(restoredOrder);
+      restoredOrder.status = "cancelled";
+      restoredOrder.cancelledAt = filledAt;
+      restoredOrder.updatedAt = filledAt;
+      restoredOrder.reason = `${restoredOrder.reason}; leverage limit`;
+      this.openOrderIndexes.delete(index);
+      return { cancelled: structuredClone(restoredOrder) };
+    }
   }
 
   private fillOrder(order: TradingOrder, index: number, filledAt: number): TradeFill {
@@ -685,10 +757,27 @@ export class SimulatedTradingBot {
       realizedPnl,
       filledAt,
       reason: order.reason,
+      targetPositionId: order.targetPositionId,
+      positionEffect: order.positionEffect,
+      manual: order.manual,
     };
     this.state.fills.push(fill);
 
     return fill;
+  }
+
+  private assertLeverageLimit(): void {
+    const maxLeverage = cleanPositive(this.state.config.maxLeverage) || 1;
+    if (maxLeverage >= 999) {
+      return;
+    }
+
+    const effectiveLeverage = analyzePositions(this.state).summary.effectiveLeverage;
+    if (effectiveLeverage > maxLeverage + 0.0001) {
+      throw new Error(
+        `Leverage limit exceeded: ${formatLeverageForError(effectiveLeverage)}x > ${formatLeverageForError(maxLeverage)}x.`,
+      );
+    }
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
@@ -864,4 +953,16 @@ function averageLast(values: number[], count: number): number {
 
 function cleanPositive(value: number | undefined): number {
   return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function isLeverageLimitError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith("Leverage limit exceeded:");
+}
+
+function formatLeverageForError(value: number): string {
+  return (Number.isFinite(value) ? value : 999).toFixed(2);
 }

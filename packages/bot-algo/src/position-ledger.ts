@@ -23,6 +23,27 @@ interface LedgerContext {
   quantityFloor: number;
 }
 
+interface BorrowProfile {
+  borrowedQuantity: number;
+  borrowedQuote: number;
+  internalBorrowedQuantity: number;
+  internalBorrowedQuote: number;
+  externalBorrowedQuantity: number;
+  externalBorrowedQuote: number;
+  borrowedFromPositionCount: number;
+}
+
+interface BorrowProfiles {
+  longs: Map<string, BorrowProfile>;
+  shorts: Map<string, BorrowProfile>;
+}
+
+interface BorrowSource {
+  id: string;
+  openedAt: number;
+  available: number;
+}
+
 type MutableLongLot = Omit<
   LongPositionLot,
   | "status"
@@ -34,6 +55,15 @@ type MutableLongLot = Omit<
   | "projectedRemainingCostQuote"
   | "projectedBreakEvenSellPrice"
   | "canReachLowerBaseline"
+  | "exposureQuote"
+  | "leverage"
+  | "borrowedQuantity"
+  | "borrowedQuote"
+  | "internalBorrowedQuantity"
+  | "internalBorrowedQuote"
+  | "externalBorrowedQuantity"
+  | "externalBorrowedQuote"
+  | "borrowedFromPositionCount"
 >;
 
 type MutableShortLot = Omit<
@@ -47,6 +77,15 @@ type MutableShortLot = Omit<
   | "projectedRemainingProceedsQuote"
   | "projectedBreakEvenBuyPrice"
   | "canReachUpperBaseline"
+  | "exposureQuote"
+  | "leverage"
+  | "borrowedQuantity"
+  | "borrowedQuote"
+  | "internalBorrowedQuantity"
+  | "internalBorrowedQuote"
+  | "externalBorrowedQuantity"
+  | "externalBorrowedQuote"
+  | "borrowedFromPositionCount"
 >;
 
 export const defaultPositionRiskConfig: PositionRiskConfig = {
@@ -101,10 +140,22 @@ export function analyzePositions(
     }
   }
 
-  const finalizedLongs = longs.map((lot) => finalizeLongLot(lot, context));
-  const finalizedShorts = shorts.map((lot) => finalizeShortLot(lot, context));
+  const borrowProfiles = buildBorrowProfiles(longs, shorts, context, state);
+  const finalizedLongs = longs.map((lot) =>
+    finalizeLongLot(lot, context, borrowProfiles.longs.get(lot.id) ?? emptyBorrowProfile()),
+  );
+  const finalizedShorts = shorts.map((lot) =>
+    finalizeShortLot(lot, context, borrowProfiles.shorts.get(lot.id) ?? emptyBorrowProfile()),
+  );
   const activeLongs = finalizedLongs.filter((lot) => lot.status !== "pending");
   const activeShorts = finalizedShorts.filter((lot) => lot.status !== "pending");
+  const longExposureQuote = roundQuote(sum(activeLongs, "exposureQuote"));
+  const shortExposureQuote = roundQuote(sum(activeShorts, "exposureQuote"));
+  const grossExposureQuote = roundQuote(longExposureQuote + shortExposureQuote);
+  const externalBorrowedQuote = roundQuote(
+    sum(activeLongs, "externalBorrowedQuote") + sum(activeShorts, "externalBorrowedQuote"),
+  );
+  const equityQuote = calculateEquityQuote(state, context.currentPrice);
 
   return {
     summary: {
@@ -121,6 +172,17 @@ export function analyzePositions(
       shortQuantity: roundAsset(sum(activeShorts, "remainingQuantity")),
       longRemainingCostQuote: roundQuote(sum(activeLongs, "remainingCostQuote")),
       shortRemainingProceedsQuote: roundQuote(sum(activeShorts, "remainingProceedsQuote")),
+      grossExposureQuote,
+      netExposureQuote: roundQuote(longExposureQuote - shortExposureQuote),
+      longExposureQuote,
+      shortExposureQuote,
+      internalBorrowedBaseQuantity: roundAsset(sum(activeShorts, "internalBorrowedQuantity")),
+      externalBorrowedBaseQuantity: roundAsset(sum(activeShorts, "externalBorrowedQuantity")),
+      internalBorrowedQuote: roundQuote(
+        sum(activeLongs, "internalBorrowedQuote") + sum(activeShorts, "internalBorrowedQuote"),
+      ),
+      externalBorrowedQuote,
+      effectiveLeverage: calculateDebtLeverage(equityQuote, externalBorrowedQuote),
       pendingLongQuantity: roundAsset(sum(finalizedLongs, "pendingQuantity")),
       pendingShortQuantity: roundAsset(sum(finalizedShorts, "pendingQuantity")),
       pendingLongQuote: roundQuote(sum(finalizedLongs, "pendingQuote")),
@@ -176,16 +238,18 @@ function applyBuyFill(
     }
   }
 
-  for (const short of shorts) {
-    if (quantityLeft <= EPSILON) {
-      break;
+  if (fill.positionEffect !== "open") {
+    for (const short of shorts) {
+      if (quantityLeft <= EPSILON) {
+        break;
+      }
+      if (short.remainingQuantity <= EPSILON) {
+        continue;
+      }
+      const closed = closeShortLot(short, quantityLeft, unitCost);
+      quantityLeft = roundAsset(quantityLeft - closed.quantity);
+      costLeft = roundQuote(costLeft - closed.quote);
     }
-    if (short.remainingQuantity <= EPSILON) {
-      continue;
-    }
-    const closed = closeShortLot(short, quantityLeft, unitCost);
-    quantityLeft = roundAsset(quantityLeft - closed.quantity);
-    costLeft = roundQuote(costLeft - closed.quote);
   }
 
   if (quantityLeft > EPSILON && costLeft > EPSILON) {
@@ -228,16 +292,18 @@ function applySellFill(
     }
   }
 
-  for (const long of longs) {
-    if (quantityLeft <= EPSILON) {
-      break;
+  if (fill.positionEffect !== "open") {
+    for (const long of longs) {
+      if (quantityLeft <= EPSILON) {
+        break;
+      }
+      if (long.remainingQuantity <= EPSILON) {
+        continue;
+      }
+      const closed = closeLongLot(long, quantityLeft, unitProceeds);
+      quantityLeft = roundAsset(quantityLeft - closed.quantity);
+      proceedsLeft = roundQuote(proceedsLeft - closed.quote);
     }
-    if (long.remainingQuantity <= EPSILON) {
-      continue;
-    }
-    const closed = closeLongLot(long, quantityLeft, unitProceeds);
-    quantityLeft = roundAsset(quantityLeft - closed.quantity);
-    proceedsLeft = roundQuote(proceedsLeft - closed.quote);
   }
 
   if (quantityLeft > EPSILON && proceedsLeft > EPSILON) {
@@ -351,8 +417,163 @@ function appendPendingOrderLot(
   });
 }
 
-function finalizeLongLot(lot: MutableLongLot, context: LedgerContext): LongPositionLot {
+function buildBorrowProfiles(
+  longs: MutableLongLot[],
+  shorts: MutableShortLot[],
+  context: LedgerContext,
+  state: PaperBotState,
+): BorrowProfiles {
+  const profiles: BorrowProfiles = {
+    longs: new Map(longs.map((lot) => [lot.id, emptyBorrowProfile()])),
+    shorts: new Map(shorts.map((lot) => [lot.id, emptyBorrowProfile()])),
+  };
+
+  allocateShortBaseBorrow(shorts, longs, profiles, context);
+  allocateLongQuoteBorrow(longs, shorts, profiles, state);
+
+  return profiles;
+}
+
+function allocateShortBaseBorrow(
+  shorts: MutableShortLot[],
+  longs: MutableLongLot[],
+  profiles: BorrowProfiles,
+  context: LedgerContext,
+): void {
+  const longSources: BorrowSource[] = longs.map((lot) => ({
+    id: lot.id,
+    openedAt: lot.openedAt,
+    available: Math.max(0, lot.remainingQuantity),
+  }));
+
+  for (const short of shorts) {
+    const profile = profiles.shorts.get(short.id);
+    if (!profile || short.remainingQuantity <= EPSILON) {
+      continue;
+    }
+
+    let needed = short.remainingQuantity;
+    const borrowedFrom = new Set<string>();
+    for (const source of nearestSources(longSources, short.openedAt)) {
+      if (needed <= EPSILON) {
+        break;
+      }
+
+      const quantity = Math.min(needed, source.available);
+      if (quantity <= EPSILON) {
+        continue;
+      }
+
+      source.available = roundAsset(source.available - quantity);
+      needed = roundAsset(needed - quantity);
+      profile.internalBorrowedQuantity = roundAsset(
+        profile.internalBorrowedQuantity + quantity,
+      );
+      borrowedFrom.add(source.id);
+    }
+
+    profile.externalBorrowedQuantity = roundAsset(Math.max(0, needed));
+    profile.borrowedQuantity = roundAsset(short.remainingQuantity);
+    profile.internalBorrowedQuote = roundQuote(
+      profile.internalBorrowedQuantity * context.currentPrice,
+    );
+    profile.externalBorrowedQuote = roundQuote(
+      profile.externalBorrowedQuantity * context.currentPrice,
+    );
+    profile.borrowedQuote = roundQuote(profile.borrowedQuantity * context.currentPrice);
+    profile.borrowedFromPositionCount = borrowedFrom.size;
+  }
+}
+
+function allocateLongQuoteBorrow(
+  longs: MutableLongLot[],
+  shorts: MutableShortLot[],
+  profiles: BorrowProfiles,
+  state: PaperBotState,
+): void {
+  const totalLongCost = sum(longs, "remainingCostQuote");
+  const totalShortProceeds = sum(shorts, "remainingProceedsQuote");
+  const ownedQuoteCapital = Math.max(0, state.startingQuote + state.realizedPnl - state.feesPaid);
+  let internalQuoteBudget = clamp(totalLongCost - ownedQuoteCapital, 0, totalShortProceeds);
+  let externalQuoteBudget = Math.max(0, -(state.quoteFree + state.quoteReserved));
+  const shortSources: BorrowSource[] = shorts.map((lot) => ({
+    id: lot.id,
+    openedAt: lot.openedAt,
+    available: Math.max(0, lot.remainingProceedsQuote),
+  }));
+
+  for (const long of longs) {
+    const profile = profiles.longs.get(long.id);
+    if (!profile || long.remainingCostQuote <= EPSILON) {
+      continue;
+    }
+
+    let needed = Math.min(long.remainingCostQuote, internalQuoteBudget);
+    const borrowedFrom = new Set<string>();
+    for (const source of nearestSources(shortSources, long.openedAt)) {
+      if (needed <= EPSILON) {
+        break;
+      }
+
+      const quote = Math.min(needed, source.available);
+      if (quote <= EPSILON) {
+        continue;
+      }
+
+      source.available = roundQuote(source.available - quote);
+      needed = roundQuote(needed - quote);
+      internalQuoteBudget = roundQuote(internalQuoteBudget - quote);
+      profile.internalBorrowedQuote = roundQuote(profile.internalBorrowedQuote + quote);
+      borrowedFrom.add(source.id);
+    }
+
+    const externalQuote = Math.min(
+      Math.max(0, long.remainingCostQuote - profile.internalBorrowedQuote),
+      externalQuoteBudget,
+    );
+    if (externalQuote > EPSILON) {
+      profile.externalBorrowedQuote = roundQuote(externalQuote);
+      externalQuoteBudget = roundQuote(externalQuoteBudget - externalQuote);
+    }
+
+    profile.borrowedQuote = roundQuote(
+      profile.internalBorrowedQuote + profile.externalBorrowedQuote,
+    );
+    profile.internalBorrowedQuantity =
+      long.averagePrice > EPSILON
+        ? roundAsset(profile.internalBorrowedQuote / long.averagePrice)
+        : 0;
+    profile.externalBorrowedQuantity =
+      long.averagePrice > EPSILON
+        ? roundAsset(profile.externalBorrowedQuote / long.averagePrice)
+        : 0;
+    profile.borrowedQuantity = roundAsset(
+      profile.internalBorrowedQuantity + profile.externalBorrowedQuantity,
+    );
+    profile.borrowedFromPositionCount = borrowedFrom.size;
+  }
+}
+
+function nearestSources(sources: BorrowSource[], openedAt: number): BorrowSource[] {
+  return sources
+    .filter((source) => source.available > EPSILON)
+    .sort((left, right) => {
+      const distance = Math.abs(left.openedAt - openedAt) - Math.abs(right.openedAt - openedAt);
+      if (distance !== 0) {
+        return distance;
+      }
+
+      return left.openedAt - right.openedAt;
+    });
+}
+
+function finalizeLongLot(
+  lot: MutableLongLot,
+  context: LedgerContext,
+  borrow: BorrowProfile,
+): LongPositionLot {
   const denominator = Math.max(lot.remainingQuantity, context.quantityFloor);
+  const exposureQuote = roundQuote(lot.remainingQuantity * context.currentPrice);
   const breakEvenSellPrice = (lot.remainingCostQuote / denominator) * (1 + context.feeAndSlippageRate);
   const maxLossSellPrice =
     (Math.max(0, lot.remainingCostQuote - context.maxLossPct * lot.costQuote) / denominator) *
@@ -388,6 +609,9 @@ function finalizeLongLot(lot: MutableLongLot, context: LedgerContext): LongPosit
     closedQuote: roundQuote(lot.closedQuote),
     costQuote: roundQuote(lot.costQuote),
     remainingCostQuote: roundQuote(lot.remainingCostQuote),
+    exposureQuote,
+    leverage: calculateLeverage(exposureQuote, borrow.externalBorrowedQuote),
+    ...roundBorrowProfile(borrow),
     breakEvenSellPrice: roundQuote(breakEvenSellPrice),
     maxLossSellPrice: roundQuote(maxLossSellPrice),
     recommendedSellQuote: roundQuote(recommendedSellQuote),
@@ -402,8 +626,13 @@ function finalizeLongLot(lot: MutableLongLot, context: LedgerContext): LongPosit
   };
 }
 
-function finalizeShortLot(lot: MutableShortLot, context: LedgerContext): ShortPositionLot {
+function finalizeShortLot(
+  lot: MutableShortLot,
+  context: LedgerContext,
+  borrow: BorrowProfile,
+): ShortPositionLot {
   const denominator = Math.max(lot.remainingQuantity, context.quantityFloor);
+  const exposureQuote = roundQuote(lot.remainingQuantity * context.currentPrice);
   const feeFactor = (1 + context.feeAndSlippageRate) ** 2;
   const breakEvenBuyPrice = lot.remainingProceedsQuote / denominator / feeFactor;
   const maxLossBuyPrice =
@@ -447,6 +676,9 @@ function finalizeShortLot(lot: MutableShortLot, context: LedgerContext): ShortPo
     closedQuote: roundQuote(lot.closedQuote),
     proceedsQuote: roundQuote(lot.proceedsQuote),
     remainingProceedsQuote: roundQuote(lot.remainingProceedsQuote),
+    exposureQuote,
+    leverage: calculateLeverage(exposureQuote, borrow.externalBorrowedQuote),
+    ...roundBorrowProfile(borrow),
     breakEvenBuyPrice: roundQuote(breakEvenBuyPrice),
     maxLossBuyPrice: roundQuote(maxLossBuyPrice),
     recommendedBuyQuote: roundQuote(recommendedBuyQuote),
@@ -460,6 +692,66 @@ function finalizeShortLot(lot: MutableShortLot, context: LedgerContext): ShortPo
     ),
     canReachUpperBaseline,
   };
+}
+
+function emptyBorrowProfile(): BorrowProfile {
+  return {
+    borrowedQuantity: 0,
+    borrowedQuote: 0,
+    internalBorrowedQuantity: 0,
+    internalBorrowedQuote: 0,
+    externalBorrowedQuantity: 0,
+    externalBorrowedQuote: 0,
+    borrowedFromPositionCount: 0,
+  };
+}
+
+function roundBorrowProfile(profile: BorrowProfile): BorrowProfile {
+  return {
+    borrowedQuantity: roundAsset(profile.borrowedQuantity),
+    borrowedQuote: roundQuote(profile.borrowedQuote),
+    internalBorrowedQuantity: roundAsset(profile.internalBorrowedQuantity),
+    internalBorrowedQuote: roundQuote(profile.internalBorrowedQuote),
+    externalBorrowedQuantity: roundAsset(profile.externalBorrowedQuantity),
+    externalBorrowedQuote: roundQuote(profile.externalBorrowedQuote),
+    borrowedFromPositionCount: profile.borrowedFromPositionCount,
+  };
+}
+
+function calculateLeverage(exposureQuote: number, externalBorrowedQuote: number): number {
+  if (exposureQuote <= EPSILON || externalBorrowedQuote <= EPSILON) {
+    return 1;
+  }
+
+  const ownExposureQuote = exposureQuote - externalBorrowedQuote;
+  if (ownExposureQuote <= EPSILON) {
+    return 999;
+  }
+
+  return roundLeverage(clamp(exposureQuote / ownExposureQuote, 1, 999));
+}
+
+function calculateDebtLeverage(equityQuote: number, externalBorrowedQuote: number): number {
+  if (externalBorrowedQuote <= EPSILON) {
+    return 1;
+  }
+  if (equityQuote <= EPSILON) {
+    return 999;
+  }
+
+  return roundLeverage(clamp(1 + externalBorrowedQuote / equityQuote, 1, 999));
+}
+
+function calculateEquityQuote(state: PaperBotState, currentPrice: number): number {
+  return roundQuote(
+    state.quoteFree +
+      state.quoteReserved +
+      (state.baseFree + state.baseReserved) * currentPrice,
+  );
+}
+
+function roundLeverage(value: number): number {
+  return Number((Number.isFinite(value) ? value : 999).toFixed(4));
 }
 
 function lotStatus(

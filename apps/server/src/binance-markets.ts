@@ -1,3 +1,5 @@
+import { createHmac } from "node:crypto";
+
 export type MarketGroup =
   | "spot"
   | "bstocks"
@@ -27,6 +29,7 @@ export interface BinanceMarketListing {
   searchable: string;
   supportsLiveStream: boolean;
   supportsHistoricalCandles: boolean;
+  maxLeverage?: number;
   unavailableReason?: string;
   pair?: string;
   contractType?: string;
@@ -59,6 +62,7 @@ export interface BinanceMarketCatalogSnapshot {
 
 interface BinanceMarketCatalogOptions {
   apiKey?: string;
+  apiSecret?: string;
   ttlMs?: number;
 }
 
@@ -83,6 +87,14 @@ interface FuturesSymbol {
   marginAsset?: unknown;
   underlyingType?: unknown;
   underlyingSubType?: unknown;
+}
+
+interface FuturesLeverageBracket {
+  symbol?: unknown;
+  pair?: unknown;
+  brackets?: Array<{
+    initialLeverage?: unknown;
+  }>;
 }
 
 interface OptionSymbol {
@@ -158,7 +170,7 @@ export class BinanceMarketCatalog {
     }
 
     const usdmResult = await loadMarketSource("usdm-futures", () =>
-      fetchUsdmFuturesMarkets(),
+      fetchUsdmFuturesMarkets(this.options.apiKey, this.options.apiSecret),
     );
     const bStockUnderlyingBases = new Set(
       usdmResult.markets
@@ -168,7 +180,9 @@ export class BinanceMarketCatalog {
     const results = await Promise.all([
       loadMarketSource("spot", () => fetchSpotMarkets(bStockUnderlyingBases)),
       Promise.resolve(usdmResult),
-      loadMarketSource("coinm-futures", () => fetchCoinmFuturesMarkets()),
+      loadMarketSource("coinm-futures", () =>
+        fetchCoinmFuturesMarkets(this.options.apiKey, this.options.apiSecret),
+      ),
       loadMarketSource("options", () => fetchOptionsMarkets()),
       loadMarketSource("predictions", () => fetchPredictionMarkets(this.options.apiKey)),
     ]);
@@ -325,37 +339,53 @@ async function fetchSpotMarkets(bStockUnderlyingBases: Set<string>): Promise<{
   };
 }
 
-async function fetchUsdmFuturesMarkets(): Promise<{
+async function fetchUsdmFuturesMarkets(
+  apiKey: string | undefined,
+  apiSecret: string | undefined,
+): Promise<{
   source: BinanceMarketSourceStatus;
   markets: BinanceMarketListing[];
+  warning?: string;
 }> {
-  const payload = await fetchJson<{ symbols?: FuturesSymbol[] }>(
-    "https://fapi.binance.com/fapi/v1/exchangeInfo",
-  );
+  const [payload, leverageResult] = await Promise.all([
+    fetchJson<{ symbols?: FuturesSymbol[] }>("https://fapi.binance.com/fapi/v1/exchangeInfo"),
+    fetchFuturesMaxLeverage("usdm-futures", apiKey, apiSecret),
+  ]);
   const markets = (payload.symbols ?? [])
-    .map((symbol) => mapFuturesSymbol(symbol, "usdm-futures"))
+    .map((symbol) =>
+      mapFuturesSymbol(symbol, "usdm-futures", leverageResult.maxLeverageBySymbol),
+    )
     .filter((market): market is BinanceMarketListing => Boolean(market));
 
   return {
     source: { source: "usdm-futures", status: "ok", count: markets.length },
     markets,
+    warning: leverageResult.warning,
   };
 }
 
-async function fetchCoinmFuturesMarkets(): Promise<{
+async function fetchCoinmFuturesMarkets(
+  apiKey: string | undefined,
+  apiSecret: string | undefined,
+): Promise<{
   source: BinanceMarketSourceStatus;
   markets: BinanceMarketListing[];
+  warning?: string;
 }> {
-  const payload = await fetchJson<{ symbols?: FuturesSymbol[] }>(
-    "https://dapi.binance.com/dapi/v1/exchangeInfo",
-  );
+  const [payload, leverageResult] = await Promise.all([
+    fetchJson<{ symbols?: FuturesSymbol[] }>("https://dapi.binance.com/dapi/v1/exchangeInfo"),
+    fetchFuturesMaxLeverage("coinm-futures", apiKey, apiSecret),
+  ]);
   const markets = (payload.symbols ?? [])
-    .map((symbol) => mapFuturesSymbol(symbol, "coinm-futures"))
+    .map((symbol) =>
+      mapFuturesSymbol(symbol, "coinm-futures", leverageResult.maxLeverageBySymbol),
+    )
     .filter((market): market is BinanceMarketListing => Boolean(market));
 
   return {
     source: { source: "coinm-futures", status: "ok", count: markets.length },
     markets,
+    warning: leverageResult.warning,
   };
 }
 
@@ -469,6 +499,7 @@ function mapSpotSymbol(
 function mapFuturesSymbol(
   symbol: FuturesSymbol,
   venue: "usdm-futures" | "coinm-futures",
+  maxLeverageBySymbol: Map<string, number>,
 ): BinanceMarketListing | undefined {
   const marketSymbol = stringValue(symbol.symbol);
   if (!marketSymbol) {
@@ -500,6 +531,7 @@ function mapFuturesSymbol(
     status,
     supportsLiveStream: isTrading,
     supportsHistoricalCandles: isTrading,
+    maxLeverage: maxLeverageBySymbol.get(marketSymbol),
     unavailableReason: isTrading ? undefined : `Futures status is ${status}`,
     pair: stringValue(symbol.pair),
     contractType,
@@ -613,6 +645,7 @@ function buildListing(
     market.group,
     market.venue,
     market.contractType,
+    market.maxLeverage ? `${market.maxLeverage}x` : undefined,
     market.underlying,
     market.underlyingType,
     ...(market.underlyingSubType ?? []),
@@ -661,6 +694,90 @@ function compareMarkets(a: BinanceMarketListing, b: BinanceMarketListing): numbe
 
 function groupRank(group: MarketGroup): number {
   return ["spot", "bstocks", "futures", "tradfi", "options", "predictions"].indexOf(group);
+}
+
+async function fetchFuturesMaxLeverage(
+  venue: "usdm-futures" | "coinm-futures",
+  apiKey: string | undefined,
+  apiSecret: string | undefined,
+): Promise<{
+  maxLeverageBySymbol: Map<string, number>;
+  warning?: string;
+}> {
+  if (!apiKey || !apiSecret) {
+    return {
+      maxLeverageBySymbol: new Map(),
+      warning: `${venueLabel(venue)} max leverage requires BINANCE_API_KEY and BINANCE_API_SECRET.`,
+    };
+  }
+
+  try {
+    const endpoint =
+      venue === "usdm-futures"
+        ? "https://fapi.binance.com/fapi/v1/leverageBracket"
+        : "https://dapi.binance.com/dapi/v2/leverageBracket";
+    const payload = await fetchSignedJson<unknown>(endpoint, apiKey, apiSecret);
+    return {
+      maxLeverageBySymbol: parseMaxLeverageBySymbol(payload),
+    };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : `${venueLabel(venue)} max leverage request failed.`;
+    return {
+      maxLeverageBySymbol: new Map(),
+      warning: message,
+    };
+  }
+}
+
+async function fetchSignedJson<T>(
+  endpoint: string,
+  apiKey: string,
+  apiSecret: string,
+): Promise<T> {
+  const url = new URL(endpoint);
+  const query = new URLSearchParams({
+    recvWindow: "5000",
+    timestamp: String(Date.now()),
+  });
+  const signature = createHmac("sha256", apiSecret).update(query.toString()).digest("hex");
+  query.set("signature", signature);
+  url.search = query.toString();
+
+  return fetchJson<T>(url, {
+    headers: {
+      "X-MBX-APIKEY": apiKey,
+    },
+  });
+}
+
+function parseMaxLeverageBySymbol(payload: unknown): Map<string, number> {
+  const rows = Array.isArray(payload) ? payload : [payload];
+  const maxLeverageBySymbol = new Map<string, number>();
+
+  for (const row of rows) {
+    if (!row || typeof row !== "object") {
+      continue;
+    }
+
+    const bracketRow = row as FuturesLeverageBracket;
+    const symbol = stringValue(bracketRow.symbol) || stringValue(bracketRow.pair);
+    const maxLeverage = Math.max(
+      0,
+      ...(bracketRow.brackets ?? []).map(
+        (bracket) => numberValue(bracket.initialLeverage) ?? 0,
+      ),
+    );
+    if (symbol && maxLeverage > 0) {
+      maxLeverageBySymbol.set(symbol, maxLeverage);
+    }
+  }
+
+  return maxLeverageBySymbol;
+}
+
+function venueLabel(venue: "usdm-futures" | "coinm-futures"): string {
+  return venue === "usdm-futures" ? "USD-M futures" : "COIN-M futures";
 }
 
 async function fetchJson<T>(url: string | URL, init?: RequestInit): Promise<T> {

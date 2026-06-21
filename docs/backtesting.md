@@ -3,17 +3,21 @@
 Current historical backtests can run over saved data, a configurable `Last X days`
 Binance candle range, fixed Binance candle ranges for the last week/month/year, or a
 random-window aggregate mode. Long Binance candle runs emit progress over the dashboard
-websocket and stop early when simulated equity falls below 1% of starting capital.
+websocket, can be cancelled from the dashboard, and stop early when simulated equity
+falls below 1% of starting capital.
 
 The random-window modes run many smaller historical candle backtests and aggregate the
 strategy result metrics across the samples. `Random weeks` defaults to 40 one-week
 windows sampled from the last year and averages raw sample results. `Random lengths`
 defaults to 40 windows with random lengths from 1 to 30 days sampled from the last year;
 because sample durations differ, it also reports average profit/day and return/day rates.
-The dashboard exposes inputs for sample count, fixed/random window length, and lookback.
+The dashboard exposes inputs for sample count, fixed/random window length, lookback,
+and extra random pairs. Extra pairs are sampled from the same market group, venue, and
+quote asset as the currently selected pair, then each random window is replayed against
+the selected pair plus those extra pairs.
 The API can tune this with `historicalDays`, `randomSampleCount`, `randomWindowDays`,
-`randomMinWindowDays`, `randomMaxWindowDays`, and `randomLookbackDays` on
-`POST /api/backtest`.
+`randomMinWindowDays`, `randomMaxWindowDays`, `randomLookbackDays`, and
+`randomPairCount` on `POST /api/backtest`.
 
 ## Historical Candle Cache
 

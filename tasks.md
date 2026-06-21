@@ -1,0 +1,10 @@
+- add strategies/algos like dca, grid, rebalancing, arbitrage, etc
+- fetch more other pairs data. compute running correlations between them. cache the results.
+- search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or come in opposite pairs.
+- brainstorm/loop agent to find other algos that could work well. The target is to at least get profitable regardless of the market conditions. Ideally approach the "perfect margin trader" as much as possible. maybe we can train some model to orchestrate between bots and positions.
+- closing all long positions if there are short positions borrowing from them should not be allowed if we get over the leverage limit. the leftover fraction is basically reserved for the already open opposing positions.
+- authorize bots to be able to trade actual money.
+- add prediction market support
+- add proper leverage integration for futures and spot margin
+- is cache size limit per pair? It should be total cache size
+- how is random week/length backtest compute equity and return?

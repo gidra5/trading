@@ -35,6 +35,7 @@ export interface BinanceMarketListing {
   searchable: string;
   supportsLiveStream: boolean;
   supportsHistoricalCandles: boolean;
+  maxLeverage?: number;
   unavailableReason?: string;
   pair?: string;
   contractType?: string;
@@ -73,6 +74,7 @@ export interface RuntimeSnapshot {
     baseAsset: string;
     quoteAsset: string;
     interval: string;
+    maxLeverage?: number;
     connected: boolean;
     statusMessage: string;
     lastEventAt: number;
@@ -84,7 +86,51 @@ export interface RuntimeSnapshot {
   positions: PositionLedger;
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
+  correlations: CorrelationSnapshot;
 }
 
 export type BacktestSelection = BacktestPreset;
 export type { BacktestProgressSnapshot };
+
+export type CorrelationStatus = "idle" | "running" | "ready" | "failed";
+
+export interface CorrelationEntry {
+  marketId: string;
+  symbol: string;
+  displaySymbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+  venue: string;
+  correlation?: number;
+  samples: number;
+  startTime?: number;
+  endTime?: number;
+  updatedAt?: number;
+}
+
+export interface CorrelationSnapshot {
+  status: CorrelationStatus;
+  focalMarketId?: string;
+  focalSymbol?: string;
+  focalDisplaySymbol?: string;
+  interval?: string;
+  lookbackMs?: number;
+  marketCount: number;
+  expectedPairs: number;
+  calculatedPairs: number;
+  processedMarkets: number;
+  requests: number;
+  cacheHitCandles: number;
+  cacheMissCandles: number;
+  cacheFetchedCandles: number;
+  cacheLoaded: boolean;
+  truncated: boolean;
+  startedAt?: number;
+  updatedAt?: number;
+  startTime?: number;
+  endTime?: number;
+  streamConnected: boolean;
+  message: string;
+  error?: string;
+  entries: CorrelationEntry[];
+}

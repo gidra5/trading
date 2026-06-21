@@ -20,7 +20,12 @@ import {
 } from "@trading/bot-algo";
 import type { MarketStreamStatus } from "./binance-stream.js";
 import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
-import { runHistoricalCandleBacktest } from "./historical-backtest.js";
+import {
+  BacktestCancelledError,
+  isBacktestCancelledError,
+  runHistoricalCandleBacktest,
+  type HistoricalBacktestMarket,
+} from "./historical-backtest.js";
 import type { TradingStorage } from "./storage.js";
 
 const PUBLIC_ORDER_LIMIT = 500;
@@ -37,6 +42,8 @@ interface BacktestStartOptions {
   randomMinWindowDays?: number;
   randomMaxWindowDays?: number;
   randomLookbackDays?: number;
+  randomPairCount?: number;
+  randomMarkets?: HistoricalBacktestMarket[];
 }
 
 export interface RuntimeSnapshot {
@@ -49,6 +56,7 @@ export interface RuntimeSnapshot {
     baseAsset: string;
     quoteAsset: string;
     interval: string;
+    maxLeverage?: number;
     connected: boolean;
     statusMessage: string;
     lastEventAt: number;
@@ -77,6 +85,7 @@ export class TradingRuntime {
   private stateSaveQueue: Promise<void> = Promise.resolve();
   private lastSavedOrderBookAt = 0;
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
+  private backtestAbort?: AbortController;
 
   constructor(
     private storage: TradingStorage,
@@ -109,6 +118,8 @@ export class TradingRuntime {
     this.orderBook = undefined;
     this.recentEvents = [];
     this.lastSavedOrderBookAt = 0;
+    this.backtestAbort?.abort();
+    this.backtestAbort = undefined;
     this.backtest = createIdleBacktest();
     this.status = {
       connected: false,
@@ -165,6 +176,7 @@ export class TradingRuntime {
         baseAsset: this.config.baseAsset,
         quoteAsset: this.config.quoteAsset,
         interval: this.interval,
+        maxLeverage: this.market.maxLeverage,
         connected: this.status.connected,
         statusMessage: this.status.message,
         lastEventAt: this.status.lastEventAt,
@@ -174,7 +186,7 @@ export class TradingRuntime {
       },
       bot: publicBot,
       positions: analyzePositions(bot as PaperBotState),
-      recentEvents: this.recentEvents,
+      recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
     };
   }
@@ -201,21 +213,24 @@ export class TradingRuntime {
   }
 
   async updateBotConfig(patch: Partial<StrategyConfig>): Promise<BotEvent[]> {
-    this.config = createStrategyConfig({
-      ...this.config,
-      ...patch,
-      symbol: this.market.symbol,
-      baseAsset: this.market.baseAsset,
-      quoteAsset: this.market.quoteAsset,
-      legacyValleyPeak: {
-        ...this.config.legacyValleyPeak,
-        ...(patch.legacyValleyPeak ?? {}),
-      },
-      positionRisk: {
-        ...this.config.positionRisk,
-        ...(patch.positionRisk ?? {}),
-      },
-    });
+    this.config = applyMarketMaxLeverage(
+      createStrategyConfig({
+        ...this.config,
+        ...patch,
+        symbol: this.market.symbol,
+        baseAsset: this.market.baseAsset,
+        quoteAsset: this.market.quoteAsset,
+        legacyValleyPeak: {
+          ...this.config.legacyValleyPeak,
+          ...(patch.legacyValleyPeak ?? {}),
+        },
+        positionRisk: {
+          ...this.config.positionRisk,
+          ...(patch.positionRisk ?? {}),
+        },
+      }),
+      this.market.maxLeverage,
+    );
     const events = this.bot.reset(this.config);
     this.recordEvents(events);
     await this.flushState();
@@ -268,6 +283,8 @@ export class TradingRuntime {
     }
 
     const id = `bt_${Date.now()}`;
+    const abortController = new AbortController();
+    this.backtestAbort = abortController;
     const source = options.preset === "saved-orderbook" ? "orderbook-mid" : "candles";
     const now = Date.now();
     this.backtest = {
@@ -282,6 +299,8 @@ export class TradingRuntime {
       processedCandles: 0,
       estimatedCandles: 0,
       requests: 0,
+      marketCount: options.randomMarkets ? options.randomMarkets.length + 1 : undefined,
+      randomPairCount: options.randomMarkets?.length ?? options.randomPairCount,
       percent: 0,
       equity: this.config.startingQuote,
       returnPct: 0,
@@ -289,7 +308,24 @@ export class TradingRuntime {
     };
     onUpdate();
 
-    void this.executeBacktest(id, options, onUpdate);
+    void this.executeBacktest(id, options, onUpdate, abortController);
+    return this.backtest;
+  }
+
+  stopBacktest(onUpdate: () => void): BacktestProgressSnapshot {
+    if (this.backtest.status !== "running") {
+      return this.backtest;
+    }
+
+    this.backtestAbort?.abort();
+    this.backtest = {
+      ...this.backtest,
+      status: "cancelled",
+      stopReason: "cancelled",
+      updatedAt: Date.now(),
+      message: "Backtest cancelled",
+    };
+    onUpdate();
     return this.backtest;
   }
 
@@ -323,17 +359,29 @@ export class TradingRuntime {
       return;
     }
 
-    this.recentEvents = [...events, ...this.recentEvents].slice(0, 60);
+    this.recentEvents = [...events.map(compactPublicEvent), ...this.recentEvents].slice(0, 60);
   }
 
   private async executeBacktest(
     id: string,
     options: BacktestStartOptions,
     onUpdate: () => void,
+    abortController: AbortController,
   ): Promise<void> {
     try {
-      const result = await this.runBacktestNow(id, options, onUpdate);
+      const result = await this.runBacktestNow(
+        id,
+        options,
+        onUpdate,
+        abortController.signal,
+      );
+      if (abortController.signal.aborted) {
+        throw new BacktestCancelledError();
+      }
       await this.storage.saveBacktest(result);
+      if (this.backtest.id !== id) {
+        return;
+      }
       this.backtest = buildCompletedProgress(
         this.backtest,
         result,
@@ -343,6 +391,20 @@ export class TradingRuntime {
       );
       onUpdate();
     } catch (error) {
+      if (this.backtest.id !== id) {
+        return;
+      }
+      if (abortController.signal.aborted || isBacktestCancelledError(error)) {
+        this.backtest = {
+          ...this.backtest,
+          status: "cancelled",
+          stopReason: "cancelled",
+          updatedAt: Date.now(),
+          message: "Backtest cancelled",
+        };
+        onUpdate();
+        return;
+      }
       const message = error instanceof Error ? error.message : "Backtest failed";
       this.backtest = {
         ...this.backtest,
@@ -353,6 +415,10 @@ export class TradingRuntime {
         message,
       };
       onUpdate();
+    } finally {
+      if (this.backtestAbort === abortController) {
+        this.backtestAbort = undefined;
+      }
     }
   }
 
@@ -360,7 +426,9 @@ export class TradingRuntime {
     id: string,
     options: BacktestStartOptions,
     onUpdate: () => void,
+    cancelSignal: AbortSignal,
   ): Promise<BacktestResult> {
+    throwIfBacktestCancelled(cancelSignal);
     const config = {
       ...this.config,
       ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
@@ -376,9 +444,14 @@ export class TradingRuntime {
         {
           id,
           preset: options.preset,
+          marketId: this.market.id,
           marketKey: this.market.id,
           venue,
           symbol: this.config.symbol,
+          displaySymbol: this.market.displaySymbol,
+          baseAsset: this.market.baseAsset,
+          quoteAsset: this.market.quoteAsset,
+          maxLeverage: this.market.maxLeverage,
           interval: this.interval,
           config,
           cache: this.historicalCache,
@@ -403,14 +476,21 @@ export class TradingRuntime {
             options.randomLookbackDays === undefined
               ? undefined
               : options.randomLookbackDays * 24 * 60 * 60 * 1000,
+          randomMarkets: options.randomMarkets,
+          randomPairCount: options.randomMarkets?.length ?? options.randomPairCount,
+          cancelSignal,
         },
         (progress) => {
+          if (cancelSignal.aborted) {
+            return;
+          }
           this.backtest = progress;
           onUpdate();
         },
       );
     }
 
+    throwIfBacktestCancelled(cancelSignal);
     const startedAt = Date.now();
     const result =
       options.preset === "saved-orderbook"
@@ -420,6 +500,7 @@ export class TradingRuntime {
         : runBacktestFromCandles(await this.storage.loadCandles(options.limit), {
             config,
           });
+    throwIfBacktestCancelled(cancelSignal);
     const durationMs = Date.now() - startedAt;
     result.summary.durationMs = durationMs;
     result.summary.stopReason = "completed";
@@ -431,13 +512,28 @@ export class TradingRuntime {
   }
 
   private createMarketConfig(savedState?: PaperBotState): StrategyConfig {
-    return createStrategyConfig({
+    const config = createStrategyConfig({
       ...(savedState?.config ?? this.config),
       symbol: this.market.symbol,
       baseAsset: this.market.baseAsset,
       quoteAsset: this.market.quoteAsset,
     });
+    return applyMarketMaxLeverage(config, this.market.maxLeverage);
   }
+}
+
+function applyMarketMaxLeverage(
+  config: StrategyConfig,
+  marketMaxLeverage: number | undefined,
+): StrategyConfig {
+  if (!Number.isFinite(marketMaxLeverage) || (marketMaxLeverage as number) < 1) {
+    return config;
+  }
+
+  return {
+    ...config,
+    maxLeverage: Math.min(config.maxLeverage, marketMaxLeverage as number),
+  };
 }
 
 function isHistoricalVenue(venue: string): venue is StreamVenue {
@@ -447,6 +543,12 @@ function isHistoricalVenue(venue: string): venue is StreamVenue {
     venue === "coinm-futures" ||
     venue === "options"
   );
+}
+
+function throwIfBacktestCancelled(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new BacktestCancelledError();
+  }
 }
 
 function isHistoricalBacktestPreset(
@@ -473,6 +575,20 @@ function compactPublicBotState(state: Readonly<PaperBotState>): PaperBotState {
     memory: compactPublicMemory(state.memory, state.config),
     metrics: { ...state.metrics },
     config: structuredClone(state.config),
+  };
+}
+
+function compactPublicEvents(events: readonly BotEvent[]): BotEvent[] {
+  return events.map(compactPublicEvent);
+}
+
+function compactPublicEvent(event: BotEvent): BotEvent {
+  return {
+    type: event.type,
+    at: event.at,
+    message: event.message,
+    order: event.order ? { ...event.order } : undefined,
+    fill: event.fill ? { ...event.fill } : undefined,
   };
 }
 

@@ -20,9 +20,11 @@ export type BacktestPreset =
   | "random-windows"
   | "random-length-windows";
 
-export type BacktestRunStatus = "idle" | "running" | "completed" | "failed";
+export type BacktestRunStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
 
-export type BacktestStopReason = "completed" | "wiped_out" | "error";
+export type BacktestStopReason = "completed" | "wiped_out" | "error" | "cancelled";
+
+export type PositionEffect = "auto" | "open" | "close";
 
 export interface PriceTick {
   symbol: string;
@@ -67,6 +69,7 @@ export interface StrategyConfig {
   quoteAsset: string;
   algorithm: StrategyAlgorithm;
   startingQuote: number;
+  maxLeverage: number;
   feeBps: number;
   orderQuoteSize: number;
   maxPositionQuote: number;
@@ -151,6 +154,7 @@ export interface TradingOrder {
   realizedPnl: number;
   feeQuote: number;
   targetPositionId?: string;
+  positionEffect?: PositionEffect;
   manual?: boolean;
 }
 
@@ -166,6 +170,7 @@ export interface TradeFill {
   filledAt: number;
   reason: string;
   targetPositionId?: string;
+  positionEffect?: PositionEffect;
   manual?: boolean;
 }
 
@@ -175,6 +180,7 @@ export interface ManualTradeInput {
   quantity: number;
   reason?: string;
   targetPositionId?: string;
+  positionEffect?: PositionEffect;
 }
 
 export interface StrategyMemory {
@@ -247,6 +253,15 @@ export interface PositionLotBase {
   closedQuantity: number;
   closedQuote: number;
   averagePrice: number;
+  exposureQuote: number;
+  leverage: number;
+  borrowedQuantity: number;
+  borrowedQuote: number;
+  internalBorrowedQuantity: number;
+  internalBorrowedQuote: number;
+  externalBorrowedQuantity: number;
+  externalBorrowedQuote: number;
+  borrowedFromPositionCount: number;
 }
 
 export interface LongPositionLot extends PositionLotBase {
@@ -295,6 +310,15 @@ export interface PositionLedgerSummary {
   shortQuantity: number;
   longRemainingCostQuote: number;
   shortRemainingProceedsQuote: number;
+  grossExposureQuote: number;
+  netExposureQuote: number;
+  longExposureQuote: number;
+  shortExposureQuote: number;
+  internalBorrowedBaseQuantity: number;
+  externalBorrowedBaseQuantity: number;
+  internalBorrowedQuote: number;
+  externalBorrowedQuote: number;
+  effectiveLeverage: number;
   pendingLongQuantity: number;
   pendingShortQuantity: number;
   pendingLongQuote: number;
@@ -324,6 +348,8 @@ export interface BotEvent {
 
 export interface BacktestSummary {
   symbol: string;
+  marketId?: string;
+  displaySymbol?: string;
   source: "candles" | "orderbook-mid";
   startTime: number;
   endTime: number;
@@ -344,6 +370,9 @@ export interface BacktestSummary {
   sampleMinWindowMs?: number;
   sampleMaxWindowMs?: number;
   sampleLookbackMs?: number;
+  marketCount?: number;
+  randomPairCount?: number;
+  marketSymbols?: string[];
   profitableSamples?: number;
   wipedOutSamples?: number;
   bestReturnPct?: number;
@@ -354,6 +383,11 @@ export interface BacktestSummary {
   worstNetPnlPerDay?: number;
   bestReturnPctPerDay?: number;
   worstReturnPctPerDay?: number;
+  perfectMarginLeverage?: number;
+  perfectMarginFinalEquity?: number;
+  perfectMarginNetPnl?: number;
+  perfectMarginReturnPct?: number;
+  perfectMarginCapturePct?: number;
   stoppedEarly?: boolean;
   stopReason?: BacktestStopReason;
   survivedMs?: number;
@@ -370,6 +404,9 @@ export interface BacktestSummary {
 
 export interface BacktestSampleSummary {
   index: number;
+  marketId?: string;
+  symbol?: string;
+  displaySymbol?: string;
   startTime: number;
   endTime: number;
   durationMs: number;
@@ -380,6 +417,11 @@ export interface BacktestSampleSummary {
   returnPct: number;
   netPnlPerDay: number;
   returnPctPerDay: number;
+  perfectMarginLeverage?: number;
+  perfectMarginFinalEquity?: number;
+  perfectMarginNetPnl?: number;
+  perfectMarginReturnPct?: number;
+  perfectMarginCapturePct?: number;
   maxDrawdownPct: number;
   tradeCount: number;
   winRate: number;
@@ -429,6 +471,8 @@ export interface BacktestProgressSnapshot {
   sampleMinWindowMs?: number;
   sampleMaxWindowMs?: number;
   sampleLookbackMs?: number;
+  marketCount?: number;
+  randomPairCount?: number;
   netPnlPerDay?: number;
   returnPctPerDay?: number;
   percent: number;

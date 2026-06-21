@@ -4,6 +4,7 @@ import {
   createStrategyConfig,
 } from "./bot.js";
 import type {
+  BacktestSummary,
   BacktestResult,
   Candle,
   EquityPoint,
@@ -27,6 +28,23 @@ const DEFAULT_MAX_EQUITY_POINTS = 800;
 const DEFAULT_MAX_RETURNED_ORDERS = 2_000;
 const DEFAULT_MAX_RETURNED_FILLS = 2_000;
 
+interface PerfectMarginBenchmarkAccumulator {
+  startingQuote: number;
+  leverage: number;
+  roundTripFrictionRate: number;
+  previousPrice?: number;
+  netPnl: number;
+}
+
+type PerfectMarginBenchmark = Pick<
+  BacktestSummary,
+  | "perfectMarginLeverage"
+  | "perfectMarginFinalEquity"
+  | "perfectMarginNetPnl"
+  | "perfectMarginReturnPct"
+  | "perfectMarginCapturePct"
+>;
+
 export function runBacktestFromCandles(
   candles: Candle[],
   options: Omit<RunBacktestOptions, "source"> = {},
@@ -41,6 +59,7 @@ export function runBacktestFromCandles(
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
   const bot = new SimulatedTradingBot(createInitialBotState(config));
+  const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const startedAt = Date.now();
   const sampleEvery = Math.max(
@@ -50,7 +69,7 @@ export function runBacktestFromCandles(
 
   for (let index = 0; index < candles.length; index += 1) {
     const candle = candles[index];
-    replayCandle(bot, candle);
+    replayCandle(bot, candle, perfectMargin);
 
     if (index % sampleEvery === 0 || index === candles.length - 1) {
       const metrics = bot.markToMarket();
@@ -76,6 +95,7 @@ export function runBacktestFromCandles(
     equityCurve,
     finalState,
     options,
+    finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
   );
 }
 
@@ -94,6 +114,7 @@ export function runBacktestFromOrderBook(
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
   const bot = new SimulatedTradingBot(createInitialBotState(config));
+  const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const startedAt = Date.now();
   const sampleEvery = Math.max(
@@ -113,6 +134,7 @@ export function runBacktestFromOrderBook(
     }
 
     const price = (bestBid + bestAsk) / 2;
+    observePerfectMarginPrice(perfectMargin, price);
     startTime ||= snapshot.eventTime;
     endTime = snapshot.eventTime;
     processed += 1;
@@ -155,6 +177,7 @@ export function runBacktestFromOrderBook(
     equityCurve,
     finalState,
     options,
+    finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
   );
 }
 
@@ -173,6 +196,7 @@ export function runBacktestFromTicks(
   });
   const state = createInitialBotState(config);
   const bot = new SimulatedTradingBot(state);
+  const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const startedAt = Date.now();
   const sampleEvery = Math.max(
@@ -182,6 +206,7 @@ export function runBacktestFromTicks(
 
   for (let index = 0; index < ticks.length; index += 1) {
     const tick = ticks[index];
+    observePerfectMarginPrice(perfectMargin, tick.price);
     bot.onTick(tick, {
       collectEvents: false,
       updateMetrics: false,
@@ -209,52 +234,106 @@ export function runBacktestFromTicks(
     equityCurve,
     finalState,
     options,
+    finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
   );
 }
 
-function replayCandle(bot: SimulatedTradingBot, candle: Candle): void {
-  const duration = Math.max(1, candle.closeTime - candle.openTime);
-  const symbol = candle.symbol;
+function replayCandle(
+  bot: SimulatedTradingBot,
+  candle: Candle,
+  perfectMargin?: PerfectMarginBenchmarkAccumulator,
+): void {
   const options = {
     collectEvents: false,
     updateMetrics: false,
   };
-  bot.onTick(
+
+  for (const tick of candleReplayTicks(candle)) {
+    observePerfectMarginPrice(perfectMargin, tick.price);
+    bot.onTick(tick, options);
+  }
+}
+
+function candleReplayTicks(candle: Candle): PriceTick[] {
+  const duration = Math.max(1, candle.closeTime - candle.openTime);
+  const symbol = candle.symbol;
+
+  return [
     {
       symbol,
       eventTime: candle.openTime,
       price: candle.open,
       quantity: candle.volume * 0.2,
     },
-    options,
-  );
-  bot.onTick(
     {
       symbol,
       eventTime: candle.openTime + duration * 0.33,
       price: candle.high,
       quantity: candle.volume * 0.25,
     },
-    options,
-  );
-  bot.onTick(
     {
       symbol,
       eventTime: candle.openTime + duration * 0.66,
       price: candle.low,
       quantity: candle.volume * 0.25,
     },
-    options,
-  );
-  bot.onTick(
     {
       symbol,
       eventTime: candle.closeTime,
       price: candle.close,
       quantity: candle.volume * 0.3,
     },
-    options,
-  );
+  ];
+}
+
+function createPerfectMarginBenchmark(
+  config: StrategyConfig,
+): PerfectMarginBenchmarkAccumulator {
+  return {
+    startingQuote: config.startingQuote,
+    leverage: config.maxLeverage,
+    roundTripFrictionRate:
+      2 *
+      ((Math.max(0, config.feeBps) + Math.max(0, config.positionRisk.marketSlippageBps)) /
+        10_000),
+    netPnl: 0,
+  };
+}
+
+function observePerfectMarginPrice(
+  benchmark: PerfectMarginBenchmarkAccumulator | undefined,
+  price: number,
+): void {
+  if (!benchmark || !Number.isFinite(price) || price <= 0) {
+    return;
+  }
+
+  if (benchmark.previousPrice && benchmark.previousPrice > 0) {
+    const changeRate = Math.abs(price - benchmark.previousPrice) / benchmark.previousPrice;
+    const netRate = changeRate - benchmark.roundTripFrictionRate;
+    if (netRate > 0) {
+      benchmark.netPnl += benchmark.startingQuote * benchmark.leverage * netRate;
+    }
+  }
+  benchmark.previousPrice = price;
+}
+
+function finalizePerfectMarginBenchmark(
+  benchmark: PerfectMarginBenchmarkAccumulator,
+  actualNetPnl: number,
+): PerfectMarginBenchmark {
+  const netPnl = benchmark.netPnl;
+  const finalEquity = benchmark.startingQuote + netPnl;
+  const returnPct =
+    benchmark.startingQuote > 0 ? (netPnl / benchmark.startingQuote) * 100 : 0;
+
+  return {
+    perfectMarginLeverage: benchmark.leverage,
+    perfectMarginFinalEquity: finalEquity,
+    perfectMarginNetPnl: netPnl,
+    perfectMarginReturnPct: returnPct,
+    perfectMarginCapturePct: netPnl > 0 ? (actualNetPnl / netPnl) * 100 : undefined,
+  };
 }
 
 function buildBacktestResult(
@@ -270,6 +349,7 @@ function buildBacktestResult(
   equityCurve: EquityPoint[],
   finalState: Readonly<PaperBotState>,
   options: Pick<RunBacktestOptions, "maxReturnedOrders" | "maxReturnedFills">,
+  perfectMargin: PerfectMarginBenchmark,
 ): BacktestResult {
   const resultState = compactBacktestState(finalState, options);
 
@@ -292,6 +372,7 @@ function buildBacktestResult(
       maxDrawdownPct: finalState.metrics.maxDrawdownPct,
       tradeCount: finalState.metrics.tradeCount,
       winRate: finalState.metrics.winRate,
+      ...perfectMargin,
     },
     equityCurve,
     orders: resultState.orders,

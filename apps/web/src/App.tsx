@@ -38,6 +38,8 @@ import type {
   BacktestSelection,
   BinanceMarketCatalog,
   BinanceMarketListing,
+  CorrelationEntry,
+  CorrelationSnapshot,
   MarketGroup,
   RuntimeSnapshot,
 } from "./types";
@@ -46,6 +48,12 @@ const apiBase =
   import.meta.env.VITE_API_URL ??
   (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
 const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
+const buttonBaseClass =
+  "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
+const buttonPrimaryClass =
+  `${buttonBaseClass} border border-accent bg-accent text-ink-950 shadow-[0_10px_24px_rgba(56,189,248,0.18)] hover:bg-accent/88 focus-visible:ring-accent/55`;
+const buttonDangerClass =
+  `${buttonBaseClass} border border-loss/55 bg-loss/14 text-loss hover:border-loss hover:bg-loss/22 focus-visible:ring-loss/40`;
 
 interface BacktestSettings {
   historicalDays: number;
@@ -54,7 +62,10 @@ interface BacktestSettings {
   randomMinWindowDays: number;
   randomMaxWindowDays: number;
   randomLookbackDays: number;
+  randomPairCount: number;
 }
+
+type CorrelationSortMode = "abs-desc" | "abs-asc" | "value-desc" | "value-asc";
 
 const defaultBacktestSettings: BacktestSettings = {
   historicalDays: 30,
@@ -63,6 +74,7 @@ const defaultBacktestSettings: BacktestSettings = {
   randomMinWindowDays: 1,
   randomMaxWindowDays: 30,
   randomLookbackDays: 365,
+  randomPairCount: 0,
 };
 
 export function App() {
@@ -82,8 +94,12 @@ export function App() {
   const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog>();
   const [marketError, setMarketError] = createSignal<string>();
   const [switchingMarketId, setSwitchingMarketId] = createSignal<string>();
+  const [correlationSortMode, setCorrelationSortMode] =
+    createSignal<CorrelationSortMode>("abs-desc");
+  const [correlationError, setCorrelationError] = createSignal<string>();
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
+  let requestedCorrelationMarketId: string | undefined;
 
   const bot = createMemo(() => snapshot()?.bot);
   const market = createMemo(() => snapshot()?.market);
@@ -94,6 +110,7 @@ export function App() {
   const fills = createMemo(() => (bot()?.fills ?? []).slice(-12).reverse());
   const events = createMemo(() => snapshot()?.recentEvents ?? []);
   const backtest = createMemo(() => snapshot()?.backtest);
+  const correlations = createMemo(() => snapshot()?.correlations);
 
   createEffect(() => {
     const config = bot()?.config;
@@ -199,6 +216,7 @@ export function App() {
       randomMinWindowDays?: number;
       randomMaxWindowDays?: number;
       randomLookbackDays?: number;
+      randomPairCount?: number;
     } = {
       preset,
       limit: preset === "saved-orderbook" ? 3_000 : 1_000,
@@ -212,6 +230,7 @@ export function App() {
       body.randomSampleCount = settings.randomSampleCount;
       body.randomWindowDays = settings.randomWindowDays;
       body.randomLookbackDays = settings.randomLookbackDays;
+      body.randomPairCount = settings.randomPairCount;
     }
 
     if (preset === "random-length-windows") {
@@ -219,6 +238,7 @@ export function App() {
       body.randomMinWindowDays = settings.randomMinWindowDays;
       body.randomMaxWindowDays = settings.randomMaxWindowDays;
       body.randomLookbackDays = settings.randomLookbackDays;
+      body.randomPairCount = settings.randomPairCount;
     }
 
     const response = await fetch(`${apiBase}/api/backtest`, {
@@ -236,6 +256,48 @@ export function App() {
 
     setSnapshot(payload as RuntimeSnapshot);
   };
+
+  const stopBacktest = async () => {
+    setBacktestError(undefined);
+    const response = await fetch(`${apiBase}/api/backtest/stop`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setBacktestError(payload.error ?? "Backtest stop failed");
+      return;
+    }
+
+    setSnapshot(payload as RuntimeSnapshot);
+  };
+
+  const loadCorrelations = async (refresh = false) => {
+    setCorrelationError(undefined);
+    const response = await fetch(`${apiBase}/api/correlations`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ refresh }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setCorrelationError(payload.error ?? "Correlation request failed");
+      return;
+    }
+
+    setSnapshot(payload as RuntimeSnapshot);
+  };
+
+  createEffect(() => {
+    const marketId = market()?.id;
+    if (!marketId || requestedCorrelationMarketId === marketId) {
+      return;
+    }
+
+    requestedCorrelationMarketId = marketId;
+    void loadCorrelations();
+  });
 
   const applyConfig = async () => {
     const config = configDraft();
@@ -345,15 +407,15 @@ export function App() {
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <button class="btn-primary" onClick={() => void controlBot("start")}>
+            <button class={buttonPrimaryClass} type="button" onClick={() => void controlBot("start")}>
               <Play size={16} />
               Start
             </button>
-            <button class="btn" onClick={() => void controlBot("stop")}>
+            <button class={buttonDangerClass} type="button" onClick={() => void controlBot("stop")}>
               <Square size={16} />
               Stop
             </button>
-            <button class="btn" onClick={() => void controlBot("reset")}>
+            <button class="btn" type="button" onClick={() => void controlBot("reset")}>
               <RotateCcw size={16} />
               Reset
             </button>
@@ -381,6 +443,7 @@ export function App() {
 
         <AlgorithmPanel
           config={configDraft()}
+          marketMaxLeverage={market()?.maxLeverage}
           error={configError()}
           onChange={setConfigDraft}
           onApply={() => void applyConfig()}
@@ -412,6 +475,14 @@ export function App() {
           </div>
         </section>
 
+        <CorrelationPanel
+          snapshot={correlations()}
+          sortMode={correlationSortMode()}
+          error={correlationError()}
+          onSortChange={setCorrelationSortMode}
+          onRefresh={(refresh) => void loadCorrelations(refresh)}
+        />
+
         <section class="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
           <div class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
             <OrdersPanel title="Open Orders" orders={openOrders()} />
@@ -437,6 +508,7 @@ export function App() {
           progress={backtest()}
           error={backtestError()}
           onRun={() => void runBacktest()}
+          onStop={() => void stopBacktest()}
         />
       </div>
     </main>
@@ -543,7 +615,12 @@ function AssetSelector(props: {
             {selected()?.displaySymbol ?? props.selectedSymbol}
           </h1>
         </div>
-        <button class="btn px-2.5" onClick={props.onRefresh} disabled={props.disabled}>
+        <button
+          class="btn px-2.5"
+          onClick={props.onRefresh}
+          disabled={props.disabled}
+          type="button"
+        >
           <RefreshCw size={16} />
         </button>
       </div>
@@ -568,10 +645,10 @@ function AssetSelector(props: {
 
       <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,240px)_minmax(0,1fr)]">
         <label class="relative min-w-0">
-          <span class="sr-only">Search markets</span>
           <Search size={15} class="pointer-events-none absolute left-2.5 top-2.5 text-ink-300" />
           <input
             class="w-full rounded-2 border border-line bg-ink-800 py-2 pl-8 pr-2 text-sm text-ink-100"
+            aria-label="Search markets"
             value={query()}
             placeholder="Search BTC, TSLA, XAU..."
             onInput={(event) => setQuery(event.currentTarget.value)}
@@ -627,7 +704,8 @@ function marketGroupLabel(group: MarketGroup | "all"): string {
 function marketOptionLabel(market: BinanceMarketListing): string {
   const unavailable = market.supportsLiveStream ? "" : " unavailable";
   const contract = market.contractType ? ` ${market.contractType.replace("_", " ")}` : "";
-  return `${market.displaySymbol} | ${venueLabel(market.venue)} | ${market.symbol}${contract}${unavailable}`;
+  const maxLeverage = market.maxLeverage ? ` | max ${formatLeverage(market.maxLeverage)}` : "";
+  return `${market.displaySymbol} | ${venueLabel(market.venue)} | ${market.symbol}${contract}${maxLeverage}${unavailable}`;
 }
 
 function venueLabel(venue: BinanceMarketListing["venue"]): string {
@@ -646,10 +724,15 @@ function venueLabel(venue: BinanceMarketListing["venue"]): string {
 
 function AlgorithmPanel(props: {
   config?: StrategyConfig;
+  marketMaxLeverage?: number;
   error?: string;
   onChange: (config: StrategyConfig) => void;
   onApply: () => void;
 }) {
+  const marketMaxLeverage = () =>
+    Number.isFinite(props.marketMaxLeverage) && (props.marketMaxLeverage as number) >= 1
+      ? props.marketMaxLeverage
+      : undefined;
   const update = <K extends keyof StrategyConfig>(key: K, value: StrategyConfig[K]) => {
     if (!props.config) {
       return;
@@ -704,7 +787,12 @@ function AlgorithmPanel(props: {
               : "Moving Average"}
           </h2>
         </div>
-        <button class="btn-primary" disabled={!props.config} onClick={props.onApply}>
+        <button
+          class={buttonPrimaryClass}
+          disabled={!props.config}
+          onClick={props.onApply}
+          type="button"
+        >
           <Save size={16} />
           Apply
         </button>
@@ -718,7 +806,7 @@ function AlgorithmPanel(props: {
 
       <Show when={props.config}>
         {(config) => (
-          <div class="grid grid-cols-1 gap-4 xl:grid-cols-4">
+          <div class="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <div class="rounded-2 bg-ink-800 p-3">
               <label class="muted-label block" for="algorithm-select">
                 Strategy
@@ -755,6 +843,26 @@ function AlgorithmPanel(props: {
                   onInput={(value) => update("maxOpenOrders", value)}
                 />
                 <NumberField
+                  label="Max Lev"
+                  value={config().maxLeverage}
+                  min={1}
+                  max={marketMaxLeverage()}
+                  step={0.25}
+                  onInput={(value) =>
+                    update("maxLeverage", clampNumber(value, 1, marketMaxLeverage() ?? 999))
+                  }
+                />
+                <Show when={marketMaxLeverage()}>
+                  {(value) => (
+                    <div class="rounded-2 bg-ink-900 px-2 py-2">
+                      <div class="muted-label">Exchange Max</div>
+                      <div class="mt-1 text-sm font-semibold tabular-nums text-ink-100">
+                        {formatLeverage(value())}
+                      </div>
+                    </div>
+                  )}
+                </Show>
+                <NumberField
                   label="Cooldown sec"
                   value={config().cooldownMs / 1000}
                   min={0}
@@ -763,96 +871,100 @@ function AlgorithmPanel(props: {
               </div>
             </div>
 
-            <div class="rounded-2 bg-ink-800 p-3">
-              <div class="muted-label">Moving Average</div>
-              <div class="mt-3 grid grid-cols-2 gap-3">
-                <NumberField
-                  label="Fast Window"
-                  value={config().fastWindow}
-                  min={2}
-                  step={1}
-                  onInput={(value) => update("fastWindow", value)}
-                />
-                <NumberField
-                  label="Slow Window"
-                  value={config().slowWindow}
-                  min={3}
-                  step={1}
-                  onInput={(value) => update("slowWindow", value)}
-                />
-                <NumberField
-                  label="Signal bps"
-                  value={config().signalThresholdBps}
-                  min={0}
-                  onInput={(value) => update("signalThresholdBps", value)}
-                />
-                <NumberField
-                  label="Limit bps"
-                  value={config().limitOffsetBps}
-                  min={0}
-                  onInput={(value) => update("limitOffsetBps", value)}
-                />
+            <Show when={config().algorithm === "moving-average"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Moving Average</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Fast Window"
+                    value={config().fastWindow}
+                    min={2}
+                    step={1}
+                    onInput={(value) => update("fastWindow", value)}
+                  />
+                  <NumberField
+                    label="Slow Window"
+                    value={config().slowWindow}
+                    min={3}
+                    step={1}
+                    onInput={(value) => update("slowWindow", value)}
+                  />
+                  <NumberField
+                    label="Signal bps"
+                    value={config().signalThresholdBps}
+                    min={0}
+                    onInput={(value) => update("signalThresholdBps", value)}
+                  />
+                  <NumberField
+                    label="Limit bps"
+                    value={config().limitOffsetBps}
+                    min={0}
+                    onInput={(value) => update("limitOffsetBps", value)}
+                  />
+                </div>
               </div>
-            </div>
+            </Show>
 
-            <div class="rounded-2 bg-ink-800 p-3">
-              <div class="muted-label">Legacy Valley/Peak</div>
-              <div class="mt-3 grid grid-cols-2 gap-3">
-                <NumberField
-                  label="Buy Rate"
-                  value={config().legacyValleyPeak.buySpendRate}
-                  min={0}
-                  step={0.05}
-                  onInput={(value) => updateLegacy("buySpendRate", value)}
-                />
-                <NumberField
-                  label="Sell Rate"
-                  value={config().legacyValleyPeak.sellAmountRate}
-                  min={0}
-                  step={0.05}
-                  onInput={(value) => updateLegacy("sellAmountRate", value)}
-                />
-                <NumberField
-                  label="Buy Sigma"
-                  value={config().legacyValleyPeak.buySigma}
-                  min={0.000001}
-                  step={0.01}
-                  onInput={(value) => updateLegacy("buySigma", value)}
-                />
-                <NumberField
-                  label="Sell Sigma"
-                  value={config().legacyValleyPeak.sellSigma}
-                  min={0.000001}
-                  step={0.01}
-                  onInput={(value) => updateLegacy("sellSigma", value)}
-                />
-                <NumberField
-                  label="Min USDT"
-                  value={config().legacyValleyPeak.minTradeQuote}
-                  min={0}
-                  onInput={(value) => updateLegacy("minTradeQuote", value)}
-                />
-                <NumberField
-                  label="Max USDT"
-                  value={config().legacyValleyPeak.maxTradeQuote}
-                  min={1}
-                  onInput={(value) => updateLegacy("maxTradeQuote", value)}
-                />
-                <NumberField
-                  label="Warmup min"
-                  value={config().legacyValleyPeak.saturationSec / 60}
-                  min={0}
-                  onInput={(value) => updateLegacy("saturationSec", value * 60)}
-                />
-                <NumberField
-                  label="Buy Confirm"
-                  value={config().legacyValleyPeak.buyConfirmationOffset}
-                  min={0}
-                  step={1}
-                  onInput={(value) => updateLegacy("buyConfirmationOffset", value)}
-                />
+            <Show when={config().algorithm === "legacy-valley-peak"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Legacy Valley/Peak</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Buy Rate"
+                    value={config().legacyValleyPeak.buySpendRate}
+                    min={0}
+                    step={0.05}
+                    onInput={(value) => updateLegacy("buySpendRate", value)}
+                  />
+                  <NumberField
+                    label="Sell Rate"
+                    value={config().legacyValleyPeak.sellAmountRate}
+                    min={0}
+                    step={0.05}
+                    onInput={(value) => updateLegacy("sellAmountRate", value)}
+                  />
+                  <NumberField
+                    label="Buy Sigma"
+                    value={config().legacyValleyPeak.buySigma}
+                    min={0.000001}
+                    step={0.01}
+                    onInput={(value) => updateLegacy("buySigma", value)}
+                  />
+                  <NumberField
+                    label="Sell Sigma"
+                    value={config().legacyValleyPeak.sellSigma}
+                    min={0.000001}
+                    step={0.01}
+                    onInput={(value) => updateLegacy("sellSigma", value)}
+                  />
+                  <NumberField
+                    label="Min USDT"
+                    value={config().legacyValleyPeak.minTradeQuote}
+                    min={0}
+                    onInput={(value) => updateLegacy("minTradeQuote", value)}
+                  />
+                  <NumberField
+                    label="Max USDT"
+                    value={config().legacyValleyPeak.maxTradeQuote}
+                    min={1}
+                    onInput={(value) => updateLegacy("maxTradeQuote", value)}
+                  />
+                  <NumberField
+                    label="Warmup min"
+                    value={config().legacyValleyPeak.saturationSec / 60}
+                    min={0}
+                    onInput={(value) => updateLegacy("saturationSec", value * 60)}
+                  />
+                  <NumberField
+                    label="Buy Confirm"
+                    value={config().legacyValleyPeak.buyConfirmationOffset}
+                    min={0}
+                    step={1}
+                    onInput={(value) => updateLegacy("buyConfirmationOffset", value)}
+                  />
+                </div>
               </div>
-            </div>
+            </Show>
 
             <div class="rounded-2 bg-ink-800 p-3">
               <div class="muted-label">Position Risk</div>
@@ -919,6 +1031,7 @@ function NumberField(props: {
   label: string;
   value: number;
   min?: number;
+  max?: number;
   step?: number;
   onInput: (value: number) => void;
 }) {
@@ -929,6 +1042,7 @@ function NumberField(props: {
         class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100 tabular-nums"
         type="number"
         min={props.min}
+        max={props.max}
         step={props.step ?? 1}
         value={Number.isFinite(props.value) ? props.value : 0}
         onInput={(event) => props.onInput(Number(event.currentTarget.value))}
@@ -973,6 +1087,17 @@ function SmallMetric(props: { label: string; value: string }) {
       <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">{props.value}</div>
     </div>
   );
+}
+
+function formatLeverage(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  if ((value as number) >= 999) {
+    return ">999x";
+  }
+
+  return `${formatQuote(value, 2)}x`;
 }
 
 function OrderBookPanel(props: { snapshot?: RuntimeSnapshot }) {
@@ -1021,6 +1146,205 @@ function OrderBookPanel(props: { snapshot?: RuntimeSnapshot }) {
       </div>
     </div>
   );
+}
+
+function CorrelationPanel(props: {
+  snapshot?: CorrelationSnapshot;
+  sortMode: CorrelationSortMode;
+  error?: string;
+  onSortChange: (mode: CorrelationSortMode) => void;
+  onRefresh: (refresh: boolean) => void;
+}) {
+  const snapshot = () => props.snapshot;
+  const entries = createMemo(() =>
+    sortCorrelationEntries(snapshot()?.entries ?? [], props.sortMode),
+  );
+  const isRunning = () => snapshot()?.status === "running";
+  const progress = () => {
+    const current = snapshot()?.calculatedPairs ?? 0;
+    const total = snapshot()?.expectedPairs ?? 0;
+    if (total <= 0) {
+      return isRunning() ? 0 : 100;
+    }
+    return Math.max(0, Math.min(100, (current / total) * 100));
+  };
+  const message = () =>
+    props.error ?? snapshot()?.error ?? snapshot()?.message ?? "Correlations have not been computed yet";
+
+  return (
+    <section class="panel min-w-0 overflow-hidden">
+      <div class="mb-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+        <div>
+          <div class="muted-label">Correlations</div>
+          <h2 class="text-lg font-semibold">
+            {snapshot()?.focalDisplaySymbol ?? "Asset"} vector
+          </h2>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <For each={correlationSortModes}>
+            {(mode) => (
+              <button
+                class="rounded-2 border px-2.5 py-1.5 text-xs font-semibold transition"
+                classList={{
+                  "border-accent bg-accent text-ink-950": props.sortMode === mode.value,
+                  "border-line bg-ink-800 text-ink-300 hover:border-accent hover:text-ink-100":
+                    props.sortMode !== mode.value,
+                }}
+                onClick={() => props.onSortChange(mode.value)}
+                type="button"
+              >
+                {mode.label}
+              </button>
+            )}
+          </For>
+          <button
+            class="btn px-2.5"
+            disabled={isRunning()}
+            onClick={() => props.onRefresh(true)}
+            type="button"
+          >
+            <RefreshCw size={16} class={isRunning() ? "animate-spin" : ""} />
+          </button>
+        </div>
+      </div>
+
+      <Show when={props.error ?? snapshot()?.error}>
+        {(error) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{error()}</div>}
+      </Show>
+
+      <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-6">
+        <SmallMetric
+          label="Pairs"
+          value={`${formatQuote(snapshot()?.calculatedPairs, 0)} / ${formatQuote(
+            snapshot()?.expectedPairs,
+            0,
+          )}`}
+        />
+        <SmallMetric label="Markets" value={formatQuote(snapshot()?.marketCount, 0)} />
+        <SmallMetric label="Lookback" value={formatDuration(snapshot()?.lookbackMs)} />
+        <SmallMetric label="Requests" value={formatQuote(snapshot()?.requests, 0)} />
+        <SmallMetric
+          label="Cache"
+          value={snapshot()?.cacheLoaded ? "Vector" : formatQuote(snapshot()?.cacheFetchedCandles, 0)}
+        />
+        <SmallMetric label="Stream" value={snapshot()?.streamConnected ? "Live" : "Idle"} />
+      </div>
+
+      <div class="mb-4 rounded-2 bg-ink-800 p-3">
+        <div class="mb-2 flex items-center justify-between gap-3">
+          <div class="min-w-0 truncate text-sm text-ink-100">
+            {message()}
+            <Show when={snapshot()?.truncated}>
+              <span class="ml-2 text-warn">max {formatQuote(snapshot()?.marketCount, 0)} markets</span>
+            </Show>
+          </div>
+          <div class="shrink-0 text-sm tabular-nums text-ink-300">
+            {formatPercent(progress())}
+          </div>
+        </div>
+        <div class="h-2 overflow-hidden rounded-full bg-ink-700">
+          <div
+            class="h-full bg-accent transition-all"
+            style={{ width: `${progress()}%` }}
+          />
+        </div>
+      </div>
+
+      <div class="max-w-full overflow-x-auto">
+        <table class="w-full min-w-180">
+          <thead>
+            <tr>
+              <th class="table-head pb-2">Asset</th>
+              <th class="table-head pb-2">Correlation</th>
+              <th class="table-head pb-2">Abs</th>
+              <th class="table-head pb-2">Samples</th>
+              <th class="table-head pb-2">Window</th>
+              <th class="table-head pb-2">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={entries()} fallback={<EmptyRow columns={6} label="No correlations yet" />}>
+              {(entry) => (
+                <tr>
+                  <td class="td-cell">
+                    <div class="font-semibold text-ink-100">{entry.displaySymbol}</div>
+                    <div class="mt-1 text-xs text-ink-300">{entry.symbol}</div>
+                  </td>
+                  <td
+                    class="td-cell font-semibold tabular-nums"
+                    classList={{
+                      "text-gain": (entry.correlation ?? 0) > 0,
+                      "text-loss": (entry.correlation ?? 0) < 0,
+                      "text-ink-300": entry.correlation === undefined,
+                    }}
+                  >
+                    {formatCorrelation(entry.correlation)}
+                  </td>
+                  <td class="td-cell tabular-nums">
+                    {formatCorrelation(
+                      entry.correlation === undefined ? undefined : Math.abs(entry.correlation),
+                    )}
+                  </td>
+                  <td class="td-cell tabular-nums">{formatQuote(entry.samples, 0)}</td>
+                  <td class="td-cell text-ink-300">
+                    {formatDateTime(entry.startTime)} - {formatDateTime(entry.endTime)}
+                  </td>
+                  <td class="td-cell text-ink-300">{formatTime(entry.updatedAt)}</td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+const correlationSortModes: Array<{ value: CorrelationSortMode; label: string }> = [
+  { value: "abs-desc", label: "|r| desc" },
+  { value: "abs-asc", label: "|r| asc" },
+  { value: "value-desc", label: "r desc" },
+  { value: "value-asc", label: "r asc" },
+];
+
+function sortCorrelationEntries(
+  entries: CorrelationEntry[],
+  mode: CorrelationSortMode,
+): CorrelationEntry[] {
+  return [...entries].sort((a, b) => {
+    const aValue = sortableCorrelationValue(a, mode);
+    const bValue = sortableCorrelationValue(b, mode);
+    const aMissing = aValue === undefined;
+    const bMissing = bValue === undefined;
+    if (aMissing || bMissing) {
+      if (aMissing && bMissing) {
+        return a.displaySymbol.localeCompare(b.displaySymbol);
+      }
+      return aMissing ? 1 : -1;
+    }
+
+    const direction = mode === "abs-asc" || mode === "value-asc" ? 1 : -1;
+    return (aValue - bValue) * direction || a.displaySymbol.localeCompare(b.displaySymbol);
+  });
+}
+
+function sortableCorrelationValue(
+  entry: CorrelationEntry,
+  mode: CorrelationSortMode,
+): number | undefined {
+  if (!Number.isFinite(entry.correlation)) {
+    return undefined;
+  }
+
+  return mode.startsWith("abs") ? Math.abs(entry.correlation as number) : entry.correlation;
+}
+
+function formatCorrelation(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  return formatQuote(value, 3);
 }
 
 function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
@@ -1128,6 +1452,8 @@ function PositionLedgerPanel(props: {
     setDraft({
       ...draft,
       price: draft.price || currentPrice(),
+      priceMode: draft.priceMode ?? "current",
+      positionEffect: draft.positionEffect ?? (draft.targetPositionId ? "close" : "open"),
     });
   };
   const submitDraft = async () => {
@@ -1136,13 +1462,19 @@ function PositionLedgerPanel(props: {
       return;
     }
 
+    const price = manualTradePrice(value, currentPrice());
+    const quantity = manualTradeQuantity(value, currentPrice());
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(quantity) || quantity <= 0) {
+      return;
+    }
+
     setSubmitting(true);
     const ok = await props.onRecordTrade({
       side: value.side,
-      price: value.price,
-      quantity: value.quantity,
-      reason: value.reason,
+      price,
+      quantity,
       targetPositionId: value.targetPositionId,
+      positionEffect: value.positionEffect,
     });
     setSubmitting(false);
     if (ok) {
@@ -1168,10 +1500,13 @@ function PositionLedgerPanel(props: {
                 title: "Add Long",
                 side: "buy",
                 quantity: 0,
+                quoteAmount: 0,
                 price: currentPrice(),
-                reason: "manual long position",
+                priceMode: "current",
+                positionEffect: "open",
               })
             }
+            type="button"
           >
             <Plus size={16} />
             Long
@@ -1183,10 +1518,13 @@ function PositionLedgerPanel(props: {
                 title: "Add Short",
                 side: "sell",
                 quantity: 0,
+                quoteAmount: 0,
                 price: currentPrice(),
-                reason: "manual short position",
+                priceMode: "current",
+                positionEffect: "open",
               })
             }
+            type="button"
           >
             <Plus size={16} />
             Short
@@ -1195,20 +1533,21 @@ function PositionLedgerPanel(props: {
       </div>
 
       <Show when={props.error}>
-        {(message) => (
-          <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>
-        )}
+        {(message) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>}
       </Show>
 
       <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
         <SmallMetric label="Net Sell" value={`$${formatQuote(summary()?.netMarketSellPrice, 2)}`} />
         <SmallMetric label="Gross Buy" value={`$${formatQuote(summary()?.grossMarketBuyPrice, 2)}`} />
-        <SmallMetric label="Long Base" value={`$${formatQuote(summary()?.lowerBaselinePrice, 2)}`} />
-        <SmallMetric label="Short Base" value={`$${formatQuote(summary()?.upperBaselinePrice, 2)}`} />
+        <SmallMetric label="Gross Exp" value={`$${formatQuote(summary()?.grossExposureQuote, 2)}`} />
+        <SmallMetric label="Debt Lev" value={formatLeverage(summary()?.effectiveLeverage)} />
         <SmallMetric label="Long Left" value={formatAsset(summary()?.longQuantity)} />
         <SmallMetric label="Short Left" value={formatAsset(summary()?.shortQuantity)} />
-        <SmallMetric label="Pending Buy" value={formatAsset(summary()?.pendingLongQuantity)} />
-        <SmallMetric label="Pending Sell" value={formatAsset(summary()?.pendingShortQuantity)} />
+        <SmallMetric
+          label="Base Debt"
+          value={`${formatAsset(summary()?.externalBorrowedBaseQuantity)} ${props.baseAsset}`}
+        />
+        <SmallMetric label="Debt Value" value={`$${formatQuote(summary()?.externalBorrowedQuote, 2)}`} />
       </div>
 
       <Show when={draft()}>
@@ -1217,6 +1556,7 @@ function PositionLedgerPanel(props: {
             draft={value()}
             baseAsset={props.baseAsset}
             quoteAsset={props.quoteAsset}
+            currentPrice={currentPrice()}
             submitting={submitting()}
             onChange={setDraft}
             onCancel={() => setDraft(undefined)}
@@ -1235,9 +1575,11 @@ function PositionLedgerPanel(props: {
               title: "Close Long",
               side: "sell",
               quantity: lot.remainingQuantity,
+              quoteAmount: lot.remainingQuantity * currentPrice(),
               price: currentPrice(),
+              priceMode: "current",
               targetPositionId: lot.id,
-              reason: `manual close ${lot.sourceOrderId}`,
+              positionEffect: "close",
             })
           }
         />
@@ -1250,9 +1592,11 @@ function PositionLedgerPanel(props: {
               title: "Close Short",
               side: "buy",
               quantity: lot.remainingQuantity,
+              quoteAmount: lot.remainingQuantity * currentPrice(),
               price: currentPrice(),
+              priceMode: "current",
               targetPositionId: lot.id,
-              reason: `manual close ${lot.sourceOrderId}`,
+              positionEffect: "close",
             })
           }
         />
@@ -1261,16 +1605,41 @@ function PositionLedgerPanel(props: {
   );
 }
 
-type ManualTradeDraft = ManualTradeInput & {
+type ManualTradePriceMode = "current" | "limit";
+
+type ManualTradeDraft = {
   title: string;
+  side: ManualTradeInput["side"];
   price: number;
-  reason: string;
+  priceMode: ManualTradePriceMode;
+  quantity: number;
+  quoteAmount: number;
+  targetPositionId?: string;
+  positionEffect: NonNullable<ManualTradeInput["positionEffect"]>;
 };
+
+function manualTradePrice(draft: ManualTradeDraft, currentPrice: number): number {
+  return draft.priceMode === "current" ? currentPrice : draft.price;
+}
+
+function manualTradeQuantity(draft: ManualTradeDraft, currentPrice: number): number {
+  if (draft.targetPositionId) {
+    return draft.quantity;
+  }
+
+  const price = manualTradePrice(draft, currentPrice);
+  if (price <= 0) {
+    return 0;
+  }
+
+  return draft.quoteAmount / price;
+}
 
 function ManualTradeForm(props: {
   draft: ManualTradeDraft;
   baseAsset: string;
   quoteAsset: string;
+  currentPrice: number;
   submitting: boolean;
   onChange: (draft: ManualTradeDraft) => void;
   onCancel: () => void;
@@ -1280,6 +1649,24 @@ function ManualTradeForm(props: {
     props.onChange({
       ...props.draft,
       [key]: value,
+    });
+  };
+  const isClose = () => Boolean(props.draft.targetPositionId);
+  const effectivePrice = () => manualTradePrice(props.draft, props.currentPrice);
+  const estimatedQuantity = () => manualTradeQuantity(props.draft, props.currentPrice);
+  const estimatedQuote = () => estimatedQuantity() * effectivePrice();
+  const actionVerb = () => (props.draft.side === "buy" ? "Buy" : "Sell");
+  const canSubmit = () =>
+    !props.submitting &&
+    Number.isFinite(effectivePrice()) &&
+    effectivePrice() > 0 &&
+    Number.isFinite(estimatedQuantity()) &&
+    estimatedQuantity() > 0;
+  const setPriceMode = (priceMode: ManualTradePriceMode) => {
+    props.onChange({
+      ...props.draft,
+      priceMode,
+      price: priceMode === "limit" && props.draft.price > 0 ? props.draft.price : props.currentPrice,
     });
   };
 
@@ -1300,7 +1687,7 @@ function ManualTradeForm(props: {
           </div>
         </div>
         <div class="flex flex-wrap gap-2">
-          <button class="btn-primary" type="submit" disabled={props.submitting}>
+          <button class={buttonPrimaryClass} type="submit" disabled={!canSubmit()}>
             <Check size={16} />
             Record
           </button>
@@ -1311,28 +1698,81 @@ function ManualTradeForm(props: {
         </div>
       </div>
       <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
-        <NumberField
-          label={`${props.baseAsset} Qty`}
-          value={props.draft.quantity}
-          min={0}
-          step={0.00000001}
-          onInput={(value) => update("quantity", value)}
-        />
-        <NumberField
-          label={`${props.quoteAsset} Price`}
-          value={props.draft.price}
-          min={0}
-          step={0.01}
-          onInput={(value) => update("price", value)}
-        />
-        <label class="block">
-          <span class="muted-label">Reason</span>
-          <input
-            class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100"
-            value={props.draft.reason}
-            onInput={(event) => update("reason", event.currentTarget.value)}
+        <Show
+          when={!isClose()}
+          fallback={
+            <div class="block">
+              <span class="muted-label">{props.baseAsset} Amount</span>
+              <div class="mt-1 rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100 tabular-nums">
+                {formatAsset(props.draft.quantity)}
+              </div>
+            </div>
+          }
+        >
+          <NumberField
+            label={`${props.quoteAsset} Amount`}
+            value={props.draft.quoteAmount}
+            min={0}
+            step={0.01}
+            onInput={(value) => update("quoteAmount", value)}
           />
+        </Show>
+        <label class="block">
+          <span class="muted-label">Price</span>
+          <div class="mt-1 grid grid-cols-2 gap-1 rounded-2 border border-line bg-ink-900 p-1">
+            <button
+              class="rounded-2 px-2 py-1.5 text-sm font-semibold transition"
+              classList={{
+                "bg-accent text-ink-950": props.draft.priceMode === "current",
+                "text-ink-300 hover:text-ink-100": props.draft.priceMode !== "current",
+              }}
+              onClick={() => setPriceMode("current")}
+              type="button"
+            >
+              Current
+            </button>
+            <button
+              class="rounded-2 px-2 py-1.5 text-sm font-semibold transition"
+              classList={{
+                "bg-accent text-ink-950": props.draft.priceMode === "limit",
+                "text-ink-300 hover:text-ink-100": props.draft.priceMode !== "limit",
+              }}
+              onClick={() => setPriceMode("limit")}
+              type="button"
+            >
+              Limit
+            </button>
+          </div>
         </label>
+        <Show
+          when={props.draft.priceMode === "limit"}
+          fallback={
+            <div class="block">
+              <span class="muted-label">{props.quoteAsset} Current</span>
+              <div class="mt-1 rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100 tabular-nums">
+                {formatQuote(props.currentPrice, 4)}
+              </div>
+            </div>
+          }
+        >
+          <NumberField
+            label={`${props.quoteAsset} Limit`}
+            value={props.draft.price}
+            min={0}
+            step={0.01}
+            onInput={(value) => update("price", value)}
+          />
+        </Show>
+      </div>
+      <div class="mt-3 rounded-2 border border-line bg-ink-900 p-3">
+        <div class="muted-label">{actionVerb()} Preview</div>
+        <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">
+          {formatAsset(estimatedQuantity())} {props.baseAsset}
+        </div>
+        <div class="mt-1 text-sm text-ink-300 tabular-nums">
+          at {formatQuote(effectivePrice(), 4)} {props.quoteAsset} for {formatQuote(estimatedQuote(), 2)}{" "}
+          {props.quoteAsset}
+        </div>
       </div>
     </form>
   );
@@ -1351,18 +1791,17 @@ function PositionLongTable(props: {
         <h3 class="text-base font-semibold">Buy Positions</h3>
       </div>
       <div class="max-w-full overflow-x-auto">
-        <table class="w-full min-w-280">
+        <table class="min-w-full w-max">
           <thead>
             <tr>
               <th class="table-head pb-2">Status</th>
               <th class="table-head pb-2">Order</th>
-              <th class="table-head pb-2">Bought</th>
+              <th class="table-head pb-2">Left/Bought</th>
+              <th class="table-head pb-2">Lev</th>
+              <th class="table-head pb-2">Borrowed</th>
               <th class="table-head pb-2">Pending</th>
               <th class="table-head pb-2">Closed</th>
-              <th class="table-head pb-2">Cost</th>
               <th class="table-head pb-2">Avg</th>
-              <th class="table-head pb-2">Left Sell</th>
-              <th class="table-head pb-2">Left Cost</th>
               <th class="table-head pb-2">Break Even</th>
               <th class="table-head pb-2">Max Loss</th>
               <th class="table-head pb-2">Sell Now</th>
@@ -1371,14 +1810,32 @@ function PositionLongTable(props: {
             </tr>
           </thead>
           <tbody>
-            <For each={props.lots} fallback={<EmptyRow columns={14} label="No long lots" />}>
+            <For each={props.lots} fallback={<EmptyRow columns={13} label="No long lots" />}>
               {(lot) => (
                 <tr>
                   <td class="td-cell">
                     <StatusBadge status={lot.status} />
                   </td>
                   <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
-                  <td class="td-cell">{formatAsset(lot.filledQuantity || lot.originalQuantity)}</td>
+                  <td class="td-cell">
+                    <QuantityValueRatioCell
+                      quantity={lot.remainingQuantity}
+                      totalQuantity={lot.filledQuantity || lot.originalQuantity}
+                      quote={lot.remainingCostQuote}
+                      totalQuote={lot.costQuote}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
+                  <td class="td-cell">
+                    <LeverageCell leverage={lot.leverage} />
+                  </td>
+                  <td class="td-cell">
+                    <BorrowedCell
+                      lot={lot}
+                      baseAsset={props.baseAsset}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
                   <td class="td-cell">
                     <PendingCell
                       quantity={lot.pendingQuantity}
@@ -1390,10 +1847,7 @@ function PositionLongTable(props: {
                   <td class="td-cell">
                     <ActionAmount quantity={lot.closedQuantity} quote={lot.closedQuote} />
                   </td>
-                  <td class="td-cell">${formatQuote(lot.costQuote, 2)}</td>
                   <td class="td-cell">${formatQuote(lot.averagePrice, 4)}</td>
-                  <td class="td-cell">{formatAsset(lot.remainingQuantity)}</td>
-                  <td class="td-cell">${formatQuote(lot.remainingCostQuote, 2)}</td>
                   <td class="td-cell">${formatQuote(lot.breakEvenSellPrice, 4)}</td>
                   <td class="td-cell">${formatQuote(lot.maxLossSellPrice, 4)}</td>
                   <td class="td-cell">
@@ -1407,6 +1861,7 @@ function PositionLongTable(props: {
                       class="btn px-2 py-1 text-xs"
                       disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
                       onClick={() => props.onClose(lot)}
+                      type="button"
                     >
                       <MinusCircle size={14} />
                       Close
@@ -1435,18 +1890,17 @@ function PositionShortTable(props: {
         <h3 class="text-base font-semibold">Sell Positions</h3>
       </div>
       <div class="max-w-full overflow-x-auto">
-        <table class="w-full min-w-280">
+        <table class="min-w-full w-max">
           <thead>
             <tr>
               <th class="table-head pb-2">Status</th>
               <th class="table-head pb-2">Order</th>
-              <th class="table-head pb-2">Sold</th>
+              <th class="table-head pb-2">Left/Sold</th>
+              <th class="table-head pb-2">Lev</th>
+              <th class="table-head pb-2">Borrowed</th>
               <th class="table-head pb-2">Pending</th>
               <th class="table-head pb-2">Closed</th>
-              <th class="table-head pb-2">Proceeds</th>
               <th class="table-head pb-2">Avg</th>
-              <th class="table-head pb-2">Left Buy</th>
-              <th class="table-head pb-2">Left Proceeds</th>
               <th class="table-head pb-2">Break Even</th>
               <th class="table-head pb-2">Max Loss</th>
               <th class="table-head pb-2">Buy Now</th>
@@ -1455,14 +1909,32 @@ function PositionShortTable(props: {
             </tr>
           </thead>
           <tbody>
-            <For each={props.lots} fallback={<EmptyRow columns={14} label="No short lots" />}>
+            <For each={props.lots} fallback={<EmptyRow columns={13} label="No short lots" />}>
               {(lot) => (
                 <tr>
                   <td class="td-cell">
                     <StatusBadge status={lot.status} />
                   </td>
                   <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
-                  <td class="td-cell">{formatAsset(lot.filledQuantity || lot.originalQuantity)}</td>
+                  <td class="td-cell">
+                    <QuantityValueRatioCell
+                      quantity={lot.remainingQuantity}
+                      totalQuantity={lot.filledQuantity || lot.originalQuantity}
+                      quote={lot.remainingProceedsQuote}
+                      totalQuote={lot.proceedsQuote}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
+                  <td class="td-cell">
+                    <LeverageCell leverage={lot.leverage} />
+                  </td>
+                  <td class="td-cell">
+                    <BorrowedCell
+                      lot={lot}
+                      baseAsset={props.baseAsset}
+                      quoteAsset={props.quoteAsset}
+                    />
+                  </td>
                   <td class="td-cell">
                     <PendingCell
                       quantity={lot.pendingQuantity}
@@ -1474,10 +1946,7 @@ function PositionShortTable(props: {
                   <td class="td-cell">
                     <ActionAmount quantity={lot.closedQuantity} quote={lot.closedQuote} />
                   </td>
-                  <td class="td-cell">${formatQuote(lot.proceedsQuote, 2)}</td>
                   <td class="td-cell">${formatQuote(lot.averagePrice, 4)}</td>
-                  <td class="td-cell">{formatAsset(lot.remainingQuantity)}</td>
-                  <td class="td-cell">${formatQuote(lot.remainingProceedsQuote, 2)}</td>
                   <td class="td-cell">${formatQuote(lot.breakEvenBuyPrice, 4)}</td>
                   <td class="td-cell">${formatQuote(lot.maxLossBuyPrice, 4)}</td>
                   <td class="td-cell">
@@ -1491,6 +1960,7 @@ function PositionShortTable(props: {
                       class="btn px-2 py-1 text-xs"
                       disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
                       onClick={() => props.onClose(lot)}
+                      type="button"
                     >
                       <MinusCircle size={14} />
                       Close
@@ -1506,6 +1976,73 @@ function PositionShortTable(props: {
   );
 }
 
+function LeverageCell(props: { leverage: number }) {
+  return <span class="font-semibold tabular-nums text-ink-100">{formatLeverage(props.leverage)}</span>;
+}
+
+function BorrowedCell(props: {
+  lot: LongPositionLot | ShortPositionLot;
+  baseAsset: string;
+  quoteAsset: string;
+}) {
+  if (props.lot.borrowedQuote <= 0 && props.lot.borrowedQuantity <= 0) {
+    return <span class="text-ink-300">-</span>;
+  }
+
+  if (props.lot.side === "long") {
+    return (
+      <div class="tabular-nums">
+        <div class="whitespace-nowrap">
+          {formatQuote(props.lot.borrowedQuote, 2)} {props.quoteAsset}
+        </div>
+        <div class="mt-1 whitespace-nowrap text-xs text-ink-300">
+          int {formatQuote(props.lot.internalBorrowedQuote, 2)} / ext{" "}
+          {formatQuote(props.lot.externalBorrowedQuote, 2)}
+          <Show when={props.lot.borrowedFromPositionCount > 0}>
+            {" "}
+            ({props.lot.borrowedFromPositionCount} pos)
+          </Show>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div class="tabular-nums">
+      <div class="whitespace-nowrap">
+        {formatAsset(props.lot.borrowedQuantity)} {props.baseAsset}
+      </div>
+      <div class="mt-1 whitespace-nowrap text-xs text-ink-300">
+        int {formatAsset(props.lot.internalBorrowedQuantity)} / ext{" "}
+        {formatAsset(props.lot.externalBorrowedQuantity)}
+        <Show when={props.lot.borrowedFromPositionCount > 0}>
+          {" "}
+          ({props.lot.borrowedFromPositionCount} pos)
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+function QuantityValueRatioCell(props: {
+  quantity: number;
+  totalQuantity: number;
+  quote: number;
+  totalQuote: number;
+  quoteAsset: string;
+}) {
+  return (
+    <div class="tabular-nums">
+      <div class="whitespace-nowrap">
+        {formatAsset(props.quantity)} / {formatAsset(props.totalQuantity)}
+      </div>
+      <div class="mt-1 whitespace-nowrap text-xs text-ink-300">
+        {formatQuote(props.quote, 2)} / {formatQuote(props.totalQuote, 2)} {props.quoteAsset}
+      </div>
+    </div>
+  );
+}
+
 function PendingCell(props: {
   quantity: number;
   quote: number;
@@ -1513,13 +2050,13 @@ function PendingCell(props: {
   quoteAsset: string;
 }) {
   if (props.quantity <= 0) {
-    return <span class="text-ink-500">-</span>;
+    return <span class="text-ink-300">-</span>;
   }
 
   return (
-    <span>
+    <span class="whitespace-nowrap">
       {formatAsset(props.quantity)} @ ${formatQuote(props.price, 4)}
-      <span class="ml-1 text-ink-400">
+      <span class="ml-1 text-ink-300">
         {formatQuote(props.quote, 2)} {props.quoteAsset}
       </span>
     </span>
@@ -1528,13 +2065,13 @@ function PendingCell(props: {
 
 function ActionAmount(props: { quantity: number; quote: number }) {
   if (props.quantity <= 0 || props.quote <= 0) {
-    return <span class="text-ink-500">-</span>;
+    return <span class="text-ink-300">-</span>;
   }
 
   return (
-    <span>
+    <span class="whitespace-nowrap">
       {formatAsset(props.quantity)}
-      <span class="ml-1 text-ink-400">${formatQuote(props.quote, 2)}</span>
+      <span class="ml-1 text-ink-300">${formatQuote(props.quote, 2)}</span>
     </span>
   );
 }
@@ -1610,11 +2147,28 @@ function BacktestPanel(props: {
   progress?: BacktestProgressSnapshot;
   error?: string;
   onRun: () => void;
+  onStop: () => void;
 }) {
   const result = () => props.progress?.result;
   const summary = () => result()?.summary;
   const isRunning = () => props.progress?.status === "running";
   const progressPercent = () => Math.max(0, Math.min(100, props.progress?.percent ?? 0));
+  const cacheMissCandles = () =>
+    props.progress?.cacheMissCandles ?? summary()?.cacheMissCandles ?? 0;
+  const cacheFetchedCandles = () =>
+    props.progress?.cacheFetchedCandles ?? summary()?.cacheFetchedCandles ?? 0;
+  const cacheProgressPercent = () => {
+    const missing = cacheMissCandles();
+    if (missing <= 0) {
+      return undefined;
+    }
+
+    return Math.max(0, Math.min(100, (cacheFetchedCandles() / missing) * 100));
+  };
+  const showCacheProgress = () =>
+    props.progress?.status === "running" &&
+    cacheProgressPercent() !== undefined &&
+    cacheFetchedCandles() < cacheMissCandles();
   const error = () => props.error ?? props.progress?.error;
   const processedLabel = () => {
     const processed = props.progress?.processedCandles ?? summary()?.candlesProcessed ?? 0;
@@ -1649,10 +2203,25 @@ function BacktestPanel(props: {
             <option value="random-windows">Random weeks</option>
             <option value="random-length-windows">Random lengths</option>
           </select>
-          <button class="btn-primary" disabled={isRunning()} onClick={props.onRun}>
+          <button
+            class={buttonPrimaryClass}
+            disabled={isRunning()}
+            onClick={props.onRun}
+            type="button"
+          >
             <RefreshCw size={16} class={isRunning() ? "animate-spin" : ""} />
             Run
           </button>
+          <Show when={isRunning()}>
+            <button
+              class={buttonDangerClass}
+              onClick={props.onStop}
+              type="button"
+            >
+              <Square size={16} />
+              Stop
+            </button>
+          </Show>
         </div>
       </div>
 
@@ -1670,7 +2239,7 @@ function BacktestPanel(props: {
       </Show>
 
       <Show when={props.preset === "random-windows"}>
-        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-3">
+        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-2 xl:grid-cols-4">
           <BacktestNumberInput
             label="Samples"
             value={props.settings.randomSampleCount}
@@ -1695,11 +2264,19 @@ function BacktestPanel(props: {
             disabled={isRunning()}
             onChange={(value) => props.onSettingChange("randomLookbackDays", value)}
           />
+          <BacktestNumberInput
+            label="Extra Pairs"
+            value={props.settings.randomPairCount}
+            min={0}
+            max={25}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomPairCount", value)}
+          />
         </div>
       </Show>
 
       <Show when={props.preset === "random-length-windows"}>
-        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-2 xl:grid-cols-5">
           <BacktestNumberInput
             label="Samples"
             value={props.settings.randomSampleCount}
@@ -1732,6 +2309,14 @@ function BacktestPanel(props: {
             disabled={isRunning()}
             onChange={(value) => props.onSettingChange("randomLookbackDays", value)}
           />
+          <BacktestNumberInput
+            label="Extra Pairs"
+            value={props.settings.randomPairCount}
+            min={0}
+            max={25}
+            disabled={isRunning()}
+            onChange={(value) => props.onSettingChange("randomPairCount", value)}
+          />
         </div>
       </Show>
 
@@ -1753,6 +2338,24 @@ function BacktestPanel(props: {
               style={{ width: `${progressPercent()}%` }}
             />
           </div>
+          <Show when={showCacheProgress()}>
+            <div class="mt-3">
+              <div class="mb-2 flex items-center justify-between gap-3">
+                <div class="text-xs uppercase tracking-wide text-ink-300">Candle Cache</div>
+                <div class="text-xs tabular-nums text-ink-300">
+                  {formatQuote(Math.min(cacheFetchedCandles(), cacheMissCandles()), 0)} /{" "}
+                  {formatQuote(cacheMissCandles(), 0)} ·{" "}
+                  {formatPercent(cacheProgressPercent())}
+                </div>
+              </div>
+              <div class="h-2 overflow-hidden rounded-full bg-ink-700">
+                <div
+                  class="h-full bg-warn transition-all"
+                  style={{ width: `${cacheProgressPercent() ?? 0}%` }}
+                />
+              </div>
+            </div>
+          </Show>
         </div>
       </Show>
 
@@ -1768,6 +2371,22 @@ function BacktestPanel(props: {
           <SmallMetric
             label="Return"
             value={formatPercent(props.progress?.returnPct ?? summary()?.returnPct)}
+          />
+          <SmallMetric
+            label="Perfect Ret"
+            value={formatPercent(summary()?.perfectMarginReturnPct)}
+          />
+          <SmallMetric
+            label="Capture"
+            value={formatPercent(summary()?.perfectMarginCapturePct)}
+          />
+          <SmallMetric
+            label="Perfect PnL"
+            value={`$${formatQuote(summary()?.perfectMarginNetPnl, 2)}`}
+          />
+          <SmallMetric
+            label="Bench Lev"
+            value={formatLeverage(summary()?.perfectMarginLeverage)}
           />
           <SmallMetric label="Trades" value={formatQuote(summary()?.tradeCount, 0)} />
           <SmallMetric label="Win Rate" value={formatPercent(summary()?.winRate)} />
@@ -1788,6 +2407,18 @@ function BacktestPanel(props: {
                 0,
               )} / ${formatQuote(summary()?.sampleCount ?? props.progress?.sampleCount, 0)}`}
             />
+            <Show when={(summary()?.marketCount ?? props.progress?.marketCount ?? 0) > 1}>
+              <SmallMetric
+                label="Pairs"
+                value={`${formatQuote(
+                  summary()?.marketCount ?? props.progress?.marketCount,
+                  0,
+                )} (${formatQuote(
+                  summary()?.randomPairCount ?? props.progress?.randomPairCount,
+                  0,
+                )} extra)`}
+              />
+            </Show>
             <SmallMetric label="Best" value={formatPercent(summary()?.bestReturnPct)} />
             <SmallMetric label="Worst" value={formatPercent(summary()?.worstReturnPct)} />
             <SmallMetric
@@ -1860,7 +2491,7 @@ function BacktestPanel(props: {
                   : `${formatDuration(item().sampleMinWindowMs)}-${formatDuration(
                       item().sampleMaxWindowMs,
                     )}`}{" "}
-                windows
+                {(item()?.marketCount ?? 0) > 1 ? "market-window samples" : "windows"}
               </span>
             </Show>
           </div>
@@ -1905,7 +2536,7 @@ function BacktestNumberInput(props: {
 }
 
 function clampNumber(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
+  return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
 }
 
 function Side(props: { side: "buy" | "sell" }) {

@@ -23,17 +23,23 @@ export const appConfig = {
   market,
   interval,
   binanceApiKey: process.env.BINANCE_API_KEY,
+  binanceApiSecret: process.env.BINANCE_API_SECRET,
   dataDir: process.env.TRADING_DATA_DIR ? path.resolve(process.env.TRADING_DATA_DIR) : path.join(repoRoot, "data"),
   webDistDir: path.join(repoRoot, "apps/web/dist"),
   historicalCache: {
     maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 1024 * 1024 * 1024),
     minFreeBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MIN_FREE_BYTES, 1024 * 1024 * 1024),
   },
+  correlations: {
+    lookbackDays: parseNumber(process.env.TRADING_CORRELATION_LOOKBACK_DAYS, 14),
+    maxMarkets: Math.max(2, Math.round(parseNumber(process.env.TRADING_CORRELATION_MAX_MARKETS, 60))),
+  },
   strategy: createStrategyConfig({
     symbol: market.symbol,
     baseAsset: market.baseAsset,
     quoteAsset: market.quoteAsset,
     startingQuote: Number(process.env.TRADING_STARTING_QUOTE ?? 10_000),
+    maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 1),
   }),
 };
 
@@ -49,6 +55,15 @@ function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
   }
 
   return undefined;
+}
+
+function parseNumber(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function parseBytes(value: string | undefined, fallback: number): number {
