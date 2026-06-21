@@ -29,7 +29,7 @@ interface CommandResult {
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_AGENT_COMMAND =
   process.env.TRADING_EXPERIMENT_AGENT_COMMAND ??
-  "codex exec -C . --sandbox workspace-write --ask-for-approval never -";
+  "codex exec -C . --sandbox workspace-write -";
 const DEFAULT_BENCHMARK_COMMAND =
   process.env.TRADING_EXPERIMENT_BENCHMARK_COMMAND ??
   [

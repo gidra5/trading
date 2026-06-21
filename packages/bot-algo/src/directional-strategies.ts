@@ -2,6 +2,7 @@ import type {
   BotSignal,
   MasterAdaptiveConfig,
   MeanReversionConfig,
+  StrategyConfig,
   TrendFollowingConfig,
   VolatilityBreakoutConfig,
 } from "./types.js";
@@ -11,6 +12,36 @@ export type DirectionalSide = "long" | "short" | "flat";
 export interface DirectionalStrategyInput {
   prices: number[];
   currentSide: DirectionalSide;
+  stats?: DirectionalRuntimeStats;
+}
+
+export interface DirectionalRuntimeStats {
+  priceCount: number;
+  previousPrice?: number;
+  meanReversionPriceWindow: RollingValueWindow;
+  trendVolatilityWindow: RollingValueWindow;
+  masterVolatilityWindow: RollingValueWindow;
+  breakoutRangeWindow: RollingRangeWindow;
+}
+
+interface RollingValueWindow {
+  window: number;
+  values: number[];
+  cursor: number;
+  count: number;
+  sum: number;
+  sumSquares: number;
+}
+
+interface RollingRangeWindow {
+  window: number;
+  index: number;
+  maxIndexes: number[];
+  maxValues: number[];
+  maxHead: number;
+  minIndexes: number[];
+  minValues: number[];
+  minHead: number;
 }
 
 export type DirectionalDecision =
@@ -140,6 +171,55 @@ export function createMasterAdaptiveConfig(
   return config;
 }
 
+export function createDirectionalRuntimeStats(
+  config: StrategyConfig,
+  initialPrices: readonly number[] = [],
+): DirectionalRuntimeStats {
+  const trendVolatilityWindow = createRollingValueWindow(
+    config.trendFollowing.volatilityWindow,
+  );
+  const masterVolatilityWindow =
+    config.masterAdaptive.volatilityWindow === config.trendFollowing.volatilityWindow
+      ? trendVolatilityWindow
+      : createRollingValueWindow(config.masterAdaptive.volatilityWindow);
+  const stats: DirectionalRuntimeStats = {
+    priceCount: 0,
+    meanReversionPriceWindow: createRollingValueWindow(config.meanReversion.window),
+    trendVolatilityWindow,
+    masterVolatilityWindow,
+    breakoutRangeWindow: createRollingRangeWindow(config.volatilityBreakout.lookbackWindow),
+  };
+
+  for (const price of initialPrices) {
+    recordDirectionalRuntimePrice(stats, price);
+  }
+
+  return stats;
+}
+
+export function recordDirectionalRuntimePrice(
+  stats: DirectionalRuntimeStats,
+  price: number,
+): void {
+  if (!Number.isFinite(price) || price <= 0) {
+    return;
+  }
+
+  stats.priceCount += 1;
+  recordRollingValue(stats.meanReversionPriceWindow, price);
+  recordRollingRange(stats.breakoutRangeWindow, price);
+
+  const previousPrice = stats.previousPrice;
+  if (previousPrice !== undefined && previousPrice > 0) {
+    const returnBps = ((price - previousPrice) / previousPrice) * 10_000;
+    recordRollingValue(stats.trendVolatilityWindow, returnBps);
+    if (stats.masterVolatilityWindow !== stats.trendVolatilityWindow) {
+      recordRollingValue(stats.masterVolatilityWindow, returnBps);
+    }
+  }
+  stats.previousPrice = price;
+}
+
 export function evaluateTrendFollowing(
   config: TrendFollowingConfig,
   input: DirectionalStrategyInput,
@@ -153,7 +233,11 @@ export function evaluateTrendFollowing(
   const currentPrice = prices[prices.length - 1];
   const fastBps = windowReturnBps(prices, config.fastWindow);
   const slowBps = windowReturnBps(prices, config.slowWindow);
-  const volatilityBps = rollingReturnVolatilityBps(prices, config.volatilityWindow);
+  const volatilityBps = rollingReturnVolatilityBps(
+    prices,
+    config.volatilityWindow,
+    input.stats,
+  );
   const entryBps = volatilityAdjustedThreshold(config.entryThresholdBps, volatilityBps);
   const exitBps = config.exitThresholdBps;
 
@@ -198,9 +282,14 @@ export function evaluateVolatilityBreakout(
   }
 
   const currentPrice = prices[prices.length - 1];
-  const history = prices.slice(prices.length - config.lookbackWindow - 1, prices.length - 1);
-  const rangeHigh = Math.max(...history);
-  const rangeLow = Math.min(...history);
+  const historyStart = prices.length - config.lookbackWindow - 1;
+  const historyEnd = prices.length - 1;
+  const rangeHigh =
+    previousRangeHigh(input.stats, config.lookbackWindow) ??
+    maxRange(prices, historyStart, historyEnd);
+  const rangeLow =
+    previousRangeLow(input.stats, config.lookbackWindow) ??
+    minRange(prices, historyStart, historyEnd);
   const midpoint = (rangeHigh + rangeLow) / 2;
   const breakoutRate = config.breakoutThresholdBps / 10_000;
   const exitRate = config.exitThresholdBps / 10_000;
@@ -244,9 +333,13 @@ export function evaluateMeanReversion(
   }
 
   const currentPrice = prices[prices.length - 1];
-  const windowPrices = prices.slice(prices.length - config.window);
-  const mean = average(windowPrices);
-  const stdDev = standardDeviation(windowPrices, mean);
+  const windowStart = prices.length - config.window;
+  const cachedWindow = priceStatsWindow(input.stats, config.window);
+  const cachedMean = valueWindowMean(cachedWindow);
+  const mean = cachedMean ?? averageRange(prices, windowStart, prices.length);
+  const stdDev =
+    valueWindowStdDev(cachedWindow) ??
+    standardDeviationRange(prices, windowStart, prices.length, mean);
   if (stdDev <= 0) {
     return hold("mean reversion flat volatility");
   }
@@ -287,42 +380,44 @@ export function evaluateMasterAdaptive(
   input: DirectionalStrategyInput,
 ): DirectionalDecision {
   const prices = input.prices;
-  const decisions = [
-    {
-      label: "trend",
-      weight: config.trendWeight,
-      maxTarget: children.trendFollowing.targetExposurePct,
-      decision: evaluateTrendFollowing(children.trendFollowing, input),
-    },
-    {
-      label: "breakout",
-      weight: config.breakoutWeight,
-      maxTarget: children.volatilityBreakout.targetExposurePct,
-      decision: evaluateVolatilityBreakout(children.volatilityBreakout, input),
-    },
-    {
-      label: "reversion",
-      weight: config.reversionWeight,
-      maxTarget: children.meanReversion.targetExposurePct,
-      decision: evaluateMeanReversion(children.meanReversion, input),
-    },
-  ].filter((entry) => entry.weight > 0);
+  let totalWeight = 0;
+  let weightedScore = 0;
+  let trendScore = 0;
+  let breakoutScore = 0;
+  let reversionScore = 0;
 
-  const totalWeight = decisions.reduce((total, entry) => total + entry.weight, 0);
+  if (config.trendWeight > 0) {
+    trendScore = trendFollowingConsensusScore(children.trendFollowing, input);
+    totalWeight += config.trendWeight;
+    weightedScore += config.trendWeight * trendScore;
+  }
+  if (config.breakoutWeight > 0) {
+    breakoutScore = volatilityBreakoutConsensusScore(
+      children.volatilityBreakout,
+      input,
+    );
+    totalWeight += config.breakoutWeight;
+    weightedScore += config.breakoutWeight * breakoutScore;
+  }
+  if (config.reversionWeight > 0) {
+    reversionScore = meanReversionConsensusScore(children.meanReversion, input);
+    totalWeight += config.reversionWeight;
+    weightedScore += config.reversionWeight * reversionScore;
+  }
+
   if (totalWeight <= 0) {
     return target("flat", 0, "master adaptive has no enabled child signals");
   }
 
-  const scores = decisions.map((entry) => ({
-    ...entry,
-    score: decisionConsensusScore(entry.decision, entry.maxTarget),
-  }));
-  const weightedScore =
-    scores.reduce((total, entry) => total + entry.weight * entry.score, 0) / totalWeight;
-  const hasLong = scores.some((entry) => entry.score > 0);
-  const hasShort = scores.some((entry) => entry.score < 0);
+  weightedScore /= totalWeight;
+  const hasLong = trendScore > 0 || breakoutScore > 0 || reversionScore > 0;
+  const hasShort = trendScore < 0 || breakoutScore < 0 || reversionScore < 0;
   const disagreementScale = hasLong && hasShort ? config.disagreementExposureScale : 1;
-  const volatilityBps = rollingReturnVolatilityBps(prices, config.volatilityWindow);
+  const volatilityBps = rollingReturnVolatilityBps(
+    prices,
+    config.volatilityWindow,
+    input.stats,
+  );
   const volatilityScale =
     config.highVolatilityBps > 0 && volatilityBps >= config.highVolatilityBps
       ? config.highVolatilityExposureScale
@@ -339,10 +434,11 @@ export function evaluateMasterAdaptive(
   }
 
   const side: DirectionalSide = finalScore > 0 ? "long" : "short";
-  const activeSignals = scores
-    .filter((entry) => entry.score !== 0)
-    .map((entry) => `${entry.label} ${formatScore(entry.score)}`)
-    .join(", ");
+  const activeSignals = formatActiveMasterSignals(
+    trendScore,
+    breakoutScore,
+    reversionScore,
+  );
 
   return target(
     side,
@@ -351,6 +447,162 @@ export function evaluateMasterAdaptive(
       activeSignals ? `, ${activeSignals}` : ""
     }`,
   );
+}
+
+function trendFollowingConsensusScore(
+  config: TrendFollowingConfig,
+  input: DirectionalStrategyInput,
+): number {
+  const prices = input.prices;
+  const requiredPrices = Math.max(config.slowWindow, config.volatilityWindow) + 1;
+  if (prices.length < requiredPrices || config.targetExposurePct <= 0) {
+    return 0;
+  }
+
+  const currentPrice = prices[prices.length - 1];
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+    return 0;
+  }
+
+  const fastBps = windowReturnBps(prices, config.fastWindow);
+  const slowBps = windowReturnBps(prices, config.slowWindow);
+  const volatilityBps = rollingReturnVolatilityBps(
+    prices,
+    config.volatilityWindow,
+    input.stats,
+  );
+  const entryBps = volatilityAdjustedThreshold(config.entryThresholdBps, volatilityBps);
+  const exitBps = config.exitThresholdBps;
+
+  if (fastBps >= entryBps && slowBps >= exitBps) {
+    return childConsensusScore(
+      config.targetExposurePct,
+      confidenceFromMove(fastBps, entryBps),
+    );
+  }
+
+  if (fastBps <= -entryBps && slowBps <= -exitBps) {
+    return childConsensusScore(
+      config.targetExposurePct,
+      -confidenceFromMove(fastBps, entryBps),
+    );
+  }
+
+  return 0;
+}
+
+function volatilityBreakoutConsensusScore(
+  config: VolatilityBreakoutConfig,
+  input: DirectionalStrategyInput,
+): number {
+  const prices = input.prices;
+  if (prices.length < config.lookbackWindow + 1 || config.targetExposurePct <= 0) {
+    return 0;
+  }
+
+  const currentPrice = prices[prices.length - 1];
+  const historyStart = prices.length - config.lookbackWindow - 1;
+  const historyEnd = prices.length - 1;
+  const rangeHigh =
+    previousRangeHigh(input.stats, config.lookbackWindow) ??
+    maxRange(prices, historyStart, historyEnd);
+  const rangeLow =
+    previousRangeLow(input.stats, config.lookbackWindow) ??
+    minRange(prices, historyStart, historyEnd);
+  const breakoutRate = config.breakoutThresholdBps / 10_000;
+
+  if (currentPrice >= rangeHigh * (1 + breakoutRate)) {
+    const moveBps = ((currentPrice - rangeHigh) / rangeHigh) * 10_000;
+    return childConsensusScore(
+      config.targetExposurePct,
+      confidenceFromMove(moveBps, config.breakoutThresholdBps),
+    );
+  }
+
+  if (currentPrice <= rangeLow * (1 - breakoutRate)) {
+    const moveBps = ((rangeLow - currentPrice) / rangeLow) * 10_000;
+    return childConsensusScore(
+      config.targetExposurePct,
+      -confidenceFromMove(moveBps, config.breakoutThresholdBps),
+    );
+  }
+
+  return 0;
+}
+
+function meanReversionConsensusScore(
+  config: MeanReversionConfig,
+  input: DirectionalStrategyInput,
+): number {
+  const prices = input.prices;
+  if (prices.length < config.trendWindow + 1 || config.targetExposurePct <= 0) {
+    return 0;
+  }
+
+  const currentPrice = prices[prices.length - 1];
+  const windowStart = prices.length - config.window;
+  const cachedWindow = priceStatsWindow(input.stats, config.window);
+  const cachedMean = valueWindowMean(cachedWindow);
+  const mean = cachedMean ?? averageRange(prices, windowStart, prices.length);
+  const stdDev =
+    valueWindowStdDev(cachedWindow) ??
+    standardDeviationRange(prices, windowStart, prices.length, mean);
+  if (stdDev <= 0) {
+    return 0;
+  }
+
+  const zScore = (currentPrice - mean) / stdDev;
+  const trendBps = windowReturnBps(prices, config.trendWindow);
+
+  if (zScore <= -config.entryZScore && trendBps >= -config.maxTrendBps) {
+    return childConsensusScore(
+      config.targetExposurePct,
+      confidenceFromZScore(zScore, config.entryZScore),
+    );
+  }
+
+  if (zScore >= config.entryZScore && trendBps <= config.maxTrendBps) {
+    return childConsensusScore(
+      config.targetExposurePct,
+      -confidenceFromZScore(zScore, config.entryZScore),
+    );
+  }
+
+  return 0;
+}
+
+function childConsensusScore(maxTargetExposurePct: number, score: number): number {
+  if (maxTargetExposurePct <= 0) {
+    return 0;
+  }
+
+  return clamp(
+    (maxTargetExposurePct * score) / Math.max(maxTargetExposurePct, 0.01),
+    -1,
+    1,
+  );
+}
+
+function formatActiveMasterSignals(
+  trendScore: number,
+  breakoutScore: number,
+  reversionScore: number,
+): string {
+  let summary = "";
+  if (trendScore !== 0) {
+    summary = `trend ${formatScore(trendScore)}`;
+  }
+  if (breakoutScore !== 0) {
+    summary = appendSummary(summary, `breakout ${formatScore(breakoutScore)}`);
+  }
+  if (reversionScore !== 0) {
+    summary = appendSummary(summary, `reversion ${formatScore(reversionScore)}`);
+  }
+  return summary;
+}
+
+function appendSummary(summary: string, next: string): string {
+  return summary ? `${summary}, ${next}` : next;
 }
 
 function hold(reason: string): DirectionalDecision {
@@ -383,22 +635,223 @@ function windowReturnBps(prices: number[], window: number): number {
   return ((current - previous) / previous) * 10_000;
 }
 
-function rollingReturnVolatilityBps(prices: number[], window: number): number {
+function rollingReturnVolatilityBps(
+  prices: number[],
+  window: number,
+  stats?: DirectionalRuntimeStats,
+): number {
+  const cachedStdDev = valueWindowStdDev(returnStatsWindow(stats, window));
+  if (cachedStdDev !== undefined) {
+    return cachedStdDev;
+  }
+
   const start = Math.max(1, prices.length - window);
-  const returns: number[] = [];
+  let count = 0;
+  let sum = 0;
+
   for (let index = start; index < prices.length; index += 1) {
     const previous = prices[index - 1];
     const current = prices[index];
     if (previous > 0 && current > 0) {
-      returns.push(((current - previous) / previous) * 10_000);
+      const value = ((current - previous) / previous) * 10_000;
+      count += 1;
+      sum += value;
     }
   }
 
-  if (returns.length < 2) {
+  if (count < 2) {
     return 0;
   }
 
-  return standardDeviation(returns, average(returns));
+  const mean = sum / count;
+  let variance = 0;
+  for (let index = start; index < prices.length; index += 1) {
+    const previous = prices[index - 1];
+    const current = prices[index];
+    if (previous > 0 && current > 0) {
+      const value = ((current - previous) / previous) * 10_000;
+      variance += (value - mean) ** 2;
+    }
+  }
+
+  return Math.sqrt(variance / count);
+}
+
+function valueWindowMean(window: RollingValueWindow | undefined): number | undefined {
+  if (!window || window.count < 2) {
+    return undefined;
+  }
+
+  return window.sum / window.count;
+}
+
+function valueWindowStdDev(window: RollingValueWindow | undefined): number | undefined {
+  if (!window || window.count < 2) {
+    return undefined;
+  }
+
+  const mean = window.sum / window.count;
+  const variance = Math.max(0, window.sumSquares / window.count - mean * mean);
+  return Math.sqrt(variance);
+}
+
+function previousRangeHigh(
+  stats: DirectionalRuntimeStats | undefined,
+  window: number,
+): number | undefined {
+  return previousRangeValue(rangeStatsWindow(stats, window), "max");
+}
+
+function previousRangeLow(
+  stats: DirectionalRuntimeStats | undefined,
+  window: number,
+): number | undefined {
+  return previousRangeValue(rangeStatsWindow(stats, window), "min");
+}
+
+function priceStatsWindow(
+  stats: DirectionalRuntimeStats | undefined,
+  window: number,
+): RollingValueWindow | undefined {
+  const candidate = stats?.meanReversionPriceWindow;
+  return candidate?.window === window ? candidate : undefined;
+}
+
+function returnStatsWindow(
+  stats: DirectionalRuntimeStats | undefined,
+  window: number,
+): RollingValueWindow | undefined {
+  if (!stats) {
+    return undefined;
+  }
+  if (stats.trendVolatilityWindow.window === window) {
+    return stats.trendVolatilityWindow;
+  }
+  if (stats.masterVolatilityWindow.window === window) {
+    return stats.masterVolatilityWindow;
+  }
+  return undefined;
+}
+
+function rangeStatsWindow(
+  stats: DirectionalRuntimeStats | undefined,
+  window: number,
+): RollingRangeWindow | undefined {
+  const candidate = stats?.breakoutRangeWindow;
+  return candidate?.window === window ? candidate : undefined;
+}
+
+function previousRangeValue(
+  window: RollingRangeWindow | undefined,
+  side: "max" | "min",
+): number | undefined {
+  if (!window || window.index <= window.window) {
+    return undefined;
+  }
+
+  const currentIndex = window.index - 1;
+  const indexes = side === "max" ? window.maxIndexes : window.minIndexes;
+  const values = side === "max" ? window.maxValues : window.minValues;
+  let head = side === "max" ? window.maxHead : window.minHead;
+  if (indexes[head] === currentIndex) {
+    head += 1;
+  }
+  return head < indexes.length ? values[head] : undefined;
+}
+
+function createRollingValueWindow(window: number): RollingValueWindow {
+  return {
+    window,
+    values: new Array<number>(window),
+    cursor: 0,
+    count: 0,
+    sum: 0,
+    sumSquares: 0,
+  };
+}
+
+function recordRollingValue(window: RollingValueWindow, value: number): void {
+  if (window.count < window.window) {
+    window.values[window.cursor] = value;
+    window.cursor = (window.cursor + 1) % window.window;
+    window.count += 1;
+    window.sum += value;
+    window.sumSquares += value * value;
+    return;
+  }
+
+  const previous = window.values[window.cursor] ?? 0;
+  window.values[window.cursor] = value;
+  window.cursor = (window.cursor + 1) % window.window;
+  window.sum += value - previous;
+  window.sumSquares += value * value - previous * previous;
+}
+
+function createRollingRangeWindow(window: number): RollingRangeWindow {
+  return {
+    window,
+    index: 0,
+    maxIndexes: [],
+    maxValues: [],
+    maxHead: 0,
+    minIndexes: [],
+    minValues: [],
+    minHead: 0,
+  };
+}
+
+function recordRollingRange(window: RollingRangeWindow, value: number): void {
+  const index = window.index;
+  window.index += 1;
+
+  while (
+    window.maxValues.length > window.maxHead &&
+    window.maxValues[window.maxValues.length - 1] <= value
+  ) {
+    window.maxValues.pop();
+    window.maxIndexes.pop();
+  }
+  window.maxValues.push(value);
+  window.maxIndexes.push(index);
+
+  while (
+    window.minValues.length > window.minHead &&
+    window.minValues[window.minValues.length - 1] >= value
+  ) {
+    window.minValues.pop();
+    window.minIndexes.pop();
+  }
+  window.minValues.push(value);
+  window.minIndexes.push(index);
+
+  const oldestIndex = index - window.window;
+  while (
+    window.maxHead < window.maxIndexes.length &&
+    window.maxIndexes[window.maxHead] < oldestIndex
+  ) {
+    window.maxHead += 1;
+  }
+  while (
+    window.minHead < window.minIndexes.length &&
+    window.minIndexes[window.minHead] < oldestIndex
+  ) {
+    window.minHead += 1;
+  }
+
+  compactRangeWindow(window);
+}
+
+function compactRangeWindow(window: RollingRangeWindow): void {
+  if (window.maxHead > 2048) {
+    window.maxIndexes = window.maxIndexes.slice(window.maxHead);
+    window.maxValues = window.maxValues.slice(window.maxHead);
+    window.maxHead = 0;
+  }
+  if (window.minHead > 2048) {
+    window.minIndexes = window.minIndexes.slice(window.minHead);
+    window.minValues = window.minValues.slice(window.minHead);
+    window.minHead = 0;
+  }
 }
 
 function volatilityAdjustedThreshold(baseThresholdBps: number, volatilityBps: number): number {
@@ -426,28 +879,56 @@ function decisionConsensusScore(
   return clamp(decision.targetExposurePct / denominator, -1, 1);
 }
 
-function average(values: number[]): number {
-  if (values.length === 0) {
+function maxRange(values: number[], start: number, end: number): number {
+  let max = -Infinity;
+  for (let index = start; index < end; index += 1) {
+    if (values[index] > max) {
+      max = values[index];
+    }
+  }
+  return max;
+}
+
+function minRange(values: number[], start: number, end: number): number {
+  let min = Infinity;
+  for (let index = start; index < end; index += 1) {
+    if (values[index] < min) {
+      min = values[index];
+    }
+  }
+  return min;
+}
+
+function averageRange(values: number[], start: number, end: number): number {
+  const count = end - start;
+  if (count <= 0) {
     return 0;
   }
 
   let sum = 0;
-  for (const value of values) {
-    sum += value;
+  for (let index = start; index < end; index += 1) {
+    sum += values[index];
   }
-  return sum / values.length;
+  return sum / count;
 }
 
-function standardDeviation(values: number[], mean: number): number {
-  if (values.length < 2) {
+function standardDeviationRange(
+  values: number[],
+  start: number,
+  end: number,
+  mean: number,
+): number {
+  const count = end - start;
+  if (count < 2) {
     return 0;
   }
 
   let variance = 0;
-  for (const value of values) {
+  for (let index = start; index < end; index += 1) {
+    const value = values[index];
     variance += (value - mean) ** 2;
   }
-  return Math.sqrt(variance / values.length);
+  return Math.sqrt(variance / count);
 }
 
 function clampInt(value: number, min: number, max: number): number {

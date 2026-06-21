@@ -24,6 +24,7 @@ import type { StreamVenue } from "./binance-markets.js";
 const WIPEOUT_EQUITY_FRACTION = 0.01;
 const WIPEOUT_CHECK_CANDLES = 100;
 const MAX_EQUITY_POINTS = 800;
+const REPLAY_PROGRESS_CANDLES = 10_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RANDOM_SAMPLE_COUNT = 40;
 const MAX_RANDOM_SAMPLE_COUNT = 200;
@@ -544,7 +545,11 @@ async function runHistoricalRangeBacktest(
 
   const replayStartedAt = Date.now();
 
-  outer: for await (const candles of cache.readRangeBatches(targetStartTime, targetEndTime)) {
+  outer: for await (const candles of cache.readRangeBatches(
+    targetStartTime,
+    targetEndTime,
+    REPLAY_PROGRESS_CANDLES,
+  )) {
     for (const candle of candles) {
       if (processedCandles % 100 === 0) {
         throwIfCancelled(options.cancelSignal);
@@ -1162,51 +1167,18 @@ function replayCandle(
   candle: Candle,
   perfectMargin?: PerfectMarginBenchmarkAccumulator,
 ): void {
-  const options = {
-    collectEvents: false,
-    updateMetrics: false,
-  };
-
-  for (const tick of candleReplayTicks(candle)) {
-    observePerfectMarginPrice(perfectMargin, tick.price);
-    bot.onTick(tick, options);
-  }
-}
-
-function candleReplayTicks(candle: Candle): Array<{
-  symbol: string;
-  eventTime: number;
-  price: number;
-  quantity: number;
-}> {
   const duration = Math.max(1, candle.closeTime - candle.openTime);
+  const highTime = candle.openTime + duration * 0.33;
+  const lowTime = candle.openTime + duration * 0.66;
 
-  return [
-    {
-      symbol: candle.symbol,
-      eventTime: candle.openTime,
-      price: candle.open,
-      quantity: candle.volume * 0.2,
-    },
-    {
-      symbol: candle.symbol,
-      eventTime: candle.openTime + duration * 0.33,
-      price: candle.high,
-      quantity: candle.volume * 0.25,
-    },
-    {
-      symbol: candle.symbol,
-      eventTime: candle.openTime + duration * 0.66,
-      price: candle.low,
-      quantity: candle.volume * 0.25,
-    },
-    {
-      symbol: candle.symbol,
-      eventTime: candle.closeTime,
-      price: candle.close,
-      quantity: candle.volume * 0.3,
-    },
-  ];
+  observePerfectMarginPrice(perfectMargin, candle.open);
+  bot.onReplayPriceTick(candle.openTime, candle.open);
+  observePerfectMarginPrice(perfectMargin, candle.high);
+  bot.onReplayPriceTick(highTime, candle.high);
+  observePerfectMarginPrice(perfectMargin, candle.low);
+  bot.onReplayPriceTick(lowTime, candle.low);
+  observePerfectMarginPrice(perfectMargin, candle.close);
+  bot.onReplayPriceTick(candle.closeTime, candle.close);
 }
 
 function createPerfectMarginBenchmark(

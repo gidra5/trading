@@ -86,7 +86,7 @@ trend can make passive short exposure look better than it is across a full BTC c
 Useful overrides:
 
 ```bash
-TRADING_EXPERIMENT_AGENT_COMMAND="codex exec -C . --sandbox workspace-write --ask-for-approval never -" npm run experiment:loop
+TRADING_EXPERIMENT_AGENT_COMMAND="codex exec -C . --sandbox workspace-write -" npm run experiment:loop
 npm run experiment:loop -- --sleep-sec 300 --agent-timeout-min 240
 npm run experiment:loop -- --benchmark-command "npm run benchmark:strategies -- --mode random-lengths --lookback-days 1825 --min-window-days 14 --max-window-days 180 --samples 48 --seed {seed}"
 ```

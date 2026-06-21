@@ -4,6 +4,7 @@ import type {
   BotStatus,
   BotMetrics,
   Candle,
+  LegacyValleyPeakMemory,
   ManualTradeInput,
   PaperBotState,
   PriceTick,
@@ -20,6 +21,7 @@ import {
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
 import {
+  createDirectionalRuntimeStats,
   createMasterAdaptiveConfig,
   createMeanReversionConfig,
   createTrendFollowingConfig,
@@ -30,9 +32,11 @@ import {
   defaultVolatilityBreakoutConfig,
   evaluateMasterAdaptive,
   evaluateMeanReversion,
+  recordDirectionalRuntimePrice,
   evaluateTrendFollowing,
   evaluateVolatilityBreakout,
   type DirectionalDecision,
+  type DirectionalRuntimeStats,
   type DirectionalSide,
 } from "./directional-strategies.js";
 import {
@@ -94,6 +98,7 @@ interface ImmediateFillRollback {
 
 const roundAsset = (value: number) => Number(value.toFixed(8));
 const roundQuote = (value: number) => Number(value.toFixed(6));
+const NO_EVENTS: BotEvent[] = [];
 
 export function createStrategyConfig(
   overrides: Partial<StrategyConfig> = {},
@@ -199,11 +204,26 @@ export function createInitialBotState(
 export class SimulatedTradingBot {
   private state: PaperBotState;
   private openOrderIndexes = new Set<number>();
+  private priceMemoryLimit = 0;
+  private directionalStats: DirectionalRuntimeStats;
+  private usesDirectionalStats = false;
+  private readonly reusableTick: PriceTick = {
+    symbol: "",
+    eventTime: 0,
+    price: 0,
+  };
 
   constructor(initialState?: PaperBotState, overrides: Partial<StrategyConfig> = {}) {
     this.state = initialState
       ? normalizeLoadedState(initialState, overrides)
       : createInitialBotState(overrides);
+    this.priceMemoryLimit = priceMemoryLimit(this.state.config);
+    this.directionalStats = createDirectionalRuntimeStats(
+      this.state.config,
+      this.state.memory.prices,
+    );
+    this.usesDirectionalStats = usesDirectionalRuntimeStats(this.state.config);
+    this.reusableTick.symbol = this.state.symbol;
     this.rebuildOpenOrderIndex();
   }
 
@@ -241,6 +261,10 @@ export class SimulatedTradingBot {
     this.state = createInitialBotState({ ...this.state.config, ...overrides });
     this.state.createdAt = at;
     this.state.updatedAt = at;
+    this.priceMemoryLimit = priceMemoryLimit(this.state.config);
+    this.directionalStats = createDirectionalRuntimeStats(this.state.config);
+    this.usesDirectionalStats = usesDirectionalRuntimeStats(this.state.config);
+    this.reusableTick.symbol = this.state.symbol;
     this.rebuildOpenOrderIndex();
     return [
       {
@@ -401,23 +425,87 @@ export class SimulatedTradingBot {
   }
 
   onTick(tick: PriceTick, options: TickProcessingOptions = {}): BotEvent[] {
-    if (tick.symbol !== this.state.symbol || tick.price <= 0) {
+    return this.onPriceTick(tick.symbol, tick.eventTime, tick.price, tick.quantity, options);
+  }
+
+  onPriceTick(
+    symbol: string,
+    eventTime: number,
+    price: number,
+    quantity?: number,
+    options: TickProcessingOptions = {},
+  ): BotEvent[] {
+    if (symbol !== this.state.symbol || price <= 0) {
       return [];
+    }
+
+    return this.processAcceptedPriceTick(eventTime, price, quantity, options);
+  }
+
+  onReplayPriceTick(
+    eventTime: number,
+    price: number,
+  ): BotEvent[] {
+    if (price <= 0) {
+      return [];
+    }
+
+    this.state.lastPrice = price;
+    this.state.updatedAt = eventTime;
+
+    const tick = this.reusableTick;
+    if (tick.symbol !== this.state.symbol) {
+      tick.symbol = this.state.symbol;
+    }
+    tick.eventTime = eventTime;
+    tick.price = price;
+    tick.quantity = undefined;
+
+    this.cancelStaleOrders(eventTime, false);
+    this.fillOpenOrders(tick, false);
+    this.rememberPrice(price);
+    if (this.usesDirectionalStats) {
+      recordDirectionalRuntimePrice(this.directionalStats, price);
+    }
+
+    if (this.state.status === "running") {
+      this.evaluateStrategy(tick, false);
+    }
+
+    return NO_EVENTS;
+  }
+
+  private processAcceptedPriceTick(
+    eventTime: number,
+    price: number,
+    quantity: number | undefined,
+    options: TickProcessingOptions,
+  ): BotEvent[] {
+    if (this.reusableTick.symbol !== this.state.symbol) {
+      this.reusableTick.symbol = this.state.symbol;
     }
 
     const collectEvents = options.collectEvents ?? true;
     const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
-    this.state.lastPrice = tick.price;
-    this.state.updatedAt = tick.eventTime;
+    this.state.lastPrice = price;
+    this.state.updatedAt = eventTime;
+
+    const tick = this.reusableTick;
+    tick.eventTime = eventTime;
+    tick.price = price;
+    tick.quantity = quantity;
 
     if (events) {
-      events.push(...this.cancelStaleOrders(tick.eventTime, collectEvents));
+      events.push(...this.cancelStaleOrders(eventTime, collectEvents));
       events.push(...this.fillOpenOrders(tick, collectEvents));
     } else {
-      this.cancelStaleOrders(tick.eventTime, collectEvents);
+      this.cancelStaleOrders(eventTime, collectEvents);
       this.fillOpenOrders(tick, collectEvents);
     }
-    this.rememberPrice(tick.price);
+    this.rememberPrice(price);
+    if (this.usesDirectionalStats) {
+      recordDirectionalRuntimePrice(this.directionalStats, price);
+    }
 
     if (this.state.status === "running") {
       if (events) {
@@ -554,13 +642,10 @@ export class SimulatedTradingBot {
       return [];
     }
 
-    this.state.memory.legacyValleyPeak = normalizeLegacyValleyPeakMemory(
-      this.state.memory.legacyValleyPeak,
-      config.legacyValleyPeak,
-    );
+    const memory = this.ensureLegacyValleyPeakMemory();
 
     const decision = evaluateLegacyValleyPeak(
-      this.state.memory.legacyValleyPeak,
+      memory,
       config.legacyValleyPeak,
       {
         eventTime: tick.eventTime,
@@ -619,6 +704,7 @@ export class SimulatedTradingBot {
     const input = {
       prices: this.state.memory.prices,
       currentSide,
+      stats: this.directionalStats,
     };
     const decision =
       config.algorithm === "trend-following"
@@ -1121,7 +1207,7 @@ export class SimulatedTradingBot {
   }
 
   private fillOpenOrders(tick: PriceTick, collectEvents: boolean): BotEvent[] {
-    const events: BotEvent[] = [];
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
 
     for (const index of this.openOrderIndexes) {
       const order = this.state.orders[index];
@@ -1139,7 +1225,7 @@ export class SimulatedTradingBot {
 
       const result = this.tryFillOrder(order, index, tick.eventTime);
       if (result.cancelled) {
-        if (collectEvents) {
+        if (events) {
           events.push({
             type: "order_cancelled",
             at: tick.eventTime,
@@ -1152,7 +1238,7 @@ export class SimulatedTradingBot {
       if (!result.fill) {
         continue;
       }
-      if (!collectEvents) {
+      if (!events) {
         continue;
       }
       events.push({
@@ -1164,7 +1250,7 @@ export class SimulatedTradingBot {
       });
     }
 
-    return events;
+    return events ?? NO_EVENTS;
   }
 
   private tryFillOrder(
@@ -1322,7 +1408,7 @@ export class SimulatedTradingBot {
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
-    const events: BotEvent[] = [];
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
 
     for (const index of this.openOrderIndexes) {
       const order = this.state.orders[index];
@@ -1340,7 +1426,7 @@ export class SimulatedTradingBot {
       order.updatedAt = at;
       this.openOrderIndexes.delete(index);
 
-      if (collectEvents) {
+      if (events) {
         events.push({
           type: "order_cancelled",
           at,
@@ -1350,7 +1436,7 @@ export class SimulatedTradingBot {
       }
     }
 
-    return events;
+    return events ?? NO_EVENTS;
   }
 
   private releaseOrderReserve(order: TradingOrder): void {
@@ -1368,11 +1454,29 @@ export class SimulatedTradingBot {
   }
 
   private rememberPrice(price: number): void {
-    const maxPrices = priceMemoryLimit(this.state.config);
+    const maxPrices = this.priceMemoryLimit;
     this.state.memory.prices.push(price);
     if (this.state.memory.prices.length > maxPrices * 2) {
       this.state.memory.prices.splice(0, this.state.memory.prices.length - maxPrices);
     }
+  }
+
+  private ensureLegacyValleyPeakMemory(): LegacyValleyPeakMemory {
+    let memory = this.state.memory.legacyValleyPeak;
+    const rangeCount = this.state.config.legacyValleyPeak.averagingRangesSec.length;
+    if (
+      !memory ||
+      memory.buyAverages.length !== rangeCount ||
+      memory.sellAverages.length !== rangeCount
+    ) {
+      memory = normalizeLegacyValleyPeakMemory(
+        memory,
+        this.state.config.legacyValleyPeak,
+      );
+      this.state.memory.legacyValleyPeak = memory;
+    }
+
+    return memory;
   }
 
   private openOrders(): TradingOrder[] {
@@ -1503,6 +1607,15 @@ function priceMemoryLimit(config: StrategyConfig): number {
     config.trendFollowing.volatilityWindow + 2,
     config.volatilityBreakout.lookbackWindow + 2,
     config.meanReversion.trendWindow + 2,
+  );
+}
+
+function usesDirectionalRuntimeStats(config: StrategyConfig): boolean {
+  return (
+    config.algorithm === "trend-following" ||
+    config.algorithm === "volatility-breakout" ||
+    config.algorithm === "mean-reversion" ||
+    config.algorithm === "master-adaptive"
   );
 }
 

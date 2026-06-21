@@ -55,21 +55,11 @@ export class HistoricalCandleCache {
     await fs.mkdir(this.rootDir, { recursive: true });
     const protectedFiles = new Set(this.filePathsForRange(startTime, endTime));
     const stats = await this.initialStats(protectedFiles);
-    const cachedOpenTimes = await this.collectCachedOpenTimes(startTime, endTime);
-    const expectedOpenTimes = expectedCandleOpenTimes(
-      startTime,
-      endTime,
-      this.options.intervalMs,
-    );
-    const missingRanges = missingRangesFromExpected(
-      expectedOpenTimes,
-      cachedOpenTimes,
-      this.options.intervalMs,
-    );
+    const rangeState = await this.inspectCachedRange(startTime, endTime);
+    const missingRanges = rangeState.missingRanges;
 
-    stats.cacheHitCandles =
-      expectedOpenTimes.length - sumRangeCandles(missingRanges, this.options.intervalMs);
-    stats.cacheMissCandles = sumRangeCandles(missingRanges, this.options.intervalMs);
+    stats.cacheHitCandles = rangeState.cacheHitCandles;
+    stats.cacheMissCandles = rangeState.cacheMissCandles;
     onProgress?.({ ...stats });
 
     for (const range of missingRanges) {
@@ -113,16 +103,36 @@ export class HistoricalCandleCache {
     let batch: Candle[] = [];
 
     for (const filePath of this.filePathsForRange(startTime, endTime)) {
-      const candles = (await readJsonLines<Candle>(filePath))
-        .filter((candle) => candle.openTime >= startTime && candle.openTime <= endTime)
-        .sort((a, b) => a.openTime - b.openTime);
-
-      for (const candle of candles) {
-        batch.push(candle);
-        if (batch.length >= batchSize) {
-          yield batch;
-          batch = [];
+      let content: string;
+      try {
+        content = await fs.readFile(filePath, "utf8");
+      } catch (error) {
+        if (isMissingFile(error)) {
+          continue;
         }
+
+        throw error;
+      }
+
+      let lineStart = 0;
+      while (lineStart < content.length) {
+        let lineEnd = content.indexOf("\n", lineStart);
+        if (lineEnd === -1) {
+          lineEnd = content.length;
+        }
+
+        if (lineEnd > lineStart) {
+          const candle = JSON.parse(content.slice(lineStart, lineEnd)) as Candle;
+          if (candle.openTime >= startTime && candle.openTime <= endTime) {
+            batch.push(candle);
+            if (batch.length >= batchSize) {
+              yield batch;
+              batch = [];
+            }
+          }
+        }
+
+        lineStart = lineEnd + 1;
       }
     }
 
@@ -131,17 +141,92 @@ export class HistoricalCandleCache {
     }
   }
 
+  private async inspectCachedRange(
+    startTime: number,
+    endTime: number,
+  ): Promise<{
+    cacheHitCandles: number;
+    cacheMissCandles: number;
+    missingRanges: Array<{ startTime: number; endTime: number }>;
+  }> {
+    const first = alignUp(startTime, this.options.intervalMs);
+    const last = alignDown(endTime, this.options.intervalMs);
+    const missingRanges: Array<{ startTime: number; endTime: number }> = [];
+    let expectedCandles = 0;
+    let missingCandles = 0;
+
+    if (last < first) {
+      return {
+        cacheHitCandles: 0,
+        cacheMissCandles: 0,
+        missingRanges,
+      };
+    }
+
+    let cursor = utcDayStart(first);
+    const endDay = utcDayStart(last);
+
+    while (cursor <= endDay) {
+      const dayStart = alignUp(cursor, this.options.intervalMs);
+      const dayEnd = alignDown(cursor + DAY_MS - 1, this.options.intervalMs);
+      const rangeStart = Math.max(first, dayStart);
+      const rangeEnd = Math.min(last, dayEnd);
+
+      if (rangeStart <= rangeEnd) {
+        const rangeCandles = countCandlesInRange(
+          rangeStart,
+          rangeEnd,
+          this.options.intervalMs,
+        );
+        expectedCandles += rangeCandles;
+
+        const filePath = this.filePathForTime(cursor);
+        const fullDayRange = rangeStart === dayStart && rangeEnd === dayEnd;
+        const fullDayComplete =
+          fullDayRange &&
+          (await fileHasCompleteRange(
+            filePath,
+            dayStart,
+            dayEnd,
+            rangeCandles,
+          ));
+
+        if (!fullDayComplete) {
+          const cachedOpenTimes = await this.collectCachedOpenTimes(
+            filePath,
+            rangeStart,
+            rangeEnd,
+          );
+          missingCandles += appendMissingRanges(
+            missingRanges,
+            rangeStart,
+            rangeEnd,
+            cachedOpenTimes,
+            this.options.intervalMs,
+          );
+        }
+      }
+
+      cursor += DAY_MS;
+    }
+
+    return {
+      cacheHitCandles: expectedCandles - missingCandles,
+      cacheMissCandles: missingCandles,
+      missingRanges,
+    };
+  }
+
   private async collectCachedOpenTimes(
+    filePath: string,
     startTime: number,
     endTime: number,
   ): Promise<Set<number>> {
     const openTimes = new Set<number>();
 
-    for (const filePath of this.filePathsForRange(startTime, endTime)) {
-      for (const candle of await readJsonLines<Candle>(filePath)) {
-        if (candle.openTime >= startTime && candle.openTime <= endTime) {
-          openTimes.add(candle.openTime);
-        }
+    for (const candle of await readJsonLines<Candle>(filePath)) {
+      if (candle.openTime >= startTime && candle.openTime <= endTime) {
+        openTimes.add(candle.openTime);
       }
     }
 
@@ -258,32 +343,81 @@ export class HistoricalCandleCache {
   }
 }
 
-function expectedCandleOpenTimes(
+async function fileHasCompleteRange(
+  filePath: string,
   startTime: number,
   endTime: number,
-  intervalMs: number,
-): number[] {
-  const openTimes: number[] = [];
-  const first = alignUp(startTime, intervalMs);
-  const last = alignDown(endTime, intervalMs);
+  expectedCandles: number,
+): Promise<boolean> {
+  let content: string;
+  try {
+    content = await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (isMissingFile(error)) {
+      return false;
+    }
 
-  for (let time = first; time <= last; time += intervalMs) {
-    openTimes.push(time);
+    throw error;
   }
 
-  return openTimes;
+  if (content.length === 0 || expectedCandles <= 0) {
+    return false;
+  }
+
+  const firstLineEnd = content.indexOf("\n");
+  if (firstLineEnd <= 0) {
+    return false;
+  }
+
+  const lastLineEnd =
+    content.charCodeAt(content.length - 1) === 10 ? content.length - 1 : content.length;
+  const lastLineStart = content.lastIndexOf("\n", lastLineEnd - 1) + 1;
+  if (lastLineStart < 0 || lastLineStart >= lastLineEnd) {
+    return false;
+  }
+
+  const lineCount = countNonEmptyLines(content);
+  if (lineCount !== expectedCandles) {
+    return false;
+  }
+
+  const first = JSON.parse(content.slice(0, firstLineEnd)) as Candle;
+  const last = JSON.parse(content.slice(lastLineStart, lastLineEnd)) as Candle;
+  return first.openTime === startTime && last.openTime === endTime;
 }
 
-function missingRangesFromExpected(
-  expectedOpenTimes: number[],
+function countNonEmptyLines(content: string): number {
+  let count = 0;
+  let lineStart = 0;
+
+  while (lineStart < content.length) {
+    let lineEnd = content.indexOf("\n", lineStart);
+    if (lineEnd === -1) {
+      lineEnd = content.length;
+    }
+
+    if (lineEnd > lineStart) {
+      count += 1;
+    }
+
+    lineStart = lineEnd + 1;
+  }
+
+  return count;
+}
+
+function appendMissingRanges(
+  ranges: Array<{ startTime: number; endTime: number }>,
+  startTime: number,
+  endTime: number,
   cachedOpenTimes: Set<number>,
   intervalMs: number,
-): Array<{ startTime: number; endTime: number }> {
-  const ranges: Array<{ startTime: number; endTime: number }> = [];
+): number {
+  let missingCount = 0;
   let currentStart: number | undefined;
   let previousMissing: number | undefined;
 
-  for (const openTime of expectedOpenTimes) {
+  for (let openTime = startTime; openTime <= endTime; openTime += intervalMs) {
     if (cachedOpenTimes.has(openTime)) {
       if (currentStart !== undefined && previousMissing !== undefined) {
         ranges.push({
@@ -298,6 +432,7 @@ function missingRangesFromExpected(
 
     currentStart ??= openTime;
     previousMissing = openTime;
+    missingCount += 1;
   }
 
   if (currentStart !== undefined && previousMissing !== undefined) {
@@ -307,16 +442,15 @@ function missingRangesFromExpected(
     });
   }
 
-  return ranges;
+  return missingCount;
 }
 
-function sumRangeCandles(
-  ranges: Array<{ startTime: number; endTime: number }>,
+function countCandlesInRange(
+  startTime: number,
+  endTime: number,
   intervalMs: number,
 ): number {
-  return ranges.reduce((sum, range) => {
-    return sum + Math.max(0, Math.floor((range.endTime - range.startTime + 1) / intervalMs));
-  }, 0);
+  return Math.max(0, Math.floor((endTime - startTime) / intervalMs) + 1);
 }
 
 function mergeBudgetStats(

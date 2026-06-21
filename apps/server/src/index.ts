@@ -226,7 +226,7 @@ server.post("/api/backtest", async (request, reply) => {
           : clampInt(Number(body.randomLookbackDays), 1, 3650),
       randomPairCount: randomMarkets?.length ?? randomPairCount,
       randomMarkets,
-    }, broadcastState);
+    }, scheduleBroadcast);
     broadcastState();
     return publicSnapshot();
   } catch (error) {
@@ -454,6 +454,10 @@ function scheduleBroadcast(): void {
 }
 
 function broadcastState(): void {
+  if (sockets.size === 0) {
+    return;
+  }
+
   const message = JSON.stringify({
     type: "snapshot",
     payload: publicSnapshot(),

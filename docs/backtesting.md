@@ -49,6 +49,10 @@ The replay path is optimized for long candle runs:
 - returned backtest orders/fills are capped to the latest 2,000 each by default; summary metrics still count the full run
 - open order bookkeeping uses indexed set entries instead of scanning all historical orders on every fill
 - leverage checks use a fast debt-leverage estimate first and rebuild the full position ledger only when the estimate is near or above the configured limit
+- historical replay emits progress in larger candle batches and dashboard websocket broadcasts are throttled so UI snapshots do not block replay
+- directional strategies keep private rolling stats for volatility, mean/std, and breakout ranges instead of rescanning price windows every tick
+- replay uses a trusted no-event tick path, skipping symbol checks, unused volume-derived quantities, and per-tick metrics updates
+- cached full-day shards are validated with line count plus first/last candle checks instead of parsing every cached candle before replay
 
 ## Strategy Benchmark Script
 
@@ -140,20 +144,31 @@ The detailed experiment plan, grid-search result, and portfolio result are recor
 [`docs/experiment-plan.md`](experiment-plan.md).
 
 The original synthetic benchmark was too optimistic because it did not match the active
-dashboard path. With the default `legacy-valley-peak` algorithm and cached Binance
-one-minute candles, the API-backed dashboard path currently processes roughly:
+dashboard path. With cached Binance one-minute candles, the API-backed historical path
+currently processes roughly:
 
-- 32k candles/s over a cached month backtest
-- 35k candles/s over a cached year backtest
+- 101k candles/s over a cached month `master-adaptive` backtest with a live dashboard websocket
+- 109k candles/s over a cached month `master-adaptive` backtest through the direct API path
+- 133k candles/s over a cached year `master-adaptive` backtest through the direct API path
 
-The in-memory replay path for the same cached month is closer to 40k candles/s. Simpler
-synthetic strategy benchmarks can still be much faster, but they should not be treated as
-representative of the live dashboard backtest path.
+The in-memory replay path is faster because it excludes cache batch reads: the same
+master strategy processed the latest cached 30-day window at about 110k candles/s.
+Simpler synthetic strategy benchmarks and lighter algorithms can still be faster, but
+they should not be treated as representative of the live dashboard backtest path.
+
+The biggest replay wins came from removing hot-loop allocations and duplicate work:
+candle replay no longer allocates tick arrays, legacy buy/sell rolling averages share
+the same price stream, rolling-average samples no longer allocate objects per update,
+directional rolling-window helpers use cached rolling stats, and dashboard progress
+updates no longer force a full public websocket snapshot every 1,000 candles.
+Repeated cached runs also avoid a full JSON parse pass during cache validation for
+complete day shards.
+Legacy-only replay can still be much faster; the master-adaptive path is the current
+conservative benchmark because it exercises the heaviest strategy stack.
 
 Remaining work before treating year-scale runs as cheap:
 
 - improve the historical cache importer with resume/checkpoint metadata and batch verification
 - store long historical data in a queryable binary or columnar format instead of JSONL
-- reduce remaining strategy/accounting overhead enough to reach 100k+ candles/s on real cached data
 - run long backtests in a dedicated worker/job queue so UI and live trading remain isolated
 - add optional full trade-log export for cases where the latest 2,000 returned fills are not enough
