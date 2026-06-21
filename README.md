@@ -18,6 +18,18 @@ Backend API: http://localhost:3001
 
 The dev server writes live state and saved market data under `data/`.
 
+## Experiments
+
+```bash
+npm run benchmark:strategies
+npm run experiment:loop
+```
+
+`benchmark:strategies` defaults to random-length BTCUSDT samples across the available
+five-year cycle instead of a recent 30-day window. `experiment:loop` repeatedly runs
+that benchmark, prompts a Codex agent to review and improve the master adaptive
+strategy, runs typecheck, and writes iteration logs under `data/experiments/agent-loop`.
+
 ## Build
 
 ```bash

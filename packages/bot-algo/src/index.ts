@@ -16,11 +16,14 @@ export {
 } from "./legacy-valley-peak.js";
 export {
   createMeanReversionConfig,
+  createMasterAdaptiveConfig,
   createTrendFollowingConfig,
   createVolatilityBreakoutConfig,
+  defaultMasterAdaptiveConfig,
   defaultMeanReversionConfig,
   defaultTrendFollowingConfig,
   defaultVolatilityBreakoutConfig,
+  evaluateMasterAdaptive,
   evaluateMeanReversion,
   evaluateTrendFollowing,
   evaluateVolatilityBreakout,

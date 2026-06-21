@@ -32,13 +32,16 @@ The first implementation slice adds real long/short paper mechanics:
 - fast leverage precheck before full ledger validation
 - deterministic OHLC tick replay through the same strategy path used by dashboard historical backtests
 
-Three bidirectional research baselines were added:
+Three bidirectional research baselines and one master strategy were added:
 
 - `trend-following`
 - `volatility-breakout`
 - `mean-reversion`
+- `master-adaptive`
 
-These are intentionally simple and parameterized from the dashboard.
+The first three are intentionally simple and parameterized from the dashboard. The
+master strategy combines their signed exposure signals and is the current target for
+autonomous improvement.
 
 ## Benchmark Observations
 
@@ -47,6 +50,11 @@ Default benchmark command:
 ```bash
 npm run benchmark:strategies
 ```
+
+This now runs deterministic random-length samples across the available BTC cycle by
+default. Recent fixed-window tests are still useful as smoke checks, but they are not
+promotion evidence because a single market regime can make passive long or passive short
+look artificially strong.
 
 `Risk Ret` is `returnPct / maxDrawdownPct`; `Sharpe` is annualized from the sampled
 equity curve with zero risk-free rate.

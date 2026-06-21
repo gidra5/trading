@@ -12,6 +12,7 @@
     "build": "npm run build -w @trading/bot-algo && npm run build -w @trading/server && npm run build -w @trading/web",
     "typecheck": "npm run typecheck -w @trading/bot-algo && npm run typecheck -w @trading/server && npm run typecheck -w @trading/web",
     "benchmark:strategies": "tsx scripts/benchmark-strategies.ts",
+    "experiment:loop": "tsx scripts/experiment-agent-loop.ts",
     "start": "npm run start -w @trading/server"
   },
   "devDependencies": {

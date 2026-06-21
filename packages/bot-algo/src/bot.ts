@@ -20,12 +20,15 @@ import {
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
 import {
+  createMasterAdaptiveConfig,
   createMeanReversionConfig,
   createTrendFollowingConfig,
   createVolatilityBreakoutConfig,
+  defaultMasterAdaptiveConfig,
   defaultMeanReversionConfig,
   defaultTrendFollowingConfig,
   defaultVolatilityBreakoutConfig,
+  evaluateMasterAdaptive,
   evaluateMeanReversion,
   evaluateTrendFollowing,
   evaluateVolatilityBreakout,
@@ -63,6 +66,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   trendFollowing: defaultTrendFollowingConfig,
   volatilityBreakout: defaultVolatilityBreakoutConfig,
   meanReversion: defaultMeanReversionConfig,
+  masterAdaptive: defaultMasterAdaptiveConfig,
   positionRisk: defaultPositionRiskConfig,
 };
 
@@ -113,6 +117,10 @@ export function createStrategyConfig(
       ...defaultStrategyConfig.meanReversion,
       ...(overrides.meanReversion ?? {}),
     }),
+    masterAdaptive: createMasterAdaptiveConfig({
+      ...defaultStrategyConfig.masterAdaptive,
+      ...(overrides.masterAdaptive ?? {}),
+    }),
     positionRisk: createPositionRiskConfig({
       ...defaultStrategyConfig.positionRisk,
       ...(overrides.positionRisk ?? {}),
@@ -128,6 +136,7 @@ export function createStrategyConfig(
     config.algorithm !== "trend-following" &&
     config.algorithm !== "volatility-breakout" &&
     config.algorithm !== "mean-reversion" &&
+    config.algorithm !== "master-adaptive" &&
     config.algorithm !== "benchmark-always-long" &&
     config.algorithm !== "benchmark-always-short" &&
     config.algorithm !== "benchmark-always-flat" &&
@@ -432,7 +441,8 @@ export class SimulatedTradingBot {
     if (
       config.algorithm === "trend-following" ||
       config.algorithm === "volatility-breakout" ||
-      config.algorithm === "mean-reversion"
+      config.algorithm === "mean-reversion" ||
+      config.algorithm === "master-adaptive"
     ) {
       return this.evaluateDirectionalStrategy(tick, collectEvents);
     }
@@ -615,7 +625,17 @@ export class SimulatedTradingBot {
         ? evaluateTrendFollowing(config.trendFollowing, input)
         : config.algorithm === "volatility-breakout"
           ? evaluateVolatilityBreakout(config.volatilityBreakout, input)
-          : evaluateMeanReversion(config.meanReversion, input);
+          : config.algorithm === "mean-reversion"
+            ? evaluateMeanReversion(config.meanReversion, input)
+            : evaluateMasterAdaptive(
+                config.masterAdaptive,
+                {
+                  trendFollowing: config.trendFollowing,
+                  volatilityBreakout: config.volatilityBreakout,
+                  meanReversion: config.meanReversion,
+                },
+                input,
+              );
 
     if (decision.action === "hold") {
       this.state.memory.lastSignal = "hold";

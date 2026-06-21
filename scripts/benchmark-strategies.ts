@@ -15,6 +15,7 @@ type BenchmarkMode = "days" | "year" | "random-lengths" | "grid-search" | "portf
 
 interface BenchmarkArgs {
   mode: BenchmarkMode;
+  marketKey?: string;
   symbol: string;
   interval: string;
   days: number;
@@ -129,14 +130,18 @@ interface PortfolioRow extends PortfolioMetrics {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const YEAR_DAYS = 365;
+const FULL_BTC_CYCLE_DAYS = YEAR_DAYS * 5;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const args = parseArgs(process.argv.slice(2));
 const files = historicalCandleFiles(args);
 
 if (files.length === 0) {
+  const searched = historicalCandleDirCandidates(args)
+    .map((dir) => path.relative(repoRoot, dir))
+    .join(", ");
   throw new Error(
-    `No candles found under data/historical/${args.symbol.toLowerCase()}/${args.interval}.`,
+    `No candles found for ${args.symbol.toUpperCase()} ${args.interval}. Searched: ${searched}.`,
   );
 }
 
@@ -309,6 +314,32 @@ function createGridCandidates(): GridCandidate[] {
                 exitZScore: 0.25,
                 maxTrendBps,
                 targetExposurePct,
+              },
+            },
+          });
+        }
+      }
+    }
+  }
+
+  for (const trendWeight of [0.8, 1.2]) {
+    for (const breakoutWeight of [0.8, 1.2]) {
+      for (const reversionWeight of [0.2, 0.7]) {
+        for (const minConsensusScore of [0.2, 0.35]) {
+          candidates.push({
+            label: `Master t${trendWeight}/b${breakoutWeight}/r${reversionWeight}/s${minConsensusScore}`,
+            algorithm: "master-adaptive",
+            config: {
+              masterAdaptive: {
+                trendWeight,
+                breakoutWeight,
+                reversionWeight,
+                minConsensusScore,
+                disagreementExposureScale: 0.4,
+                targetExposurePct: 0.4,
+                volatilityWindow: 720,
+                highVolatilityBps: 35,
+                highVolatilityExposureScale: 0.65,
               },
             },
           });
@@ -802,19 +833,11 @@ function createRandomLengthWindows(
 }
 
 function historicalCandleFiles(options: BenchmarkArgs): string[] {
-  const dir = historicalCandleDir(options);
-  if (!fs.existsSync(dir)) {
-    return [];
-  }
-  return fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-    .map((entry) => entry.name)
-    .sort();
+  return historicalCandleSource(options).files;
 }
 
 function loadHistoricalCandles(options: BenchmarkArgs, files: string[]): Candle[] {
-  const dir = historicalCandleDir(options);
+  const dir = historicalCandleSource(options).dir;
   const candles: Candle[] = [];
   for (const file of files) {
     const content = fs.readFileSync(path.join(dir, file), "utf8");
@@ -831,13 +854,76 @@ function loadHistoricalCandles(options: BenchmarkArgs, files: string[]): Candle[
 }
 
 function historicalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
+  return historicalCandleSource(options).dir;
+}
+
+function historicalCandleSource(
+  options: Pick<BenchmarkArgs, "marketKey" | "symbol" | "interval">,
+): { dir: string; files: string[] } {
+  const candidates = historicalCandleDirCandidates(options)
+    .map((dir) => ({
+      dir,
+      files: listHistoricalCandleFiles(dir),
+    }))
+    .sort(
+      (left, right) =>
+        right.files.length - left.files.length ||
+        left.dir.localeCompare(right.dir),
+    );
+
+  return candidates[0] ?? {
+    dir: legacyHistoricalCandleDir(options),
+    files: [],
+  };
+}
+
+function historicalCandleDirCandidates(
+  options: Pick<BenchmarkArgs, "marketKey" | "symbol" | "interval">,
+): string[] {
+  const root = path.join(repoRoot, "data", "historical");
+  const symbol = safePathPart(options.symbol);
+  const interval = safePathPart(options.interval);
+  const dirs = new Set<string>();
+
+  if (options.marketKey) {
+    dirs.add(path.join(root, safePathPart(options.marketKey), symbol, interval));
+  }
+
+  dirs.add(legacyHistoricalCandleDir(options));
+
+  if (!fs.existsSync(root)) {
+    return [...dirs];
+  }
+
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    dirs.add(path.join(root, entry.name, symbol, interval));
+  }
+
+  return [...dirs];
+}
+
+function legacyHistoricalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
   return path.join(
     repoRoot,
     "data",
     "historical",
-    options.symbol.toLowerCase(),
-    options.interval,
+    safePathPart(options.symbol),
+    safePathPart(options.interval),
   );
+}
+
+function listHistoricalCandleFiles(dir: string): string[] {
+  if (!fs.existsSync(dir)) {
+    return [];
+  }
+  return fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .map((entry) => entry.name)
+    .sort();
 }
 
 function parseArgs(argv: string[]): BenchmarkArgs {
@@ -859,16 +945,17 @@ function parseArgs(argv: string[]): BenchmarkArgs {
   const mode = parseMode(values.get("mode"));
   return {
     mode,
+    marketKey: values.get("market-key"),
     symbol: values.get("symbol") ?? "BTCUSDT",
     interval: values.get("interval") ?? "1m",
-    days: parsePositiveInt(values.get("days"), 30),
+    days: parsePositiveInt(values.get("days"), FULL_BTC_CYCLE_DAYS),
     startingQuote: parsePositiveNumber(values.get("starting-quote"), 10_000),
     leverage: parsePositiveNumber(values.get("leverage"), 3),
     cooldownSec: parsePositiveNumber(values.get("cooldown-sec"), 300),
-    randomSampleCount: parsePositiveInt(values.get("samples"), 40),
-    randomMinWindowDays: parsePositiveNumber(values.get("min-window-days"), 1),
-    randomMaxWindowDays: parsePositiveNumber(values.get("max-window-days"), 30),
-    randomLookbackDays: parsePositiveNumber(values.get("lookback-days"), YEAR_DAYS),
+    randomSampleCount: parsePositiveInt(values.get("samples"), 48),
+    randomMinWindowDays: parsePositiveNumber(values.get("min-window-days"), 7),
+    randomMaxWindowDays: parsePositiveNumber(values.get("max-window-days"), 120),
+    randomLookbackDays: parsePositiveNumber(values.get("lookback-days"), FULL_BTC_CYCLE_DAYS),
     gridFolds: parsePositiveInt(values.get("grid-folds"), 3),
     gridLimit: parsePositiveInt(values.get("grid-limit"), 12),
     portfolioLookbackCandles: parsePositiveInt(values.get("portfolio-lookback-candles"), 720),
@@ -884,6 +971,7 @@ function parseArgs(argv: string[]): BenchmarkArgs {
 
 function parseMode(value: string | undefined): BenchmarkMode {
   if (
+    value === "days" ||
     value === "year" ||
     value === "random-lengths" ||
     value === "grid-search" ||
@@ -891,7 +979,7 @@ function parseMode(value: string | undefined): BenchmarkMode {
   ) {
     return value;
   }
-  return "days";
+  return "random-lengths";
 }
 
 function selectBenchmarkCases(
@@ -931,6 +1019,10 @@ function selectBenchmarkCases(
       label: "Mean reversion L/S",
       algorithm: "mean-reversion",
     },
+    {
+      label: "Master adaptive L/S",
+      algorithm: "master-adaptive",
+    },
   ];
 
   if (includeRandomSign || only?.toLowerCase().includes("random")) {
@@ -965,6 +1057,7 @@ function singleWindowHeader(
     `${options.symbol.toUpperCase()} ${options.interval}`,
     `${candles.length.toLocaleString()} candles`,
     `${fileCount.toLocaleString()} day files`,
+    cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
     benchmarkCapSummary(options),
@@ -986,6 +1079,7 @@ function randomLengthHeader(
     `${options.randomMinWindowDays}-${options.randomMaxWindowDays} day windows`,
     `${options.randomLookbackDays} day lookback`,
     `seed ${options.seed}`,
+    cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)} cache span`,
     `${firstWindow.label} first sample`,
     `${lastWindow.label} last sample`,
@@ -1007,6 +1101,7 @@ function gridSearchHeader(
     `${candidateCount.toLocaleString()} candidates`,
     `${folds.length.toLocaleString()} folds`,
     `${candles.length.toLocaleString()} candles`,
+    cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
     benchmarkCapSummary(options),
@@ -1023,6 +1118,7 @@ function portfolioHeader(
     `Strategy benchmark: portfolio ${subject}`,
     `${options.symbol.toUpperCase()} ${options.interval}`,
     `${candles.length.toLocaleString()} primary candles`,
+    cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.portfolioGrossLeverage}x portfolio gross leverage`,
     `${options.portfolioRebalanceCandles.toLocaleString()} candle rebalance`,
@@ -1304,6 +1400,10 @@ function formatGridConfig(config: Partial<StrategyConfig>): string {
     const value = config.meanReversion;
     return `window=${value.window}, trend=${value.trendWindow}, z=${value.entryZScore}, exit=${value.exitZScore}, maxTrend=${value.maxTrendBps}, exposure=${value.targetExposurePct}`;
   }
+  if (config.masterAdaptive) {
+    const value = config.masterAdaptive;
+    return `trendW=${value.trendWeight}, breakoutW=${value.breakoutWeight}, reversionW=${value.reversionWeight}, minScore=${value.minConsensusScore}, exposure=${value.targetExposurePct}, highVol=${value.highVolatilityBps}`;
+  }
   return "-";
 }
 
@@ -1313,14 +1413,32 @@ function discoverHistoricalSymbols(interval: string): string[] {
     return [];
   }
 
-  return fs
-    .readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name.toUpperCase())
-    .filter((symbol) =>
-      fs.existsSync(path.join(root, symbol.toLowerCase(), interval)),
-    )
-    .sort();
+  const symbols = new Set<string>();
+  const safeInterval = safePathPart(interval);
+
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    if (listHistoricalCandleFiles(path.join(root, entry.name, safeInterval)).length > 0) {
+      symbols.add(entry.name.toUpperCase());
+    }
+
+    const marketDir = path.join(root, entry.name);
+    for (const symbolEntry of fs.readdirSync(marketDir, { withFileTypes: true })) {
+      if (!symbolEntry.isDirectory()) {
+        continue;
+      }
+      if (
+        listHistoricalCandleFiles(path.join(marketDir, symbolEntry.name, safeInterval)).length > 0
+      ) {
+        symbols.add(symbolEntry.name.toUpperCase());
+      }
+    }
+  }
+
+  return [...symbols].sort();
 }
 
 function normalizeWeights(weights: number[], grossLimit: number): number[] {
@@ -1377,4 +1495,13 @@ function calculateMaxDrawdownPct(equityCurve: EquityPoint[]): number {
     }
   }
   return maxDrawdown;
+}
+
+function cacheSourceSummary(options: Pick<BenchmarkArgs, "marketKey" | "symbol" | "interval">): string {
+  const source = historicalCandleSource(options);
+  return `cache ${path.relative(repoRoot, source.dir) || "."}`;
+}
+
+function safePathPart(value: string): string {
+  return value.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
 }

@@ -1,5 +1,6 @@
 import type {
   BotSignal,
+  MasterAdaptiveConfig,
   MeanReversionConfig,
   TrendFollowingConfig,
   VolatilityBreakoutConfig,
@@ -48,6 +49,18 @@ export const defaultMeanReversionConfig: MeanReversionConfig = {
   exitZScore: 0.25,
   maxTrendBps: 45,
   targetExposurePct: 0.25,
+};
+
+export const defaultMasterAdaptiveConfig: MasterAdaptiveConfig = {
+  trendWeight: 1.2,
+  breakoutWeight: 1,
+  reversionWeight: 0.7,
+  minConsensusScore: 0.25,
+  disagreementExposureScale: 0.5,
+  targetExposurePct: 0.4,
+  volatilityWindow: 720,
+  highVolatilityBps: 35,
+  highVolatilityExposureScale: 0.65,
 };
 
 export function createTrendFollowingConfig(
@@ -102,6 +115,27 @@ export function createMeanReversionConfig(
   config.exitZScore = clamp(cleanNonNegative(config.exitZScore), 0, config.entryZScore);
   config.maxTrendBps = cleanNonNegative(config.maxTrendBps);
   config.targetExposurePct = clamp(cleanNumber(config.targetExposurePct), 0, 1);
+
+  return config;
+}
+
+export function createMasterAdaptiveConfig(
+  overrides: Partial<MasterAdaptiveConfig> = {},
+): MasterAdaptiveConfig {
+  const config = {
+    ...defaultMasterAdaptiveConfig,
+    ...overrides,
+  };
+
+  config.trendWeight = cleanNonNegative(config.trendWeight);
+  config.breakoutWeight = cleanNonNegative(config.breakoutWeight);
+  config.reversionWeight = cleanNonNegative(config.reversionWeight);
+  config.minConsensusScore = clamp(cleanNumber(config.minConsensusScore), 0, 1);
+  config.disagreementExposureScale = clamp(cleanNumber(config.disagreementExposureScale), 0, 1);
+  config.targetExposurePct = clamp(cleanNumber(config.targetExposurePct), 0, 1);
+  config.volatilityWindow = clampInt(config.volatilityWindow, 2, 40_000);
+  config.highVolatilityBps = cleanNonNegative(config.highVolatilityBps);
+  config.highVolatilityExposureScale = clamp(cleanNumber(config.highVolatilityExposureScale), 0, 1);
 
   return config;
 }
@@ -243,6 +277,82 @@ export function evaluateMeanReversion(
   return hold("mean reversion hold");
 }
 
+export function evaluateMasterAdaptive(
+  config: MasterAdaptiveConfig,
+  children: {
+    trendFollowing: TrendFollowingConfig;
+    volatilityBreakout: VolatilityBreakoutConfig;
+    meanReversion: MeanReversionConfig;
+  },
+  input: DirectionalStrategyInput,
+): DirectionalDecision {
+  const prices = input.prices;
+  const decisions = [
+    {
+      label: "trend",
+      weight: config.trendWeight,
+      maxTarget: children.trendFollowing.targetExposurePct,
+      decision: evaluateTrendFollowing(children.trendFollowing, input),
+    },
+    {
+      label: "breakout",
+      weight: config.breakoutWeight,
+      maxTarget: children.volatilityBreakout.targetExposurePct,
+      decision: evaluateVolatilityBreakout(children.volatilityBreakout, input),
+    },
+    {
+      label: "reversion",
+      weight: config.reversionWeight,
+      maxTarget: children.meanReversion.targetExposurePct,
+      decision: evaluateMeanReversion(children.meanReversion, input),
+    },
+  ].filter((entry) => entry.weight > 0);
+
+  const totalWeight = decisions.reduce((total, entry) => total + entry.weight, 0);
+  if (totalWeight <= 0) {
+    return target("flat", 0, "master adaptive has no enabled child signals");
+  }
+
+  const scores = decisions.map((entry) => ({
+    ...entry,
+    score: decisionConsensusScore(entry.decision, entry.maxTarget),
+  }));
+  const weightedScore =
+    scores.reduce((total, entry) => total + entry.weight * entry.score, 0) / totalWeight;
+  const hasLong = scores.some((entry) => entry.score > 0);
+  const hasShort = scores.some((entry) => entry.score < 0);
+  const disagreementScale = hasLong && hasShort ? config.disagreementExposureScale : 1;
+  const volatilityBps = rollingReturnVolatilityBps(prices, config.volatilityWindow);
+  const volatilityScale =
+    config.highVolatilityBps > 0 && volatilityBps >= config.highVolatilityBps
+      ? config.highVolatilityExposureScale
+      : 1;
+  const finalScore = clamp(weightedScore * disagreementScale * volatilityScale, -1, 1);
+  const absScore = Math.abs(finalScore);
+
+  if (absScore < config.minConsensusScore) {
+    return target(
+      "flat",
+      0,
+      `master adaptive flat: score ${formatScore(finalScore)}, vol ${formatBps(volatilityBps)}bps`,
+    );
+  }
+
+  const side: DirectionalSide = finalScore > 0 ? "long" : "short";
+  const activeSignals = scores
+    .filter((entry) => entry.score !== 0)
+    .map((entry) => `${entry.label} ${formatScore(entry.score)}`)
+    .join(", ");
+
+  return target(
+    side,
+    config.targetExposurePct * absScore,
+    `master adaptive ${side}: score ${formatScore(finalScore)}, vol ${formatBps(volatilityBps)}bps${
+      activeSignals ? `, ${activeSignals}` : ""
+    }`,
+  );
+}
+
 function hold(reason: string): DirectionalDecision {
   return {
     action: "hold",
@@ -304,6 +414,18 @@ function confidenceFromZScore(zScore: number, entryZScore: number): number {
   return clamp(Math.abs(zScore) / Math.max(entryZScore * 2, 0.01), 0.25, 1);
 }
 
+function decisionConsensusScore(
+  decision: DirectionalDecision,
+  maxTargetExposurePct: number,
+): number {
+  if (decision.action !== "rebalance") {
+    return 0;
+  }
+
+  const denominator = Math.max(maxTargetExposurePct, 0.01);
+  return clamp(decision.targetExposurePct / denominator, -1, 1);
+}
+
 function average(values: number[]): number {
   if (values.length === 0) {
     return 0;
@@ -354,4 +476,8 @@ function formatBps(value: number): string {
 
 function formatZ(value: number): string {
   return (Number.isFinite(value) ? value : 0).toFixed(2);
+}
+
+function formatScore(value: number): string {
+  return (Number.isFinite(value) ? value : 0).toFixed(3);
 }

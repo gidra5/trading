@@ -15,9 +15,10 @@ A candidate is not interesting unless it beats cheap controls on the same window
 - deterministic random sign, opt-in because it is intentionally churn-heavy
 
 Promotable candidates should show positive net PnL, positive risk-adjusted return,
-acceptable max drawdown, and stable behavior across 30-day, last-year, and random-length
-backtests. A parameter candidate that only wins one fold or one window is treated as
-overfit until proven otherwise.
+acceptable max drawdown, and stable behavior across random-length samples from the
+whole available BTC cycle. A parameter candidate that only wins one fold, one recent
+30-day window, or the current directional regime is treated as overfit until proven
+otherwise.
 
 ## Implemented Experiment Modes
 
@@ -27,16 +28,28 @@ Run the normal strategy benchmark:
 npm run benchmark:strategies
 ```
 
+The default benchmark is now a cycle-wide random-length BTCUSDT test: 48 deterministic
+samples, 7-120 day windows, 1,825 day lookback, seed 1337. The script chooses the
+deepest local candle cache for the requested symbol, so the newer
+`data/historical/spot-btcusdt/btcusdt/1m` cache is used automatically when it has more
+history than the older flat `data/historical/btcusdt/1m` cache.
+
+Run an explicit recent-window smoke test only when needed:
+
+```bash
+npm run benchmark:strategies -- --mode days --days 30
+```
+
 Run folded parameter search:
 
 ```bash
-npm run benchmark:strategies -- --mode grid-search --days 30 --grid-folds 3 --grid-limit 12
+npm run benchmark:strategies -- --mode grid-search --days 1825 --grid-folds 6 --grid-limit 12
 ```
 
 Run strategy-ensemble portfolio allocation:
 
 ```bash
-npm run benchmark:strategies -- --mode portfolio --days 30 --portfolio-rebalance-candles 40 --portfolio-lookback-candles 120
+npm run benchmark:strategies -- --mode portfolio --days 1825 --portfolio-rebalance-candles 40 --portfolio-lookback-candles 120
 ```
 
 Run the expensive churn control explicitly:
@@ -46,9 +59,37 @@ npm run benchmark:strategies -- --days 3 --include-random-sign --only random
 ```
 
 The script also supports multi-symbol portfolio allocation through `--mode portfolio`
-and `--symbols BTCUSDT,ETHUSDT,...`. It skips uncached symbols cleanly. At the time of
-this run, only BTCUSDT 1m candles are cached locally, so true multi-symbol allocation is
-blocked on data collection.
+and `--symbols BTCUSDT,ETHUSDT,...`. It skips uncached symbols cleanly. Many non-BTC
+symbols have shallow local 1m caches, but cycle-scale multi-symbol allocation is still
+blocked until enough liquid symbols have comparable 4-5 year history.
+
+## Autonomous Experiment Loop
+
+Run one prompt dry-run to inspect what the loop will ask an agent to do:
+
+```bash
+npm run experiment:loop -- --max-iterations 1 --dry-run
+```
+
+Run indefinitely:
+
+```bash
+npm run experiment:loop
+```
+
+Each iteration runs a cycle-wide random-length benchmark, stores the output under
+`data/experiments/agent-loop`, prompts `codex exec` to review the evidence and improve
+the `master-adaptive` algorithm, then runs `npm run typecheck`. The loop deliberately
+forbids promoting changes from a simple 30-day test because the current recent market
+trend can make passive short exposure look better than it is across a full BTC cycle.
+
+Useful overrides:
+
+```bash
+TRADING_EXPERIMENT_AGENT_COMMAND="codex exec -C . --sandbox workspace-write --ask-for-approval never -" npm run experiment:loop
+npm run experiment:loop -- --sleep-sec 300 --agent-timeout-min 240
+npm run experiment:loop -- --benchmark-command "npm run benchmark:strategies -- --mode random-lengths --lookback-days 1825 --min-window-days 14 --max-window-days 180 --samples 48 --seed {seed}"
+```
 
 ## Experiment 1: Market-Regime Controls
 

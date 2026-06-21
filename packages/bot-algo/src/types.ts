@@ -14,6 +14,7 @@ export type StrategyAlgorithm =
   | "trend-following"
   | "volatility-breakout"
   | "mean-reversion"
+  | "master-adaptive"
   | "benchmark-always-long"
   | "benchmark-always-short"
   | "benchmark-always-flat"
@@ -97,6 +98,7 @@ export interface StrategyConfig {
   trendFollowing: TrendFollowingConfig;
   volatilityBreakout: VolatilityBreakoutConfig;
   meanReversion: MeanReversionConfig;
+  masterAdaptive: MasterAdaptiveConfig;
   positionRisk: PositionRiskConfig;
 }
 
@@ -151,6 +153,18 @@ export interface MeanReversionConfig {
   exitZScore: number;
   maxTrendBps: number;
   targetExposurePct: number;
+}
+
+export interface MasterAdaptiveConfig {
+  trendWeight: number;
+  breakoutWeight: number;
+  reversionWeight: number;
+  minConsensusScore: number;
+  disagreementExposureScale: number;
+  targetExposurePct: number;
+  volatilityWindow: number;
+  highVolatilityBps: number;
+  highVolatilityExposureScale: number;
 }
 
 export interface RollingAveragePoint {

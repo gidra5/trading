@@ -40,8 +40,14 @@ Current bidirectional strategies:
 - `trend-following` - goes long when fast and slow returns are both positive enough, short when both are negative enough, and exits when momentum fades.
 - `volatility-breakout` - goes long above the recent rolling high, short below the recent rolling low, and exits when price mean-reverts toward the range midpoint.
 - `mean-reversion` - goes long on large negative z-score deviations and short on large positive z-score deviations when the larger trend filter is not too strong against the trade.
+- `master-adaptive` - combines the trend, breakout, and reversion decisions into one signed exposure score, scales down when child signals disagree, and throttles exposure during high one-minute volatility.
 
 The dashboard exposes each strategy's windows, entry/exit thresholds, and target exposure percentage. These are research baselines, not production-ready alpha. Initial BTCUSDT benchmarks show that naive long/short signals still lose after fees/slippage, especially when cooldown is short and turnover is high.
+
+The master strategy is the current optimization target for autonomous experiments. Its
+purpose is to learn from simpler strategy behavior without deleting those simpler
+controls. Any promoted change should beat the controls on full-cycle random-length BTC
+windows, not only on a recent contiguous drawdown or rally.
 
 ## Benchmark Controls
 

@@ -735,6 +735,9 @@ function algorithmLabel(algorithm: StrategyConfig["algorithm"] | undefined): str
   if (algorithm === "mean-reversion") {
     return "Mean Reversion";
   }
+  if (algorithm === "master-adaptive") {
+    return "Master Adaptive";
+  }
   if (algorithm === "benchmark-always-long") {
     return "Benchmark Always Long";
   }
@@ -835,6 +838,22 @@ function AlgorithmPanel(props: {
       },
     });
   };
+  const updateMaster = <K extends keyof StrategyConfig["masterAdaptive"]>(
+    key: K,
+    value: StrategyConfig["masterAdaptive"][K],
+  ) => {
+    if (!props.config) {
+      return;
+    }
+
+    props.onChange({
+      ...props.config,
+      masterAdaptive: {
+        ...props.config.masterAdaptive,
+        [key]: value,
+      },
+    });
+  };
   const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
     key: K,
     value: StrategyConfig["positionRisk"][K],
@@ -898,6 +917,7 @@ function AlgorithmPanel(props: {
                 <option value="trend-following">Trend following</option>
                 <option value="volatility-breakout">Volatility breakout</option>
                 <option value="mean-reversion">Mean reversion</option>
+                <option value="master-adaptive">Master adaptive</option>
                 <option value="benchmark-always-flat">Benchmark always flat</option>
                 <option value="benchmark-always-long">Benchmark always long</option>
                 <option value="benchmark-always-short">Benchmark always short</option>
@@ -1181,6 +1201,81 @@ function AlgorithmPanel(props: {
                     max={100}
                     step={1}
                     onInput={(value) => updateReversion("targetExposurePct", value / 100)}
+                  />
+                </div>
+              </div>
+            </Show>
+
+            <Show when={config().algorithm === "master-adaptive"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Master Adaptive</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Trend W"
+                    value={config().masterAdaptive.trendWeight}
+                    min={0}
+                    step={0.1}
+                    onInput={(value) => updateMaster("trendWeight", value)}
+                  />
+                  <NumberField
+                    label="Break W"
+                    value={config().masterAdaptive.breakoutWeight}
+                    min={0}
+                    step={0.1}
+                    onInput={(value) => updateMaster("breakoutWeight", value)}
+                  />
+                  <NumberField
+                    label="Revert W"
+                    value={config().masterAdaptive.reversionWeight}
+                    min={0}
+                    step={0.1}
+                    onInput={(value) => updateMaster("reversionWeight", value)}
+                  />
+                  <NumberField
+                    label="Min Score"
+                    value={config().masterAdaptive.minConsensusScore}
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    onInput={(value) => updateMaster("minConsensusScore", value)}
+                  />
+                  <NumberField
+                    label="Disagree x"
+                    value={config().masterAdaptive.disagreementExposureScale}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    onInput={(value) => updateMaster("disagreementExposureScale", value)}
+                  />
+                  <NumberField
+                    label="Exposure %"
+                    value={config().masterAdaptive.targetExposurePct * 100}
+                    min={0}
+                    max={100}
+                    step={1}
+                    onInput={(value) => updateMaster("targetExposurePct", value / 100)}
+                  />
+                  <NumberField
+                    label="Vol Window"
+                    value={config().masterAdaptive.volatilityWindow}
+                    min={2}
+                    step={1}
+                    onInput={(value) => updateMaster("volatilityWindow", value)}
+                  />
+                  <NumberField
+                    label="High Vol bps"
+                    value={config().masterAdaptive.highVolatilityBps}
+                    min={0}
+                    step={0.5}
+                    onInput={(value) => updateMaster("highVolatilityBps", value)}
+                  />
+                  <NumberField
+                    label="High Vol x"
+                    value={config().masterAdaptive.highVolatilityExposureScale}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    onInput={(value) => updateMaster("highVolatilityExposureScale", value)}
                   />
                 </div>
               </div>

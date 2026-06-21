@@ -236,6 +236,10 @@ export class TradingRuntime {
           ...this.config.meanReversion,
           ...(patch.meanReversion ?? {}),
         },
+        masterAdaptive: {
+          ...this.config.masterAdaptive,
+          ...(patch.masterAdaptive ?? {}),
+        },
         positionRisk: {
           ...this.config.positionRisk,
           ...(patch.positionRisk ?? {}),
