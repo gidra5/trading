@@ -224,6 +224,18 @@ export class TradingRuntime {
           ...this.config.legacyValleyPeak,
           ...(patch.legacyValleyPeak ?? {}),
         },
+        trendFollowing: {
+          ...this.config.trendFollowing,
+          ...(patch.trendFollowing ?? {}),
+        },
+        volatilityBreakout: {
+          ...this.config.volatilityBreakout,
+          ...(patch.volatilityBreakout ?? {}),
+        },
+        meanReversion: {
+          ...this.config.meanReversion,
+          ...(patch.meanReversion ?? {}),
+        },
         positionRisk: {
           ...this.config.positionRisk,
           ...(patch.positionRisk ?? {}),

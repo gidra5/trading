@@ -358,12 +358,11 @@ async function selectCorrelationMarkets(
   const catalog = await marketCatalog.list(forceRefresh);
   const candidates = catalog.markets.filter(
     (item) =>
-      item.group === market.group &&
-      item.venue === market.venue &&
       item.quoteAsset === market.quoteAsset &&
       item.supportsHistoricalCandles &&
       item.supportsLiveStream &&
-      isStreamVenue(item.venue),
+      isStreamVenue(item.venue) &&
+      isCorrelationMarketGroup(item.group),
   );
 
   if (!candidates.some((item) => item.id === market.id)) {
@@ -371,6 +370,16 @@ async function selectCorrelationMarkets(
   }
 
   return candidates;
+}
+
+function isCorrelationMarketGroup(group: BinanceMarketListing["group"]): boolean {
+  return (
+    group === "spot" ||
+    group === "bstocks" ||
+    group === "futures" ||
+    group === "tradfi" ||
+    group === "options"
+  );
 }
 
 function toHistoricalBacktestMarket(

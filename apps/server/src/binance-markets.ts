@@ -29,6 +29,10 @@ export interface BinanceMarketListing {
   searchable: string;
   supportsLiveStream: boolean;
   supportsHistoricalCandles: boolean;
+  quoteVolume24h?: number;
+  volume24h?: number;
+  priceChangePercent24h?: number;
+  tradeCount24h?: number;
   maxLeverage?: number;
   unavailableReason?: string;
   pair?: string;
@@ -130,6 +134,19 @@ interface PredictionOutcomeMarket {
     chance?: unknown;
   }>;
 }
+
+interface Ticker24h {
+  symbol?: unknown;
+  quoteVolume?: unknown;
+  volume?: unknown;
+  priceChangePercent?: unknown;
+  count?: unknown;
+}
+
+type MarketTickerMetrics = Pick<
+  BinanceMarketListing,
+  "quoteVolume24h" | "volume24h" | "priceChangePercent24h" | "tradeCount24h"
+>;
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 const KNOWN_BSTOCK_BASE_ASSETS = new Set([
@@ -326,11 +343,12 @@ async function fetchSpotMarkets(bStockUnderlyingBases: Set<string>): Promise<{
   source: BinanceMarketSourceStatus;
   markets: BinanceMarketListing[];
 }> {
-  const payload = await fetchJson<{ symbols?: SpotSymbol[] }>(
-    "https://api.binance.com/api/v3/exchangeInfo",
-  );
+  const [payload, tickerMetrics] = await Promise.all([
+    fetchJson<{ symbols?: SpotSymbol[] }>("https://api.binance.com/api/v3/exchangeInfo"),
+    fetchTickerMetrics("spot"),
+  ]);
   const markets = (payload.symbols ?? [])
-    .map((symbol) => mapSpotSymbol(symbol, bStockUnderlyingBases))
+    .map((symbol) => mapSpotSymbol(symbol, bStockUnderlyingBases, tickerMetrics))
     .filter((market): market is BinanceMarketListing => Boolean(market));
 
   return {
@@ -347,13 +365,19 @@ async function fetchUsdmFuturesMarkets(
   markets: BinanceMarketListing[];
   warning?: string;
 }> {
-  const [payload, leverageResult] = await Promise.all([
+  const [payload, leverageResult, tickerMetrics] = await Promise.all([
     fetchJson<{ symbols?: FuturesSymbol[] }>("https://fapi.binance.com/fapi/v1/exchangeInfo"),
     fetchFuturesMaxLeverage("usdm-futures", apiKey, apiSecret),
+    fetchTickerMetrics("usdm-futures"),
   ]);
   const markets = (payload.symbols ?? [])
     .map((symbol) =>
-      mapFuturesSymbol(symbol, "usdm-futures", leverageResult.maxLeverageBySymbol),
+      mapFuturesSymbol(
+        symbol,
+        "usdm-futures",
+        leverageResult.maxLeverageBySymbol,
+        tickerMetrics,
+      ),
     )
     .filter((market): market is BinanceMarketListing => Boolean(market));
 
@@ -372,13 +396,19 @@ async function fetchCoinmFuturesMarkets(
   markets: BinanceMarketListing[];
   warning?: string;
 }> {
-  const [payload, leverageResult] = await Promise.all([
+  const [payload, leverageResult, tickerMetrics] = await Promise.all([
     fetchJson<{ symbols?: FuturesSymbol[] }>("https://dapi.binance.com/dapi/v1/exchangeInfo"),
     fetchFuturesMaxLeverage("coinm-futures", apiKey, apiSecret),
+    fetchTickerMetrics("coinm-futures"),
   ]);
   const markets = (payload.symbols ?? [])
     .map((symbol) =>
-      mapFuturesSymbol(symbol, "coinm-futures", leverageResult.maxLeverageBySymbol),
+      mapFuturesSymbol(
+        symbol,
+        "coinm-futures",
+        leverageResult.maxLeverageBySymbol,
+        tickerMetrics,
+      ),
     )
     .filter((market): market is BinanceMarketListing => Boolean(market));
 
@@ -464,6 +494,7 @@ async function fetchPredictionMarkets(apiKey: string | undefined): Promise<{
 function mapSpotSymbol(
   symbol: SpotSymbol,
   bStockUnderlyingBases: Set<string>,
+  tickerMetrics: Map<string, MarketTickerMetrics>,
 ): BinanceMarketListing | undefined {
   const marketSymbol = stringValue(symbol.symbol);
   if (!marketSymbol) {
@@ -490,6 +521,7 @@ function mapSpotSymbol(
     supportsLiveStream: isTrading,
     supportsHistoricalCandles: isTrading,
     unavailableReason: isTrading ? undefined : `Spot status is ${status}`,
+    ...tickerMetrics.get(marketSymbol),
     underlying: bStockUnderlying,
     underlyingType: isBStock ? "EQUITY" : undefined,
     underlyingSubType: isBStock ? ["bStock"] : undefined,
@@ -500,6 +532,7 @@ function mapFuturesSymbol(
   symbol: FuturesSymbol,
   venue: "usdm-futures" | "coinm-futures",
   maxLeverageBySymbol: Map<string, number>,
+  tickerMetrics: Map<string, MarketTickerMetrics>,
 ): BinanceMarketListing | undefined {
   const marketSymbol = stringValue(symbol.symbol);
   if (!marketSymbol) {
@@ -531,6 +564,7 @@ function mapFuturesSymbol(
     status,
     supportsLiveStream: isTrading,
     supportsHistoricalCandles: isTrading,
+    ...tickerMetrics.get(marketSymbol),
     maxLeverage: maxLeverageBySymbol.get(marketSymbol),
     unavailableReason: isTrading ? undefined : `Futures status is ${status}`,
     pair: stringValue(symbol.pair),
@@ -694,6 +728,46 @@ function compareMarkets(a: BinanceMarketListing, b: BinanceMarketListing): numbe
 
 function groupRank(group: MarketGroup): number {
   return ["spot", "bstocks", "futures", "tradfi", "options", "predictions"].indexOf(group);
+}
+
+async function fetchTickerMetrics(
+  venue: Extract<MarketVenue, "spot" | "usdm-futures" | "coinm-futures">,
+): Promise<Map<string, MarketTickerMetrics>> {
+  try {
+    const payload = await fetchJson<Ticker24h[]>(ticker24hEndpointForVenue(venue));
+    const metricsBySymbol = new Map<string, MarketTickerMetrics>();
+
+    for (const row of payload) {
+      const symbol = stringValue(row.symbol);
+      if (!symbol) {
+        continue;
+      }
+
+      const metrics: MarketTickerMetrics = {
+        quoteVolume24h: numberValue(row.quoteVolume),
+        volume24h: numberValue(row.volume),
+        priceChangePercent24h: numberValue(row.priceChangePercent),
+        tradeCount24h: numberValue(row.count),
+      };
+      metricsBySymbol.set(symbol, metrics);
+    }
+
+    return metricsBySymbol;
+  } catch {
+    return new Map();
+  }
+}
+
+function ticker24hEndpointForVenue(
+  venue: Extract<MarketVenue, "spot" | "usdm-futures" | "coinm-futures">,
+): string {
+  if (venue === "spot") {
+    return "https://api.binance.com/api/v3/ticker/24hr";
+  }
+  if (venue === "coinm-futures") {
+    return "https://dapi.binance.com/dapi/v1/ticker/24hr";
+  }
+  return "https://fapi.binance.com/fapi/v1/ticker/24hr";
 }
 
 async function fetchFuturesMaxLeverage(

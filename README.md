@@ -32,6 +32,8 @@ npm start
 
 Algorithm behavior is summarized in [docs/algorithms.md](docs/algorithms.md).
 Backtesting behavior and current performance debt are tracked in [docs/backtesting.md](docs/backtesting.md).
+Strategy research notes and benchmark observations are tracked in [docs/strategy-research.md](docs/strategy-research.md).
+The current experiment plan and latest run results are recorded in [docs/experiment-plan.md](docs/experiment-plan.md).
 Spreadsheet-derived position ledger formulas are documented in [docs/position-ledger.md](docs/position-ledger.md).
 
 ## Environment

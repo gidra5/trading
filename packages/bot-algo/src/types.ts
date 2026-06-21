@@ -4,11 +4,20 @@ export type OrderSide = "buy" | "sell";
 
 export type OrderStatus = "open" | "filled" | "cancelled";
 
-export type OrderType = "limit";
+export type OrderType = "limit" | "market";
 
 export type BotSignal = "buy" | "sell" | "hold";
 
-export type StrategyAlgorithm = "moving-average" | "legacy-valley-peak";
+export type StrategyAlgorithm =
+  | "moving-average"
+  | "legacy-valley-peak"
+  | "trend-following"
+  | "volatility-breakout"
+  | "mean-reversion"
+  | "benchmark-always-long"
+  | "benchmark-always-short"
+  | "benchmark-always-flat"
+  | "benchmark-random-sign";
 
 export type BacktestPreset =
   | "saved-candles"
@@ -83,7 +92,11 @@ export interface StrategyConfig {
   takeProfitBps: number;
   stopLossBps: number;
   minOrderQuote: number;
+  benchmarkRandomSeed: number;
   legacyValleyPeak: LegacyValleyPeakConfig;
+  trendFollowing: TrendFollowingConfig;
+  volatilityBreakout: VolatilityBreakoutConfig;
+  meanReversion: MeanReversionConfig;
   positionRisk: PositionRiskConfig;
 }
 
@@ -113,6 +126,31 @@ export interface LegacyValleyPeakConfig {
   sellSigma: number;
   minTradeQuote: number;
   maxTradeQuote: number;
+}
+
+export interface TrendFollowingConfig {
+  fastWindow: number;
+  slowWindow: number;
+  volatilityWindow: number;
+  entryThresholdBps: number;
+  exitThresholdBps: number;
+  targetExposurePct: number;
+}
+
+export interface VolatilityBreakoutConfig {
+  lookbackWindow: number;
+  breakoutThresholdBps: number;
+  exitThresholdBps: number;
+  targetExposurePct: number;
+}
+
+export interface MeanReversionConfig {
+  window: number;
+  trendWindow: number;
+  entryZScore: number;
+  exitZScore: number;
+  maxTrendBps: number;
+  targetExposurePct: number;
 }
 
 export interface RollingAveragePoint {
@@ -220,6 +258,7 @@ export interface PaperBotState {
   baseFree: number;
   baseReserved: number;
   avgEntryPrice: number;
+  avgShortEntryPrice: number;
   lastPrice: number;
   sequence: number;
   createdAt: number;
@@ -397,6 +436,8 @@ export interface BacktestSummary {
   finalEquity: number;
   netPnl: number;
   returnPct: number;
+  riskAdjustedReturn?: number;
+  sharpeRatio?: number;
   maxDrawdownPct: number;
   tradeCount: number;
   winRate: number;
@@ -415,6 +456,8 @@ export interface BacktestSampleSummary {
   finalEquity: number;
   netPnl: number;
   returnPct: number;
+  riskAdjustedReturn?: number;
+  sharpeRatio?: number;
   netPnlPerDay: number;
   returnPctPerDay: number;
   perfectMarginLeverage?: number;

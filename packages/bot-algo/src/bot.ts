@@ -20,6 +20,19 @@ import {
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
 import {
+  createMeanReversionConfig,
+  createTrendFollowingConfig,
+  createVolatilityBreakoutConfig,
+  defaultMeanReversionConfig,
+  defaultTrendFollowingConfig,
+  defaultVolatilityBreakoutConfig,
+  evaluateMeanReversion,
+  evaluateTrendFollowing,
+  evaluateVolatilityBreakout,
+  type DirectionalDecision,
+  type DirectionalSide,
+} from "./directional-strategies.js";
+import {
   analyzePositions,
   createPositionRiskConfig,
   defaultPositionRiskConfig,
@@ -45,12 +58,35 @@ export const defaultStrategyConfig: StrategyConfig = {
   takeProfitBps: 45,
   stopLossBps: 35,
   minOrderQuote: 25,
+  benchmarkRandomSeed: 1337,
   legacyValleyPeak: defaultLegacyValleyPeakConfig,
+  trendFollowing: defaultTrendFollowingConfig,
+  volatilityBreakout: defaultVolatilityBreakoutConfig,
+  meanReversion: defaultMeanReversionConfig,
   positionRisk: defaultPositionRiskConfig,
 };
 
 export type PartialStrategyConfig = Partial<StrategyConfig> &
   Pick<StrategyConfig, "symbol">;
+
+interface ImmediateFillRollback {
+  quoteFree: number;
+  quoteReserved: number;
+  baseFree: number;
+  baseReserved: number;
+  avgEntryPrice: number;
+  avgShortEntryPrice: number;
+  lastPrice: number;
+  updatedAt: number;
+  realizedPnl: number;
+  feesPaid: number;
+  winningTrades: number;
+  losingTrades: number;
+  sequence: number;
+  ordersLength: number;
+  fillsLength: number;
+  metrics: BotMetrics;
+}
 
 const roundAsset = (value: number) => Number(value.toFixed(8));
 const roundQuote = (value: number) => Number(value.toFixed(6));
@@ -65,6 +101,18 @@ export function createStrategyConfig(
       ...defaultStrategyConfig.legacyValleyPeak,
       ...(overrides.legacyValleyPeak ?? {}),
     }),
+    trendFollowing: createTrendFollowingConfig({
+      ...defaultStrategyConfig.trendFollowing,
+      ...(overrides.trendFollowing ?? {}),
+    }),
+    volatilityBreakout: createVolatilityBreakoutConfig({
+      ...defaultStrategyConfig.volatilityBreakout,
+      ...(overrides.volatilityBreakout ?? {}),
+    }),
+    meanReversion: createMeanReversionConfig({
+      ...defaultStrategyConfig.meanReversion,
+      ...(overrides.meanReversion ?? {}),
+    }),
     positionRisk: createPositionRiskConfig({
       ...defaultStrategyConfig.positionRisk,
       ...(overrides.positionRisk ?? {}),
@@ -74,7 +122,17 @@ export function createStrategyConfig(
   if (config.fastWindow >= config.slowWindow) {
     config.fastWindow = Math.max(2, Math.floor(config.slowWindow / 2));
   }
-  if (config.algorithm !== "moving-average" && config.algorithm !== "legacy-valley-peak") {
+  if (
+    config.algorithm !== "moving-average" &&
+    config.algorithm !== "legacy-valley-peak" &&
+    config.algorithm !== "trend-following" &&
+    config.algorithm !== "volatility-breakout" &&
+    config.algorithm !== "mean-reversion" &&
+    config.algorithm !== "benchmark-always-long" &&
+    config.algorithm !== "benchmark-always-short" &&
+    config.algorithm !== "benchmark-always-flat" &&
+    config.algorithm !== "benchmark-random-sign"
+  ) {
     config.algorithm = defaultStrategyConfig.algorithm;
   }
   config.maxOpenOrders = Math.max(1, Math.round(config.maxOpenOrders));
@@ -105,6 +163,7 @@ export function createInitialBotState(
     baseFree: 0,
     baseReserved: 0,
     avgEntryPrice: 0,
+    avgShortEntryPrice: 0,
     lastPrice: 0,
     sequence: 0,
     createdAt: now,
@@ -370,6 +429,21 @@ export class SimulatedTradingBot {
     if (config.algorithm === "legacy-valley-peak") {
       return this.evaluateLegacyValleyPeakStrategy(tick, collectEvents);
     }
+    if (
+      config.algorithm === "trend-following" ||
+      config.algorithm === "volatility-breakout" ||
+      config.algorithm === "mean-reversion"
+    ) {
+      return this.evaluateDirectionalStrategy(tick, collectEvents);
+    }
+    if (
+      config.algorithm === "benchmark-always-long" ||
+      config.algorithm === "benchmark-always-short" ||
+      config.algorithm === "benchmark-always-flat" ||
+      config.algorithm === "benchmark-random-sign"
+    ) {
+      return this.evaluateBenchmarkControlStrategy(tick, collectEvents);
+    }
 
     return this.evaluateMovingAverageStrategy(tick, collectEvents);
   }
@@ -520,6 +594,421 @@ export class SimulatedTradingBot {
     ];
   }
 
+  private evaluateDirectionalStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
+    const config = this.state.config;
+
+    if (this.openOrderIndexes.size > 0) {
+      return [];
+    }
+
+    if (tick.eventTime - this.state.memory.lastActionAt < config.cooldownMs) {
+      return [];
+    }
+
+    const currentSide = this.currentDirectionalSide(tick.price);
+    const input = {
+      prices: this.state.memory.prices,
+      currentSide,
+    };
+    const decision =
+      config.algorithm === "trend-following"
+        ? evaluateTrendFollowing(config.trendFollowing, input)
+        : config.algorithm === "volatility-breakout"
+          ? evaluateVolatilityBreakout(config.volatilityBreakout, input)
+          : evaluateMeanReversion(config.meanReversion, input);
+
+    if (decision.action === "hold") {
+      this.state.memory.lastSignal = "hold";
+      return [];
+    }
+
+    const result = this.rebalanceToTargetExposure(
+      tick.price,
+      tick.eventTime,
+      decision,
+    );
+
+    if (!result) {
+      return [];
+    }
+
+    this.state.memory.lastSignal = result.order.side === "buy" ? "buy" : "sell";
+    this.state.memory.lastActionAt = tick.eventTime;
+
+    if (!collectEvents) {
+      return [];
+    }
+
+    return [
+      {
+        type: "order_filled",
+        at: tick.eventTime,
+        message: `${result.order.side.toUpperCase()} market fill: ${decision.reason}`,
+        order: structuredClone(result.order),
+        fill: structuredClone(result.fill),
+      },
+    ];
+  }
+
+  private evaluateBenchmarkControlStrategy(
+    tick: PriceTick,
+    collectEvents: boolean,
+  ): BotEvent[] {
+    const config = this.state.config;
+
+    if (this.openOrderIndexes.size > 0) {
+      return [];
+    }
+
+    if (tick.eventTime - this.state.memory.lastActionAt < config.cooldownMs) {
+      return [];
+    }
+
+    const currentSide = this.currentDirectionalSide(tick.price);
+    const targetSide = this.benchmarkControlTargetSide(tick);
+    if (currentSide === targetSide) {
+      this.state.memory.lastSignal = "hold";
+      return [];
+    }
+
+    const targetExposurePct =
+      targetSide === "long" ? 1 : targetSide === "short" ? -1 : 0;
+    const decision: Extract<DirectionalDecision, { action: "rebalance" }> = {
+      action: "rebalance",
+      signal: targetSide === "long" ? "buy" : targetSide === "short" ? "sell" : "hold",
+      targetExposurePct,
+      reason: `${config.algorithm} target ${targetSide}`,
+    };
+
+    const result = this.rebalanceToTargetExposure(tick.price, tick.eventTime, decision);
+
+    if (!result) {
+      return [];
+    }
+
+    this.state.memory.lastSignal = result.order.side === "buy" ? "buy" : "sell";
+    this.state.memory.lastActionAt = tick.eventTime;
+
+    if (!collectEvents) {
+      return [];
+    }
+
+    return [
+      {
+        type: "order_filled",
+        at: tick.eventTime,
+        message: `${result.order.side.toUpperCase()} benchmark fill: ${decision.reason}`,
+        order: structuredClone(result.order),
+        fill: structuredClone(result.fill),
+      },
+    ];
+  }
+
+  private benchmarkControlTargetSide(tick: PriceTick): DirectionalSide {
+    const algorithm = this.state.config.algorithm;
+    if (algorithm === "benchmark-always-long") {
+      return "long";
+    }
+    if (algorithm === "benchmark-always-short") {
+      return "short";
+    }
+    if (algorithm === "benchmark-always-flat") {
+      return "flat";
+    }
+
+    const cooldownMs = Math.max(1, this.state.config.cooldownMs);
+    const decisionBucket = Math.floor(tick.eventTime / cooldownMs);
+    const randomUnit = deterministicUnitInterval(
+      this.state.config.benchmarkRandomSeed,
+      decisionBucket,
+    );
+    if (randomUnit < 0.45) {
+      return "long";
+    }
+    if (randomUnit > 0.55) {
+      return "short";
+    }
+    return "flat";
+  }
+
+  private currentDirectionalSide(price: number): DirectionalSide {
+    const exposureQuote = (this.state.baseFree + this.state.baseReserved) * price;
+    if (exposureQuote >= this.state.config.minOrderQuote) {
+      return "long";
+    }
+    if (exposureQuote <= -this.state.config.minOrderQuote) {
+      return "short";
+    }
+    return "flat";
+  }
+
+  private rebalanceToTargetExposure(
+    marketPrice: number,
+    at: number,
+    decision: Extract<DirectionalDecision, { action: "rebalance" }>,
+  ): { order: TradingOrder; fill: TradeFill } | undefined {
+    const config = this.state.config;
+    const equity = this.equityAt(marketPrice);
+    if (equity <= 0 || marketPrice <= 0) {
+      return undefined;
+    }
+
+    const longLimitQuote = Math.min(
+      config.maxPositionQuote,
+      equity * config.maxLeverage * 0.98,
+    );
+    const shortLimitQuote = Math.min(
+      config.maxPositionQuote,
+      equity * Math.max(0, config.maxLeverage - 1) * 0.98,
+    );
+    if (longLimitQuote <= 0 && shortLimitQuote <= 0) {
+      return undefined;
+    }
+
+    const targetExposurePct = clamp(decision.targetExposurePct, -1, 1);
+    const targetQuote =
+      targetExposurePct >= 0
+        ? targetExposurePct * longLimitQuote
+        : targetExposurePct * shortLimitQuote;
+    const currentBase = this.state.baseFree + this.state.baseReserved;
+    const targetBase = targetQuote / marketPrice;
+    const deltaBase = roundAsset(targetBase - currentBase);
+    const quantity = roundAsset(Math.abs(deltaBase));
+    const tradeQuote = quantity * marketPrice;
+    const closingToFlat =
+      Math.abs(targetQuote) < config.minOrderQuote &&
+      Math.abs(currentBase * marketPrice) > 0;
+
+    if (quantity <= 0 || (tradeQuote < config.minOrderQuote && !closingToFlat)) {
+      return undefined;
+    }
+
+    return this.executeMarketFill(
+      deltaBase > 0 ? "buy" : "sell",
+      marketPrice,
+      quantity,
+      at,
+      decision.reason,
+    );
+  }
+
+  private executeMarketFill(
+    side: "buy" | "sell",
+    marketPrice: number,
+    quantity: number,
+    at: number,
+    reason: string,
+  ): { order: TradingOrder; fill: TradeFill } | undefined {
+    const rollback = this.captureImmediateFillRollback();
+
+    try {
+      const config = this.state.config;
+      const feeRate = config.feeBps / 10_000;
+      const slippageRate = Math.max(0, config.positionRisk.marketSlippageBps) / 10_000;
+      const price = roundQuote(
+        side === "buy"
+          ? marketPrice * (1 + slippageRate)
+          : marketPrice * Math.max(0.000001, 1 - slippageRate),
+      );
+      const quoteQuantity = roundQuote(price * quantity);
+      const feeQuote = roundQuote(quoteQuantity * feeRate);
+      const oldBase = this.state.baseFree + this.state.baseReserved;
+      let realizedPnl = 0;
+
+      if (side === "buy") {
+        const spent = roundQuote(quoteQuantity + feeQuote);
+        const closedShortQuantity = Math.min(quantity, Math.max(0, -oldBase));
+        if (closedShortQuantity > 0) {
+          const feeForClosedQuantity = feeQuote * (closedShortQuantity / quantity);
+          const averageShortEntryPrice = this.averageOpenShortEntryPrice();
+          realizedPnl = roundQuote(
+            averageShortEntryPrice * closedShortQuantity -
+              price * closedShortQuantity -
+              feeForClosedQuantity,
+          );
+        }
+
+        this.state.quoteFree = roundQuote(this.state.quoteFree - spent);
+        this.state.baseFree = roundAsset(this.state.baseFree + quantity);
+
+        const newBase = oldBase + quantity;
+        if (newBase >= -0.00000001) {
+          this.state.avgShortEntryPrice = 0;
+        }
+        if (oldBase >= 0) {
+          const oldCost = this.state.avgEntryPrice * oldBase;
+          this.state.avgEntryPrice =
+            newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
+        } else if (newBase > 0) {
+          const leftoverRatio = Math.min(1, newBase / quantity);
+          this.state.avgEntryPrice = roundQuote((spent * leftoverRatio) / newBase);
+        } else {
+          this.state.avgEntryPrice = 0;
+        }
+      } else {
+        const proceeds = roundQuote(quoteQuantity - feeQuote);
+        const closedLongQuantity = Math.min(quantity, Math.max(0, oldBase));
+        const openedShortQuantity = Math.max(0, -Math.min(0, oldBase - quantity));
+        const previousShortQuantity = Math.max(0, -oldBase);
+        if (closedLongQuantity > 0 && this.state.avgEntryPrice > 0) {
+          const feeForClosedQuantity = feeQuote * (closedLongQuantity / quantity);
+          realizedPnl = roundQuote(
+            price * closedLongQuantity -
+              feeForClosedQuantity -
+              this.state.avgEntryPrice * closedLongQuantity,
+          );
+        }
+
+        this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
+        this.state.baseFree = roundAsset(this.state.baseFree - quantity);
+
+        const newBase = oldBase - quantity;
+        if (newBase <= 0.00000001) {
+          this.state.avgEntryPrice = 0;
+        }
+        if (newBase < -0.00000001) {
+          const openedInThisFill = Math.max(0, openedShortQuantity - previousShortQuantity);
+          const feeForOpenedQuantity = feeQuote * (openedInThisFill / quantity);
+          const openedProceeds = Math.max(0, price * openedInThisFill - feeForOpenedQuantity);
+          const previousProceeds = this.state.avgShortEntryPrice * previousShortQuantity;
+          this.state.avgShortEntryPrice = roundQuote(
+            (previousProceeds + openedProceeds) / Math.max(openedShortQuantity, 0.00000001),
+          );
+        } else {
+          this.state.avgShortEntryPrice = 0;
+        }
+      }
+
+      this.state.feesPaid = roundQuote(this.state.feesPaid + feeQuote);
+      this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
+      if (realizedPnl > 0) {
+        this.state.winningTrades += 1;
+      } else if (realizedPnl < 0) {
+        this.state.losingTrades += 1;
+      }
+
+      const orderId = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
+      const order: TradingOrder = {
+        id: orderId,
+        side,
+        type: "market",
+        status: "filled",
+        price,
+        quantity,
+        filledQuantity: quantity,
+        estimatedQuoteCost: side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
+        createdAt: at,
+        updatedAt: at,
+        filledAt: at,
+        reason,
+        realizedPnl,
+        feeQuote,
+        positionEffect: "auto",
+      };
+      const fill: TradeFill = {
+        id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
+        orderId,
+        side,
+        price,
+        quantity,
+        quoteQuantity,
+        feeQuote,
+        realizedPnl,
+        filledAt: at,
+        reason,
+        positionEffect: "auto",
+      };
+
+      this.state.orders.push(order);
+      this.state.fills.push(fill);
+      this.state.lastPrice = roundQuote(marketPrice);
+      this.state.updatedAt = at;
+      recalculateMetrics(this.state);
+      this.assertLeverageLimit();
+
+      return { order, fill };
+    } catch (error) {
+      this.restoreImmediateFillRollback(rollback);
+      this.rebuildOpenOrderIndex();
+      if (isLeverageLimitError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  private averageOpenShortEntryPrice(): number {
+    if (this.state.avgShortEntryPrice > 0) {
+      return this.state.avgShortEntryPrice;
+    }
+
+    const positions = analyzePositions(this.state);
+    let quantity = 0;
+    let proceeds = 0;
+
+    for (const lot of positions.shorts) {
+      if (lot.status === "pending" || lot.remainingQuantity <= 0) {
+        continue;
+      }
+      quantity += lot.remainingQuantity;
+      proceeds += lot.remainingProceedsQuote;
+    }
+
+    if (quantity <= 0) {
+      return this.state.lastPrice;
+    }
+
+    return proceeds / quantity;
+  }
+
+  private equityAt(price: number): number {
+    return roundQuote(
+      this.state.quoteFree +
+        this.state.quoteReserved +
+        (this.state.baseFree + this.state.baseReserved) * price,
+    );
+  }
+
+  private captureImmediateFillRollback(): ImmediateFillRollback {
+    return {
+      quoteFree: this.state.quoteFree,
+      quoteReserved: this.state.quoteReserved,
+      baseFree: this.state.baseFree,
+      baseReserved: this.state.baseReserved,
+      avgEntryPrice: this.state.avgEntryPrice,
+      avgShortEntryPrice: this.state.avgShortEntryPrice,
+      lastPrice: this.state.lastPrice,
+      updatedAt: this.state.updatedAt,
+      realizedPnl: this.state.realizedPnl,
+      feesPaid: this.state.feesPaid,
+      winningTrades: this.state.winningTrades,
+      losingTrades: this.state.losingTrades,
+      sequence: this.state.sequence,
+      ordersLength: this.state.orders.length,
+      fillsLength: this.state.fills.length,
+      metrics: { ...this.state.metrics },
+    };
+  }
+
+  private restoreImmediateFillRollback(rollback: ImmediateFillRollback): void {
+    this.state.quoteFree = rollback.quoteFree;
+    this.state.quoteReserved = rollback.quoteReserved;
+    this.state.baseFree = rollback.baseFree;
+    this.state.baseReserved = rollback.baseReserved;
+    this.state.avgEntryPrice = rollback.avgEntryPrice;
+    this.state.avgShortEntryPrice = rollback.avgShortEntryPrice;
+    this.state.lastPrice = rollback.lastPrice;
+    this.state.updatedAt = rollback.updatedAt;
+    this.state.realizedPnl = rollback.realizedPnl;
+    this.state.feesPaid = rollback.feesPaid;
+    this.state.winningTrades = rollback.winningTrades;
+    this.state.losingTrades = rollback.losingTrades;
+    this.state.sequence = rollback.sequence;
+    this.state.orders.length = rollback.ordersLength;
+    this.state.fills.length = rollback.fillsLength;
+    this.state.metrics = rollback.metrics;
+  }
+
   private createBuyOrder(
     marketPrice: number,
     createdAt: number,
@@ -663,7 +1152,8 @@ export class SimulatedTradingBot {
     index: number,
     filledAt: number,
   ): { fill?: TradeFill; cancelled?: TradingOrder } {
-    const previousState = structuredClone(this.state);
+    const rollback = this.captureImmediateFillRollback();
+    const orderBeforeFill = { ...order };
 
     try {
       const fill = this.fillOrder(order, index, filledAt);
@@ -674,7 +1164,8 @@ export class SimulatedTradingBot {
         throw error;
       }
 
-      this.state = previousState;
+      this.restoreImmediateFillRollback(rollback);
+      this.state.orders[index] = orderBeforeFill;
       this.rebuildOpenOrderIndex();
       const restoredOrder = this.state.orders[index];
       if (restoredOrder?.status !== "open") {
@@ -772,12 +1263,42 @@ export class SimulatedTradingBot {
       return;
     }
 
+    const estimatedLeverage = this.estimateDebtLeverage();
+    if (estimatedLeverage <= maxLeverage + 0.0001) {
+      return;
+    }
+
     const effectiveLeverage = analyzePositions(this.state).summary.effectiveLeverage;
     if (effectiveLeverage > maxLeverage + 0.0001) {
       throw new Error(
         `Leverage limit exceeded: ${formatLeverageForError(effectiveLeverage)}x > ${formatLeverageForError(maxLeverage)}x.`,
       );
     }
+  }
+
+  private estimateDebtLeverage(): number {
+    const price =
+      cleanPositive(this.state.lastPrice) ||
+      cleanPositive(this.state.avgEntryPrice) ||
+      cleanPositive(this.state.avgShortEntryPrice);
+    if (price <= 0) {
+      return 1;
+    }
+
+    const quoteBalance = this.state.quoteFree + this.state.quoteReserved;
+    const baseQuantity = this.state.baseFree + this.state.baseReserved;
+    const equity = this.equityAt(price);
+    const borrowedQuote = Math.max(0, -quoteBalance);
+    const borrowedBaseValue = Math.max(0, -baseQuantity * price);
+    const externalBorrowedQuote = borrowedQuote + borrowedBaseValue;
+    if (externalBorrowedQuote <= 0) {
+      return 1;
+    }
+    if (equity <= 0) {
+      return 999;
+    }
+
+    return clamp(1 + externalBorrowedQuote / equity, 1, 999);
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
@@ -827,7 +1348,7 @@ export class SimulatedTradingBot {
   }
 
   private rememberPrice(price: number): void {
-    const maxPrices = this.state.config.slowWindow * 8;
+    const maxPrices = priceMemoryLimit(this.state.config);
     this.state.memory.prices.push(price);
     if (this.state.memory.prices.length > maxPrices * 2) {
       this.state.memory.prices.splice(0, this.state.memory.prices.length - maxPrices);
@@ -883,6 +1404,7 @@ function normalizeLoadedState(
   normalized.fills ??= [];
   normalized.quoteReserved ??= 0;
   normalized.baseReserved ??= 0;
+  normalized.avgShortEntryPrice ??= inferAverageShortEntryPrice(normalized);
   normalized.winningTrades ??= 0;
   normalized.losingTrades ??= 0;
   normalized.sequence ??= normalized.orders.length + normalized.fills.length;
@@ -896,12 +1418,11 @@ function recalculateMetrics(state: PaperBotState): PaperBotState {
 
 function calculateMetrics(state: PaperBotState): BotMetrics {
   const lastPrice = state.lastPrice || state.avgEntryPrice || 0;
-  const baseValue = (state.baseFree + state.baseReserved) * lastPrice;
+  const baseQuantity = state.baseFree + state.baseReserved;
+  const baseValue = baseQuantity * lastPrice;
+  const exposureValue = Math.abs(baseValue);
   const equity = roundQuote(state.quoteFree + state.quoteReserved + baseValue);
-  const unrealizedPnl =
-    state.avgEntryPrice > 0
-      ? roundQuote((lastPrice - state.avgEntryPrice) * (state.baseFree + state.baseReserved))
-      : 0;
+  const unrealizedPnl = calculateUnrealizedPnl(state, baseQuantity, lastPrice);
   const netPnl = roundQuote(equity - state.startingQuote);
   const peakEquity = Math.max(state.metrics?.peakEquity ?? state.startingQuote, equity);
   const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
@@ -920,8 +1441,49 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
     winRate: totalClosedTrades > 0 ? (state.winningTrades / totalClosedTrades) * 100 : 0,
     peakEquity,
     maxDrawdownPct: Math.max(state.metrics?.maxDrawdownPct ?? 0, drawdown),
-    exposurePct: equity > 0 ? (baseValue / equity) * 100 : 0,
+    exposurePct: equity > 0 ? (exposureValue / equity) * 100 : 0,
   };
+}
+
+function calculateUnrealizedPnl(
+  state: PaperBotState,
+  baseQuantity: number,
+  lastPrice: number,
+): number {
+  if (baseQuantity > 0 && state.avgEntryPrice > 0) {
+    return roundQuote((lastPrice - state.avgEntryPrice) * baseQuantity);
+  }
+  if (baseQuantity < 0 && state.avgShortEntryPrice > 0) {
+    return roundQuote((state.avgShortEntryPrice - lastPrice) * Math.abs(baseQuantity));
+  }
+  return 0;
+}
+
+function inferAverageShortEntryPrice(state: PaperBotState): number {
+  const positions = analyzePositions(state);
+  let quantity = 0;
+  let proceeds = 0;
+
+  for (const lot of positions.shorts) {
+    if (lot.status === "pending" || lot.remainingQuantity <= 0) {
+      continue;
+    }
+    quantity += lot.remainingQuantity;
+    proceeds += lot.remainingProceedsQuote;
+  }
+
+  return quantity > 0 ? roundQuote(proceeds / quantity) : 0;
+}
+
+function priceMemoryLimit(config: StrategyConfig): number {
+  return Math.max(
+    50,
+    config.slowWindow * 8,
+    config.trendFollowing.slowWindow + 2,
+    config.trendFollowing.volatilityWindow + 2,
+    config.volatilityBreakout.lookbackWindow + 2,
+    config.meanReversion.trendWindow + 2,
+  );
 }
 
 function emptyMetrics(startingQuote: number): BotMetrics {
@@ -957,6 +1519,20 @@ function cleanPositive(value: number | undefined): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function deterministicUnitInterval(...values: number[]): number {
+  let hash = 2166136261;
+  for (const value of values) {
+    hash ^= Math.trunc(value);
+    hash = Math.imul(hash, 16777619);
+  }
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 2246822507);
+  hash ^= hash >>> 13;
+  hash = Math.imul(hash, 3266489909);
+  hash ^= hash >>> 16;
+  return (hash >>> 0) / 4294967296;
 }
 
 function isLeverageLimitError(error: unknown): boolean {

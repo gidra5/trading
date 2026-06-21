@@ -722,6 +722,34 @@ function venueLabel(venue: BinanceMarketListing["venue"]): string {
   return venue[0].toUpperCase() + venue.slice(1);
 }
 
+function algorithmLabel(algorithm: StrategyConfig["algorithm"] | undefined): string {
+  if (algorithm === "legacy-valley-peak") {
+    return "Legacy Valley/Peak";
+  }
+  if (algorithm === "trend-following") {
+    return "Trend Following";
+  }
+  if (algorithm === "volatility-breakout") {
+    return "Volatility Breakout";
+  }
+  if (algorithm === "mean-reversion") {
+    return "Mean Reversion";
+  }
+  if (algorithm === "benchmark-always-long") {
+    return "Benchmark Always Long";
+  }
+  if (algorithm === "benchmark-always-short") {
+    return "Benchmark Always Short";
+  }
+  if (algorithm === "benchmark-always-flat") {
+    return "Benchmark Always Flat";
+  }
+  if (algorithm === "benchmark-random-sign") {
+    return "Benchmark Random Sign";
+  }
+  return "Moving Average";
+}
+
 function AlgorithmPanel(props: {
   config?: StrategyConfig;
   marketMaxLeverage?: number;
@@ -759,6 +787,54 @@ function AlgorithmPanel(props: {
       },
     });
   };
+  const updateTrend = <K extends keyof StrategyConfig["trendFollowing"]>(
+    key: K,
+    value: StrategyConfig["trendFollowing"][K],
+  ) => {
+    if (!props.config) {
+      return;
+    }
+
+    props.onChange({
+      ...props.config,
+      trendFollowing: {
+        ...props.config.trendFollowing,
+        [key]: value,
+      },
+    });
+  };
+  const updateBreakout = <K extends keyof StrategyConfig["volatilityBreakout"]>(
+    key: K,
+    value: StrategyConfig["volatilityBreakout"][K],
+  ) => {
+    if (!props.config) {
+      return;
+    }
+
+    props.onChange({
+      ...props.config,
+      volatilityBreakout: {
+        ...props.config.volatilityBreakout,
+        [key]: value,
+      },
+    });
+  };
+  const updateReversion = <K extends keyof StrategyConfig["meanReversion"]>(
+    key: K,
+    value: StrategyConfig["meanReversion"][K],
+  ) => {
+    if (!props.config) {
+      return;
+    }
+
+    props.onChange({
+      ...props.config,
+      meanReversion: {
+        ...props.config.meanReversion,
+        [key]: value,
+      },
+    });
+  };
   const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
     key: K,
     value: StrategyConfig["positionRisk"][K],
@@ -782,9 +858,7 @@ function AlgorithmPanel(props: {
         <div>
           <div class="muted-label">Algorithm</div>
           <h2 class="text-lg font-semibold">
-            {props.config?.algorithm === "legacy-valley-peak"
-              ? "Legacy Valley/Peak"
-              : "Moving Average"}
+            {algorithmLabel(props.config?.algorithm)}
           </h2>
         </div>
         <button
@@ -821,6 +895,13 @@ function AlgorithmPanel(props: {
               >
                 <option value="moving-average">Moving average</option>
                 <option value="legacy-valley-peak">Legacy valley/peak</option>
+                <option value="trend-following">Trend following</option>
+                <option value="volatility-breakout">Volatility breakout</option>
+                <option value="mean-reversion">Mean reversion</option>
+                <option value="benchmark-always-flat">Benchmark always flat</option>
+                <option value="benchmark-always-long">Benchmark always long</option>
+                <option value="benchmark-always-short">Benchmark always short</option>
+                <option value="benchmark-random-sign">Benchmark random sign</option>
               </select>
               <div class="mt-3 grid grid-cols-2 gap-3">
                 <NumberField
@@ -966,6 +1047,145 @@ function AlgorithmPanel(props: {
               </div>
             </Show>
 
+            <Show when={config().algorithm === "trend-following"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Trend Following</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Fast Window"
+                    value={config().trendFollowing.fastWindow}
+                    min={2}
+                    step={1}
+                    onInput={(value) => updateTrend("fastWindow", value)}
+                  />
+                  <NumberField
+                    label="Slow Window"
+                    value={config().trendFollowing.slowWindow}
+                    min={3}
+                    step={1}
+                    onInput={(value) => updateTrend("slowWindow", value)}
+                  />
+                  <NumberField
+                    label="Vol Window"
+                    value={config().trendFollowing.volatilityWindow}
+                    min={2}
+                    step={1}
+                    onInput={(value) => updateTrend("volatilityWindow", value)}
+                  />
+                  <NumberField
+                    label="Entry bps"
+                    value={config().trendFollowing.entryThresholdBps}
+                    min={0}
+                    step={0.5}
+                    onInput={(value) => updateTrend("entryThresholdBps", value)}
+                  />
+                  <NumberField
+                    label="Exit bps"
+                    value={config().trendFollowing.exitThresholdBps}
+                    min={0}
+                    step={0.5}
+                    onInput={(value) => updateTrend("exitThresholdBps", value)}
+                  />
+                  <NumberField
+                    label="Exposure %"
+                    value={config().trendFollowing.targetExposurePct * 100}
+                    min={0}
+                    max={100}
+                    step={1}
+                    onInput={(value) => updateTrend("targetExposurePct", value / 100)}
+                  />
+                </div>
+              </div>
+            </Show>
+
+            <Show when={config().algorithm === "volatility-breakout"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Volatility Breakout</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Lookback"
+                    value={config().volatilityBreakout.lookbackWindow}
+                    min={2}
+                    step={1}
+                    onInput={(value) => updateBreakout("lookbackWindow", value)}
+                  />
+                  <NumberField
+                    label="Break bps"
+                    value={config().volatilityBreakout.breakoutThresholdBps}
+                    min={0}
+                    step={0.5}
+                    onInput={(value) => updateBreakout("breakoutThresholdBps", value)}
+                  />
+                  <NumberField
+                    label="Exit bps"
+                    value={config().volatilityBreakout.exitThresholdBps}
+                    min={0}
+                    step={0.5}
+                    onInput={(value) => updateBreakout("exitThresholdBps", value)}
+                  />
+                  <NumberField
+                    label="Exposure %"
+                    value={config().volatilityBreakout.targetExposurePct * 100}
+                    min={0}
+                    max={100}
+                    step={1}
+                    onInput={(value) => updateBreakout("targetExposurePct", value / 100)}
+                  />
+                </div>
+              </div>
+            </Show>
+
+            <Show when={config().algorithm === "mean-reversion"}>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label">Mean Reversion</div>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="Window"
+                    value={config().meanReversion.window}
+                    min={3}
+                    step={1}
+                    onInput={(value) => updateReversion("window", value)}
+                  />
+                  <NumberField
+                    label="Trend Window"
+                    value={config().meanReversion.trendWindow}
+                    min={3}
+                    step={1}
+                    onInput={(value) => updateReversion("trendWindow", value)}
+                  />
+                  <NumberField
+                    label="Entry Z"
+                    value={config().meanReversion.entryZScore}
+                    min={0.01}
+                    step={0.05}
+                    onInput={(value) => updateReversion("entryZScore", value)}
+                  />
+                  <NumberField
+                    label="Exit Z"
+                    value={config().meanReversion.exitZScore}
+                    min={0}
+                    step={0.05}
+                    onInput={(value) => updateReversion("exitZScore", value)}
+                  />
+                  <NumberField
+                    label="Max Trend"
+                    value={config().meanReversion.maxTrendBps}
+                    min={0}
+                    step={1}
+                    onInput={(value) => updateReversion("maxTrendBps", value)}
+                  />
+                  <NumberField
+                    label="Exposure %"
+                    value={config().meanReversion.targetExposurePct * 100}
+                    min={0}
+                    max={100}
+                    step={1}
+                    onInput={(value) => updateReversion("targetExposurePct", value / 100)}
+                  />
+                </div>
+              </div>
+            </Show>
+
             <div class="rounded-2 bg-ink-800 p-3">
               <div class="muted-label">Position Risk</div>
               <div class="mt-3 grid grid-cols-2 gap-3">
@@ -1098,6 +1318,14 @@ function formatLeverage(value: number | undefined): string {
   }
 
   return `${formatQuote(value, 2)}x`;
+}
+
+function formatRatio(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  return formatQuote(value, 3);
 }
 
 function OrderBookPanel(props: { snapshot?: RuntimeSnapshot }) {
@@ -2372,6 +2600,8 @@ function BacktestPanel(props: {
             label="Return"
             value={formatPercent(props.progress?.returnPct ?? summary()?.returnPct)}
           />
+          <SmallMetric label="Risk Ret" value={formatRatio(summary()?.riskAdjustedReturn)} />
+          <SmallMetric label="Sharpe" value={formatRatio(summary()?.sharpeRatio)} />
           <SmallMetric
             label="Perfect Ret"
             value={formatPercent(summary()?.perfectMarginReturnPct)}

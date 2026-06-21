@@ -3,6 +3,7 @@ import {
   createInitialBotState,
   createStrategyConfig,
 } from "./bot.js";
+import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 import type {
   BacktestSummary,
   BacktestResult,
@@ -352,6 +353,11 @@ function buildBacktestResult(
   perfectMargin: PerfectMarginBenchmark,
 ): BacktestResult {
   const resultState = compactBacktestState(finalState, options);
+  const riskMetrics = calculateRiskAdjustedMetrics(
+    equityCurve,
+    finalState.metrics.returnPct,
+    finalState.metrics.maxDrawdownPct,
+  );
 
   return {
     summary: {
@@ -369,6 +375,7 @@ function buildBacktestResult(
       finalEquity: finalState.metrics.equity,
       netPnl: finalState.metrics.netPnl,
       returnPct: finalState.metrics.returnPct,
+      ...riskMetrics,
       maxDrawdownPct: finalState.metrics.maxDrawdownPct,
       tradeCount: finalState.metrics.tradeCount,
       winRate: finalState.metrics.winRate,
@@ -411,8 +418,17 @@ function compactBacktestMemory(
   memory: Readonly<StrategyMemory>,
   config: Readonly<StrategyConfig>,
 ): StrategyMemory {
+  const priceLimit = Math.max(
+    50,
+    config.slowWindow * 2,
+    config.trendFollowing.slowWindow + 2,
+    config.trendFollowing.volatilityWindow + 2,
+    config.volatilityBreakout.lookbackWindow + 2,
+    config.meanReversion.trendWindow + 2,
+  );
+
   return {
-    prices: tail(memory.prices, Math.max(50, config.slowWindow * 2)).slice(),
+    prices: tail(memory.prices, priceLimit).slice(),
     lastSignal: memory.lastSignal,
     lastActionAt: memory.lastActionAt,
     previousFastAvg: memory.previousFastAvg,

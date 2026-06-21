@@ -1,7 +1,7 @@
 - add strategies/algos like dca, grid, rebalancing, arbitrage, etc
-- fetch more other pairs data. compute running correlations between them. cache the results.
-- search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or come in opposite pairs.
-- brainstorm/loop agent to find other algos that could work well. The target is to at least get profitable regardless of the market conditions. Ideally approach the "perfect margin trader" as much as possible. maybe we can train some model to orchestrate between bots and positions.
+- search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or compensate variance of each other.
+- portfolio management experiments: initial strategy-portfolio harness exists; still need cached multi-symbol data for inverse-vol allocation, correlation-cluster caps, volatility-targeted leverage, market-neutral pairs, robust min-variance baskets, turnover-aware rebalancing, funding-aware overlays, and stress-mode deleveraging. Details are in docs/strategy-research.md and docs/experiment-plan.md.
+- randomized model. lets say we look at the price according to some poisson process. At each observation we decide one of the following - open new long/short position, close existing position, or do nothing. We should pick the action based on which will yield best change in equity or break-even price.
 - closing all long positions if there are short positions borrowing from them should not be allowed if we get over the leverage limit. the leftover fraction is basically reserved for the already open opposing positions.
 - authorize bots to be able to trade actual money.
 - add prediction market support

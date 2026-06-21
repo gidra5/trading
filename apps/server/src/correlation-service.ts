@@ -19,6 +19,7 @@ import {
 const CORRELATION_CACHE_VERSION = 1;
 const STREAM_CHUNK_SIZE = 80;
 const PENDING_RETURN_BUCKET_LIMIT = 4_000;
+const CATEGORY_MIN_MARKETS = 3;
 
 export type CorrelationStatus = "idle" | "running" | "ready" | "failed";
 
@@ -529,29 +530,22 @@ export class CorrelationService {
         continue;
       }
       if (
-        market.venue !== focalMarket.venue ||
-        market.group !== focalMarket.group ||
         market.quoteAsset !== focalMarket.quoteAsset ||
-        !market.supportsHistoricalCandles
+        !market.supportsHistoricalCandles ||
+        !market.supportsLiveStream ||
+        !isCorrelationMarketGroup(market.group) ||
+        market.venue === "predictions"
       ) {
         continue;
       }
       byId.set(market.id, market);
     }
 
-    const sorted = [...byId.values()].sort((a, b) => {
-      if (a.id === focalMarket.id) {
-        return -1;
-      }
-      if (b.id === focalMarket.id) {
-        return 1;
-      }
-      return a.displaySymbol.localeCompare(b.displaySymbol) || a.id.localeCompare(b.id);
-    });
+    const eligibleMarkets = [...byId.values()];
     const maxMarkets = Math.max(1, Math.floor(this.options.maxMarkets));
-    const truncated = sorted.length > maxMarkets;
+    const truncated = eligibleMarkets.length > maxMarkets;
     return {
-      markets: truncated ? sorted.slice(0, maxMarkets) : sorted,
+      markets: rankCorrelationMarkets(focalMarket, eligibleMarkets, maxMarkets),
       truncated,
     };
   }
@@ -1140,6 +1134,239 @@ function emptyRunningStats(): RunningCorrelationStats {
   };
 }
 
+function rankCorrelationMarkets(
+  focalMarket: BinanceMarketListing,
+  markets: BinanceMarketListing[],
+  maxMarkets: number,
+): BinanceMarketListing[] {
+  const focal = markets.find((market) => market.id === focalMarket.id) ?? focalMarket;
+  const peers = markets
+    .filter((market) => market.id !== focal.id)
+    .sort(compareCorrelationAlphabetically);
+  const limit = Math.max(1, maxMarkets);
+
+  if (peers.length + 1 <= limit) {
+    return [focal, ...peers];
+  }
+
+  const selected = new Map<string, BinanceMarketListing>([[focal.id, focal]]);
+  seedCategoryQuotas(selected, peers, focal, limit);
+  const rankings = [
+    rankByCategory(peers, focal),
+    rankByMetric(peers, (market) => market.quoteVolume24h),
+    rankByMetric(peers, (market) =>
+      Number.isFinite(market.priceChangePercent24h)
+        ? Math.abs(market.priceChangePercent24h as number)
+        : undefined,
+    ),
+    rankByMetric(peers, (market) => market.tradeCount24h),
+    rankByMetric(peers, (market) => market.volume24h),
+    peers,
+  ].filter((ranking) => ranking.length > 0);
+  const cursors = new Array(rankings.length).fill(0);
+
+  while (selected.size < limit) {
+    let added = false;
+    for (let rankingIndex = 0; rankingIndex < rankings.length; rankingIndex += 1) {
+      const ranking = rankings[rankingIndex];
+      while (
+        cursors[rankingIndex] < ranking.length &&
+        selected.has(ranking[cursors[rankingIndex]].id)
+      ) {
+        cursors[rankingIndex] += 1;
+      }
+
+      const market = ranking[cursors[rankingIndex]];
+      if (!market) {
+        continue;
+      }
+
+      selected.set(market.id, market);
+      cursors[rankingIndex] += 1;
+      added = true;
+      if (selected.size >= limit) {
+        break;
+      }
+    }
+
+    if (!added) {
+      break;
+    }
+  }
+
+  for (const market of peers) {
+    if (selected.size >= limit) {
+      break;
+    }
+    selected.set(market.id, market);
+  }
+
+  return [...selected.values()];
+}
+
+type CorrelationAssetCategory = "spot" | "futures" | "stocks" | "options";
+
+function seedCategoryQuotas(
+  selected: Map<string, BinanceMarketListing>,
+  peers: BinanceMarketListing[],
+  focalMarket: BinanceMarketListing,
+  limit: number,
+): void {
+  const categories = categoryOrderFor(focalMarket).filter((category) =>
+    peers.some((market) => correlationAssetCategory(market) === category) ||
+    correlationAssetCategory(focalMarket) === category,
+  );
+  const marketsByCategory = new Map<CorrelationAssetCategory, BinanceMarketListing[]>();
+  for (const category of categories) {
+    marketsByCategory.set(
+      category,
+      peers
+        .filter((market) => correlationAssetCategory(market) === category)
+        .sort(compareCorrelationSelectionScore),
+    );
+  }
+
+  for (let targetCount = 1; targetCount <= CATEGORY_MIN_MARKETS; targetCount += 1) {
+    for (const category of categories) {
+      if (selected.size >= limit) {
+        return;
+      }
+      if (selectedCategoryCount(selected, category) >= targetCount) {
+        continue;
+      }
+
+      const market = nextUnselected(marketsByCategory.get(category) ?? [], selected);
+      if (market) {
+        selected.set(market.id, market);
+      }
+    }
+  }
+}
+
+function rankByCategory(
+  markets: BinanceMarketListing[],
+  focalMarket: BinanceMarketListing,
+): BinanceMarketListing[] {
+  const marketsByCategory = new Map<CorrelationAssetCategory, BinanceMarketListing[]>();
+  for (const market of markets) {
+    const category = correlationAssetCategory(market);
+    const bucket = marketsByCategory.get(category) ?? [];
+    bucket.push(market);
+    marketsByCategory.set(category, bucket);
+  }
+  for (const bucket of marketsByCategory.values()) {
+    bucket.sort(compareCorrelationSelectionScore);
+  }
+
+  const ranked: BinanceMarketListing[] = [];
+  const categories = categoryOrderFor(focalMarket);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const category of categories) {
+      const market = marketsByCategory.get(category)?.shift();
+      if (!market) {
+        continue;
+      }
+      ranked.push(market);
+      added = true;
+    }
+  }
+
+  return ranked;
+}
+
+function rankByMetric(
+  markets: BinanceMarketListing[],
+  metric: (market: BinanceMarketListing) => number | undefined,
+): BinanceMarketListing[] {
+  return markets
+    .filter((market) => Number.isFinite(metric(market)))
+    .sort((a, b) => {
+      const metricDiff = (metric(b) as number) - (metric(a) as number);
+      return metricDiff || compareCorrelationAlphabetically(a, b);
+    });
+}
+
+function selectedCategoryCount(
+  selected: Map<string, BinanceMarketListing>,
+  category: CorrelationAssetCategory,
+): number {
+  return [...selected.values()].filter(
+    (market) => correlationAssetCategory(market) === category,
+  ).length;
+}
+
+function nextUnselected(
+  markets: BinanceMarketListing[],
+  selected: Map<string, BinanceMarketListing>,
+): BinanceMarketListing | undefined {
+  return markets.find((market) => !selected.has(market.id));
+}
+
+function categoryOrderFor(focalMarket: BinanceMarketListing): CorrelationAssetCategory[] {
+  const focalCategory = correlationAssetCategory(focalMarket);
+  const categories: CorrelationAssetCategory[] = ["spot", "futures", "stocks", "options"];
+  return [
+    focalCategory,
+    ...categories.filter((category) => category !== focalCategory),
+  ];
+}
+
+function correlationAssetCategory(
+  market: Pick<BinanceMarketListing, "group" | "venue">,
+): CorrelationAssetCategory {
+  if (market.group === "options" || market.venue === "options") {
+    return "options";
+  }
+  if (market.group === "bstocks" || market.group === "tradfi") {
+    return "stocks";
+  }
+  if (
+    market.group === "futures" ||
+    market.venue === "usdm-futures" ||
+    market.venue === "coinm-futures"
+  ) {
+    return "futures";
+  }
+  return "spot";
+}
+
+function isCorrelationMarketGroup(group: BinanceMarketListing["group"]): boolean {
+  return (
+    group === "spot" ||
+    group === "bstocks" ||
+    group === "futures" ||
+    group === "tradfi" ||
+    group === "options"
+  );
+}
+
+function compareCorrelationSelectionScore(
+  a: BinanceMarketListing,
+  b: BinanceMarketListing,
+): number {
+  return (
+    marketSelectionScore(b) - marketSelectionScore(a) ||
+    compareCorrelationAlphabetically(a, b)
+  );
+}
+
+function marketSelectionScore(market: BinanceMarketListing): number {
+  const quoteVolume = Math.log10((market.quoteVolume24h ?? 0) + 1);
+  const tradeCount = Math.log10((market.tradeCount24h ?? 0) + 1);
+  const baseVolume = Math.log10((market.volume24h ?? 0) + 1);
+  const absMove = Math.abs(market.priceChangePercent24h ?? 0);
+  return quoteVolume * 3 + tradeCount * 2 + baseVolume + absMove * 0.25;
+}
+
+function compareCorrelationAlphabetically(
+  a: BinanceMarketListing,
+  b: BinanceMarketListing,
+): number {
+  return a.displaySymbol.localeCompare(b.displaySymbol) || a.id.localeCompare(b.id);
+}
+
 function emptyCacheStats(): HistoricalCandleCacheStats {
   return {
     cacheHitCandles: 0,
@@ -1205,6 +1432,9 @@ function streamBaseUrl(venue: StreamVenue): string {
   }
   if (venue === "coinm-futures") {
     return "wss://dstream.binance.com";
+  }
+  if (venue === "options") {
+    return "wss://nbstream.binance.com/eoptions";
   }
   return "wss://fstream.binance.com/market";
 }

@@ -1,5 +1,6 @@
 import {
   SimulatedTradingBot,
+  calculateRiskAdjustedMetrics,
   compactBacktestState,
   createInitialBotState,
   createStrategyConfig,
@@ -605,6 +606,11 @@ async function runHistoricalRangeBacktest(
     processedStartTime && processedEndTime
       ? processedEndTime - processedStartTime
       : undefined;
+  const riskMetrics = calculateRiskAdjustedMetrics(
+    equityCurve,
+    finalState.metrics.returnPct,
+    finalState.metrics.maxDrawdownPct,
+  );
   const result: BacktestResult = {
     summary: {
       symbol: options.symbol,
@@ -634,6 +640,7 @@ async function runHistoricalRangeBacktest(
       finalEquity: finalState.metrics.equity,
       netPnl: finalState.metrics.netPnl,
       returnPct: finalState.metrics.returnPct,
+      ...riskMetrics,
       maxDrawdownPct: finalState.metrics.maxDrawdownPct,
       tradeCount: finalState.metrics.tradeCount,
       winRate: finalState.metrics.winRate,
@@ -749,6 +756,8 @@ function buildRandomAggregateResult(input: {
       finalEquity: result.summary.finalEquity,
       netPnl: result.summary.netPnl,
       returnPct: result.summary.returnPct,
+      riskAdjustedReturn: result.summary.riskAdjustedReturn,
+      sharpeRatio: result.summary.sharpeRatio,
       netPnlPerDay: rate.netPnlPerDay,
       returnPctPerDay: rate.returnPctPerDay,
       perfectMarginLeverage: result.summary.perfectMarginLeverage,
@@ -772,6 +781,12 @@ function buildRandomAggregateResult(input: {
   const metrics = averageBotMetrics(results);
   const finalState = createAggregateFinalState(config, results, metrics);
   const returnValues = samples.map((sample) => sample.returnPct);
+  const riskAdjustedReturnValues = samples
+    .map((sample) => sample.riskAdjustedReturn)
+    .filter((value): value is number => Number.isFinite(value));
+  const sharpeRatioValues = samples
+    .map((sample) => sample.sharpeRatio)
+    .filter((value): value is number => Number.isFinite(value));
   const netPnlPerDayValues = samples.map((sample) => sample.netPnlPerDay);
   const returnPctPerDayValues = samples.map((sample) => sample.returnPctPerDay);
   const perfectMarginNetPnl = averageDefined(
@@ -840,6 +855,9 @@ function buildRandomAggregateResult(input: {
       finalEquity: metrics.equity,
       netPnl: metrics.netPnl,
       returnPct: metrics.returnPct,
+      riskAdjustedReturn:
+        riskAdjustedReturnValues.length > 0 ? average(riskAdjustedReturnValues) : undefined,
+      sharpeRatio: sharpeRatioValues.length > 0 ? average(sharpeRatioValues) : undefined,
       maxDrawdownPct: metrics.maxDrawdownPct,
       tradeCount: metrics.tradeCount,
       winRate: metrics.winRate,

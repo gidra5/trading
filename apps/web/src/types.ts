@@ -35,6 +35,10 @@ export interface BinanceMarketListing {
   searchable: string;
   supportsLiveStream: boolean;
   supportsHistoricalCandles: boolean;
+  quoteVolume24h?: number;
+  volume24h?: number;
+  priceChangePercent24h?: number;
+  tradeCount24h?: number;
   maxLeverage?: number;
   unavailableReason?: string;
   pair?: string;
