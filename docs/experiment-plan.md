@@ -20,6 +20,10 @@ whole available BTC cycle. A parameter candidate that only wins one fold, one re
 30-day window, or the current directional regime is treated as overfit until proven
 otherwise.
 
+Random-length tables report average, median, and P10 return. Median and P10 are part of
+the acceptance check because average return alone can hide a strategy that only survives
+through a small number of favorable regimes.
+
 ## Implemented Experiment Modes
 
 Run the normal strategy benchmark:

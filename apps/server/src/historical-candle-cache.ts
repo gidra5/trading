@@ -31,6 +31,11 @@ export interface CandleFetchRequest {
   limit: number;
 }
 
+export interface CandleTimeRange {
+  startTime: number;
+  endTime: number;
+}
+
 export type CandleRangeFetcher = (request: CandleFetchRequest) => Promise<Candle[]>;
 
 export class HistoricalCandleCache {
@@ -52,42 +57,61 @@ export class HistoricalCandleCache {
     fetcher: CandleRangeFetcher,
     onProgress?: (stats: HistoricalCandleCacheStats) => void,
   ): Promise<HistoricalCandleCacheStats> {
+    return this.ensureRanges([{ startTime, endTime }], fetcher, onProgress);
+  }
+
+  async ensureRanges(
+    ranges: CandleTimeRange[],
+    fetcher: CandleRangeFetcher,
+    onProgress?: (stats: HistoricalCandleCacheStats) => void,
+  ): Promise<HistoricalCandleCacheStats> {
     await fs.mkdir(this.rootDir, { recursive: true });
-    const protectedFiles = new Set(this.filePathsForRange(startTime, endTime));
+    const normalizedRanges = mergeTimeRanges(ranges, this.options.intervalMs);
+    const protectedFiles = new Set(
+      normalizedRanges.flatMap((range) =>
+        this.filePathsForRange(range.startTime, range.endTime),
+      ),
+    );
     const stats = await this.initialStats(protectedFiles);
-    const rangeState = await this.inspectCachedRange(startTime, endTime);
-    const missingRanges = rangeState.missingRanges;
 
-    stats.cacheHitCandles = rangeState.cacheHitCandles;
-    stats.cacheMissCandles = rangeState.cacheMissCandles;
-    onProgress?.({ ...stats });
+    for (const requestedRange of normalizedRanges) {
+      const rangeState = await this.inspectCachedRange(
+        requestedRange.startTime,
+        requestedRange.endTime,
+      );
+      const missingRanges = rangeState.missingRanges;
 
-    for (const range of missingRanges) {
-      let cursor = range.startTime;
+      stats.cacheHitCandles += rangeState.cacheHitCandles;
+      stats.cacheMissCandles += rangeState.cacheMissCandles;
+      onProgress?.({ ...stats });
 
-      while (cursor <= range.endTime) {
-        const candles = await fetcher({
-          startTime: cursor,
-          endTime: range.endTime,
-          limit: 1000,
-        });
-        stats.requests += 1;
+      for (const range of missingRanges) {
+        let cursor = range.startTime;
 
-        if (candles.length === 0) {
-          break;
+        while (cursor <= range.endTime) {
+          const candles = await fetcher({
+            startTime: cursor,
+            endTime: range.endTime,
+            limit: 1000,
+          });
+          stats.requests += 1;
+
+          if (candles.length === 0) {
+            break;
+          }
+
+          await this.mergeCandles(candles);
+          stats.cacheFetchedCandles += candles.length;
+          const last = candles[candles.length - 1];
+          const nextCursor = last.openTime + this.options.intervalMs;
+          if (!Number.isFinite(nextCursor) || nextCursor <= cursor) {
+            break;
+          }
+
+          cursor = nextCursor;
+          mergeBudgetStats(stats, await this.enforceStorageBudget(protectedFiles));
+          onProgress?.({ ...stats });
         }
-
-        await this.mergeCandles(candles);
-        stats.cacheFetchedCandles += candles.length;
-        const last = candles[candles.length - 1];
-        const nextCursor = last.openTime + this.options.intervalMs;
-        if (!Number.isFinite(nextCursor) || nextCursor <= cursor) {
-          break;
-        }
-
-        cursor = nextCursor;
-        mergeBudgetStats(stats, await this.enforceStorageBudget(protectedFiles));
-        onProgress?.({ ...stats });
       }
     }
 
@@ -451,6 +475,30 @@ function countCandlesInRange(
   intervalMs: number,
 ): number {
   return Math.max(0, Math.floor((endTime - startTime) / intervalMs) + 1);
+}
+
+function mergeTimeRanges(ranges: CandleTimeRange[], intervalMs: number): CandleTimeRange[] {
+  const sorted = ranges
+    .filter((range) => range.endTime >= range.startTime)
+    .map((range) => ({
+      startTime: alignUp(range.startTime, intervalMs),
+      endTime: alignDown(range.endTime, intervalMs),
+    }))
+    .filter((range) => range.endTime >= range.startTime)
+    .sort((left, right) => left.startTime - right.startTime || left.endTime - right.endTime);
+  const merged: CandleTimeRange[] = [];
+
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.startTime > previous.endTime + intervalMs) {
+      merged.push({ ...range });
+      continue;
+    }
+
+    previous.endTime = Math.max(previous.endTime, range.endTime);
+  }
+
+  return merged;
 }
 
 function mergeBudgetStats(

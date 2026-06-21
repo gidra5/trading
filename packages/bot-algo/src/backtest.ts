@@ -23,6 +23,8 @@ export interface RunBacktestOptions {
   maxEquityPoints?: number;
   maxReturnedOrders?: number;
   maxReturnedFills?: number;
+  startIndex?: number;
+  endIndex?: number;
 }
 
 const DEFAULT_MAX_EQUITY_POINTS = 800;
@@ -50,12 +52,22 @@ export function runBacktestFromCandles(
   candles: Candle[],
   options: Omit<RunBacktestOptions, "source"> = {},
 ): BacktestResult {
-  if (candles.length === 0) {
+  const startIndex = clampReplayIndex(options.startIndex, 0, candles.length, 0);
+  const endIndex = clampReplayIndex(
+    options.endIndex,
+    startIndex,
+    candles.length,
+    candles.length,
+  );
+  const candleCount = endIndex - startIndex;
+  if (candleCount <= 0) {
     throw new Error("Backtest requires at least one candle.");
   }
 
+  const firstCandle = candles[startIndex];
+  const lastCandle = candles[endIndex - 1];
   const config = createStrategyConfig({
-    symbol: candles[0]?.symbol ?? "BTCUSDT",
+    symbol: firstCandle?.symbol ?? "BTCUSDT",
     ...(options.config ?? {}),
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
@@ -65,14 +77,15 @@ export function runBacktestFromCandles(
   const startedAt = Date.now();
   const sampleEvery = Math.max(
     1,
-    Math.ceil(candles.length / (options.maxEquityPoints ?? DEFAULT_MAX_EQUITY_POINTS)),
+    Math.ceil(candleCount / (options.maxEquityPoints ?? DEFAULT_MAX_EQUITY_POINTS)),
   );
 
-  for (let index = 0; index < candles.length; index += 1) {
+  for (let index = startIndex; index < endIndex; index += 1) {
     const candle = candles[index];
+    const relativeIndex = index - startIndex;
     replayCandle(bot, candle, perfectMargin);
 
-    if (index % sampleEvery === 0 || index === candles.length - 1) {
+    if (relativeIndex % sampleEvery === 0 || index === endIndex - 1) {
       const metrics = bot.markToMarket();
       equityCurve.push({
         time: candle.closeTime,
@@ -87,10 +100,10 @@ export function runBacktestFromCandles(
     "candles",
     {
       symbol: finalState.symbol,
-      startTime: candles[0].openTime,
-      endTime: candles[candles.length - 1].closeTime,
-      eventsProcessed: candles.length * 4,
-      candlesProcessed: candles.length,
+      startTime: firstCandle.openTime,
+      endTime: lastCandle.closeTime,
+      eventsProcessed: candleCount * 4,
+      candlesProcessed: candleCount,
       replayDurationMs: Date.now() - startedAt,
     },
     equityCurve,
@@ -415,6 +428,19 @@ function normalizeResultLimit(value: number | undefined, fallback: number): numb
     return Number.MAX_SAFE_INTEGER;
   }
   return Math.max(0, Math.round(value));
+}
+
+function clampReplayIndex(
+  value: number | undefined,
+  minValue: number,
+  maxValue: number,
+  fallback: number,
+): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(minValue, Math.min(maxValue, Math.floor(value)));
 }
 
 function tail<T>(items: readonly T[], limit: number): readonly T[] {

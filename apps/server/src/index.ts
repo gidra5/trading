@@ -424,15 +424,12 @@ const wss = new WebSocketServer({
   server: server.server,
   path: "/ws",
 });
+const snapshotSource = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+const MAX_SOCKET_BUFFER_BYTES = 1_000_000;
 
 wss.on("connection", (socket) => {
   sockets.add(socket);
-  socket.send(
-    JSON.stringify({
-      type: "snapshot",
-      payload: publicSnapshot(),
-    }),
-  );
+  sendSnapshot(socket, publicSnapshot());
   socket.on("close", () => sockets.delete(socket));
 });
 
@@ -441,39 +438,131 @@ server.log.info(`Trading server listening at ${address}`);
 server.log.info(`Dashboard websocket available at ws://localhost:${appConfig.port}/ws`);
 
 let broadcastTimer: NodeJS.Timeout | undefined;
+let broadcastImmediate: NodeJS.Immediate | undefined;
+let broadcastRunning = false;
+let broadcastDirty = false;
+let snapshotSeq = 0;
 
 function scheduleBroadcast(): void {
-  if (broadcastTimer) {
+  queueBroadcast(500);
+}
+
+function broadcastState(): void {
+  queueBroadcast(0);
+}
+
+function queueBroadcast(delayMs: number): void {
+  if (sockets.size === 0) {
+    return;
+  }
+
+  broadcastDirty = true;
+  if (delayMs <= 0) {
+    if (broadcastTimer) {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = undefined;
+    }
+    queueBroadcastFlush();
+    return;
+  }
+
+  if (broadcastTimer || broadcastImmediate) {
     return;
   }
 
   broadcastTimer = setTimeout(() => {
     broadcastTimer = undefined;
-    broadcastState();
-  }, 500);
+    queueBroadcastFlush();
+  }, delayMs);
 }
 
-function broadcastState(): void {
-  if (sockets.size === 0) {
+function queueBroadcastFlush(): void {
+  if (broadcastImmediate) {
     return;
   }
 
-  const message = JSON.stringify({
-    type: "snapshot",
-    payload: publicSnapshot(),
-  });
+  broadcastImmediate = setImmediate(flushBroadcast);
+}
 
-  for (const socket of sockets) {
-    if (socket.readyState === socket.OPEN) {
-      socket.send(message);
-    }
+function flushBroadcast(): void {
+  broadcastImmediate = undefined;
+  if (broadcastRunning) {
+    broadcastDirty = true;
+    return;
+  }
+  if (!broadcastDirty || sockets.size === 0) {
+    broadcastDirty = false;
+    return;
+  }
+
+  broadcastRunning = true;
+  broadcastDirty = false;
+  void Promise.resolve()
+    .then(() => {
+      const snapshot = publicSnapshot();
+      const message = JSON.stringify({
+        type: "snapshot",
+        sequence: snapshot.snapshotSeq,
+        sentAt: Date.now(),
+        payload: snapshot,
+      });
+      for (const socket of sockets) {
+        if (socket.readyState !== socket.OPEN) {
+          continue;
+        }
+        if (socket.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+          continue;
+        }
+        sendMessage(socket, message);
+      }
+    })
+    .catch((error) => {
+      server.log.warn(
+        error instanceof Error ? error.message : "Dashboard broadcast failed.",
+      );
+    })
+    .finally(() => {
+      broadcastRunning = false;
+      if (broadcastDirty && sockets.size > 0) {
+        queueBroadcast(0);
+      }
+    });
+}
+
+function sendSnapshot(socket: WebSocket, snapshot: ReturnType<typeof publicSnapshot>): void {
+  sendMessage(
+    socket,
+    JSON.stringify({
+      type: "snapshot",
+      sequence: snapshot.snapshotSeq,
+      sentAt: Date.now(),
+      payload: snapshot,
+    }),
+  );
+}
+
+function sendMessage(socket: WebSocket, message: string): void {
+  try {
+    socket.send(message, (error) => {
+      if (error) {
+        sockets.delete(socket);
+        socket.close();
+      }
+    });
+  } catch {
+    sockets.delete(socket);
+    socket.close();
   }
 }
 
 function publicSnapshot() {
+  snapshotSeq += 1;
   const snapshot = runtime.snapshot();
   return {
     ...snapshot,
+    snapshotSource,
+    snapshotSeq,
+    snapshotAt: Date.now(),
     correlations: correlationService.snapshotForMarket(snapshot.market.id),
   };
 }

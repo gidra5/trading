@@ -53,6 +53,8 @@ The replay path is optimized for long candle runs:
 - directional strategies keep private rolling stats for volatility, mean/std, and breakout ranges instead of rescanning price windows every tick
 - replay uses a trusted no-event tick path, skipping symbol checks, unused volume-derived quantities, and per-tick metrics updates
 - cached full-day shards are validated with line count plus first/last candle checks instead of parsing every cached candle before replay
+- random-window and random-length runs prefetch the merged union of sample windows once per market, then skip cache validation for each individual sample
+- random-window and random-length runs preload the merged candle union for moderately sized sample sets and replay individual samples by index, avoiding repeated JSONL parsing of overlapping windows
 
 ## Strategy Benchmark Script
 
@@ -165,6 +167,10 @@ Repeated cached runs also avoid a full JSON parse pass during cache validation f
 complete day shards.
 Legacy-only replay can still be much faster; the master-adaptive path is the current
 conservative benchmark because it exercises the heaviest strategy stack.
+For random-length runs, the same 40-sample `master-adaptive` configuration dropped from
+roughly 19s wall-clock to about 8.5-9s wall-clock in the server path. A cached local
+CLI run over the same random-length shape completed in about 5.1s by replaying sample
+index ranges against one loaded candle array.
 
 Remaining work before treating year-scale runs as cheap:
 

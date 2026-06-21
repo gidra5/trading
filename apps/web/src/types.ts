@@ -69,6 +69,9 @@ export interface BinanceMarketCatalog {
 }
 
 export interface RuntimeSnapshot {
+  snapshotSource: string;
+  snapshotSeq: number;
+  snapshotAt: number;
   market: {
     id: string;
     group: MarketGroup;

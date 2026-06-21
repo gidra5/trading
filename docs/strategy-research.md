@@ -127,6 +127,61 @@ grid search also failed: 48 trend/breakout/reversion parameter candidates had ze
 profitable folds. Strategy-portfolio allocation reduced losses but did not become
 profitable on true candle-level periods.
 
+### 2026-06-21 Agent Iteration 1
+
+Validation frame: `random-lengths`, BTCUSDT 1m, 48 samples, 7-120 day windows,
+1,825 day lookback, seed 7331, 3x max leverage.
+
+The controls show that this sample set contains mixed regimes but still has strong BTC
+long drift: always-long averaged `21.66%` return with 28/48 profitable samples, while
+always-short averaged `-17.34%`. The active L/S strategies all lost money after
+fees/slippage and rebalancing: trend-following `-65.83%`, volatility breakout
+`-29.36%`, mean reversion `-74.99%`, and current master-adaptive `-32.12%`. Legacy
+valley/peak remained the only active strategy with positive average return at `4.22%`,
+but its median return was `0.00%`, so the edge is not broadly distributed.
+
+The new random-window table reports median and P10 return because the average alone hid
+tail fragility. For the current master, median return was `-25.89%` and P10 was
+`-67.11%`, confirming that the failure is not one bad window.
+
+Defensive master variants were tested on the same 48 random windows. Lower exposure
+improved average return from `-32.12%` to `-9.05%`; a breakout-only defensive variant
+improved it to `-6.35%` with 3/48 profitable samples and much lower average trades.
+Neither beat always-flat, so neither should become the default. Full-cycle six-fold
+checks also rejected them for promotion: breakout-only defensive averaged `-35.35%`
+with 0/6 profitable folds, and defensive low-exposure averaged `-47.08%` with 0/6
+profitable folds.
+
+Implementation outcome: keep the master default unchanged, add the defensive variants
+only as explicit grid-search hypotheses, add oracle capture to grid output, and make
+`--only` filter grid candidates so future agents can run focused full-cycle checks
+without scanning the entire naive grid.
+
+### 2026-06-21 Agent Iteration 2
+
+Validation frame: `random-lengths`, BTCUSDT 1m, 48 samples, 7-120 day windows,
+1,825 day lookback, seed 7332, 3x max leverage. The benchmark was rerun after adding
+median and P10 return columns to the random-length table.
+
+This seed is more directionally balanced than iteration 1: always-long averaged
+`-0.74%` return with median `-4.60%`, while always-short averaged `-0.12%` with median
+`2.85%`. Both passive controls had large lower tails (`-66.47%` P10 for long and
+`-45.94%` P10 for short), so neither passive direction is robust despite being far less
+bad than the active timing rules.
+
+The active algorithms again show the cost and churn failure mode. Trend-following made
+about `4,652` trades per sample and averaged `-78.31%`; mean reversion made about
+`5,102` trades and averaged `-83.09%`; moving average made about `9,431` trades and
+averaged `-62.73%`. Volatility breakout traded less, about `809` trades per sample, but
+still averaged `-39.41%` with zero profitable samples. Master-adaptive averaged
+`-43.14%`, median `-40.67%`, P10 `-68.81%`, and zero profitable samples, so the ensemble
+still mostly combines losing child signals rather than filtering them.
+
+Implementation outcome: do not change the master default. The justified change is a
+validation-harness improvement: random-length output now includes median and P10 return
+so future candidates must clear both average and lower-tail robustness checks before
+promotion.
+
 ## Research And Theory References
 
 The practical theme across the literature is that signal discovery, sizing, validation,

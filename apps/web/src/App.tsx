@@ -100,6 +100,8 @@ export function App() {
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
   let requestedCorrelationMarketId: string | undefined;
+  let lastSnapshotSource: string | undefined;
+  let lastSnapshotSeq = 0;
 
   const bot = createMemo(() => snapshot()?.bot);
   const market = createMemo(() => snapshot()?.market);
@@ -119,12 +121,26 @@ export function App() {
     }
   });
 
+  const applySnapshot = (next: RuntimeSnapshot) => {
+    if (next.snapshotSource !== lastSnapshotSource) {
+      lastSnapshotSource = next.snapshotSource;
+      lastSnapshotSeq = 0;
+    }
+    if (next.snapshotSeq <= lastSnapshotSeq) {
+      return false;
+    }
+
+    lastSnapshotSeq = next.snapshotSeq;
+    setSnapshot(next);
+    return true;
+  };
+
   const loadInitial = async () => {
     const response = await fetch(`${apiBase}/api/state`);
     if (!response.ok) {
       throw new Error(`State request failed: ${response.status}`);
     }
-    setSnapshot((await response.json()) as RuntimeSnapshot);
+    applySnapshot((await response.json()) as RuntimeSnapshot);
   };
 
   const loadMarkets = async (refresh = false) => {
@@ -147,10 +163,12 @@ export function App() {
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data) as {
         type: "snapshot";
+        sequence?: number;
+        sentAt?: number;
         payload: RuntimeSnapshot;
       };
       if (message.type === "snapshot") {
-        setSnapshot(message.payload);
+        applySnapshot(message.payload);
       }
     };
     socket.onclose = () => {
@@ -167,7 +185,7 @@ export function App() {
       method: "POST",
     });
     if (response.ok) {
-      setSnapshot((await response.json()) as RuntimeSnapshot);
+      applySnapshot((await response.json()) as RuntimeSnapshot);
     }
   };
 
@@ -199,8 +217,9 @@ export function App() {
     }
 
     const nextSnapshot = payload as RuntimeSnapshot;
-    setSnapshot(nextSnapshot);
-    setConfigDraft(structuredClone(nextSnapshot.bot.config));
+    if (applySnapshot(nextSnapshot)) {
+      setConfigDraft(structuredClone(nextSnapshot.bot.config));
+    }
   };
 
   const runBacktest = async () => {
@@ -254,7 +273,7 @@ export function App() {
       return;
     }
 
-    setSnapshot(payload as RuntimeSnapshot);
+    applySnapshot(payload as RuntimeSnapshot);
   };
 
   const stopBacktest = async () => {
@@ -268,7 +287,7 @@ export function App() {
       return;
     }
 
-    setSnapshot(payload as RuntimeSnapshot);
+    applySnapshot(payload as RuntimeSnapshot);
   };
 
   const loadCorrelations = async (refresh = false) => {
@@ -286,7 +305,7 @@ export function App() {
       return;
     }
 
-    setSnapshot(payload as RuntimeSnapshot);
+    applySnapshot(payload as RuntimeSnapshot);
   };
 
   createEffect(() => {
@@ -319,8 +338,10 @@ export function App() {
       return;
     }
 
-    setSnapshot(payload as RuntimeSnapshot);
-    setConfigDraft(structuredClone((payload as RuntimeSnapshot).bot.config));
+    const nextSnapshot = payload as RuntimeSnapshot;
+    if (applySnapshot(nextSnapshot)) {
+      setConfigDraft(structuredClone(nextSnapshot.bot.config));
+    }
   };
 
   const recordManualTrade = async (input: ManualTradeInput): Promise<boolean> => {
@@ -338,7 +359,7 @@ export function App() {
       return false;
     }
 
-    setSnapshot(payload as RuntimeSnapshot);
+    applySnapshot(payload as RuntimeSnapshot);
     return true;
   };
 

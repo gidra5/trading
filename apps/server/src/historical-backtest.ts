@@ -17,6 +17,7 @@ import {
 } from "@trading/bot-algo";
 import {
   HistoricalCandleCache,
+  type CandleTimeRange,
   type HistoricalCandleCacheStats,
 } from "./historical-candle-cache.js";
 import type { StreamVenue } from "./binance-markets.js";
@@ -25,6 +26,7 @@ const WIPEOUT_EQUITY_FRACTION = 0.01;
 const WIPEOUT_CHECK_CANDLES = 100;
 const MAX_EQUITY_POINTS = 800;
 const REPLAY_PROGRESS_CANDLES = 10_000;
+const MAX_RANDOM_PRELOADED_CANDLES = 2_000_000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RANDOM_SAMPLE_COUNT = 40;
 const MAX_RANDOM_SAMPLE_COUNT = 200;
@@ -92,6 +94,10 @@ export interface HistoricalBacktestOptions {
 interface HistoricalRangeBacktestOptions extends HistoricalBacktestOptions {
   targetStartTime: number;
   targetEndTime: number;
+  cacheAlreadyEnsured?: boolean;
+  replayCandles?: readonly Candle[];
+  replayStartIndex?: number;
+  replayEndIndex?: number;
   currentSample?: number;
   sampleCount?: number;
   sampleWindowMs?: number;
@@ -104,6 +110,11 @@ interface RandomBacktestWindow {
   startTime: number;
   endTime: number;
   windowMs: number;
+}
+
+interface RandomReplayWindow extends RandomBacktestWindow {
+  replayStartIndex?: number;
+  replayEndIndex?: number;
 }
 
 interface PerfectMarginBenchmarkAccumulator {
@@ -274,11 +285,49 @@ async function runRandomHistoricalCandleBacktest(
 
   for (let marketIndex = 0; marketIndex < markets.length; marketIndex += 1) {
     const market = markets[marketIndex];
-    for (let windowIndex = 0; windowIndex < windows.length; windowIndex += 1) {
+    const completedMarketCacheStats = { ...cacheStats };
+    const marketCacheStats = await ensureRandomWindowCache(
+      options,
+      market,
+      windows,
+      intervalMs,
+      (stats) => {
+        cacheStats = mergedCacheStats(completedMarketCacheStats, stats);
+        emitAggregateProgress(`Checking ${market.displaySymbol} random-window cache`);
+      },
+    );
+    cacheStats = mergedCacheStats(completedMarketCacheStats, marketCacheStats);
+    const preloadedCandles = await preloadRandomWindowCandles(
+      options,
+      market,
+      windows,
+      intervalMs,
+      (loadedCandles, estimatedCandlesToLoad) => {
+        const suffix =
+          estimatedCandlesToLoad > 0
+            ? ` ${loadedCandles.toLocaleString()}/${estimatedCandlesToLoad.toLocaleString()}`
+            : "";
+        emitAggregateProgress(
+          `Loading ${market.displaySymbol} random-window candles${suffix}`,
+        );
+      },
+    );
+    const replayWindows: RandomReplayWindow[] = preloadedCandles
+      ? windows.map((window) => ({
+          ...window,
+          replayStartIndex: lowerBoundCandleOpenTime(
+            preloadedCandles,
+            window.startTime,
+          ),
+          replayEndIndex: upperBoundCandleOpenTime(preloadedCandles, window.endTime),
+        }))
+      : windows;
+
+    for (let windowIndex = 0; windowIndex < replayWindows.length; windowIndex += 1) {
       throwIfCancelled(options.cancelSignal);
       const currentSample = marketIndex * sampleCount + windowIndex + 1;
       const currentWindowSample = windowIndex + 1;
-      const window = windows[windowIndex];
+      const window = replayWindows[windowIndex];
       const result = await runHistoricalRangeBacktest(
         {
           ...options,
@@ -287,6 +336,10 @@ async function runRandomHistoricalCandleBacktest(
           randomPairCount,
           targetStartTime: window.startTime,
           targetEndTime: window.endTime,
+          cacheAlreadyEnsured: true,
+          replayCandles: preloadedCandles,
+          replayStartIndex: window.replayStartIndex,
+          replayEndIndex: window.replayEndIndex,
           currentSample,
           sampleCount: totalSampleCount,
           sampleWindowMs: window.windowMs,
@@ -314,7 +367,6 @@ async function runRandomHistoricalCandleBacktest(
         completedSurvivedMs += result.summary.survivedMs;
         completedSurvivedSamples += 1;
       }
-      mergeSummaryCacheStats(cacheStats, result.summary);
       emitAggregateProgress(
         `Completed ${market.displaySymbol} sample ${currentWindowSample}/${sampleCount}`,
       );
@@ -329,6 +381,7 @@ async function runRandomHistoricalCandleBacktest(
     startedAt,
     targetStartTime,
     targetEndTime,
+    cacheStats,
     sampleWindowMs,
     sampleMinWindowMs,
     sampleMaxWindowMs,
@@ -469,6 +522,93 @@ async function runRandomHistoricalCandleBacktest(
   }
 }
 
+async function ensureRandomWindowCache(
+  options: HistoricalBacktestOptions,
+  market: HistoricalBacktestMarket,
+  windows: RandomBacktestWindow[],
+  intervalMs: number,
+  onProgress: (stats: HistoricalCandleCacheStats) => void,
+): Promise<HistoricalCandleCacheStats> {
+  throwIfCancelled(options.cancelSignal);
+  const cache = new HistoricalCandleCache({
+    dataDir: options.cache.dataDir,
+    marketKey: market.marketKey,
+    symbol: market.symbol,
+    interval: options.interval,
+    intervalMs,
+    maxBytes: options.cache.maxBytes,
+    minFreeBytes: options.cache.minFreeBytes,
+  });
+  const ranges: CandleTimeRange[] = windows.map((window) => ({
+    startTime: window.startTime,
+    endTime: window.endTime,
+  }));
+
+  return cache.ensureRanges(
+    ranges,
+    (request) =>
+      fetchKlines({
+        venue: market.venue,
+        symbol: market.symbol,
+        interval: options.interval,
+        startTime: request.startTime,
+        endTime: request.endTime,
+        limit: request.limit,
+        signal: options.cancelSignal,
+      }),
+    (stats) => {
+      throwIfCancelled(options.cancelSignal);
+      onProgress(stats);
+    },
+  );
+}
+
+async function preloadRandomWindowCandles(
+  options: HistoricalBacktestOptions,
+  market: HistoricalBacktestMarket,
+  windows: RandomBacktestWindow[],
+  intervalMs: number,
+  onProgress: (loadedCandles: number, estimatedCandles: number) => void,
+): Promise<readonly Candle[] | undefined> {
+  const ranges = mergeCandleTimeRanges(windows, intervalMs);
+  const estimatedCandles = sumDefined(
+    ranges.map((range) => estimateRangeCandles(range.startTime, range.endTime, intervalMs)),
+  );
+  if (estimatedCandles > MAX_RANDOM_PRELOADED_CANDLES) {
+    return undefined;
+  }
+
+  throwIfCancelled(options.cancelSignal);
+  const cache = new HistoricalCandleCache({
+    dataDir: options.cache.dataDir,
+    marketKey: market.marketKey,
+    symbol: market.symbol,
+    interval: options.interval,
+    intervalMs,
+    maxBytes: options.cache.maxBytes,
+    minFreeBytes: options.cache.minFreeBytes,
+  });
+  const candles: Candle[] = [];
+
+  for (const range of ranges) {
+    for await (const batch of cache.readRangeBatches(
+      range.startTime,
+      range.endTime,
+      REPLAY_PROGRESS_CANDLES,
+    )) {
+      for (const candle of batch) {
+        if (candle.openTime >= range.startTime && candle.openTime <= range.endTime) {
+          candles.push(candle);
+        }
+      }
+      throwIfCancelled(options.cancelSignal);
+      onProgress(candles.length, estimatedCandles);
+    }
+  }
+
+  return candles;
+}
+
 async function runHistoricalRangeBacktest(
   options: HistoricalRangeBacktestOptions,
   onProgress: (progress: BacktestProgressSnapshot) => void,
@@ -513,90 +653,82 @@ async function runHistoricalRangeBacktest(
   let latestMetrics = bot.view().metrics;
   let survivedMs: number | undefined;
 
-  emitProgress("running", "Checking historical candle cache");
+  if (!options.cacheAlreadyEnsured) {
+    emitProgress("running", "Checking historical candle cache");
 
-  cacheStats = await cache.ensureRange(
-    targetStartTime,
-    targetEndTime,
-    (request) =>
-      fetchKlines({
-        venue: options.venue,
-        symbol: options.symbol,
-        interval: options.interval,
-        startTime: request.startTime,
-        endTime: request.endTime,
-        limit: request.limit,
-        signal: options.cancelSignal,
-      }),
-    (stats) => {
-      throwIfCancelled(options.cancelSignal);
-      cacheStats = stats;
-      emitProgress(
-        "running",
-        stats.cacheMissCandles > stats.cacheFetchedCandles
-          ? `Caching ${(
-              stats.cacheMissCandles - stats.cacheFetchedCandles
-            ).toLocaleString()} missing candles`
-          : "Historical cache ready",
-      );
-    },
-  );
-  throwIfCancelled(options.cancelSignal);
+    cacheStats = await cache.ensureRange(
+      targetStartTime,
+      targetEndTime,
+      (request) =>
+        fetchKlines({
+          venue: options.venue,
+          symbol: options.symbol,
+          interval: options.interval,
+          startTime: request.startTime,
+          endTime: request.endTime,
+          limit: request.limit,
+          signal: options.cancelSignal,
+        }),
+      (stats) => {
+        throwIfCancelled(options.cancelSignal);
+        cacheStats = stats;
+        emitProgress(
+          "running",
+          stats.cacheMissCandles > stats.cacheFetchedCandles
+            ? `Caching ${(
+                stats.cacheMissCandles - stats.cacheFetchedCandles
+              ).toLocaleString()} missing candles`
+            : "Historical cache ready",
+        );
+      },
+    );
+    throwIfCancelled(options.cancelSignal);
+  }
 
   const replayStartedAt = Date.now();
 
-  outer: for await (const candles of cache.readRangeBatches(
-    targetStartTime,
-    targetEndTime,
-    REPLAY_PROGRESS_CANDLES,
-  )) {
-    for (const candle of candles) {
-      if (processedCandles % 100 === 0) {
+  if (options.replayCandles) {
+    const replayStartIndex = Math.max(0, options.replayStartIndex ?? 0);
+    const replayEndIndex = Math.min(
+      options.replayCandles.length,
+      options.replayEndIndex ?? options.replayCandles.length,
+    );
+    for (let index = replayStartIndex; index < replayEndIndex; index += 1) {
+      if (!processReplayCandle(options.replayCandles[index])) {
+        break;
+      }
+      if (processedCandles > 0 && processedCandles % REPLAY_PROGRESS_CANDLES === 0) {
         throwIfCancelled(options.cancelSignal);
-      }
-      if (candle.openTime < targetStartTime || candle.openTime > targetEndTime) {
-        continue;
-      }
-
-      processedStartTime ??= candle.openTime;
-      processedEndTime = candle.closeTime;
-
-      replayCandle(bot, candle, perfectMargin);
-      processedCandles += 1;
-      const shouldSample = processedCandles % sampleEvery === 0;
-      const shouldCheckMetrics =
-        shouldSample ||
-        processedCandles % metricsEvery === 0 ||
-        processedCandles >= estimatedCandles;
-
-      if (shouldCheckMetrics) {
-        latestMetrics = bot.markToMarket();
-      }
-
-      if (shouldSample) {
-        equityCurve.push({
-          time: candle.closeTime,
-          equity: latestMetrics.equity,
-          price: candle.close,
-        });
-      }
-
-      if (
-        shouldCheckMetrics &&
-        processedCandles >= config.slowWindow &&
-        latestMetrics.equity <= wipeoutEquity
-      ) {
-        stopReason = "wiped_out";
-        break outer;
+        emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
       }
     }
+  } else {
+    outer: for await (const candles of cache.readRangeBatches(
+      targetStartTime,
+      targetEndTime,
+      REPLAY_PROGRESS_CANDLES,
+    )) {
+      for (const candle of candles) {
+        if (!processReplayCandle(candle)) {
+          break outer;
+        }
+      }
 
-    throwIfCancelled(options.cancelSignal);
-    emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
+      throwIfCancelled(options.cancelSignal);
+      emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
+    }
   }
 
   latestMetrics = bot.markToMarket();
-  const finalState = compactBacktestState(bot.view());
+  const finalState = compactBacktestState(
+    bot.view(),
+    options.sampleCount
+      ? {
+          maxReturnedOrders: 0,
+          maxReturnedFills: 0,
+        }
+      : {},
+  );
   if (processedEndTime && equityCurve.at(-1)?.time !== processedEndTime) {
     equityCurve.push({
       time: processedEndTime,
@@ -658,6 +790,49 @@ async function runHistoricalRangeBacktest(
   };
 
   return result;
+
+  function processReplayCandle(candle: Candle): boolean {
+    if (processedCandles % 100 === 0) {
+      throwIfCancelled(options.cancelSignal);
+    }
+    if (candle.openTime < targetStartTime || candle.openTime > targetEndTime) {
+      return true;
+    }
+
+    processedStartTime ??= candle.openTime;
+    processedEndTime = candle.closeTime;
+
+    replayCandle(bot, candle, perfectMargin);
+    processedCandles += 1;
+    const shouldSample = processedCandles % sampleEvery === 0;
+    const shouldCheckMetrics =
+      shouldSample ||
+      processedCandles % metricsEvery === 0 ||
+      processedCandles >= estimatedCandles;
+
+    if (shouldCheckMetrics) {
+      latestMetrics = bot.markToMarket();
+    }
+
+    if (shouldSample) {
+      equityCurve.push({
+        time: candle.closeTime,
+        equity: latestMetrics.equity,
+        price: candle.close,
+      });
+    }
+
+    if (
+      shouldCheckMetrics &&
+      processedCandles >= config.slowWindow &&
+      latestMetrics.equity <= wipeoutEquity
+    ) {
+      stopReason = "wiped_out";
+      return false;
+    }
+
+    return true;
+  }
 
   function emitProgress(
     status: BacktestProgressSnapshot["status"],
@@ -723,6 +898,7 @@ function buildRandomAggregateResult(input: {
   startedAt: number;
   targetStartTime: number;
   targetEndTime: number;
+  cacheStats?: HistoricalCandleCacheStats;
   sampleWindowMs?: number;
   sampleMinWindowMs?: number;
   sampleMaxWindowMs?: number;
@@ -736,6 +912,7 @@ function buildRandomAggregateResult(input: {
     startedAt,
     targetStartTime,
     targetEndTime,
+    cacheStats: inputCacheStats,
     sampleWindowMs,
     sampleMinWindowMs,
     sampleMaxWindowMs,
@@ -778,7 +955,10 @@ function buildRandomAggregateResult(input: {
       survivedMs: result.summary.survivedMs,
     };
   });
-  const cacheStats = summarizeCacheStats(results);
+  const cacheStats = mergedCacheStats(
+    inputCacheStats ?? emptyCacheStats(),
+    summarizeCacheStats(results),
+  );
   const totalCandles = sumDefined(results.map((result) => result.summary.candlesProcessed));
   const totalReplayDurationMs = sumDefined(
     results.map((result) => result.summary.replayDurationMs),
@@ -921,6 +1101,33 @@ function buildRandomWindows(options: {
   return windows.sort((a, b) => a.startTime - b.startTime);
 }
 
+function mergeCandleTimeRanges(
+  ranges: CandleTimeRange[],
+  intervalMs: number,
+): CandleTimeRange[] {
+  const sorted = ranges
+    .filter((range) => range.endTime >= range.startTime)
+    .map((range) => ({
+      startTime: alignUp(range.startTime, intervalMs),
+      endTime: alignDown(range.endTime, intervalMs),
+    }))
+    .filter((range) => range.endTime >= range.startTime)
+    .sort((left, right) => left.startTime - right.startTime || left.endTime - right.endTime);
+  const merged: CandleTimeRange[] = [];
+
+  for (const range of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous || range.startTime > previous.endTime + intervalMs) {
+      merged.push({ ...range });
+      continue;
+    }
+
+    previous.endTime = Math.max(previous.endTime, range.endTime);
+  }
+
+  return merged;
+}
+
 function averageEquityCurves(results: BacktestResult[]): EquityPoint[] {
   const curves = results
     .map((result) => result.equityCurve)
@@ -937,18 +1144,22 @@ function averageEquityCurves(results: BacktestResult[]): EquityPoint[] {
 
   return Array.from({ length: pointCount }, (_, index) => {
     const position = pointCount === 1 ? 0 : index / (pointCount - 1);
-    const points = curves.map((curve) => {
+    let equity = 0;
+    let price = 0;
+
+    for (const curve of curves) {
       const curveIndex = Math.min(
         curve.length - 1,
         Math.round(position * (curve.length - 1)),
       );
-      return curve[curveIndex];
-    });
+      equity += curve[curveIndex].equity;
+      price += curve[curveIndex].price;
+    }
 
     return {
       time: index,
-      equity: average(points.map((point) => point.equity)),
-      price: average(points.map((point) => point.price)),
+      equity: equity / curves.length,
+      price: price / curves.length,
     };
   });
 }
@@ -1019,6 +1230,22 @@ function mergeSummaryCacheStats(
   target.cacheEvictedFiles += summary.cacheEvictedFiles ?? 0;
 }
 
+function mergedCacheStats(
+  left: HistoricalCandleCacheStats,
+  right: HistoricalCandleCacheStats,
+): HistoricalCandleCacheStats {
+  return {
+    cacheHitCandles: left.cacheHitCandles + right.cacheHitCandles,
+    cacheMissCandles: left.cacheMissCandles + right.cacheMissCandles,
+    cacheFetchedCandles: left.cacheFetchedCandles + right.cacheFetchedCandles,
+    requests: left.requests + right.requests,
+    cacheSizeBytes: right.cacheSizeBytes || left.cacheSizeBytes,
+    cacheEvictedBytes: left.cacheEvictedBytes + right.cacheEvictedBytes,
+    cacheEvictedFiles: left.cacheEvictedFiles + right.cacheEvictedFiles,
+    freeBytes: right.freeBytes || left.freeBytes,
+  };
+}
+
 function mergeProgressCacheStats(
   completed: HistoricalCandleCacheStats,
   progress: BacktestProgressSnapshot | undefined,
@@ -1032,7 +1259,7 @@ function mergeProgressCacheStats(
     cacheSizeBytes: progress?.cacheSizeBytes ?? completed.cacheSizeBytes,
     cacheEvictedBytes: completed.cacheEvictedBytes + (progress?.cacheEvictedBytes ?? 0),
     cacheEvictedFiles: completed.cacheEvictedFiles + (progress?.cacheEvictedFiles ?? 0),
-    freeBytes: progress ? completed.freeBytes : completed.freeBytes,
+    freeBytes: completed.freeBytes,
   };
 }
 
@@ -1160,6 +1387,34 @@ function alignUp(value: number, intervalMs: number): number {
 
 function alignDown(value: number, intervalMs: number): number {
   return Math.floor(value / intervalMs) * intervalMs;
+}
+
+function lowerBoundCandleOpenTime(candles: readonly Candle[], time: number): number {
+  let low = 0;
+  let high = candles.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (candles[mid].openTime < time) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+function upperBoundCandleOpenTime(candles: readonly Candle[], time: number): number {
+  let low = 0;
+  let high = candles.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (candles[mid].openTime <= time) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
 }
 
 function replayCandle(

@@ -47,7 +47,14 @@ interface BenchmarkCase {
 interface CandleWindow {
   index: number;
   label: string;
-  candles: Candle[];
+  startIndex: number;
+  endIndex: number;
+  durationDays: number;
+}
+
+interface CandleReplayRange {
+  startIndex: number;
+  endIndex: number;
 }
 
 interface BenchmarkMetrics {
@@ -70,6 +77,8 @@ interface RandomBenchmarkRow {
   sampleCount: number;
   profitableSamples: number;
   avgReturnPct: number;
+  medianReturnPct: number;
+  p10ReturnPct: number;
   avgNetPnl: number;
   avgNetPnlPerDay: number;
   avgMaxDrawdownPct: number;
@@ -96,6 +105,7 @@ interface GridSearchRow {
   avgReturnPct: number;
   avgRiskAdjustedReturn: number | undefined;
   avgSharpeRatio: number | undefined;
+  avgPerfectCapturePct: number | undefined;
   avgMaxDrawdownPct: number;
   avgTradeCount: number;
   worstReturnPct: number;
@@ -145,15 +155,16 @@ if (files.length === 0) {
   );
 }
 
-const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
-
 if (args.mode === "random-lengths") {
+  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
   runRandomLengthMode(args, files, cases);
 } else if (args.mode === "grid-search") {
   runGridSearchMode(args, files);
 } else if (args.mode === "portfolio") {
+  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
   runPortfolioMode(args, files, cases);
 } else {
+  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
   runSingleWindowMode(args, files, cases);
 }
 
@@ -192,7 +203,9 @@ function runRandomLengthMode(
   assertCandles(candles);
 
   const windows = createRandomLengthWindows(candles, options);
-  const rows = cases.map((benchmark) => runRandomLengthBenchmark(benchmark, windows, options));
+  const rows = cases.map((benchmark) =>
+    runRandomLengthBenchmark(benchmark, candles, windows, options),
+  );
 
   console.log(randomLengthHeader(options, candles, windows));
   console.log("");
@@ -205,7 +218,7 @@ function runGridSearchMode(options: BenchmarkArgs, allFiles: string[]): void {
   assertCandles(candles);
 
   const folds = splitCandlesIntoFolds(candles, options.gridFolds);
-  const candidates = createGridCandidates();
+  const candidates = selectGridCandidates(options.only);
   const rows = candidates
     .map((candidate) => runGridCandidate(candidate, folds, options))
     .sort(compareGridRows)
@@ -247,6 +260,9 @@ function runGridCandidate(
       metrics.map((metric) => metric.riskAdjustedReturn),
     ),
     avgSharpeRatio: averageDefined(metrics.map((metric) => metric.sharpeRatio)),
+    avgPerfectCapturePct: averageDefined(
+      metrics.map((metric) => metric.perfectCapturePct),
+    ),
     avgMaxDrawdownPct: average(metrics.map((metric) => metric.maxDrawdownPct)),
     avgTradeCount: average(metrics.map((metric) => metric.tradeCount)),
     worstReturnPct: Math.min(...metrics.map((metric) => metric.returnPct)),
@@ -348,7 +364,99 @@ function createGridCandidates(): GridCandidate[] {
     }
   }
 
+  candidates.push(
+    {
+      label: "Master defensive low exposure",
+      algorithm: "master-adaptive",
+      config: {
+        masterAdaptive: {
+          trendWeight: 1.2,
+          breakoutWeight: 1,
+          reversionWeight: 0.7,
+          minConsensusScore: 0.35,
+          disagreementExposureScale: 0.35,
+          targetExposurePct: 0.12,
+          volatilityWindow: 720,
+          highVolatilityBps: 30,
+          highVolatilityExposureScale: 0.4,
+        },
+      },
+    },
+    {
+      label: "Master defensive 2-of-3 consensus",
+      algorithm: "master-adaptive",
+      config: {
+        masterAdaptive: {
+          trendWeight: 1.2,
+          breakoutWeight: 1,
+          reversionWeight: 0.7,
+          minConsensusScore: 0.5,
+          disagreementExposureScale: 0.25,
+          targetExposurePct: 0.25,
+          volatilityWindow: 720,
+          highVolatilityBps: 30,
+          highVolatilityExposureScale: 0.45,
+        },
+      },
+    },
+    {
+      label: "Master trend-breakout strict",
+      algorithm: "master-adaptive",
+      config: {
+        masterAdaptive: {
+          trendWeight: 1,
+          breakoutWeight: 1,
+          reversionWeight: 0,
+          minConsensusScore: 0.55,
+          disagreementExposureScale: 0.25,
+          targetExposurePct: 0.25,
+          volatilityWindow: 1440,
+          highVolatilityBps: 25,
+          highVolatilityExposureScale: 0.4,
+        },
+      },
+    },
+    {
+      label: "Master breakout-only defensive",
+      algorithm: "master-adaptive",
+      config: {
+        masterAdaptive: {
+          trendWeight: 0,
+          breakoutWeight: 1,
+          reversionWeight: 0,
+          minConsensusScore: 0.75,
+          disagreementExposureScale: 0.25,
+          targetExposurePct: 0.18,
+          volatilityWindow: 1440,
+          highVolatilityBps: 25,
+          highVolatilityExposureScale: 0.4,
+        },
+      },
+    },
+  );
+
   return candidates;
+}
+
+function selectGridCandidates(only: string | undefined): GridCandidate[] {
+  const candidates = createGridCandidates();
+  if (!only) {
+    return candidates;
+  }
+
+  const normalizedOnly = only.toLowerCase();
+  const selected = candidates.filter(
+    (candidate) =>
+      candidate.algorithm === only ||
+      candidate.algorithm.toLowerCase().includes(normalizedOnly) ||
+      candidate.label.toLowerCase().includes(normalizedOnly),
+  );
+
+  if (selected.length === 0) {
+    throw new Error(`No grid candidate matched --only ${only}.`);
+  }
+
+  return selected;
 }
 
 function splitCandlesIntoFolds(candles: Candle[], requestedFolds: number): Candle[][] {
@@ -696,11 +804,15 @@ function runBenchmark(
   options: BenchmarkArgs,
   log = true,
   maxEquityPoints?: number,
+  candleRange?: CandleReplayRange,
 ): { label: string; result: BacktestResult; elapsedMs: number } {
   const maxPositionQuote = options.startingQuote * options.leverage * 0.85;
   const startedAt = Date.now();
+  const candleCount = candleRange
+    ? candleRange.endIndex - candleRange.startIndex
+    : sourceCandles.length;
   if (log) {
-    console.error(`Running ${benchmark.label} on ${sourceCandles.length.toLocaleString()} candles...`);
+    console.error(`Running ${benchmark.label} on ${candleCount.toLocaleString()} candles...`);
   }
   const result = runBacktestFromCandles(sourceCandles, {
     config: {
@@ -715,6 +827,9 @@ function runBenchmark(
       ...benchmark.config,
     },
     ...(maxEquityPoints ? { maxEquityPoints } : {}),
+    ...(candleRange
+      ? { startIndex: candleRange.startIndex, endIndex: candleRange.endIndex }
+      : {}),
     maxReturnedOrders: 0,
     maxReturnedFills: 0,
   });
@@ -733,47 +848,87 @@ function runBenchmark(
 
 function runRandomLengthBenchmark(
   benchmark: BenchmarkCase,
+  candles: Candle[],
   windows: CandleWindow[],
   options: BenchmarkArgs,
 ): RandomBenchmarkRow {
   const startedAt = Date.now();
   console.error(`Running ${benchmark.label} on ${windows.length.toLocaleString()} random windows...`);
-  const samples = windows.map((window) => {
-    const result = runBenchmark(benchmark, window.candles, options, false).result;
-    const durationDays = Math.max(
-      1 / 24 / 60,
-      (window.candles[window.candles.length - 1].closeTime - window.candles[0].openTime) /
-        DAY_MS,
-    );
-    return {
-      result,
-      durationDays,
-    };
-  });
-  const metrics = samples.map((sample) => metricsFromResult(sample.result));
+  let profitableSamples = 0;
+  let returnPct = 0;
+  let netPnl = 0;
+  let netPnlPerDay = 0;
+  let maxDrawdownPct = 0;
+  let tradeCount = 0;
+  let riskAdjustedReturn = 0;
+  let riskAdjustedReturnCount = 0;
+  let sharpeRatio = 0;
+  let sharpeRatioCount = 0;
+  let perfectCapturePct = 0;
+  let perfectCaptureCount = 0;
+  let bestReturnPct = Number.NEGATIVE_INFINITY;
+  let worstReturnPct = Number.POSITIVE_INFINITY;
+  const returnSamples: number[] = [];
+
+  for (const window of windows) {
+    const result = runBenchmark(
+      benchmark,
+      candles,
+      options,
+      false,
+      undefined,
+      { startIndex: window.startIndex, endIndex: window.endIndex },
+    ).result;
+    const metrics = metricsFromResult(result);
+    if (result.summary.netPnl > 0) {
+      profitableSamples += 1;
+    }
+
+    returnPct += metrics.returnPct;
+    returnSamples.push(metrics.returnPct);
+    netPnl += metrics.netPnl;
+    netPnlPerDay += result.summary.netPnl / window.durationDays;
+    maxDrawdownPct += metrics.maxDrawdownPct;
+    tradeCount += metrics.tradeCount;
+    bestReturnPct = Math.max(bestReturnPct, metrics.returnPct);
+    worstReturnPct = Math.min(worstReturnPct, metrics.returnPct);
+    if (metrics.riskAdjustedReturn !== undefined) {
+      riskAdjustedReturn += metrics.riskAdjustedReturn;
+      riskAdjustedReturnCount += 1;
+    }
+    if (metrics.sharpeRatio !== undefined) {
+      sharpeRatio += metrics.sharpeRatio;
+      sharpeRatioCount += 1;
+    }
+    if (metrics.perfectCapturePct !== undefined) {
+      perfectCapturePct += metrics.perfectCapturePct;
+      perfectCaptureCount += 1;
+    }
+  }
+
+  const sampleCount = windows.length;
+  const averageOptional = (total: number, count: number) =>
+    count > 0 ? total / count : undefined;
+  const averageRequired = (total: number) => total / sampleCount;
   const elapsedMs = Date.now() - startedAt;
   console.error(`Finished ${benchmark.label} random aggregate in ${elapsedMs.toLocaleString()}ms.`);
 
   return {
     strategy: benchmark.label,
-    sampleCount: samples.length,
-    profitableSamples: samples.filter((sample) => sample.result.summary.netPnl > 0).length,
-    avgReturnPct: average(metrics.map((metric) => metric.returnPct)),
-    avgNetPnl: average(metrics.map((metric) => metric.netPnl)),
-    avgNetPnlPerDay: average(
-      samples.map((sample) => sample.result.summary.netPnl / sample.durationDays),
-    ),
-    avgMaxDrawdownPct: average(metrics.map((metric) => metric.maxDrawdownPct)),
-    avgTradeCount: average(metrics.map((metric) => metric.tradeCount)),
-    avgRiskAdjustedReturn: averageDefined(
-      metrics.map((metric) => metric.riskAdjustedReturn),
-    ),
-    avgSharpeRatio: averageDefined(metrics.map((metric) => metric.sharpeRatio)),
-    avgPerfectCapturePct: averageDefined(
-      metrics.map((metric) => metric.perfectCapturePct),
-    ),
-    bestReturnPct: Math.max(...metrics.map((metric) => metric.returnPct)),
-    worstReturnPct: Math.min(...metrics.map((metric) => metric.returnPct)),
+    sampleCount,
+    profitableSamples,
+    avgReturnPct: averageRequired(returnPct),
+    medianReturnPct: percentile(returnSamples, 0.5),
+    p10ReturnPct: percentile(returnSamples, 0.1),
+    avgNetPnl: averageRequired(netPnl),
+    avgNetPnlPerDay: averageRequired(netPnlPerDay),
+    avgMaxDrawdownPct: averageRequired(maxDrawdownPct),
+    avgTradeCount: averageRequired(tradeCount),
+    avgRiskAdjustedReturn: averageOptional(riskAdjustedReturn, riskAdjustedReturnCount),
+    avgSharpeRatio: averageOptional(sharpeRatio, sharpeRatioCount),
+    avgPerfectCapturePct: averageOptional(perfectCapturePct, perfectCaptureCount),
+    bestReturnPct,
+    worstReturnPct,
   };
 }
 
@@ -815,17 +970,21 @@ function createRandomLengthWindows(
     const endTime = startTime + durationMs;
     const startIndex = lowerBoundCandleOpenTime(candles, startTime);
     const endIndex = upperBoundCandleOpenTime(candles, endTime);
-    const windowCandles = candles.slice(startIndex, endIndex);
-    if (windowCandles.length === 0) {
+    if (endIndex <= startIndex) {
       index -= 1;
       continue;
     }
+    const firstCandle = candles[startIndex];
+    const lastCandle = candles[endIndex - 1];
     windows.push({
       index,
-      label: `${formatDate(windowCandles[0].openTime)} to ${formatDate(
-        windowCandles[windowCandles.length - 1].closeTime,
-      )}`,
-      candles: windowCandles,
+      label: `${formatDate(firstCandle.openTime)} to ${formatDate(lastCandle.closeTime)}`,
+      startIndex,
+      endIndex,
+      durationDays: Math.max(
+        1 / 24 / 60,
+        (lastCandle.closeTime - firstCandle.openTime) / DAY_MS,
+      ),
     });
   }
 
@@ -1159,6 +1318,8 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     "Samples",
     "Profitable",
     "Avg Return",
+    "Median",
+    "P10",
     "Avg Net PnL",
     "Avg PnL/day",
     "Avg Max DD",
@@ -1174,6 +1335,8 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     row.sampleCount.toLocaleString(),
     `${row.profitableSamples}/${row.sampleCount}`,
     `${formatNumber(row.avgReturnPct, 2)}%`,
+    `${formatNumber(row.medianReturnPct, 2)}%`,
+    `${formatNumber(row.p10ReturnPct, 2)}%`,
     formatMoney(row.avgNetPnl),
     formatMoney(row.avgNetPnlPerDay),
     `${formatNumber(row.avgMaxDrawdownPct, 2)}%`,
@@ -1198,6 +1361,7 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     "Avg Return",
     "Avg Risk Ret",
     "Avg Sharpe",
+    "Avg Capture",
     "Avg Max DD",
     "Avg Trades",
     "Worst",
@@ -1212,6 +1376,7 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     `${formatNumber(row.avgReturnPct, 2)}%`,
     formatOptionalNumber(row.avgRiskAdjustedReturn, 3),
     formatOptionalNumber(row.avgSharpeRatio, 3),
+    row.avgPerfectCapturePct === undefined ? "-" : `${formatNumber(row.avgPerfectCapturePct, 3)}%`,
     `${formatNumber(row.avgMaxDrawdownPct, 2)}%`,
     formatNumber(row.avgTradeCount, 1),
     `${formatNumber(row.worstReturnPct, 2)}%`,
@@ -1314,6 +1479,24 @@ function averageDefined(values: Array<number | undefined>): number | undefined {
   return defined.length > 0 ? average(defined) : undefined;
 }
 
+function percentile(values: number[], percentileRank: number): number {
+  const finite = values
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
+  if (finite.length === 0) {
+    return 0;
+  }
+
+  const rank = clamp(percentileRank, 0, 1) * (finite.length - 1);
+  const lower = Math.floor(rank);
+  const upper = Math.ceil(rank);
+  if (lower === upper) {
+    return finite[lower];
+  }
+
+  return finite[lower] + (finite[upper] - finite[lower]) * (rank - lower);
+}
+
 function assertCandles(candles: Candle[]): asserts candles is [Candle, ...Candle[]] {
   if (candles.length === 0) {
     throw new Error("Benchmark requires at least one candle.");
@@ -1343,6 +1526,10 @@ function parseSymbols(value: string | undefined): string[] | undefined {
 
 function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 function formatDate(value: number): string {
