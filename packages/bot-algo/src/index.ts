@@ -3,6 +3,7 @@ export {
   createInitialBotState,
   createStrategyConfig,
   defaultStrategyConfig,
+  type PartialStrategyConfig,
 } from "./bot.js";
 export {
   compactBacktestState,
@@ -14,20 +15,6 @@ export {
   createLegacyValleyPeakConfig,
   defaultLegacyValleyPeakConfig,
 } from "./legacy-valley-peak.js";
-export {
-  createMeanReversionConfig,
-  createMasterAdaptiveConfig,
-  createTrendFollowingConfig,
-  createVolatilityBreakoutConfig,
-  defaultMasterAdaptiveConfig,
-  defaultMeanReversionConfig,
-  defaultTrendFollowingConfig,
-  defaultVolatilityBreakoutConfig,
-  evaluateMasterAdaptive,
-  evaluateMeanReversion,
-  evaluateTrendFollowing,
-  evaluateVolatilityBreakout,
-} from "./directional-strategies.js";
 export {
   analyzePositions,
   createPositionRiskConfig,

@@ -3,7 +3,11 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
 import { WebSocketServer, type WebSocket } from "ws";
-import type { BacktestPreset, ManualTradeInput, StrategyConfig } from "@trading/bot-algo";
+import type {
+  BacktestPreset,
+  ManualTradeInput,
+  PartialStrategyConfig,
+} from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
 import {
@@ -132,7 +136,7 @@ server.post("/api/bot/reset", async () => {
 });
 
 server.put("/api/bot/config", async (request) => {
-  const body = (request.body ?? {}) as Partial<StrategyConfig>;
+  const body = (request.body ?? {}) as PartialStrategyConfig;
   await runtime.updateBotConfig(body);
   broadcastState();
   return publicSnapshot();

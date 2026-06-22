@@ -35,7 +35,7 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   buySigma: 0.1,
   sellSigma: 0.1,
   minTradeQuote: 25,
-  maxTradeQuote: 750,
+  maxTradeQuote: 3_000,
 };
 
 const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;

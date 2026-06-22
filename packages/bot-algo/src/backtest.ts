@@ -2,6 +2,7 @@ import {
   SimulatedTradingBot,
   createInitialBotState,
   createStrategyConfig,
+  type PartialStrategyConfig,
 } from "./bot.js";
 import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 import type {
@@ -18,7 +19,7 @@ import type {
 
 export interface RunBacktestOptions {
   source: "candles" | "orderbook-mid";
-  config?: Partial<StrategyConfig>;
+  config?: PartialStrategyConfig;
   startingQuote?: number;
   maxEquityPoints?: number;
   maxReturnedOrders?: number;
@@ -404,19 +405,13 @@ function compactBacktestMemory(
 ): StrategyMemory {
   const priceLimit = Math.max(
     50,
-    config.slowWindow * 2,
-    config.trendFollowing.slowWindow + 2,
-    config.trendFollowing.volatilityWindow + 2,
-    config.volatilityBreakout.lookbackWindow + 2,
-    config.meanReversion.trendWindow + 2,
+    config.legacyValleyPeak.averagingRangesSec.length * 100,
   );
 
   return {
     prices: tail(memory.prices, priceLimit).slice(),
     lastSignal: memory.lastSignal,
     lastActionAt: memory.lastActionAt,
-    previousFastAvg: memory.previousFastAvg,
-    previousSlowAvg: memory.previousSlowAvg,
   };
 }
 

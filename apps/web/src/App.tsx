@@ -744,34 +744,7 @@ function venueLabel(venue: BinanceMarketListing["venue"]): string {
 }
 
 function algorithmLabel(algorithm: StrategyConfig["algorithm"] | undefined): string {
-  if (algorithm === "legacy-valley-peak") {
-    return "Legacy Valley/Peak";
-  }
-  if (algorithm === "trend-following") {
-    return "Trend Following";
-  }
-  if (algorithm === "volatility-breakout") {
-    return "Volatility Breakout";
-  }
-  if (algorithm === "mean-reversion") {
-    return "Mean Reversion";
-  }
-  if (algorithm === "master-adaptive") {
-    return "Master Adaptive";
-  }
-  if (algorithm === "benchmark-always-long") {
-    return "Benchmark Always Long";
-  }
-  if (algorithm === "benchmark-always-short") {
-    return "Benchmark Always Short";
-  }
-  if (algorithm === "benchmark-always-flat") {
-    return "Benchmark Always Flat";
-  }
-  if (algorithm === "benchmark-random-sign") {
-    return "Benchmark Random Sign";
-  }
-  return "Moving Average";
+  return algorithm === "legacy-valley-peak" ? "Legacy Valley/Peak" : "Legacy Valley/Peak";
 }
 
 function AlgorithmPanel(props: {
@@ -795,7 +768,7 @@ function AlgorithmPanel(props: {
       [key]: value,
     });
   };
-  const updateLegacy = <K extends keyof StrategyConfig["legacyValleyPeak"]>(
+  const updateValleyPeak = <K extends keyof StrategyConfig["legacyValleyPeak"]>(
     key: K,
     value: StrategyConfig["legacyValleyPeak"][K],
   ) => {
@@ -807,70 +780,6 @@ function AlgorithmPanel(props: {
       ...props.config,
       legacyValleyPeak: {
         ...props.config.legacyValleyPeak,
-        [key]: value,
-      },
-    });
-  };
-  const updateTrend = <K extends keyof StrategyConfig["trendFollowing"]>(
-    key: K,
-    value: StrategyConfig["trendFollowing"][K],
-  ) => {
-    if (!props.config) {
-      return;
-    }
-
-    props.onChange({
-      ...props.config,
-      trendFollowing: {
-        ...props.config.trendFollowing,
-        [key]: value,
-      },
-    });
-  };
-  const updateBreakout = <K extends keyof StrategyConfig["volatilityBreakout"]>(
-    key: K,
-    value: StrategyConfig["volatilityBreakout"][K],
-  ) => {
-    if (!props.config) {
-      return;
-    }
-
-    props.onChange({
-      ...props.config,
-      volatilityBreakout: {
-        ...props.config.volatilityBreakout,
-        [key]: value,
-      },
-    });
-  };
-  const updateReversion = <K extends keyof StrategyConfig["meanReversion"]>(
-    key: K,
-    value: StrategyConfig["meanReversion"][K],
-  ) => {
-    if (!props.config) {
-      return;
-    }
-
-    props.onChange({
-      ...props.config,
-      meanReversion: {
-        ...props.config.meanReversion,
-        [key]: value,
-      },
-    });
-  };
-  const updateMaster = <K extends keyof StrategyConfig["masterAdaptive"]>(
-    key: K,
-    value: StrategyConfig["masterAdaptive"][K],
-  ) => {
-    if (!props.config) {
-      return;
-    }
-
-    props.onChange({
-      ...props.config,
-      masterAdaptive: {
-        ...props.config.masterAdaptive,
         [key]: value,
       },
     });
@@ -922,47 +831,16 @@ function AlgorithmPanel(props: {
         {(config) => (
           <div class="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <div class="rounded-2 bg-ink-800 p-3">
-              <label class="muted-label block" for="algorithm-select">
-                Strategy
-              </label>
-              <select
-                id="algorithm-select"
-                class="mt-2 w-full rounded-2 border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100"
-                value={config().algorithm}
-                onInput={(event) =>
-                  update("algorithm", event.currentTarget.value as StrategyConfig["algorithm"])
-                }
-              >
-                <option value="moving-average">Moving average</option>
-                <option value="legacy-valley-peak">Legacy valley/peak</option>
-                <option value="trend-following">Trend following</option>
-                <option value="volatility-breakout">Volatility breakout</option>
-                <option value="mean-reversion">Mean reversion</option>
-                <option value="master-adaptive">Master adaptive</option>
-                <option value="benchmark-always-flat">Benchmark always flat</option>
-                <option value="benchmark-always-long">Benchmark always long</option>
-                <option value="benchmark-always-short">Benchmark always short</option>
-                <option value="benchmark-random-sign">Benchmark random sign</option>
-              </select>
+              <div class="muted-label">Strategy</div>
+              <div class="mt-2 rounded-2 bg-ink-900 px-3 py-2 text-sm font-semibold text-ink-100">
+                Legacy Valley/Peak
+              </div>
               <div class="mt-3 grid grid-cols-2 gap-3">
-                <NumberField
-                  label="Order USDT"
-                  value={config().orderQuoteSize}
-                  min={1}
-                  onInput={(value) => update("orderQuoteSize", value)}
-                />
                 <NumberField
                   label="Max Position"
                   value={config().maxPositionQuote}
                   min={1}
                   onInput={(value) => update("maxPositionQuote", value)}
-                />
-                <NumberField
-                  label="Max Orders"
-                  value={config().maxOpenOrders}
-                  min={1}
-                  step={1}
-                  onInput={(value) => update("maxOpenOrders", value)}
                 />
                 <NumberField
                   label="Max Lev"
@@ -990,317 +868,94 @@ function AlgorithmPanel(props: {
                   min={0}
                   onInput={(value) => update("cooldownMs", value * 1000)}
                 />
+                <NumberField
+                  label="Limit bps"
+                  value={config().limitOffsetBps}
+                  min={0}
+                  step={0.5}
+                  onInput={(value) => update("limitOffsetBps", value)}
+                />
+                <NumberField
+                  label="Open Orders"
+                  value={config().maxOpenOrders}
+                  min={1}
+                  step={1}
+                  onInput={(value) => update("maxOpenOrders", Math.round(value))}
+                />
+                <NumberField
+                  label="Stale sec"
+                  value={config().staleOrderMs / 1000}
+                  min={1}
+                  step={1}
+                  onInput={(value) => update("staleOrderMs", value * 1000)}
+                />
+                <NumberField
+                  label="Min USDT"
+                  value={config().minOrderQuote}
+                  min={0}
+                  onInput={(value) => update("minOrderQuote", value)}
+                />
               </div>
             </div>
 
-            <Show when={config().algorithm === "moving-average"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Moving Average</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Fast Window"
-                    value={config().fastWindow}
-                    min={2}
-                    step={1}
-                    onInput={(value) => update("fastWindow", value)}
-                  />
-                  <NumberField
-                    label="Slow Window"
-                    value={config().slowWindow}
-                    min={3}
-                    step={1}
-                    onInput={(value) => update("slowWindow", value)}
-                  />
-                  <NumberField
-                    label="Signal bps"
-                    value={config().signalThresholdBps}
-                    min={0}
-                    onInput={(value) => update("signalThresholdBps", value)}
-                  />
-                  <NumberField
-                    label="Limit bps"
-                    value={config().limitOffsetBps}
-                    min={0}
-                    onInput={(value) => update("limitOffsetBps", value)}
-                  />
-                </div>
+            <div class="rounded-2 bg-ink-800 p-3">
+              <div class="muted-label">Legacy Valley/Peak</div>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <NumberField
+                  label="Buy Rate"
+                  value={config().legacyValleyPeak.buySpendRate}
+                  min={0}
+                  step={0.05}
+                  onInput={(value) => updateValleyPeak("buySpendRate", value)}
+                />
+                <NumberField
+                  label="Sell Rate"
+                  value={config().legacyValleyPeak.sellAmountRate}
+                  min={0}
+                  step={0.05}
+                  onInput={(value) => updateValleyPeak("sellAmountRate", value)}
+                />
+                <NumberField
+                  label="Buy Sigma"
+                  value={config().legacyValleyPeak.buySigma}
+                  min={0.000001}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("buySigma", value)}
+                />
+                <NumberField
+                  label="Sell Sigma"
+                  value={config().legacyValleyPeak.sellSigma}
+                  min={0.000001}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("sellSigma", value)}
+                />
+                <NumberField
+                  label="Signal Min"
+                  value={config().legacyValleyPeak.minTradeQuote}
+                  min={0}
+                  onInput={(value) => updateValleyPeak("minTradeQuote", value)}
+                />
+                <NumberField
+                  label="Signal Max"
+                  value={config().legacyValleyPeak.maxTradeQuote}
+                  min={1}
+                  onInput={(value) => updateValleyPeak("maxTradeQuote", value)}
+                />
+                <NumberField
+                  label="Warmup min"
+                  value={config().legacyValleyPeak.saturationSec / 60}
+                  min={0}
+                  onInput={(value) => updateValleyPeak("saturationSec", value * 60)}
+                />
+                <NumberField
+                  label="Buy Confirm"
+                  value={config().legacyValleyPeak.buyConfirmationOffset}
+                  min={0}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("buyConfirmationOffset", value)}
+                />
               </div>
-            </Show>
-
-            <Show when={config().algorithm === "legacy-valley-peak"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Legacy Valley/Peak</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Buy Rate"
-                    value={config().legacyValleyPeak.buySpendRate}
-                    min={0}
-                    step={0.05}
-                    onInput={(value) => updateLegacy("buySpendRate", value)}
-                  />
-                  <NumberField
-                    label="Sell Rate"
-                    value={config().legacyValleyPeak.sellAmountRate}
-                    min={0}
-                    step={0.05}
-                    onInput={(value) => updateLegacy("sellAmountRate", value)}
-                  />
-                  <NumberField
-                    label="Buy Sigma"
-                    value={config().legacyValleyPeak.buySigma}
-                    min={0.000001}
-                    step={0.01}
-                    onInput={(value) => updateLegacy("buySigma", value)}
-                  />
-                  <NumberField
-                    label="Sell Sigma"
-                    value={config().legacyValleyPeak.sellSigma}
-                    min={0.000001}
-                    step={0.01}
-                    onInput={(value) => updateLegacy("sellSigma", value)}
-                  />
-                  <NumberField
-                    label="Min USDT"
-                    value={config().legacyValleyPeak.minTradeQuote}
-                    min={0}
-                    onInput={(value) => updateLegacy("minTradeQuote", value)}
-                  />
-                  <NumberField
-                    label="Max USDT"
-                    value={config().legacyValleyPeak.maxTradeQuote}
-                    min={1}
-                    onInput={(value) => updateLegacy("maxTradeQuote", value)}
-                  />
-                  <NumberField
-                    label="Warmup min"
-                    value={config().legacyValleyPeak.saturationSec / 60}
-                    min={0}
-                    onInput={(value) => updateLegacy("saturationSec", value * 60)}
-                  />
-                  <NumberField
-                    label="Buy Confirm"
-                    value={config().legacyValleyPeak.buyConfirmationOffset}
-                    min={0}
-                    step={1}
-                    onInput={(value) => updateLegacy("buyConfirmationOffset", value)}
-                  />
-                </div>
-              </div>
-            </Show>
-
-            <Show when={config().algorithm === "trend-following"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Trend Following</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Fast Window"
-                    value={config().trendFollowing.fastWindow}
-                    min={2}
-                    step={1}
-                    onInput={(value) => updateTrend("fastWindow", value)}
-                  />
-                  <NumberField
-                    label="Slow Window"
-                    value={config().trendFollowing.slowWindow}
-                    min={3}
-                    step={1}
-                    onInput={(value) => updateTrend("slowWindow", value)}
-                  />
-                  <NumberField
-                    label="Vol Window"
-                    value={config().trendFollowing.volatilityWindow}
-                    min={2}
-                    step={1}
-                    onInput={(value) => updateTrend("volatilityWindow", value)}
-                  />
-                  <NumberField
-                    label="Entry bps"
-                    value={config().trendFollowing.entryThresholdBps}
-                    min={0}
-                    step={0.5}
-                    onInput={(value) => updateTrend("entryThresholdBps", value)}
-                  />
-                  <NumberField
-                    label="Exit bps"
-                    value={config().trendFollowing.exitThresholdBps}
-                    min={0}
-                    step={0.5}
-                    onInput={(value) => updateTrend("exitThresholdBps", value)}
-                  />
-                  <NumberField
-                    label="Exposure %"
-                    value={config().trendFollowing.targetExposurePct * 100}
-                    min={0}
-                    max={100}
-                    step={1}
-                    onInput={(value) => updateTrend("targetExposurePct", value / 100)}
-                  />
-                </div>
-              </div>
-            </Show>
-
-            <Show when={config().algorithm === "volatility-breakout"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Volatility Breakout</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Lookback"
-                    value={config().volatilityBreakout.lookbackWindow}
-                    min={2}
-                    step={1}
-                    onInput={(value) => updateBreakout("lookbackWindow", value)}
-                  />
-                  <NumberField
-                    label="Break bps"
-                    value={config().volatilityBreakout.breakoutThresholdBps}
-                    min={0}
-                    step={0.5}
-                    onInput={(value) => updateBreakout("breakoutThresholdBps", value)}
-                  />
-                  <NumberField
-                    label="Exit bps"
-                    value={config().volatilityBreakout.exitThresholdBps}
-                    min={0}
-                    step={0.5}
-                    onInput={(value) => updateBreakout("exitThresholdBps", value)}
-                  />
-                  <NumberField
-                    label="Exposure %"
-                    value={config().volatilityBreakout.targetExposurePct * 100}
-                    min={0}
-                    max={100}
-                    step={1}
-                    onInput={(value) => updateBreakout("targetExposurePct", value / 100)}
-                  />
-                </div>
-              </div>
-            </Show>
-
-            <Show when={config().algorithm === "mean-reversion"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Mean Reversion</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Window"
-                    value={config().meanReversion.window}
-                    min={3}
-                    step={1}
-                    onInput={(value) => updateReversion("window", value)}
-                  />
-                  <NumberField
-                    label="Trend Window"
-                    value={config().meanReversion.trendWindow}
-                    min={3}
-                    step={1}
-                    onInput={(value) => updateReversion("trendWindow", value)}
-                  />
-                  <NumberField
-                    label="Entry Z"
-                    value={config().meanReversion.entryZScore}
-                    min={0.01}
-                    step={0.05}
-                    onInput={(value) => updateReversion("entryZScore", value)}
-                  />
-                  <NumberField
-                    label="Exit Z"
-                    value={config().meanReversion.exitZScore}
-                    min={0}
-                    step={0.05}
-                    onInput={(value) => updateReversion("exitZScore", value)}
-                  />
-                  <NumberField
-                    label="Max Trend"
-                    value={config().meanReversion.maxTrendBps}
-                    min={0}
-                    step={1}
-                    onInput={(value) => updateReversion("maxTrendBps", value)}
-                  />
-                  <NumberField
-                    label="Exposure %"
-                    value={config().meanReversion.targetExposurePct * 100}
-                    min={0}
-                    max={100}
-                    step={1}
-                    onInput={(value) => updateReversion("targetExposurePct", value / 100)}
-                  />
-                </div>
-              </div>
-            </Show>
-
-            <Show when={config().algorithm === "master-adaptive"}>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label">Master Adaptive</div>
-                <div class="mt-3 grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="Trend W"
-                    value={config().masterAdaptive.trendWeight}
-                    min={0}
-                    step={0.1}
-                    onInput={(value) => updateMaster("trendWeight", value)}
-                  />
-                  <NumberField
-                    label="Break W"
-                    value={config().masterAdaptive.breakoutWeight}
-                    min={0}
-                    step={0.1}
-                    onInput={(value) => updateMaster("breakoutWeight", value)}
-                  />
-                  <NumberField
-                    label="Revert W"
-                    value={config().masterAdaptive.reversionWeight}
-                    min={0}
-                    step={0.1}
-                    onInput={(value) => updateMaster("reversionWeight", value)}
-                  />
-                  <NumberField
-                    label="Min Score"
-                    value={config().masterAdaptive.minConsensusScore}
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    onInput={(value) => updateMaster("minConsensusScore", value)}
-                  />
-                  <NumberField
-                    label="Disagree x"
-                    value={config().masterAdaptive.disagreementExposureScale}
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    onInput={(value) => updateMaster("disagreementExposureScale", value)}
-                  />
-                  <NumberField
-                    label="Exposure %"
-                    value={config().masterAdaptive.targetExposurePct * 100}
-                    min={0}
-                    max={100}
-                    step={1}
-                    onInput={(value) => updateMaster("targetExposurePct", value / 100)}
-                  />
-                  <NumberField
-                    label="Vol Window"
-                    value={config().masterAdaptive.volatilityWindow}
-                    min={2}
-                    step={1}
-                    onInput={(value) => updateMaster("volatilityWindow", value)}
-                  />
-                  <NumberField
-                    label="High Vol bps"
-                    value={config().masterAdaptive.highVolatilityBps}
-                    min={0}
-                    step={0.5}
-                    onInput={(value) => updateMaster("highVolatilityBps", value)}
-                  />
-                  <NumberField
-                    label="High Vol x"
-                    value={config().masterAdaptive.highVolatilityExposureScale}
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    onInput={(value) => updateMaster("highVolatilityExposureScale", value)}
-                  />
-                </div>
-              </div>
-            </Show>
+            </div>
 
             <div class="rounded-2 bg-ink-800 p-3">
               <div class="muted-label">Position Risk</div>

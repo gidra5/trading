@@ -8,17 +8,7 @@ export type OrderType = "limit" | "market";
 
 export type BotSignal = "buy" | "sell" | "hold";
 
-export type StrategyAlgorithm =
-  | "moving-average"
-  | "legacy-valley-peak"
-  | "trend-following"
-  | "volatility-breakout"
-  | "mean-reversion"
-  | "master-adaptive"
-  | "benchmark-always-long"
-  | "benchmark-always-short"
-  | "benchmark-always-flat"
-  | "benchmark-random-sign";
+export type StrategyAlgorithm = "legacy-valley-peak";
 
 export type BacktestPreset =
   | "saved-candles"
@@ -81,24 +71,13 @@ export interface StrategyConfig {
   startingQuote: number;
   maxLeverage: number;
   feeBps: number;
-  orderQuoteSize: number;
   maxPositionQuote: number;
-  fastWindow: number;
-  slowWindow: number;
-  signalThresholdBps: number;
   limitOffsetBps: number;
   maxOpenOrders: number;
   cooldownMs: number;
   staleOrderMs: number;
-  takeProfitBps: number;
-  stopLossBps: number;
   minOrderQuote: number;
-  benchmarkRandomSeed: number;
   legacyValleyPeak: LegacyValleyPeakConfig;
-  trendFollowing: TrendFollowingConfig;
-  volatilityBreakout: VolatilityBreakoutConfig;
-  meanReversion: MeanReversionConfig;
-  masterAdaptive: MasterAdaptiveConfig;
   positionRisk: PositionRiskConfig;
 }
 
@@ -128,43 +107,6 @@ export interface LegacyValleyPeakConfig {
   sellSigma: number;
   minTradeQuote: number;
   maxTradeQuote: number;
-}
-
-export interface TrendFollowingConfig {
-  fastWindow: number;
-  slowWindow: number;
-  volatilityWindow: number;
-  entryThresholdBps: number;
-  exitThresholdBps: number;
-  targetExposurePct: number;
-}
-
-export interface VolatilityBreakoutConfig {
-  lookbackWindow: number;
-  breakoutThresholdBps: number;
-  exitThresholdBps: number;
-  targetExposurePct: number;
-}
-
-export interface MeanReversionConfig {
-  window: number;
-  trendWindow: number;
-  entryZScore: number;
-  exitZScore: number;
-  maxTrendBps: number;
-  targetExposurePct: number;
-}
-
-export interface MasterAdaptiveConfig {
-  trendWeight: number;
-  breakoutWeight: number;
-  reversionWeight: number;
-  minConsensusScore: number;
-  disagreementExposureScale: number;
-  targetExposurePct: number;
-  volatilityWindow: number;
-  highVolatilityBps: number;
-  highVolatilityExposureScale: number;
 }
 
 export interface RollingAveragePoint {
@@ -239,8 +181,6 @@ export interface StrategyMemory {
   prices: number[];
   lastSignal: BotSignal;
   lastActionAt: number;
-  previousFastAvg?: number;
-  previousSlowAvg?: number;
   legacyValleyPeak?: LegacyValleyPeakMemory;
 }
 

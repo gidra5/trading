@@ -7,8 +7,8 @@ import {
   type BacktestResult,
   type Candle,
   type EquityPoint,
+  type PartialStrategyConfig,
   type StrategyAlgorithm,
-  type StrategyConfig,
 } from "../packages/bot-algo/src/index.js";
 
 type BenchmarkMode = "days" | "year" | "random-lengths" | "grid-search" | "portfolio";
@@ -33,7 +33,6 @@ interface BenchmarkArgs {
   portfolioGrossLeverage: number;
   portfolioTargetVolPct: number;
   seed: number;
-  includeRandomSign: boolean;
   only?: string;
   symbols?: string[];
 }
@@ -41,7 +40,7 @@ interface BenchmarkArgs {
 interface BenchmarkCase {
   label: string;
   algorithm: StrategyAlgorithm;
-  config?: Partial<StrategyConfig>;
+  config?: PartialStrategyConfig;
 }
 
 interface CandleWindow {
@@ -93,7 +92,7 @@ interface RandomBenchmarkRow {
 interface GridCandidate {
   label: string;
   algorithm: StrategyAlgorithm;
-  config: Partial<StrategyConfig>;
+  config: PartialStrategyConfig;
 }
 
 interface GridSearchRow {
@@ -156,15 +155,15 @@ if (files.length === 0) {
 }
 
 if (args.mode === "random-lengths") {
-  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
+  const cases = selectBenchmarkCases(args.only);
   runRandomLengthMode(args, files, cases);
 } else if (args.mode === "grid-search") {
   runGridSearchMode(args, files);
 } else if (args.mode === "portfolio") {
-  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
+  const cases = selectBenchmarkCases(args.only);
   runPortfolioMode(args, files, cases);
 } else {
-  const cases = selectBenchmarkCases(args.only, args.includeRandomSign);
+  const cases = selectBenchmarkCases(args.only);
   runSingleWindowMode(args, files, cases);
 }
 
@@ -271,171 +270,57 @@ function runGridCandidate(
 }
 
 function createGridCandidates(): GridCandidate[] {
-  const candidates: GridCandidate[] = [];
-
-  for (const fastWindow of [12, 24]) {
-    for (const slowWindow of [72, 144, 288]) {
-      for (const entryThresholdBps of [12, 24]) {
-        for (const targetExposurePct of [0.2, 0.35]) {
-          candidates.push({
-            label: `Trend f${fastWindow}/s${slowWindow}/e${entryThresholdBps}/x${targetExposurePct}`,
-            algorithm: "trend-following",
-            config: {
-              trendFollowing: {
-                fastWindow,
-                slowWindow,
-                volatilityWindow: Math.max(48, Math.floor(slowWindow / 2)),
-                entryThresholdBps,
-                exitThresholdBps: Math.max(4, Math.floor(entryThresholdBps / 3)),
-                targetExposurePct,
-              },
-            },
-          });
-        }
-      }
-    }
-  }
-
-  for (const lookbackWindow of [96, 288]) {
-    for (const breakoutThresholdBps of [12, 24]) {
-      for (const targetExposurePct of [0.2, 0.35]) {
-        candidates.push({
-          label: `Breakout l${lookbackWindow}/b${breakoutThresholdBps}/x${targetExposurePct}`,
-          algorithm: "volatility-breakout",
-          config: {
-            volatilityBreakout: {
-              lookbackWindow,
-              breakoutThresholdBps,
-              exitThresholdBps: Math.max(4, Math.floor(breakoutThresholdBps / 3)),
-              targetExposurePct,
-            },
-          },
-        });
-      }
-    }
-  }
-
-  for (const window of [48, 96]) {
-    for (const entryZScore of [1.8, 2.4]) {
-      for (const maxTrendBps of [30, 60]) {
-        for (const targetExposurePct of [0.15, 0.25]) {
-          candidates.push({
-            label: `Reversion w${window}/z${entryZScore}/t${maxTrendBps}/x${targetExposurePct}`,
-            algorithm: "mean-reversion",
-            config: {
-              meanReversion: {
-                window,
-                trendWindow: window * 3,
-                entryZScore,
-                exitZScore: 0.25,
-                maxTrendBps,
-                targetExposurePct,
-              },
-            },
-          });
-        }
-      }
-    }
-  }
-
-  for (const trendWeight of [0.8, 1.2]) {
-    for (const breakoutWeight of [0.8, 1.2]) {
-      for (const reversionWeight of [0.2, 0.7]) {
-        for (const minConsensusScore of [0.2, 0.35]) {
-          candidates.push({
-            label: `Master t${trendWeight}/b${breakoutWeight}/r${reversionWeight}/s${minConsensusScore}`,
-            algorithm: "master-adaptive",
-            config: {
-              masterAdaptive: {
-                trendWeight,
-                breakoutWeight,
-                reversionWeight,
-                minConsensusScore,
-                disagreementExposureScale: 0.4,
-                targetExposurePct: 0.4,
-                volatilityWindow: 720,
-                highVolatilityBps: 35,
-                highVolatilityExposureScale: 0.65,
-              },
-            },
-          });
-        }
-      }
-    }
-  }
-
-  candidates.push(
+  return [
     {
-      label: "Master defensive low exposure",
-      algorithm: "master-adaptive",
+      label: "Legacy Valley/Peak default",
+      algorithm: "legacy-valley-peak",
+      config: {},
+    },
+    {
+      label: "Legacy smaller clips",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { maxTradeQuote: 500 } },
+    },
+    {
+      label: "Legacy 1250 clips",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { maxTradeQuote: 1_250 } },
+    },
+    {
+      label: "Legacy 5000 clips",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { maxTradeQuote: 5_000 } },
+    },
+    {
+      label: "Legacy longer warmup",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { saturationSec: 7_200 } },
+    },
+    {
+      label: "Legacy tighter sigma",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { buySigma: 0.06, sellSigma: 0.06 } },
+    },
+    {
+      label: "Legacy wider sigma",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { buySigma: 0.16, sellSigma: 0.16 } },
+    },
+    {
+      label: "Legacy conservative clips",
+      algorithm: "legacy-valley-peak",
       config: {
-        masterAdaptive: {
-          trendWeight: 1.2,
-          breakoutWeight: 1,
-          reversionWeight: 0.7,
-          minConsensusScore: 0.35,
-          disagreementExposureScale: 0.35,
-          targetExposurePct: 0.12,
-          volatilityWindow: 720,
-          highVolatilityBps: 30,
-          highVolatilityExposureScale: 0.4,
+        legacyValleyPeak: {
+          buySpendRate: 0.6,
+          sellAmountRate: 0.8,
+          maxTradeQuote: 500,
+          buySigma: 0.08,
+          sellSigma: 0.12,
+          buyConfirmationOffset: 8,
         },
       },
     },
-    {
-      label: "Master defensive 2-of-3 consensus",
-      algorithm: "master-adaptive",
-      config: {
-        masterAdaptive: {
-          trendWeight: 1.2,
-          breakoutWeight: 1,
-          reversionWeight: 0.7,
-          minConsensusScore: 0.5,
-          disagreementExposureScale: 0.25,
-          targetExposurePct: 0.25,
-          volatilityWindow: 720,
-          highVolatilityBps: 30,
-          highVolatilityExposureScale: 0.45,
-        },
-      },
-    },
-    {
-      label: "Master trend-breakout strict",
-      algorithm: "master-adaptive",
-      config: {
-        masterAdaptive: {
-          trendWeight: 1,
-          breakoutWeight: 1,
-          reversionWeight: 0,
-          minConsensusScore: 0.55,
-          disagreementExposureScale: 0.25,
-          targetExposurePct: 0.25,
-          volatilityWindow: 1440,
-          highVolatilityBps: 25,
-          highVolatilityExposureScale: 0.4,
-        },
-      },
-    },
-    {
-      label: "Master breakout-only defensive",
-      algorithm: "master-adaptive",
-      config: {
-        masterAdaptive: {
-          trendWeight: 0,
-          breakoutWeight: 1,
-          reversionWeight: 0,
-          minConsensusScore: 0.75,
-          disagreementExposureScale: 0.25,
-          targetExposurePct: 0.18,
-          volatilityWindow: 1440,
-          highVolatilityBps: 25,
-          highVolatilityExposureScale: 0.4,
-        },
-      },
-    },
-  );
-
-  return candidates;
+  ];
 }
 
 function selectGridCandidates(only: string | undefined): GridCandidate[] {
@@ -822,8 +707,6 @@ function runBenchmark(
       maxLeverage: options.leverage,
       maxPositionQuote,
       cooldownMs: options.cooldownSec * 1000,
-      benchmarkRandomSeed: options.seed,
-      maxOpenOrders: 3,
       ...benchmark.config,
     },
     ...(maxEquityPoints ? { maxEquityPoints } : {}),
@@ -1031,7 +914,7 @@ function historicalCandleSource(
     );
 
   return candidates[0] ?? {
-    dir: legacyHistoricalCandleDir(options),
+    dir: fallbackHistoricalCandleDir(options),
     files: [],
   };
 }
@@ -1048,7 +931,7 @@ function historicalCandleDirCandidates(
     dirs.add(path.join(root, safePathPart(options.marketKey), symbol, interval));
   }
 
-  dirs.add(legacyHistoricalCandleDir(options));
+  dirs.add(fallbackHistoricalCandleDir(options));
 
   if (!fs.existsSync(root)) {
     return [...dirs];
@@ -1064,7 +947,7 @@ function historicalCandleDirCandidates(
   return [...dirs];
 }
 
-function legacyHistoricalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
+function fallbackHistoricalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
   return path.join(
     repoRoot,
     "data",
@@ -1122,7 +1005,6 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     portfolioGrossLeverage: parsePositiveNumber(values.get("portfolio-gross-leverage"), 1),
     portfolioTargetVolPct: parsePositiveNumber(values.get("portfolio-target-vol-pct"), 35),
     seed: parsePositiveInt(values.get("seed"), 1337),
-    includeRandomSign: values.has("include-random-sign"),
     only: values.get("only"),
     symbols: parseSymbols(values.get("symbols")),
   };
@@ -1141,55 +1023,13 @@ function parseMode(value: string | undefined): BenchmarkMode {
   return "random-lengths";
 }
 
-function selectBenchmarkCases(
-  only: string | undefined,
-  includeRandomSign: boolean,
-): BenchmarkCase[] {
+function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
   const cases: BenchmarkCase[] = [
     {
-      label: "Baseline always flat",
-      algorithm: "benchmark-always-flat",
-    },
-    {
-      label: "Baseline always long",
-      algorithm: "benchmark-always-long",
-    },
-    {
-      label: "Baseline always short",
-      algorithm: "benchmark-always-short",
-    },
-    {
-      label: "Moving average",
-      algorithm: "moving-average",
-    },
-    {
-      label: "Legacy valley/peak",
+      label: "Legacy Valley/Peak",
       algorithm: "legacy-valley-peak",
     },
-    {
-      label: "Trend following L/S",
-      algorithm: "trend-following",
-    },
-    {
-      label: "Vol breakout L/S",
-      algorithm: "volatility-breakout",
-    },
-    {
-      label: "Mean reversion L/S",
-      algorithm: "mean-reversion",
-    },
-    {
-      label: "Master adaptive L/S",
-      algorithm: "master-adaptive",
-    },
   ];
-
-  if (includeRandomSign || only?.toLowerCase().includes("random")) {
-    cases.splice(3, 0, {
-      label: "Baseline random sign",
-      algorithm: "benchmark-random-sign",
-    });
-  }
 
   const selected = only
     ? cases.filter(
@@ -1574,24 +1414,22 @@ function compareOptionalDesc(
   return rightValue - leftValue;
 }
 
-function formatGridConfig(config: Partial<StrategyConfig>): string {
-  if (config.trendFollowing) {
-    const value = config.trendFollowing;
-    return `fast=${value.fastWindow}, slow=${value.slowWindow}, vol=${value.volatilityWindow}, entry=${value.entryThresholdBps}, exit=${value.exitThresholdBps}, exposure=${value.targetExposurePct}`;
+function formatGridConfig(config: PartialStrategyConfig): string {
+  const parts: string[] = [];
+  if (config.legacyValleyPeak) {
+    const value = config.legacyValleyPeak;
+    parts.push(
+      `buyRate=${value.buySpendRate ?? "-"}`,
+      `sellRate=${value.sellAmountRate ?? "-"}`,
+      `maxTrade=${value.maxTradeQuote ?? "-"}`,
+      `buySigma=${value.buySigma ?? "-"}`,
+      `sellSigma=${value.sellSigma ?? "-"}`,
+      `buyConfirm=${value.buyConfirmationOffset ?? "-"}`,
+      `sellIndex=${value.sellDataIndex ?? "-"}`,
+      `warmup=${value.saturationSec ?? "-"}`,
+    );
   }
-  if (config.volatilityBreakout) {
-    const value = config.volatilityBreakout;
-    return `lookback=${value.lookbackWindow}, breakout=${value.breakoutThresholdBps}, exit=${value.exitThresholdBps}, exposure=${value.targetExposurePct}`;
-  }
-  if (config.meanReversion) {
-    const value = config.meanReversion;
-    return `window=${value.window}, trend=${value.trendWindow}, z=${value.entryZScore}, exit=${value.exitZScore}, maxTrend=${value.maxTrendBps}, exposure=${value.targetExposurePct}`;
-  }
-  if (config.masterAdaptive) {
-    const value = config.masterAdaptive;
-    return `trendW=${value.trendWeight}, breakoutW=${value.breakoutWeight}, reversionW=${value.reversionWeight}, minScore=${value.minConsensusScore}, exposure=${value.targetExposurePct}, highVol=${value.highVolatilityBps}`;
-  }
-  return "-";
+  return parts.length > 0 ? parts.join(", ") : "-";
 }
 
 function discoverHistoricalSymbols(interval: string): string[] {

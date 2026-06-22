@@ -824,7 +824,7 @@ async function runHistoricalRangeBacktest(
 
     if (
       shouldCheckMetrics &&
-      processedCandles >= config.slowWindow &&
+      processedCandles > 0 &&
       latestMetrics.equity <= wipeoutEquity
     ) {
       stopReason = "wiped_out";

@@ -11,6 +11,7 @@ import {
   type Candle,
   type ManualTradeInput,
   type OrderBookSnapshot,
+  type PartialStrategyConfig,
   type PaperBotState,
   type PriceTick,
   type PositionLedger,
@@ -212,7 +213,7 @@ export class TradingRuntime {
     return events;
   }
 
-  async updateBotConfig(patch: Partial<StrategyConfig>): Promise<BotEvent[]> {
+  async updateBotConfig(patch: PartialStrategyConfig): Promise<BotEvent[]> {
     this.config = applyMarketMaxLeverage(
       createStrategyConfig({
         ...this.config,
@@ -223,22 +224,6 @@ export class TradingRuntime {
         legacyValleyPeak: {
           ...this.config.legacyValleyPeak,
           ...(patch.legacyValleyPeak ?? {}),
-        },
-        trendFollowing: {
-          ...this.config.trendFollowing,
-          ...(patch.trendFollowing ?? {}),
-        },
-        volatilityBreakout: {
-          ...this.config.volatilityBreakout,
-          ...(patch.volatilityBreakout ?? {}),
-        },
-        meanReversion: {
-          ...this.config.meanReversion,
-          ...(patch.meanReversion ?? {}),
-        },
-        masterAdaptive: {
-          ...this.config.masterAdaptive,
-          ...(patch.masterAdaptive ?? {}),
         },
         positionRisk: {
           ...this.config.positionRisk,
@@ -614,12 +599,15 @@ function compactPublicMemory(
 ): StrategyMemory {
   return {
     prices: memory.prices
-      .slice(-Math.max(PUBLIC_PRICE_MEMORY_LIMIT, config.slowWindow * 2))
+      .slice(
+        -Math.max(
+          PUBLIC_PRICE_MEMORY_LIMIT,
+          config.legacyValleyPeak.averagingRangesSec.length * 100,
+        ),
+      )
       .slice(),
     lastSignal: memory.lastSignal,
     lastActionAt: memory.lastActionAt,
-    previousFastAvg: memory.previousFastAvg,
-    previousSlowAvg: memory.previousSlowAvg,
   };
 }
 

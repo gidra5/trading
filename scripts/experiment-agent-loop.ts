@@ -149,13 +149,13 @@ function buildAgentPrompt(input: {
   const relativeRunDir = path.relative(repoRoot, input.runDir);
   return `You are an autonomous trading-strategy experiment agent working in this repo.
 
-Goal: improve the master algorithm so it captures more of the perfect-margin-trader oracle profit without overfitting to a recent 30-day trend.
+Goal: improve the legacy valley/peak algorithm so it captures more of the perfect-margin-trader oracle profit without overfitting to a recent 30-day trend.
 
 Mandatory validation frame:
 - Treat full BTC-cycle random-length testing as the primary evidence source.
 - Do not promote a change based only on a contiguous 30-day backtest.
 - Prefer random windows sampled across the whole available BTC cycle, currently requested as 1825 lookback days.
-- Compare every master change against always-flat, always-long, always-short, trend-following, volatility-breakout, and mean-reversion controls.
+- Compare every legacy valley/peak change against the current legacy default and the perfect-margin oracle metrics.
 - Optimize for oracle capture, net return, risk-adjusted return, drawdown, and robustness across sampled regimes, not one lucky window.
 
 Current iteration:
@@ -176,15 +176,15 @@ ${input.benchmark.stderrTail.trim()}
 \`\`\`
 
 Your task:
-1. Review the benchmark and identify what the simpler algorithms reveal about market regimes, costs, and failure modes.
+1. Review the benchmark and identify what the legacy valley/peak variants reveal about market regimes, costs, and failure modes.
 2. Run additional experiments only if they use cycle-wide random-length windows, full-cycle folds, or a broader regime sample. Avoid optimizing against a single recent 30-day window.
-3. Improve the master-adaptive algorithm, its default config, grid candidates, or experiment harness when the evidence justifies it.
+3. Improve the legacy valley/peak algorithm, its default config, grid candidates, or experiment harness when the evidence justifies it.
 4. Record the important observation in docs/experiment-plan.md or docs/strategy-research.md.
 5. Run ${input.verifyCommand || "the relevant typecheck/build command"} before finishing.
 
 Constraints:
 - Do not start another indefinite experiment loop.
-- Do not remove benchmark controls.
+- Do not add non-legacy strategy controls.
 - Keep changes inspectable and focused.
 - If no code change is justified, write that conclusion to the docs and leave the implementation alone.
 `;
