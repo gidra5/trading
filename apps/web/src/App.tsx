@@ -2386,11 +2386,34 @@ function BacktestPanel(props: {
             value={`$${formatQuote(summary()?.perfectMarginNetPnl, 2)}`}
           />
           <SmallMetric
+            label="Reinvest Ret"
+            value={formatPercent(summary()?.perfectMarginCompoundedReturnPct)}
+          />
+          <SmallMetric
+            label="Reinvest Cap"
+            value={formatPercent(summary()?.perfectMarginCompoundedCapturePct)}
+          />
+          <SmallMetric
             label="Bench Lev"
             value={formatLeverage(summary()?.perfectMarginLeverage)}
           />
           <SmallMetric label="Trades" value={formatQuote(summary()?.tradeCount, 0)} />
           <SmallMetric label="Win Rate" value={formatPercent(summary()?.winRate)} />
+          <SmallMetric
+            label="Prof Pos"
+            value={`${formatQuote(summary()?.profitableClosedPositionCount, 0)} / ${formatQuote(
+              summary()?.closedPositionCount,
+              0,
+            )}`}
+          />
+          <SmallMetric
+            label="Pos Win"
+            value={formatPercent(summary()?.profitableClosedPositionRate)}
+          />
+          <SmallMetric
+            label="Liq Pos"
+            value={formatQuote(summary()?.liquidatedPositionCount, 0)}
+          />
           <SmallMetric label="Candles" value={processedLabel()} />
           <SmallMetric
             label="Speed"

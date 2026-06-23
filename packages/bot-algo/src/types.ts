@@ -22,9 +22,18 @@ export type BacktestPreset =
 
 export type BacktestRunStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
 
-export type BacktestStopReason = "completed" | "wiped_out" | "error" | "cancelled";
+export type BacktestStopReason =
+  | "completed"
+  | "wiped_out"
+  | "liquidated"
+  | "error"
+  | "cancelled";
 
 export type PositionEffect = "auto" | "open" | "close";
+
+export type ExitGridPriceDistribution = "uniform" | "geometric";
+
+export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
 export interface PriceTick {
   symbol: string;
@@ -36,6 +45,7 @@ export interface PriceTick {
 export interface TickProcessingOptions {
   collectEvents?: boolean;
   updateMetrics?: boolean;
+  simulateLiquidation?: boolean;
 }
 
 export interface Candle {
@@ -107,6 +117,16 @@ export interface LegacyValleyPeakConfig {
   sellSigma: number;
   minTradeQuote: number;
   maxTradeQuote: number;
+  exitGridEnabled: boolean;
+  exitGridMarketEntry: boolean;
+  exitGridOrderCount: number;
+  exitGridPriceDistribution: ExitGridPriceDistribution;
+  exitGridSizeDistribution: ExitGridSizeDistribution;
+  exitGridSellFraction: number;
+  exitGridMinProfitBps: number;
+  exitGridResetBps: number;
+  exitGridPositionMode: "aggregate" | "per-lot";
+  exitGridResetMode: "higher-peak" | "filled-grid";
 }
 
 export interface RollingAveragePoint {
@@ -129,12 +149,23 @@ export interface LegacyValleyPeakMemory {
   startedAt?: number;
   buyAverages: RollingAverageMemory[];
   sellAverages: RollingAverageMemory[];
+  exitGrids?: Record<string, LegacyExitGridMemory>;
+}
+
+export interface LegacyExitGridMemory {
+  lotId: string;
+  entryPrice: number;
+  entryQuantity: number;
+  peakPrice: number;
+  gridPeakPrice: number;
+  gridOrderIds: string[];
 }
 
 export interface TradingOrder {
   id: string;
   side: OrderSide;
   type: OrderType;
+  trigger?: "above" | "below";
   status: OrderStatus;
   price: number;
   quantity: number;
@@ -150,6 +181,8 @@ export interface TradingOrder {
   targetPositionId?: string;
   positionEffect?: PositionEffect;
   manual?: boolean;
+  liquidation?: boolean;
+  liquidatedPositionCount?: number;
 }
 
 export interface TradeFill {
@@ -166,6 +199,8 @@ export interface TradeFill {
   targetPositionId?: string;
   positionEffect?: PositionEffect;
   manual?: boolean;
+  liquidation?: boolean;
+  liquidatedPositionCount?: number;
 }
 
 export interface ManualTradeInput {
@@ -381,6 +416,10 @@ export interface BacktestSummary {
   perfectMarginNetPnl?: number;
   perfectMarginReturnPct?: number;
   perfectMarginCapturePct?: number;
+  perfectMarginCompoundedFinalEquity?: number;
+  perfectMarginCompoundedNetPnl?: number;
+  perfectMarginCompoundedReturnPct?: number;
+  perfectMarginCompoundedCapturePct?: number;
   stoppedEarly?: boolean;
   stopReason?: BacktestStopReason;
   survivedMs?: number;
@@ -395,6 +434,10 @@ export interface BacktestSummary {
   maxDrawdownPct: number;
   tradeCount: number;
   winRate: number;
+  closedPositionCount: number;
+  profitableClosedPositionCount: number;
+  profitableClosedPositionRate: number;
+  liquidatedPositionCount: number;
 }
 
 export interface BacktestSampleSummary {
@@ -419,9 +462,17 @@ export interface BacktestSampleSummary {
   perfectMarginNetPnl?: number;
   perfectMarginReturnPct?: number;
   perfectMarginCapturePct?: number;
+  perfectMarginCompoundedFinalEquity?: number;
+  perfectMarginCompoundedNetPnl?: number;
+  perfectMarginCompoundedReturnPct?: number;
+  perfectMarginCompoundedCapturePct?: number;
   maxDrawdownPct: number;
   tradeCount: number;
   winRate: number;
+  closedPositionCount: number;
+  profitableClosedPositionCount: number;
+  profitableClosedPositionRate: number;
+  liquidatedPositionCount: number;
   stoppedEarly?: boolean;
   stopReason?: BacktestStopReason;
   survivedMs?: number;

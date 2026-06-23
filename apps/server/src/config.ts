@@ -39,7 +39,8 @@ export const appConfig = {
     baseAsset: market.baseAsset,
     quoteAsset: market.quoteAsset,
     startingQuote: Number(process.env.TRADING_STARTING_QUOTE ?? 10_000),
-    maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 1),
+    maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 5),
+    maxPositionQuote: Number(process.env.TRADING_MAX_POSITION_QUOTE ?? 50_000),
   }),
 };
 

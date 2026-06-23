@@ -387,7 +387,9 @@ export class TradingRuntime {
         this.backtest,
         result,
         result.summary.stoppedEarly
-          ? "Stopped early after portfolio wipeout"
+          ? result.summary.stopReason === "liquidated"
+            ? "Stopped early after account liquidation"
+            : "Stopped early after portfolio wipeout"
           : "Backtest completed",
       );
       onUpdate();

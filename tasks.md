@@ -9,19 +9,9 @@
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
 
+
 - develop strategy
-  - the basic components of the strategy are:
-    1. signal when to sell/buy (lows/highs or peaks/valleys)
-    2. a procedure to choose size based on available capital 
-    3. the better these are, the closer we can get to the perfect trader.
-    4. size - optimally chosen such that we don't loose opportunities to buy further dip, but also dont loose opportunities to extract the most profit from the current dip
-    5. price - optimally chosen such that we don't waste money on fees due to frequent trades, but also dont waste opportunities to exploit volatility.
-    6. while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
-  - backtesting:
-    1. we can base test it on syntetic graphs - sine waves, constant slope with various levels of noise added. If it fails on such predictable graphs, we know that it can't exploit even the simplest of patterns.
-    2. test on historic data - last x days/months/years
-    3. test on random data sampled from historic data - random intervals of time, with shuffled deltas to preserve statistical properties of the sample.
-    4. sample across multiple markets - each represents unique market conditions, which diversifies the samples even more.
+  - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
   - accomodate in some way average candle size at various levels of granularity
   - the optimal strategy will maximize utility from peaks and valleys, while avoiding loosing to much profit on fees.
   - every trade is supposed to be profitable, so we should calculate break even price and only close positions if we are below/above it. 
@@ -40,4 +30,4 @@
   - use the resulting "balance" as a derivative asset useful for creating portfolios.
   - use boxing of positions - they should basically be closed until some fixed time and have definite take profit/stop loss prices.
   - after we get to some suitable level of performance, explore portfolio management strategies. hedging, rebalancing, correlation reduction, maybe something else.
-  - if we created a long position and hit a peak, we may distribute the closure throughout the price interval (open price, peak) in a grid, each point in which will close a fraction of the remaining position, until it hits the opening price, at which point we close it completely. this way we dont overcommit to the peak and leave space to selling at even higher price the rest, while also not missing the opportunity to get already existing profit.
+  - the strategies currently account for jagged up or down trend, but possibly breaks when the trend changes. Need to account for transition periods as well.

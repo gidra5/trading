@@ -19,6 +19,7 @@ export {
   analyzePositions,
   createPositionRiskConfig,
   defaultPositionRiskConfig,
+  summarizeClosedPositions,
 } from "./position-ledger.js";
 export { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 export type * from "./types.js";

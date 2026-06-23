@@ -9,7 +9,7 @@ export interface LegacyValleyPeakInput {
   eventTime: number;
   price: number;
   feeRate: number;
-  quoteFree: number;
+  buyingPowerQuote: number;
   baseFree: number;
   positionQuote: number;
   maxPositionQuote: number;
@@ -32,10 +32,20 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
-  buySigma: 0.1,
+  buySigma: 0.3,
   sellSigma: 0.1,
   minTradeQuote: 25,
-  maxTradeQuote: 3_000,
+  maxTradeQuote: 50_000,
+  exitGridEnabled: true,
+  exitGridMarketEntry: true,
+  exitGridOrderCount: 6,
+  exitGridPriceDistribution: "uniform",
+  exitGridSizeDistribution: "geometric",
+  exitGridSellFraction: 0.35,
+  exitGridMinProfitBps: 20,
+  exitGridResetBps: 10,
+  exitGridPositionMode: "per-lot",
+  exitGridResetMode: "filled-grid",
 };
 
 const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;
@@ -75,6 +85,37 @@ export function createLegacyValleyPeakConfig(
   config.sellSigma = Math.max(0.000001, config.sellSigma);
   config.minTradeQuote = Math.max(0, config.minTradeQuote);
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
+  config.exitGridOrderCount = clampInt(config.exitGridOrderCount, 1, 24);
+  if (
+    config.exitGridPriceDistribution !== "uniform" &&
+    config.exitGridPriceDistribution !== "geometric"
+  ) {
+    config.exitGridPriceDistribution =
+      defaultLegacyValleyPeakConfig.exitGridPriceDistribution;
+  }
+  if (
+    config.exitGridSizeDistribution !== "geometric" &&
+    config.exitGridSizeDistribution !== "linear" &&
+    config.exitGridSizeDistribution !== "constant"
+  ) {
+    config.exitGridSizeDistribution =
+      defaultLegacyValleyPeakConfig.exitGridSizeDistribution;
+  }
+  config.exitGridSellFraction = clamp(config.exitGridSellFraction, 0.01, 1);
+  config.exitGridMinProfitBps = Math.max(0, config.exitGridMinProfitBps);
+  config.exitGridResetBps = Math.max(0, config.exitGridResetBps);
+  if (
+    config.exitGridPositionMode !== "aggregate" &&
+    config.exitGridPositionMode !== "per-lot"
+  ) {
+    config.exitGridPositionMode = defaultLegacyValleyPeakConfig.exitGridPositionMode;
+  }
+  if (
+    config.exitGridResetMode !== "higher-peak" &&
+    config.exitGridResetMode !== "filled-grid"
+  ) {
+    config.exitGridResetMode = defaultLegacyValleyPeakConfig.exitGridResetMode;
+  }
 
   return config;
 }
@@ -102,6 +143,7 @@ export function normalizeLegacyValleyPeakMemory(
     startedAt: memory.startedAt,
     buyAverages: averages,
     sellAverages: averages,
+    exitGrids: memory.exitGrids,
   };
 }
 
@@ -206,13 +248,17 @@ function buyQuoteSize(
 ): number {
   const data = memory.buyAverages[Math.min(3, memory.buyAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
-  const desired = input.quoteFree * config.buySpendRate * gaussian(derivative, 0, config.buySigma);
+  const buyingPowerQuote = Math.max(0, input.buyingPowerQuote);
+  const desired =
+    buyingPowerQuote *
+    config.buySpendRate *
+    gaussian(derivative, 0, config.buySigma);
   const remainingPositionQuote = Math.max(0, input.maxPositionQuote - input.positionQuote);
 
   return clamp(
     desired,
     config.minTradeQuote,
-    Math.min(config.maxTradeQuote, input.quoteFree * 0.98, remainingPositionQuote, rate * 10_000),
+    Math.min(config.maxTradeQuote, buyingPowerQuote, remainingPositionQuote, rate * 10_000),
   );
 }
 

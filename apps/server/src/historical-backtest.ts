@@ -4,8 +4,10 @@ import {
   compactBacktestState,
   createInitialBotState,
   createStrategyConfig,
+  summarizeClosedPositions,
   type BacktestSummary,
   type BacktestSampleSummary,
+  type BacktestStopReason,
   type BacktestPreset,
   type BacktestProgressSnapshot,
   type BacktestResult,
@@ -123,6 +125,7 @@ interface PerfectMarginBenchmarkAccumulator {
   roundTripFrictionRate: number;
   previousPrice?: number;
   netPnl: number;
+  compoundedEquity: number;
 }
 
 type PerfectMarginBenchmark = Pick<
@@ -132,6 +135,10 @@ type PerfectMarginBenchmark = Pick<
   | "perfectMarginNetPnl"
   | "perfectMarginReturnPct"
   | "perfectMarginCapturePct"
+  | "perfectMarginCompoundedFinalEquity"
+  | "perfectMarginCompoundedNetPnl"
+  | "perfectMarginCompoundedReturnPct"
+  | "perfectMarginCompoundedCapturePct"
 >;
 
 export class BacktestCancelledError extends Error {
@@ -649,7 +656,7 @@ async function runHistoricalRangeBacktest(
   let cacheStats = emptyCacheStats();
   let processedStartTime: number | undefined;
   let processedEndTime: number | undefined;
-  let stopReason: "completed" | "wiped_out" = "completed";
+  let stopReason: BacktestStopReason = "completed";
   let latestMetrics = bot.view().metrics;
   let survivedMs: number | undefined;
 
@@ -720,8 +727,10 @@ async function runHistoricalRangeBacktest(
   }
 
   latestMetrics = bot.markToMarket();
+  const fullFinalState = bot.view();
+  const closedPositionStats = summarizeClosedPositions(fullFinalState);
   const finalState = compactBacktestState(
-    bot.view(),
+    fullFinalState,
     options.sampleCount
       ? {
           maxReturnedOrders: 0,
@@ -781,6 +790,7 @@ async function runHistoricalRangeBacktest(
       maxDrawdownPct: finalState.metrics.maxDrawdownPct,
       tradeCount: finalState.metrics.tradeCount,
       winRate: finalState.metrics.winRate,
+      ...closedPositionStats,
       ...finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
     },
     equityCurve,
@@ -802,7 +812,7 @@ async function runHistoricalRangeBacktest(
     processedStartTime ??= candle.openTime;
     processedEndTime = candle.closeTime;
 
-    replayCandle(bot, candle, perfectMargin);
+    const liquidated = replayCandle(bot, candle, perfectMargin);
     processedCandles += 1;
     const shouldSample = processedCandles % sampleEvery === 0;
     const shouldCheckMetrics =
@@ -820,6 +830,14 @@ async function runHistoricalRangeBacktest(
         equity: latestMetrics.equity,
         price: candle.close,
       });
+    }
+
+    if (liquidated) {
+      if (!shouldCheckMetrics) {
+        latestMetrics = bot.markToMarket();
+      }
+      stopReason = "liquidated";
+      return false;
     }
 
     if (
@@ -947,9 +965,20 @@ function buildRandomAggregateResult(input: {
       perfectMarginNetPnl: result.summary.perfectMarginNetPnl,
       perfectMarginReturnPct: result.summary.perfectMarginReturnPct,
       perfectMarginCapturePct: result.summary.perfectMarginCapturePct,
+      perfectMarginCompoundedFinalEquity:
+        result.summary.perfectMarginCompoundedFinalEquity,
+      perfectMarginCompoundedNetPnl: result.summary.perfectMarginCompoundedNetPnl,
+      perfectMarginCompoundedReturnPct:
+        result.summary.perfectMarginCompoundedReturnPct,
+      perfectMarginCompoundedCapturePct:
+        result.summary.perfectMarginCompoundedCapturePct,
       maxDrawdownPct: result.summary.maxDrawdownPct,
       tradeCount: result.summary.tradeCount,
       winRate: result.summary.winRate,
+      closedPositionCount: result.summary.closedPositionCount,
+      profitableClosedPositionCount: result.summary.profitableClosedPositionCount,
+      profitableClosedPositionRate: result.summary.profitableClosedPositionRate,
+      liquidatedPositionCount: result.summary.liquidatedPositionCount,
       stoppedEarly: result.summary.stoppedEarly,
       stopReason: result.summary.stopReason,
       survivedMs: result.summary.survivedMs,
@@ -976,6 +1005,9 @@ function buildRandomAggregateResult(input: {
   const returnPctPerDayValues = samples.map((sample) => sample.returnPctPerDay);
   const perfectMarginNetPnl = averageDefined(
     samples.map((sample) => sample.perfectMarginNetPnl),
+  );
+  const perfectMarginCompoundedNetPnl = averageDefined(
+    samples.map((sample) => sample.perfectMarginCompoundedNetPnl),
   );
 
   return {
@@ -1008,6 +1040,9 @@ function buildRandomAggregateResult(input: {
       marketSymbols: markets.map((market) => market.symbol),
       profitableSamples: samples.filter((sample) => sample.returnPct > 0).length,
       wipedOutSamples: samples.filter((sample) => sample.stopReason === "wiped_out").length,
+      liquidatedPositionCount: average(
+        samples.map((sample) => sample.liquidatedPositionCount),
+      ),
       bestReturnPct: Math.max(...returnValues),
       worstReturnPct: Math.min(...returnValues),
       netPnlPerDay: average(netPnlPerDayValues),
@@ -1030,6 +1065,17 @@ function buildRandomAggregateResult(input: {
         perfectMarginNetPnl && perfectMarginNetPnl > 0
           ? (metrics.netPnl / perfectMarginNetPnl) * 100
           : undefined,
+      perfectMarginCompoundedFinalEquity: averageDefined(
+        samples.map((sample) => sample.perfectMarginCompoundedFinalEquity),
+      ),
+      perfectMarginCompoundedNetPnl,
+      perfectMarginCompoundedReturnPct: averageDefined(
+        samples.map((sample) => sample.perfectMarginCompoundedReturnPct),
+      ),
+      perfectMarginCompoundedCapturePct:
+        perfectMarginCompoundedNetPnl && perfectMarginCompoundedNetPnl > 0
+          ? (metrics.netPnl / perfectMarginCompoundedNetPnl) * 100
+          : undefined,
       stoppedEarly: false,
       stopReason: "completed",
       survivedMs: averageDefined(samples.map((sample) => sample.survivedMs)),
@@ -1046,6 +1092,13 @@ function buildRandomAggregateResult(input: {
       maxDrawdownPct: metrics.maxDrawdownPct,
       tradeCount: metrics.tradeCount,
       winRate: metrics.winRate,
+      closedPositionCount: average(samples.map((sample) => sample.closedPositionCount)),
+      profitableClosedPositionCount: average(
+        samples.map((sample) => sample.profitableClosedPositionCount),
+      ),
+      profitableClosedPositionRate: average(
+        samples.map((sample) => sample.profitableClosedPositionRate),
+      ),
     },
     equityCurve: averageEquityCurves(results),
     orders: [],
@@ -1421,19 +1474,30 @@ function replayCandle(
   bot: SimulatedTradingBot,
   candle: Candle,
   perfectMargin?: PerfectMarginBenchmarkAccumulator,
-): void {
+): boolean {
   const duration = Math.max(1, candle.closeTime - candle.openTime);
   const highTime = candle.openTime + duration * 0.33;
   const lowTime = candle.openTime + duration * 0.66;
+  const liquidatedBefore = bot.liquidatedPositionCount();
 
   observePerfectMarginPrice(perfectMargin, candle.open);
   bot.onReplayPriceTick(candle.openTime, candle.open);
+  if (bot.liquidatedPositionCount() > liquidatedBefore) {
+    return true;
+  }
   observePerfectMarginPrice(perfectMargin, candle.high);
   bot.onReplayPriceTick(highTime, candle.high);
+  if (bot.liquidatedPositionCount() > liquidatedBefore) {
+    return true;
+  }
   observePerfectMarginPrice(perfectMargin, candle.low);
   bot.onReplayPriceTick(lowTime, candle.low);
+  if (bot.liquidatedPositionCount() > liquidatedBefore) {
+    return true;
+  }
   observePerfectMarginPrice(perfectMargin, candle.close);
   bot.onReplayPriceTick(candle.closeTime, candle.close);
+  return bot.liquidatedPositionCount() > liquidatedBefore;
 }
 
 function createPerfectMarginBenchmark(
@@ -1447,6 +1511,7 @@ function createPerfectMarginBenchmark(
       ((Math.max(0, config.feeBps) + Math.max(0, config.positionRisk.marketSlippageBps)) /
         10_000),
     netPnl: 0,
+    compoundedEquity: config.startingQuote,
   };
 }
 
@@ -1463,6 +1528,7 @@ function observePerfectMarginPrice(
     const netRate = changeRate - benchmark.roundTripFrictionRate;
     if (netRate > 0) {
       benchmark.netPnl += benchmark.startingQuote * benchmark.leverage * netRate;
+      benchmark.compoundedEquity *= 1 + benchmark.leverage * netRate;
     }
   }
   benchmark.previousPrice = price;
@@ -1476,6 +1542,12 @@ function finalizePerfectMarginBenchmark(
   const finalEquity = benchmark.startingQuote + netPnl;
   const returnPct =
     benchmark.startingQuote > 0 ? (netPnl / benchmark.startingQuote) * 100 : 0;
+  const compoundedFinalEquity = benchmark.compoundedEquity;
+  const compoundedNetPnl = compoundedFinalEquity - benchmark.startingQuote;
+  const compoundedReturnPct =
+    benchmark.startingQuote > 0
+      ? (compoundedNetPnl / benchmark.startingQuote) * 100
+      : 0;
 
   return {
     perfectMarginLeverage: benchmark.leverage,
@@ -1483,6 +1555,11 @@ function finalizePerfectMarginBenchmark(
     perfectMarginNetPnl: netPnl,
     perfectMarginReturnPct: returnPct,
     perfectMarginCapturePct: netPnl > 0 ? (actualNetPnl / netPnl) * 100 : undefined,
+    perfectMarginCompoundedFinalEquity: compoundedFinalEquity,
+    perfectMarginCompoundedNetPnl: compoundedNetPnl,
+    perfectMarginCompoundedReturnPct: compoundedReturnPct,
+    perfectMarginCompoundedCapturePct:
+      compoundedNetPnl > 0 ? (actualNetPnl / compoundedNetPnl) * 100 : undefined,
   };
 }
 

@@ -25,6 +25,11 @@ export function formatPercent(value: number | undefined): string {
     return "-";
   }
 
+  const finite = value as number;
+  if (Math.abs(finite) >= 1_000_000) {
+    return `${finite.toExponential(2)}%`;
+  }
+
   return `${formatQuote(value, 2)}%`;
 }
 

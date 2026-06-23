@@ -44,6 +44,13 @@ interface BorrowSource {
   available: number;
 }
 
+export interface ClosedPositionStats {
+  closedPositionCount: number;
+  profitableClosedPositionCount: number;
+  profitableClosedPositionRate: number;
+  liquidatedPositionCount: number;
+}
+
 type MutableLongLot = Omit<
   LongPositionLot,
   | "status"
@@ -191,6 +198,42 @@ export function analyzePositions(
     },
     longs: finalizedLongs,
     shorts: finalizedShorts,
+  };
+}
+
+export function summarizeClosedPositions(state: PaperBotState): ClosedPositionStats {
+  const ledger = analyzePositions(state);
+  let closedPositionCount = 0;
+  let profitableClosedPositionCount = 0;
+  let liquidatedPositionCount = 0;
+
+  for (const lot of [...ledger.longs, ...ledger.shorts]) {
+    if (lot.status !== "closed" || lot.filledQuantity <= EPSILON) {
+      continue;
+    }
+
+    closedPositionCount += 1;
+    const pnl =
+      lot.side === "long"
+        ? lot.closedQuote - lot.costQuote
+        : lot.proceedsQuote - lot.closedQuote;
+    if (pnl > EPSILON) {
+      profitableClosedPositionCount += 1;
+    }
+  }
+
+  for (const fill of state.fills) {
+    if (fill.liquidation) {
+      liquidatedPositionCount += Math.max(1, fill.liquidatedPositionCount ?? 1);
+    }
+  }
+
+  return {
+    closedPositionCount,
+    profitableClosedPositionCount,
+    profitableClosedPositionRate:
+      closedPositionCount > 0 ? (profitableClosedPositionCount / closedPositionCount) * 100 : 0,
+    liquidatedPositionCount,
   };
 }
 

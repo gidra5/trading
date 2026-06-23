@@ -1,16 +1,181 @@
-# Position Ledger
+# Trading Model and Position Ledger
 
-The position ledger mirrors the `sol` spreadsheet section from rows 111 onward. It is implemented in `packages/bot-algo/src/position-ledger.ts` and is derived from the paper bot fills plus currently open limit orders.
+The bot keeps one persisted paper-trading state and derives the position ledger from
+that state. The persisted state is the source of truth for balances, orders, fills,
+strategy memory, and metrics. The ledger is a reconstructed view used by position-risk
+helpers, benchmark metrics, and presentation layers.
 
-## Lot Model
+The implementation lives in:
 
-Each filled buy that is not consumed by earlier shorts becomes a long lot. Each filled sell that is not consumed by earlier longs becomes a short lot. Closing trades are allocated FIFO.
+- `packages/bot-algo/src/bot.ts` for account state, order lifecycle, fills, leverage
+  checks, and strategy execution
+- `packages/bot-algo/src/position-ledger.ts` for derived long/short lots, break-even
+  prices, borrow attribution, and risk suggestions
 
-Open buy limit orders are shown as pending long lots. Open sell limit orders are shown as pending short lots. Pending lots use the limit price and estimated fee-adjusted quote amount so the UI can show the break-even levels that would apply if the order fills.
+## Account State
 
-Every lot also keeps explicit closed quantity and closed quote. For long lots that quote value is allocated sell proceeds. For short lots it is allocated buyback cost.
+The account is modeled as base and quote balances:
 
-## Spreadsheet Formulas
+- `quoteFree` is spendable quote.
+- `quoteReserved` is quote reserved by open buy orders, including estimated fees.
+- `baseFree` is sellable base.
+- `baseReserved` is base reserved by open sell orders.
+- `avgEntryPrice` is the aggregate long entry price used for simple PnL accounting.
+- `avgShortEntryPrice` is inferred from derived short lots.
+
+Balances can go negative. A negative quote balance represents borrowed quote used to
+hold leveraged long exposure. A negative net base balance represents borrowed base used
+to hold short exposure. Equity is still computed from marked-to-market balances:
+
+```text
+equity = quoteFree + quoteReserved + (baseFree + baseReserved) * currentPrice
+```
+
+The state model can represent both long and short lots. Which side a specific strategy
+opens is strategy behavior, not part of the ledger model.
+
+## Orders and Fills
+
+Orders are persisted in `state.orders`; fills are persisted in `state.fills`.
+
+An order has:
+
+- `side`: `buy` or `sell`
+- `type`: `limit` or `market`
+- optional `trigger`: `above` or `below`
+- `status`: `open`, `filled`, or `cancelled`
+- `price`, `quantity`, estimated quote cost, timestamps, reason, and optional target lot
+
+Open order accounting is reserve-based:
+
+- creating a buy order reserves estimated quote cost and moves it from `quoteFree` to
+  `quoteReserved`
+- creating a sell order reserves base and moves it from `baseFree` to `baseReserved`
+- cancelling an order releases its reserve
+- filling an order consumes the reserve, creates a `TradeFill`, updates balances, and
+  records fees
+
+When `trigger` is absent, limit orders use exchange-like crossing rules:
+
+- buy fills when price moves at or below the order price
+- sell fills when price moves at or above the order price
+
+When `trigger` is present, it controls the crossing direction directly:
+
+- `trigger = "below"` fills when price moves at or below the order price
+- `trigger = "above"` fills when price moves at or above the order price
+
+This lets strategy-specific management represent stop-like orders without changing the
+ledger accounting model.
+
+Market orders are modeled as orders that are immediately filled on the same tick. If
+the leverage guard rejects the fill, the state rolls back and the order is cancelled.
+
+## Position Lots
+
+The position ledger is rebuilt by replaying fills in chronological order, then adding
+currently open orders as pending lots.
+
+Long lots:
+
+- come from filled buys that are not consumed by earlier short lots
+- store original quantity, remaining quantity, cost quote including fee, average price,
+  closed quantity, and allocated sell proceeds
+- close when later sells are allocated to them
+
+Short lots:
+
+- come from filled sells that are not consumed by earlier long lots
+- store original quantity, remaining quantity, proceeds quote after fee, average price,
+  closed quantity, and allocated buyback cost
+- close when later buys are allocated to them
+
+Open buy orders appear as pending long lots. Open sell orders appear as pending short
+lots. Pending lots use the limit price and estimated fee-adjusted quote amount so
+callers can see the break-even levels that would apply if the order fills. Pending lots
+are reported separately in ledger summary totals; they are not counted as active
+exposure until filled.
+
+## Fill Allocation
+
+Fill allocation is controlled by `targetPositionId` and `positionEffect`.
+
+- If `targetPositionId` is present, the fill first closes that specific lot.
+- If `positionEffect` is `open`, any remaining quantity opens a new lot even if
+  opposite-side lots exist.
+- Otherwise, the fill closes opposite-side lots in chronological order before any
+  leftover quantity opens a new lot.
+
+This gives callers two behaviors:
+
+- targeted closes, used by explicit close fills
+- ordinary netting, used when a non-targeted fill should reduce existing opposing
+  exposure before opening new exposure
+
+Callers can force a new lot with `positionEffect = "open"` or close a specific lot with
+`targetPositionId`.
+
+## Leverage and Borrowing
+
+The account does not model exchange margin buckets directly. It derives debt from
+balances and attributes that debt back to lots for inspection.
+
+Summary leverage uses external borrowed value:
+
+```text
+effective leverage = 1 + externalBorrowedQuote / equity
+```
+
+Lot leverage uses the portion of that lot's exposure that required external borrowing:
+
+```text
+lot leverage = exposureQuote / (exposureQuote - externalBorrowedQuote)
+```
+
+Borrow attribution distinguishes internal and external borrowing:
+
+- A short can borrow base internally from active long lots; any remaining borrowed base
+  is external.
+- A long can use owned quote capital first, then borrow quote internally from active
+  short proceeds, then borrow quote externally if the account quote balance is negative.
+- `externalBorrowedQuote` is the amount that counts toward effective leverage.
+- `internalBorrowedQuote` and `internalBorrowedQuantity` show how much opposing
+  position value is being reused inside the account model.
+
+The leverage guard runs after every fill. If estimated debt leverage is above
+`maxLeverage`, the bot rebuilds the full ledger and checks effective leverage. If the
+full ledger is still above the limit, the fill is rolled back and the order is
+cancelled with a leverage-limit reason.
+
+## Account Liquidation
+
+Backtests model liquidation at account level, not per position. The liquidation check
+uses aggregate balances, so long and short exposure can compensate for each other
+through net base and quote.
+
+For a net long account with borrowed quote:
+
+```text
+liquidation price = -quote balance / net base quantity
+```
+
+For a net short account with borrowed base:
+
+```text
+liquidation price = quote balance / -net base quantity
+```
+
+If replay price crosses that account liquidation price, the simulator cancels open
+orders, closes all active exposure at the liquidation price, marks the fills as
+liquidations, and records how many active ledger positions were liquidated. This is an
+equity-zero model; it does not include maintenance margin tiers or exchange-specific
+buffer rules.
+
+## Risk Fields
+
+The ledger mirrors the `sol` spreadsheet section from rows 111 onward. It computes
+break-even and suggested partial-close levels for each lot. These fields are advisory;
+the ledger does not execute the recommended risk actions by itself.
 
 Long lots use the spreadsheet recovery model:
 
@@ -34,14 +199,27 @@ buy-now quote = max(0, (remaining proceeds - upper baseline * remaining quantity
 can reach upper baseline = buy-now quote > 0 and buy-now quote < remaining proceeds and quantity is available
 ```
 
-The default quantity floor is `0.01`, matching the spreadsheet guard against divide-by-zero rows. Fee is the bot configured Binance fee. Slippage is a separate market-order estimate exposed in the UI.
+The default quantity floor is `0.01`, matching the spreadsheet guard against
+divide-by-zero rows. Fee is the bot configured Binance fee. Slippage is a separate
+market-order estimate.
 
-## Manual Table Actions
+## Workflow Boundaries
 
-The ledger table can record manual paper fills:
+Manual fills are represented by the same order and fill records as automated fills, with
+`manual: true`. They are replayed by the same ledger allocator and can create or close
+the same lot types.
 
-- `Long` records a manual buy fill and creates a long lot unless it closes an existing short.
-- `Short` records a manual sell fill and creates a short lot unless it closes an existing long.
-- row `Close` records the opposite-side fill against that specific lot id. Quantity is editable, so the same action supports partial closes.
+The operator controls for creating those fills are not part of the trading model. They are
+documented in [Manual Position Management](manual-position-management.md).
 
-Manual fills are stored as normal filled paper orders and trade fills with `manual: true`; they persist with the rest of the bot state and are replayed by the ledger allocator.
+Automated strategy management is also outside the neutral ledger model. The current
+strategy behavior is documented in
+[Automated Position Management](automated-position-management.md).
+
+## Known Gaps
+
+- Funding, borrow interest, exchange margin tiers, and maintenance margin are not
+  modeled yet.
+- The account-level average entry fields are aggregate conveniences. Per-lot behavior
+  comes from the fill-derived ledger.
+- Internal borrowing is an accounting attribution, not an exchange operation.

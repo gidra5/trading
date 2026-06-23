@@ -3,6 +3,7 @@ import type {
   BotStatus,
   BotMetrics,
   Candle,
+  LegacyExitGridMemory,
   LegacyValleyPeakMemory,
   ManualTradeInput,
   PaperBotState,
@@ -31,13 +32,13 @@ export const defaultStrategyConfig: StrategyConfig = {
   quoteAsset: "USDT",
   algorithm: "legacy-valley-peak",
   startingQuote: 10_000,
-  maxLeverage: 1,
+  maxLeverage: 5,
   feeBps: 7.5,
-  maxPositionQuote: 4_500,
+  maxPositionQuote: 50_000,
   limitOffsetBps: 2,
-  maxOpenOrders: 3,
+  maxOpenOrders: 24,
   cooldownMs: 30_000,
-  staleOrderMs: 180_000,
+  staleOrderMs: 30 * 24 * 60 * 60 * 1000,
   minOrderQuote: 25,
   legacyValleyPeak: defaultLegacyValleyPeakConfig,
   positionRisk: defaultPositionRiskConfig,
@@ -70,12 +71,38 @@ interface ImmediateFillRollback {
   sequence: number;
   ordersLength: number;
   fillsLength: number;
+  liquidatedPositionCount: number;
   metrics: BotMetrics;
+}
+
+interface ImmediateOrderResult {
+  order?: TradingOrder;
+  fill?: TradeFill;
+  cancelled?: TradingOrder;
+}
+
+interface LegacyExitGridLot {
+  id: string;
+  averagePrice: number;
+  originalQuantity: number;
+  remainingQuantity: number;
+  breakEvenSellPrice: number;
+}
+
+interface LegacyLongLotCache {
+  processedFillsLength: number;
+  lots: Map<string, LegacyTrackedLongLot>;
+}
+
+interface LegacyTrackedLongLot extends LegacyExitGridLot {
+  remainingCostQuote: number;
 }
 
 const roundAsset = (value: number) => Number(value.toFixed(8));
 const roundQuote = (value: number) => Number(value.toFixed(6));
 const NO_EVENTS: BotEvent[] = [];
+const MIN_BASE_QUANTITY = 0.00000001;
+const LEGACY_EXIT_GRID_REASON = "legacy exit grid";
 
 export function createStrategyConfig(
   overrides: PartialStrategyConfig = {},
@@ -163,6 +190,8 @@ export class SimulatedTradingBot {
   private state: PaperBotState;
   private openOrderIndexes = new Set<number>();
   private priceMemoryLimit = 0;
+  private legacyLongLotCache?: LegacyLongLotCache;
+  private liquidatedPositionCountValue = 0;
   private readonly reusableTick: PriceTick = {
     symbol: "",
     eventTime: 0,
@@ -175,6 +204,7 @@ export class SimulatedTradingBot {
       : createInitialBotState(overrides);
     this.priceMemoryLimit = priceMemoryLimit(this.state.config);
     this.reusableTick.symbol = this.state.symbol;
+    this.liquidatedPositionCountValue = countLiquidatedPositions(this.state.fills);
     this.rebuildOpenOrderIndex();
   }
 
@@ -189,6 +219,22 @@ export class SimulatedTradingBot {
   markToMarket(): Readonly<BotMetrics> {
     recalculateMetrics(this.state);
     return this.state.metrics;
+  }
+
+  accountLiquidationPrice(): number | undefined {
+    const quoteBalance = this.state.quoteFree + this.state.quoteReserved;
+    const baseQuantity = this.totalBase();
+    if (baseQuantity > MIN_BASE_QUANTITY && quoteBalance < 0) {
+      return roundQuote(-quoteBalance / baseQuantity);
+    }
+    if (baseQuantity < -MIN_BASE_QUANTITY && quoteBalance > 0) {
+      return roundQuote(quoteBalance / -baseQuantity);
+    }
+    return undefined;
+  }
+
+  liquidatedPositionCount(): number {
+    return this.liquidatedPositionCountValue;
   }
 
   setStatus(status: BotStatus, at = Date.now()): BotEvent[] {
@@ -216,6 +262,8 @@ export class SimulatedTradingBot {
     this.state.updatedAt = at;
     this.priceMemoryLimit = priceMemoryLimit(this.state.config);
     this.reusableTick.symbol = this.state.symbol;
+    this.legacyLongLotCache = undefined;
+    this.liquidatedPositionCountValue = 0;
     this.rebuildOpenOrderIndex();
     return [
       {
@@ -413,6 +461,9 @@ export class SimulatedTradingBot {
 
     this.cancelStaleOrders(eventTime, false);
     this.fillOpenOrders(tick, false);
+    if (this.liquidateAccountIfNeeded(eventTime, price, false)) {
+      return NO_EVENTS;
+    }
     this.rememberPrice(price);
 
     if (this.state.status === "running") {
@@ -449,9 +500,12 @@ export class SimulatedTradingBot {
       this.cancelStaleOrders(eventTime, collectEvents);
       this.fillOpenOrders(tick, collectEvents);
     }
+    const liquidated = options.simulateLiquidation
+      ? this.liquidateAccountIfNeeded(eventTime, price, collectEvents, events)
+      : false;
     this.rememberPrice(price);
 
-    if (this.state.status === "running") {
+    if (!liquidated && this.state.status === "running") {
       if (events) {
         events.push(...this.evaluateStrategy(tick, collectEvents));
       } else {
@@ -472,6 +526,10 @@ export class SimulatedTradingBot {
   private evaluateLegacyValleyPeakStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const config = this.state.config;
 
+    if (config.legacyValleyPeak.exitGridEnabled) {
+      return this.evaluateLegacyValleyPeakExitGridStrategy(tick, collectEvents);
+    }
+
     if (this.openOrderIndexes.size >= config.maxOpenOrders) {
       return [];
     }
@@ -481,6 +539,7 @@ export class SimulatedTradingBot {
     }
 
     const memory = this.ensureLegacyValleyPeakMemory();
+    const targetEntryLeverage = this.targetLongEntryLeverage(tick.price);
     const decision = evaluateLegacyValleyPeak(
       memory,
       config.legacyValleyPeak,
@@ -488,7 +547,7 @@ export class SimulatedTradingBot {
         eventTime: tick.eventTime,
         price: tick.price,
         feeRate: config.feeBps / 10_000,
-        quoteFree: this.state.quoteFree,
+        buyingPowerQuote: this.longEntryBuyingPowerQuote(tick.price, targetEntryLeverage),
         baseFree: this.state.baseFree,
         positionQuote: (this.state.baseFree + this.state.baseReserved) * tick.price,
         maxPositionQuote: config.maxPositionQuote,
@@ -526,6 +585,160 @@ export class SimulatedTradingBot {
     ];
   }
 
+  private evaluateLegacyValleyPeakExitGridStrategy(
+    tick: PriceTick,
+    collectEvents: boolean,
+  ): BotEvent[] {
+    const config = this.state.config;
+    const legacyConfig = config.legacyValleyPeak;
+    const memory = this.ensureLegacyValleyPeakMemory();
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+    const totalBase = this.totalBase();
+
+    if (
+      legacyConfig.exitGridPositionMode === "aggregate" &&
+      totalBase <= MIN_BASE_QUANTITY
+    ) {
+      delete memory.exitGrids?.["aggregate-long"];
+    }
+    this.updateLegacyExitGridPeaks(memory, tick.price);
+    const targetEntryLeverage = this.targetLongEntryLeverage(tick.price);
+
+    const decision = evaluateLegacyValleyPeak(
+      memory,
+      legacyConfig,
+      {
+        eventTime: tick.eventTime,
+        price: tick.price,
+        feeRate: config.feeBps / 10_000,
+        buyingPowerQuote: this.longEntryBuyingPowerQuote(tick.price, targetEntryLeverage),
+        baseFree: totalBase,
+        positionQuote: totalBase * tick.price,
+        maxPositionQuote: config.maxPositionQuote,
+      },
+    );
+
+    if (decision.signal === "buy") {
+      if (
+        legacyConfig.exitGridPositionMode === "aggregate" &&
+        totalBase > MIN_BASE_QUANTITY
+      ) {
+        this.state.memory.lastSignal = "buy";
+        return events ?? NO_EVENTS;
+      }
+      if (
+        this.openOrderIndexes.size >= config.maxOpenOrders ||
+        tick.eventTime - this.state.memory.lastActionAt < config.cooldownMs
+      ) {
+        return events ?? NO_EVENTS;
+      }
+
+      if (legacyConfig.exitGridMarketEntry) {
+        const result = this.createMarketBuyOrder(
+          tick.price,
+          tick.eventTime,
+          decision.reason,
+          decision.quoteSize,
+        );
+        if (!result.order) {
+          return events ?? NO_EVENTS;
+        }
+
+        this.state.memory.lastSignal = "buy";
+        this.state.memory.lastActionAt = tick.eventTime;
+        this.syncLegacyExitGridMemories(
+          memory,
+          this.activeLegacyLongLots(tick.price),
+          tick.price,
+        );
+
+        if (events) {
+          events.push(...this.immediateOrderEvents("BUY", result, tick.eventTime));
+        }
+        return events ?? NO_EVENTS;
+      }
+
+      const order = this.createBuyOrder(
+        tick.price,
+        tick.eventTime,
+        decision.reason,
+        decision.quoteSize,
+      );
+      if (!order) {
+        return events ?? NO_EVENTS;
+      }
+      order.positionEffect = "open";
+
+      this.state.memory.lastSignal = "buy";
+      this.state.memory.lastActionAt = tick.eventTime;
+      if (events) {
+        events.push({
+          type: "order_created",
+          at: tick.eventTime,
+          message: `BUY limit order created: ${decision.reason}`,
+          order: structuredClone(order),
+        });
+      }
+      return events ?? NO_EVENTS;
+    }
+
+    if (decision.signal !== "sell") {
+      this.state.memory.lastSignal = decision.signal;
+      return events ?? NO_EVENTS;
+    }
+
+    if (tick.eventTime - this.state.memory.lastActionAt < config.cooldownMs) {
+      return events ?? NO_EVENTS;
+    }
+
+    const activeLongs = this.activeLegacyLongLots(tick.price);
+    this.syncLegacyExitGridMemories(memory, activeLongs, tick.price);
+
+    const orders: TradingOrder[] = [];
+    for (const lot of activeLongs) {
+      const grid = this.ensureLegacyExitGrid(memory, lot, tick.price);
+      grid.peakPrice = Math.max(grid.peakPrice, tick.price);
+
+      const resetPeakPrice = this.legacyExitGridResetPeakPrice(grid, lot, tick.price);
+      if (resetPeakPrice === undefined) {
+        continue;
+      }
+      grid.peakPrice = resetPeakPrice;
+
+      if (events) {
+        events.push(...this.cancelLegacyExitGridOrders(tick.eventTime, true, lot.id));
+      } else {
+        this.cancelLegacyExitGridOrders(tick.eventTime, false, lot.id);
+      }
+
+      orders.push(...this.createLegacyExitGridOrders(grid, lot, tick.eventTime));
+      if (this.openOrderIndexes.size >= config.maxOpenOrders) {
+        break;
+      }
+    }
+
+    if (orders.length === 0) {
+      this.state.memory.lastSignal = "sell";
+      return events ?? NO_EVENTS;
+    }
+
+    this.state.memory.lastSignal = "sell";
+    this.state.memory.lastActionAt = tick.eventTime;
+
+    if (events) {
+      for (const order of orders) {
+        events.push({
+          type: "order_created",
+          at: tick.eventTime,
+          message: `SELL exit grid order created at ${order.price}`,
+          order: structuredClone(order),
+        });
+      }
+    }
+
+    return events ?? NO_EVENTS;
+  }
+
   private createBuyOrder(
     marketPrice: number,
     createdAt: number,
@@ -533,10 +746,8 @@ export class SimulatedTradingBot {
     desiredQuoteSize: number,
   ): TradingOrder | undefined {
     const config = this.state.config;
-    const positionQuote = (this.state.baseFree + this.state.baseReserved) * marketPrice;
-    const remainingPositionQuote = Math.max(0, config.maxPositionQuote - positionQuote);
-    const availableQuote = Math.max(0, this.state.quoteFree * 0.98);
-    const quoteSize = Math.min(desiredQuoteSize, remainingPositionQuote, availableQuote);
+    const availableQuote = this.longEntryBuyingPowerQuote(marketPrice);
+    const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
     if (quoteSize < config.minOrderQuote) {
       return undefined;
@@ -547,7 +758,7 @@ export class SimulatedTradingBot {
     const quantity = roundAsset(quoteSize / price);
     const estimatedQuoteCost = roundQuote(quantity * price * (1 + feeRate));
 
-    if (estimatedQuoteCost > this.state.quoteFree || quantity <= 0) {
+    if (quantity <= 0) {
       return undefined;
     }
 
@@ -589,6 +800,94 @@ export class SimulatedTradingBot {
     return order;
   }
 
+  private createMarketBuyOrder(
+    marketPrice: number,
+    createdAt: number,
+    reason: string,
+    desiredQuoteSize: number,
+  ): ImmediateOrderResult {
+    const config = this.state.config;
+    const availableQuote = this.longEntryBuyingPowerQuote(marketPrice);
+    const quoteSize = Math.min(desiredQuoteSize, availableQuote);
+
+    if (quoteSize < config.minOrderQuote) {
+      return {};
+    }
+
+    const price = roundQuote(marketPrice);
+    const feeRate = config.feeBps / 10_000;
+    const quantity = roundAsset(quoteSize / price);
+    const estimatedQuoteCost = roundQuote(quantity * price * (1 + feeRate));
+
+    if (quantity <= 0) {
+      return {};
+    }
+
+    this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
+    this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+
+    const order = this.buildOrder(
+      "buy",
+      price,
+      quantity,
+      estimatedQuoteCost,
+      createdAt,
+      reason,
+      "market",
+    );
+    const index = this.state.orders.length;
+    order.positionEffect = "open";
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(index);
+
+    const result = this.tryFillOrder(order, index, createdAt);
+    return {
+      order: this.state.orders[index],
+      fill: result.fill,
+      cancelled: result.cancelled,
+    };
+  }
+
+  private createTriggeredSellOrder(
+    price: number,
+    quantity: number,
+    createdAt: number,
+    reason: string,
+    targetPositionId?: string,
+  ): TradingOrder | undefined {
+    const roundedQuantity = roundAsset(quantity);
+    const quoteSize = roundedQuantity * price;
+
+    if (
+      roundedQuantity <= 0 ||
+      quoteSize < this.state.config.minOrderQuote ||
+      roundedQuantity > this.state.baseFree
+    ) {
+      return undefined;
+    }
+
+    this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
+    this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+
+    const order = this.buildOrder(
+      "sell",
+      roundQuote(price),
+      roundedQuantity,
+      0,
+      createdAt,
+      reason,
+      "limit",
+      "below",
+    );
+    if (targetPositionId) {
+      order.targetPositionId = targetPositionId;
+      order.positionEffect = "close";
+    }
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(this.state.orders.length - 1);
+    return order;
+  }
+
   private buildOrder(
     side: "buy" | "sell",
     price: number,
@@ -596,12 +895,15 @@ export class SimulatedTradingBot {
     estimatedQuoteCost: number,
     createdAt: number,
     reason: string,
+    type: "limit" | "market" = "limit",
+    trigger?: "above" | "below",
   ): TradingOrder {
     const id = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
     return {
       id,
       side,
-      type: "limit",
+      type,
+      trigger,
       status: "open",
       price,
       quantity,
@@ -615,6 +917,416 @@ export class SimulatedTradingBot {
     };
   }
 
+  private immediateOrderEvents(
+    side: "BUY" | "SELL",
+    result: ImmediateOrderResult,
+    at: number,
+  ): BotEvent[] {
+    if (result.fill && result.order) {
+      return [
+        {
+          type: "order_filled",
+          at,
+          message: `${side} market order filled at ${result.order.price}`,
+          order: structuredClone(result.order),
+          fill: structuredClone(result.fill),
+        },
+      ];
+    }
+
+    if (result.cancelled) {
+      return [
+        {
+          type: "order_cancelled",
+          at,
+          message: `${side} market order cancelled by leverage limit`,
+          order: structuredClone(result.cancelled),
+        },
+      ];
+    }
+
+    return [];
+  }
+
+  private activeLegacyLongLots(price: number): LegacyExitGridLot[] {
+    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+      const totalBase = this.totalBase();
+      const averagePrice = cleanPositive(this.state.avgEntryPrice) || price;
+      if (totalBase <= MIN_BASE_QUANTITY || averagePrice <= 0) {
+        return [];
+      }
+
+      const feeRate = this.state.config.feeBps / 10_000;
+      return [
+        {
+          id: "aggregate-long",
+          averagePrice,
+          originalQuantity: totalBase,
+          remainingQuantity: totalBase,
+          breakEvenSellPrice: averagePrice / Math.max(0.000001, 1 - feeRate),
+        },
+      ];
+    }
+
+    this.updateLegacyLongLotCache();
+    const lots = this.legacyLongLotCache?.lots.values() ?? [];
+    return [...lots].filter((lot) => lot.remainingQuantity > MIN_BASE_QUANTITY);
+  }
+
+  private updateLegacyLongLotCache(): void {
+    const feeAndSlippageRate =
+      (this.state.config.feeBps + this.state.config.positionRisk.marketSlippageBps) / 10_000;
+    const quantityFloor = Math.max(MIN_BASE_QUANTITY, this.state.config.positionRisk.quantityFloor);
+
+    if (
+      !this.legacyLongLotCache ||
+      this.legacyLongLotCache.processedFillsLength > this.state.fills.length
+    ) {
+      this.legacyLongLotCache = {
+        processedFillsLength: 0,
+        lots: new Map(),
+      };
+    }
+
+    const cache = this.legacyLongLotCache;
+    for (
+      let index = cache.processedFillsLength;
+      index < this.state.fills.length;
+      index += 1
+    ) {
+      const fill = this.state.fills[index];
+      if (fill.side === "buy") {
+        if (fill.positionEffect !== "open") {
+          continue;
+        }
+
+        const costQuote = roundQuote(fill.quoteQuantity + fill.feeQuote);
+        const averagePrice = roundQuote(costQuote / fill.quantity);
+        cache.lots.set(`long_${fill.id}`, {
+          id: `long_${fill.id}`,
+          averagePrice,
+          originalQuantity: fill.quantity,
+          remainingQuantity: fill.quantity,
+          remainingCostQuote: costQuote,
+          breakEvenSellPrice: roundQuote(
+            (costQuote / Math.max(fill.quantity, quantityFloor)) * (1 + feeAndSlippageRate),
+          ),
+        });
+        continue;
+      }
+
+      if (fill.side !== "sell" || fill.positionEffect === "open") {
+        continue;
+      }
+
+      this.closeLegacyTrackedLongLots(cache, fill, feeAndSlippageRate, quantityFloor);
+    }
+
+    cache.processedFillsLength = this.state.fills.length;
+  }
+
+  private closeLegacyTrackedLongLots(
+    cache: LegacyLongLotCache,
+    fill: TradeFill,
+    feeAndSlippageRate: number,
+    quantityFloor: number,
+  ): void {
+    let quantityLeft = fill.quantity;
+    const unitProceeds = (fill.quoteQuantity - fill.feeQuote) / fill.quantity;
+    const targets = fill.targetPositionId
+      ? [cache.lots.get(fill.targetPositionId)].filter(
+          (lot): lot is LegacyTrackedLongLot => lot !== undefined,
+        )
+      : [...cache.lots.values()];
+
+    for (const lot of targets) {
+      if (quantityLeft <= MIN_BASE_QUANTITY) {
+        break;
+      }
+
+      const quantity = Math.min(quantityLeft, lot.remainingQuantity);
+      if (quantity <= MIN_BASE_QUANTITY) {
+        continue;
+      }
+
+      lot.remainingQuantity = roundAsset(lot.remainingQuantity - quantity);
+      lot.remainingCostQuote = roundQuote(lot.remainingCostQuote - quantity * unitProceeds);
+      lot.breakEvenSellPrice =
+        lot.remainingQuantity > MIN_BASE_QUANTITY
+          ? roundQuote(
+              (lot.remainingCostQuote / Math.max(lot.remainingQuantity, quantityFloor)) *
+                (1 + feeAndSlippageRate),
+            )
+          : 0;
+      quantityLeft = roundAsset(quantityLeft - quantity);
+
+      if (lot.remainingQuantity <= MIN_BASE_QUANTITY) {
+        cache.lots.delete(lot.id);
+      }
+    }
+  }
+
+  private updateLegacyExitGridPeaks(
+    memory: LegacyValleyPeakMemory,
+    price: number,
+  ): void {
+    for (const grid of Object.values(memory.exitGrids ?? {})) {
+      grid.peakPrice = Math.max(grid.peakPrice, price);
+    }
+  }
+
+  private syncLegacyExitGridMemories(
+    memory: LegacyValleyPeakMemory,
+    lots: LegacyExitGridLot[],
+    price: number,
+  ): void {
+    const grids = (memory.exitGrids ??= {});
+    const activeLotIds = new Set(lots.map((lot) => lot.id));
+    const openGridIds = new Map<string, string[]>();
+    for (const { order } of this.openLegacyExitGridOrders()) {
+      if (!order.targetPositionId) {
+        continue;
+      }
+      const ids = openGridIds.get(order.targetPositionId) ?? [];
+      ids.push(order.id);
+      openGridIds.set(order.targetPositionId, ids);
+    }
+
+    for (const lotId of Object.keys(grids)) {
+      if (!activeLotIds.has(lotId)) {
+        delete grids[lotId];
+        continue;
+      }
+      grids[lotId].gridOrderIds = grids[lotId].gridOrderIds.filter((id) =>
+        (openGridIds.get(lotId) ?? []).includes(id),
+      );
+    }
+
+    for (const lot of lots) {
+      const grid = this.ensureLegacyExitGrid(memory, lot, price);
+      grid.peakPrice = Math.max(grid.peakPrice, price);
+      grid.gridOrderIds = openGridIds.get(lot.id) ?? grid.gridOrderIds;
+    }
+  }
+
+  private ensureLegacyExitGrid(
+    memory: LegacyValleyPeakMemory,
+    lot: LegacyExitGridLot,
+    price: number,
+  ): LegacyExitGridMemory {
+    const grids = (memory.exitGrids ??= {});
+    let grid = grids[lot.id];
+    if (!grid) {
+      const entryPrice = cleanPositive(lot.averagePrice) || price;
+      grid = {
+        lotId: lot.id,
+        entryPrice,
+        entryQuantity: lot.originalQuantity,
+        peakPrice: Math.max(entryPrice, price),
+        gridPeakPrice: 0,
+        gridOrderIds: [],
+      };
+      grids[lot.id] = grid;
+    }
+    return grid;
+  }
+
+  private legacyExitGridResetPeakPrice(
+    grid: LegacyExitGridMemory,
+    lot: LegacyExitGridLot,
+    currentPrice: number,
+  ): number | undefined {
+    const config = this.state.config.legacyValleyPeak;
+    const breakEvenSellPrice = Math.max(lot.breakEvenSellPrice, grid.entryPrice);
+    const minimumPeakPrice = breakEvenSellPrice * (1 + config.exitGridMinProfitBps / 10_000);
+    const peakPrice = Math.max(grid.peakPrice, currentPrice);
+
+    if (grid.gridOrderIds.length === 0 || grid.gridPeakPrice <= 0) {
+      return peakPrice > minimumPeakPrice ? peakPrice : undefined;
+    }
+
+    if (
+      config.exitGridResetMode === "higher-peak" &&
+      peakPrice >= grid.gridPeakPrice * (1 + config.exitGridResetBps / 10_000)
+    ) {
+      return peakPrice > minimumPeakPrice ? peakPrice : undefined;
+    }
+
+    if (
+      config.exitGridResetMode === "filled-grid" &&
+      this.hasCrossedFilledLegacyExitGridPoint(lot.id, currentPrice)
+    ) {
+      return currentPrice > minimumPeakPrice ? currentPrice : undefined;
+    }
+
+    return undefined;
+  }
+
+  private hasCrossedFilledLegacyExitGridPoint(lotId: string, peakPrice: number): boolean {
+    return this.state.orders.some(
+      (order) =>
+        order.status === "filled" &&
+        order.targetPositionId === lotId &&
+        order.reason.startsWith(LEGACY_EXIT_GRID_REASON) &&
+        peakPrice > order.price,
+    );
+  }
+
+  private createLegacyExitGridOrders(
+    grid: LegacyExitGridMemory,
+    lot: LegacyExitGridLot,
+    createdAt: number,
+  ): TradingOrder[] {
+    const config = this.state.config;
+    const legacyConfig = config.legacyValleyPeak;
+    const lowerPrice = roundQuote(Math.max(lot.breakEvenSellPrice, grid.entryPrice));
+    const upperPrice = roundQuote(Math.max(grid.peakPrice, lowerPrice));
+    const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
+    const orderCount = Math.min(legacyConfig.exitGridOrderCount, availableSlots);
+    const availableQuantity = Math.min(lot.remainingQuantity, this.state.baseFree);
+
+    if (orderCount <= 0 || upperPrice <= lowerPrice || availableQuantity <= MIN_BASE_QUANTITY) {
+      return [];
+    }
+
+    const orders: TradingOrder[] = [];
+    let remainingQuantity = availableQuantity;
+
+    for (let index = 0; index < orderCount; index += 1) {
+      const price = this.legacyExitGridOrderPrice(
+        index,
+        orderCount,
+        lowerPrice,
+        upperPrice,
+      );
+      const desiredQuantity = this.legacyExitGridOrderQuantity(
+        index,
+        orderCount,
+        remainingQuantity,
+      );
+      const quantity = roundAsset(Math.min(remainingQuantity, desiredQuantity));
+
+      if (quantity <= MIN_BASE_QUANTITY) {
+        break;
+      }
+      if (quantity * price < config.minOrderQuote) {
+        if (index === orderCount - 1 && orders.length === 0) {
+          break;
+        }
+        continue;
+      }
+
+      const order = this.createTriggeredSellOrder(
+        price,
+        quantity,
+        createdAt,
+        `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; peak ${upperPrice}`,
+        lot.id,
+      );
+      if (!order) {
+        break;
+      }
+
+      orders.push(order);
+      remainingQuantity = roundAsset(remainingQuantity - quantity);
+      if (remainingQuantity <= MIN_BASE_QUANTITY) {
+        break;
+      }
+    }
+
+    grid.gridPeakPrice = upperPrice;
+    grid.gridOrderIds = orders.map((order) => order.id);
+    return orders;
+  }
+
+  private legacyExitGridOrderPrice(
+    index: number,
+    orderCount: number,
+    lowerPrice: number,
+    upperPrice: number,
+  ): number {
+    if (orderCount <= 1) {
+      return lowerPrice;
+    }
+
+    const progress = index / Math.max(1, orderCount - 1);
+    if (
+      this.state.config.legacyValleyPeak.exitGridPriceDistribution === "geometric" &&
+      lowerPrice > 0 &&
+      upperPrice > lowerPrice
+    ) {
+      return roundQuote(upperPrice * Math.pow(lowerPrice / upperPrice, progress));
+    }
+
+    return roundQuote(upperPrice - (upperPrice - lowerPrice) * progress);
+  }
+
+  private legacyExitGridOrderQuantity(
+    index: number,
+    orderCount: number,
+    remainingQuantity: number,
+  ): number {
+    if (index >= orderCount - 1) {
+      return remainingQuantity;
+    }
+
+    const config = this.state.config.legacyValleyPeak;
+    const slotsLeft = Math.max(1, orderCount - index);
+    if (config.exitGridSizeDistribution === "constant") {
+      return remainingQuantity / slotsLeft;
+    }
+
+    if (config.exitGridSizeDistribution === "linear") {
+      const remainingWeight = (slotsLeft * (slotsLeft + 1)) / 2;
+      return remainingQuantity * (slotsLeft / remainingWeight);
+    }
+
+    return remainingQuantity * config.exitGridSellFraction;
+  }
+
+  private cancelLegacyExitGridOrders(
+    at: number,
+    collectEvents: boolean,
+    lotId?: string,
+  ): BotEvent[] {
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+
+    for (const { index, order } of this.openLegacyExitGridOrders(lotId)) {
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = at;
+      order.updatedAt = at;
+      order.reason = `${order.reason}; reset`;
+      this.openOrderIndexes.delete(index);
+
+      if (events) {
+        events.push({
+          type: "order_cancelled",
+          at,
+          message: `SELL exit grid order cancelled for reset`,
+          order: structuredClone(order),
+        });
+      }
+    }
+
+    return events ?? NO_EVENTS;
+  }
+
+  private openLegacyExitGridOrders(lotId?: string): Array<{ index: number; order: TradingOrder }> {
+    const orders: Array<{ index: number; order: TradingOrder }> = [];
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (
+        order?.status === "open" &&
+        order.reason.startsWith(LEGACY_EXIT_GRID_REASON) &&
+        (!lotId || order.targetPositionId === lotId)
+      ) {
+        orders.push({ index, order });
+      }
+    }
+    return orders;
+  }
+
   private fillOpenOrders(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
 
@@ -625,8 +1337,8 @@ export class SimulatedTradingBot {
         continue;
       }
 
-      const canFill =
-        order.side === "buy" ? tick.price <= order.price : tick.price >= order.price;
+      const trigger = order.trigger ?? (order.side === "buy" ? "below" : "above");
+      const canFill = trigger === "below" ? tick.price <= order.price : tick.price >= order.price;
 
       if (!canFill) {
         continue;
@@ -666,13 +1378,16 @@ export class SimulatedTradingBot {
     order: TradingOrder,
     index: number,
     filledAt: number,
+    skipLeverageCheck = false,
   ): { fill?: TradeFill; cancelled?: TradingOrder } {
     const rollback = this.captureImmediateFillRollback();
     const orderBeforeFill = { ...order };
 
     try {
       const fill = this.fillOrder(order, index, filledAt);
-      this.assertLeverageLimit();
+      if (!skipLeverageCheck) {
+        this.assertLeverageLimit();
+      }
       return { fill };
     } catch (error) {
       if (!isLeverageLimitError(error)) {
@@ -724,8 +1439,9 @@ export class SimulatedTradingBot {
         Math.max(0, this.state.baseReserved - order.quantity),
       );
       const proceeds = roundQuote(quoteQuantity - feeQuote);
+      const entryPrice = this.longEntryPriceForCloseOrder(order);
       this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
-      realizedPnl = roundQuote((order.price - this.state.avgEntryPrice) * order.quantity - feeQuote);
+      realizedPnl = roundQuote((order.price - entryPrice) * order.quantity - feeQuote);
       this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
 
       if (realizedPnl > 0) {
@@ -766,10 +1482,196 @@ export class SimulatedTradingBot {
       targetPositionId: order.targetPositionId,
       positionEffect: order.positionEffect,
       manual: order.manual,
+      liquidation: order.liquidation,
+      liquidatedPositionCount: order.liquidatedPositionCount,
     };
     this.state.fills.push(fill);
+    if (fill.liquidation) {
+      this.liquidatedPositionCountValue += Math.max(
+        1,
+        fill.liquidatedPositionCount ?? 1,
+      );
+    }
 
     return fill;
+  }
+
+  private liquidateAccountIfNeeded(
+    at: number,
+    price: number,
+    collectEvents: boolean,
+    existingEvents?: BotEvent[],
+  ): boolean {
+    const liquidationPrice = this.accountLiquidationPrice();
+    if (!liquidationPrice || !Number.isFinite(liquidationPrice) || liquidationPrice <= 0) {
+      return false;
+    }
+
+    const baseQuantity = this.totalBase();
+    const crossed =
+      baseQuantity > MIN_BASE_QUANTITY
+        ? price <= liquidationPrice
+        : baseQuantity < -MIN_BASE_QUANTITY
+          ? price >= liquidationPrice
+          : false;
+    if (!crossed) {
+      return false;
+    }
+
+    const events = existingEvents ?? (collectEvents ? [] : undefined);
+    const positions = analyzePositions(this.state, { currentPrice: liquidationPrice });
+    const activeLongs = positions.longs.filter(
+      (lot) => lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
+    );
+    const activeShorts = positions.shorts.filter(
+      (lot) => lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
+    );
+    if (activeLongs.length === 0 && activeShorts.length === 0) {
+      return false;
+    }
+
+    this.cancelAllOpenOrdersForLiquidation(at, events);
+
+    const shortQuantity = roundAsset(
+      activeShorts.reduce((quantity, lot) => quantity + lot.remainingQuantity, 0),
+    );
+    const longQuantity = roundAsset(
+      activeLongs.reduce((quantity, lot) => quantity + lot.remainingQuantity, 0),
+    );
+
+    if (shortQuantity > MIN_BASE_QUANTITY) {
+      const result = this.createLiquidationMarketOrder(
+        "buy",
+        liquidationPrice,
+        shortQuantity,
+        activeShorts.length,
+        at,
+      );
+      if (result && events) {
+        events.push(result);
+      }
+    }
+
+    if (longQuantity > MIN_BASE_QUANTITY) {
+      const result = this.createLiquidationMarketOrder(
+        "sell",
+        liquidationPrice,
+        longQuantity,
+        activeLongs.length,
+        at,
+      );
+      if (result && events) {
+        events.push(result);
+      }
+    }
+
+    const memory = this.state.memory.legacyValleyPeak;
+    if (memory?.exitGrids) {
+      memory.exitGrids = {};
+    }
+    recalculateMetrics(this.state);
+    return true;
+  }
+
+  private cancelAllOpenOrdersForLiquidation(
+    at: number,
+    events: BotEvent[] | undefined,
+  ): void {
+    for (const index of [...this.openOrderIndexes]) {
+      const order = this.state.orders[index];
+      if (order?.status !== "open") {
+        this.openOrderIndexes.delete(index);
+        continue;
+      }
+
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = at;
+      order.updatedAt = at;
+      order.reason = `${order.reason}; account liquidation`;
+      this.openOrderIndexes.delete(index);
+
+      if (events) {
+        events.push({
+          type: "order_cancelled",
+          at,
+          message: `${order.side.toUpperCase()} order cancelled by account liquidation`,
+          order: structuredClone(order),
+        });
+      }
+    }
+  }
+
+  private createLiquidationMarketOrder(
+    side: "buy" | "sell",
+    price: number,
+    quantity: number,
+    liquidatedPositionCount: number,
+    at: number,
+  ): BotEvent | undefined {
+    const roundedQuantity = roundAsset(quantity);
+    if (roundedQuantity <= MIN_BASE_QUANTITY || price <= 0) {
+      return undefined;
+    }
+
+    const feeRate = this.state.config.feeBps / 10_000;
+    const quoteQuantity = roundQuote(price * roundedQuantity);
+    const estimatedQuoteCost =
+      side === "buy" ? roundQuote(quoteQuantity * (1 + feeRate)) : 0;
+
+    if (side === "buy") {
+      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
+      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    } else {
+      this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
+      this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+    }
+
+    const order = this.buildOrder(
+      side,
+      price,
+      roundedQuantity,
+      estimatedQuoteCost,
+      at,
+      "account liquidation",
+      "market",
+    );
+    order.positionEffect = "close";
+    order.liquidation = true;
+    order.liquidatedPositionCount = liquidatedPositionCount;
+
+    const index = this.state.orders.length;
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(index);
+    const result = this.tryFillOrder(order, index, at, true);
+    if (!result.fill) {
+      return undefined;
+    }
+
+    return {
+      type: "order_filled",
+      at,
+      message: `${side.toUpperCase()} liquidation order filled at ${price}`,
+      order: structuredClone(this.state.orders[index]),
+      fill: structuredClone(result.fill),
+    };
+  }
+
+  private longEntryPriceForCloseOrder(order: TradingOrder): number {
+    if (!order.targetPositionId) {
+      return this.state.avgEntryPrice;
+    }
+
+    const cachedLot = this.legacyLongLotCache?.lots.get(order.targetPositionId);
+    if (cachedLot) {
+      return cachedLot.averagePrice;
+    }
+
+    const target = analyzePositions(this.state, {
+      currentPrice: this.state.lastPrice || order.price,
+    }).longs.find((lot) => lot.id === order.targetPositionId);
+
+    return cleanPositive(target?.averagePrice) || this.state.avgEntryPrice;
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
@@ -826,6 +1728,55 @@ export class SimulatedTradingBot {
     );
   }
 
+  private totalBase(): number {
+    return this.state.baseFree + this.state.baseReserved;
+  }
+
+  private pendingLongEntryQuote(): number {
+    let pendingQuote = 0;
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (order?.status === "open" && order.side === "buy") {
+        pendingQuote += order.price * order.quantity;
+      }
+    }
+    return roundQuote(pendingQuote);
+  }
+
+  private targetLongEntryLeverage(_marketPrice: number): number {
+    return clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+  }
+
+  private longEntryBuyingPowerQuote(
+    marketPrice: number,
+    targetEntryLeverage = this.targetLongEntryLeverage(marketPrice),
+  ): number {
+    const config = this.state.config;
+    const equity = this.equityAt(marketPrice);
+    if (equity <= 0 || marketPrice <= 0) {
+      return 0;
+    }
+
+    const feeRate = config.feeBps / 10_000;
+    const longExposureQuote = Math.max(0, this.totalBase() * marketPrice);
+    const pendingLongEntryQuote = this.pendingLongEntryQuote();
+    const positionCapacity = Math.max(
+      0,
+      config.maxPositionQuote - longExposureQuote - pendingLongEntryQuote,
+    );
+    const leverageCapacity = Math.max(
+      0,
+      (
+        targetEntryLeverage * equity -
+        longExposureQuote -
+        pendingLongEntryQuote * (1 + targetEntryLeverage * feeRate)
+      ) /
+        (1 + targetEntryLeverage * feeRate),
+    );
+
+    return roundQuote(Math.min(positionCapacity, leverageCapacity));
+  }
+
   private captureImmediateFillRollback(): ImmediateFillRollback {
     return {
       quoteFree: this.state.quoteFree,
@@ -843,6 +1794,7 @@ export class SimulatedTradingBot {
       sequence: this.state.sequence,
       ordersLength: this.state.orders.length,
       fillsLength: this.state.fills.length,
+      liquidatedPositionCount: this.liquidatedPositionCountValue,
       metrics: { ...this.state.metrics },
     };
   }
@@ -863,6 +1815,7 @@ export class SimulatedTradingBot {
     this.state.sequence = rollback.sequence;
     this.state.orders.length = rollback.ordersLength;
     this.state.fills.length = rollback.fillsLength;
+    this.liquidatedPositionCountValue = rollback.liquidatedPositionCount;
     this.state.metrics = rollback.metrics;
   }
 
@@ -1094,6 +2047,14 @@ function emptyMetrics(startingQuote: number): BotMetrics {
     maxDrawdownPct: 0,
     exposurePct: 0,
   };
+}
+
+function countLiquidatedPositions(fills: readonly TradeFill[]): number {
+  return fills.reduce(
+    (count, fill) =>
+      fill.liquidation ? count + Math.max(1, fill.liquidatedPositionCount ?? 1) : count,
+    0,
+  );
 }
 
 function cleanPositive(value: number | undefined): number {

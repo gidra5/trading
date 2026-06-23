@@ -11,7 +11,13 @@ import {
   type StrategyAlgorithm,
 } from "../packages/bot-algo/src/index.js";
 
-type BenchmarkMode = "days" | "year" | "random-lengths" | "grid-search" | "portfolio";
+type BenchmarkMode =
+  | "days"
+  | "year"
+  | "random-lengths"
+  | "grid-search"
+  | "portfolio"
+  | "synthetic";
 
 interface BenchmarkArgs {
   mode: BenchmarkMode;
@@ -32,6 +38,12 @@ interface BenchmarkArgs {
   portfolioRebalanceCandles: number;
   portfolioGrossLeverage: number;
   portfolioTargetVolPct: number;
+  syntheticCandles: number;
+  syntheticStartPrice: number;
+  syntheticFrequency: number;
+  syntheticAmplitude: number;
+  syntheticTrend: number;
+  syntheticNoise: number;
   seed: number;
   only?: string;
   symbols?: string[];
@@ -65,6 +77,12 @@ interface BenchmarkMetrics {
   riskAdjustedReturn: number | undefined;
   sharpeRatio: number | undefined;
   perfectCapturePct: number | undefined;
+  perfectCompoundedReturnPct: number | undefined;
+  perfectCompoundedCapturePct: number | undefined;
+  closedPositionCount: number;
+  profitableClosedPositionCount: number;
+  profitableClosedPositionRate: number;
+  liquidatedPositionCount: number;
 }
 
 interface SingleBenchmarkRow extends BenchmarkMetrics {
@@ -85,6 +103,11 @@ interface RandomBenchmarkRow {
   avgRiskAdjustedReturn: number | undefined;
   avgSharpeRatio: number | undefined;
   avgPerfectCapturePct: number | undefined;
+  avgPerfectCompoundedCapturePct: number | undefined;
+  avgClosedPositionCount: number;
+  avgProfitableClosedPositionCount: number;
+  avgProfitableClosedPositionRate: number;
+  avgLiquidatedPositionCount: number;
   bestReturnPct: number;
   worstReturnPct: number;
 }
@@ -105,6 +128,11 @@ interface GridSearchRow {
   avgRiskAdjustedReturn: number | undefined;
   avgSharpeRatio: number | undefined;
   avgPerfectCapturePct: number | undefined;
+  avgPerfectCompoundedCapturePct: number | undefined;
+  avgClosedPositionCount: number;
+  avgProfitableClosedPositionCount: number;
+  avgProfitableClosedPositionRate: number;
+  avgLiquidatedPositionCount: number;
   avgMaxDrawdownPct: number;
   avgTradeCount: number;
   worstReturnPct: number;
@@ -143,28 +171,48 @@ const FULL_BTC_CYCLE_DAYS = YEAR_DAYS * 5;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const args = parseArgs(process.argv.slice(2));
-const files = historicalCandleFiles(args);
+if (args.mode === "synthetic") {
+  const cases = selectBenchmarkCases(args.only);
+  runSyntheticMode(args, cases);
+} else {
+  const files = historicalCandleFiles(args);
 
-if (files.length === 0) {
-  const searched = historicalCandleDirCandidates(args)
-    .map((dir) => path.relative(repoRoot, dir))
-    .join(", ");
-  throw new Error(
-    `No candles found for ${args.symbol.toUpperCase()} ${args.interval}. Searched: ${searched}.`,
-  );
+  if (files.length === 0) {
+    const searched = historicalCandleDirCandidates(args)
+      .map((dir) => path.relative(repoRoot, dir))
+      .join(", ");
+    throw new Error(
+      `No candles found for ${args.symbol.toUpperCase()} ${args.interval}. Searched: ${searched}.`,
+    );
+  }
+
+  if (args.mode === "random-lengths") {
+    const cases = selectBenchmarkCases(args.only);
+    runRandomLengthMode(args, files, cases);
+  } else if (args.mode === "grid-search") {
+    runGridSearchMode(args, files);
+  } else if (args.mode === "portfolio") {
+    const cases = selectBenchmarkCases(args.only);
+    runPortfolioMode(args, files, cases);
+  } else {
+    const cases = selectBenchmarkCases(args.only);
+    runSingleWindowMode(args, files, cases);
+  }
 }
 
-if (args.mode === "random-lengths") {
-  const cases = selectBenchmarkCases(args.only);
-  runRandomLengthMode(args, files, cases);
-} else if (args.mode === "grid-search") {
-  runGridSearchMode(args, files);
-} else if (args.mode === "portfolio") {
-  const cases = selectBenchmarkCases(args.only);
-  runPortfolioMode(args, files, cases);
-} else {
-  const cases = selectBenchmarkCases(args.only);
-  runSingleWindowMode(args, files, cases);
+function runSyntheticMode(options: BenchmarkArgs, cases: BenchmarkCase[]): void {
+  const candles = createSyntheticCandles(options);
+  assertCandles(candles);
+
+  const results = cases.map((benchmark) => runBenchmark(benchmark, candles, options));
+  const rows = results.map((result) => ({
+    strategy: result.label,
+    ...metricsFromResult(result.result),
+  }));
+
+  console.log(syntheticHeader(options, candles));
+  console.log("");
+  console.log(singleBenchmarkTable(rows));
 }
 
 function runSingleWindowMode(
@@ -262,6 +310,19 @@ function runGridCandidate(
     avgPerfectCapturePct: averageDefined(
       metrics.map((metric) => metric.perfectCapturePct),
     ),
+    avgPerfectCompoundedCapturePct: averageDefined(
+      metrics.map((metric) => metric.perfectCompoundedCapturePct),
+    ),
+    avgClosedPositionCount: average(metrics.map((metric) => metric.closedPositionCount)),
+    avgProfitableClosedPositionCount: average(
+      metrics.map((metric) => metric.profitableClosedPositionCount),
+    ),
+    avgProfitableClosedPositionRate: average(
+      metrics.map((metric) => metric.profitableClosedPositionRate),
+    ),
+    avgLiquidatedPositionCount: average(
+      metrics.map((metric) => metric.liquidatedPositionCount),
+    ),
     avgMaxDrawdownPct: average(metrics.map((metric) => metric.maxDrawdownPct)),
     avgTradeCount: average(metrics.map((metric) => metric.tradeCount)),
     worstReturnPct: Math.min(...metrics.map((metric) => metric.returnPct)),
@@ -275,6 +336,21 @@ function createGridCandidates(): GridCandidate[] {
       label: "Legacy Valley/Peak default",
       algorithm: "legacy-valley-peak",
       config: {},
+    },
+    {
+      label: "Legacy peak exit grid aggregate",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("aggregate"),
+    },
+    {
+      label: "Legacy peak exit grid per-lot strict",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-strict"),
+    },
+    {
+      label: "Legacy peak exit grid per-lot relaxed",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-relaxed"),
     },
     {
       label: "Legacy smaller clips",
@@ -691,7 +767,7 @@ function runBenchmark(
   maxEquityPoints?: number,
   candleRange?: CandleReplayRange,
 ): { label: string; result: BacktestResult; elapsedMs: number } {
-  const maxPositionQuote = options.startingQuote * options.leverage * 0.85;
+  const maxPositionQuote = options.startingQuote * options.leverage;
   const startedAt = Date.now();
   const candleCount = candleRange
     ? candleRange.endIndex - candleRange.startIndex
@@ -749,6 +825,12 @@ function runRandomLengthBenchmark(
   let sharpeRatioCount = 0;
   let perfectCapturePct = 0;
   let perfectCaptureCount = 0;
+  let perfectCompoundedCapturePct = 0;
+  let perfectCompoundedCaptureCount = 0;
+  let closedPositionCount = 0;
+  let profitableClosedPositionCount = 0;
+  let profitableClosedPositionRate = 0;
+  let liquidatedPositionCount = 0;
   let bestReturnPct = Number.NEGATIVE_INFINITY;
   let worstReturnPct = Number.POSITIVE_INFINITY;
   const returnSamples: number[] = [];
@@ -773,6 +855,10 @@ function runRandomLengthBenchmark(
     netPnlPerDay += result.summary.netPnl / window.durationDays;
     maxDrawdownPct += metrics.maxDrawdownPct;
     tradeCount += metrics.tradeCount;
+    closedPositionCount += metrics.closedPositionCount;
+    profitableClosedPositionCount += metrics.profitableClosedPositionCount;
+    profitableClosedPositionRate += metrics.profitableClosedPositionRate;
+    liquidatedPositionCount += metrics.liquidatedPositionCount;
     bestReturnPct = Math.max(bestReturnPct, metrics.returnPct);
     worstReturnPct = Math.min(worstReturnPct, metrics.returnPct);
     if (metrics.riskAdjustedReturn !== undefined) {
@@ -786,6 +872,10 @@ function runRandomLengthBenchmark(
     if (metrics.perfectCapturePct !== undefined) {
       perfectCapturePct += metrics.perfectCapturePct;
       perfectCaptureCount += 1;
+    }
+    if (metrics.perfectCompoundedCapturePct !== undefined) {
+      perfectCompoundedCapturePct += metrics.perfectCompoundedCapturePct;
+      perfectCompoundedCaptureCount += 1;
     }
   }
 
@@ -810,6 +900,14 @@ function runRandomLengthBenchmark(
     avgRiskAdjustedReturn: averageOptional(riskAdjustedReturn, riskAdjustedReturnCount),
     avgSharpeRatio: averageOptional(sharpeRatio, sharpeRatioCount),
     avgPerfectCapturePct: averageOptional(perfectCapturePct, perfectCaptureCount),
+    avgPerfectCompoundedCapturePct: averageOptional(
+      perfectCompoundedCapturePct,
+      perfectCompoundedCaptureCount,
+    ),
+    avgClosedPositionCount: averageRequired(closedPositionCount),
+    avgProfitableClosedPositionCount: averageRequired(profitableClosedPositionCount),
+    avgProfitableClosedPositionRate: averageRequired(profitableClosedPositionRate),
+    avgLiquidatedPositionCount: averageRequired(liquidatedPositionCount),
     bestReturnPct,
     worstReturnPct,
   };
@@ -826,6 +924,12 @@ function metricsFromResult(result: BacktestResult): BenchmarkMetrics {
     riskAdjustedReturn: summary.riskAdjustedReturn,
     sharpeRatio: summary.sharpeRatio,
     perfectCapturePct: summary.perfectMarginCapturePct,
+    perfectCompoundedReturnPct: summary.perfectMarginCompoundedReturnPct,
+    perfectCompoundedCapturePct: summary.perfectMarginCompoundedCapturePct,
+    closedPositionCount: summary.closedPositionCount,
+    profitableClosedPositionCount: summary.profitableClosedPositionCount,
+    profitableClosedPositionRate: summary.profitableClosedPositionRate,
+    liquidatedPositionCount: summary.liquidatedPositionCount,
   };
 }
 
@@ -893,6 +997,61 @@ function loadHistoricalCandles(options: BenchmarkArgs, files: string[]): Candle[
   }
 
   return candles.sort((left, right) => left.openTime - right.openTime);
+}
+
+function createSyntheticCandles(options: BenchmarkArgs): Candle[] {
+  const rng = mulberry32(options.seed);
+  const intervalMs = intervalToMs(options.interval);
+  const intervalDays = intervalMs / DAY_MS;
+  const halfStepDeviation = options.syntheticNoise * Math.sqrt(intervalDays / 2);
+  const startTime = Date.UTC(2021, 0, 1);
+  const symbol = options.symbol.toUpperCase();
+  const priceFloor = options.syntheticStartPrice * 0.0001;
+  const candles: Candle[] = [];
+  let brownian = 0;
+
+  const priceAt = (elapsedDays: number, brownianValue: number): number => {
+    const cycle = Math.sin(2 * Math.PI * options.syntheticFrequency * elapsedDays);
+    const relative =
+      1 +
+      options.syntheticAmplitude * cycle +
+      options.syntheticTrend * elapsedDays +
+      brownianValue;
+    return Math.max(priceFloor, options.syntheticStartPrice * relative);
+  };
+
+  for (let index = 0; index < options.syntheticCandles; index += 1) {
+    const candleStartTime = startTime + index * intervalMs;
+    const elapsedDays = index * intervalDays;
+    const midpointDays = elapsedDays + intervalDays / 2;
+    const closeDays = elapsedDays + intervalDays;
+
+    if (index > 0) {
+      brownian += normalRandom(rng) * halfStepDeviation;
+    }
+    const open = priceAt(elapsedDays, brownian);
+    brownian += normalRandom(rng) * halfStepDeviation;
+    const midpointPrice = priceAt(midpointDays, brownian);
+    brownian += normalRandom(rng) * halfStepDeviation;
+    const close = priceAt(closeDays, brownian);
+    const high = Math.max(open, midpointPrice, close);
+    const low = Math.min(open, midpointPrice, close);
+
+    candles.push({
+      symbol,
+      interval: options.interval,
+      openTime: candleStartTime,
+      closeTime: candleStartTime + intervalMs - 1,
+      open,
+      high,
+      low,
+      close,
+      volume: 1_000,
+      closed: true,
+    });
+  }
+
+  return candles;
 }
 
 function historicalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
@@ -985,14 +1144,17 @@ function parseArgs(argv: string[]): BenchmarkArgs {
   }
 
   const mode = parseMode(values.get("mode"));
+  const interval = values.get("interval") ?? "1m";
+  const days = parsePositiveInt(values.get("days"), FULL_BTC_CYCLE_DAYS);
+  const defaultSyntheticCandles = Math.max(1, Math.ceil((days * DAY_MS) / intervalToMs(interval)));
   return {
     mode,
     marketKey: values.get("market-key"),
     symbol: values.get("symbol") ?? "BTCUSDT",
-    interval: values.get("interval") ?? "1m",
-    days: parsePositiveInt(values.get("days"), FULL_BTC_CYCLE_DAYS),
+    interval,
+    days,
     startingQuote: parsePositiveNumber(values.get("starting-quote"), 10_000),
-    leverage: parsePositiveNumber(values.get("leverage"), 3),
+    leverage: parsePositiveNumber(values.get("leverage"), 5),
     cooldownSec: parsePositiveNumber(values.get("cooldown-sec"), 300),
     randomSampleCount: parsePositiveInt(values.get("samples"), 48),
     randomMinWindowDays: parsePositiveNumber(values.get("min-window-days"), 7),
@@ -1004,6 +1166,15 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     portfolioRebalanceCandles: parsePositiveInt(values.get("portfolio-rebalance-candles"), 60),
     portfolioGrossLeverage: parsePositiveNumber(values.get("portfolio-gross-leverage"), 1),
     portfolioTargetVolPct: parsePositiveNumber(values.get("portfolio-target-vol-pct"), 35),
+    syntheticCandles: parsePositiveInt(
+      values.get("synthetic-candles"),
+      defaultSyntheticCandles,
+    ),
+    syntheticStartPrice: parsePositiveNumber(values.get("synthetic-start-price"), 100_000),
+    syntheticFrequency: parseNonNegativeNumber(values.get("synthetic-frequency"), 1),
+    syntheticAmplitude: parseNonNegativeNumber(values.get("synthetic-amplitude"), 0.1),
+    syntheticTrend: parseFiniteNumber(values.get("synthetic-trend"), 0),
+    syntheticNoise: parseNonNegativeNumber(values.get("synthetic-noise"), 0.02),
     seed: parsePositiveInt(values.get("seed"), 1337),
     only: values.get("only"),
     symbols: parseSymbols(values.get("symbols")),
@@ -1016,7 +1187,8 @@ function parseMode(value: string | undefined): BenchmarkMode {
     value === "year" ||
     value === "random-lengths" ||
     value === "grid-search" ||
-    value === "portfolio"
+    value === "portfolio" ||
+    value === "synthetic"
   ) {
     return value;
   }
@@ -1028,6 +1200,21 @@ function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
     {
       label: "Legacy Valley/Peak",
       algorithm: "legacy-valley-peak",
+    },
+    {
+      label: "Legacy Peak Exit Grid Aggregate",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("aggregate"),
+    },
+    {
+      label: "Legacy Peak Exit Grid Per-Lot Strict",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-strict"),
+    },
+    {
+      label: "Legacy Peak Exit Grid Per-Lot Relaxed",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-relaxed"),
     },
   ];
 
@@ -1043,6 +1230,30 @@ function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
   }
 
   return selected;
+}
+
+type PeakExitGridVariant = "aggregate" | "per-lot-strict" | "per-lot-relaxed";
+
+function peakExitGridConfig(variant: PeakExitGridVariant): PartialStrategyConfig {
+  const isAggregate = variant === "aggregate";
+  return {
+    maxOpenOrders: isAggregate ? 8 : 24,
+    staleOrderMs: 30 * DAY_MS,
+    legacyValleyPeak: {
+      buySigma: 0.3,
+      exitGridEnabled: true,
+      exitGridMarketEntry: true,
+      exitGridOrderCount: 6,
+      exitGridPriceDistribution: "uniform",
+      exitGridSizeDistribution: "geometric",
+      exitGridSellFraction: 0.35,
+      exitGridMinProfitBps: 20,
+      exitGridResetBps: 10,
+      exitGridPositionMode: isAggregate ? "aggregate" : "per-lot",
+      exitGridResetMode:
+        variant === "per-lot-relaxed" ? "filled-grid" : "higher-peak",
+    },
+  };
 }
 
 function singleWindowHeader(
@@ -1125,6 +1336,23 @@ function portfolioHeader(
   ].join(", ");
 }
 
+function syntheticHeader(options: BenchmarkArgs, candles: Candle[]): string {
+  return [
+    "Strategy benchmark: synthetic",
+    `${options.symbol.toUpperCase()} ${options.interval}`,
+    `${candles.length.toLocaleString()} candles`,
+    `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
+    `freq ${options.syntheticFrequency}/day`,
+    `amp ${formatNumber(options.syntheticAmplitude * 100, 2)}%`,
+    `trend ${formatNumber(options.syntheticTrend * 100, 2)}%/day`,
+    `brownian ${formatNumber(options.syntheticNoise * 100, 2)}% daily vol`,
+    `seed ${options.seed}`,
+    `${options.leverage}x max leverage`,
+    benchmarkCapSummary(options),
+    `${options.cooldownSec}s cooldown`,
+  ].join(", ");
+}
+
 function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
   const header = [
     "Strategy",
@@ -1135,7 +1363,11 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     "Sharpe",
     "Trades",
     "Win Rate",
+    "Prof Pos",
+    "Liq Pos",
     "Oracle Capture",
+    "Reinvest Ret",
+    "Reinvest Capture",
   ];
   const tableRows = rows.map((row) => [
     row.strategy,
@@ -1146,7 +1378,11 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     formatOptionalNumber(row.sharpeRatio, 3),
     row.tradeCount.toLocaleString(),
     `${formatNumber(row.winRate, 1)}%`,
+    `${row.profitableClosedPositionCount.toLocaleString()}/${row.closedPositionCount.toLocaleString()} (${formatNumber(row.profitableClosedPositionRate, 1)}%)`,
+    formatNumber(row.liquidatedPositionCount, 0),
     row.perfectCapturePct === undefined ? "-" : `${formatNumber(row.perfectCapturePct, 3)}%`,
+    formatOptionalPercent(row.perfectCompoundedReturnPct, 2, true),
+    formatOptionalPercent(row.perfectCompoundedCapturePct, 6, true),
   ]);
 
   return markdownTable(header, tableRows);
@@ -1166,7 +1402,10 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     "Avg Risk Ret",
     "Avg Sharpe",
     "Avg Trades",
+    "Avg Prof Pos",
+    "Avg Liq Pos",
     "Avg Capture",
+    "Avg Reinvest Cap",
     "Best",
     "Worst",
   ];
@@ -1183,7 +1422,10 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     formatOptionalNumber(row.avgRiskAdjustedReturn, 3),
     formatOptionalNumber(row.avgSharpeRatio, 3),
     formatNumber(row.avgTradeCount, 1),
+    `${formatNumber(row.avgProfitableClosedPositionCount, 1)}/${formatNumber(row.avgClosedPositionCount, 1)} (${formatNumber(row.avgProfitableClosedPositionRate, 1)}%)`,
+    formatNumber(row.avgLiquidatedPositionCount, 1),
     row.avgPerfectCapturePct === undefined ? "-" : `${formatNumber(row.avgPerfectCapturePct, 3)}%`,
+    formatOptionalPercent(row.avgPerfectCompoundedCapturePct, 6, true),
     `${formatNumber(row.bestReturnPct, 2)}%`,
     `${formatNumber(row.worstReturnPct, 2)}%`,
   ]);
@@ -1202,6 +1444,9 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     "Avg Risk Ret",
     "Avg Sharpe",
     "Avg Capture",
+    "Avg Reinvest Cap",
+    "Avg Prof Pos",
+    "Avg Liq Pos",
     "Avg Max DD",
     "Avg Trades",
     "Worst",
@@ -1217,6 +1462,9 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     formatOptionalNumber(row.avgRiskAdjustedReturn, 3),
     formatOptionalNumber(row.avgSharpeRatio, 3),
     row.avgPerfectCapturePct === undefined ? "-" : `${formatNumber(row.avgPerfectCapturePct, 3)}%`,
+    formatOptionalPercent(row.avgPerfectCompoundedCapturePct, 6, true),
+    `${formatNumber(row.avgProfitableClosedPositionCount, 1)}/${formatNumber(row.avgClosedPositionCount, 1)} (${formatNumber(row.avgProfitableClosedPositionRate, 1)}%)`,
+    formatNumber(row.avgLiquidatedPositionCount, 1),
     `${formatNumber(row.avgMaxDrawdownPct, 2)}%`,
     formatNumber(row.avgTradeCount, 1),
     `${formatNumber(row.worstReturnPct, 2)}%`,
@@ -1307,6 +1555,12 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+function normalRandom(rng: () => number): number {
+  const u1 = Math.max(Number.EPSILON, rng());
+  const u2 = Math.max(Number.EPSILON, rng());
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
 function average(values: number[]): number {
   if (values.length === 0) {
     return 0;
@@ -1353,6 +1607,16 @@ function parsePositiveNumber(value: string | undefined, fallback: number): numbe
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function parseFiniteNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function parseSymbols(value: string | undefined): string[] | undefined {
   if (!value) {
     return undefined;
@@ -1372,6 +1636,24 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function intervalToMs(interval: string): number {
+  const match = /^(\d+)([mhdw])$/.exec(interval);
+  if (!match) {
+    return 60_000;
+  }
+
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multipliers: Record<string, number> = {
+    m: 60_000,
+    h: 60 * 60_000,
+    d: DAY_MS,
+    w: 7 * DAY_MS,
+  };
+
+  return value * multipliers[unit];
+}
+
 function formatDate(value: number): string {
   return new Date(value).toISOString().slice(0, 10);
 }
@@ -1388,10 +1670,26 @@ function formatOptionalNumber(value: number | undefined, digits: number): string
   return Number.isFinite(value) ? (value as number).toFixed(digits) : "-";
 }
 
+function formatOptionalPercent(
+  value: number | undefined,
+  digits: number,
+  scientificForLarge = false,
+): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  const finite = value as number;
+  if (scientificForLarge && Math.abs(finite) >= 1_000_000) {
+    return `${finite.toExponential(Math.min(6, Math.max(0, digits)))}%`;
+  }
+  return `${finite.toFixed(digits)}%`;
+}
+
 function benchmarkCapSummary(options: BenchmarkArgs): string {
-  const configuredCap = options.startingQuote * options.leverage * 0.85;
+  const configuredCap = options.startingQuote * options.leverage;
   const initialShortDebtCap = options.startingQuote * Math.max(0, options.leverage - 1) * 0.98;
-  return `target cap ${formatMoney(configuredCap)}, initial short debt cap ${formatMoney(
+  return `target cap ${formatMoney(configuredCap)}, initial debt cap ${formatMoney(
     Math.min(configuredCap, initialShortDebtCap),
   )}`;
 }
@@ -1427,6 +1725,13 @@ function formatGridConfig(config: PartialStrategyConfig): string {
       `buyConfirm=${value.buyConfirmationOffset ?? "-"}`,
       `sellIndex=${value.sellDataIndex ?? "-"}`,
       `warmup=${value.saturationSec ?? "-"}`,
+      `exitGrid=${value.exitGridEnabled ?? "-"}`,
+      `gridMode=${value.exitGridPositionMode ?? "-"}`,
+      `resetMode=${value.exitGridResetMode ?? "-"}`,
+      `gridOrders=${value.exitGridOrderCount ?? "-"}`,
+      `gridPrice=${value.exitGridPriceDistribution ?? "-"}`,
+      `gridSize=${value.exitGridSizeDistribution ?? "-"}`,
+      `gridFraction=${value.exitGridSellFraction ?? "-"}`,
     );
   }
   return parts.length > 0 ? parts.join(", ") : "-";
