@@ -10,6 +10,8 @@ export type BotSignal = "buy" | "sell" | "hold";
 
 export type StrategyAlgorithm = "legacy-valley-peak";
 
+export type ShortMarginModel = "spot-borrow" | "futures-margin";
+
 export type BacktestPreset =
   | "saved-candles"
   | "saved-orderbook"
@@ -80,6 +82,7 @@ export interface StrategyConfig {
   algorithm: StrategyAlgorithm;
   startingQuote: number;
   maxLeverage: number;
+  shortMarginModel: ShortMarginModel;
   feeBps: number;
   maxPositionQuote: number;
   limitOffsetBps: number;
@@ -117,6 +120,8 @@ export interface LegacyValleyPeakConfig {
   sellSigma: number;
   minTradeQuote: number;
   maxTradeQuote: number;
+  longSideEnabled: boolean;
+  shortSideEnabled: boolean;
   exitGridEnabled: boolean;
   exitGridMarketEntry: boolean;
   exitGridOrderCount: number;
@@ -154,10 +159,13 @@ export interface LegacyValleyPeakMemory {
 
 export interface LegacyExitGridMemory {
   lotId: string;
+  side?: PositionLotSide;
   entryPrice: number;
   entryQuantity: number;
   peakPrice: number;
   gridPeakPrice: number;
+  troughPrice?: number;
+  gridTroughPrice?: number;
   gridOrderIds: string[];
 }
 

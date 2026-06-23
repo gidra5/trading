@@ -852,6 +852,20 @@ function AlgorithmPanel(props: {
                     update("maxLeverage", clampNumber(value, 1, marketMaxLeverage() ?? 999))
                   }
                 />
+                <SelectField
+                  label="Short Margin"
+                  value={config().shortMarginModel}
+                  options={[
+                    { value: "spot-borrow", label: "Spot Borrow" },
+                    { value: "futures-margin", label: "Futures Margin" },
+                  ]}
+                  onInput={(value) =>
+                    update(
+                      "shortMarginModel",
+                      value as StrategyConfig["shortMarginModel"],
+                    )
+                  }
+                />
                 <Show when={marketMaxLeverage()}>
                   {(value) => (
                     <div class="rounded-2 bg-ink-900 px-2 py-2">
@@ -914,6 +928,16 @@ function AlgorithmPanel(props: {
                   min={0}
                   step={0.05}
                   onInput={(value) => updateValleyPeak("sellAmountRate", value)}
+                />
+                <BooleanField
+                  label="Long Side"
+                  checked={config().legacyValleyPeak.longSideEnabled}
+                  onInput={(value) => updateValleyPeak("longSideEnabled", value)}
+                />
+                <BooleanField
+                  label="Short Side"
+                  checked={config().legacyValleyPeak.shortSideEnabled}
+                  onInput={(value) => updateValleyPeak("shortSideEnabled", value)}
                 />
                 <NumberField
                   label="Buy Sigma"
@@ -1038,6 +1062,49 @@ function NumberField(props: {
         value={Number.isFinite(props.value) ? props.value : 0}
         onInput={(event) => props.onInput(Number(event.currentTarget.value))}
       />
+    </label>
+  );
+}
+
+function SelectField(props: {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onInput: (value: string) => void;
+}) {
+  return (
+    <label class="block">
+      <span class="muted-label">{props.label}</span>
+      <select
+        class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm font-semibold text-ink-100"
+        value={props.value}
+        onInput={(event) => props.onInput(event.currentTarget.value)}
+      >
+        <For each={props.options}>
+          {(option) => <option value={option.value}>{option.label}</option>}
+        </For>
+      </select>
+    </label>
+  );
+}
+
+function BooleanField(props: {
+  label: string;
+  checked: boolean;
+  onInput: (value: boolean) => void;
+}) {
+  return (
+    <label class="block rounded-2 border border-line bg-ink-900 px-2 py-2">
+      <span class="muted-label">{props.label}</span>
+      <span class="mt-2 flex items-center gap-2 text-sm font-semibold text-ink-100">
+        <input
+          class="h-4 w-4 accent-accent"
+          type="checkbox"
+          checked={props.checked}
+          onInput={(event) => props.onInput(event.currentTarget.checked)}
+        />
+        Enabled
+      </span>
     </label>
   );
 }
@@ -1539,7 +1606,7 @@ function PositionLedgerPanel(props: {
         <SmallMetric label="Net Sell" value={`$${formatQuote(summary()?.netMarketSellPrice, 2)}`} />
         <SmallMetric label="Gross Buy" value={`$${formatQuote(summary()?.grossMarketBuyPrice, 2)}`} />
         <SmallMetric label="Gross Exp" value={`$${formatQuote(summary()?.grossExposureQuote, 2)}`} />
-        <SmallMetric label="Debt Lev" value={formatLeverage(summary()?.effectiveLeverage)} />
+        <SmallMetric label="Eff Lev" value={formatLeverage(summary()?.effectiveLeverage)} />
         <SmallMetric label="Long Left" value={formatAsset(summary()?.longQuantity)} />
         <SmallMetric label="Short Left" value={formatAsset(summary()?.shortQuantity)} />
         <SmallMetric

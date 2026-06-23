@@ -94,8 +94,13 @@ npm run benchmark:strategies -- --mode random-lengths
 npm run benchmark:strategies -- --mode grid-search --days 1825 --grid-folds 6
 npm run benchmark:strategies -- --mode portfolio --days 1825
 npm run benchmark:strategies -- --mode synthetic --synthetic-frequency 2 --synthetic-amplitude 0.08
-npm run benchmark:strategies -- --leverage 5 --cooldown-sec 300
+npm run benchmark:strategies -- --cooldown-sec 300
 npm run benchmark:strategies -- --only "legacy"
+npm run benchmark:strategies -- --mode days --days 30 --only relaxed
+npm run benchmark:strategies -- --mode synthetic --days 30 --only relaxed
+npm run benchmark:strategies -- --mode random-lengths --leverage 1 --only relaxed
+npm run benchmark:strategies -- --mode random-lengths --leverage 5 --only relaxed
+npm run benchmark:strategies -- --mode days --days 30 --leverage 1 --only "short only" --short-margin futures-margin
 ```
 
 The script reads local historical candles, runs `legacy-valley-peak` with identical
@@ -103,6 +108,13 @@ starting capital, leverage guard, position cap, fees, limit offset, and cooldown
 reports return, drawdown, trade count, trade win rate, profitable closed positions,
 liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin capture,
 and compounded perfect-margin capture.
+The benchmark script defaults to `1x` max leverage. Fixed historical, synthetic, grid,
+and portfolio checks should generally stay no-leverage first; run paired `1x` and `5x`
+comparisons mainly for random-window validation. The `--only relaxed` comparison includes
+the current relaxed per-lot long/short default, long-only, and short-only variants.
+Shorts default to the `spot-borrow` margin model. Use `--short-margin futures-margin`
+when testing standalone unlevered shorts against collateral-backed futures-style gross
+exposure instead of borrowed-base spot-margin debt.
 
 Random-length mode defaults to deterministic sampled windows. Tune it with:
 

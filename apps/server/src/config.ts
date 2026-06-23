@@ -40,6 +40,10 @@ export const appConfig = {
     quoteAsset: market.quoteAsset,
     startingQuote: Number(process.env.TRADING_STARTING_QUOTE ?? 10_000),
     maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 5),
+    shortMarginModel:
+      process.env.TRADING_SHORT_MARGIN_MODEL === "futures-margin"
+        ? "futures-margin"
+        : "spot-borrow",
     maxPositionQuote: Number(process.env.TRADING_MAX_POSITION_QUOTE ?? 50_000),
   }),
 };

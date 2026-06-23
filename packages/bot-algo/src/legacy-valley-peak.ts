@@ -10,15 +10,18 @@ export interface LegacyValleyPeakInput {
   price: number;
   feeRate: number;
   buyingPowerQuote: number;
+  shortSellingPowerQuote?: number;
   baseFree: number;
+  shortBaseFree?: number;
   positionQuote: number;
+  shortPositionQuote?: number;
   maxPositionQuote: number;
 }
 
 export type LegacyValleyPeakDecision =
   | { signal: "hold" }
-  | { signal: "buy"; reason: string; quoteSize: number }
-  | { signal: "sell"; reason: string; quantity: number };
+  | { signal: "buy"; reason: string; quoteSize: number; coverQuantity: number }
+  | { signal: "sell"; reason: string; quantity: number; quoteSize: number };
 
 export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
@@ -36,6 +39,8 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   sellSigma: 0.1,
   minTradeQuote: 25,
   maxTradeQuote: 50_000,
+  longSideEnabled: true,
+  shortSideEnabled: true,
   exitGridEnabled: true,
   exitGridMarketEntry: true,
   exitGridOrderCount: 6,
@@ -85,6 +90,8 @@ export function createLegacyValleyPeakConfig(
   config.sellSigma = Math.max(0.000001, config.sellSigma);
   config.minTradeQuote = Math.max(0, config.minTradeQuote);
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
+  config.longSideEnabled = config.longSideEnabled !== false;
+  config.shortSideEnabled = config.shortSideEnabled !== false;
   config.exitGridOrderCount = clampInt(config.exitGridOrderCount, 1, 24);
   if (
     config.exitGridPriceDistribution !== "uniform" &&
@@ -178,22 +185,32 @@ export function evaluateLegacyValleyPeak(
 
   if (shouldBuy(memory, config)) {
     const quoteSize = buyQuoteSize(memory, config, input, feeAdjustedBuyRate);
-    if (quoteSize >= config.minTradeQuote) {
+    const coverQuantity = buyCoverQuantity(memory, config, input, feeAdjustedBuyRate);
+    if (
+      quoteSize >= config.minTradeQuote ||
+      coverQuantity * feeAdjustedBuyRate >= config.minTradeQuote
+    ) {
       return {
         signal: "buy",
         reason: "legacy valley detected",
         quoteSize,
+        coverQuantity,
       };
     }
   }
 
   if (shouldSell(memory, config)) {
     const quantity = sellQuantity(memory, config, input, feeAdjustedSellRate);
-    if (quantity * feeAdjustedSellRate >= config.minTradeQuote) {
+    const quoteSize = shortSellQuoteSize(memory, config, input, feeAdjustedSellRate);
+    if (
+      quantity * feeAdjustedSellRate >= config.minTradeQuote ||
+      quoteSize >= config.minTradeQuote
+    ) {
       return {
         signal: "sell",
         reason: "legacy peak detected",
         quantity,
+        quoteSize,
       };
     }
   }
@@ -246,6 +263,10 @@ function buyQuoteSize(
   input: LegacyValleyPeakInput,
   rate: number,
 ): number {
+  if (!config.longSideEnabled) {
+    return 0;
+  }
+
   const data = memory.buyAverages[Math.min(3, memory.buyAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
   const buyingPowerQuote = Math.max(0, input.buyingPowerQuote);
@@ -262,12 +283,37 @@ function buyQuoteSize(
   );
 }
 
+function buyCoverQuantity(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput,
+  rate: number,
+): number {
+  if (!config.shortSideEnabled) {
+    return 0;
+  }
+
+  const data = memory.buyAverages[Math.min(3, memory.buyAverages.length - 1)];
+  const derivative = latestPoint(data)?.rate ?? 0;
+  const shortBaseFree = Math.max(0, input.shortBaseFree ?? 0);
+  const desired =
+    shortBaseFree * config.buySpendRate * gaussian(derivative, 0, config.buySigma);
+  const minQuantity = config.minTradeQuote / rate;
+  const maxQuantity = Math.min(config.maxTradeQuote / rate, shortBaseFree);
+
+  return clamp(desired, minQuantity, maxQuantity);
+}
+
 function sellQuantity(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   input: LegacyValleyPeakInput,
   rate: number,
 ): number {
+  if (!config.longSideEnabled) {
+    return 0;
+  }
+
   const data = memory.sellAverages[Math.min(3, memory.sellAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
   const desired =
@@ -276,6 +322,35 @@ function sellQuantity(
   const maxQuantity = Math.min(config.maxTradeQuote / rate, input.baseFree);
 
   return clamp(desired, minQuantity, maxQuantity);
+}
+
+function shortSellQuoteSize(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput,
+  rate: number,
+): number {
+  if (!config.shortSideEnabled) {
+    return 0;
+  }
+
+  const data = memory.sellAverages[Math.min(3, memory.sellAverages.length - 1)];
+  const derivative = latestPoint(data)?.rate ?? 0;
+  const sellingPowerQuote = Math.max(0, input.shortSellingPowerQuote ?? 0);
+  const desired =
+    sellingPowerQuote *
+    config.sellAmountRate *
+    gaussian(derivative, 0, config.sellSigma);
+  const remainingPositionQuote = Math.max(
+    0,
+    input.maxPositionQuote - Math.max(0, input.shortPositionQuote ?? 0),
+  );
+
+  return clamp(
+    desired,
+    config.minTradeQuote,
+    Math.min(config.maxTradeQuote, sellingPowerQuote, remainingPositionQuote, rate * 10_000),
+  );
 }
 
 function updateRollingAverage(

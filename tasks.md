@@ -5,7 +5,9 @@
 - closing all long positions if there are short positions borrowing from them should not be allowed if we get over the leverage limit. the leftover fraction is basically reserved for the already open opposing positions.
 - authorize bots to be able to trade actual money.
 - add prediction market support
-- add proper leverage integration for futures and spot margin
+- add proper live-exchange leverage integration for futures and spot margin; paper
+  simulator now has a `shortMarginModel = "futures-margin"` option for collateral-backed
+  standalone shorts
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
 

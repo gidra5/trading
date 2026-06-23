@@ -8,6 +8,7 @@ import {
   type Candle,
   type EquityPoint,
   type PartialStrategyConfig,
+  type ShortMarginModel,
   type StrategyAlgorithm,
 } from "../packages/bot-algo/src/index.js";
 
@@ -27,6 +28,7 @@ interface BenchmarkArgs {
   days: number;
   startingQuote: number;
   leverage: number;
+  shortMarginModel: ShortMarginModel;
   cooldownSec: number;
   randomSampleCount: number;
   randomMinWindowDays: number;
@@ -333,12 +335,22 @@ function runGridCandidate(
 function createGridCandidates(): GridCandidate[] {
   return [
     {
-      label: "Legacy Valley/Peak default",
+      label: "Legacy Valley/Peak default long/short",
       algorithm: "legacy-valley-peak",
       config: {},
     },
     {
-      label: "Legacy peak exit grid aggregate",
+      label: "Legacy Valley/Peak default long only",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { shortSideEnabled: false } },
+    },
+    {
+      label: "Legacy Valley/Peak default short only",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { longSideEnabled: false, shortSideEnabled: true } },
+    },
+    {
+      label: "Legacy peak exit grid aggregate long/short",
       algorithm: "legacy-valley-peak",
       config: peakExitGridConfig("aggregate"),
     },
@@ -351,6 +363,11 @@ function createGridCandidates(): GridCandidate[] {
       label: "Legacy peak exit grid per-lot relaxed",
       algorithm: "legacy-valley-peak",
       config: peakExitGridConfig("per-lot-relaxed"),
+    },
+    {
+      label: "Legacy peak exit grid per-lot relaxed short only",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-relaxed", "short-only"),
     },
     {
       label: "Legacy smaller clips",
@@ -781,6 +798,7 @@ function runBenchmark(
       algorithm: benchmark.algorithm,
       startingQuote: options.startingQuote,
       maxLeverage: options.leverage,
+      shortMarginModel: options.shortMarginModel,
       maxPositionQuote,
       cooldownMs: options.cooldownSec * 1000,
       ...benchmark.config,
@@ -1154,7 +1172,10 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     interval,
     days,
     startingQuote: parsePositiveNumber(values.get("starting-quote"), 10_000),
-    leverage: parsePositiveNumber(values.get("leverage"), 5),
+    leverage: parsePositiveNumber(values.get("leverage"), 1),
+    shortMarginModel: parseShortMarginModel(
+      values.get("short-margin") ?? values.get("short-margin-model"),
+    ),
     cooldownSec: parsePositiveNumber(values.get("cooldown-sec"), 300),
     randomSampleCount: parsePositiveInt(values.get("samples"), 48),
     randomMinWindowDays: parsePositiveNumber(values.get("min-window-days"), 7),
@@ -1195,26 +1216,50 @@ function parseMode(value: string | undefined): BenchmarkMode {
   return "random-lengths";
 }
 
+function parseShortMarginModel(value: string | undefined): ShortMarginModel {
+  return value === "futures-margin" ? "futures-margin" : "spot-borrow";
+}
+
 function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
   const cases: BenchmarkCase[] = [
     {
-      label: "Legacy Valley/Peak",
+      label: "Legacy Valley/Peak Long/Short",
       algorithm: "legacy-valley-peak",
     },
     {
-      label: "Legacy Peak Exit Grid Aggregate",
+      label: "Legacy Valley/Peak Long Only",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { shortSideEnabled: false } },
+    },
+    {
+      label: "Legacy Valley/Peak Short Only",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: { longSideEnabled: false, shortSideEnabled: true } },
+    },
+    {
+      label: "Legacy Peak Exit Grid Aggregate Long/Short",
       algorithm: "legacy-valley-peak",
       config: peakExitGridConfig("aggregate"),
     },
     {
-      label: "Legacy Peak Exit Grid Per-Lot Strict",
+      label: "Legacy Peak Exit Grid Per-Lot Strict Long/Short",
       algorithm: "legacy-valley-peak",
       config: peakExitGridConfig("per-lot-strict"),
     },
     {
-      label: "Legacy Peak Exit Grid Per-Lot Relaxed",
+      label: "Legacy Peak Exit Grid Per-Lot Relaxed Long/Short",
       algorithm: "legacy-valley-peak",
       config: peakExitGridConfig("per-lot-relaxed"),
+    },
+    {
+      label: "Legacy Peak Exit Grid Per-Lot Relaxed Long Only",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-relaxed", "long-only"),
+    },
+    {
+      label: "Legacy Peak Exit Grid Per-Lot Relaxed Short Only",
+      algorithm: "legacy-valley-peak",
+      config: peakExitGridConfig("per-lot-relaxed", "short-only"),
     },
   ];
 
@@ -1233,14 +1278,20 @@ function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
 }
 
 type PeakExitGridVariant = "aggregate" | "per-lot-strict" | "per-lot-relaxed";
+type StrategySideMode = "long-short" | "long-only" | "short-only";
 
-function peakExitGridConfig(variant: PeakExitGridVariant): PartialStrategyConfig {
+function peakExitGridConfig(
+  variant: PeakExitGridVariant,
+  sideMode: StrategySideMode = "long-short",
+): PartialStrategyConfig {
   const isAggregate = variant === "aggregate";
   return {
     maxOpenOrders: isAggregate ? 8 : 24,
     staleOrderMs: 30 * DAY_MS,
     legacyValleyPeak: {
       buySigma: 0.3,
+      longSideEnabled: sideMode !== "short-only",
+      shortSideEnabled: sideMode !== "long-only",
       exitGridEnabled: true,
       exitGridMarketEntry: true,
       exitGridOrderCount: 6,
@@ -1270,6 +1321,7 @@ function singleWindowHeader(
     cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
+    `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1294,6 +1346,7 @@ function randomLengthHeader(
     `${firstWindow.label} first sample`,
     `${lastWindow.label} last sample`,
     `${options.leverage}x max leverage`,
+    `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1314,6 +1367,7 @@ function gridSearchHeader(
     cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
+    `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1330,6 +1384,8 @@ function portfolioHeader(
     `${candles.length.toLocaleString()} primary candles`,
     cacheSourceSummary(options),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
+    `${options.leverage}x strategy max leverage`,
+    `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     `${options.portfolioGrossLeverage}x portfolio gross leverage`,
     `${options.portfolioRebalanceCandles.toLocaleString()} candle rebalance`,
     `${options.portfolioLookbackCandles.toLocaleString()} candle lookback`,
@@ -1348,6 +1404,7 @@ function syntheticHeader(options: BenchmarkArgs, candles: Candle[]): string {
     `brownian ${formatNumber(options.syntheticNoise * 100, 2)}% daily vol`,
     `seed ${options.seed}`,
     `${options.leverage}x max leverage`,
+    `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1688,10 +1745,18 @@ function formatOptionalPercent(
 
 function benchmarkCapSummary(options: BenchmarkArgs): string {
   const configuredCap = options.startingQuote * options.leverage;
+  if (options.shortMarginModel === "futures-margin") {
+    return `target cap ${formatMoney(configuredCap)}, gross margin cap ${formatMoney(configuredCap)}`;
+  }
+
   const initialShortDebtCap = options.startingQuote * Math.max(0, options.leverage - 1) * 0.98;
   return `target cap ${formatMoney(configuredCap)}, initial debt cap ${formatMoney(
     Math.min(configuredCap, initialShortDebtCap),
   )}`;
+}
+
+function formatShortMarginModel(value: ShortMarginModel): string {
+  return value === "futures-margin" ? "futures-margin" : "spot-borrow";
 }
 
 function compareGridRows(left: GridSearchRow, right: GridSearchRow): number {
@@ -1714,6 +1779,10 @@ function compareOptionalDesc(
 
 function formatGridConfig(config: PartialStrategyConfig): string {
   const parts: string[] = [];
+  if (config.shortMarginModel) {
+    parts.push(`shortMargin=${config.shortMarginModel}`);
+  }
+
   if (config.legacyValleyPeak) {
     const value = config.legacyValleyPeak;
     parts.push(
@@ -1722,6 +1791,8 @@ function formatGridConfig(config: PartialStrategyConfig): string {
       `maxTrade=${value.maxTradeQuote ?? "-"}`,
       `buySigma=${value.buySigma ?? "-"}`,
       `sellSigma=${value.sellSigma ?? "-"}`,
+      `longs=${value.longSideEnabled ?? "-"}`,
+      `shorts=${value.shortSideEnabled ?? "-"}`,
       `buyConfirm=${value.buyConfirmationOffset ?? "-"}`,
       `sellIndex=${value.sellDataIndex ?? "-"}`,
       `warmup=${value.saturationSec ?? "-"}`,

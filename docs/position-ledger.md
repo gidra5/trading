@@ -120,10 +120,25 @@ Callers can force a new lot with `positionEffect = "open"` or close a specific l
 The account does not model exchange margin buckets directly. It derives debt from
 balances and attributes that debt back to lots for inspection.
 
-Summary leverage uses external borrowed value:
+`shortMarginModel` controls how standalone shorts count against the leverage guard:
+
+- `spot-borrow` is the default. A short is modeled as borrowed base, so an unhedged
+  short at `1x` has no headroom because the borrowed base value counts as external
+  debt.
+- `futures-margin` treats shorts as collateral-backed futures-style exposure. Account
+  balances are still represented the same way, but summary leverage and fill rejection
+  use gross notional exposure over equity.
+
+In `spot-borrow`, summary leverage uses external borrowed value:
 
 ```text
 effective leverage = 1 + externalBorrowedQuote / equity
+```
+
+In `futures-margin`, summary leverage uses gross exposure:
+
+```text
+effective leverage = grossExposureQuote / equity
 ```
 
 Lot leverage uses the portion of that lot's exposure that required external borrowing:
@@ -135,17 +150,27 @@ lot leverage = exposureQuote / (exposureQuote - externalBorrowedQuote)
 Borrow attribution distinguishes internal and external borrowing:
 
 - A short can borrow base internally from active long lots; any remaining borrowed base
-  is external.
+  is external. Internal short borrow records the source long lot without closing that
+  long.
+- Opening a borrowed short credits its sale proceeds to the source long lot's remaining
+  cost, which lowers that long's break-even immediately.
+- Buying the borrowed short back charges the cover cost back to the same source long.
+  The completed effect is the short's realized profit or loss applied to the long cost
+  basis.
 - A long can use owned quote capital first, then borrow quote internally from active
   short proceeds, then borrow quote externally if the account quote balance is negative.
-- `externalBorrowedQuote` is the amount that counts toward effective leverage.
+- In `spot-borrow`, `externalBorrowedQuote` is the amount that counts toward effective
+  leverage.
+- In `futures-margin`, `externalBorrowedQuote` is still shown for inspection, but gross
+  exposure controls effective leverage.
 - `internalBorrowedQuote` and `internalBorrowedQuantity` show how much opposing
   position value is being reused inside the account model.
 
-The leverage guard runs after every fill. If estimated debt leverage is above
-`maxLeverage`, the bot rebuilds the full ledger and checks effective leverage. If the
-full ledger is still above the limit, the fill is rolled back and the order is
-cancelled with a leverage-limit reason.
+The leverage guard runs after every fill. In `spot-borrow`, it uses a fast debt-leverage
+estimate before rebuilding the full ledger if needed. In `futures-margin`, it rebuilds
+the ledger and checks gross exposure directly. If effective leverage is above
+`maxLeverage`, the fill is rolled back and the order is cancelled with a leverage-limit
+reason.
 
 ## Account Liquidation
 
@@ -222,4 +247,5 @@ strategy behavior is documented in
   modeled yet.
 - The account-level average entry fields are aggregate conveniences. Per-lot behavior
   comes from the fill-derived ledger.
-- Internal borrowing is an accounting attribution, not an exchange operation.
+- Internal borrowing is a paper-accounting operation, not a live exchange borrow or
+  transfer operation.

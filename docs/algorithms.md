@@ -2,17 +2,14 @@
 
 The project currently has one automated strategy: `legacy-valley-peak`.
 
-Legacy valley/peak is a long-only mean-turning strategy. It watches rolling price
-averages across several timeframes. The current default is the relaxed peak-to-entry
-exit-grid mode: it opens long lots at confirmed valleys, waits for confirmed peaks,
-then manages each long lot with its own resettable partial-exit ladder.
+Legacy valley/peak is a bidirectional mean-turning strategy. It watches rolling price
+averages across several timeframes. The current default is the relaxed per-lot exit-grid
+mode: it opens long lots at confirmed valleys, opens short lots at confirmed peaks, and
+manages each lot with its own resettable partial-exit ladder.
 
-It does not open automated shorts, does not use online outcome labels, and does not
-force positions out with separate quality-exit rules.
-
-Explicit paper fills and manual short positions still exist outside the automated
-strategy. The automated strategy itself only buys base with quote and sells base it
-already holds.
+It does not use online outcome labels or separate quality-exit rules.
+`longSideEnabled` and `shortSideEnabled` can disable one side for comparison runs, but
+the default strategy now trades both sides.
 
 The account, order, lot, and leverage model is documented separately in
 [Trading Model and Position Ledger](position-ledger.md). UI-driven manual controls are
@@ -36,8 +33,10 @@ Every accepted price tick runs this sequence:
 With `legacyValleyPeak.exitGridEnabled = false`, the older limit-only behavior never
 fills a signal immediately. A signal creates one resting limit order:
 
-- buy orders rest below the current market by `limitOffsetBps`
-- sell orders rest above the current market by `limitOffsetBps`
+- long-entry buy and short-cover buy orders rest below the current market by
+  `limitOffsetBps`
+- long-exit sell and short-entry sell orders rest above the current market by
+  `limitOffsetBps`
 - orders fill later only if replay/live price crosses the limit
 - stale orders are cancelled after `staleOrderMs`
 - the bot will not place more than `maxOpenOrders` open automated orders
@@ -239,15 +238,26 @@ With the current default `legacyValleyPeak.exitGridEnabled = true`, the same
 valley/peak detector drives a different execution model:
 
 - a valley opens a new long lot, using a market buy when
-  `legacyValleyPeak.exitGridMarketEntry` is true
+  `legacyValleyPeak.exitGridMarketEntry` and `longSideEnabled` are true
+- a valley also recreates buy-to-cover ladders for active short lots when price has
+  moved far enough below their break-even buy price
 - additional valleys can open additional long lots while older lots remain active
-- the strategy reads active long lots from the position ledger and tracks entry price,
-  original quantity, and highest observed price per lot
+- a peak opens a new short lot, using a market sell when
+  `legacyValleyPeak.exitGridMarketEntry` is true and `shortSideEnabled` is true
+- a peak also recreates sell ladders for active long lots when price has moved far
+  enough above their break-even sell price
+- the strategy reads active long and short lots from the position ledger and tracks
+  entry price, original quantity, highest observed price per long lot, and lowest
+  observed price per short lot
 - a confirmed peak creates targeted sell orders between each lot's tracked peak and
   break-even sell price
+- a confirmed valley creates targeted buy orders between each short lot's tracked trough
+  and break-even buy price
 - the grid distribution procedure chooses both ladder prices and per-order sizes
 - a later peak cancels that lot's open grid orders and recreates its ladder when the
   peak crosses back above at least one already filled grid point
+- a later valley mirrors the reset for short lots when price crosses below at least one
+  already filled buy-cover grid point
 
 The default distribution is a uniform price grid with geometric size decay:
 
@@ -266,14 +276,27 @@ The simulator represents these exit-grid orders as sell limit orders with
 `trigger = "below"`, so they fill when replay/live price falls through a ladder level.
 That models the intended peak-to-entry exit ladder, but it is stop-like behavior rather
 than a normal exchange sell limit resting above market.
+Short cover ladders mirror this with buy limit orders using `trigger = "above"`, so they
+fill when replay/live price rises back through a ladder level after a trough.
+After creating a new exit grid, the simulator immediately evaluates the new orders
+against the same tick. This lets the extrema-side grid point fill on the signal tick
+instead of waiting for the next replay/live price update.
+
+When a short is opened while long lots are active, the ledger records which long lots
+supplied internal borrowed base, prioritizing underwater longs. The short sale proceeds
+immediately reduce those long lots' remaining cost basis and break-even, without
+treating the short open as a long close. Buying that short back charges the cover cost
+back to the same source longs, so the completed borrow cycle applies the short's net
+profit or loss to the long cost basis.
 
 ## Current Defaults To Watch
 
 | Config | Default | Meaning |
 | --- | ---: | --- |
 | `algorithm` | `legacy-valley-peak` | The only automated algorithm key. |
-| `maxLeverage` | `5` | Leverage guard and current target leverage for new long entries; automated legacy does not open shorts. |
-| `maxPositionQuote` | `50000` | Maximum long notional the strategy can build. |
+| `maxLeverage` | `5` | Leverage guard and current target leverage for new long and short entries. |
+| `shortMarginModel` | `spot-borrow` | Short leverage accounting; use `futures-margin` for collateral-backed unlevered shorts. |
+| `maxPositionQuote` | `50000` | Maximum notional the strategy can build per side. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
 | `maxOpenOrders` | `24` | Maximum resting automated orders; relaxed exit-grid mode needs enough slots for per-lot ladders. |
 | `cooldownMs` | `30000` | Minimum delay between newly created automated orders. |
@@ -281,6 +304,8 @@ than a normal exchange sell limit resting above market.
 | `minOrderQuote` | `25` | Global minimum order notional. |
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
 | `legacyValleyPeak.maxTradeQuote` | `50000` | Per-signal quote/notional clip. |
+| `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
+| `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
 | `legacyValleyPeak.buySigma` | `0.3` | Buy Gaussian width around the sizing derivative. |
 | `legacyValleyPeak.sellSigma` | `0.1` | Sell Gaussian width around the sizing derivative. |
 | `legacyValleyPeak.exitGridEnabled` | `true` | Enables the peak-to-entry exit ladder. |
@@ -296,11 +321,44 @@ than a normal exchange sell limit resting above market.
 
 ## Current Default Backtests
 
-All rows below use the current default bot strategy: relaxed per-lot exit grid with
-filled-grid resets, `5x` max leverage, `$10000` starting quote, `$50000` target position
-cap, `$39200` initial debt cap, account-level liquidation, and a `300s` cooldown.
-Historical rows use local `BTCUSDT` `1m` candles through June 21, 2026. Random and
-synthetic runs use seed `1337`.
+### Short-Side Comparison
+
+Focused comparisons after adding mirrored short entries and buy-to-cover grids. All rows
+use relaxed per-lot filled-grid mode, `$10000` starting quote, `300s` cooldown, and no
+liquidations. Historical rows use local BTCUSDT `1m` candles from 2026-05-23 to
+2026-06-21. Synthetic rows use 30 days of default sine-plus-noise candles with seed
+`1337`. These rows used the default `spot-borrow` short margin model. The `1x`
+short-only rows have zero fills because the spot-margin debt guard rejects
+borrowed-base short entries at `1x`; use `shortMarginModel = "futures-margin"` to test
+standalone collateral-backed shorts without leverage.
+
+| Source | Max lev | Strategy | Return | Max DD | Risk Ret | Sharpe | Trades | Profitable closed positions | Oracle Capture | Reinvest Cap |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Historical | `1x` | Long/Short | `-7.90%` | `12.10%` | `-0.653` | `-3.488` | `347` | `19/73 (26.0%)` | `-13.146%` | `-9.610847%` |
+| Historical | `1x` | Long Only | `-9.85%` | `17.91%` | `-0.550` | `-2.546` | `45` | `3/10 (30.0%)` | `-16.386%` | `-11.979724%` |
+| Historical | `1x` | Short Only | `0.00%` | `0.00%` | `-` | `-` | `0` | `0/0 (0.0%)` | `0.000%` | `0.000000%` |
+| Historical | `5x` | Long/Short | `-44.46%` | `78.27%` | `-0.568` | `0.134` | `105` | `7/13 (53.8%)` | `-14.791%` | `-2.379744%` |
+| Historical | `5x` | Long Only | `-49.49%` | `84.47%` | `-0.586` | `0.691` | `59` | `4/12 (33.3%)` | `-16.464%` | `-2.648954%` |
+| Historical | `5x` | Short Only | `9.34%` | `16.34%` | `0.572` | `2.237` | `283` | `30/30 (100.0%)` | `3.106%` | `0.499801%` |
+| Synthetic | `1x` | Long/Short | `61.48%` | `19.40%` | `3.170` | `4.945` | `992` | `132/263 (50.2%)` | `-` | `-` |
+| Synthetic | `1x` | Long Only | `64.32%` | `22.53%` | `2.855` | `4.579` | `996` | `131/281 (46.6%)` | `-` | `-` |
+| Synthetic | `1x` | Short Only | `0.00%` | `0.00%` | `-` | `-` | `0` | `0/0 (0.0%)` | `-` | `-` |
+| Synthetic | `5x` | Long/Short | `319.69%` | `50.91%` | `6.280` | `5.535` | `2213` | `340/503 (67.6%)` | `-` | `-` |
+| Synthetic | `5x` | Long Only | `299.73%` | `69.57%` | `4.308` | `5.706` | `1661` | `255/363 (70.2%)` | `-` | `-` |
+| Synthetic | `5x` | Short Only | `16.30%` | `87.77%` | `0.186` | `4.806` | `959` | `16/16 (100.0%)` | `-` | `-` |
+
+With `shortMarginModel = "futures-margin"` and `1x` max leverage, the short-only row
+fills normally: the same historical window returned `2.24%` with `8.22%` drawdown over
+`134` fills, and the same synthetic setup returned `2.31%` with `28.80%` drawdown over
+`335` fills. Current relaxed long/short at `1x` under `futures-margin` returned
+`4.65%` with `5.46%` drawdown on the historical window and `4.65%` with `15.34%`
+drawdown on the synthetic series. All checks had zero liquidations.
+
+The broader reference rows below were captured before the short-side default changed.
+They use relaxed per-lot exit grid with filled-grid resets, `5x` max leverage, `$10000`
+starting quote, `$50000` target position cap, `$39200` initial debt cap, account-level
+liquidation, and a `300s` cooldown. Historical rows use local `BTCUSDT` `1m` candles
+through June 21, 2026. Random and synthetic runs use seed `1337`.
 `Reinvest Cap` is capture versus the compounded perfect-margin upper bound; `-` means
 the corresponding oracle PnL was not positive.
 

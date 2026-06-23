@@ -40,17 +40,23 @@ the relaxed per-lot peak exit-grid execution model:
 
 - detects local valleys from clamped rolling-average derivative sign changes
 - opens long lots at confirmed valleys with market-style entries
+- recreates buy-to-cover ladders for active short lots at confirmed valleys
 - detects local peaks from clamped rolling-average derivative sign changes
+- opens short lots at confirmed peaks with market-style entries when `shortSideEnabled`
+  is true
 - places resettable targeted sell ladders between each lot's tracked peak and
   break-even sell price
+- places resettable targeted buy ladders between each short lot's tracked trough and
+  break-even buy price
 - cancels stale unfilled orders after `staleOrderMs`
 - tracks quote/base reserves while orders are open
-- records fees, realized PnL, long average entry, drawdown, and win rate when orders fill
-- does not open automated shorts
+- records fees, realized PnL, ledger-derived long/short average entries, drawdown, and
+  win rate when orders fill
 
 In the simulator those ladder orders use a below-price trigger, which is closer to
-stop-ladder behavior than normal exchange sell-limit behavior. The older limit-only mode
-still exists as a configuration path, but it is no longer the default.
+stop-ladder behavior than normal exchange sell-limit behavior. Short cover ladders
+mirror this with above-price buy triggers. The older limit-only mode still exists as a
+configuration path, but it is no longer the default.
 
 The detailed implementation flow and current default parameters are documented in
 [Algorithms](algorithms.md).
@@ -116,6 +122,28 @@ Legacy valley/peak remains useful but fragile:
   return). This is strategy allocation evidence only; multi-symbol allocation was
   skipped because the cached symbol set did not yield enough aligned usable series for
   that routine.
+- After adding mirrored peak shorts and valley buy-to-cover grids, the focused
+  2026-05-23 to 2026-06-21 BTCUSDT `1m` comparison improved the relaxed per-lot
+  baseline but long/short remained unprofitable. At `1x`, long/short returned
+  `-7.90%` with `12.10%` drawdown versus long-only `-9.85%` with `17.91%` drawdown.
+  Short-only had zero fills at `1x` under the default `spot-borrow` model because the
+  debt guard rejects borrowed-base shorts with no leverage headroom. At `5x`,
+  long/short returned `-44.46%` with `78.27%` drawdown, long-only returned `-49.49%`
+  with `84.47%` drawdown, and short-only returned `9.34%` with `16.34%` drawdown. All
+  rows had zero liquidations. Use `shortMarginModel = "futures-margin"` for
+  collateral-backed unlevered short-only validation.
+- On the 30-day default synthetic sine-plus-noise series, `1x` long/short returned
+  `61.48%` with `19.40%` drawdown and long-only returned `64.32%` with `22.53%`
+  drawdown; short-only again had zero fills at `1x` under `spot-borrow`. At `5x`,
+  long/short returned `319.69%` with `50.91%` drawdown, long-only returned `299.73%`
+  with `69.57%` drawdown, and short-only returned `16.30%` with `87.77%` drawdown.
+- After adding the `futures-margin` short model, `1x` short-only no longer has the
+  zero-fill problem. On the same 2026-05-23 to 2026-06-21 historical BTCUSDT window,
+  short-only returned `2.24%` with `8.22%` drawdown over `134` fills. On the 30-day
+  default synthetic series, short-only returned `2.31%` with `28.80%` drawdown over
+  `335` fills. Current relaxed long/short at `1x` under `futures-margin` returned
+  `4.65%` with `5.46%` drawdown on the historical window and `4.65%` with `15.34%`
+  drawdown on the synthetic series. All futures-margin checks had zero liquidations.
 
 The most important next improvement is better signal qualification. The strategy needs
 to know whether a detected valley/peak has enough expected move after costs and fill
