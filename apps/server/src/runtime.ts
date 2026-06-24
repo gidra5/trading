@@ -257,9 +257,21 @@ export class TradingRuntime {
   }
 
   async resetBot(): Promise<BotEvent[]> {
+    const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
+    if (exchangeCanSubmit) {
+      await this.paperTrading!.cancelAllOpenOrders(this.market);
+      await this.paperTrading!.closeOpenPositions(this.market, {
+        includeUnprofitable: true,
+      });
+    }
+
     const events = this.bot.reset(this.config);
     this.recordEvents(events);
     await this.flushState();
+    if (exchangeCanSubmit) {
+      const snapshot = await this.paperTrading!.sync(this.market);
+      await this.applyExchangeSnapshot(snapshot);
+    }
     return events;
   }
 
@@ -283,13 +295,22 @@ export class TradingRuntime {
     events.push(...this.bot.cancelOpenOrders("close positions requested", at));
 
     if (exchangeCanSubmit) {
+      if (options.includeUnprofitable) {
+        this.recordEvents(events);
+        const snapshot = await this.paperTrading!.closeOpenPositions(this.market, options);
+        await this.applyExchangeSnapshot(snapshot);
+        await this.flushState();
+        return events;
+      }
+
       const closeEvents = this.bot.createPositionCloseOrders(options, at);
       events.push(...closeEvents);
       this.recordEvents(events);
       await this.submitCreatedOrdersToPaperExchange(closeEvents, {
         force: true,
-        throwOnFailure: true,
       });
+      const snapshot = await this.paperTrading!.closeOpenPositions(this.market, options);
+      await this.applyExchangeSnapshot(snapshot);
       await this.flushState();
       return events;
     }

@@ -794,6 +794,13 @@ export class SimulatedTradingBot {
     }
 
     const updatedAt = cleanPositive(update.updatedAt) || cleanPositive(update.createdAt) || fallbackAt;
+    const exchangeCreatedAt = cleanPositive(update.createdAt);
+    if (
+      (exchangeCreatedAt > 0 && exchangeCreatedAt < order.createdAt) ||
+      updatedAt < order.createdAt
+    ) {
+      return [];
+    }
     const missingFilledQuantity = roundAsset(
       Math.max(0, update.filledQuantity - order.filledQuantity),
     );
@@ -853,6 +860,12 @@ export class SimulatedTradingBot {
 
   private applyExchangeFill(input: ExchangeTradeFill): BotEvent | undefined {
     if (!input.id || this.state.fills.some((fill) => fill.id === input.id)) {
+      return undefined;
+    }
+    if (input.filledAt < this.state.createdAt) {
+      return undefined;
+    }
+    if (input.localOrderId && this.findOrderIndex(input.localOrderId) === undefined) {
       return undefined;
     }
 
@@ -1832,7 +1845,7 @@ export class SimulatedTradingBot {
     type: "limit" | "market" = "limit",
     trigger?: "above" | "below",
   ): TradingOrder {
-    const id = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
+    const id = `ord_${orderRunId(this.state.createdAt)}_${this.nextSequence().toString().padStart(6, "0")}`;
     return {
       id,
       side,
@@ -4171,6 +4184,11 @@ function remainingOrderReserveQuote(
     return 0;
   }
   return roundQuote(order.estimatedQuoteCost * (quantity / order.quantity));
+}
+
+function orderRunId(createdAt: number): string {
+  const source = Number.isFinite(createdAt) && createdAt > 0 ? Math.floor(createdAt) : Date.now();
+  return source.toString(36).slice(-8);
 }
 
 function cleanFiniteNumber(value: number | undefined): number {

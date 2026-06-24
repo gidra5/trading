@@ -543,6 +543,59 @@ export class BinancePaperTrading {
     return snapshot;
   }
 
+  async closeOpenPositions(
+    market: BinanceMarketListing,
+    options: { includeUnprofitable?: boolean } = {},
+  ): Promise<BinancePaperSnapshot> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") {
+      throw new Error("Exchange position close is only available for futures paper modes.");
+    }
+
+    const initial = await this.sync(market);
+    const positions = initial.positions.filter((position) =>
+      shouldClosePosition(position, options.includeUnprofitable === true),
+    );
+    if (positions.length === 0) {
+      return {
+        ...initial,
+        message: "No open Binance paper positions to close",
+      };
+    }
+
+    let closedCount = 0;
+    for (const position of positions) {
+      const quantity = Math.abs(position.positionAmt);
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        continue;
+      }
+      const positionSide = normalizePositionSideForOrder(position.positionSide);
+      const isHedgePosition = positionSide === "LONG" || positionSide === "SHORT";
+      await this.placeOrder(market, {
+        symbol: market.symbol,
+        side: position.positionAmt > 0 ? "sell" : "buy",
+        type: "market",
+        quantity,
+        reduceOnly: isHedgePosition ? undefined : true,
+        positionSide,
+        clientOrderId: createClientOrderId("close"),
+      });
+      closedCount += 1;
+    }
+
+    const synced = await this.sync(market);
+    const snapshot: BinancePaperSnapshot = {
+      ...synced,
+      lastSubmitAt: Date.now(),
+      message:
+        closedCount === 1
+          ? `Closed 1 open ${market.symbol} Binance paper position`
+          : `Closed ${closedCount} open ${market.symbol} Binance paper positions`,
+    };
+    this.snapshots.set(snapshotKey(environment, market.symbol), snapshot);
+    return snapshot;
+  }
+
   async changeLeverage(
     market: BinanceMarketListing,
     leverage: number,
@@ -1171,8 +1224,8 @@ function decimalParam(value: number | undefined): string | undefined {
   });
 }
 
-function createClientOrderId(): string {
-  return `trd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`.slice(
+function createClientOrderId(prefix = "trd"): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`.slice(
     0,
     36,
   );
@@ -1251,6 +1304,38 @@ function extractPositions(
           position.notional !== 0 ||
           position.unrealizedPnl !== 0),
     );
+}
+
+function shouldClosePosition(
+  position: BinancePaperPosition,
+  includeUnprofitable: boolean,
+): boolean {
+  if (position.positionAmt === 0) {
+    return false;
+  }
+  if (includeUnprofitable) {
+    return true;
+  }
+  if (Number.isFinite(position.unrealizedPnl) && (position.unrealizedPnl as number) > 0) {
+    return true;
+  }
+
+  const entryPrice = position.entryPrice ?? 0;
+  const markPrice = position.markPrice ?? 0;
+  if (entryPrice <= 0 || markPrice <= 0) {
+    return false;
+  }
+  return position.positionAmt > 0 ? markPrice > entryPrice : markPrice < entryPrice;
+}
+
+function normalizePositionSideForOrder(
+  positionSide: string | undefined,
+): "BOTH" | "LONG" | "SHORT" | undefined {
+  const normalized = stringValue(positionSide).toUpperCase();
+  if (normalized === "LONG" || normalized === "SHORT") {
+    return normalized;
+  }
+  return undefined;
 }
 
 function normalizeOrder(raw: unknown): BinancePaperOrder {
