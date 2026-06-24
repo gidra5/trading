@@ -100,11 +100,15 @@ npm run benchmark:strategies -- --mode days --days 30 --only relaxed
 npm run benchmark:strategies -- --mode synthetic --days 30 --only relaxed
 npm run benchmark:strategies -- --mode random-lengths --leverage 1 --only relaxed
 npm run benchmark:strategies -- --mode random-lengths --leverage 5 --only relaxed
+npm run benchmark:strategies -- --mode random-lengths --min-window-days 7 --max-window-days 7 --long-borrow-depth 1 --short-borrow-depth 2
+npm run benchmark:strategies -- --mode random-lengths --min-window-days 30 --max-window-days 30 --max-open-orders 1024
+npm run benchmark:strategies -- --mode random-lengths --only relaxed --borrow-depth-matrix --resample-minutes 30
 npm run benchmark:strategies -- --mode days --days 30 --leverage 1 --only "short only" --short-margin futures-margin
 ```
 
 The script reads local historical candles, runs `legacy-valley-peak` with identical
-starting capital, leverage guard, position cap, fees, limit offset, and cooldown, then
+starting capital, leverage guard, per-side position cap set to 100x starting capital,
+fees, limit offset, and cooldown, then
 reports return, drawdown, trade count, trade win rate, profitable closed positions,
 liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin capture,
 and compounded perfect-margin capture.
@@ -115,6 +119,17 @@ the current relaxed per-lot long/short default, long-only, and short-only varian
 Shorts default to the `spot-borrow` margin model. Use `--short-margin futures-margin`
 when testing standalone unlevered shorts against collateral-backed futures-style gross
 exposure instead of borrowed-base spot-margin debt.
+Use `--long-borrow-depth` and `--short-borrow-depth` to test depth-limited internal
+borrow chains by origin side. Use `--lock-borrowed-lender-collateral false` to allow
+the older behavior where lender lots can exit-grid collateral that is currently lent to
+borrowers. Use `--borrower-profit-share-to-lender` with a value from `0` to `1` to
+decide how much profitable borrower closes lower the lender's break-even. Use
+`--max-open-orders` to test the strategy-level resting order cap. Use
+`--borrow-depth-matrix` to expand the selected case across the standard `0/0`, `1/0`,
+`0/1`, `1/1`, `1/2`, `2/1`, and `2/2` depth matrix.
+Use `--resample-minutes` for fast historical proxy runs that replay aggregated OHLC
+buckets instead of exact cached candles; these runs are useful for checkpointing but
+should not be treated as exact 1m backtests.
 
 Random-length mode defaults to deterministic sampled windows. Tune it with:
 
@@ -157,6 +172,8 @@ keeps BTCUSDT-scale detector thresholds meaningful. Tune it with:
 `Risk Ret` is `returnPct / maxDrawdownPct`. `Sharpe` is annualized from the sampled
 equity curve with zero risk-free rate, so it is a coarse comparison metric rather than a
 tick-perfect realized Sharpe.
+Random-length tables include best and worst sample returns. Grid-search tables include
+best and worst fold returns.
 
 ## Promotion Standard
 

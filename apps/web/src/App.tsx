@@ -784,6 +784,10 @@ function AlgorithmPanel(props: {
       },
     });
   };
+  const updateValleyPeakOffsets = (
+    key: "buyConfirmationOffsets" | "sellConfirmationOffsets",
+    value: number[],
+  ) => updateValleyPeak(key, value);
   const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
     key: K,
     value: StrategyConfig["positionRisk"][K],
@@ -890,11 +894,40 @@ function AlgorithmPanel(props: {
                   onInput={(value) => update("limitOffsetBps", value)}
                 />
                 <NumberField
-                  label="Open Orders"
+                  label="Max Orders"
                   value={config().maxOpenOrders}
                   min={1}
                   step={1}
                   onInput={(value) => update("maxOpenOrders", Math.round(value))}
+                />
+                <NumberField
+                  label="Long Depth"
+                  value={config().longBorrowDepth}
+                  min={0}
+                  step={1}
+                  onInput={(value) => update("longBorrowDepth", Math.round(value))}
+                />
+                <NumberField
+                  label="Short Depth"
+                  value={config().shortBorrowDepth}
+                  min={0}
+                  step={1}
+                  onInput={(value) => update("shortBorrowDepth", Math.round(value))}
+                />
+                <BooleanField
+                  label="Lock Lent Collateral"
+                  checked={config().lockBorrowedLenderCollateral}
+                  onInput={(value) => update("lockBorrowedLenderCollateral", value)}
+                />
+                <NumberField
+                  label="Profit Share"
+                  value={config().borrowerProfitShareToLender}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  onInput={(value) =>
+                    update("borrowerProfitShareToLender", clampNumber(value, 0, 1))
+                  }
                 />
                 <NumberField
                   label="Stale sec"
@@ -971,12 +1004,15 @@ function AlgorithmPanel(props: {
                   min={0}
                   onInput={(value) => updateValleyPeak("saturationSec", value * 60)}
                 />
-                <NumberField
-                  label="Buy Confirm"
-                  value={config().legacyValleyPeak.buyConfirmationOffset}
-                  min={0}
-                  step={1}
-                  onInput={(value) => updateValleyPeak("buyConfirmationOffset", value)}
+                <NumberListField
+                  label="Buy Confirms"
+                  value={config().legacyValleyPeak.buyConfirmationOffsets}
+                  onInput={(value) => updateValleyPeakOffsets("buyConfirmationOffsets", value)}
+                />
+                <NumberListField
+                  label="Sell Confirms"
+                  value={config().legacyValleyPeak.sellConfirmationOffsets}
+                  onInput={(value) => updateValleyPeakOffsets("sellConfirmationOffsets", value)}
                 />
               </div>
             </div>
@@ -1061,6 +1097,31 @@ function NumberField(props: {
         step={props.step ?? 1}
         value={Number.isFinite(props.value) ? props.value : 0}
         onInput={(event) => props.onInput(Number(event.currentTarget.value))}
+      />
+    </label>
+  );
+}
+
+function NumberListField(props: {
+  label: string;
+  value: number[];
+  onInput: (value: number[]) => void;
+}) {
+  const parseOffsets = (rawValue: string) =>
+    rawValue
+      .split(",")
+      .map((part) => Number(part.trim()))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .map((value) => Math.round(value));
+
+  return (
+    <label class="block">
+      <span class="muted-label">{props.label}</span>
+      <input
+        class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100 tabular-nums"
+        type="text"
+        value={props.value.join(",")}
+        onInput={(event) => props.onInput(parseOffsets(event.currentTarget.value))}
       />
     </label>
   );

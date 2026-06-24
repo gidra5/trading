@@ -83,6 +83,10 @@ export interface StrategyConfig {
   startingQuote: number;
   maxLeverage: number;
   shortMarginModel: ShortMarginModel;
+  longBorrowDepth: number;
+  shortBorrowDepth: number;
+  lockBorrowedLenderCollateral: boolean;
+  borrowerProfitShareToLender: number;
   feeBps: number;
   maxPositionQuote: number;
   limitOffsetBps: number;
@@ -111,7 +115,7 @@ export interface LegacyValleyPeakConfig {
   rateThresholdsHigh: number[];
   buyDataIndex: number;
   sellDataIndex: number;
-  buyConfirmationOffset: number;
+  buyConfirmationOffsets: number[];
   sellConfirmationOffsets: number[];
   saturationSec: number;
   buySpendRate: number;
@@ -166,6 +170,7 @@ export interface LegacyExitGridMemory {
   gridPeakPrice: number;
   troughPrice?: number;
   gridTroughPrice?: number;
+  gridCreatedAt?: number;
   gridOrderIds: string[];
 }
 

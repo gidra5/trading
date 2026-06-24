@@ -33,6 +33,8 @@ extract profit from the current dip. Optimal execution price has the same tensio
 too frequently and fees eat the edge; wait too long and volatility opportunities are
 missed.
 
+We also want to maximize utility of every dollar available. basically the more of our total capital we allocate at quality valleys/peaks, the more utility per dollar we get.
+
 ## Current Legacy Summary
 
 Legacy valley/peak is a rolling-average turning-point strategy. The current default is
@@ -144,6 +146,345 @@ Legacy valley/peak remains useful but fragile:
   `335` fills. Current relaxed long/short at `1x` under `futures-margin` returned
   `4.65%` with `5.46%` drawdown on the historical window and `4.65%` with `15.34%`
   drawdown on the synthetic series. All futures-margin checks had zero liquidations.
+- After replacing the no-chain borrow rule with separate `longBorrowDepth` and
+  `shortBorrowDepth`, relaxed per-lot long/short was tested at `1x` with
+  `futures-margin`, `maxOpenOrders = 1024`, and seed `1337`. On 48 random 7-day BTCUSDT
+  windows, `L2/S2` had the best average return at `0.79%`, followed by `L1/S2` at
+  `0.77%`; both reduced the worst weekly result from roughly `-26%` to `-13.91%`.
+  On the 2025-06-22 to 2026-06-21 one-year window, however, `L0/S0` was least bad at
+  `-1.74%`, while deeper borrow chains increased drawdown and losses. All checked
+  combinations had zero liquidations.
+
+Borrow-depth matrix, random 7-day windows:
+
+| Depth L/S | Avg Return | Median | Avg DD | Avg Trades |
+| --- | ---: | ---: | ---: | ---: |
+| `0/0` | `-0.11%` | `0.06%` | `3.09%` | `66.6` |
+| `1/0` | `0.08%` | `0.12%` | `3.05%` | `76.8` |
+| `0/1` | `0.05%` | `0.04%` | `3.23%` | `88.0` |
+| `1/1` | `0.12%` | `0.06%` | `3.17%` | `84.3` |
+| `1/2` | `0.77%` | `0.12%` | `2.78%` | `83.5` |
+| `2/1` | `0.14%` | `0.06%` | `3.22%` | `90.9` |
+| `2/2` | `0.79%` | `0.12%` | `2.83%` | `94.3` |
+
+Borrow-depth matrix, 1-year window:
+
+| Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `0/0` | `-1.74%` | `9.84%` | `637` |
+| `1/0` | `-5.61%` | `12.28%` | `646` |
+| `0/1` | `-8.99%` | `16.59%` | `890` |
+| `1/1` | `-6.39%` | `13.70%` | `836` |
+| `1/2` | `-6.56%` | `13.10%` | `818` |
+| `2/1` | `-12.56%` | `20.06%` | `957` |
+| `2/2` | `-10.29%` | `18.05%` | `865` |
+
+Longer random-window borrow-depth checks used relaxed per-lot long/short, `1x`,
+`futures-margin`, `maxOpenOrders = 1024`, `300s` cooldown, seed `1337`, and the
+spot BTCUSDT 1m cache. The 365-day sample set only produced two heavily
+overlapping April 2022-April 2023 windows, so treat it as a single-regime stress
+check rather than broad one-year coverage.
+
+Borrow-depth matrix, random 30-day windows, 8 samples:
+
+| Depth L/S | Avg Return | Avg DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0/0` | `-0.61%` | `6.80%` | `134.9` | `5.62%` | `-13.48%` |
+| `1/0` | `1.19%` | `6.68%` | `148.9` | `5.76%` | `-4.04%` |
+| `0/1` | `-0.63%` | `7.13%` | `230.6` | `5.62%` | `-13.80%` |
+| `1/1` | `-0.51%` | `6.31%` | `172.1` | `5.76%` | `-13.80%` |
+| `1/2` | `2.23%` | `4.13%` | `190.4` | `5.76%` | `-1.54%` |
+| `2/1` | `-0.41%` | `6.99%` | `238.6` | `5.76%` | `-13.80%` |
+| `2/2` | `1.99%` | `4.79%` | `274.6` | `5.93%` | `-4.04%` |
+
+Borrow-depth matrix, random 180-day windows, 3 samples:
+
+| Depth L/S | Avg Return | Avg DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0/0` | `-2.81%` | `19.14%` | `300.3` | `5.92%` | `-12.76%` |
+| `1/0` | `12.81%` | `11.04%` | `477.7` | `15.73%` | `9.50%` |
+| `0/1` | `1.84%` | `21.48%` | `399.0` | `22.06%` | `-20.06%` |
+| `1/1` | `4.19%` | `16.90%` | `396.3` | `28.57%` | `-18.93%` |
+| `1/2` | `14.81%` | `8.40%` | `518.0` | `18.03%` | `12.67%` |
+| `2/1` | `-7.14%` | `23.35%` | `339.3` | `3.91%` | `-19.47%` |
+| `2/2` | `18.35%` | `10.72%` | `605.0` | `23.23%` | `13.82%` |
+
+Borrow-depth matrix, random 365-day windows, 2 overlapping samples:
+
+| Depth L/S | Avg Return | Avg DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0/0` | `17.95%` | `24.11%` | `514.5` | `19.04%` | `16.86%` |
+| `1/0` | `34.23%` | `7.21%` | `990.0` | `39.05%` | `29.42%` |
+| `0/1` | `2.57%` | `27.71%` | `501.5` | `2.99%` | `2.15%` |
+| `1/1` | `23.06%` | `7.83%` | `743.5` | `35.42%` | `10.71%` |
+| `1/2` | `48.70%` | `6.62%` | `956.5` | `58.59%` | `38.82%` |
+| `2/1` | `12.01%` | `22.07%` | `643.0` | `16.05%` | `7.97%` |
+| `2/2` | `47.77%` | `12.60%` | `1054.0` | `63.94%` | `31.60%` |
+
+Activity diagnostic on the 2022-05-12 to 2022-11-08 180-day sample:
+
+| Depth L/S | Return | Max DD | Trades | Fees | Orders | Cancelled | Exit-grid orders | Active L/S lots | Gross Exposure | Internal Borrow |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1/0` | `23.86%` | `11.34%` | `474` | `$93.73` | `694` | `219` | `481` | `81/94` | `$12559.85` | `0.17114899 BTC / $3174.34` |
+| `1/2` | `19.66%` | `18.69%` | `544` | `$112.38` | `1167` | `620` | `963` | `66/75` | `$12103.77` | `0.15008842 BTC / $3401.08` |
+| `2/1` | `-6.23%` | `23.16%` | `435` | `$104.38` | `683` | `243` | `532` | `67/40` | `$9407.01` | `0.02696449 BTC / $2248.64` |
+| `2/2` | `28.36%` | `8.46%` | `672` | `$163.96` | `1910` | `1219` | `1690` | `55/76` | `$12958.04` | `0.09058885 BTC / $5007.26` |
+
+Longer windows show two competing effects. `S2` often improves sampled returns by
+letting profitable opposing positions subsidize bad inventory, but every extra hop
+materially increases lots, exit-grid resets, cancellations, fees, and pending
+inventory. The suspicious case is `L2/S1`: it is worse in both 180-day and
+365-day checks, with high drawdown despite many profitable closed positions. That
+suggests the second long-origin hop can over-recycle capital into local valleys
+inside larger down moves, leaving the book with stale long exposure while the
+closed-position stats still look healthy. Since the extrema detector is local and
+not trend-aware, deeper chains amplify false reversals instead of adding edge; the
+strategy needs regime/signal qualification before promoting deeper borrow limits.
+
+The 2021-12-03 to 2022-06-01 worst 180-day window exposed a grid reset edge case:
+tiny extrema-side partials could fall below `minOrderQuote`, get skipped, and leave
+only break-even-side orders to be repeatedly cancelled on resets. The grid builder now
+sweeps the whole remaining lot when a partial would create a below-minimum remainder,
+and filled-grid resets only reuse filled points from the active grid unless price makes
+a new higher peak or lower trough than the previous reset.
+
+Exact 1m replay of that window after the fix:
+
+| Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `0/0` | `-34.65%` | `37.66%` | `404` |
+| `1/0` | `53.35%` | `9.13%` | `1209` |
+| `0/1` | `-36.40%` | `39.98%` | `358` |
+| `1/1` | `-7.66%` | `14.12%` | `1020` |
+| `1/2` | `58.63%` | `8.38%` | `1336` |
+| `2/1` | `-8.77%` | `14.44%` | `1056` |
+| `2/2` | `53.54%` | `9.28%` | `1779` |
+
+After swapping the extrema procedures, the default detector now uses the old peak
+procedure for valley buys (`1m` source with `30m`/`10m` rising confirmations) and the
+old valley procedure for peak sells (`1s` source with `12h` falling confirmation). This
+turns long entries into broader-uptrend pullbacks and short entries into broader-downtrend
+bounce peaks. Exact 1m replay of the same 2021-12-03 to 2022-06-01 window:
+
+| Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `0/0` | `25.27%` | `10.47%` | `496` |
+| `1/0` | `29.44%` | `11.95%` | `469` |
+| `0/1` | `44.54%` | `17.86%` | `407` |
+| `1/1` | `46.38%` | `17.10%` | `448` |
+| `1/2` | `27.72%` | `8.88%` | `503` |
+| `2/1` | `46.38%` | `17.10%` | `448` |
+| `2/2` | `46.31%` | `17.10%` | `448` |
+
+Symmetric detector checks on the same exact window:
+
+- Symmetric permissive means both sides use the `1s` primary with `12h` trend
+  confirmation. Every borrow-depth case converged to the same path: `54.27%`
+  return, `26.94%` max drawdown, and `229` trades.
+- Symmetric strict means both sides use the `1m` primary with `30m`/`10m` trend
+  confirmations.
+
+| Strict Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `0/0` | `29.46%` | `0.85%` | `926` |
+| `1/0` | `28.38%` | `3.20%` | `898` |
+| `0/1` | `73.32%` | `6.20%` | `2688` |
+| `1/1` | `36.68%` | `2.95%` | `1123` |
+| `1/2` | `35.01%` | `3.48%` | `1171` |
+| `2/1` | `85.78%` | `6.27%` | `3163` |
+| `2/2` | `45.74%` | `1.77%` | `1889` |
+
+Odd-depth strict-symmetric check on the same window:
+
+| Strict Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `1/1` | `36.68%` | `2.95%` | `1123` |
+| `1/3` | `44.66%` | `4.44%` | `1432` |
+| `3/1` | `50.64%` | `5.81%` | `1866` |
+| `3/3` | `88.72%` | `5.98%` | `3011` |
+
+Next odd-depth strict-symmetric check:
+
+| Strict Depth L/S | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: |
+| `3/5` | `98.05%` | `2.59%` | `3782` |
+| `5/3` | `94.70%` | `7.29%` | `3204` |
+| `5/5` | `104.65%` | `1.80%` | `3879` |
+
+An effectively unlimited strict-symmetric depth run with `999/999` produced the same
+result as `5/5` on this window: `104.65%` return, `1.80%` max drawdown, and `3879`
+trades. The natural chain depth therefore appears to saturate by depth 5 for this
+specific replay.
+
+Strict-symmetric fixed last-window anchor, captured in the Codex session log on
+2026-06-23, used `1x`, `futures-margin`, exact BTCUSDT 1m candles, `300s` cooldown,
+`maxOpenOrders = 1024`, `maxPositionQuote = 10000`, `exitGridResetMode = "filled-grid"`,
+and no borrow-lock/profit-share config. The detector was strict symmetric:
+`buyDataIndex = 1`, `sellDataIndex = 1`, `buyConfirmationOffsets = [2, 1]`, and
+`sellConfirmationOffsets = [2, 1]`.
+
+| Window | Depth | Interval | Return | Net PnL | Max DD | Trades | Win Rate | Prof Pos |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30d | `5/5` | 2026-05-22..2026-06-21 | `5.12%` | `$512.39` | `2.85%` | `878` | `74.9%` | `92/109` |
+| 30d | `999/999` | 2026-05-22..2026-06-21 | `5.12%` | `$512.39` | `2.85%` | `878` | `74.9%` | `92/109` |
+| 180d | `5/5` | 2025-12-23..2026-06-21 | `0.35%` | `$34.79` | `8.43%` | `1093` | `67.7%` | `104/131` |
+| 180d | `999/999` | 2025-12-23..2026-06-21 | `0.35%` | `$34.79` | `8.43%` | `1093` | `67.7%` | `104/131` |
+| 365d | `5/5` | 2025-06-21..2026-06-21 | `23.11%` | `$2311.47` | `7.98%` | `1570` | `80.3%` | `152/169` |
+| 365d | `999/999` | 2025-06-21..2026-06-21 | `23.11%` | `$2311.47` | `7.98%` | `1570` | `80.3%` | `152/169` |
+
+The exact 180d anchor interval starts at `2025-12-23T20:22:00Z`, not midnight. A later
+audit reran that exact interval with current code and explicit `lockBorrowedLenderCollateral = false`
+plus `borrowerProfitShareToLender = 1`; it reproduced `0.35%`, `$34.79`, and `1093`
+trades. Raising only `maxPositionQuote` from `10000` to `1000000` did not change that
+strict `5/5` anchor row, so the position cap was not the cause of the original near-flat
+result.
+
+Strict-symmetric random 90d exact 1m matrix, same anchor config, seed `1337`, 50 samples:
+
+| Depth | Samples | Profitable | Avg Return | Median | P10 | Avg Max DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `5/5` | `50` | `48/50` | `28.38%` | `27.86%` | `4.42%` | `5.98%` | `989.9` | `82.91%` | `-4.40%` |
+| `999/999` | `50` | `48/50` | `28.47%` | `27.86%` | `4.42%` | `5.98%` | `996.8` | `83.18%` | `-4.87%` |
+
+The 90d sample set was strong and mostly profitable, but the 180d fixed anchor showed
+that one recent half-year path could still give back most of the early gains. Depth
+`999/999` was essentially identical to `5/5` on 30d/90d/180d/365d recent checks, so
+unlimited depth was not useful there.
+
+Full-cycle strict-symmetric 1800d checks changed that conclusion slightly. The `5/5`
+run returned `253.50%` on `2021-07-17..2026-06-21`. A tracked `999/999` run returned
+`261.14%`, `$26114.14` net PnL, `4794` trades, `81.3%` win rate, and `659/769`
+profitable closed positions. The tracked run reached max long depth `6` and max short
+depth `7`, first in late 2021. So full-cycle unlimited depth exceeded `5/5`, but only
+modestly; it did not grow without bound.
+
+Asymmetric short-favoring detector checks used strict buys with permissive sells:
+`buyDataIndex = 1`, `buyConfirmationOffsets = [2, 1]`, `sellDataIndex = 0`, and
+`sellConfirmationOffsets = [6]`, with `7/7`, `1x`, `futures-margin`, and exact 1m
+replay.
+
+| Window | Interval | Market | Return | Max DD | Trades | Prof Pos |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 180d recent | 2025-12-23..2026-06-21 | - | `27.89%` | `14.05%` | `405` | `10/10` |
+| 180d uptrend | 2023-09-16..2024-03-13 | `174.71%` | `107.15%` | `4.86%` | `400` | `43/45` |
+| 1800d full cycle | 2021-07-17..2026-06-21 | `101.62%` | `213.97%` | `51.78%` | `1686` | `230/253` |
+
+This variant was much better on the troublesome recent 180d interval, but the 1800d
+drawdown was very high. It looks more like a directional short-trigger bias than a
+robust all-regime improvement.
+
+Random 30d strict-symmetric `7/7` leverage scaling, 50 exact 1m samples:
+
+| Leverage | Profitable | Stopped | Avg Return | Median | P10 | Avg Max DD | Avg Trades | Liquidated Positions | Best | Worst |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1x` | `43/50` | `0` | `12.41%` | `9.38%` | `-1.01%` | `5.13%` | `488.2` | `0` | `42.13%` | `-5.20%` |
+| `2x` | `46/50` | `0` | `33.19%` | `30.49%` | `4.76%` | `9.04%` | `884.4` | `0` | `91.53%` | `-3.06%` |
+| `3.5x` | `44/50` | `2` | `56.65%` | `56.27%` | `-0.29%` | `17.31%` | `1041.1` | `15` | `171.97%` | `-100.15%` |
+| `5x` | `44/50` | `2` | `85.95%` | `91.31%` | `-0.41%` | `22.01%` | `1109.4` | `13` | `257.76%` | `-100.24%` |
+
+Leverage helped average returns but introduced liquidation/tail-loss failures at `3.5x`
+and `5x`. The practical no-leverage-first rule still stands; paired leverage tests are
+useful for stress validation, not for selecting parameters by average return alone.
+
+Borrow-lock/profit-share experiments were added after observing that lender lots could
+still exit-grid free account base while another position had borrowed from that lot.
+The historical note below was captured during that implementation pass on the
+troublesome recent 180d replay with `7/7`, `1x`, `futures-margin`, and exact 1m
+candles:
+
+| Lock Lent Collateral | Borrower Profit Share To Lender | Return | Max DD | Trades | Prof Pos |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| off | `1.00` | `0.35%` | `8.43%` | `1093` | `104/131` |
+| off | `0.50` | `2.21%` | `7.73%` | `1163` | `115/148` |
+| off | `0.00` | `1.32%` | `7.19%` | `1273` | `130/164` |
+| on | `1.00` | `1.81%` | `6.86%` | `523` | `16/17` |
+| on | `0.50` | `1.81%` | `6.86%` | `523` | `16/17` |
+| on | `0.00` | `1.81%` | `6.86%` | `523` | `16/17` |
+
+The later audit found that the `off / 1.00` row was conflated with the strict-symmetric
+fixed-window anchor above. Treat this table as historical context for why locking was
+added, not as a clean current-code reproduction. Under current code with the swapped
+default detector and `7/7`, the same calendar span now measures around `5.8%` to `6.9%`
+depending on lock and cap settings.
+
+Current-code cap checks on the same calendar replay:
+
+| Borrow Lock | Cap | Return | Max DD | Trades |
+| --- | ---: | ---: | ---: | ---: |
+| off | `1x` | `5.94%` | `9.73%` | `329` |
+| off | `100x` | `6.89%` | `9.40%` | `326` |
+| on | `1x` | `5.82%` | `9.47%` | `326` |
+| on | `100x` | `6.58%` | `9.40%` | `320` |
+
+The reproduction audit also tried nearby current-code variants on the same calendar
+span. The current swapped detector returned about `5.94%` with the old `10000` cap and
+about `6.89%` once the cap was raised. A strict-symmetric override returned `3.83%`
+regardless of `10000`, `50000`, or `1000000` cap, so the cap was not the reason it
+failed to reproduce `0.35%`. Reset-mode changes also did not reproduce the anchor:
+swapped/filled returned `6.68%`, strict/higher returned `3.83%`, and strict/filled
+returned `3.53%`. Reverting the sell-confirmation sign produced `2.51%` at both caps,
+also not the anchor.
+
+Strict-symmetric grid order-count probes on that calendar span were non-monotonic:
+`3` orders returned `-5.90%`, `6` returned `3.83%`, `8` returned `6.99%`, `10`
+returned `10.97%`, and `12` returned `8.50%`. More grid levels can help, but this is
+parameter sensitivity, not a clean explanation for the original 180d near-flat row.
+
+The cap increase from `startingQuote * leverage` to `startingQuote * 100` removed a
+hidden per-side bucket during low-leverage tests, but it did not remove the main
+capacity blocker. Instrumentation on the locked `7/7`, `1x`, futures-margin replay
+showed that March-June peak signals were mostly blocked by gross exposure capacity,
+not by borrow depth or by short-side cap:
+
+| Month | Peak Signals | Quote OK | Gross Cap Blocked | Sell Opens | Min Short Cap | Max Gross Exposure |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2026-03 | `955` | `0` | `955` | `0` | `$1745.18` | `$13019.56` |
+| 2026-04 | `302` | `0` | `302` | `0` | `$1366.59` | `$13616.69` |
+| 2026-05 | `247` | `0` | `247` | `0` | `$1001.16` | `$14193.03` |
+| 2026-06 | `753` | `27` | `726` | `27` | `$1920.56` | `$12692.70` |
+
+The exact condition was `grossEntryLeverageCapacityQuote(...) < minOrderQuote`, which
+makes short entry selling power zero before borrow allocation is even attempted. Internal
+borrow improves lot basis accounting, but the current guard still counts both long and
+short exposure toward gross leverage capacity at `1x`.
+
+Higher-sample checkpoint, 30m OHLC proxy: exact 1m 50-sample long-window matrices
+were too slow for a 30-minute checkpoint, so the benchmark runner was extended with
+`--borrow-depth-matrix` and `--resample-minutes`. The 30d and 180d matrices below
+completed with 50 samples per depth case. A 365d 50-sample pass was stopped before
+producing a table; a reduced 10-sample 365d pass also exceeded the checkpoint while
+still inside `L0/S1`, so the previous exact 2-sample 365d table remains the only
+complete 1-year depth matrix for now.
+
+Borrow-depth matrix, random 30-day windows, 50 samples, 30m OHLC proxy:
+
+| Depth L/S | Avg Return | Median | P10 | Avg DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0/0` | `3.83%` | `3.75%` | `-3.75%` | `8.55%` | `277.4` | `22.94%` | `-27.21%` |
+| `1/0` | `7.74%` | `5.38%` | `2.92%` | `4.93%` | `464.4` | `27.69%` | `-3.13%` |
+| `0/1` | `4.20%` | `4.48%` | `-3.78%` | `8.99%` | `292.7` | `23.73%` | `-27.21%` |
+| `1/1` | `5.45%` | `5.58%` | `-1.36%` | `7.19%` | `381.3` | `22.12%` | `-27.25%` |
+| `1/2` | `8.10%` | `5.91%` | `3.03%` | `4.91%` | `472.7` | `27.70%` | `-3.13%` |
+| `2/1` | `4.79%` | `4.61%` | `-3.50%` | `8.12%` | `350.6` | `22.90%` | `-27.25%` |
+| `2/2` | `6.93%` | `5.60%` | `1.82%` | `5.58%` | `460.1` | `22.97%` | `-12.01%` |
+
+Borrow-depth matrix, random 180-day windows, 50 samples, 30m OHLC proxy:
+
+| Depth L/S | Avg Return | Median | P10 | Avg DD | Avg Trades | Best | Worst |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `0/0` | `11.00%` | `11.57%` | `-14.16%` | `14.12%` | `649.3` | `47.27%` | `-43.92%` |
+| `1/0` | `23.64%` | `16.26%` | `5.31%` | `7.96%` | `1084.5` | `84.22%` | `-43.92%` |
+| `0/1` | `10.94%` | `15.25%` | `-17.80%` | `16.57%` | `838.1` | `34.17%` | `-43.92%` |
+| `1/1` | `20.94%` | `17.91%` | `6.47%` | `10.89%` | `976.6` | `81.39%` | `-43.75%` |
+| `1/2` | `24.73%` | `18.89%` | `4.89%` | `8.54%` | `1087.6` | `84.22%` | `-43.92%` |
+| `2/1` | `13.50%` | `16.67%` | `-10.83%` | `13.84%` | `955.5` | `36.43%` | `-43.75%` |
+| `2/2` | `22.33%` | `23.10%` | `6.86%` | `10.07%` | `1200.7` | `70.87%` | `-43.92%` |
+
+The higher-sample proxy keeps the same broad ranking as the smaller exact checks:
+`L1/S2` and `L1/S0` are strongest, `L0/S1` adds weaker short-origin churn, and
+`L2/S1` remains inferior to the one-hop long-origin variants. The proxy also makes
+the cost of deeper chains clearer: the best-return variants roughly double trade
+count versus `0/0`, and `2/2` is the highest-activity case.
 
 The most important next improvement is better signal qualification. The strategy needs
 to know whether a detected valley/peak has enough expected move after costs and fill

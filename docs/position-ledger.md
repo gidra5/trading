@@ -157,8 +157,16 @@ Borrow attribution distinguishes internal and external borrowing:
 - Buying the borrowed short back charges the cover cost back to the same source long.
   The completed effect is the short's realized profit or loss applied to the long cost
   basis.
-- A long can use owned quote capital first, then borrow quote internally from active
-  short proceeds, then borrow quote externally if the account quote balance is negative.
+- A long can borrow quote internally from active short proceeds. The source short is
+  recorded, its available proceeds are lent out while the long is open, and closing
+  the long returns sale value to the same source short in proportion to the funded
+  base quantity.
+- Borrow chains are depth-limited. `longBorrowDepth` controls how many alternating
+  internal borrow hops can start from a long lender; `shortBorrowDepth` does the same
+  for a short lender. A depth of `0` disables that origin side as an internal lender,
+  while the default `1` matches the previous one-hop behavior.
+- Any long cost not funded internally or by owned quote can still appear as external
+  borrowed quote if the account quote balance is negative.
 - In `spot-borrow`, `externalBorrowedQuote` is the amount that counts toward effective
   leverage.
 - In `futures-margin`, `externalBorrowedQuote` is still shown for inspection, but gross

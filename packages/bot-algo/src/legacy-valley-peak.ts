@@ -28,10 +28,10 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
-  buyDataIndex: 0,
-  sellDataIndex: 1,
-  buyConfirmationOffset: 6,
-  sellConfirmationOffsets: [2, 1],
+  buyDataIndex: 1,
+  sellDataIndex: 0,
+  buyConfirmationOffsets: [2, 1],
+  sellConfirmationOffsets: [6],
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
@@ -68,6 +68,9 @@ export function createLegacyValleyPeakConfig(
       overrides.rateThresholdsLow ?? defaultLegacyValleyPeakConfig.rateThresholdsLow,
     rateThresholdsHigh:
       overrides.rateThresholdsHigh ?? defaultLegacyValleyPeakConfig.rateThresholdsHigh,
+    buyConfirmationOffsets:
+      overrides.buyConfirmationOffsets ??
+      defaultLegacyValleyPeakConfig.buyConfirmationOffsets,
     sellConfirmationOffsets:
       overrides.sellConfirmationOffsets ??
       defaultLegacyValleyPeakConfig.sellConfirmationOffsets,
@@ -79,7 +82,9 @@ export function createLegacyValleyPeakConfig(
   config.rateThresholdsHigh = padNumbers(config.rateThresholdsHigh, rangeCount, 0.25);
   config.buyDataIndex = clampInt(config.buyDataIndex, 0, rangeCount - 1);
   config.sellDataIndex = clampInt(config.sellDataIndex, 0, rangeCount - 1);
-  config.buyConfirmationOffset = Math.max(0, Math.round(config.buyConfirmationOffset));
+  config.buyConfirmationOffsets = config.buyConfirmationOffsets.map((offset) =>
+    Math.max(0, Math.round(offset)),
+  );
   config.sellConfirmationOffsets = config.sellConfirmationOffsets.map((offset) =>
     Math.max(0, Math.round(offset)),
   );
@@ -227,11 +232,12 @@ function shouldBuy(
     return false;
   }
 
-  const confirmationIndex = config.buyDataIndex + config.buyConfirmationOffset;
-  const confirmation = memory.buyAverages[confirmationIndex];
-  const confirmationPoint = latestPoint(confirmation);
-  if (confirmationPoint && confirmationPoint.rateClamped >= 0) {
-    return false;
+  for (const offset of config.buyConfirmationOffsets) {
+    const confirmation = memory.buyAverages[config.buyDataIndex + offset];
+    const confirmationPoint = latestPoint(confirmation);
+    if (confirmationPoint && confirmationPoint.rateClamped <= 0) {
+      return false;
+    }
   }
 
   return true;
@@ -249,7 +255,7 @@ function shouldSell(
   for (const offset of config.sellConfirmationOffsets) {
     const confirmation = memory.sellAverages[config.sellDataIndex + offset];
     const confirmationPoint = latestPoint(confirmation);
-    if (confirmationPoint && confirmationPoint.rateClamped <= 0) {
+    if (confirmationPoint && confirmationPoint.rateClamped >= 0) {
       return false;
     }
   }

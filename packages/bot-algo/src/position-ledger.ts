@@ -21,6 +21,9 @@ interface LedgerContext {
   netMarketSellPrice: number;
   grossMarketBuyPrice: number;
   quantityFloor: number;
+  longBorrowDepth: number;
+  shortBorrowDepth: number;
+  borrowerProfitShareToLender: number;
 }
 
 interface BorrowProfile {
@@ -38,15 +41,18 @@ interface BorrowProfiles {
   shorts: Map<string, BorrowProfile>;
 }
 
-interface BorrowSource {
-  id: string;
-  openedAt: number;
-  available: number;
-}
-
 interface ShortBorrowAllocation {
   longLotId: string;
   quantity: number;
+  quote: number;
+  depthRemaining: number;
+}
+
+interface LongBorrowAllocation {
+  shortLotId: string;
+  quantity: number;
+  quote: number;
+  depthRemaining: number;
 }
 
 export interface ClosedPositionStats {
@@ -78,6 +84,8 @@ type MutableLongLot = Omit<
   | "borrowedFromPositionCount"
 > & {
   lentQuantity: number;
+  borrowDepthRemaining: number;
+  borrowAllocations: LongBorrowAllocation[];
 };
 
 type MutableShortLot = Omit<
@@ -101,6 +109,8 @@ type MutableShortLot = Omit<
   | "externalBorrowedQuote"
   | "borrowedFromPositionCount"
 > & {
+  lentQuote: number;
+  borrowDepthRemaining: number;
   borrowAllocations: ShortBorrowAllocation[];
 };
 
@@ -144,15 +154,15 @@ export function analyzePositions(
 
   for (const fill of chronologicalFills(state.fills)) {
     if (fill.side === "buy") {
-      applyBuyFill(fill, orderById.get(fill.orderId), shorts, longs);
+      applyBuyFill(fill, orderById.get(fill.orderId), shorts, longs, context);
     } else {
-      applySellFill(fill, orderById.get(fill.orderId), longs, shorts);
+      applySellFill(fill, orderById.get(fill.orderId), longs, shorts, context);
     }
   }
 
   for (const order of state.orders) {
     if (order.status === "open") {
-      appendPendingOrderLot(order, state.config.feeBps / 10_000, longs, shorts);
+      appendPendingOrderLot(order, state.config.feeBps / 10_000, context, longs, shorts);
     }
   }
 
@@ -271,6 +281,13 @@ function buildContext(state: PaperBotState, currentPriceOverride?: number): Ledg
     netMarketSellPrice: currentPrice > 0 ? currentPrice / (1 + feeAndSlippageRate) : 0,
     grossMarketBuyPrice: currentPrice > 0 ? currentPrice * (1 + feeAndSlippageRate) : 0,
     quantityFloor: risk.quantityFloor,
+    longBorrowDepth: normalizeBorrowDepth(state.config.longBorrowDepth),
+    shortBorrowDepth: normalizeBorrowDepth(state.config.shortBorrowDepth),
+    borrowerProfitShareToLender: clamp(
+      cleanNumber(state.config.borrowerProfitShareToLender ?? 1),
+      0,
+      1,
+    ),
   };
 }
 
@@ -279,6 +296,7 @@ function applyBuyFill(
   sourceOrder: TradingOrder | undefined,
   shorts: MutableShortLot[],
   longs: MutableLongLot[],
+  context: LedgerContext,
 ): void {
   const unitCost = (fill.quoteQuantity + fill.feeQuote) / fill.quantity;
   let quantityLeft = fill.quantity;
@@ -287,7 +305,7 @@ function applyBuyFill(
   if (fill.targetPositionId) {
     const target = shorts.find((short) => short.id === fill.targetPositionId);
     if (target) {
-      const closed = closeShortLot(target, quantityLeft, unitCost, longs);
+      const closed = closeShortLot(target, quantityLeft, unitCost, longs, context);
       quantityLeft = roundAsset(quantityLeft - closed.quantity);
       costLeft = roundQuote(costLeft - closed.quote);
     }
@@ -301,13 +319,18 @@ function applyBuyFill(
       if (short.remainingQuantity <= EPSILON) {
         continue;
       }
-      const closed = closeShortLot(short, quantityLeft, unitCost, longs);
+      const closed = closeShortLot(short, quantityLeft, unitCost, longs, context);
       quantityLeft = roundAsset(quantityLeft - closed.quantity);
       costLeft = roundQuote(costLeft - closed.quote);
     }
   }
 
   if (quantityLeft > EPSILON && costLeft > EPSILON) {
+    const borrowAllocations = allocateLongBorrowFromShortLots(
+      shorts,
+      quantityLeft,
+      unitCost,
+    );
     longs.push({
       id: `long_${fill.id}`,
       side: "long",
@@ -325,6 +348,11 @@ function applyBuyFill(
       remainingQuantity: roundAsset(quantityLeft),
       remainingCostQuote: roundQuote(costLeft),
       lentQuantity: 0,
+      borrowDepthRemaining: inheritedLongBorrowDepth(
+        borrowAllocations,
+        context.longBorrowDepth,
+      ),
+      borrowAllocations,
     });
   }
 }
@@ -334,6 +362,7 @@ function applySellFill(
   sourceOrder: TradingOrder | undefined,
   longs: MutableLongLot[],
   shorts: MutableShortLot[],
+  context: LedgerContext,
 ): void {
   const unitProceeds = (fill.quoteQuantity - fill.feeQuote) / fill.quantity;
   let quantityLeft = fill.quantity;
@@ -342,7 +371,7 @@ function applySellFill(
   if (fill.targetPositionId) {
     const target = longs.find((long) => long.id === fill.targetPositionId);
     if (target) {
-      const closed = closeLongLot(target, quantityLeft, unitProceeds);
+      const closed = closeLongLot(target, quantityLeft, unitProceeds, shorts, context);
       quantityLeft = roundAsset(quantityLeft - closed.quantity);
       proceedsLeft = roundQuote(proceedsLeft - closed.quote);
     }
@@ -356,7 +385,7 @@ function applySellFill(
       if (long.remainingQuantity <= EPSILON) {
         continue;
       }
-      const closed = closeLongLot(long, quantityLeft, unitProceeds);
+      const closed = closeLongLot(long, quantityLeft, unitProceeds, shorts, context);
       quantityLeft = roundAsset(quantityLeft - closed.quantity);
       proceedsLeft = roundQuote(proceedsLeft - closed.quote);
     }
@@ -384,6 +413,11 @@ function applySellFill(
       proceedsQuote: roundQuote(proceedsLeft),
       remainingQuantity: roundAsset(quantityLeft),
       remainingProceedsQuote: roundQuote(proceedsLeft),
+      lentQuote: 0,
+      borrowDepthRemaining: inheritedShortBorrowDepth(
+        borrowAllocations,
+        context.shortBorrowDepth,
+      ),
       borrowAllocations,
     });
   }
@@ -394,10 +428,11 @@ function closeShortLot(
   requestedQuantity: number,
   unitCost: number,
   longs: MutableLongLot[],
+  context: LedgerContext,
 ): { quantity: number; quote: number } {
   const quantity = Math.min(requestedQuantity, short.remainingQuantity);
   const quote = quantity * unitCost;
-  settleShortBorrowAllocations(short, quantity, unitCost, longs);
+  settleShortBorrowAllocations(short, quantity, unitCost, longs, context);
   short.remainingQuantity = roundAsset(short.remainingQuantity - quantity);
   short.remainingProceedsQuote = roundQuote(short.remainingProceedsQuote - quote);
   short.closedQuantity = roundAsset(short.closedQuantity + quantity);
@@ -412,9 +447,12 @@ function closeLongLot(
   long: MutableLongLot,
   requestedQuantity: number,
   unitProceeds: number,
+  shorts: MutableShortLot[],
+  context: LedgerContext,
 ): { quantity: number; quote: number } {
   const quantity = Math.min(requestedQuantity, long.remainingQuantity);
   const quote = quantity * unitProceeds;
+  settleLongBorrowAllocations(long, quantity, unitProceeds, shorts, context);
   long.remainingQuantity = roundAsset(long.remainingQuantity - quantity);
   long.remainingCostQuote = roundQuote(long.remainingCostQuote - quote);
   long.lentQuantity = roundAsset(Math.min(long.lentQuantity, long.remainingQuantity));
@@ -434,7 +472,11 @@ function allocateShortBorrowFromLongLots(
   let quantityLeft = roundAsset(quantity);
   const allocations: ShortBorrowAllocation[] = [];
   const sources = [...longs]
-    .filter((lot) => lot.remainingQuantity - lot.lentQuantity > EPSILON)
+    .filter(
+      (lot) =>
+        lot.borrowDepthRemaining > 0 &&
+        lot.remainingQuantity - lot.lentQuantity > EPSILON,
+    )
     .sort((left, right) => {
       const leftBreakEven = longLotBreakEvenBeforeFees(left);
       const rightBreakEven = longLotBreakEvenBeforeFees(right);
@@ -458,13 +500,69 @@ function allocateShortBorrowFromLongLots(
     }
 
     source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
+    const borrowedQuote = roundQuote(borrowedQuantity * unitProceeds);
     source.remainingCostQuote = roundQuote(
-      source.remainingCostQuote - borrowedQuantity * unitProceeds,
+      source.remainingCostQuote - borrowedQuote,
     );
     quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
     allocations.push({
       longLotId: source.id,
       quantity: borrowedQuantity,
+      quote: borrowedQuote,
+      depthRemaining: Math.max(0, source.borrowDepthRemaining - 1),
+    });
+  }
+
+  return allocations;
+}
+
+function allocateLongBorrowFromShortLots(
+  shorts: MutableShortLot[],
+  quantity: number,
+  unitCost: number,
+): LongBorrowAllocation[] {
+  let quantityLeft = roundAsset(quantity);
+  const allocations: LongBorrowAllocation[] = [];
+  const sources = [...shorts]
+    .filter(
+      (lot) =>
+        lot.borrowDepthRemaining > 0 &&
+        lot.remainingQuantity > EPSILON &&
+        lot.remainingProceedsQuote > EPSILON,
+    )
+    .sort((left, right) => {
+      const leftBreakEven = shortLotBreakEvenBeforeFees(left);
+      const rightBreakEven = shortLotBreakEvenBeforeFees(right);
+      const leftIsBad = unitCost > leftBreakEven;
+      const rightIsBad = unitCost > rightBreakEven;
+      if (leftIsBad !== rightIsBad) {
+        return leftIsBad ? -1 : 1;
+      }
+      return leftBreakEven - rightBreakEven || left.openedAt - right.openedAt;
+    });
+
+  for (const source of sources) {
+    if (quantityLeft <= EPSILON) {
+      break;
+    }
+
+    const affordableQuantity = source.remainingProceedsQuote / unitCost;
+    const borrowedQuantity = roundAsset(Math.min(quantityLeft, affordableQuantity));
+    if (borrowedQuantity <= EPSILON) {
+      continue;
+    }
+
+    const borrowedQuote = roundQuote(borrowedQuantity * unitCost);
+    source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
+    source.remainingProceedsQuote = roundQuote(
+      source.remainingProceedsQuote - borrowedQuote,
+    );
+    quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
+    allocations.push({
+      shortLotId: source.id,
+      quantity: borrowedQuantity,
+      quote: borrowedQuote,
+      depthRemaining: Math.max(0, source.borrowDepthRemaining - 1),
     });
   }
 
@@ -476,6 +574,7 @@ function settleShortBorrowAllocations(
   closedQuantity: number,
   unitCost: number,
   longs: MutableLongLot[],
+  context: LedgerContext,
 ): void {
   let quantityLeft = roundAsset(closedQuantity);
 
@@ -483,25 +582,82 @@ function settleShortBorrowAllocations(
     if (quantityLeft <= EPSILON) {
       break;
     }
-    if (allocation.quantity <= EPSILON) {
+    if (allocation.quantity <= EPSILON || allocation.quote <= EPSILON) {
       continue;
     }
 
     const quantity = roundAsset(Math.min(quantityLeft, allocation.quantity));
+    const allocationRatio = quantity / allocation.quantity;
+    const principalQuote = roundQuote(allocation.quote * allocationRatio);
+    const coverQuote = roundQuote(quantity * unitCost);
     const long = longs.find((lot) => lot.id === allocation.longLotId);
     if (long) {
       long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
+      const profitQuote = principalQuote - coverQuote;
+      const returnedQuote =
+        profitQuote > 0
+          ? roundQuote(
+              principalQuote - profitQuote * context.borrowerProfitShareToLender,
+            )
+          : coverQuote;
       long.remainingCostQuote = roundQuote(
-        long.remainingCostQuote + quantity * unitCost,
+        long.remainingCostQuote + returnedQuote,
       );
     }
 
     allocation.quantity = roundAsset(allocation.quantity - quantity);
+    allocation.quote = roundQuote(allocation.quote - principalQuote);
     quantityLeft = roundAsset(quantityLeft - quantity);
   }
 
   short.borrowAllocations = short.borrowAllocations.filter(
-    (allocation) => allocation.quantity > EPSILON,
+    (allocation) => allocation.quantity > EPSILON && allocation.quote > EPSILON,
+  );
+}
+
+function settleLongBorrowAllocations(
+  long: MutableLongLot,
+  closedQuantity: number,
+  unitProceeds: number,
+  shorts: MutableShortLot[],
+  context: LedgerContext,
+): void {
+  let quantityLeft = roundAsset(closedQuantity);
+
+  for (const allocation of long.borrowAllocations) {
+    if (quantityLeft <= EPSILON) {
+      break;
+    }
+    if (allocation.quantity <= EPSILON || allocation.quote <= EPSILON) {
+      continue;
+    }
+
+    const quantity = roundAsset(Math.min(quantityLeft, allocation.quantity));
+    const allocationRatio = quantity / allocation.quantity;
+    const principalQuote = roundQuote(allocation.quote * allocationRatio);
+    const returnedQuote = roundQuote(quantity * unitProceeds);
+    const short = shorts.find((lot) => lot.id === allocation.shortLotId);
+    if (short) {
+      short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
+      const profitQuote = returnedQuote - principalQuote;
+      const lenderQuote =
+        profitQuote > 0
+          ? roundQuote(
+              principalQuote + profitQuote * context.borrowerProfitShareToLender,
+            )
+          : returnedQuote;
+      short.remainingProceedsQuote = roundQuote(
+        short.remainingProceedsQuote + lenderQuote,
+      );
+    }
+
+    allocation.quantity = roundAsset(allocation.quantity - quantity);
+    allocation.quote = roundQuote(allocation.quote - principalQuote);
+    quantityLeft = roundAsset(quantityLeft - quantity);
+  }
+
+  long.borrowAllocations = long.borrowAllocations.filter(
+    (allocation) => allocation.quantity > EPSILON && allocation.quote > EPSILON,
   );
 }
 
@@ -511,9 +667,34 @@ function longLotBreakEvenBeforeFees(long: MutableLongLot): number {
     : 0;
 }
 
+function shortLotBreakEvenBeforeFees(short: MutableShortLot): number {
+  return short.remainingQuantity > EPSILON
+    ? short.remainingProceedsQuote / short.remainingQuantity
+    : 0;
+}
+
+function inheritedLongBorrowDepth(
+  allocations: LongBorrowAllocation[],
+  originDepth: number,
+): number {
+  return allocations.length > 0
+    ? Math.max(...allocations.map((allocation) => allocation.depthRemaining))
+    : originDepth;
+}
+
+function inheritedShortBorrowDepth(
+  allocations: ShortBorrowAllocation[],
+  originDepth: number,
+): number {
+  return allocations.length > 0
+    ? Math.max(...allocations.map((allocation) => allocation.depthRemaining))
+    : originDepth;
+}
+
 function appendPendingOrderLot(
   order: TradingOrder,
   feeRate: number,
+  context: LedgerContext,
   longs: MutableLongLot[],
   shorts: MutableShortLot[],
 ): void {
@@ -544,6 +725,8 @@ function appendPendingOrderLot(
       remainingQuantity: pendingQuantity,
       remainingCostQuote: roundQuote(pendingQuote),
       lentQuantity: 0,
+      borrowDepthRemaining: context.longBorrowDepth,
+      borrowAllocations: [],
     });
     return;
   }
@@ -565,6 +748,8 @@ function appendPendingOrderLot(
     proceedsQuote: roundQuote(pendingQuote),
     remainingQuantity: pendingQuantity,
     remainingProceedsQuote: roundQuote(pendingQuote),
+    lentQuote: 0,
+    borrowDepthRemaining: context.shortBorrowDepth,
     borrowAllocations: [],
   });
 }
@@ -581,7 +766,7 @@ function buildBorrowProfiles(
   };
 
   allocateShortBaseBorrow(shorts, profiles, context);
-  allocateLongQuoteBorrow(longs, shorts, profiles, state);
+  allocateLongQuoteBorrow(longs, profiles, state);
 
   return profiles;
 }
@@ -624,44 +809,29 @@ function allocateShortBaseBorrow(
 
 function allocateLongQuoteBorrow(
   longs: MutableLongLot[],
-  shorts: MutableShortLot[],
   profiles: BorrowProfiles,
   state: PaperBotState,
 ): void {
-  const totalLongCost = sum(longs, "remainingCostQuote");
-  const totalShortProceeds = sum(shorts, "remainingProceedsQuote");
-  const ownedQuoteCapital = Math.max(0, state.startingQuote + state.realizedPnl - state.feesPaid);
-  let internalQuoteBudget = clamp(totalLongCost - ownedQuoteCapital, 0, totalShortProceeds);
   let externalQuoteBudget = Math.max(0, -(state.quoteFree + state.quoteReserved));
-  const shortSources: BorrowSource[] = shorts.map((lot) => ({
-    id: lot.id,
-    openedAt: lot.openedAt,
-    available: Math.max(0, lot.remainingProceedsQuote),
-  }));
 
   for (const long of longs) {
     const profile = profiles.longs.get(long.id);
-    if (!profile || long.remainingCostQuote <= EPSILON) {
+    if (!profile || long.remainingQuantity <= EPSILON) {
       continue;
     }
 
-    let needed = Math.min(long.remainingCostQuote, internalQuoteBudget);
     const borrowedFrom = new Set<string>();
-    for (const source of nearestSources(shortSources, long.openedAt)) {
-      if (needed <= EPSILON) {
-        break;
-      }
-
-      const quote = Math.min(needed, source.available);
-      if (quote <= EPSILON) {
+    for (const allocation of long.borrowAllocations) {
+      if (allocation.quote <= EPSILON || allocation.quantity <= EPSILON) {
         continue;
       }
-
-      source.available = roundQuote(source.available - quote);
-      needed = roundQuote(needed - quote);
-      internalQuoteBudget = roundQuote(internalQuoteBudget - quote);
-      profile.internalBorrowedQuote = roundQuote(profile.internalBorrowedQuote + quote);
-      borrowedFrom.add(source.id);
+      profile.internalBorrowedQuote = roundQuote(
+        profile.internalBorrowedQuote + allocation.quote,
+      );
+      profile.internalBorrowedQuantity = roundAsset(
+        profile.internalBorrowedQuantity + allocation.quantity,
+      );
+      borrowedFrom.add(allocation.shortLotId);
     }
 
     const externalQuote = Math.min(
@@ -676,10 +846,6 @@ function allocateLongQuoteBorrow(
     profile.borrowedQuote = roundQuote(
       profile.internalBorrowedQuote + profile.externalBorrowedQuote,
     );
-    profile.internalBorrowedQuantity =
-      long.averagePrice > EPSILON
-        ? roundAsset(profile.internalBorrowedQuote / long.averagePrice)
-        : 0;
     profile.externalBorrowedQuantity =
       long.averagePrice > EPSILON
         ? roundAsset(profile.externalBorrowedQuote / long.averagePrice)
@@ -689,19 +855,6 @@ function allocateLongQuoteBorrow(
     );
     profile.borrowedFromPositionCount = borrowedFrom.size;
   }
-}
-
-function nearestSources(sources: BorrowSource[], openedAt: number): BorrowSource[] {
-  return sources
-    .filter((source) => source.available > EPSILON)
-    .sort((left, right) => {
-      const distance = Math.abs(left.openedAt - openedAt) - Math.abs(right.openedAt - openedAt);
-      if (distance !== 0) {
-        return distance;
-      }
-
-      return left.openedAt - right.openedAt;
-    });
 }
 
 function finalizeLongLot(
@@ -942,6 +1095,13 @@ function cleanNonNegative(value: number): number {
 
 function cleanPositive(value: number | undefined): number {
   return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+}
+
+function normalizeBorrowDepth(value: number | undefined): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.max(0, Math.round(value ?? 0));
 }
 
 function clamp(value: number, min: number, max: number): number {

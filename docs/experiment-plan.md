@@ -87,8 +87,9 @@ npm run experiment:loop -- --benchmark-command "npm run benchmark:strategies -- 
 | Warmup | `legacyValleyPeak.saturationSec` | Avoid early trades before rolling averages are meaningful. |
 | Gaussian sizing | `buySigma`, `sellSigma`, buy/sell rates | Control how aggressively derivative shape maps to size. |
 | Signal source | `buyDataIndex`, `sellDataIndex` | Shift the primary valley/peak detector between timeframes. |
-| Confirmation | `buyConfirmationOffset`, `sellConfirmationOffsets` | Decide how much broader-window confirmation is required. |
-| Limit execution | `limitOffsetBps`, `staleOrderMs`, `maxOpenOrders` | Balance fill probability against entry/exit price improvement. |
+| Confirmation | `buyConfirmationOffsets`, `sellConfirmationOffsets` | Decide how much broader-window confirmation is required. |
+| Limit execution | `limitOffsetBps`, `staleOrderMs` | Balance fill probability against entry/exit price improvement. |
+| Internal borrow chains | `longBorrowDepth`, `shortBorrowDepth` | Compare disabled, one-hop, and multi-hop reuse of opposing positions. |
 | Exposure cap | `maxPositionQuote`, `minOrderQuote` | Avoid oversized long inventory and tiny fee-inefficient trades. |
 
 ## Experiment Log Template

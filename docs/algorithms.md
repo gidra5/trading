@@ -39,7 +39,6 @@ fills a signal immediately. A signal creates one resting limit order:
   `limitOffsetBps`
 - orders fill later only if replay/live price crosses the limit
 - stale orders are cancelled after `staleOrderMs`
-- the bot will not place more than `maxOpenOrders` open automated orders
 
 ## Rolling Average State
 
@@ -80,22 +79,21 @@ latest.rateClamped >= 0
 previous.rateClamped < 0
 ```
 
-The default buy source is the shortest window:
+The default buy source is the 1m window:
 
 ```text
-legacyValleyPeak.buyDataIndex = 0
+legacyValleyPeak.buyDataIndex = 1
 ```
 
-The buy confirmation window is:
+The default buy confirmation windows are:
 
 ```text
-buyDataIndex + buyConfirmationOffset
+legacyValleyPeak.buyConfirmationOffsets = [2, 1]
 ```
 
-With the default `buyConfirmationOffset = 6`, a 1s valley is only accepted while the
-12h confirmation average is still falling (`rateClamped < 0`). That makes the legacy
-entry contrarian: it buys a short-term upward turn while the broader window has not yet
-turned up.
+That checks the 30m and 10m windows relative to the 1m source and requires each
+confirmation window to still be rising (`rateClamped > 0`). That makes valley entries
+stricter, slower, and aligned with broader upward context.
 
 ## Peak Signal
 
@@ -106,21 +104,22 @@ latest.rateClamped <= 0
 previous.rateClamped > 0
 ```
 
-The default sell source is the 1m window:
+The default sell source is the shortest window:
 
 ```text
-legacyValleyPeak.sellDataIndex = 1
+legacyValleyPeak.sellDataIndex = 0
 ```
 
 The default sell confirmations are:
 
 ```text
-legacyValleyPeak.sellConfirmationOffsets = [2, 1]
+legacyValleyPeak.sellConfirmationOffsets = [6]
 ```
 
-That checks the 30m and 10m windows relative to the 1m source and requires each
-confirmation window to still be rising (`rateClamped > 0`). In practice, the detector
-sells a short-term peak while larger local averages still show upward movement.
+That checks the 12h window relative to the 1s source and requires the confirmation
+window to still be falling (`rateClamped < 0`). This gives peak/short entries the
+faster extrema source that valley/long entries originally used, but in broader downward
+context.
 
 ## Warmup
 
@@ -255,9 +254,11 @@ valley/peak detector drives a different execution model:
   and break-even buy price
 - the grid distribution procedure chooses both ladder prices and per-order sizes
 - a later peak cancels that lot's open grid orders and recreates its ladder when the
-  peak crosses back above at least one already filled grid point
-- a later valley mirrors the reset for short lots when price crosses below at least one
-  already filled buy-cover grid point
+  peak rises above the previous grid peak or crosses back above a filled point from
+  the currently active grid
+- a later valley mirrors the reset for short lots when price makes a lower trough than
+  the previous grid trough or crosses below a filled buy-cover point from the currently
+  active grid
 
 The default distribution is a uniform price grid with geometric size decay:
 
@@ -271,6 +272,9 @@ The default distribution is a uniform price grid with geometric size decay:
   ladder moves down from peak toward break-even.
 - `exitGridSizeDistribution = "constant"` divides remaining quantity evenly across the
   remaining levels.
+- if a planned partial exit would create or place a below-`minOrderQuote` remainder,
+  the ladder sweeps the whole remaining lot at that grid level when the full remainder
+  is tradable.
 
 The simulator represents these exit-grid orders as sell limit orders with
 `trigger = "below"`, so they fill when replay/live price falls through a ladder level.
@@ -289,6 +293,21 @@ treating the short open as a long close. Buying that short back charges the cove
 back to the same source longs, so the completed borrow cycle applies the short's net
 profit or loss to the long cost basis.
 
+Long entries mirror this with quote borrowed from active short lots. The borrowed quote
+is tied to the base quantity it funded, and closing that long returns the corresponding
+sale value to the same source shorts. Borrow chains are limited by `longBorrowDepth`
+for chains that start from a long lender and `shortBorrowDepth` for chains that start
+from a short lender.
+
+When `lockBorrowedLenderCollateral` is enabled, a lender lot cannot place exit-grid
+orders against collateral that is currently lent to a borrower. Long lenders lock
+`lentQuantity`; short lenders lock the cover quantity represented by `lentQuote` at
+the current break-even grid price. `borrowerProfitShareToLender` controls how much of a
+profitable borrower close is credited back into the lender's lot basis. `1` preserves
+the older behavior where the lender receives the full borrower profit, while `0` keeps
+the borrower's profit free at the account level instead of lowering the lender's
+break-even further. Borrower losses are still charged back through the lender basis.
+
 ## Current Defaults To Watch
 
 | Config | Default | Meaning |
@@ -296,9 +315,13 @@ profit or loss to the long cost basis.
 | `algorithm` | `legacy-valley-peak` | The only automated algorithm key. |
 | `maxLeverage` | `5` | Leverage guard and current target leverage for new long and short entries. |
 | `shortMarginModel` | `spot-borrow` | Short leverage accounting; use `futures-margin` for collateral-backed unlevered shorts. |
-| `maxPositionQuote` | `50000` | Maximum notional the strategy can build per side. |
+| `longBorrowDepth` | `7` | Number of alternating internal borrow hops allowed from an original long lender. |
+| `shortBorrowDepth` | `7` | Number of alternating internal borrow hops allowed from an original short lender. |
+| `lockBorrowedLenderCollateral` | `true` | Prevents lender lots from exit-gridding collateral currently lent to borrowers. |
+| `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
+| `maxPositionQuote` | `1000000` | Maximum notional the strategy can build per side; default is 100x the starting quote. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
-| `maxOpenOrders` | `24` | Maximum resting automated orders; relaxed exit-grid mode needs enough slots for per-lot ladders. |
+| `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
 | `cooldownMs` | `30000` | Minimum delay between newly created automated orders. |
 | `staleOrderMs` | `2592000000` | Time before an unfilled limit order is cancelled; current grid ladders can persist for 30 days. |
 | `minOrderQuote` | `25` | Global minimum order notional. |
@@ -317,7 +340,7 @@ profit or loss to the long cost basis.
 | `legacyValleyPeak.exitGridMinProfitBps` | `20` | Minimum peak distance above break-even before creating a ladder. |
 | `legacyValleyPeak.exitGridResetBps` | `10` | Higher-peak improvement used only when manually selecting strict reset mode. |
 | `legacyValleyPeak.exitGridPositionMode` | `per-lot` | Uses position-ledger lots for independent ladders. |
-| `legacyValleyPeak.exitGridResetMode` | `filled-grid` | Resets after crossing a filled grid point. |
+| `legacyValleyPeak.exitGridResetMode` | `filled-grid` | Resets after a new higher/lower extreme or after crossing a filled point from the active grid. |
 
 ## Current Default Backtests
 

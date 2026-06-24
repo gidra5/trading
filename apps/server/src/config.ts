@@ -40,11 +40,23 @@ export const appConfig = {
     quoteAsset: market.quoteAsset,
     startingQuote: Number(process.env.TRADING_STARTING_QUOTE ?? 10_000),
     maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 5),
+    longBorrowDepth: parseNumber(process.env.TRADING_LONG_BORROW_DEPTH, 7),
+    shortBorrowDepth: parseNumber(process.env.TRADING_SHORT_BORROW_DEPTH, 7),
+    lockBorrowedLenderCollateral:
+      process.env.TRADING_LOCK_BORROWED_LENDER_COLLATERAL !== "false",
+    borrowerProfitShareToLender: parseNumber(
+      process.env.TRADING_BORROWER_PROFIT_SHARE_TO_LENDER,
+      1,
+    ),
     shortMarginModel:
       process.env.TRADING_SHORT_MARGIN_MODEL === "futures-margin"
         ? "futures-margin"
         : "spot-borrow",
-    maxPositionQuote: Number(process.env.TRADING_MAX_POSITION_QUOTE ?? 50_000),
+    maxPositionQuote: Number(
+      process.env.TRADING_MAX_POSITION_QUOTE ??
+        Number(process.env.TRADING_STARTING_QUOTE ?? 10_000) * 100,
+    ),
+    maxOpenOrders: parseNumber(process.env.TRADING_MAX_OPEN_ORDERS, 1024),
   }),
 };
 

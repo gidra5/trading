@@ -29,7 +29,14 @@ interface BenchmarkArgs {
   startingQuote: number;
   leverage: number;
   shortMarginModel: ShortMarginModel;
+  longBorrowDepth: number;
+  shortBorrowDepth: number;
+  lockBorrowedLenderCollateral: boolean;
+  borrowerProfitShareToLender: number;
+  borrowDepthMatrix: boolean;
+  maxOpenOrders: number;
   cooldownSec: number;
+  resampleMinutes: number;
   randomSampleCount: number;
   randomMinWindowDays: number;
   randomMaxWindowDays: number;
@@ -50,6 +57,8 @@ interface BenchmarkArgs {
   only?: string;
   symbols?: string[];
 }
+
+const MAX_POSITION_QUOTE_MULTIPLIER = 100;
 
 interface BenchmarkCase {
   label: string;
@@ -137,6 +146,7 @@ interface GridSearchRow {
   avgLiquidatedPositionCount: number;
   avgMaxDrawdownPct: number;
   avgTradeCount: number;
+  bestReturnPct: number;
   worstReturnPct: number;
   config: string;
 }
@@ -170,11 +180,20 @@ interface PortfolioRow extends PortfolioMetrics {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const YEAR_DAYS = 365;
 const FULL_BTC_CYCLE_DAYS = YEAR_DAYS * 5;
+const BORROW_DEPTH_MATRIX: Array<[number, number]> = [
+  [0, 0],
+  [1, 0],
+  [0, 1],
+  [1, 1],
+  [1, 2],
+  [2, 1],
+  [2, 2],
+];
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const args = parseArgs(process.argv.slice(2));
 if (args.mode === "synthetic") {
-  const cases = selectBenchmarkCases(args.only);
+  const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
   runSyntheticMode(args, cases);
 } else {
   const files = historicalCandleFiles(args);
@@ -189,15 +208,15 @@ if (args.mode === "synthetic") {
   }
 
   if (args.mode === "random-lengths") {
-    const cases = selectBenchmarkCases(args.only);
+    const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
     runRandomLengthMode(args, files, cases);
   } else if (args.mode === "grid-search") {
     runGridSearchMode(args, files);
   } else if (args.mode === "portfolio") {
-    const cases = selectBenchmarkCases(args.only);
+    const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
     runPortfolioMode(args, files, cases);
   } else {
-    const cases = selectBenchmarkCases(args.only);
+    const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
     runSingleWindowMode(args, files, cases);
   }
 }
@@ -327,6 +346,7 @@ function runGridCandidate(
     ),
     avgMaxDrawdownPct: average(metrics.map((metric) => metric.maxDrawdownPct)),
     avgTradeCount: average(metrics.map((metric) => metric.tradeCount)),
+    bestReturnPct: Math.max(...metrics.map((metric) => metric.returnPct)),
     worstReturnPct: Math.min(...metrics.map((metric) => metric.returnPct)),
     config: formatGridConfig(candidate.config),
   };
@@ -409,7 +429,7 @@ function createGridCandidates(): GridCandidate[] {
           maxTradeQuote: 500,
           buySigma: 0.08,
           sellSigma: 0.12,
-          buyConfirmationOffset: 8,
+          buyConfirmationOffsets: [8],
         },
       },
     },
@@ -784,7 +804,7 @@ function runBenchmark(
   maxEquityPoints?: number,
   candleRange?: CandleReplayRange,
 ): { label: string; result: BacktestResult; elapsedMs: number } {
-  const maxPositionQuote = options.startingQuote * options.leverage;
+  const maxPositionQuote = options.startingQuote * MAX_POSITION_QUOTE_MULTIPLIER;
   const startedAt = Date.now();
   const candleCount = candleRange
     ? candleRange.endIndex - candleRange.startIndex
@@ -799,7 +819,12 @@ function runBenchmark(
       startingQuote: options.startingQuote,
       maxLeverage: options.leverage,
       shortMarginModel: options.shortMarginModel,
+      longBorrowDepth: options.longBorrowDepth,
+      shortBorrowDepth: options.shortBorrowDepth,
+      lockBorrowedLenderCollateral: options.lockBorrowedLenderCollateral,
+      borrowerProfitShareToLender: options.borrowerProfitShareToLender,
       maxPositionQuote,
+      maxOpenOrders: options.maxOpenOrders,
       cooldownMs: options.cooldownSec * 1000,
       ...benchmark.config,
     },
@@ -1014,7 +1039,8 @@ function loadHistoricalCandles(options: BenchmarkArgs, files: string[]): Candle[
     }
   }
 
-  return candles.sort((left, right) => left.openTime - right.openTime);
+  const sorted = candles.sort((left, right) => left.openTime - right.openTime);
+  return resampleCandles(sorted, options.resampleMinutes);
 }
 
 function createSyntheticCandles(options: BenchmarkArgs): Candle[] {
@@ -1070,6 +1096,58 @@ function createSyntheticCandles(options: BenchmarkArgs): Candle[] {
   }
 
   return candles;
+}
+
+function resampleCandles(candles: Candle[], minutes: number): Candle[] {
+  if (minutes <= 1 || candles.length <= 1) {
+    return candles;
+  }
+
+  const bucketMs = minutes * 60_000;
+  const resampled: Candle[] = [];
+  let current: Candle | undefined;
+  let currentBucket = Number.NaN;
+  let volume = 0;
+
+  const flush = () => {
+    if (!current) {
+      return;
+    }
+    resampled.push({
+      ...current,
+      volume,
+      closed: true,
+    });
+  };
+
+  for (const candle of candles) {
+    const bucket = Math.floor(candle.openTime / bucketMs) * bucketMs;
+    if (!current || bucket !== currentBucket) {
+      flush();
+      currentBucket = bucket;
+      volume = candle.volume;
+      current = {
+        ...candle,
+        interval: `${minutes}m`,
+        openTime: bucket,
+        closeTime: bucket + bucketMs - 1,
+        open: candle.open,
+        high: candle.high,
+        low: candle.low,
+        close: candle.close,
+      };
+      continue;
+    }
+
+    current.high = Math.max(current.high, candle.high);
+    current.low = Math.min(current.low, candle.low);
+    current.close = candle.close;
+    current.closeTime = Math.max(current.closeTime, candle.closeTime);
+    volume += candle.volume;
+  }
+
+  flush();
+  return resampled;
 }
 
 function historicalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "interval">): string {
@@ -1176,7 +1254,22 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     shortMarginModel: parseShortMarginModel(
       values.get("short-margin") ?? values.get("short-margin-model"),
     ),
+    longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 7),
+    shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 7),
+    lockBorrowedLenderCollateral:
+      values.get("lock-borrowed-lender-collateral") !== "false" &&
+      values.get("lock-borrowed-collateral") !== "false",
+    borrowerProfitShareToLender: clamp(
+      parseFiniteNumber(values.get("borrower-profit-share-to-lender"), 1),
+      0,
+      1,
+    ),
+    borrowDepthMatrix:
+      values.get("borrow-depth-matrix") === "true" ||
+      values.get("depth-matrix") === "true",
+    maxOpenOrders: parsePositiveInt(values.get("max-open-orders"), 1024),
     cooldownSec: parsePositiveNumber(values.get("cooldown-sec"), 300),
+    resampleMinutes: parsePositiveInt(values.get("resample-minutes"), 1),
     randomSampleCount: parsePositiveInt(values.get("samples"), 48),
     randomMinWindowDays: parsePositiveNumber(values.get("min-window-days"), 7),
     randomMaxWindowDays: parsePositiveNumber(values.get("max-window-days"), 120),
@@ -1220,7 +1313,10 @@ function parseShortMarginModel(value: string | undefined): ShortMarginModel {
   return value === "futures-margin" ? "futures-margin" : "spot-borrow";
 }
 
-function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
+function selectBenchmarkCases(
+  only: string | undefined,
+  borrowDepthMatrix: boolean,
+): BenchmarkCase[] {
   const cases: BenchmarkCase[] = [
     {
       label: "Legacy Valley/Peak Long/Short",
@@ -1274,7 +1370,21 @@ function selectBenchmarkCases(only: string | undefined): BenchmarkCase[] {
     throw new Error(`No benchmark case matched --only ${only}.`);
   }
 
-  return selected;
+  return borrowDepthMatrix ? expandBorrowDepthMatrix(selected) : selected;
+}
+
+function expandBorrowDepthMatrix(cases: BenchmarkCase[]): BenchmarkCase[] {
+  return cases.flatMap((benchmark) =>
+    BORROW_DEPTH_MATRIX.map(([longBorrowDepth, shortBorrowDepth]) => ({
+      ...benchmark,
+      label: `${benchmark.label} L${longBorrowDepth}/S${shortBorrowDepth}`,
+      config: {
+        ...(benchmark.config ?? {}),
+        longBorrowDepth,
+        shortBorrowDepth,
+      },
+    })),
+  );
 }
 
 type PeakExitGridVariant = "aggregate" | "per-lot-strict" | "per-lot-relaxed";
@@ -1286,7 +1396,6 @@ function peakExitGridConfig(
 ): PartialStrategyConfig {
   const isAggregate = variant === "aggregate";
   return {
-    maxOpenOrders: isAggregate ? 8 : 24,
     staleOrderMs: 30 * DAY_MS,
     legacyValleyPeak: {
       buySigma: 0.3,
@@ -1319,9 +1428,13 @@ function singleWindowHeader(
     `${candles.length.toLocaleString()} candles`,
     `${fileCount.toLocaleString()} day files`,
     cacheSourceSummary(options),
+    ...optionalHeaderPart(resampleSummary(options)),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
+    borrowDepthSummary(options),
+    borrowPolicySummary(options),
+    maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1342,11 +1455,15 @@ function randomLengthHeader(
     `${options.randomLookbackDays} day lookback`,
     `seed ${options.seed}`,
     cacheSourceSummary(options),
+    ...optionalHeaderPart(resampleSummary(options)),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)} cache span`,
     `${firstWindow.label} first sample`,
     `${lastWindow.label} last sample`,
     `${options.leverage}x max leverage`,
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
+    borrowDepthSummary(options),
+    borrowPolicySummary(options),
+    maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1365,9 +1482,13 @@ function gridSearchHeader(
     `${folds.length.toLocaleString()} folds`,
     `${candles.length.toLocaleString()} candles`,
     cacheSourceSummary(options),
+    ...optionalHeaderPart(resampleSummary(options)),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x max leverage`,
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
+    borrowDepthSummary(options),
+    borrowPolicySummary(options),
+    maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1383,9 +1504,13 @@ function portfolioHeader(
     `${options.symbol.toUpperCase()} ${options.interval}`,
     `${candles.length.toLocaleString()} primary candles`,
     cacheSourceSummary(options),
+    ...optionalHeaderPart(resampleSummary(options)),
     `${formatDate(candles[0].openTime)} to ${formatDate(candles[candles.length - 1].closeTime)}`,
     `${options.leverage}x strategy max leverage`,
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
+    borrowDepthSummary(options),
+    borrowPolicySummary(options),
+    maxOpenOrdersSummary(options),
     `${options.portfolioGrossLeverage}x portfolio gross leverage`,
     `${options.portfolioRebalanceCandles.toLocaleString()} candle rebalance`,
     `${options.portfolioLookbackCandles.toLocaleString()} candle lookback`,
@@ -1405,6 +1530,9 @@ function syntheticHeader(options: BenchmarkArgs, candles: Candle[]): string {
     `seed ${options.seed}`,
     `${options.leverage}x max leverage`,
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
+    borrowDepthSummary(options),
+    borrowPolicySummary(options),
+    maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
   ].join(", ");
@@ -1463,8 +1591,8 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     "Avg Liq Pos",
     "Avg Capture",
     "Avg Reinvest Cap",
-    "Best",
-    "Worst",
+    "Best Return",
+    "Worst Return",
   ];
   const tableRows = rows.map((row) => [
     row.strategy,
@@ -1506,7 +1634,8 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     "Avg Liq Pos",
     "Avg Max DD",
     "Avg Trades",
-    "Worst",
+    "Best Return",
+    "Worst Return",
     "Config",
   ];
   const tableRows = rows.map((row) => [
@@ -1524,6 +1653,7 @@ function gridSearchTable(rows: GridSearchRow[]): string {
     formatNumber(row.avgLiquidatedPositionCount, 1),
     `${formatNumber(row.avgMaxDrawdownPct, 2)}%`,
     formatNumber(row.avgTradeCount, 1),
+    `${formatNumber(row.bestReturnPct, 2)}%`,
     `${formatNumber(row.worstReturnPct, 2)}%`,
     row.config,
   ]);
@@ -1659,6 +1789,11 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : fallback;
 }
 
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : fallback;
+}
+
 function parsePositiveNumber(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -1744,15 +1879,42 @@ function formatOptionalPercent(
 }
 
 function benchmarkCapSummary(options: BenchmarkArgs): string {
-  const configuredCap = options.startingQuote * options.leverage;
+  const configuredCap = options.startingQuote * MAX_POSITION_QUOTE_MULTIPLIER;
+  const grossMarginCap = options.startingQuote * options.leverage;
   if (options.shortMarginModel === "futures-margin") {
-    return `target cap ${formatMoney(configuredCap)}, gross margin cap ${formatMoney(configuredCap)}`;
+    return `target cap ${formatMoney(configuredCap)}, gross margin cap ${formatMoney(grossMarginCap)}`;
   }
 
   const initialShortDebtCap = options.startingQuote * Math.max(0, options.leverage - 1) * 0.98;
   return `target cap ${formatMoney(configuredCap)}, initial debt cap ${formatMoney(
     Math.min(configuredCap, initialShortDebtCap),
   )}`;
+}
+
+function borrowDepthSummary(options: BenchmarkArgs): string {
+  if (options.borrowDepthMatrix) {
+    return `borrow depth matrix ${BORROW_DEPTH_MATRIX.map(([long, short]) => `L${long}/S${short}`).join(",")}`;
+  }
+  return `borrow depth L${options.longBorrowDepth}/S${options.shortBorrowDepth}`;
+}
+
+function borrowPolicySummary(options: BenchmarkArgs): string {
+  return `borrow lock ${options.lockBorrowedLenderCollateral ? "on" : "off"}, lender profit share ${formatNumber(
+    options.borrowerProfitShareToLender,
+    2,
+  )}`;
+}
+
+function resampleSummary(options: BenchmarkArgs): string | undefined {
+  return options.resampleMinutes > 1 ? `resampled ${options.resampleMinutes}m OHLC` : undefined;
+}
+
+function optionalHeaderPart(value: string | undefined): string[] {
+  return value ? [value] : [];
+}
+
+function maxOpenOrdersSummary(options: BenchmarkArgs): string {
+  return `open orders cap ${options.maxOpenOrders.toLocaleString()}`;
 }
 
 function formatShortMarginModel(value: ShortMarginModel): string {
@@ -1782,6 +1944,21 @@ function formatGridConfig(config: PartialStrategyConfig): string {
   if (config.shortMarginModel) {
     parts.push(`shortMargin=${config.shortMarginModel}`);
   }
+  if (config.longBorrowDepth !== undefined) {
+    parts.push(`longBorrowDepth=${config.longBorrowDepth}`);
+  }
+  if (config.shortBorrowDepth !== undefined) {
+    parts.push(`shortBorrowDepth=${config.shortBorrowDepth}`);
+  }
+  if (config.lockBorrowedLenderCollateral !== undefined) {
+    parts.push(`lockBorrowed=${config.lockBorrowedLenderCollateral}`);
+  }
+  if (config.borrowerProfitShareToLender !== undefined) {
+    parts.push(`profitShare=${config.borrowerProfitShareToLender}`);
+  }
+  if (config.maxOpenOrders !== undefined) {
+    parts.push(`maxOpenOrders=${config.maxOpenOrders}`);
+  }
 
   if (config.legacyValleyPeak) {
     const value = config.legacyValleyPeak;
@@ -1793,7 +1970,8 @@ function formatGridConfig(config: PartialStrategyConfig): string {
       `sellSigma=${value.sellSigma ?? "-"}`,
       `longs=${value.longSideEnabled ?? "-"}`,
       `shorts=${value.shortSideEnabled ?? "-"}`,
-      `buyConfirm=${value.buyConfirmationOffset ?? "-"}`,
+      `buyConfirms=${value.buyConfirmationOffsets?.join("/") ?? "-"}`,
+      `sellConfirms=${value.sellConfirmationOffsets?.join("/") ?? "-"}`,
       `sellIndex=${value.sellDataIndex ?? "-"}`,
       `warmup=${value.saturationSec ?? "-"}`,
       `exitGrid=${value.exitGridEnabled ?? "-"}`,
