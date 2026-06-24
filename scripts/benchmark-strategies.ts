@@ -3,6 +3,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   calculateRiskAdjustedMetrics,
+  legacyValleyPeakAsymmetricShortFavoringConfig,
+  legacyValleyPeakStrictSymmetricConfig,
   runBacktestFromCandles,
   type BacktestResult,
   type Candle,
@@ -58,7 +60,7 @@ interface BenchmarkArgs {
   symbols?: string[];
 }
 
-const MAX_POSITION_QUOTE_MULTIPLIER = 100;
+const MAX_POSITION_QUOTE_MULTIPLIER = 1;
 
 interface BenchmarkCase {
   label: string;
@@ -368,6 +370,16 @@ function createGridCandidates(): GridCandidate[] {
       label: "Legacy Valley/Peak default short only",
       algorithm: "legacy-valley-peak",
       config: { legacyValleyPeak: { longSideEnabled: false, shortSideEnabled: true } },
+    },
+    {
+      label: "Legacy Valley/Peak strict-symmetric reference",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: legacyValleyPeakStrictSymmetricConfig },
+    },
+    {
+      label: "Legacy Valley/Peak asymmetric short-favoring reference",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: legacyValleyPeakAsymmetricShortFavoringConfig },
     },
     {
       label: "Legacy peak exit grid aggregate long/short",
@@ -1254,11 +1266,11 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     shortMarginModel: parseShortMarginModel(
       values.get("short-margin") ?? values.get("short-margin-model"),
     ),
-    longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 7),
-    shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 7),
+    longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 999),
+    shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 999),
     lockBorrowedLenderCollateral:
-      values.get("lock-borrowed-lender-collateral") !== "false" &&
-      values.get("lock-borrowed-collateral") !== "false",
+      values.get("lock-borrowed-lender-collateral") === "true" ||
+      values.get("lock-borrowed-collateral") === "true",
     borrowerProfitShareToLender: clamp(
       parseFiniteNumber(values.get("borrower-profit-share-to-lender"), 1),
       0,
@@ -1310,7 +1322,7 @@ function parseMode(value: string | undefined): BenchmarkMode {
 }
 
 function parseShortMarginModel(value: string | undefined): ShortMarginModel {
-  return value === "futures-margin" ? "futures-margin" : "spot-borrow";
+  return value === "spot-borrow" ? "spot-borrow" : "futures-margin";
 }
 
 function selectBenchmarkCases(
@@ -1331,6 +1343,16 @@ function selectBenchmarkCases(
       label: "Legacy Valley/Peak Short Only",
       algorithm: "legacy-valley-peak",
       config: { legacyValleyPeak: { longSideEnabled: false, shortSideEnabled: true } },
+    },
+    {
+      label: "Legacy Valley/Peak Strict-Symmetric Reference",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: legacyValleyPeakStrictSymmetricConfig },
+    },
+    {
+      label: "Legacy Valley/Peak Asymmetric Short-Favoring Reference",
+      algorithm: "legacy-valley-peak",
+      config: { legacyValleyPeak: legacyValleyPeakAsymmetricShortFavoringConfig },
     },
     {
       label: "Legacy Peak Exit Grid Aggregate Long/Short",

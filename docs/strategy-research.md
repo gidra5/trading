@@ -128,8 +128,8 @@ Legacy valley/peak remains useful but fragile:
   2026-05-23 to 2026-06-21 BTCUSDT `1m` comparison improved the relaxed per-lot
   baseline but long/short remained unprofitable. At `1x`, long/short returned
   `-7.90%` with `12.10%` drawdown versus long-only `-9.85%` with `17.91%` drawdown.
-  Short-only had zero fills at `1x` under the default `spot-borrow` model because the
-  debt guard rejects borrowed-base shorts with no leverage headroom. At `5x`,
+  Short-only had zero fills at `1x` under the then-default `spot-borrow` model because
+  the debt guard rejects borrowed-base shorts with no leverage headroom. At `5x`,
   long/short returned `-44.46%` with `78.27%` drawdown, long-only returned `-49.49%`
   with `84.47%` drawdown, and short-only returned `9.34%` with `16.34%` drawdown. All
   rows had zero liquidations. Use `shortMarginModel = "futures-margin"` for
@@ -323,6 +323,10 @@ and no borrow-lock/profit-share config. The detector was strict symmetric:
 `buyDataIndex = 1`, `sellDataIndex = 1`, `buyConfirmationOffsets = [2, 1]`, and
 `sellConfirmationOffsets = [2, 1]`.
 
+This detector is the baseline default and is exported as
+`legacyValleyPeakStrictSymmetricConfig`, with the reference key
+`strictSymmetric035Anchor`.
+
 | Window | Depth | Interval | Return | Net PnL | Max DD | Trades | Win Rate | Prof Pos |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 30d | `5/5` | 2026-05-22..2026-06-21 | `5.12%` | `$512.39` | `2.85%` | `878` | `74.9%` | `92/109` |
@@ -362,6 +366,9 @@ Asymmetric short-favoring detector checks used strict buys with permissive sells
 `buyDataIndex = 1`, `buyConfirmationOffsets = [2, 1]`, `sellDataIndex = 0`, and
 `sellConfirmationOffsets = [6]`, with `7/7`, `1x`, `futures-margin`, and exact 1m
 replay.
+
+This detector is retained as `legacyValleyPeakAsymmetricShortFavoringConfig`, with the
+reference key `asymmetricShortFavoring`, but it is not the baseline default.
 
 | Window | Interval | Market | Return | Max DD | Trades | Prof Pos |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -403,9 +410,9 @@ candles:
 
 The later audit found that the `off / 1.00` row was conflated with the strict-symmetric
 fixed-window anchor above. Treat this table as historical context for why locking was
-added, not as a clean current-code reproduction. Under current code with the swapped
-default detector and `7/7`, the same calendar span now measures around `5.8%` to `6.9%`
-depending on lock and cap settings.
+added, not as a clean current-code reproduction. Under the asymmetric-detector checkpoint
+with `7/7`, the same calendar span measured around `5.8%` to `6.9%` depending on lock
+and cap settings.
 
 Current-code cap checks on the same calendar replay:
 
@@ -447,6 +454,14 @@ The exact condition was `grossEntryLeverageCapacityQuote(...) < minOrderQuote`, 
 makes short entry selling power zero before borrow allocation is even attempted. Internal
 borrow improves lot basis accounting, but the current guard still counts both long and
 short exposure toward gross leverage capacity at `1x`.
+
+Implementation follow-up: entry power now adds internal opposite-side borrow capacity on
+top of free-capital side-cap/leverage capacity, and `futures-margin` leverage checks use
+gross exposure net of internally borrowed paired exposure. The strict-symmetric exact
+anchor replay with the same `1x`, `futures-margin`, `5/5`, `maxPositionQuote = 10000`,
+and `300s` settings moved from `0.35%` to `3.07%` return, `13.58%` max drawdown, and
+`1808` trades. March 2026 no longer had zero activity: it produced `58` short opens and
+`16` long opens, though March-June still had no later close fills inside that anchor.
 
 Higher-sample checkpoint, 30m OHLC proxy: exact 1m 50-sample long-window matrices
 were too slow for a 30-minute checkpoint, so the benchmark runner was extended with

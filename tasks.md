@@ -20,7 +20,12 @@
 - explore other peak/valley detection possibilities. a continuous variant of sma, ema. 
 - accomodate in some way average candle size at various levels of granularity
 - given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
-- march-june 0 pnl issue - likely due to short positions being rejected for some reason
+- 180d run march-june 0 pnl issue - likely due to short positions being rejected for some reason
+  - what exact conditions caused this? Why were the extrema filtered out?
+  - explore different changes we made to improve it. among those are borrow locking, borrow profit share fraction, asymmetric short favoring strategy, cap check increase (why is it even there, if leveage tracking should already account for that). as possible gates for it were also mentined "existing short exposure", "pending short-entry orders" and "total gross exposure vs maxLeverage" (which is supposed to be the only real restriction)
+- integrate with actual binance paper trading api
+- test more grid points
+- 90d samples, 30d, 180d, 365d 1800d
   
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.

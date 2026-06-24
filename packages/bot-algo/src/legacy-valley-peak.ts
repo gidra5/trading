@@ -13,9 +13,6 @@ export interface LegacyValleyPeakInput {
   shortSellingPowerQuote?: number;
   baseFree: number;
   shortBaseFree?: number;
-  positionQuote: number;
-  shortPositionQuote?: number;
-  maxPositionQuote: number;
 }
 
 export type LegacyValleyPeakDecision =
@@ -23,15 +20,15 @@ export type LegacyValleyPeakDecision =
   | { signal: "buy"; reason: string; quoteSize: number; coverQuantity: number }
   | { signal: "sell"; reason: string; quantity: number; quoteSize: number };
 
-export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
+export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
-  sellDataIndex: 0,
+  sellDataIndex: 1,
   buyConfirmationOffsets: [2, 1],
-  sellConfirmationOffsets: [6],
+  sellConfirmationOffsets: [2, 1],
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
@@ -52,6 +49,19 @@ export const defaultLegacyValleyPeakConfig: LegacyValleyPeakConfig = {
   exitGridPositionMode: "per-lot",
   exitGridResetMode: "filled-grid",
 };
+
+export const legacyValleyPeakAsymmetricShortFavoringConfig: LegacyValleyPeakConfig = {
+  ...legacyValleyPeakStrictSymmetricConfig,
+  sellDataIndex: 0,
+  sellConfirmationOffsets: [6],
+};
+
+export const legacyValleyPeakReferenceConfigs = {
+  strictSymmetric035Anchor: legacyValleyPeakStrictSymmetricConfig,
+  asymmetricShortFavoring: legacyValleyPeakAsymmetricShortFavoringConfig,
+};
+
+export const defaultLegacyValleyPeakConfig = legacyValleyPeakStrictSymmetricConfig;
 
 const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;
 
@@ -280,12 +290,11 @@ function buyQuoteSize(
     buyingPowerQuote *
     config.buySpendRate *
     gaussian(derivative, 0, config.buySigma);
-  const remainingPositionQuote = Math.max(0, input.maxPositionQuote - input.positionQuote);
 
   return clamp(
     desired,
     config.minTradeQuote,
-    Math.min(config.maxTradeQuote, buyingPowerQuote, remainingPositionQuote, rate * 10_000),
+    Math.min(config.maxTradeQuote, buyingPowerQuote, rate * 10_000),
   );
 }
 
@@ -347,15 +356,11 @@ function shortSellQuoteSize(
     sellingPowerQuote *
     config.sellAmountRate *
     gaussian(derivative, 0, config.sellSigma);
-  const remainingPositionQuote = Math.max(
-    0,
-    input.maxPositionQuote - Math.max(0, input.shortPositionQuote ?? 0),
-  );
 
   return clamp(
     desired,
     config.minTradeQuote,
-    Math.min(config.maxTradeQuote, sellingPowerQuote, remainingPositionQuote, rate * 10_000),
+    Math.min(config.maxTradeQuote, sellingPowerQuote, rate * 10_000),
   );
 }
 

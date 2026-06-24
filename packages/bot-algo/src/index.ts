@@ -14,6 +14,9 @@ export {
 export {
   createLegacyValleyPeakConfig,
   defaultLegacyValleyPeakConfig,
+  legacyValleyPeakAsymmetricShortFavoringConfig,
+  legacyValleyPeakReferenceConfigs,
+  legacyValleyPeakStrictSymmetricConfig,
 } from "./legacy-valley-peak.js";
 export {
   analyzePositions,

@@ -104,22 +104,25 @@ latest.rateClamped <= 0
 previous.rateClamped > 0
 ```
 
-The default sell source is the shortest window:
+The default sell source matches the buy source:
 
 ```text
-legacyValleyPeak.sellDataIndex = 0
+legacyValleyPeak.sellDataIndex = 1
 ```
 
 The default sell confirmations are:
 
 ```text
-legacyValleyPeak.sellConfirmationOffsets = [6]
+legacyValleyPeak.sellConfirmationOffsets = [2, 1]
 ```
 
-That checks the 12h window relative to the 1s source and requires the confirmation
-window to still be falling (`rateClamped < 0`). This gives peak/short entries the
-faster extrema source that valley/long entries originally used, but in broader downward
-context.
+That checks the 30m and 10m windows relative to the 1m source and requires each
+confirmation window to still be falling (`rateClamped < 0`). This is the
+strict-symmetric baseline used by the `0.35%` 180d anchor replay.
+
+The asymmetric short-favoring detector is saved as a reference config. It keeps strict
+buys, but uses `sellDataIndex = 0` and `sellConfirmationOffsets = [6]` for faster peak
+detection in broader downward context.
 
 ## Warmup
 
@@ -299,6 +302,14 @@ sale value to the same source shorts. Borrow chains are limited by `longBorrowDe
 for chains that start from a long lender and `shortBorrowDepth` for chains that start
 from a short lender.
 
+Entry capacity is split into two buckets. Free-capital capacity is limited by the
+per-side cap and leverage headroom. Internal borrow capacity is the sum of currently
+unlent opposite-side lots and is added on top of free-capital capacity. That lets a
+short entry borrow base from several long lots, or a long entry borrow quote from
+several short lots, when one lender lot is too small for the desired entry. Settlement
+already follows the recorded allocation list, so borrower profit or loss is returned to
+each source lot proportionally.
+
 When `lockBorrowedLenderCollateral` is enabled, a lender lot cannot place exit-grid
 orders against collateral that is currently lent to a borrower. Long lenders lock
 `lentQuantity`; short lenders lock the cover quantity represented by `lentQuote` at
@@ -313,16 +324,16 @@ break-even further. Borrower losses are still charged back through the lender ba
 | Config | Default | Meaning |
 | --- | ---: | --- |
 | `algorithm` | `legacy-valley-peak` | The only automated algorithm key. |
-| `maxLeverage` | `5` | Leverage guard and current target leverage for new long and short entries. |
-| `shortMarginModel` | `spot-borrow` | Short leverage accounting; use `futures-margin` for collateral-backed unlevered shorts. |
-| `longBorrowDepth` | `7` | Number of alternating internal borrow hops allowed from an original long lender. |
-| `shortBorrowDepth` | `7` | Number of alternating internal borrow hops allowed from an original short lender. |
-| `lockBorrowedLenderCollateral` | `true` | Prevents lender lots from exit-gridding collateral currently lent to borrowers. |
+| `maxLeverage` | `1` | Baseline leverage guard from the strict-symmetric `0.35%` anchor replay. |
+| `shortMarginModel` | `futures-margin` | Collateral-backed short accounting used by the current baseline. |
+| `longBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original long lender. |
+| `shortBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original short lender. |
+| `lockBorrowedLenderCollateral` | `false` | Lender lots can still exit-grid collateral currently lent to borrowers. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
-| `maxPositionQuote` | `1000000` | Maximum notional the strategy can build per side; default is 100x the starting quote. |
+| `maxPositionQuote` | `10000` | Maximum notional the strategy can build per side; matches the `$10000` starting quote. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
 | `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
-| `cooldownMs` | `30000` | Minimum delay between newly created automated orders. |
+| `cooldownMs` | `300000` | Minimum delay between newly created automated orders. |
 | `staleOrderMs` | `2592000000` | Time before an unfilled limit order is cancelled; current grid ladders can persist for 30 days. |
 | `minOrderQuote` | `25` | Global minimum order notional. |
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
@@ -350,8 +361,8 @@ Focused comparisons after adding mirrored short entries and buy-to-cover grids. 
 use relaxed per-lot filled-grid mode, `$10000` starting quote, `300s` cooldown, and no
 liquidations. Historical rows use local BTCUSDT `1m` candles from 2026-05-23 to
 2026-06-21. Synthetic rows use 30 days of default sine-plus-noise candles with seed
-`1337`. These rows used the default `spot-borrow` short margin model. The `1x`
-short-only rows have zero fills because the spot-margin debt guard rejects
+`1337`. These historical rows used the then-default `spot-borrow` short margin model.
+The `1x` short-only rows have zero fills because the spot-margin debt guard rejects
 borrowed-base short entries at `1x`; use `shortMarginModel = "futures-margin"` to test
 standalone collateral-backed shorts without leverage.
 

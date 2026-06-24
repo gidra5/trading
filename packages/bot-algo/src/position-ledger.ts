@@ -181,6 +181,16 @@ export function analyzePositions(
   const externalBorrowedQuote = roundQuote(
     sum(activeLongs, "externalBorrowedQuote") + sum(activeShorts, "externalBorrowedQuote"),
   );
+  const internallyNettedExposureQuote = roundQuote(
+    Math.max(
+      0,
+      sum(activeLongs, "internalBorrowedQuantity") * context.currentPrice +
+        sum(activeShorts, "internalBorrowedQuantity") * context.currentPrice,
+    ),
+  );
+  const marginGrossExposureQuote = roundQuote(
+    Math.max(0, grossExposureQuote - internallyNettedExposureQuote),
+  );
   const equityQuote = calculateEquityQuote(state, context.currentPrice);
 
   return {
@@ -210,7 +220,7 @@ export function analyzePositions(
       externalBorrowedQuote,
       effectiveLeverage:
         state.config.shortMarginModel === "futures-margin"
-          ? calculateGrossExposureLeverage(equityQuote, grossExposureQuote)
+          ? calculateGrossExposureLeverage(equityQuote, marginGrossExposureQuote)
           : calculateDebtLeverage(equityQuote, externalBorrowedQuote),
       pendingLongQuantity: roundAsset(sum(finalizedLongs, "pendingQuantity")),
       pendingShortQuantity: roundAsset(sum(finalizedShorts, "pendingQuantity")),

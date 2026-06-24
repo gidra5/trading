@@ -122,12 +122,11 @@ balances and attributes that debt back to lots for inspection.
 
 `shortMarginModel` controls how standalone shorts count against the leverage guard:
 
-- `spot-borrow` is the default. A short is modeled as borrowed base, so an unhedged
-  short at `1x` has no headroom because the borrowed base value counts as external
-  debt.
-- `futures-margin` treats shorts as collateral-backed futures-style exposure. Account
-  balances are still represented the same way, but summary leverage and fill rejection
-  use gross notional exposure over equity.
+- `futures-margin` is the default baseline. It treats shorts as collateral-backed
+  futures-style exposure. Account balances are still represented the same way, but
+  summary leverage and fill rejection use gross notional exposure over equity.
+- `spot-borrow` models a short as borrowed base, so an unhedged short at `1x` has no
+  headroom because the borrowed base value counts as external debt.
 
 In `spot-borrow`, summary leverage uses external borrowed value:
 
@@ -135,10 +134,11 @@ In `spot-borrow`, summary leverage uses external borrowed value:
 effective leverage = 1 + externalBorrowedQuote / equity
 ```
 
-In `futures-margin`, summary leverage uses gross exposure:
+In `futures-margin`, summary leverage uses gross exposure net of internally borrowed
+paired exposure:
 
 ```text
-effective leverage = grossExposureQuote / equity
+effective leverage = (grossExposureQuote - internalBorrowedExposureQuote) / equity
 ```
 
 Lot leverage uses the portion of that lot's exposure that required external borrowing:
@@ -175,10 +175,17 @@ Borrow attribution distinguishes internal and external borrowing:
   position value is being reused inside the account model.
 
 The leverage guard runs after every fill. In `spot-borrow`, it uses a fast debt-leverage
-estimate before rebuilding the full ledger if needed. In `futures-margin`, it rebuilds
-the ledger and checks gross exposure directly. If effective leverage is above
+estimate before rebuilding the full ledger if needed. In `futures-margin`, it checks
+gross exposure after subtracting exposure funded by internal long/short borrow chains.
+If effective leverage is above
 `maxLeverage`, the fill is rolled back and the order is cancelled with a leverage-limit
 reason.
+
+Automated entry sizing treats free-capital capacity and internal borrow capacity
+separately. The per-side `maxPositionQuote` and leverage headroom cap the free-capital
+portion. Unlent opposite-side lots add internal borrow capacity on top of that cap, so
+a short can borrow base from multiple long lots, and a long can borrow quote from
+multiple short lots, before any external exposure is needed.
 
 ## Account Liquidation
 

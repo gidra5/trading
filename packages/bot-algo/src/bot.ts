@@ -33,17 +33,17 @@ export const defaultStrategyConfig: StrategyConfig = {
   quoteAsset: "USDT",
   algorithm: "legacy-valley-peak",
   startingQuote: 10_000,
-  maxLeverage: 5,
-  shortMarginModel: "spot-borrow",
-  longBorrowDepth: 7,
-  shortBorrowDepth: 7,
-  lockBorrowedLenderCollateral: true,
+  maxLeverage: 1,
+  shortMarginModel: "futures-margin",
+  longBorrowDepth: 999,
+  shortBorrowDepth: 999,
+  lockBorrowedLenderCollateral: false,
   borrowerProfitShareToLender: 1,
   feeBps: 7.5,
-  maxPositionQuote: 1_000_000,
+  maxPositionQuote: 10_000,
   limitOffsetBps: 2,
   maxOpenOrders: 1024,
-  cooldownMs: 30_000,
+  cooldownMs: 300_000,
   staleOrderMs: 30 * 24 * 60 * 60 * 1000,
   minOrderQuote: 25,
   legacyValleyPeak: defaultLegacyValleyPeakConfig,
@@ -614,8 +614,6 @@ export class SimulatedTradingBot {
     const memory = this.ensureLegacyValleyPeakMemory();
     const targetEntryLeverage = this.targetLongEntryLeverage(tick.price);
     const targetShortEntryLeverage = this.targetShortEntryLeverage(tick.price);
-    const longExposureQuote = this.activeLongExposureQuote(tick.price);
-    const shortExposureQuote = this.activeShortExposureQuote(tick.price);
     const decision = evaluateLegacyValleyPeak(
       memory,
       config.legacyValleyPeak,
@@ -630,9 +628,6 @@ export class SimulatedTradingBot {
         ),
         baseFree: this.activeLongQuantity(),
         shortBaseFree: this.activeShortQuantity(),
-        positionQuote: longExposureQuote,
-        shortPositionQuote: shortExposureQuote,
-        maxPositionQuote: config.maxPositionQuote,
       },
     );
 
@@ -726,9 +721,6 @@ export class SimulatedTradingBot {
         ),
         baseFree: activeLongQuantity,
         shortBaseFree: activeShortQuantity,
-        positionQuote: this.activeLongExposureQuote(tick.price),
-        shortPositionQuote: this.activeShortExposureQuote(tick.price),
-        maxPositionQuote: config.maxPositionQuote,
       },
     );
 
@@ -2951,12 +2943,13 @@ export class SimulatedTradingBot {
       0,
       config.maxPositionQuote - longExposureQuote - pendingLongEntryQuote,
     );
+    const internalBorrowCapacity = this.longInternalBorrowCapacityQuote(marketPrice);
     if (config.shortMarginModel === "futures-margin") {
       return roundQuote(
         Math.min(
           positionCapacity,
           this.grossEntryLeverageCapacityQuote(marketPrice, targetEntryLeverage),
-        ),
+        ) + internalBorrowCapacity,
       );
     }
 
@@ -2970,7 +2963,7 @@ export class SimulatedTradingBot {
         (1 + targetEntryLeverage * feeRate),
     );
 
-    return roundQuote(Math.min(positionCapacity, leverageCapacity));
+    return roundQuote(Math.min(positionCapacity, leverageCapacity) + internalBorrowCapacity);
   }
 
   private shortEntrySellingPowerQuote(
@@ -2994,12 +2987,13 @@ export class SimulatedTradingBot {
       0,
       config.maxPositionQuote - shortExposureQuote - pendingShortEntryQuote,
     );
+    const internalBorrowCapacity = this.shortInternalBorrowCapacityQuote(marketPrice);
     if (config.shortMarginModel === "futures-margin") {
       return roundQuote(
         Math.min(
           positionCapacity,
           this.grossEntryLeverageCapacityQuote(marketPrice, targetEntryLeverage),
-        ),
+        ) + internalBorrowCapacity,
       );
     }
 
@@ -3013,7 +3007,7 @@ export class SimulatedTradingBot {
         (1 + targetEntryLeverage * feeRate),
     );
 
-    return roundQuote(Math.min(positionCapacity, leverageCapacity));
+    return roundQuote(Math.min(positionCapacity, leverageCapacity) + internalBorrowCapacity);
   }
 
   private captureImmediateFillRollback(): ImmediateFillRollback {
@@ -3123,9 +3117,7 @@ export class SimulatedTradingBot {
     }
 
     const feeRate = config.feeBps / 10_000;
-    const grossExposureQuote =
-      this.activeLongExposureQuote(marketPrice) +
-      this.activeShortExposureQuote(marketPrice);
+    const grossExposureQuote = this.marginGrossExposureQuote(marketPrice);
     const pendingEntryQuote =
       this.pendingLongEntryQuote() + this.pendingShortEntryQuote();
 
@@ -3150,17 +3142,7 @@ export class SimulatedTradingBot {
     }
 
     this.updateLegacyPositionLotCache();
-    const cache = this.legacyPositionLotCache;
-    const grossQuantity = cache
-      ? [...cache.longs.values(), ...cache.shorts.values()].reduce(
-          (quantity, lot) =>
-            lot.remainingQuantity > MIN_BASE_QUANTITY
-              ? quantity + lot.remainingQuantity
-              : quantity,
-          0,
-        )
-      : Math.abs(this.totalBase());
-    const grossExposureQuote = grossQuantity * price;
+    const grossExposureQuote = this.marginGrossExposureQuote(price);
     if (grossExposureQuote <= 0) {
       return 1;
     }
@@ -3171,6 +3153,85 @@ export class SimulatedTradingBot {
     }
 
     return clamp(grossExposureQuote / equity, 1, 999);
+  }
+
+  private marginGrossExposureQuote(marketPrice: number): number {
+    if (marketPrice <= 0) {
+      return 0;
+    }
+
+    const grossExposureQuote =
+      this.activeLongExposureQuote(marketPrice) +
+      this.activeShortExposureQuote(marketPrice);
+    return roundQuote(
+      Math.max(0, grossExposureQuote - this.internalBorrowedExposureQuote(marketPrice)),
+    );
+  }
+
+  private internalBorrowedExposureQuote(marketPrice: number): number {
+    this.updateLegacyPositionLotCache();
+    const cache = this.legacyPositionLotCache;
+    if (!cache || marketPrice <= 0) {
+      return 0;
+    }
+
+    let quantity = 0;
+    for (const short of cache.shorts.values()) {
+      for (const allocation of short.borrowAllocations) {
+        quantity += Math.max(0, allocation.quantity);
+      }
+    }
+    for (const long of cache.longs.values()) {
+      for (const allocation of long.borrowAllocations) {
+        quantity += Math.max(0, allocation.quantity);
+      }
+    }
+
+    return roundQuote(quantity * marketPrice);
+  }
+
+  private shortInternalBorrowCapacityQuote(marketPrice: number): number {
+    this.updateLegacyPositionLotCache();
+    const cache = this.legacyPositionLotCache;
+    if (!cache || marketPrice <= 0) {
+      return 0;
+    }
+
+    let quote = 0;
+    for (const lot of cache.longs.values()) {
+      if (lot.borrowDepthRemaining <= 0) {
+        continue;
+      }
+      const availableQuantity = Math.max(0, lot.remainingQuantity - lot.lentQuantity);
+      if (availableQuantity <= MIN_BASE_QUANTITY) {
+        continue;
+      }
+      quote += availableQuantity * marketPrice;
+    }
+
+    return roundQuote(quote);
+  }
+
+  private longInternalBorrowCapacityQuote(_marketPrice: number): number {
+    this.updateLegacyPositionLotCache();
+    const cache = this.legacyPositionLotCache;
+    if (!cache) {
+      return 0;
+    }
+
+    let quote = 0;
+    for (const lot of cache.shorts.values()) {
+      if (
+        lot.borrowDepthRemaining <= 0 ||
+        lot.remainingQuantity <= MIN_BASE_QUANTITY ||
+        lot.remainingProceedsQuote <= 0
+      ) {
+        continue;
+      }
+      quote += Math.max(0, lot.remainingProceedsQuote);
+    }
+
+    return roundQuote(quote);
   }
 
   private rememberPrice(price: number): void {

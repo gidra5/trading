@@ -107,23 +107,24 @@ npm run benchmark:strategies -- --mode days --days 30 --leverage 1 --only "short
 ```
 
 The script reads local historical candles, runs `legacy-valley-peak` with identical
-starting capital, leverage guard, per-side position cap set to 100x starting capital,
-fees, limit offset, and cooldown, then
+starting capital, leverage guard, per-side position cap, fees, limit offset, and
+cooldown, then
 reports return, drawdown, trade count, trade win rate, profitable closed positions,
 liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin capture,
 and compounded perfect-margin capture.
-The benchmark script defaults to `1x` max leverage. Fixed historical, synthetic, grid,
-and portfolio checks should generally stay no-leverage first; run paired `1x` and `5x`
+The benchmark script defaults to the strict-symmetric `0.35%` anchor assumptions:
+`1x`, `futures-margin`, `999/999` borrow depth, borrow lock off, `300s` cooldown, and a
+per-side position cap equal to starting capital. Fixed historical, synthetic, grid, and
+portfolio checks should generally stay no-leverage first; run paired `1x` and `5x`
 comparisons mainly for random-window validation. The `--only relaxed` comparison includes
-the current relaxed per-lot long/short default, long-only, and short-only variants.
-Shorts default to the `spot-borrow` margin model. Use `--short-margin futures-margin`
-when testing standalone unlevered shorts against collateral-backed futures-style gross
-exposure instead of borrowed-base spot-margin debt.
+the current relaxed per-lot long/short default, long-only, and short-only variants. Use
+`--short-margin spot-borrow` to test borrowed-base spot-margin debt instead of
+collateral-backed futures-style gross exposure.
 Use `--long-borrow-depth` and `--short-borrow-depth` to test depth-limited internal
-borrow chains by origin side. Use `--lock-borrowed-lender-collateral false` to allow
-the older behavior where lender lots can exit-grid collateral that is currently lent to
-borrowers. Use `--borrower-profit-share-to-lender` with a value from `0` to `1` to
-decide how much profitable borrower closes lower the lender's break-even. Use
+borrow chains by origin side. Use `--lock-borrowed-lender-collateral true` to prevent
+lender lots from exit-gridding collateral that is currently lent to borrowers. Use
+`--borrower-profit-share-to-lender` with a value from `0` to `1` to decide how much
+profitable borrower closes lower the lender's break-even. Use
 `--max-open-orders` to test the strategy-level resting order cap. Use
 `--borrow-depth-matrix` to expand the selected case across the standard `0/0`, `1/0`,
 `0/1`, `1/1`, `1/2`, `2/1`, and `2/2` depth matrix.
