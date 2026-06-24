@@ -46,6 +46,7 @@ export interface BinancePaperOrder {
   symbol: string;
   orderId: string;
   clientOrderId: string;
+  localOrderId?: string;
   side: string;
   type: string;
   status: string;
@@ -59,6 +60,42 @@ export interface BinancePaperOrder {
   positionSide?: string;
   createdAt?: number;
   updatedAt?: number;
+}
+
+export interface BinancePaperTrade {
+  id: string;
+  symbol: string;
+  orderId: string;
+  clientOrderId?: string;
+  localOrderId?: string;
+  side: "buy" | "sell";
+  price: number;
+  quantity: number;
+  quoteQuantity: number;
+  commission: number;
+  commissionAsset: string;
+  feeQuote: number;
+  realizedPnl?: number;
+  positionSide?: string;
+  time: number;
+  maker?: boolean;
+}
+
+export interface BinancePaperSymbolFilters {
+  symbol: string;
+  pricePrecision?: number;
+  quantityPrecision?: number;
+  tickSize?: number;
+  minPrice?: number;
+  maxPrice?: number;
+  stepSize?: number;
+  marketStepSize?: number;
+  minQuantity?: number;
+  maxQuantity?: number;
+  minMarketQuantity?: number;
+  maxMarketQuantity?: number;
+  minNotional?: number;
+  maxNotional?: number;
 }
 
 export interface BinancePaperSnapshot {
@@ -75,9 +112,13 @@ export interface BinancePaperSnapshot {
   lastSubmitAt?: number;
   message: string;
   error?: string;
+  maxLeverage?: number;
+  symbolFilters?: BinancePaperSymbolFilters;
   balances: BinancePaperBalance[];
   positions: BinancePaperPosition[];
   openOrders: BinancePaperOrder[];
+  recentOrders: BinancePaperOrder[];
+  recentTrades: BinancePaperTrade[];
   lastOrder?: BinancePaperOrder;
 }
 
@@ -123,19 +164,33 @@ interface BinanceApiErrorPayload {
 
 const EMPTY_SNAPSHOT: Pick<
   BinancePaperSnapshot,
-  "balances" | "positions" | "openOrders" | "connected"
+  "balances" | "positions" | "openOrders" | "recentOrders" | "recentTrades" | "connected"
 > = {
   connected: false,
   balances: [],
   positions: [],
   openOrders: [],
+  recentOrders: [],
+  recentTrades: [],
 };
 
 export class BinancePaperTrading {
   private snapshots = new Map<string, BinancePaperSnapshot>();
   private timeOffsets = new Map<string, number>();
+  private symbolFilters = new Map<string, BinancePaperSymbolFilters>();
+  private maxLeverageBySymbol = new Map<string, number>();
 
   constructor(private readonly config: BinancePaperConfig) {}
+
+  drivesOrderExecution(market: BinanceMarketListing): boolean {
+    return Boolean(
+      this.config.enabled &&
+        this.config.autoSubmit &&
+        this.config.apiKey &&
+        this.config.apiSecret &&
+        this.resolveEnvironment(market),
+    );
+  }
 
   streamEnvironmentFor(market: BinanceMarketListing): BinancePaperStreamEnvironment {
     const environment = this.resolveEnvironment(market);
@@ -196,11 +251,21 @@ export class BinancePaperTrading {
 
   async sync(market: BinanceMarketListing): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
-    const [balances, account, openOrders] = await Promise.all([
+    const [balances, account, openOrders, recentOrders, recentTrades, symbolFilters, maxLeverage] = await Promise.all([
       this.fetchBalances(environment),
       this.fetchAccount(environment),
       this.fetchOpenOrders(environment, market.symbol),
+      this.fetchRecentOrders(environment, market.symbol),
+      this.fetchRecentTrades(environment, market),
+      this.fetchSymbolFilters(environment, market.symbol),
+      this.fetchMaxLeverage(environment, market.symbol),
     ]);
+    const ordersById = new Map(recentOrders.map((order) => [order.orderId, order]));
+    const trades = recentTrades.map((trade) => ({
+      ...trade,
+      clientOrderId: trade.clientOrderId || ordersById.get(trade.orderId)?.clientOrderId,
+      localOrderId: trade.localOrderId || ordersById.get(trade.orderId)?.localOrderId,
+    }));
     const positions = extractPositions(environment, account, market.symbol);
     const snapshot: BinancePaperSnapshot = {
       ...this.snapshot(market),
@@ -210,9 +275,13 @@ export class BinancePaperTrading {
       lastSyncAt: Date.now(),
       message: "Binance paper account synced",
       error: undefined,
+      maxLeverage,
+      symbolFilters,
       balances,
       positions,
       openOrders,
+      recentOrders,
+      recentTrades: trades,
     };
     this.snapshots.set(snapshotKey(environment, market.symbol), snapshot);
     return snapshot;
@@ -223,11 +292,12 @@ export class BinancePaperTrading {
     input: BinancePaperPlaceOrderInput,
   ): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
+    const normalizedInput = await this.normalizeOrderInput(environment, market, input);
     const payload = await this.signedRequest<Record<string, unknown>>(
       environment,
       "POST",
       `${orderRestPrefix(environment)}/order`,
-      orderParams(environment, market.symbol, input),
+      orderParams(environment, market.symbol, normalizedInput),
     );
     const lastOrder = normalizeOrder(payload);
     const synced = await this.sync(market);
@@ -235,7 +305,7 @@ export class BinancePaperTrading {
       ...synced,
       lastSubmitAt: Date.now(),
       lastOrder,
-      message: `${input.side.toUpperCase()} ${input.type.toUpperCase()} order submitted to ${environment.mode}`,
+      message: `${normalizedInput.side.toUpperCase()} ${normalizedInput.type.toUpperCase()} order submitted to ${environment.mode}`,
     };
     this.snapshots.set(snapshotKey(environment, market.symbol), snapshot);
     return snapshot;
@@ -330,7 +400,9 @@ export class BinancePaperTrading {
     if (environment.product === "spot") {
       throw new Error("Leverage is only available for futures paper modes.");
     }
-    const nextLeverage = Math.max(1, Math.min(125, Math.round(leverage)));
+    const maxLeverage = await this.fetchMaxLeverage(environment, market.symbol);
+    const leverageCap = maxLeverage && maxLeverage > 0 ? maxLeverage : 125;
+    const nextLeverage = Math.max(1, Math.min(leverageCap, Math.round(leverage)));
     await this.signedRequest<unknown>(environment, "POST", `${orderRestPrefix(environment)}/leverage`, {
       symbol: market.symbol,
       leverage: String(nextLeverage),
@@ -416,6 +488,130 @@ export class BinancePaperTrading {
       { symbol },
     );
     return payload.map(normalizeOrder);
+  }
+
+  private async fetchRecentOrders(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<BinancePaperOrder[]> {
+    try {
+      const payload = await this.signedRequest<unknown[]>(
+        environment,
+        "GET",
+        `${orderRestPrefix(environment)}/allOrders`,
+        { symbol, limit: 100 },
+      );
+      return payload.map(normalizeOrder);
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchRecentTrades(
+    environment: ResolvedPaperEnvironment,
+    market: BinanceMarketListing,
+  ): Promise<BinancePaperTrade[]> {
+    try {
+      const payload = await this.signedRequest<unknown[]>(
+        environment,
+        "GET",
+        `${orderRestPrefix(environment)}/userTrades`,
+        { symbol: market.symbol, limit: 100 },
+      );
+      return payload.map((trade) => normalizeTrade(trade, market));
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchSymbolFilters(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<BinancePaperSymbolFilters | undefined> {
+    const key = `${environment.mode}:${symbol}`;
+    const cached = this.symbolFilters.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const payload = await requestJson<Record<string, unknown>>(
+      new URL(`${exchangeInfoPath(environment)}?symbol=${encodeURIComponent(symbol)}`, environment.baseUrl),
+      { method: "GET" },
+    );
+    const symbols = Array.isArray(payload.symbols) ? payload.symbols : [payload.symbols ?? payload];
+    const raw = symbols.map(asRecord).find((item) => stringValue(item.symbol) === symbol);
+    if (!raw) {
+      return undefined;
+    }
+
+    const filters = normalizeSymbolFilters(raw);
+    this.symbolFilters.set(key, filters);
+    return filters;
+  }
+
+  private async fetchMaxLeverage(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<number | undefined> {
+    if (environment.product === "spot") {
+      return undefined;
+    }
+    const key = `${environment.mode}:${symbol}`;
+    if (this.maxLeverageBySymbol.has(key)) {
+      return this.maxLeverageBySymbol.get(key);
+    }
+
+    try {
+      const payload = await this.signedRequest<unknown>(
+        environment,
+        "GET",
+        leverageBracketPath(environment),
+        { symbol },
+      );
+      const maxLeverage = parseMaxLeverage(payload, symbol);
+      if (maxLeverage) {
+        this.maxLeverageBySymbol.set(key, maxLeverage);
+      }
+      return maxLeverage;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async normalizeOrderInput(
+    environment: ResolvedPaperEnvironment,
+    market: BinanceMarketListing,
+    input: BinancePaperPlaceOrderInput,
+  ): Promise<BinancePaperPlaceOrderInput> {
+    const filters = await this.fetchSymbolFilters(environment, market.symbol);
+    if (!filters) {
+      return input;
+    }
+
+    const price =
+      input.type === "limit"
+        ? normalizePrice(input.price, input.side, filters)
+        : input.price;
+    const quantity = normalizeQuantity(input.quantity, input.type, filters);
+    const effectivePrice = input.type === "limit" ? price : undefined;
+    const minNotional = filters.minNotional ?? 0;
+    let adjustedQuantity = quantity;
+
+    if (minNotional > 0 && effectivePrice && effectivePrice * adjustedQuantity < minNotional) {
+      adjustedQuantity = normalizeQuantity(
+        minNotional / effectivePrice,
+        input.type,
+        filters,
+        "ceil",
+      );
+    }
+
+    validateNormalizedOrder(input, adjustedQuantity, effectivePrice, filters);
+    return {
+      ...input,
+      price: effectivePrice,
+      quantity: adjustedQuantity,
+    };
   }
 
   private async signedRequest<T>(
@@ -560,6 +756,118 @@ function cancelAllOpenOrdersPath(environment: ResolvedPaperEnvironment): string 
     : `${orderRestPrefix(environment)}/allOpenOrders`;
 }
 
+function exchangeInfoPath(environment: ResolvedPaperEnvironment): string {
+  if (environment.product === "spot") {
+    return "/api/v3/exchangeInfo";
+  }
+  return `${orderRestPrefix(environment)}/exchangeInfo`;
+}
+
+function leverageBracketPath(environment: ResolvedPaperEnvironment): string {
+  return environment.product === "coinm-futures"
+    ? "/dapi/v2/leverageBracket"
+    : "/fapi/v1/leverageBracket";
+}
+
+function normalizePrice(
+  value: number | undefined,
+  side: "buy" | "sell",
+  filters: BinancePaperSymbolFilters,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Limit paper orders require a positive price.");
+  }
+  const tickSize = filters.tickSize ?? 0;
+  if (tickSize <= 0) {
+    return price;
+  }
+  return side === "buy"
+    ? roundToStep(price, tickSize, "floor")
+    : roundToStep(price, tickSize, "ceil");
+}
+
+function normalizeQuantity(
+  value: number,
+  type: "limit" | "market",
+  filters: BinancePaperSymbolFilters,
+  mode: "floor" | "ceil" = "floor",
+): number {
+  const quantity = Number(value);
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("Binance order quantity must be positive.");
+  }
+  const stepSize =
+    type === "market" && filters.marketStepSize
+      ? filters.marketStepSize
+      : filters.stepSize;
+  if (!stepSize || stepSize <= 0) {
+    return quantity;
+  }
+  return roundToStep(quantity, stepSize, mode);
+}
+
+function validateNormalizedOrder(
+  input: BinancePaperPlaceOrderInput,
+  quantity: number,
+  price: number | undefined,
+  filters: BinancePaperSymbolFilters,
+): void {
+  const minQuantity =
+    input.type === "market" && filters.minMarketQuantity
+      ? filters.minMarketQuantity
+      : filters.minQuantity;
+  const maxQuantity =
+    input.type === "market" && filters.maxMarketQuantity
+      ? filters.maxMarketQuantity
+      : filters.maxQuantity;
+  if (minQuantity && quantity < minQuantity) {
+    throw new Error(`Normalized Binance order quantity ${quantity} is below minQty ${minQuantity}.`);
+  }
+  if (maxQuantity && maxQuantity > 0 && quantity > maxQuantity) {
+    throw new Error(`Normalized Binance order quantity ${quantity} is above maxQty ${maxQuantity}.`);
+  }
+  if (price !== undefined) {
+    if (filters.minPrice && price < filters.minPrice) {
+      throw new Error(`Normalized Binance order price ${price} is below minPrice ${filters.minPrice}.`);
+    }
+    if (filters.maxPrice && filters.maxPrice > 0 && price > filters.maxPrice) {
+      throw new Error(`Normalized Binance order price ${price} is above maxPrice ${filters.maxPrice}.`);
+    }
+    const notional = price * quantity;
+    if (filters.minNotional && notional < filters.minNotional) {
+      throw new Error(`Normalized Binance order notional ${notional} is below minNotional ${filters.minNotional}.`);
+    }
+    if (filters.maxNotional && filters.maxNotional > 0 && notional > filters.maxNotional) {
+      throw new Error(`Normalized Binance order notional ${notional} is above maxNotional ${filters.maxNotional}.`);
+    }
+  }
+}
+
+function roundToStep(value: number, step: number, mode: "floor" | "ceil"): number {
+  const precision = decimalPrecision(step);
+  const scaled = value / step;
+  const rounded = mode === "ceil"
+    ? Math.ceil(scaled - 1e-12)
+    : Math.floor(scaled + 1e-12);
+  return Number((rounded * step).toFixed(precision));
+}
+
+function decimalPrecision(step: number): number {
+  const text = step.toLocaleString("en-US", {
+    useGrouping: false,
+    maximumFractionDigits: 18,
+  });
+  const dotIndex = text.indexOf(".");
+  if (dotIndex < 0) {
+    return 0;
+  }
+  return text.length - dotIndex - 1;
+}
+
 function orderParams(
   environment: ResolvedPaperEnvironment,
   symbol: string,
@@ -616,6 +924,14 @@ function createClientOrderId(): string {
 
 function clientOrderIdForBotOrder(orderId: string): string {
   return `bot_${orderId.replace(/[^.A-Z:/a-z0-9_-]/g, "_")}`.slice(0, 36);
+}
+
+function localOrderIdFromClientOrderId(clientOrderId: string): string | undefined {
+  if (!clientOrderId.startsWith("bot_")) {
+    return undefined;
+  }
+  const orderId = clientOrderId.slice(4);
+  return orderId || undefined;
 }
 
 function normalizeSpotBalance(raw: unknown): BinancePaperBalance {
@@ -683,10 +999,12 @@ function extractPositions(
 
 function normalizeOrder(raw: unknown): BinancePaperOrder {
   const item = asRecord(raw);
+  const clientOrderId = stringValue(item.clientOrderId);
   return {
     symbol: stringValue(item.symbol),
     orderId: stringValue(item.orderId),
-    clientOrderId: stringValue(item.clientOrderId),
+    clientOrderId,
+    localOrderId: localOrderIdFromClientOrderId(clientOrderId),
     side: stringValue(item.side),
     type: stringValue(item.type),
     status: stringValue(item.status),
@@ -701,6 +1019,101 @@ function normalizeOrder(raw: unknown): BinancePaperOrder {
     createdAt: numberValue(item.time),
     updatedAt: numberValue(item.updateTime ?? item.transactTime),
   };
+}
+
+function normalizeTrade(raw: unknown, market: BinanceMarketListing): BinancePaperTrade {
+  const item = asRecord(raw);
+  const side = tradeSide(item);
+  const price = numberValue(item.price);
+  const quantity = numberValue(item.qty);
+  const quoteQuantity = numberValue(item.quoteQty);
+  const commission = numberValue(item.commission);
+  const commissionAsset = stringValue(item.commissionAsset);
+  const feeQuote =
+    commissionAsset === market.quoteAsset
+      ? commission
+      : commissionAsset === market.baseAsset
+        ? commission * price
+        : 0;
+  const clientOrderId = stringValue(item.clientOrderId);
+  const id = stringValue(item.id);
+  return {
+    id: `${market.id}:trade:${id || `${stringValue(item.orderId)}:${stringValue(item.time)}`}`,
+    symbol: stringValue(item.symbol),
+    orderId: stringValue(item.orderId),
+    clientOrderId,
+    localOrderId: localOrderIdFromClientOrderId(clientOrderId),
+    side,
+    price,
+    quantity,
+    quoteQuantity: quoteQuantity || price * quantity,
+    commission,
+    commissionAsset,
+    feeQuote,
+    realizedPnl: optionalNumber(item.realizedPnl),
+    positionSide: stringValue(item.positionSide),
+    time: numberValue(item.time),
+    maker: booleanValue(item.maker),
+  };
+}
+
+function normalizeSymbolFilters(raw: Record<string, unknown>): BinancePaperSymbolFilters {
+  const filters = Array.isArray(raw.filters) ? raw.filters.map(asRecord) : [];
+  const priceFilter = filterByType(filters, "PRICE_FILTER");
+  const lotSize = filterByType(filters, "LOT_SIZE");
+  const marketLotSize = filterByType(filters, "MARKET_LOT_SIZE");
+  const minNotional = filterByType(filters, "MIN_NOTIONAL");
+  const notional = filterByType(filters, "NOTIONAL");
+  return {
+    symbol: stringValue(raw.symbol),
+    pricePrecision: optionalNumber(raw.pricePrecision),
+    quantityPrecision: optionalNumber(raw.quantityPrecision),
+    tickSize: optionalNumber(priceFilter.tickSize),
+    minPrice: optionalNumber(priceFilter.minPrice),
+    maxPrice: optionalNumber(priceFilter.maxPrice),
+    stepSize: optionalNumber(lotSize.stepSize),
+    marketStepSize: optionalNumber(marketLotSize.stepSize),
+    minQuantity: optionalNumber(lotSize.minQty),
+    maxQuantity: optionalNumber(lotSize.maxQty),
+    minMarketQuantity: optionalNumber(marketLotSize.minQty),
+    maxMarketQuantity: optionalNumber(marketLotSize.maxQty),
+    minNotional: optionalNumber(notional.minNotional ?? minNotional.minNotional),
+    maxNotional: optionalNumber(notional.maxNotional),
+  };
+}
+
+function filterByType(
+  filters: Array<Record<string, unknown>>,
+  filterType: string,
+): Record<string, unknown> {
+  return filters.find((filter) => stringValue(filter.filterType) === filterType) ?? {};
+}
+
+function parseMaxLeverage(payload: unknown, symbol: string): number | undefined {
+  const rows = Array.isArray(payload) ? payload : [payload];
+  let maxLeverage = 0;
+  for (const row of rows.map(asRecord)) {
+    const rowSymbol = stringValue(row.symbol) || stringValue(row.pair);
+    if (rowSymbol && rowSymbol !== symbol) {
+      continue;
+    }
+    const brackets = Array.isArray(row.brackets) ? row.brackets.map(asRecord) : [];
+    for (const bracket of brackets) {
+      maxLeverage = Math.max(maxLeverage, numberValue(bracket.initialLeverage));
+    }
+  }
+  return maxLeverage > 0 ? maxLeverage : undefined;
+}
+
+function tradeSide(item: Record<string, unknown>): "buy" | "sell" {
+  const side = stringValue(item.side).toUpperCase();
+  if (side === "BUY") {
+    return "buy";
+  }
+  if (side === "SELL") {
+    return "sell";
+  }
+  return booleanValue(item.isBuyer) ? "buy" : "sell";
 }
 
 async function requestJson<T>(url: URL, init: RequestInit): Promise<T> {
@@ -737,6 +1150,11 @@ function stringValue(value: unknown): string {
 function numberValue(value: unknown): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function booleanValue(value: unknown): boolean | undefined {

@@ -177,6 +177,7 @@ export interface BinancePaperOrder {
   symbol: string;
   orderId: string;
   clientOrderId: string;
+  localOrderId?: string;
   side: string;
   type: string;
   status: string;
@@ -190,6 +191,42 @@ export interface BinancePaperOrder {
   positionSide?: string;
   createdAt?: number;
   updatedAt?: number;
+}
+
+export interface BinancePaperTrade {
+  id: string;
+  symbol: string;
+  orderId: string;
+  clientOrderId?: string;
+  localOrderId?: string;
+  side: "buy" | "sell";
+  price: number;
+  quantity: number;
+  quoteQuantity: number;
+  commission: number;
+  commissionAsset: string;
+  feeQuote: number;
+  realizedPnl?: number;
+  positionSide?: string;
+  time: number;
+  maker?: boolean;
+}
+
+export interface BinancePaperSymbolFilters {
+  symbol: string;
+  pricePrecision?: number;
+  quantityPrecision?: number;
+  tickSize?: number;
+  minPrice?: number;
+  maxPrice?: number;
+  stepSize?: number;
+  marketStepSize?: number;
+  minQuantity?: number;
+  maxQuantity?: number;
+  minMarketQuantity?: number;
+  maxMarketQuantity?: number;
+  minNotional?: number;
+  maxNotional?: number;
 }
 
 export interface BinancePaperSnapshot {
@@ -206,8 +243,12 @@ export interface BinancePaperSnapshot {
   lastSubmitAt?: number;
   message: string;
   error?: string;
+  maxLeverage?: number;
+  symbolFilters?: BinancePaperSymbolFilters;
   balances: BinancePaperBalance[];
   positions: BinancePaperPosition[];
   openOrders: BinancePaperOrder[];
+  recentOrders: BinancePaperOrder[];
+  recentTrades: BinancePaperTrade[];
   lastOrder?: BinancePaperOrder;
 }

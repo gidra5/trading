@@ -2,11 +2,7 @@
 - search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or compensate variance of each other.
 - portfolio management experiments: initial strategy-portfolio harness exists; still need cached multi-symbol data for inverse-vol allocation, correlation-cluster caps, volatility-targeted leverage, market-neutral pairs, robust min-variance baskets, turnover-aware rebalancing, funding-aware overlays, and stress-mode deleveraging. Details are in docs/strategy-research.md and docs/experiment-plan.md.
 - randomized model. lets say we look at the price according to some poisson process. At each observation we decide one of the following - open new long/short position, close existing position, or do nothing. We should pick the action based on which will yield best change in equity or break-even price.
-- authorize bots to be able to trade actual money.
 - add prediction market support
-- add proper live-exchange leverage integration for futures and spot margin; paper
-  simulator now has a `shortMarginModel = "futures-margin"` option for collateral-backed
-  standalone shorts
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
 - maybe run some kind of genetic algorithm to finetune the parameters. use quick 1month backtests to verify quality and guide the search.
@@ -26,10 +22,12 @@
 - integrate with actual binance paper trading api
   - initial Spot Testnet/Demo and USD-M/COIN-M Futures Testnet adapter exists; dashboard
     can sync balances/open orders, place/cancel paper orders, set futures leverage, and
-    optionally shadow-submit strategy-created orders with
+    optionally exchange-submit strategy-created orders with
     `TRADING_BINANCE_PAPER_AUTO_SUBMIT=true`
-  - still need exchange-fill reconciliation back into the local bot ledger before making
-    auto-submit the default execution path
+  - exchange filter normalization, REST order/trade reconciliation, restart recovery,
+    and paper futures max-leverage caps are implemented
+  - still need user-data websocket streaming and long-running futures soak tests before
+    making auto-submit the default execution path
 - test more grid points
 - 90d samples, 30d, 180d, 365d 1800d
   

@@ -3,6 +3,9 @@ import type {
   BotStatus,
   BotMetrics,
   Candle,
+  ExchangeOrderUpdate,
+  ExchangeReconciliationInput,
+  ExchangeTradeFill,
   LegacyExitGridMemory,
   LegacyValleyPeakMemory,
   ManualTradeInput,
@@ -347,6 +350,42 @@ export class SimulatedTradingBot {
     ];
   }
 
+  setConfig(config: StrategyConfig, at = Date.now()): void {
+    this.state.config = createStrategyConfig(config);
+    this.state.updatedAt = at;
+    this.priceMemoryLimit = priceMemoryLimit(this.state.config);
+  }
+
+  cancelOpenOrder(orderId: string, reason: string, at = Date.now()): BotEvent[] {
+    const index = this.findOrderIndex(orderId);
+    if (index === undefined) {
+      return [];
+    }
+    const order = this.state.orders[index];
+    if (!order || order.status !== "open") {
+      return [];
+    }
+
+    this.releaseOrderReserve(order);
+    order.status = "cancelled";
+    order.cancelledAt = at;
+    order.updatedAt = at;
+    order.reason = `${order.reason}; ${reason}`;
+    this.openOrderIndexes.delete(index);
+    this.state.updatedAt = at;
+    recalculateMetrics(this.state);
+
+    return [
+      {
+        type: "order_cancelled",
+        at,
+        message: `${order.side.toUpperCase()} order cancelled: ${reason}`,
+        order: structuredClone(order),
+        state: this.snapshot(),
+      },
+    ];
+  }
+
   recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
     const price = cleanPositive(input.price) || this.state.lastPrice || this.state.avgEntryPrice;
     const quantity = roundAsset(input.quantity);
@@ -486,6 +525,51 @@ export class SimulatedTradingBot {
     }
   }
 
+  applyExchangeReconciliation(
+    input: ExchangeReconciliationInput,
+    at = Date.now(),
+  ): BotEvent[] {
+    const previousState = structuredClone(this.state);
+    const events: BotEvent[] = [];
+
+    try {
+      const fills = [...(input.fills ?? [])].sort(
+        (left, right) =>
+          left.filledAt - right.filledAt ||
+          left.id.localeCompare(right.id),
+      );
+      for (const fill of fills) {
+        const event = this.applyExchangeFill(fill);
+        if (event) {
+          events.push(event);
+        }
+      }
+
+      const orders = [...(input.orders ?? [])].sort(
+        (left, right) =>
+          (left.updatedAt ?? left.createdAt ?? at) -
+          (right.updatedAt ?? right.createdAt ?? at),
+      );
+      for (const order of orders) {
+        events.push(...this.applyExchangeOrderUpdate(order, at));
+      }
+
+      if (events.length === 0) {
+        return [];
+      }
+
+      this.refreshAverageEntryPrices();
+      this.state.updatedAt = Math.max(at, ...events.map((event) => event.at));
+      recalculateMetrics(this.state);
+      this.rebuildOpenOrderIndex();
+      return events;
+    } catch (error) {
+      this.state = previousState;
+      this.rebuildOpenOrderIndex();
+      throw error;
+    }
+  }
+
   onCandle(candle: Candle): BotEvent[] {
     return this.onTick({
       symbol: candle.symbol,
@@ -546,6 +630,316 @@ export class SimulatedTradingBot {
     return NO_EVENTS;
   }
 
+  private applyExchangeOrderUpdate(
+    update: ExchangeOrderUpdate,
+    fallbackAt: number,
+  ): BotEvent[] {
+    const index = this.findOrderIndex(update.localOrderId);
+    if (index === undefined) {
+      return [];
+    }
+
+    const order = this.state.orders[index];
+    if (!order) {
+      return [];
+    }
+
+    const updatedAt = cleanPositive(update.updatedAt) || cleanPositive(update.createdAt) || fallbackAt;
+    const missingFilledQuantity = roundAsset(
+      Math.max(0, update.filledQuantity - order.filledQuantity),
+    );
+    this.adjustOpenOrderToExchange(order, update);
+
+    const events: BotEvent[] = [];
+    if (missingFilledQuantity > MIN_BASE_QUANTITY) {
+      const filledQuote = cleanPositive(update.quoteQuantity);
+      const averagePrice =
+        filledQuote && update.filledQuantity > 0
+          ? filledQuote / update.filledQuantity
+          : update.price;
+      const fill = this.applyExchangeFill({
+        id: `exchange_order_${update.externalOrderId || order.id}_${update.filledQuantity}`,
+        localOrderId: order.id,
+        externalOrderId: update.externalOrderId,
+        clientOrderId: update.clientOrderId,
+        side: update.side,
+        price: cleanPositive(averagePrice) || order.price,
+        quantity: missingFilledQuantity,
+        quoteQuantity: roundQuote((cleanPositive(averagePrice) || order.price) * missingFilledQuantity),
+        feeQuote: update.feeQuote ?? 0,
+        realizedPnl: undefined,
+        filledAt: updatedAt,
+        reason: update.reason,
+        positionEffect: update.positionEffect ?? order.positionEffect,
+      });
+      if (fill) {
+        events.push(fill);
+      }
+    }
+
+    if (update.status === "cancelled" && order.status === "open") {
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = updatedAt;
+      order.updatedAt = updatedAt;
+      this.openOrderIndexes.delete(index);
+      events.push({
+        type: "order_cancelled",
+        at: updatedAt,
+        message: `${order.side.toUpperCase()} order cancelled on exchange`,
+        order: structuredClone(order),
+      });
+    } else if (update.status === "filled" && order.status === "open") {
+      order.status = "filled";
+      order.filledAt = updatedAt;
+      order.updatedAt = updatedAt;
+      order.filledQuantity = Math.max(order.filledQuantity, order.quantity);
+      this.openOrderIndexes.delete(index);
+    } else {
+      order.updatedAt = Math.max(order.updatedAt, updatedAt);
+    }
+
+    return events;
+  }
+
+  private applyExchangeFill(input: ExchangeTradeFill): BotEvent | undefined {
+    if (!input.id || this.state.fills.some((fill) => fill.id === input.id)) {
+      return undefined;
+    }
+
+    const index = this.findOrCreateExchangeOrder(input);
+    const order = this.state.orders[index];
+    if (!order || order.status === "cancelled") {
+      return undefined;
+    }
+    if (order.status === "filled" && order.filledQuantity >= order.quantity - MIN_BASE_QUANTITY) {
+      return undefined;
+    }
+
+    const remainingQuantity = roundAsset(Math.max(0, order.quantity - order.filledQuantity));
+    const quantity = roundAsset(
+      remainingQuantity > MIN_BASE_QUANTITY
+        ? Math.min(input.quantity, remainingQuantity)
+        : input.quantity,
+    );
+    const price = roundQuote(input.price);
+    if (quantity <= MIN_BASE_QUANTITY || price <= 0) {
+      return undefined;
+    }
+
+    const quoteQuantity = roundQuote(
+      cleanPositive(input.quoteQuantity) || price * quantity,
+    );
+    const feeQuote = roundQuote(Math.max(0, input.feeQuote));
+    const positionEffect = input.positionEffect ?? order.positionEffect ?? "auto";
+    const orderView: TradingOrder = {
+      ...order,
+      price,
+      quantity,
+      positionEffect,
+    };
+    let realizedPnl = 0;
+
+    if (input.side === "buy") {
+      const closedShortQuantity = this.shortCloseQuantityForOrder(orderView);
+      const spent = roundQuote(quoteQuantity + feeQuote);
+      this.consumeQuoteReserveForExchangeFill(order, quantity, spent);
+      this.state.baseFree = roundAsset(this.state.baseFree + quantity);
+      if (closedShortQuantity > MIN_BASE_QUANTITY) {
+        realizedPnl =
+          input.realizedPnl !== undefined && Number.isFinite(input.realizedPnl)
+            ? roundQuote(input.realizedPnl)
+            : roundQuote(
+                (this.shortEntryPriceForCloseOrder(orderView) - price) *
+                  closedShortQuantity -
+                  feeQuote * (closedShortQuantity / quantity),
+              );
+      }
+    } else {
+      const closedLongQuantity = this.longCloseQuantityForOrder(orderView);
+      this.consumeBaseReserveForExchangeFill(order, quantity);
+      const proceeds = roundQuote(quoteQuantity - feeQuote);
+      this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
+      if (closedLongQuantity > MIN_BASE_QUANTITY) {
+        realizedPnl =
+          input.realizedPnl !== undefined && Number.isFinite(input.realizedPnl)
+            ? roundQuote(input.realizedPnl)
+            : roundQuote(
+                (price - this.longEntryPriceForCloseOrder(orderView)) *
+                  closedLongQuantity -
+                  feeQuote * (closedLongQuantity / quantity),
+              );
+      }
+    }
+
+    this.state.realizedPnl = roundQuote(this.state.realizedPnl + realizedPnl);
+    if (realizedPnl > 0) {
+      this.state.winningTrades += 1;
+    } else if (realizedPnl < 0) {
+      this.state.losingTrades += 1;
+    }
+    this.state.feesPaid = roundQuote(this.state.feesPaid + feeQuote);
+
+    order.price = price;
+    order.filledQuantity = roundAsset(order.filledQuantity + quantity);
+    order.updatedAt = input.filledAt;
+    order.feeQuote = roundQuote(order.feeQuote + feeQuote);
+    order.realizedPnl = roundQuote(order.realizedPnl + realizedPnl);
+    order.positionEffect = positionEffect;
+    if (order.filledQuantity >= order.quantity - MIN_BASE_QUANTITY) {
+      order.status = "filled";
+      order.filledAt = input.filledAt;
+      this.openOrderIndexes.delete(index);
+    }
+
+    const fill: TradeFill = {
+      id: input.id,
+      orderId: order.id,
+      side: input.side,
+      price,
+      quantity,
+      quoteQuantity,
+      feeQuote,
+      realizedPnl,
+      filledAt: input.filledAt,
+      reason: input.reason?.trim() || order.reason || "exchange fill",
+      targetPositionId: order.targetPositionId,
+      positionEffect,
+      manual: false,
+    };
+    this.state.fills.push(fill);
+    this.state.lastPrice = price;
+
+    return {
+      type: "order_filled",
+      at: input.filledAt,
+      message: `${input.side.toUpperCase()} exchange fill reconciled at ${price}`,
+      order: structuredClone(order),
+      fill: structuredClone(fill),
+      state: this.snapshot(),
+    };
+  }
+
+  private findOrCreateExchangeOrder(input: ExchangeTradeFill): number {
+    const existingIndex = this.findOrderIndex(input.localOrderId);
+    if (existingIndex !== undefined) {
+      return existingIndex;
+    }
+
+    const quantity = roundAsset(input.quantity);
+    const price = roundQuote(input.price);
+    const quoteQuantity = roundQuote(cleanPositive(input.quoteQuantity) || price * quantity);
+    const order: TradingOrder = {
+      id: input.localOrderId || `ex_ord_${this.nextSequence().toString().padStart(6, "0")}`,
+      side: input.side,
+      type: "limit",
+      status: "open",
+      price,
+      quantity,
+      filledQuantity: 0,
+      estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + input.feeQuote) : 0,
+      createdAt: input.filledAt,
+      updatedAt: input.filledAt,
+      reason: input.reason?.trim() || "exchange fill",
+      realizedPnl: 0,
+      feeQuote: 0,
+      positionEffect: input.positionEffect ?? "auto",
+      manual: false,
+    };
+    const index = this.state.orders.length;
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(index);
+    return index;
+  }
+
+  private findOrderIndex(orderId: string | undefined): number | undefined {
+    if (!orderId) {
+      return undefined;
+    }
+    const index = this.state.orders.findIndex((order) => order.id === orderId);
+    return index >= 0 ? index : undefined;
+  }
+
+  private adjustOpenOrderToExchange(
+    order: TradingOrder,
+    update: ExchangeOrderUpdate,
+  ): void {
+    if (order.status !== "open") {
+      return;
+    }
+
+    const nextQuantity = roundAsset(update.quantity);
+    const nextPrice = roundQuote(update.price);
+    if (nextQuantity <= MIN_BASE_QUANTITY || nextPrice <= 0) {
+      return;
+    }
+
+    const currentRemainingQuantity = roundAsset(
+      Math.max(0, order.quantity - order.filledQuantity),
+    );
+    const nextRemainingQuantity = roundAsset(
+      Math.max(0, nextQuantity - order.filledQuantity),
+    );
+
+    if (order.side === "buy") {
+      const currentRemainingReserve = remainingOrderReserveQuote(order);
+      const nextEstimatedQuoteCost = roundQuote(
+        nextQuantity * nextPrice * (1 + this.state.config.feeBps / 10_000),
+      );
+      const nextRemainingReserve =
+        nextQuantity > MIN_BASE_QUANTITY
+          ? roundQuote(nextEstimatedQuoteCost * (nextRemainingQuantity / nextQuantity))
+          : 0;
+      const reserveDelta = roundQuote(nextRemainingReserve - currentRemainingReserve);
+      this.state.quoteReserved = roundQuote(this.state.quoteReserved + reserveDelta);
+      this.state.quoteFree = roundQuote(this.state.quoteFree - reserveDelta);
+      order.estimatedQuoteCost = nextEstimatedQuoteCost;
+    } else if (order.positionEffect !== "open") {
+      const reserveDelta = roundAsset(nextRemainingQuantity - currentRemainingQuantity);
+      this.state.baseReserved = roundAsset(this.state.baseReserved + reserveDelta);
+      this.state.baseFree = roundAsset(this.state.baseFree - reserveDelta);
+    }
+
+    order.price = nextPrice;
+    order.quantity = nextQuantity;
+  }
+
+  private consumeQuoteReserveForExchangeFill(
+    order: TradingOrder,
+    quantity: number,
+    spentQuote: number,
+  ): void {
+    const reservedPortion =
+      order.status === "open" ? remainingOrderReserveQuote(order, quantity) : 0;
+    if (reservedPortion > 0) {
+      this.state.quoteReserved = roundQuote(
+        Math.max(0, this.state.quoteReserved - reservedPortion),
+      );
+      this.state.quoteFree = roundQuote(
+        this.state.quoteFree + reservedPortion - spentQuote,
+      );
+    } else {
+      this.state.quoteFree = roundQuote(this.state.quoteFree - spentQuote);
+    }
+  }
+
+  private consumeBaseReserveForExchangeFill(order: TradingOrder, quantity: number): void {
+    if (order.status === "open" && order.positionEffect !== "open") {
+      const reservedQuantity = Math.min(this.state.baseReserved, quantity);
+      this.state.baseReserved = roundAsset(
+        Math.max(0, this.state.baseReserved - reservedQuantity),
+      );
+      if (quantity > reservedQuantity + MIN_BASE_QUANTITY) {
+        this.state.baseFree = roundAsset(
+          this.state.baseFree - (quantity - reservedQuantity),
+        );
+      }
+      return;
+    }
+
+    this.state.baseFree = roundAsset(this.state.baseFree - quantity);
+  }
+
   private processAcceptedPriceTick(
     eventTime: number,
     price: number,
@@ -566,12 +960,14 @@ export class SimulatedTradingBot {
     tick.price = price;
     tick.quantity = quantity;
 
-    if (events) {
-      events.push(...this.cancelStaleOrders(eventTime, collectEvents));
-      events.push(...this.fillOpenOrders(tick, collectEvents));
-    } else {
-      this.cancelStaleOrders(eventTime, collectEvents);
-      this.fillOpenOrders(tick, collectEvents);
+    if (options.processOpenOrders ?? true) {
+      if (events) {
+        events.push(...this.cancelStaleOrders(eventTime, collectEvents));
+        events.push(...this.fillOpenOrders(tick, collectEvents));
+      } else {
+        this.cancelStaleOrders(eventTime, collectEvents);
+        this.fillOpenOrders(tick, collectEvents);
+      }
     }
     const liquidated = options.simulateLiquidation
       ? this.liquidateAccountIfNeeded(eventTime, price, collectEvents, events)
@@ -2835,18 +3231,20 @@ export class SimulatedTradingBot {
   }
 
   private releaseOrderReserve(order: TradingOrder): void {
+    const remainingQuantity = roundAsset(Math.max(0, order.quantity - order.filledQuantity));
     if (order.side === "buy") {
+      const reserveQuote = remainingOrderReserveQuote(order, remainingQuantity);
       this.state.quoteReserved = roundQuote(
-        Math.max(0, this.state.quoteReserved - order.estimatedQuoteCost),
+        Math.max(0, this.state.quoteReserved - reserveQuote),
       );
-      this.state.quoteFree = roundQuote(this.state.quoteFree + order.estimatedQuoteCost);
+      this.state.quoteFree = roundQuote(this.state.quoteFree + reserveQuote);
     } else if (order.positionEffect === "open") {
       return;
     } else {
       this.state.baseReserved = roundAsset(
-        Math.max(0, this.state.baseReserved - order.quantity),
+        Math.max(0, this.state.baseReserved - remainingQuantity),
       );
-      this.state.baseFree = roundAsset(this.state.baseFree + order.quantity);
+      this.state.baseFree = roundAsset(this.state.baseFree + remainingQuantity);
     }
   }
 
@@ -3453,6 +3851,16 @@ function countLiquidatedPositions(fills: readonly TradeFill[]): number {
 
 function cleanPositive(value: number | undefined): number {
   return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+}
+
+function remainingOrderReserveQuote(
+  order: TradingOrder,
+  quantity = Math.max(0, order.quantity - order.filledQuantity),
+): number {
+  if (order.side !== "buy" || order.quantity <= MIN_BASE_QUANTITY) {
+    return 0;
+  }
+  return roundQuote(order.estimatedQuoteCost * (quantity / order.quantity));
 }
 
 function cleanFiniteNumber(value: number | undefined): number {

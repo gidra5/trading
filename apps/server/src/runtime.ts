@@ -9,6 +9,7 @@ import {
   type BacktestResult,
   type BotEvent,
   type Candle,
+  type ExchangeReconciliationInput,
   type ManualTradeInput,
   type OrderBookSnapshot,
   type PartialStrategyConfig,
@@ -30,8 +31,10 @@ import {
 import {
   BinancePaperTrading,
   type BinancePaperCancelOrderInput,
+  type BinancePaperOrder,
   type BinancePaperPlaceOrderInput,
   type BinancePaperSnapshot,
+  type BinancePaperTrade,
 } from "./binance-paper.js";
 import type { TradingStorage } from "./storage.js";
 
@@ -114,6 +117,7 @@ export class TradingRuntime {
     const savedState = await this.storage.loadBotState();
     this.config = this.createMarketConfig(savedState);
     this.bot = new SimulatedTradingBot(savedState, this.config);
+    await this.recoverExchangeState();
   }
 
   async switchMarket(
@@ -142,6 +146,7 @@ export class TradingRuntime {
     const savedState = await this.storage.loadBotState();
     this.config = this.createMarketConfig(savedState);
     this.bot = new SimulatedTradingBot(savedState, this.config);
+    await this.recoverExchangeState();
   }
 
   handleStatus(status: MarketStreamStatus): void {
@@ -149,7 +154,8 @@ export class TradingRuntime {
   }
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
-    const events = this.bot.onTick(tick);
+    const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+    const events = this.bot.onTick(tick, { processOpenOrders: !exchangeDriven });
     await this.submitCreatedOrdersToPaperExchange(events);
     this.recordEvents(events);
     this.scheduleStateSave();
@@ -289,7 +295,9 @@ export class TradingRuntime {
     if (!this.paperTrading) {
       throw new Error("Binance paper trading is not configured.");
     }
-    return this.paperTrading.sync(this.market);
+    const snapshot = await this.paperTrading.sync(this.market);
+    await this.applyExchangeSnapshot(snapshot);
+    return snapshot;
   }
 
   async placeExchangeOrder(
@@ -298,7 +306,9 @@ export class TradingRuntime {
     if (!this.paperTrading) {
       throw new Error("Binance paper trading is not configured.");
     }
-    return this.paperTrading.placeOrder(this.market, input);
+    const snapshot = await this.paperTrading.placeOrder(this.market, input);
+    await this.applyExchangeSnapshot(snapshot);
+    return snapshot;
   }
 
   async cancelExchangeOrder(
@@ -307,21 +317,28 @@ export class TradingRuntime {
     if (!this.paperTrading) {
       throw new Error("Binance paper trading is not configured.");
     }
-    return this.paperTrading.cancelOrder(this.market, input);
+    const snapshot = await this.paperTrading.cancelOrder(this.market, input);
+    await this.applyExchangeSnapshot(snapshot);
+    return snapshot;
   }
 
   async cancelAllExchangeOrders(): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
       throw new Error("Binance paper trading is not configured.");
     }
-    return this.paperTrading.cancelAllOpenOrders(this.market);
+    const snapshot = await this.paperTrading.cancelAllOpenOrders(this.market);
+    await this.applyExchangeSnapshot(snapshot);
+    return snapshot;
   }
 
   async setExchangeLeverage(leverage: number): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
       throw new Error("Binance paper trading is not configured.");
     }
-    return this.paperTrading.changeLeverage(this.market, leverage);
+    const snapshot = await this.paperTrading.changeLeverage(this.market, leverage);
+    this.applyExchangeMaxLeverage(snapshot);
+    await this.flushState();
+    return snapshot;
   }
 
   startBacktest(
@@ -421,11 +438,58 @@ export class TradingRuntime {
         continue;
       }
       try {
-        await this.paperTrading.submitBotOrder(this.market, event.order);
+        const snapshot = await this.paperTrading.submitBotOrder(this.market, event.order);
+        if (snapshot) {
+          await this.applyExchangeSnapshot(snapshot);
+        }
       } catch {
+        const cancelled = this.bot.cancelOpenOrder(event.order.id, "exchange submit failed");
+        this.recordEvents(cancelled);
+        await this.flushState();
         return;
       }
     }
+  }
+
+  private async recoverExchangeState(): Promise<void> {
+    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+      return;
+    }
+    try {
+      const snapshot = await this.paperTrading.sync(this.market);
+      await this.applyExchangeSnapshot(snapshot);
+    } catch {
+      return;
+    }
+  }
+
+  private async applyExchangeSnapshot(snapshot: BinancePaperSnapshot): Promise<BotEvent[]> {
+    this.applyExchangeMaxLeverage(snapshot);
+    const reconciliation = exchangeReconciliationFromSnapshot(snapshot);
+    if (
+      (reconciliation.orders?.length ?? 0) === 0 &&
+      (reconciliation.fills?.length ?? 0) === 0
+    ) {
+      await this.flushState();
+      return [];
+    }
+
+    const events = this.bot.applyExchangeReconciliation(reconciliation);
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  private applyExchangeMaxLeverage(snapshot: BinancePaperSnapshot): void {
+    if (!snapshot.maxLeverage || snapshot.maxLeverage < 1) {
+      return;
+    }
+    const capped = applyMarketMaxLeverage(this.config, snapshot.maxLeverage);
+    if (capped.maxLeverage === this.config.maxLeverage) {
+      return;
+    }
+    this.config = capped;
+    this.bot.setConfig(capped);
   }
 
   private async executeBacktest(
@@ -602,7 +666,84 @@ function disabledExchangeSnapshot(): BinancePaperSnapshot {
     balances: [],
     positions: [],
     openOrders: [],
+    recentOrders: [],
+    recentTrades: [],
   };
+}
+
+function exchangeReconciliationFromSnapshot(
+  snapshot: BinancePaperSnapshot,
+): ExchangeReconciliationInput {
+  const orderById = new Map<string, BinancePaperOrder>();
+  for (const order of [...snapshot.recentOrders, ...snapshot.openOrders]) {
+    if (order.localOrderId) {
+      orderById.set(order.orderId, order);
+    }
+  }
+
+  const orders = [...orderById.values()].map((order) => ({
+    localOrderId: order.localOrderId,
+    externalOrderId: order.orderId,
+    clientOrderId: order.clientOrderId,
+    side: normalizeExchangeSide(order.side),
+    type: normalizeExchangeType(order.type),
+    status: normalizeExchangeOrderStatus(order.status),
+    price: order.avgPrice || order.price,
+    quantity: order.originalQuantity,
+    filledQuantity: order.executedQuantity,
+    quoteQuantity: order.cumulativeQuoteQuantity,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    positionEffect: order.reduceOnly ? "close" as const : undefined,
+    reason: `exchange order ${order.status}`,
+  }));
+
+  const fills = snapshot.recentTrades
+    .filter((trade) => trade.localOrderId)
+    .map((trade) => {
+      const order = orderById.get(trade.orderId);
+      return {
+        id: trade.id,
+        localOrderId: trade.localOrderId,
+        externalOrderId: trade.orderId,
+        clientOrderId: trade.clientOrderId,
+        side: trade.side,
+        price: trade.price,
+        quantity: trade.quantity,
+        quoteQuantity: trade.quoteQuantity,
+        feeQuote: trade.feeQuote,
+        realizedPnl: trade.realizedPnl,
+        filledAt: trade.time,
+        reason: "exchange fill",
+        positionEffect: order?.reduceOnly ? "close" as const : undefined,
+      };
+    });
+
+  return { orders, fills };
+}
+
+function normalizeExchangeSide(side: string): "buy" | "sell" {
+  return side.toUpperCase() === "SELL" ? "sell" : "buy";
+}
+
+function normalizeExchangeType(type: string): "limit" | "market" {
+  return type.toUpperCase() === "MARKET" ? "market" : "limit";
+}
+
+function normalizeExchangeOrderStatus(status: string): "open" | "filled" | "cancelled" {
+  const upper = status.toUpperCase();
+  if (upper === "FILLED") {
+    return "filled";
+  }
+  if (
+    upper === "CANCELED" ||
+    upper === "CANCELLED" ||
+    upper === "EXPIRED" ||
+    upper === "REJECTED"
+  ) {
+    return "cancelled";
+  }
+  return "open";
 }
 
 function applyMarketMaxLeverage(

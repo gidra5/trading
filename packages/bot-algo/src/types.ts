@@ -48,6 +48,7 @@ export interface TickProcessingOptions {
   collectEvents?: boolean;
   updateMetrics?: boolean;
   simulateLiquidation?: boolean;
+  processOpenOrders?: boolean;
 }
 
 export interface Candle {
@@ -223,6 +224,45 @@ export interface ManualTradeInput {
   reason?: string;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
+}
+
+export interface ExchangeOrderUpdate {
+  localOrderId?: string;
+  externalOrderId?: string;
+  clientOrderId?: string;
+  side: OrderSide;
+  type: OrderType;
+  status: OrderStatus;
+  price: number;
+  quantity: number;
+  filledQuantity: number;
+  quoteQuantity?: number;
+  feeQuote?: number;
+  createdAt?: number;
+  updatedAt?: number;
+  reason?: string;
+  positionEffect?: PositionEffect;
+}
+
+export interface ExchangeTradeFill {
+  id: string;
+  localOrderId?: string;
+  externalOrderId?: string;
+  clientOrderId?: string;
+  side: OrderSide;
+  price: number;
+  quantity: number;
+  quoteQuantity: number;
+  feeQuote: number;
+  realizedPnl?: number;
+  filledAt: number;
+  reason?: string;
+  positionEffect?: PositionEffect;
+}
+
+export interface ExchangeReconciliationInput {
+  orders?: ExchangeOrderUpdate[];
+  fills?: ExchangeTradeFill[];
 }
 
 export interface StrategyMemory {

@@ -4,6 +4,8 @@ The server can connect to Binance testnet/demo trading endpoints separately from
 local simulator. This is forward paper trading only; historical backtests still run
 locally.
 
+demo binance: https://demo.binance.com/en/trade/BTC_USDT?type=spot
+
 Enable it with separate paper credentials:
 
 ```bash
@@ -30,6 +32,23 @@ BINANCE_PAPER_RECV_WINDOW_MS=5000
 BINANCE_PAPER_BASE_URL=https://custom-endpoint.example
 ```
 
+Futures paper trading:
+
+```bash
+TRADING_MARKET_ID=usdm-futures:BTCUSDT
+TRADING_BINANCE_PAPER_ENABLED=true
+TRADING_BINANCE_PAPER_MODE=usdm-futures-testnet
+BINANCE_PAPER_API_KEY=...
+BINANCE_PAPER_API_SECRET=...
+TRADING_SHORT_MARGIN_MODEL=futures-margin
+TRADING_MAX_LEVERAGE=999
+```
+
+`TRADING_MAX_LEVERAGE` is treated as the requested strategy cap. For futures
+paper modes the server fetches Binance notional/leverage brackets through the
+active paper endpoint and caps the running bot config to the exchange maximum.
+Leverage changes submitted through the dashboard/API are capped the same way.
+
 When paper trading is enabled, the dashboard exposes:
 
 - exchange account sync
@@ -38,7 +57,29 @@ When paper trading is enabled, the dashboard exposes:
 - futures leverage updates
 - exchange balances, positions, and open orders
 
-`TRADING_BINANCE_PAPER_AUTO_SUBMIT=true` shadow-submits strategy-created orders to
-the active paper exchange. The local bot state remains the source of strategy memory
-and chart annotations; exchange fills are shown separately in the Binance Paper panel.
-Keep this off until strategy/exchange state reconciliation is implemented.
+The server normalizes every outgoing paper order against Binance symbol filters
+from `exchangeInfo`: price tick size, quantity step size, min/max quantity, and
+min/max notional.
+
+`TRADING_BINANCE_PAPER_AUTO_SUBMIT=true` submits strategy-created orders to the
+active paper exchange. In this mode local tick processing does not fill or stale-cancel
+open orders; Binance order/trade history is the order-status source. Exchange sync
+reconciles bot-linked orders and fills back into the local ledger using the deterministic
+`bot_<localOrderId>` client order id. Server startup runs the same sync so restart
+recovery restores accepted, cancelled, and filled bot exchange orders.
+
+Keep live trading disabled until the same reconciliation path has been exercised
+for long-running futures sessions and user-data websocket streaming is added for
+lower-latency fill updates.
+
+to run demo futures bot server locally execute this:
+```bash
+TRADING_MARKET_ID=usdm-futures:BTCUSDT \
+TRADING_BINANCE_PAPER_ENABLED=true \
+TRADING_BINANCE_PAPER_MODE=usdm-futures-testnet \
+BINANCE_PAPER_API_KEY=KifpW53tsEfJPBHiiUNrhvlAwmOL7tk54B8xexX7XhDDjy84Kszj3Ah9f5iPvV9S \
+BINANCE_PAPER_API_SECRET=pkePwOWIyVLJ86HvmOMfm5fpmjnvP2dCX3t9SPrznRzlfKWUL0UYXmzmluEjKWaf \
+TRADING_SHORT_MARGIN_MODEL=futures-margin \
+TRADING_MAX_LEVERAGE=999 \
+npm run dev -w @trading/server
+```
