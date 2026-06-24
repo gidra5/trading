@@ -20,6 +20,11 @@ import { TradingRuntime } from "./runtime.js";
 import { TradingStorage } from "./storage.js";
 import type { HistoricalBacktestMarket } from "./historical-backtest.js";
 import { CorrelationService } from "./correlation-service.js";
+import {
+  BinancePaperTrading,
+  type BinancePaperCancelOrderInput,
+  type BinancePaperPlaceOrderInput,
+} from "./binance-paper.js";
 
 const server = Fastify({
   logger: {
@@ -46,6 +51,7 @@ const marketCatalog = new BinanceMarketCatalog({
 });
 const initialMarket = await resolveInitialMarket();
 let activeMarket = initialMarket;
+const paperTrading = new BinancePaperTrading(appConfig.binancePaper);
 const runtime = new TradingRuntime(
   createStorage(initialMarket),
   initialMarket,
@@ -56,6 +62,7 @@ const runtime = new TradingRuntime(
     maxBytes: appConfig.historicalCache.maxBytes,
     minFreeBytes: appConfig.historicalCache.minFreeBytes,
   },
+  paperTrading,
 );
 await runtime.init();
 const correlationService = new CorrelationService({
@@ -150,6 +157,68 @@ server.post("/api/bot/manual-trade", async (request, reply) => {
     return publicSnapshot();
   } catch (error) {
     const message = error instanceof Error ? error.message : "Manual trade failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.post("/api/exchange/sync", async (_request, reply) => {
+  try {
+    await runtime.syncExchange();
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance paper sync failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.post("/api/exchange/order", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as BinancePaperPlaceOrderInput;
+    await runtime.placeExchangeOrder(normalizeExchangeOrderInput(body));
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance paper order failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.delete("/api/exchange/order", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as BinancePaperCancelOrderInput;
+    await runtime.cancelExchangeOrder(body);
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance paper cancel failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.delete("/api/exchange/open-orders", async (_request, reply) => {
+  try {
+    await runtime.cancelAllExchangeOrders();
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance paper cancel-all failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.post("/api/exchange/leverage", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as { leverage?: number };
+    const leverage = Number(body.leverage);
+    if (!Number.isFinite(leverage) || leverage <= 0) {
+      return reply.code(400).send({ error: "Positive leverage is required." });
+    }
+    await runtime.setExchangeLeverage(leverage);
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance paper leverage update failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -264,6 +333,7 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
     symbol: market.symbol,
     venue: market.venue,
     interval: appConfig.interval,
+    environment: paperTrading.streamEnvironmentFor(market),
     handlers: {
       onStatus: (status) => {
         if (generation !== streamGeneration) {
@@ -303,6 +373,29 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
       },
     },
   });
+}
+
+function normalizeExchangeOrderInput(
+  input: BinancePaperPlaceOrderInput,
+): BinancePaperPlaceOrderInput {
+  const side = input.side === "sell" ? "sell" : "buy";
+  const type = input.type === "market" ? "market" : "limit";
+  const quantity = Number(input.quantity);
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("Positive order quantity is required.");
+  }
+  const price = input.price === undefined ? undefined : Number(input.price);
+  if (type === "limit" && (!Number.isFinite(price) || (price as number) <= 0)) {
+    throw new Error("Positive limit order price is required.");
+  }
+  return {
+    ...input,
+    side,
+    type,
+    quantity,
+    price,
+    timeInForce: input.timeInForce ?? "GTC",
+  };
 }
 
 function createStorage(market: BinanceMarketListing): TradingStorage {

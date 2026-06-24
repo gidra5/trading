@@ -27,6 +27,12 @@ import {
   runHistoricalCandleBacktest,
   type HistoricalBacktestMarket,
 } from "./historical-backtest.js";
+import {
+  BinancePaperTrading,
+  type BinancePaperCancelOrderInput,
+  type BinancePaperPlaceOrderInput,
+  type BinancePaperSnapshot,
+} from "./binance-paper.js";
 import type { TradingStorage } from "./storage.js";
 
 const PUBLIC_ORDER_LIMIT = 500;
@@ -69,6 +75,7 @@ export interface RuntimeSnapshot {
   positions: PositionLedger;
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
+  exchange: BinancePaperSnapshot;
 }
 
 export class TradingRuntime {
@@ -98,6 +105,7 @@ export class TradingRuntime {
       maxBytes: number;
       minFreeBytes: number;
     },
+    private readonly paperTrading?: BinancePaperTrading,
   ) {}
 
   async init(): Promise<void> {
@@ -142,6 +150,7 @@ export class TradingRuntime {
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
     const events = this.bot.onTick(tick);
+    await this.submitCreatedOrdersToPaperExchange(events);
     this.recordEvents(events);
     this.scheduleStateSave();
     return events;
@@ -189,6 +198,7 @@ export class TradingRuntime {
       positions: analyzePositions(bot as PaperBotState),
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
+      exchange: this.paperTrading?.snapshot(this.market) ?? disabledExchangeSnapshot(),
     };
   }
 
@@ -273,6 +283,45 @@ export class TradingRuntime {
     this.recordEvents(events);
     await this.flushState();
     return events;
+  }
+
+  async syncExchange(): Promise<BinancePaperSnapshot> {
+    if (!this.paperTrading) {
+      throw new Error("Binance paper trading is not configured.");
+    }
+    return this.paperTrading.sync(this.market);
+  }
+
+  async placeExchangeOrder(
+    input: BinancePaperPlaceOrderInput,
+  ): Promise<BinancePaperSnapshot> {
+    if (!this.paperTrading) {
+      throw new Error("Binance paper trading is not configured.");
+    }
+    return this.paperTrading.placeOrder(this.market, input);
+  }
+
+  async cancelExchangeOrder(
+    input: BinancePaperCancelOrderInput,
+  ): Promise<BinancePaperSnapshot> {
+    if (!this.paperTrading) {
+      throw new Error("Binance paper trading is not configured.");
+    }
+    return this.paperTrading.cancelOrder(this.market, input);
+  }
+
+  async cancelAllExchangeOrders(): Promise<BinancePaperSnapshot> {
+    if (!this.paperTrading) {
+      throw new Error("Binance paper trading is not configured.");
+    }
+    return this.paperTrading.cancelAllOpenOrders(this.market);
+  }
+
+  async setExchangeLeverage(leverage: number): Promise<BinancePaperSnapshot> {
+    if (!this.paperTrading) {
+      throw new Error("Binance paper trading is not configured.");
+    }
+    return this.paperTrading.changeLeverage(this.market, leverage);
   }
 
   startBacktest(
@@ -361,6 +410,22 @@ export class TradingRuntime {
     }
 
     this.recentEvents = [...events.map(compactPublicEvent), ...this.recentEvents].slice(0, 60);
+  }
+
+  private async submitCreatedOrdersToPaperExchange(events: BotEvent[]): Promise<void> {
+    if (!this.paperTrading) {
+      return;
+    }
+    for (const event of events) {
+      if (event.type !== "order_created" || !event.order) {
+        continue;
+      }
+      try {
+        await this.paperTrading.submitBotOrder(this.market, event.order);
+      } catch {
+        return;
+      }
+    }
   }
 
   private async executeBacktest(
@@ -523,6 +588,21 @@ export class TradingRuntime {
     });
     return applyMarketMaxLeverage(config, this.market.maxLeverage);
   }
+}
+
+function disabledExchangeSnapshot(): BinancePaperSnapshot {
+  return {
+    enabled: false,
+    configured: false,
+    compatible: true,
+    mode: "auto",
+    autoSubmit: false,
+    connected: false,
+    message: "Binance paper trading disabled",
+    balances: [],
+    positions: [],
+    openOrders: [],
+  };
 }
 
 function applyMarketMaxLeverage(

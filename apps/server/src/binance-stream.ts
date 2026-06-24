@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import type { Candle, OrderBookSnapshot, PriceTick } from "@trading/bot-algo";
 import type { StreamVenue } from "./binance-markets.js";
+import type { BinancePaperStreamEnvironment } from "./binance-paper.js";
 
 export interface MarketStreamStatus {
   connected: boolean;
@@ -20,6 +21,7 @@ export interface BinanceMarketStreamOptions {
   symbol: string;
   venue: StreamVenue;
   interval: string;
+  environment?: BinancePaperStreamEnvironment;
   handlers: MarketStreamHandlers;
 }
 
@@ -38,6 +40,7 @@ export class BinanceMarketStream {
   private readonly streamSymbol: string;
   private readonly venue: StreamVenue;
   private readonly interval: string;
+  private readonly environment: BinancePaperStreamEnvironment;
   private readonly handlers: MarketStreamHandlers;
 
   constructor(options: BinanceMarketStreamOptions) {
@@ -45,6 +48,7 @@ export class BinanceMarketStream {
     this.streamSymbol = options.symbol.toLowerCase();
     this.venue = options.venue;
     this.interval = options.interval;
+    this.environment = options.environment ?? "live";
     this.handlers = options.handlers;
   }
 
@@ -82,7 +86,7 @@ export class BinanceMarketStream {
     socket.on("open", () => {
       this.openSockets.add(spec.label);
       this.reconnectAttempts.set(spec.label, 0);
-      this.emitStatus(`Connected to Binance ${this.venue} ${spec.label} stream`);
+      this.emitStatus(`Connected to Binance ${this.venue} ${this.environment} ${spec.label} stream`);
     });
 
     socket.on("message", (raw) => {
@@ -91,13 +95,15 @@ export class BinanceMarketStream {
 
     socket.on("close", () => {
       this.openSockets.delete(spec.label);
-      this.emitStatus(`Binance ${this.venue} ${spec.label} stream closed`);
+      this.emitStatus(`Binance ${this.venue} ${this.environment} ${spec.label} stream closed`);
       this.scheduleReconnect(spec);
     });
 
     socket.on("error", (error) => {
       this.openSockets.delete(spec.label);
-      this.emitStatus(`Binance ${this.venue} ${spec.label} stream error: ${error.message}`);
+      this.emitStatus(
+        `Binance ${this.venue} ${this.environment} ${spec.label} stream error: ${error.message}`,
+      );
     });
   }
 
@@ -168,6 +174,58 @@ export class BinanceMarketStream {
     const depthStream = `${this.streamSymbol}@depth10@500ms`;
     const spotDepthStream = `${this.streamSymbol}@depth10@1000ms`;
     const klineStream = `${this.streamSymbol}@kline_${this.interval}`;
+
+    if (this.environment === "spot-testnet") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://stream.testnet.binance.vision", [
+            `${this.streamSymbol}@trade`,
+            klineStream,
+            spotDepthStream,
+          ]),
+        },
+      ];
+    }
+
+    if (this.environment === "spot-demo") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://demo-stream.binance.com:9443", [
+            `${this.streamSymbol}@trade`,
+            klineStream,
+            spotDepthStream,
+          ]),
+        },
+      ];
+    }
+
+    if (this.environment === "usdm-futures-testnet") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://demo-fstream.binance.com", [
+            `${this.streamSymbol}@aggTrade`,
+            klineStream,
+            depthStream,
+          ]),
+        },
+      ];
+    }
+
+    if (this.environment === "coinm-futures-testnet") {
+      return [
+        {
+          label: "combined",
+          url: combinedStreamUrl("wss://demo-dstream.binance.com", [
+            `${this.streamSymbol}@aggTrade`,
+            klineStream,
+            depthStream,
+          ]),
+        },
+      ];
+    }
 
     if (this.venue === "spot") {
       return [

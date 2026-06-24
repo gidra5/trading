@@ -24,6 +24,12 @@
   - what exact conditions caused this? Why were the extrema filtered out?
   - explore different changes we made to improve it. among those are borrow locking, borrow profit share fraction, asymmetric short favoring strategy, cap check increase (why is it even there, if leveage tracking should already account for that). as possible gates for it were also mentined "existing short exposure", "pending short-entry orders" and "total gross exposure vs maxLeverage" (which is supposed to be the only real restriction)
 - integrate with actual binance paper trading api
+  - initial Spot Testnet/Demo and USD-M/COIN-M Futures Testnet adapter exists; dashboard
+    can sync balances/open orders, place/cancel paper orders, set futures leverage, and
+    optionally shadow-submit strategy-created orders with
+    `TRADING_BINANCE_PAPER_AUTO_SUBMIT=true`
+  - still need exchange-fill reconciliation back into the local bot ledger before making
+    auto-submit the default execution path
 - test more grid points
 - 90d samples, 30d, 180d, 365d 1800d
   

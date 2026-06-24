@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStrategyConfig } from "@trading/bot-algo";
 import { createConfiguredMarketListing, type MarketVenue } from "./binance-markets.js";
+import type { BinancePaperMode } from "./binance-paper.js";
 
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(sourceDir, "../../..");
@@ -24,6 +25,15 @@ export const appConfig = {
   interval,
   binanceApiKey: process.env.BINANCE_API_KEY,
   binanceApiSecret: process.env.BINANCE_API_SECRET,
+  binancePaper: {
+    enabled: parseBoolean(process.env.TRADING_BINANCE_PAPER_ENABLED, false),
+    mode: parseBinancePaperMode(process.env.TRADING_BINANCE_PAPER_MODE),
+    apiKey: process.env.BINANCE_PAPER_API_KEY,
+    apiSecret: process.env.BINANCE_PAPER_API_SECRET,
+    recvWindowMs: Math.max(1_000, parseNumber(process.env.BINANCE_PAPER_RECV_WINDOW_MS, 5_000)),
+    autoSubmit: parseBoolean(process.env.TRADING_BINANCE_PAPER_AUTO_SUBMIT, false),
+    baseUrlOverride: process.env.BINANCE_PAPER_BASE_URL,
+  },
   dataDir: process.env.TRADING_DATA_DIR ? path.resolve(process.env.TRADING_DATA_DIR) : path.join(repoRoot, "data"),
   webDistDir: path.join(repoRoot, "apps/web/dist"),
   historicalCache: {
@@ -72,6 +82,32 @@ function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
   }
 
   return undefined;
+}
+
+function parseBinancePaperMode(value: string | undefined): BinancePaperMode {
+  if (
+    value === "spot-testnet" ||
+    value === "spot-demo" ||
+    value === "usdm-futures-testnet" ||
+    value === "coinm-futures-testnet"
+  ) {
+    return value;
+  }
+
+  return "auto";
+}
+
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value) {
+    return fallback;
+  }
+  if (["1", "true", "yes", "on"].includes(value.toLowerCase())) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) {
+    return false;
+  }
+  return fallback;
 }
 
 function parseNumber(value: string | undefined, fallback: number): number {

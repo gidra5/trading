@@ -94,6 +94,7 @@ export interface RuntimeSnapshot {
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
   correlations: CorrelationSnapshot;
+  exchange: BinancePaperSnapshot;
 }
 
 export type BacktestSelection = BacktestPreset;
@@ -140,4 +141,73 @@ export interface CorrelationSnapshot {
   message: string;
   error?: string;
   entries: CorrelationEntry[];
+}
+
+export type BinancePaperMode =
+  | "auto"
+  | "spot-testnet"
+  | "spot-demo"
+  | "usdm-futures-testnet"
+  | "coinm-futures-testnet";
+
+export interface BinancePaperBalance {
+  asset: string;
+  free: number;
+  locked: number;
+  walletBalance?: number;
+  availableBalance?: number;
+  unrealizedPnl?: number;
+}
+
+export interface BinancePaperPosition {
+  symbol: string;
+  positionSide?: string;
+  positionAmt: number;
+  entryPrice?: number;
+  markPrice?: number;
+  unrealizedPnl?: number;
+  notional?: number;
+  leverage?: number;
+  marginType?: string;
+  isolatedMargin?: number;
+  updateTime?: number;
+}
+
+export interface BinancePaperOrder {
+  symbol: string;
+  orderId: string;
+  clientOrderId: string;
+  side: string;
+  type: string;
+  status: string;
+  price: number;
+  originalQuantity: number;
+  executedQuantity: number;
+  cumulativeQuoteQuantity?: number;
+  avgPrice?: number;
+  timeInForce?: string;
+  reduceOnly?: boolean;
+  positionSide?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface BinancePaperSnapshot {
+  enabled: boolean;
+  configured: boolean;
+  compatible: boolean;
+  mode: BinancePaperMode;
+  resolvedMode?: Exclude<BinancePaperMode, "auto">;
+  baseUrl?: string;
+  streamEnvironment?: string;
+  autoSubmit: boolean;
+  connected: boolean;
+  lastSyncAt?: number;
+  lastSubmitAt?: number;
+  message: string;
+  error?: string;
+  balances: BinancePaperBalance[];
+  positions: BinancePaperPosition[];
+  openOrders: BinancePaperOrder[];
+  lastOrder?: BinancePaperOrder;
 }

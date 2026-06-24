@@ -112,15 +112,49 @@ async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> 
 async function readJsonLines<T>(filePath: string, limit: number): Promise<T[]> {
   try {
     const content = await fs.readFile(filePath, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    const selectedLines = limit > 0 ? lines.slice(-limit) : lines;
-    return selectedLines.map((line) => JSON.parse(line) as T);
+    return parseJsonLines<T>(content, limit);
   } catch (error) {
     if (isMissingFile(error)) {
       return [];
     }
 
     throw error;
+  }
+}
+
+function parseJsonLines<T>(content: string, limit: number): T[] {
+  const lines = content.split("\n");
+  const parsed: T[] = [];
+
+  if (limit > 0) {
+    for (let index = lines.length - 1; index >= 0 && parsed.length < limit; index -= 1) {
+      const value = parseJsonLine<T>(lines[index]);
+      if (value !== undefined) {
+        parsed.unshift(value);
+      }
+    }
+    return parsed;
+  }
+
+  for (const line of lines) {
+    const value = parseJsonLine<T>(line);
+    if (value !== undefined) {
+      parsed.push(value);
+    }
+  }
+  return parsed;
+}
+
+function parseJsonLine<T>(line: string): T | undefined {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.includes("\0")) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    return undefined;
   }
 }
 

@@ -36,6 +36,8 @@ import {
 import type {
   BacktestProgressSnapshot,
   BacktestSelection,
+  BinancePaperOrder,
+  BinancePaperSnapshot,
   BinanceMarketCatalog,
   BinanceMarketListing,
   CorrelationEntry,
@@ -91,6 +93,7 @@ export function App() {
   const [configDraft, setConfigDraft] = createSignal<StrategyConfig>();
   const [configError, setConfigError] = createSignal<string>();
   const [manualTradeError, setManualTradeError] = createSignal<string>();
+  const [exchangeError, setExchangeError] = createSignal<string>();
   const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog>();
   const [marketError, setMarketError] = createSignal<string>();
   const [switchingMarketId, setSwitchingMarketId] = createSignal<string>();
@@ -113,6 +116,7 @@ export function App() {
   const events = createMemo(() => snapshot()?.recentEvents ?? []);
   const backtest = createMemo(() => snapshot()?.backtest);
   const correlations = createMemo(() => snapshot()?.correlations);
+  const exchange = createMemo(() => snapshot()?.exchange);
 
   createEffect(() => {
     const config = bot()?.config;
@@ -363,6 +367,89 @@ export function App() {
     return true;
   };
 
+  const syncExchange = async () => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/sync`, {
+      method: "POST",
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Exchange sync failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
+  const placeExchangeOrder = async (input: {
+    side: "buy" | "sell";
+    type: "limit" | "market";
+    quantity: number;
+    price?: number;
+    reduceOnly?: boolean;
+  }) => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/order`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Exchange order failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
+  const cancelExchangeOrder = async (order: BinancePaperOrder) => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/order`, {
+      method: "DELETE",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ orderId: order.orderId, clientOrderId: order.clientOrderId }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Exchange cancel failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
+  const cancelAllExchangeOrders = async () => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/open-orders`, {
+      method: "DELETE",
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Exchange cancel-all failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
+  const setExchangeLeverage = async (leverage: number) => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/leverage`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ leverage }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Exchange leverage update failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
   const updateBacktestSetting = <K extends keyof BacktestSettings>(
     key: K,
     value: BacktestSettings[K],
@@ -423,6 +510,10 @@ export function App() {
                 label={market()?.connected ? "Binance live" : "Binance offline"}
                 active={Boolean(market()?.connected)}
               />
+              <StatusPill
+                label={exchangeStatusLabel(exchange())}
+                active={Boolean(exchange()?.connected)}
+              />
               <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
             </div>
           </div>
@@ -468,6 +559,17 @@ export function App() {
           error={configError()}
           onChange={setConfigDraft}
           onApply={() => void applyConfig()}
+        />
+
+        <ExchangePaperPanel
+          market={market()}
+          snapshot={exchange()}
+          error={exchangeError()}
+          onSync={() => void syncExchange()}
+          onPlaceOrder={(input) => void placeExchangeOrder(input)}
+          onCancelOrder={(order) => void cancelExchangeOrder(order)}
+          onCancelAll={() => void cancelAllExchangeOrders()}
+          onSetLeverage={(leverage) => void setExchangeLeverage(leverage)}
         />
 
         <section class="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -575,6 +677,302 @@ function StatusPill(props: { label: string; active: boolean }) {
       />
       {props.label}
     </span>
+  );
+}
+
+function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string {
+  if (!exchange?.enabled) {
+    return "Paper off";
+  }
+  if (!exchange.configured) {
+    return "Paper keys missing";
+  }
+  if (!exchange.compatible) {
+    return "Paper incompatible";
+  }
+  return exchange.connected
+    ? `${exchange.resolvedMode ?? exchange.mode} synced`
+    : `${exchange.resolvedMode ?? exchange.mode} ready`;
+}
+
+function ExchangePaperPanel(props: {
+  market?: RuntimeSnapshot["market"];
+  snapshot?: BinancePaperSnapshot;
+  error?: string;
+  onSync: () => void;
+  onPlaceOrder: (input: {
+    side: "buy" | "sell";
+    type: "limit" | "market";
+    quantity: number;
+    price?: number;
+    reduceOnly?: boolean;
+  }) => void;
+  onCancelOrder: (order: BinancePaperOrder) => void;
+  onCancelAll: () => void;
+  onSetLeverage: (leverage: number) => void;
+}) {
+  const [side, setSide] = createSignal<"buy" | "sell">("buy");
+  const [type, setType] = createSignal<"limit" | "market">("limit");
+  const [quantity, setQuantity] = createSignal(0.001);
+  const [price, setPrice] = createSignal(0);
+  const [reduceOnly, setReduceOnly] = createSignal(false);
+  const [leverage, setLeverage] = createSignal(1);
+  let initializedPrice = false;
+
+  createEffect(() => {
+    const lastPrice = props.market?.lastPrice;
+    if (!initializedPrice && lastPrice && lastPrice > 0) {
+      initializedPrice = true;
+      setPrice(Number(lastPrice.toFixed(2)));
+    }
+  });
+
+  const exchange = () => props.snapshot;
+  const canTrade = () =>
+    Boolean(exchange()?.enabled && exchange()?.configured && exchange()?.compatible);
+  const isFutures = () =>
+    exchange()?.resolvedMode === "usdm-futures-testnet" ||
+    exchange()?.resolvedMode === "coinm-futures-testnet";
+  const quoteAsset = () => props.market?.quoteAsset ?? "USDT";
+
+  const submitOrder = () => {
+    props.onPlaceOrder({
+      side: side(),
+      type: type(),
+      quantity: quantity(),
+      price: type() === "limit" ? price() : undefined,
+      reduceOnly: reduceOnly(),
+    });
+  };
+
+  return (
+    <section class="panel min-w-0 overflow-hidden">
+      <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div class="muted-label">Binance Paper</div>
+          <h2 class="text-lg font-semibold">
+            {exchange()?.resolvedMode ?? exchange()?.mode ?? "disabled"}
+          </h2>
+          <div class="mt-1 text-xs text-ink-300">{exchange()?.message}</div>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button class="btn" type="button" onClick={props.onSync} disabled={!canTrade()}>
+            <RefreshCw size={16} />
+            Sync
+          </button>
+          <Show when={isFutures()}>
+            <button
+              class="btn"
+              type="button"
+              onClick={() => props.onSetLeverage(leverage())}
+              disabled={!canTrade()}
+            >
+              <Activity size={16} />
+              {formatLeverage(leverage())}
+            </button>
+          </Show>
+        </div>
+      </div>
+
+      <Show when={props.error ?? exchange()?.error}>
+        {(message) => (
+          <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>
+        )}
+      </Show>
+
+      <div class="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(280px,380px)]">
+        <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div class="rounded-2 bg-ink-800 p-3">
+            <div class="muted-label">Balances</div>
+            <div class="mt-3 space-y-2">
+              <Show
+                when={(exchange()?.balances.length ?? 0) > 0}
+                fallback={<div class="text-sm text-ink-400">No synced balances</div>}
+              >
+                <For each={exchange()?.balances.slice(0, 8) ?? []}>
+                  {(balance) => (
+                    <div class="flex items-center justify-between gap-3 rounded-2 bg-ink-900 px-3 py-2 text-sm">
+                      <span class="font-semibold text-ink-100">{balance.asset}</span>
+                      <span class="text-right tabular-nums text-ink-200">
+                        {formatAsset(balance.availableBalance ?? balance.free)}
+                      </span>
+                    </div>
+                  )}
+                </For>
+              </Show>
+            </div>
+          </div>
+
+          <div class="rounded-2 bg-ink-800 p-3">
+            <div class="muted-label">Futures Positions</div>
+            <div class="mt-3 space-y-2">
+              <Show
+                when={(exchange()?.positions.length ?? 0) > 0}
+                fallback={<div class="text-sm text-ink-400">No synced positions</div>}
+              >
+                <For each={exchange()?.positions ?? []}>
+                  {(position) => (
+                    <div class="rounded-2 bg-ink-900 px-3 py-2 text-sm">
+                      <div class="flex items-center justify-between gap-3">
+                        <span class="font-semibold text-ink-100">
+                          {position.symbol} {position.positionSide}
+                        </span>
+                        <span
+                          class="tabular-nums"
+                          classList={{
+                            "text-gain": position.positionAmt > 0,
+                            "text-loss": position.positionAmt < 0,
+                          }}
+                        >
+                          {formatAsset(position.positionAmt)}
+                        </span>
+                      </div>
+                      <div class="mt-1 flex justify-between gap-3 text-xs text-ink-400">
+                        <span>Entry {formatQuote(position.entryPrice, 2)}</span>
+                        <span>PnL {formatQuote(position.unrealizedPnl, 2)} {quoteAsset()}</span>
+                      </div>
+                    </div>
+                  )}
+                </For>
+              </Show>
+            </div>
+          </div>
+        </div>
+
+        <div class="rounded-2 bg-ink-800 p-3">
+          <div class="muted-label">Place Paper Order</div>
+          <div class="mt-3 grid grid-cols-2 gap-3">
+            <SelectField
+              label="Side"
+              value={side()}
+              options={[
+                { value: "buy", label: "Buy" },
+                { value: "sell", label: "Sell" },
+              ]}
+              onInput={(value) => setSide(value === "sell" ? "sell" : "buy")}
+            />
+            <SelectField
+              label="Type"
+              value={type()}
+              options={[
+                { value: "limit", label: "Limit" },
+                { value: "market", label: "Market" },
+              ]}
+              onInput={(value) => setType(value === "market" ? "market" : "limit")}
+            />
+            <NumberField
+              label="Quantity"
+              value={quantity()}
+              min={0}
+              step={0.000001}
+              onInput={setQuantity}
+            />
+            <Show when={type() === "limit"}>
+              <NumberField
+                label={`Price ${quoteAsset()}`}
+                value={price()}
+                min={0}
+                step={0.01}
+                onInput={setPrice}
+              />
+            </Show>
+            <Show when={isFutures()}>
+              <NumberField
+                label="Leverage"
+                value={leverage()}
+                min={1}
+                max={125}
+                step={1}
+                onInput={(value) => setLeverage(Math.round(value))}
+              />
+              <BooleanField
+                label="Reduce Only"
+                checked={reduceOnly()}
+                onInput={setReduceOnly}
+              />
+            </Show>
+          </div>
+          <button
+            class={`${buttonPrimaryClass} mt-3 w-full`}
+            type="button"
+            disabled={!canTrade()}
+            onClick={submitOrder}
+          >
+            <Plus size={16} />
+            Submit Paper Order
+          </button>
+        </div>
+      </div>
+
+      <div class="mt-4 min-w-0 overflow-x-auto">
+        <div class="mb-2 flex items-center justify-between gap-3">
+          <div class="muted-label">Exchange Open Orders</div>
+          <button
+            class="btn px-2 py-1 text-xs"
+            type="button"
+            disabled={!canTrade() || (exchange()?.openOrders.length ?? 0) === 0}
+            onClick={props.onCancelAll}
+          >
+            Cancel All
+          </button>
+        </div>
+        <table class="w-full min-w-180 text-left text-sm">
+          <thead class="text-xs uppercase text-ink-400">
+            <tr>
+              <th class="py-2 pr-3">Order</th>
+              <th class="py-2 pr-3">Side</th>
+              <th class="py-2 pr-3">Type</th>
+              <th class="py-2 pr-3 text-right">Price</th>
+              <th class="py-2 pr-3 text-right">Qty</th>
+              <th class="py-2 pr-3">Updated</th>
+              <th class="py-2 text-right">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={exchange()?.openOrders ?? []}>
+              {(order) => (
+                <tr class="border-t border-line">
+                  <td class="py-2 pr-3 font-mono text-xs text-ink-300">{order.orderId}</td>
+                  <td
+                    class="py-2 pr-3 font-semibold"
+                    classList={{
+                      "text-gain": order.side === "BUY",
+                      "text-loss": order.side === "SELL",
+                    }}
+                  >
+                    {order.side}
+                  </td>
+                  <td class="py-2 pr-3 text-ink-300">{order.type}</td>
+                  <td class="py-2 pr-3 text-right tabular-nums">
+                    {formatQuote(order.price, 2)}
+                  </td>
+                  <td class="py-2 pr-3 text-right tabular-nums">
+                    {formatAsset(order.originalQuantity)}
+                  </td>
+                  <td class="py-2 pr-3 text-ink-400">
+                    {formatDateTime(order.updatedAt || order.createdAt)}
+                  </td>
+                  <td class="py-2 text-right">
+                    <button
+                      class="btn px-2 py-1 text-xs"
+                      type="button"
+                      onClick={() => props.onCancelOrder(order)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+        <Show when={(exchange()?.openOrders.length ?? 0) === 0}>
+          <div class="border-t border-line py-3 text-sm text-ink-400">
+            No synced exchange open orders
+          </div>
+        </Show>
+      </div>
+    </section>
   );
 }
 
