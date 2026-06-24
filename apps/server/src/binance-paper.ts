@@ -98,6 +98,11 @@ export interface BinancePaperSymbolFilters {
   maxNotional?: number;
 }
 
+export interface BinancePaperCommission {
+  makerFeeBps?: number;
+  takerFeeBps?: number;
+}
+
 export interface BinancePaperSnapshot {
   enabled: boolean;
   configured: boolean;
@@ -114,6 +119,9 @@ export interface BinancePaperSnapshot {
   error?: string;
   maxLeverage?: number;
   symbolFilters?: BinancePaperSymbolFilters;
+  commission?: BinancePaperCommission;
+  feeBps?: number;
+  estimatedSlippageBps?: number;
   balances: BinancePaperBalance[];
   positions: BinancePaperPosition[];
   openOrders: BinancePaperOrder[];
@@ -192,6 +200,23 @@ export class BinancePaperTrading {
     );
   }
 
+  canSubmitOrders(market: BinanceMarketListing): boolean {
+    return Boolean(
+      this.config.enabled &&
+        this.config.apiKey &&
+        this.config.apiSecret &&
+        this.resolveEnvironment(market),
+    );
+  }
+
+  klineEndpointFor(market: BinanceMarketListing): string | undefined {
+    const environment = this.resolveEnvironment(market);
+    if (!this.config.enabled || !environment) {
+      return undefined;
+    }
+    return new URL(exchangeKlinePath(environment), environment.baseUrl).toString();
+  }
+
   streamEnvironmentFor(market: BinanceMarketListing): BinancePaperStreamEnvironment {
     const environment = this.resolveEnvironment(market);
     if (!environment || !this.config.enabled) {
@@ -251,7 +276,17 @@ export class BinancePaperTrading {
 
   async sync(market: BinanceMarketListing): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
-    const [balances, account, openOrders, recentOrders, recentTrades, symbolFilters, maxLeverage] = await Promise.all([
+    const [
+      balances,
+      account,
+      openOrders,
+      recentOrders,
+      recentTrades,
+      symbolFilters,
+      maxLeverage,
+      commission,
+      estimatedSlippageBps,
+    ] = await Promise.all([
       this.fetchBalances(environment),
       this.fetchAccount(environment),
       this.fetchOpenOrders(environment, market.symbol),
@@ -259,6 +294,8 @@ export class BinancePaperTrading {
       this.fetchRecentTrades(environment, market),
       this.fetchSymbolFilters(environment, market.symbol),
       this.fetchMaxLeverage(environment, market.symbol),
+      this.fetchCommission(environment, market.symbol),
+      this.fetchEstimatedSlippageBps(environment, market.symbol),
     ]);
     const ordersById = new Map(recentOrders.map((order) => [order.orderId, order]));
     const trades = recentTrades.map((trade) => ({
@@ -277,6 +314,9 @@ export class BinancePaperTrading {
       error: undefined,
       maxLeverage,
       symbolFilters,
+      commission,
+      feeBps: commission?.takerFeeBps,
+      estimatedSlippageBps,
       balances,
       positions,
       openOrders,
@@ -314,8 +354,9 @@ export class BinancePaperTrading {
   async submitBotOrder(
     market: BinanceMarketListing,
     order: TradingOrder,
+    options: { force?: boolean } = {},
   ): Promise<BinancePaperSnapshot | undefined> {
-    if (!this.config.autoSubmit || order.status !== "open") {
+    if ((!options.force && !this.config.autoSubmit) || order.status !== "open") {
       return undefined;
     }
     const environment = this.resolveEnvironment(market);
@@ -578,6 +619,44 @@ export class BinancePaperTrading {
     }
   }
 
+  private async fetchCommission(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<BinancePaperCommission | undefined> {
+    try {
+      const payload = await this.signedRequest<Record<string, unknown>>(
+        environment,
+        "GET",
+        commissionPath(environment),
+        { symbol },
+      );
+      return normalizeCommission(payload, environment.product);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fetchEstimatedSlippageBps(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<number | undefined> {
+    try {
+      const payload = await requestJson<Record<string, unknown>>(
+        new URL(`${bookTickerPath(environment)}?symbol=${encodeURIComponent(symbol)}`, environment.baseUrl),
+        { method: "GET" },
+      );
+      const bid = numberValue(payload.bidPrice);
+      const ask = numberValue(payload.askPrice);
+      const mid = (bid + ask) / 2;
+      if (bid <= 0 || ask <= 0 || mid <= 0 || ask < bid) {
+        return undefined;
+      }
+      return ((ask - bid) / mid) * 5_000;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async normalizeOrderInput(
     environment: ResolvedPaperEnvironment,
     market: BinanceMarketListing,
@@ -761,6 +840,23 @@ function exchangeInfoPath(environment: ResolvedPaperEnvironment): string {
     return "/api/v3/exchangeInfo";
   }
   return `${orderRestPrefix(environment)}/exchangeInfo`;
+}
+
+function exchangeKlinePath(environment: ResolvedPaperEnvironment): string {
+  return `${orderRestPrefix(environment)}/klines`;
+}
+
+function bookTickerPath(environment: ResolvedPaperEnvironment): string {
+  return `${orderRestPrefix(environment)}/ticker/bookTicker`;
+}
+
+function commissionPath(environment: ResolvedPaperEnvironment): string {
+  if (environment.product === "spot") {
+    return "/api/v3/account/commission";
+  }
+  return environment.product === "coinm-futures"
+    ? "/dapi/v1/commissionRate"
+    : "/fapi/v1/commissionRate";
 }
 
 function leverageBracketPath(environment: ResolvedPaperEnvironment): string {
@@ -1057,6 +1153,33 @@ function normalizeTrade(raw: unknown, market: BinanceMarketListing): BinancePape
   };
 }
 
+function normalizeCommission(
+  payload: Record<string, unknown>,
+  product: ResolvedPaperEnvironment["product"],
+): BinancePaperCommission {
+  if (product === "spot") {
+    const standard = asRecord(payload.standardCommission);
+    const maker = optionalNumber(standard.maker ?? payload.makerCommission);
+    const taker = optionalNumber(standard.taker ?? payload.takerCommission);
+    return {
+      makerFeeBps: rateToBps(maker),
+      takerFeeBps: rateToBps(taker),
+    };
+  }
+
+  return {
+    makerFeeBps: rateToBps(optionalNumber(payload.makerCommissionRate)),
+    takerFeeBps: rateToBps(optionalNumber(payload.takerCommissionRate)),
+  };
+}
+
+function rateToBps(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return undefined;
+  }
+  return value > 1 ? value : value * 10_000;
+}
+
 function normalizeSymbolFilters(raw: Record<string, unknown>): BinancePaperSymbolFilters {
   const filters = Array.isArray(raw.filters) ? raw.filters.map(asRecord) : [];
   const priceFilter = filterByType(filters, "PRICE_FILTER");
@@ -1077,7 +1200,12 @@ function normalizeSymbolFilters(raw: Record<string, unknown>): BinancePaperSymbo
     maxQuantity: optionalNumber(lotSize.maxQty),
     minMarketQuantity: optionalNumber(marketLotSize.minQty),
     maxMarketQuantity: optionalNumber(marketLotSize.maxQty),
-    minNotional: optionalNumber(notional.minNotional ?? minNotional.minNotional),
+    minNotional: optionalNumber(
+      notional.minNotional ??
+        notional.notional ??
+        minNotional.minNotional ??
+        minNotional.notional,
+    ),
     maxNotional: optionalNumber(notional.maxNotional),
   };
 }

@@ -1259,6 +1259,9 @@ function averageBotMetrics(results: BacktestResult[]): BotMetrics {
     peakEquity: average(metrics.map((item) => item.peakEquity)),
     maxDrawdownPct: average(metrics.map((item) => item.maxDrawdownPct)),
     exposurePct: average(metrics.map((item) => item.exposurePct)),
+    avgExitGridSpan: average(metrics.map((item) => item.avgExitGridSpan)),
+    avgExitGridOrderCount: average(metrics.map((item) => item.avgExitGridOrderCount)),
+    exitGridSpanCount: average(metrics.map((item) => item.exitGridSpanCount)),
   };
 }
 
@@ -1585,9 +1588,10 @@ export async function fetchKlines(options: {
   startTime: number;
   endTime: number;
   limit: number;
+  endpoint?: string;
   signal?: AbortSignal;
 }): Promise<Candle[]> {
-  const url = new URL(klineEndpointForVenue(options.venue));
+  const url = new URL(options.endpoint ?? klineEndpointForVenue(options.venue));
   const endTime =
     options.venue === "coinm-futures"
       ? Math.min(options.endTime, options.startTime + 200 * DAY_MS - 1)

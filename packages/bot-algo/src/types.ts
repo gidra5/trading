@@ -130,6 +130,7 @@ export interface LegacyValleyPeakConfig {
   exitGridEnabled: boolean;
   exitGridMarketEntry: boolean;
   exitGridOrderCount: number;
+  exitGridMaxStepPct: number;
   exitGridPriceDistribution: ExitGridPriceDistribution;
   exitGridSizeDistribution: ExitGridSizeDistribution;
   exitGridSellFraction: number;
@@ -286,6 +287,9 @@ export interface BotMetrics {
   peakEquity: number;
   maxDrawdownPct: number;
   exposurePct: number;
+  avgExitGridSpan: number;
+  avgExitGridOrderCount: number;
+  exitGridSpanCount: number;
 }
 
 export interface PaperBotState {
@@ -307,6 +311,9 @@ export interface PaperBotState {
   updatedAt: number;
   realizedPnl: number;
   feesPaid: number;
+  exitGridSpanTotal: number;
+  exitGridSpanCount: number;
+  exitGridOrderCountTotal: number;
   winningTrades: number;
   losingTrades: number;
   orders: TradingOrder[];

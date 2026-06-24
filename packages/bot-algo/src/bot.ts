@@ -48,7 +48,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   maxOpenOrders: 1024,
   cooldownMs: 300_000,
   staleOrderMs: 30 * 24 * 60 * 60 * 1000,
-  minOrderQuote: 25,
+  minOrderQuote: 5,
   legacyValleyPeak: defaultLegacyValleyPeakConfig,
   positionRisk: defaultPositionRiskConfig,
 };
@@ -75,6 +75,9 @@ interface ImmediateFillRollback {
   updatedAt: number;
   realizedPnl: number;
   feesPaid: number;
+  exitGridSpanTotal: number;
+  exitGridSpanCount: number;
+  exitGridOrderCountTotal: number;
   winningTrades: number;
   losingTrades: number;
   sequence: number;
@@ -244,6 +247,9 @@ export function createInitialBotState(
     updatedAt: now,
     realizedPnl: 0,
     feesPaid: 0,
+    exitGridSpanTotal: 0,
+    exitGridSpanCount: 0,
+    exitGridOrderCountTotal: 0,
     winningTrades: 0,
     losingTrades: 0,
     orders: [],
@@ -384,6 +390,109 @@ export class SimulatedTradingBot {
         state: this.snapshot(),
       },
     ];
+  }
+
+  cancelOpenOrders(reason: string, at = Date.now()): BotEvent[] {
+    const events: BotEvent[] = [];
+    for (const index of [...this.openOrderIndexes]) {
+      const order = this.state.orders[index];
+      if (!order || order.status !== "open") {
+        this.openOrderIndexes.delete(index);
+        continue;
+      }
+
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = at;
+      order.updatedAt = at;
+      order.reason = `${order.reason}; ${reason}`;
+      this.openOrderIndexes.delete(index);
+      events.push({
+        type: "order_cancelled",
+        at,
+        message: `${order.side.toUpperCase()} order cancelled: ${reason}`,
+        order: structuredClone(order),
+      });
+    }
+
+    if (events.length > 0) {
+      this.state.updatedAt = at;
+      recalculateMetrics(this.state);
+    }
+    return events;
+  }
+
+  createPositionCloseOrders(
+    options: { includeUnprofitable?: boolean } = {},
+    at = Date.now(),
+  ): BotEvent[] {
+    const price = cleanPositive(this.state.lastPrice);
+    if (price <= 0) {
+      return [];
+    }
+
+    const positions = analyzePositions(this.state, { currentPrice: price });
+    const events: BotEvent[] = [];
+    const longs = positions.longs.filter(
+      (lot) =>
+        lot.status !== "pending" &&
+        lot.remainingQuantity > MIN_BASE_QUANTITY &&
+        (options.includeUnprofitable || price >= lot.breakEvenSellPrice),
+    );
+    const shorts = positions.shorts.filter(
+      (lot) =>
+        lot.status !== "pending" &&
+        lot.remainingQuantity > MIN_BASE_QUANTITY &&
+        (options.includeUnprofitable || price <= lot.breakEvenBuyPrice),
+    );
+
+    for (const lot of longs) {
+      const order = this.createExternalCloseOrder(
+        "sell",
+        price,
+        lot.remainingQuantity,
+        at,
+        options.includeUnprofitable
+          ? "forced close position"
+          : "close profitable position",
+        lot.id,
+      );
+      if (order) {
+        events.push({
+          type: "order_created",
+          at,
+          message: `SELL close order created for ${lot.id}`,
+          order: structuredClone(order),
+        });
+      }
+    }
+
+    for (const lot of shorts) {
+      const order = this.createExternalCloseOrder(
+        "buy",
+        price,
+        lot.remainingQuantity,
+        at,
+        options.includeUnprofitable
+          ? "forced close position"
+          : "close profitable position",
+        lot.id,
+      );
+      if (order) {
+        events.push({
+          type: "order_created",
+          at,
+          message: `BUY close order created for ${lot.id}`,
+          order: structuredClone(order),
+        });
+      }
+    }
+
+    if (events.length > 0) {
+      this.state.updatedAt = at;
+      recalculateMetrics(this.state);
+    }
+    return events;
   }
 
   recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
@@ -628,6 +737,46 @@ export class SimulatedTradingBot {
     }
 
     return NO_EVENTS;
+  }
+
+  warmupFromCandles(candles: readonly Candle[]): number {
+    let processed = 0;
+    for (const candle of candles) {
+      const duration = Math.max(1, candle.closeTime - candle.openTime);
+      processed += this.warmupPrice(candle.openTime, candle.open);
+      processed += this.warmupPrice(candle.openTime + duration * 0.33, candle.high);
+      processed += this.warmupPrice(candle.openTime + duration * 0.66, candle.low);
+      processed += this.warmupPrice(candle.closeTime, candle.close);
+    }
+    if (processed > 0) {
+      recalculateMetrics(this.state);
+    }
+    return processed;
+  }
+
+  private warmupPrice(eventTime: number, price: number): number {
+    if (!Number.isFinite(price) || price <= 0) {
+      return 0;
+    }
+
+    this.state.lastPrice = roundQuote(price);
+    this.state.updatedAt = Math.max(this.state.updatedAt, eventTime);
+    this.rememberPrice(price);
+    const config = this.state.config;
+    evaluateLegacyValleyPeak(
+      this.ensureLegacyValleyPeakMemory(),
+      config.legacyValleyPeak,
+      {
+        eventTime,
+        price,
+        feeRate: config.feeBps / 10_000,
+        buyingPowerQuote: 0,
+        shortSellingPowerQuote: 0,
+        baseFree: 0,
+        shortBaseFree: 0,
+      },
+    );
+    return 1;
   }
 
   private applyExchangeOrderUpdate(
@@ -1159,7 +1308,9 @@ export class SimulatedTradingBot {
             this.cancelLegacyExitGridOrders(tick.eventTime, false, lot.id, "short");
           }
 
-          orders.push(...this.createLegacyShortExitGridOrders(grid, lot, tick.eventTime));
+          orders.push(
+            ...this.createLegacyShortExitGridOrders(grid, lot, tick.eventTime, tick.price),
+          );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
             break;
           }
@@ -1234,7 +1385,9 @@ export class SimulatedTradingBot {
             this.cancelLegacyExitGridOrders(tick.eventTime, false, lot.id, "long");
           }
 
-          orders.push(...this.createLegacyLongExitGridOrders(grid, lot, tick.eventTime));
+          orders.push(
+            ...this.createLegacyLongExitGridOrders(grid, lot, tick.eventTime, tick.price),
+          );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
             break;
           }
@@ -1578,6 +1731,48 @@ export class SimulatedTradingBot {
       order.targetPositionId = targetPositionId;
       order.positionEffect = "close";
     }
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(this.state.orders.length - 1);
+    return order;
+  }
+
+  private createExternalCloseOrder(
+    side: "buy" | "sell",
+    price: number,
+    quantity: number,
+    createdAt: number,
+    reason: string,
+    targetPositionId: string,
+  ): TradingOrder | undefined {
+    const roundedQuantity = roundAsset(quantity);
+    const roundedPrice = roundQuote(price);
+    if (roundedQuantity <= MIN_BASE_QUANTITY || roundedPrice <= 0) {
+      return undefined;
+    }
+
+    const feeRate = this.state.config.feeBps / 10_000;
+    const estimatedQuoteCost =
+      side === "buy" ? roundQuote(roundedQuantity * roundedPrice * (1 + feeRate)) : 0;
+
+    if (side === "buy") {
+      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
+      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    } else {
+      this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
+      this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+    }
+
+    const order = this.buildOrder(
+      side,
+      roundedPrice,
+      roundedQuantity,
+      estimatedQuoteCost,
+      createdAt,
+      reason,
+      "market",
+    );
+    order.positionEffect = "close";
+    order.targetPositionId = targetPositionId;
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
     return order;
@@ -2478,13 +2673,12 @@ export class SimulatedTradingBot {
     grid: LegacyExitGridMemory,
     lot: LegacyLongExitGridLot,
     createdAt: number,
+    currentPrice: number,
   ): TradingOrder[] {
     const config = this.state.config;
-    const legacyConfig = config.legacyValleyPeak;
     const lowerPrice = roundQuote(cleanPositive(lot.breakEvenSellPrice) || grid.entryPrice);
     const upperPrice = roundQuote(Math.max(grid.peakPrice, lowerPrice));
     const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
-    const orderCount = Math.min(legacyConfig.exitGridOrderCount, availableSlots);
     const lockedQuantity = config.lockBorrowedLenderCollateral
       ? (lot.lentQuantity ?? 0)
       : 0;
@@ -2492,6 +2686,13 @@ export class SimulatedTradingBot {
       Math.max(0, lot.remainingQuantity - lockedQuantity),
       this.state.baseFree,
     );
+    const orderCount = this.legacyExitGridOrderCount({
+      lowerPrice,
+      upperPrice,
+      currentPrice,
+      availableQuantity,
+      availableSlots,
+    });
 
     if (orderCount <= 0 || upperPrice <= lowerPrice || availableQuantity <= MIN_BASE_QUANTITY) {
       return [];
@@ -2555,6 +2756,7 @@ export class SimulatedTradingBot {
     grid.gridPeakPrice = upperPrice;
     grid.gridCreatedAt = createdAt;
     grid.gridOrderIds = orders.map((order) => order.id);
+    this.recordLegacyExitGridSpan(upperPrice - lowerPrice, orders.length);
     return orders;
   }
 
@@ -2562,17 +2764,23 @@ export class SimulatedTradingBot {
     grid: LegacyExitGridMemory,
     lot: LegacyShortExitGridLot,
     createdAt: number,
+    currentPrice: number,
   ): TradingOrder[] {
     const config = this.state.config;
-    const legacyConfig = config.legacyValleyPeak;
     const upperPrice = roundQuote(cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice);
     const lowerPrice = roundQuote(Math.min(grid.troughPrice ?? upperPrice, upperPrice));
     const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
-    const orderCount = Math.min(legacyConfig.exitGridOrderCount, availableSlots);
     const lockedQuantity = config.lockBorrowedLenderCollateral
       ? (lot.lentQuote ?? 0) / Math.max(upperPrice, MIN_BASE_QUANTITY)
       : 0;
     const availableQuantity = Math.max(0, lot.remainingQuantity - lockedQuantity);
+    const orderCount = this.legacyExitGridOrderCount({
+      lowerPrice,
+      upperPrice,
+      currentPrice,
+      availableQuantity,
+      availableSlots,
+    });
 
     if (orderCount <= 0 || upperPrice <= lowerPrice || availableQuantity <= MIN_BASE_QUANTITY) {
       return [];
@@ -2636,7 +2844,43 @@ export class SimulatedTradingBot {
     grid.gridTroughPrice = lowerPrice;
     grid.gridCreatedAt = createdAt;
     grid.gridOrderIds = orders.map((order) => order.id);
+    this.recordLegacyExitGridSpan(upperPrice - lowerPrice, orders.length);
     return orders;
+  }
+
+  private legacyExitGridOrderCount(input: {
+    lowerPrice: number;
+    upperPrice: number;
+    currentPrice: number;
+    availableQuantity: number;
+    availableSlots: number;
+  }): number {
+    const config = this.state.config.legacyValleyPeak;
+    const maxOrderCount = Math.min(config.exitGridOrderCount, input.availableSlots);
+    if (maxOrderCount <= 0) {
+      return 0;
+    }
+
+    const span = Math.max(0, input.upperPrice - input.lowerPrice);
+    const stepOrderCount =
+      span > 0 && config.exitGridMaxStepPct > 0
+        ? Math.ceil(
+            span /
+              (Math.max(input.currentPrice, MIN_BASE_QUANTITY) *
+                (config.exitGridMaxStepPct / 100)),
+          ) + 1
+        : maxOrderCount;
+    return Math.min(maxOrderCount, stepOrderCount);
+  }
+
+  private recordLegacyExitGridSpan(span: number, orderCount: number): void {
+    if (orderCount <= 0 || !Number.isFinite(span) || span <= 0) {
+      return;
+    }
+
+    this.state.exitGridSpanTotal = roundQuote(this.state.exitGridSpanTotal + span);
+    this.state.exitGridSpanCount += 1;
+    this.state.exitGridOrderCountTotal += orderCount;
   }
 
   private legacyExitGridOrderPrice(
@@ -3420,6 +3664,9 @@ export class SimulatedTradingBot {
       updatedAt: this.state.updatedAt,
       realizedPnl: this.state.realizedPnl,
       feesPaid: this.state.feesPaid,
+      exitGridSpanTotal: this.state.exitGridSpanTotal,
+      exitGridSpanCount: this.state.exitGridSpanCount,
+      exitGridOrderCountTotal: this.state.exitGridOrderCountTotal,
       winningTrades: this.state.winningTrades,
       losingTrades: this.state.losingTrades,
       sequence: this.state.sequence,
@@ -3441,6 +3688,9 @@ export class SimulatedTradingBot {
     this.state.updatedAt = rollback.updatedAt;
     this.state.realizedPnl = rollback.realizedPnl;
     this.state.feesPaid = rollback.feesPaid;
+    this.state.exitGridSpanTotal = rollback.exitGridSpanTotal;
+    this.state.exitGridSpanCount = rollback.exitGridSpanCount;
+    this.state.exitGridOrderCountTotal = rollback.exitGridOrderCountTotal;
     this.state.winningTrades = rollback.winningTrades;
     this.state.losingTrades = rollback.losingTrades;
     this.state.sequence = rollback.sequence;
@@ -3693,6 +3943,9 @@ function normalizeLoadedState(
   normalized.fills ??= [];
   normalized.quoteReserved ??= 0;
   normalized.baseReserved ??= 0;
+  normalized.exitGridSpanTotal ??= 0;
+  normalized.exitGridSpanCount ??= 0;
+  normalized.exitGridOrderCountTotal ??= 0;
   normalized.avgEntryPrice = inferAverageLongEntryPrice(normalized);
   normalized.avgShortEntryPrice = inferAverageShortEntryPrice(normalized);
   normalized.winningTrades ??= 0;
@@ -3766,6 +4019,7 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
   const peakEquity = Math.max(state.metrics?.peakEquity ?? state.startingQuote, equity);
   const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
   const totalClosedTrades = state.winningTrades + state.losingTrades;
+  const exitGridSpanCount = Math.max(0, state.exitGridSpanCount ?? 0);
 
   return {
     equity,
@@ -3781,6 +4035,15 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
     peakEquity,
     maxDrawdownPct: Math.max(state.metrics?.maxDrawdownPct ?? 0, drawdown),
     exposurePct: equity > 0 ? (exposureValue / equity) * 100 : 0,
+    avgExitGridSpan:
+      exitGridSpanCount > 0
+        ? roundQuote((state.exitGridSpanTotal ?? 0) / exitGridSpanCount)
+        : 0,
+    avgExitGridOrderCount:
+      exitGridSpanCount > 0
+        ? (state.exitGridOrderCountTotal ?? 0) / exitGridSpanCount
+        : 0,
+    exitGridSpanCount,
   };
 }
 
@@ -3838,6 +4101,9 @@ function emptyMetrics(startingQuote: number): BotMetrics {
     peakEquity: startingQuote,
     maxDrawdownPct: 0,
     exposurePct: 0,
+    avgExitGridSpan: 0,
+    avgExitGridOrderCount: 0,
+    exitGridSpanCount: 0,
   };
 }
 

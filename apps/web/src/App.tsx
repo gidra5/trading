@@ -117,6 +117,14 @@ export function App() {
   const backtest = createMemo(() => snapshot()?.backtest);
   const correlations = createMemo(() => snapshot()?.correlations);
   const exchange = createMemo(() => snapshot()?.exchange);
+  const hasClosablePositions = createMemo(() => {
+    const summary = snapshot()?.positions.summary;
+    return Boolean(
+      summary &&
+        (Math.abs(summary.longQuantity) > 0.00000001 ||
+          Math.abs(summary.shortQuantity) > 0.00000001),
+    );
+  });
 
   createEffect(() => {
     const config = bot()?.config;
@@ -191,6 +199,23 @@ export function App() {
     if (response.ok) {
       applySnapshot((await response.json()) as RuntimeSnapshot);
     }
+  };
+
+  const closeBotPositions = async (includeUnprofitable: boolean) => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/bot/close-positions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ includeUnprofitable }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Position close failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
   };
 
   const selectMarket = async (marketId: string) => {
@@ -531,6 +556,24 @@ export function App() {
               <RotateCcw size={16} />
               Reset
             </button>
+            <button
+              class="btn"
+              type="button"
+              disabled={!hasClosablePositions()}
+              onClick={() => void closeBotPositions(false)}
+            >
+              <MinusCircle size={16} />
+              Close Profitable + Pause
+            </button>
+            <button
+              class={buttonDangerClass}
+              type="button"
+              disabled={!hasClosablePositions()}
+              onClick={() => void closeBotPositions(true)}
+            >
+              <MinusCircle size={16} />
+              Force Close All
+            </button>
           </div>
         </header>
 
@@ -680,6 +723,17 @@ function StatusPill(props: { label: string; active: boolean }) {
   );
 }
 
+function ExchangeRule(props: { label: string; value: string }) {
+  return (
+    <div class="rounded-2 bg-ink-800 p-3">
+      <div class="muted-label">{props.label}</div>
+      <div class="mt-1 truncate text-sm font-semibold tabular-nums text-ink-100">
+        {props.value}
+      </div>
+    </div>
+  );
+}
+
 function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string {
   if (!exchange?.enabled) {
     return "Paper off";
@@ -779,6 +833,26 @@ function ExchangePaperPanel(props: {
           <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>
         )}
       </Show>
+
+      <div class="mb-4 grid grid-cols-2 gap-2 lg:grid-cols-5">
+        <ExchangeRule label="Taker Fee" value={formatBps(exchange()?.feeBps)} />
+        <ExchangeRule
+          label="Spread Slip"
+          value={formatBps(exchange()?.estimatedSlippageBps)}
+        />
+        <ExchangeRule
+          label="Min Notional"
+          value={formatOptionalQuote(exchange()?.symbolFilters?.minNotional, quoteAsset())}
+        />
+        <ExchangeRule
+          label="Max Notional"
+          value={formatOptionalQuote(exchange()?.symbolFilters?.maxNotional, quoteAsset())}
+        />
+        <ExchangeRule
+          label="Qty Step"
+          value={formatOptionalAsset(exchange()?.symbolFilters?.stepSize)}
+        />
+      </div>
 
       <div class="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(280px,380px)]">
         <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -1615,6 +1689,27 @@ function formatLeverage(value: number | undefined): string {
   }
 
   return `${formatQuote(value, 2)}x`;
+}
+
+function formatBps(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  return `${formatQuote(value, 3)} bps`;
+}
+
+function formatOptionalQuote(value: number | undefined, quoteAsset: string): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  return `${formatQuote(value, 2)} ${quoteAsset}`;
+}
+
+function formatOptionalAsset(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  return formatAsset(value);
 }
 
 function formatRatio(value: number | undefined): string {

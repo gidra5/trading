@@ -229,6 +229,11 @@ export interface BinancePaperSymbolFilters {
   maxNotional?: number;
 }
 
+export interface BinancePaperCommission {
+  makerFeeBps?: number;
+  takerFeeBps?: number;
+}
+
 export interface BinancePaperSnapshot {
   enabled: boolean;
   configured: boolean;
@@ -245,6 +250,9 @@ export interface BinancePaperSnapshot {
   error?: string;
   maxLeverage?: number;
   symbolFilters?: BinancePaperSymbolFilters;
+  commission?: BinancePaperCommission;
+  feeBps?: number;
+  estimatedSlippageBps?: number;
   balances: BinancePaperBalance[];
   positions: BinancePaperPosition[];
   openOrders: BinancePaperOrder[];

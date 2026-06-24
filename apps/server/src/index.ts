@@ -142,6 +142,18 @@ server.post("/api/bot/reset", async () => {
   return publicSnapshot();
 });
 
+server.post("/api/bot/close-positions", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as { includeUnprofitable?: boolean };
+    await runtime.closePositions({ includeUnprofitable: body.includeUnprofitable === true });
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Position close failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
 server.put("/api/bot/config", async (request) => {
   const body = (request.body ?? {}) as PartialStrategyConfig;
   await runtime.updateBotConfig(body);

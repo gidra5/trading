@@ -24,6 +24,8 @@ import type { MarketStreamStatus } from "./binance-stream.js";
 import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
 import {
   BacktestCancelledError,
+  fetchKlines,
+  intervalToMs,
   isBacktestCancelledError,
   runHistoricalCandleBacktest,
   type HistoricalBacktestMarket,
@@ -117,6 +119,7 @@ export class TradingRuntime {
     const savedState = await this.storage.loadBotState();
     this.config = this.createMarketConfig(savedState);
     this.bot = new SimulatedTradingBot(savedState, this.config);
+    await this.warmupBotFromHistory(savedState);
     await this.recoverExchangeState();
   }
 
@@ -146,6 +149,7 @@ export class TradingRuntime {
     const savedState = await this.storage.loadBotState();
     this.config = this.createMarketConfig(savedState);
     this.bot = new SimulatedTradingBot(savedState, this.config);
+    await this.warmupBotFromHistory(savedState);
     await this.recoverExchangeState();
   }
 
@@ -224,6 +228,43 @@ export class TradingRuntime {
 
   async resetBot(): Promise<BotEvent[]> {
     const events = this.bot.reset(this.config);
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  async closePositions(
+    options: { includeUnprofitable?: boolean } = {},
+  ): Promise<BotEvent[]> {
+    const at = Date.now();
+    const events: BotEvent[] = [];
+    events.push(...this.bot.setStatus("stopped", at));
+
+    const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
+    if (exchangeCanSubmit) {
+      try {
+        const snapshot = await this.paperTrading!.cancelAllOpenOrders(this.market);
+        await this.applyExchangeSnapshot(snapshot);
+      } catch {
+        // Local open orders are cancelled below so the strategy will not place follow-up orders.
+      }
+    }
+
+    events.push(...this.bot.cancelOpenOrders("close positions requested", at));
+
+    if (exchangeCanSubmit) {
+      const closeEvents = this.bot.createPositionCloseOrders(options, at);
+      events.push(...closeEvents);
+      this.recordEvents(events);
+      await this.submitCreatedOrdersToPaperExchange(closeEvents, {
+        force: true,
+        throwOnFailure: true,
+      });
+      await this.flushState();
+      return events;
+    }
+
+    events.push(...this.closePositionsLocally(options, at));
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -429,7 +470,10 @@ export class TradingRuntime {
     this.recentEvents = [...events.map(compactPublicEvent), ...this.recentEvents].slice(0, 60);
   }
 
-  private async submitCreatedOrdersToPaperExchange(events: BotEvent[]): Promise<void> {
+  private async submitCreatedOrdersToPaperExchange(
+    events: BotEvent[],
+    options: { force?: boolean; throwOnFailure?: boolean } = {},
+  ): Promise<void> {
     if (!this.paperTrading) {
       return;
     }
@@ -438,17 +482,80 @@ export class TradingRuntime {
         continue;
       }
       try {
-        const snapshot = await this.paperTrading.submitBotOrder(this.market, event.order);
+        const snapshot = await this.paperTrading.submitBotOrder(
+          this.market,
+          event.order,
+          { force: options.force },
+        );
         if (snapshot) {
           await this.applyExchangeSnapshot(snapshot);
         }
-      } catch {
+      } catch (error) {
         const cancelled = this.bot.cancelOpenOrder(event.order.id, "exchange submit failed");
         this.recordEvents(cancelled);
         await this.flushState();
+        if (options.throwOnFailure) {
+          throw error;
+        }
         return;
       }
     }
+  }
+
+  private closePositionsLocally(
+    options: { includeUnprofitable?: boolean },
+    at: number,
+  ): BotEvent[] {
+    const state = this.bot.snapshot();
+    const price = state.lastPrice;
+    if (!Number.isFinite(price) || price <= 0) {
+      return [];
+    }
+
+    const ledger = analyzePositions(state, { currentPrice: price });
+    const reason = options.includeUnprofitable
+      ? "forced local position close"
+      : "local profitable position close";
+    const events: BotEvent[] = [];
+    for (const lot of ledger.longs) {
+      if (
+        lot.status === "pending" ||
+        lot.remainingQuantity <= 0 ||
+        (!options.includeUnprofitable && price < lot.breakEvenSellPrice)
+      ) {
+        continue;
+      }
+      events.push(
+        ...this.bot.recordManualTrade({
+          side: "sell",
+          price,
+          quantity: lot.remainingQuantity,
+          targetPositionId: lot.id,
+          positionEffect: "close",
+          reason,
+        }, at),
+      );
+    }
+    for (const lot of ledger.shorts) {
+      if (
+        lot.status === "pending" ||
+        lot.remainingQuantity <= 0 ||
+        (!options.includeUnprofitable && price > lot.breakEvenBuyPrice)
+      ) {
+        continue;
+      }
+      events.push(
+        ...this.bot.recordManualTrade({
+          side: "buy",
+          price,
+          quantity: lot.remainingQuantity,
+          targetPositionId: lot.id,
+          positionEffect: "close",
+          reason,
+        }, at),
+      );
+    }
+    return events;
   }
 
   private async recoverExchangeState(): Promise<void> {
@@ -463,8 +570,75 @@ export class TradingRuntime {
     }
   }
 
+  private async warmupBotFromHistory(savedState?: PaperBotState): Promise<void> {
+    if (!this.needsHistoricalWarmup(savedState) || !isHistoricalVenue(this.market.venue)) {
+      return;
+    }
+
+    const candles = await this.loadWarmupCandles();
+    if (candles.length === 0) {
+      return;
+    }
+
+    const processed = this.bot.warmupFromCandles(candles);
+    if (processed <= 0) {
+      return;
+    }
+    for (const candle of candles) {
+      upsertCandle(this.candles, candle, 500);
+    }
+    await this.flushState();
+  }
+
+  private needsHistoricalWarmup(savedState?: PaperBotState): boolean {
+    const memory = savedState?.memory.legacyValleyPeak;
+    if (!memory) {
+      return true;
+    }
+    return memory.buyAverages.every((average) => average.timestamps.length === 0);
+  }
+
+  private async loadWarmupCandles(): Promise<Candle[]> {
+    const intervalMs = intervalToMs(this.interval);
+    const config = this.config.legacyValleyPeak;
+    const warmupMs =
+      (Math.max(...config.averagingRangesSec, 0) + config.saturationSec) * 1000;
+    const requiredCandles = Math.max(10, Math.ceil(warmupMs / intervalMs) + 5);
+    const storedCandles = this.candles
+      .filter((candle) => candle.closed)
+      .slice(-requiredCandles);
+    const storedSpan =
+      storedCandles.length > 0
+        ? storedCandles.at(-1)!.closeTime - storedCandles[0].openTime
+        : 0;
+    if (storedSpan >= warmupMs) {
+      return storedCandles;
+    }
+
+    const limit = Math.min(1000, requiredCandles);
+    const endTime = Date.now();
+    const startTime = endTime - limit * intervalMs;
+    if (!isHistoricalVenue(this.market.venue)) {
+      return storedCandles;
+    }
+    try {
+      return await fetchKlines({
+        venue: this.market.venue,
+        symbol: this.market.symbol,
+        interval: this.interval,
+        startTime,
+        endTime,
+        limit,
+        endpoint: this.paperTrading?.klineEndpointFor(this.market),
+      });
+    } catch {
+      return storedCandles;
+    }
+  }
+
   private async applyExchangeSnapshot(snapshot: BinancePaperSnapshot): Promise<BotEvent[]> {
     this.applyExchangeMaxLeverage(snapshot);
+    this.applyExchangeTradingRules(snapshot);
     const reconciliation = exchangeReconciliationFromSnapshot(snapshot);
     if (
       (reconciliation.orders?.length ?? 0) === 0 &&
@@ -490,6 +664,49 @@ export class TradingRuntime {
     }
     this.config = capped;
     this.bot.setConfig(capped);
+  }
+
+  private applyExchangeTradingRules(snapshot: BinancePaperSnapshot): void {
+    let next = this.config;
+    const minOrderQuote = snapshot.symbolFilters?.minNotional;
+    if (minOrderQuote && minOrderQuote > 0) {
+      next = createStrategyConfig({
+        ...next,
+        minOrderQuote: Math.max(next.minOrderQuote, minOrderQuote),
+        legacyValleyPeak: {
+          ...next.legacyValleyPeak,
+          minTradeQuote: Math.max(next.legacyValleyPeak.minTradeQuote, minOrderQuote),
+          maxTradeQuote: snapshot.symbolFilters?.maxNotional
+            ? Math.min(next.legacyValleyPeak.maxTradeQuote, snapshot.symbolFilters.maxNotional)
+            : next.legacyValleyPeak.maxTradeQuote,
+        },
+      });
+    }
+    if (snapshot.feeBps !== undefined && Number.isFinite(snapshot.feeBps)) {
+      next = createStrategyConfig({
+        ...next,
+        feeBps: snapshot.feeBps,
+      });
+    }
+    if (
+      snapshot.estimatedSlippageBps !== undefined &&
+      Number.isFinite(snapshot.estimatedSlippageBps) &&
+      snapshot.estimatedSlippageBps >= 0
+    ) {
+      next = createStrategyConfig({
+        ...next,
+        positionRisk: {
+          ...next.positionRisk,
+          marketSlippageBps: snapshot.estimatedSlippageBps,
+        },
+      });
+    }
+
+    if (JSON.stringify(next) === JSON.stringify(this.config)) {
+      return;
+    }
+    this.config = next;
+    this.bot.setConfig(next);
   }
 
   private async executeBacktest(

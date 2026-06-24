@@ -335,7 +335,7 @@ break-even further. Borrower losses are still charged back through the lender ba
 | `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
 | `cooldownMs` | `300000` | Minimum delay between newly created automated orders. |
 | `staleOrderMs` | `2592000000` | Time before an unfilled limit order is cancelled; current grid ladders can persist for 30 days. |
-| `minOrderQuote` | `25` | Global minimum order notional. |
+| `minOrderQuote` | `5` | Global minimum order notional. |
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
 | `legacyValleyPeak.maxTradeQuote` | `50000` | Per-signal quote/notional clip. |
 | `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
@@ -344,7 +344,8 @@ break-even further. Borrower losses are still charged back through the lender ba
 | `legacyValleyPeak.sellSigma` | `0.1` | Sell Gaussian width around the sizing derivative. |
 | `legacyValleyPeak.exitGridEnabled` | `true` | Enables the peak-to-entry exit ladder. |
 | `legacyValleyPeak.exitGridMarketEntry` | `true` | Uses immediate market-style valley entries in grid mode. |
-| `legacyValleyPeak.exitGridOrderCount` | `6` | Maximum orders in a recreated exit ladder. |
+| `legacyValleyPeak.exitGridOrderCount` | `200` | Maximum orders in a recreated exit ladder. |
+| `legacyValleyPeak.exitGridMaxStepPct` | `0.006` | Maximum target grid price step as a percentage of current price; `0` disables this cap. |
 | `legacyValleyPeak.exitGridPriceDistribution` | `uniform` | Spacing procedure for ladder prices. |
 | `legacyValleyPeak.exitGridSizeDistribution` | `geometric` | Sizing procedure for ladder quantities. |
 | `legacyValleyPeak.exitGridSellFraction` | `0.35` | Fraction of remaining base sold by each non-final grid order. |

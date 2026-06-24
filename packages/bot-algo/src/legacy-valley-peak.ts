@@ -40,7 +40,8 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   shortSideEnabled: true,
   exitGridEnabled: true,
   exitGridMarketEntry: true,
-  exitGridOrderCount: 6,
+  exitGridOrderCount: 200,
+  exitGridMaxStepPct: 0.006,
   exitGridPriceDistribution: "uniform",
   exitGridSizeDistribution: "geometric",
   exitGridSellFraction: 0.35,
@@ -64,6 +65,7 @@ export const legacyValleyPeakReferenceConfigs = {
 export const defaultLegacyValleyPeakConfig = legacyValleyPeakStrictSymmetricConfig;
 
 const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;
+const MAX_EXIT_GRID_ORDER_COUNT = 5_000;
 
 export function createLegacyValleyPeakConfig(
   overrides: Partial<LegacyValleyPeakConfig> = {},
@@ -107,7 +109,12 @@ export function createLegacyValleyPeakConfig(
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
   config.longSideEnabled = config.longSideEnabled !== false;
   config.shortSideEnabled = config.shortSideEnabled !== false;
-  config.exitGridOrderCount = clampInt(config.exitGridOrderCount, 1, 24);
+  config.exitGridOrderCount = clampInt(
+    config.exitGridOrderCount,
+    1,
+    MAX_EXIT_GRID_ORDER_COUNT,
+  );
+  config.exitGridMaxStepPct = Math.max(0, config.exitGridMaxStepPct);
   if (
     config.exitGridPriceDistribution !== "uniform" &&
     config.exitGridPriceDistribution !== "geometric"

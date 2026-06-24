@@ -142,6 +142,19 @@ Random-length mode defaults to deterministic sampled windows. Tune it with:
 --seed
 ```
 
+Pathological windows can be collected and rerun as a small regression suite:
+
+```bash
+npm run backtest:pathologies
+npm run backtest:pathologies -- --mode rerun
+```
+
+The collector samples two fixed random BTCUSDT windows across `1d, 3d, 5d, 1w,
+2w, 1m, 2m, 3m` buckets by default, saves negative-profit cases plus the lowest
+oracle-capture cases, and records absolute start/end times for deterministic reruns.
+The saved case report is in
+[Pathological Backtest Analysis](pathological-backtest-analysis.md).
+
 Grid-search mode runs folded tests over legacy parameter variants only. Current grid
 candidates adjust valley/peak clip size, warmup, sigma, buy/sell rates, and confirmation
 strictness.
