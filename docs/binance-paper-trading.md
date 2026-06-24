@@ -75,22 +75,28 @@ rate. Binance does not expose a static slippage constant, so the server estimate
 
 `TRADING_BINANCE_PAPER_AUTO_SUBMIT=true` submits strategy-created orders to the
 active paper exchange. In this mode local tick processing does not fill or stale-cancel
-open orders; Binance order/trade history is the order-status source. Exchange sync
-reconciles bot-linked orders and fills back into the local ledger using the deterministic
-`bot_<localOrderId>` client order id. Server startup runs the same sync so restart
-recovery restores accepted, cancelled, and filled bot exchange orders.
+open orders; Binance order/trade updates are the order-status source. Futures
+paper modes open a private user-data websocket, keep its listen key alive, and
+apply bot-linked `ORDER_TRADE_UPDATE` fills immediately using the deterministic
+`bot_<localOrderId>` client order id. Each user-data event also triggers an
+exchange sync so balances, positions, and REST order history stay consistent.
+Server startup runs the same sync so restart recovery restores accepted,
+cancelled, and filled bot exchange orders.
+
+Spot paper modes still use explicit REST sync for account updates. Binance removed
+the old Spot listen-key stream path; adding Spot user-data streaming needs the new
+WebSocket API authentication flow.
 
 Keep live trading disabled until the same reconciliation path has been exercised
-for long-running futures sessions and user-data websocket streaming is added for
-lower-latency fill updates.
+for long-running futures sessions.
 
 to run demo futures bot server locally execute this:
 ```bash
 TRADING_MARKET_ID=usdm-futures:BTCUSDT \
 TRADING_BINANCE_PAPER_ENABLED=true \
 TRADING_BINANCE_PAPER_MODE=usdm-futures-testnet \
-BINANCE_PAPER_API_KEY=... \
-BINANCE_PAPER_API_SECRET=... \
+BINANCE_PAPER_API_KEY=KifpW53tsEfJPBHiiUNrhvlAwmOL7tk54B8xexX7XhDDjy84Kszj3Ah9f5iPvV9S \
+BINANCE_PAPER_API_SECRET=pkePwOWIyVLJ86HvmOMfm5fpmjnvP2dCX3t9SPrznRzlfKWUL0UYXmzmluEjKWaf \
 TRADING_SHORT_MARGIN_MODEL=futures-margin \
 TRADING_MAX_LEVERAGE=1 \
 npm run dev -w @trading/server

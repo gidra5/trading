@@ -744,6 +744,9 @@ function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string
   if (!exchange.compatible) {
     return "Paper incompatible";
   }
+  if (exchange.userDataStreamConnected) {
+    return `${exchange.resolvedMode ?? exchange.mode} streaming`;
+  }
   return exchange.connected
     ? `${exchange.resolvedMode ?? exchange.mode} synced`
     : `${exchange.resolvedMode ?? exchange.mode} ready`;
@@ -807,7 +810,9 @@ function ExchangePaperPanel(props: {
           <h2 class="text-lg font-semibold">
             {exchange()?.resolvedMode ?? exchange()?.mode ?? "disabled"}
           </h2>
-          <div class="mt-1 text-xs text-ink-300">{exchange()?.message}</div>
+          <div class="mt-1 text-xs text-ink-300">
+            {exchange()?.userDataStreamMessage ?? exchange()?.message}
+          </div>
         </div>
         <div class="flex flex-wrap gap-2">
           <button class="btn" type="button" onClick={props.onSync} disabled={!canTrade()}>
@@ -834,7 +839,11 @@ function ExchangePaperPanel(props: {
         )}
       </Show>
 
-      <div class="mb-4 grid grid-cols-2 gap-2 lg:grid-cols-5">
+      <div class="mb-4 grid grid-cols-2 gap-2 lg:grid-cols-6">
+        <ExchangeRule
+          label="User Stream"
+          value={exchange()?.userDataStreamConnected ? "Connected" : "Offline"}
+        />
         <ExchangeRule label="Taker Fee" value={formatBps(exchange()?.feeBps)} />
         <ExchangeRule
           label="Spread Slip"

@@ -183,6 +183,33 @@ export class TradingRuntime {
     }
   }
 
+  async handleExchangeUserData(payload: unknown): Promise<BotEvent[]> {
+    if (!this.paperTrading) {
+      return [];
+    }
+
+    const events: BotEvent[] = [];
+    const reconciliation = this.paperTrading.reconciliationFromUserDataEvent(
+      this.market,
+      payload,
+    );
+    if (hasExchangeReconciliationUpdates(reconciliation)) {
+      const directEvents = this.bot.applyExchangeReconciliation(reconciliation);
+      this.recordEvents(directEvents);
+      events.push(...directEvents);
+      await this.flushState();
+    }
+
+    try {
+      const snapshot = await this.paperTrading.sync(this.market);
+      events.push(...(await this.applyExchangeSnapshot(snapshot)));
+    } catch {
+      return events;
+    }
+
+    return events;
+  }
+
   snapshot(): RuntimeSnapshot {
     const bot = this.bot.view();
     const publicBot = compactPublicBotState(bot);
@@ -937,6 +964,12 @@ function exchangeReconciliationFromSnapshot(
     });
 
   return { orders, fills };
+}
+
+function hasExchangeReconciliationUpdates(
+  input: ExchangeReconciliationInput | undefined,
+): input is ExchangeReconciliationInput {
+  return (input?.orders?.length ?? 0) > 0 || (input?.fills?.length ?? 0) > 0;
 }
 
 function normalizeExchangeSide(side: string): "buy" | "sell" {

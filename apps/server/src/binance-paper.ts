@@ -1,5 +1,9 @@
 import { createHmac } from "node:crypto";
-import type { TradingOrder } from "@trading/bot-algo";
+import type {
+  ExchangeReconciliationInput,
+  ExchangeTradeFill,
+  TradingOrder,
+} from "@trading/bot-algo";
 import type { BinanceMarketListing } from "./binance-markets.js";
 
 export type BinancePaperMode =
@@ -113,6 +117,9 @@ export interface BinancePaperSnapshot {
   streamEnvironment?: BinancePaperStreamEnvironment;
   autoSubmit: boolean;
   connected: boolean;
+  userDataStreamConnected?: boolean;
+  lastUserDataStreamAt?: number;
+  userDataStreamMessage?: string;
   lastSyncAt?: number;
   lastSubmitAt?: number;
   message: string;
@@ -128,6 +135,19 @@ export interface BinancePaperSnapshot {
   recentOrders: BinancePaperOrder[];
   recentTrades: BinancePaperTrade[];
   lastOrder?: BinancePaperOrder;
+}
+
+export interface BinancePaperUserDataStreamSession {
+  listenKey: string;
+  url: string;
+  mode: Exclude<BinancePaperMode, "auto">;
+}
+
+export interface BinancePaperUserDataStreamStatus {
+  connected: boolean;
+  message: string;
+  lastEventAt: number;
+  reconnectAttempt: number;
 }
 
 export interface BinancePaperPlaceOrderInput {
@@ -209,12 +229,102 @@ export class BinancePaperTrading {
     );
   }
 
+  canStreamUserData(market: BinanceMarketListing): boolean {
+    const environment = this.resolveEnvironment(market);
+    return Boolean(
+      this.config.enabled &&
+        this.config.apiKey &&
+        this.config.apiSecret &&
+        environment &&
+        environment.product !== "spot",
+    );
+  }
+
   klineEndpointFor(market: BinanceMarketListing): string | undefined {
     const environment = this.resolveEnvironment(market);
     if (!this.config.enabled || !environment) {
       return undefined;
     }
     return new URL(exchangeKlinePath(environment), environment.baseUrl).toString();
+  }
+
+  async openUserDataStream(
+    market: BinanceMarketListing,
+  ): Promise<BinancePaperUserDataStreamSession> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") {
+      throw new Error("Spot paper user-data streams require WebSocket API auth and are not enabled yet.");
+    }
+    const payload = await this.apiKeyRequest<Record<string, unknown>>(
+      environment,
+      "POST",
+      userDataStreamPath(environment),
+    );
+    const listenKey = stringValue(payload.listenKey);
+    if (!listenKey) {
+      throw new Error("Binance paper user-data stream did not return a listenKey.");
+    }
+    return {
+      listenKey,
+      url: userDataStreamWebSocketUrl(environment, listenKey),
+      mode: environment.mode,
+    };
+  }
+
+  async keepAliveUserDataStream(
+    market: BinanceMarketListing,
+    _listenKey: string,
+  ): Promise<void> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") {
+      return;
+    }
+    await this.apiKeyRequest<Record<string, unknown>>(
+      environment,
+      "PUT",
+      userDataStreamPath(environment),
+    );
+  }
+
+  async closeUserDataStream(
+    market: BinanceMarketListing,
+    _listenKey: string,
+  ): Promise<void> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") {
+      return;
+    }
+    await this.apiKeyRequest<Record<string, unknown>>(
+      environment,
+      "DELETE",
+      userDataStreamPath(environment),
+    );
+  }
+
+  updateUserDataStreamStatus(
+    market: BinanceMarketListing,
+    status: BinancePaperUserDataStreamStatus,
+  ): BinancePaperSnapshot {
+    const environment = this.resolveEnvironment(market);
+    const snapshot = {
+      ...this.snapshot(market),
+      userDataStreamConnected: status.connected,
+      lastUserDataStreamAt: status.lastEventAt,
+      userDataStreamMessage: status.message,
+    };
+    this.snapshots.set(environment ? snapshotKey(environment, market.symbol) : market.id, snapshot);
+    return snapshot;
+  }
+
+  reconciliationFromUserDataEvent(
+    market: BinanceMarketListing,
+    payload: unknown,
+  ): ExchangeReconciliationInput | undefined {
+    const environment = this.resolveEnvironment(market);
+    if (!environment || environment.product === "spot") {
+      return undefined;
+    }
+    return futuresReconciliationFromUserDataEvent(market, payload);
   }
 
   streamEnvironmentFor(market: BinanceMarketListing): BinancePaperStreamEnvironment {
@@ -721,6 +831,28 @@ export class BinancePaperTrading {
     });
   }
 
+  private async apiKeyRequest<T>(
+    environment: ResolvedPaperEnvironment,
+    method: "POST" | "PUT" | "DELETE",
+    path: string,
+    params: Record<string, string | number | boolean | undefined> = {},
+  ): Promise<T> {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined && value !== "") {
+        search.set(key, String(value));
+      }
+    }
+    const query = search.toString();
+    const pathWithQuery = query ? `${path}?${query}` : path;
+    return requestJson<T>(new URL(pathWithQuery, environment.baseUrl), {
+      method,
+      headers: {
+        "X-MBX-APIKEY": this.config.apiKey ?? "",
+      },
+    });
+  }
+
   private async syncTime(environment: ResolvedPaperEnvironment): Promise<void> {
     if (this.timeOffsets.has(environment.mode)) {
       return;
@@ -863,6 +995,29 @@ function leverageBracketPath(environment: ResolvedPaperEnvironment): string {
   return environment.product === "coinm-futures"
     ? "/dapi/v2/leverageBracket"
     : "/fapi/v1/leverageBracket";
+}
+
+function userDataStreamPath(environment: ResolvedPaperEnvironment): string {
+  return `${orderRestPrefix(environment)}/listenKey`;
+}
+
+function userDataStreamWebSocketUrl(
+  environment: ResolvedPaperEnvironment,
+  listenKey: string,
+): string {
+  if (environment.product === "usdm-futures") {
+    const base =
+      environment.mode === "usdm-futures-testnet"
+        ? "wss://demo-fstream.binance.com/private"
+        : "wss://fstream.binance.com/private";
+    return `${base}/ws/${encodeURIComponent(listenKey)}`;
+  }
+
+  const base =
+    environment.mode === "coinm-futures-testnet"
+      ? "wss://demo-dstream.binance.com"
+      : "wss://dstream.binance.com";
+  return `${base}/ws/${encodeURIComponent(listenKey)}`;
 }
 
 function normalizePrice(
@@ -1242,6 +1397,111 @@ function tradeSide(item: Record<string, unknown>): "buy" | "sell" {
     return "sell";
   }
   return booleanValue(item.isBuyer) ? "buy" : "sell";
+}
+
+function futuresReconciliationFromUserDataEvent(
+  market: BinanceMarketListing,
+  payload: unknown,
+): ExchangeReconciliationInput | undefined {
+  const event = asRecord(payload);
+  if (stringValue(event.e) !== "ORDER_TRADE_UPDATE") {
+    return undefined;
+  }
+
+  const order = asRecord(event.o);
+  if (stringValue(order.s) !== market.symbol) {
+    return undefined;
+  }
+
+  const clientOrderId = stringValue(order.c);
+  const localOrderId = localOrderIdFromClientOrderId(clientOrderId);
+  if (!localOrderId) {
+    return undefined;
+  }
+
+  const side = normalizeUserDataSide(order.S);
+  const status = normalizeUserDataOrderStatus(order.X);
+  const executionType = stringValue(order.x).toUpperCase();
+  const externalOrderId = stringValue(order.i);
+  const transactionTime = numberValue(event.T) || numberValue(order.T) || numberValue(event.E);
+  const orderPrice = numberValue(order.ap) || numberValue(order.p) || numberValue(order.L);
+  const filledQuantity = numberValue(order.z);
+  const quoteQuantity = orderPrice > 0 ? orderPrice * filledQuantity : undefined;
+  const reduceOnly = booleanValue(order.R);
+  const positionEffect = reduceOnly ? "close" as const : undefined;
+  const orders = [{
+    localOrderId,
+    externalOrderId,
+    clientOrderId,
+    side,
+    type: normalizeUserDataOrderType(order.o),
+    status,
+    price: orderPrice,
+    quantity: numberValue(order.q),
+    filledQuantity,
+    quoteQuantity,
+    createdAt: transactionTime,
+    updatedAt: transactionTime,
+    positionEffect,
+    reason: `user-data ${executionType || status}`,
+  }];
+
+  const lastQuantity = numberValue(order.l);
+  const lastPrice = numberValue(order.L) || orderPrice;
+  const tradeId = stringValue(order.t);
+  const fills: ExchangeTradeFill[] = [];
+  if (executionType === "TRADE" && lastQuantity > 0 && lastPrice > 0) {
+    const commission = numberValue(order.n);
+    const commissionAsset = stringValue(order.N);
+    const feeQuote =
+      commissionAsset === market.quoteAsset
+        ? commission
+        : commissionAsset === market.baseAsset
+          ? commission * lastPrice
+          : 0;
+    fills.push({
+      id: `${market.id}:trade:${tradeId || `${externalOrderId}:${transactionTime}`}`,
+      localOrderId,
+      externalOrderId,
+      clientOrderId,
+      side,
+      price: lastPrice,
+      quantity: lastQuantity,
+      quoteQuantity: lastPrice * lastQuantity,
+      feeQuote,
+      realizedPnl: optionalNumber(order.rp),
+      filledAt: transactionTime,
+      reason: "user-data exchange fill",
+      positionEffect,
+    });
+  }
+
+  return { orders, fills };
+}
+
+function normalizeUserDataSide(value: unknown): "buy" | "sell" {
+  return stringValue(value).toUpperCase() === "SELL" ? "sell" : "buy";
+}
+
+function normalizeUserDataOrderType(value: unknown): "limit" | "market" {
+  return stringValue(value).toUpperCase() === "MARKET" ? "market" : "limit";
+}
+
+function normalizeUserDataOrderStatus(value: unknown): "open" | "filled" | "cancelled" {
+  const status = stringValue(value).toUpperCase();
+  if (status === "FILLED") {
+    return "filled";
+  }
+  if (
+    status === "CANCELED" ||
+    status === "CANCELLED" ||
+    status === "EXPIRED" ||
+    status === "EXPIRED_IN_MATCH" ||
+    status === "REJECTED"
+  ) {
+    return "cancelled";
+  }
+  return "open";
 }
 
 async function requestJson<T>(url: URL, init: RequestInit): Promise<T> {

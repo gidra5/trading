@@ -244,6 +244,9 @@ export interface BinancePaperSnapshot {
   streamEnvironment?: string;
   autoSubmit: boolean;
   connected: boolean;
+  userDataStreamConnected?: boolean;
+  lastUserDataStreamAt?: number;
+  userDataStreamMessage?: string;
   lastSyncAt?: number;
   lastSubmitAt?: number;
   message: string;

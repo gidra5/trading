@@ -10,6 +10,7 @@ import type {
 } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
+import { BinancePaperUserDataStream } from "./binance-user-data-stream.js";
 import {
   BinanceMarketCatalog,
   getMarketStorageKey,
@@ -108,10 +109,13 @@ server.post("/api/market", async (request, reply) => {
 
   streamGeneration += 1;
   stream.stop();
+  userDataStream.stop();
   await runtime.switchMarket(market, createStorage(market));
   activeMarket = market;
   stream = createStream(market, streamGeneration);
+  userDataStream = createUserDataStream(market, streamGeneration);
   stream.start();
+  userDataStream.start();
   broadcastState();
   return publicSnapshot();
 });
@@ -335,6 +339,7 @@ server.setErrorHandler((error, _request, reply) => {
 
 let streamGeneration = 0;
 let stream = createStream(activeMarket, streamGeneration);
+let userDataStream = createUserDataStream(activeMarket, streamGeneration);
 
 function createStream(market: BinanceMarketListing, generation: number): BinanceMarketStream {
   if (!isStreamVenue(market.venue)) {
@@ -382,6 +387,39 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
         }
         await runtime.handleOrderBook(snapshot);
         scheduleBroadcast();
+      },
+    },
+  });
+}
+
+function createUserDataStream(
+  market: BinanceMarketListing,
+  generation: number,
+): BinancePaperUserDataStream {
+  return new BinancePaperUserDataStream({
+    market,
+    paperTrading,
+    handlers: {
+      onStatus: (status) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        paperTrading.updateUserDataStreamStatus(market, status);
+        scheduleBroadcast();
+      },
+      onUserData: async (payload) => {
+        if (generation !== streamGeneration) {
+          return;
+        }
+        const events = await runtime.handleExchangeUserData(payload);
+        if (generation !== streamGeneration) {
+          return;
+        }
+        if (events.length > 0) {
+          broadcastState();
+        } else {
+          scheduleBroadcast();
+        }
       },
     },
   });
@@ -543,6 +581,7 @@ wss.on("connection", (socket) => {
 });
 
 stream.start();
+userDataStream.start();
 server.log.info(`Trading server listening at ${address}`);
 server.log.info(`Dashboard websocket available at ws://localhost:${appConfig.port}/ws`);
 
