@@ -482,7 +482,7 @@ export class BinancePaperTrading {
       side: order.side,
       type: order.type,
       quantity: order.quantity,
-      price: order.type === "limit" ? order.price : undefined,
+      price: order.price,
       timeInForce: "GTC",
       reduceOnly: environment.product !== "spot" && order.positionEffect === "close",
       clientOrderId: clientOrderIdForBotOrder(order.id),
@@ -782,7 +782,12 @@ export class BinancePaperTrading {
         ? normalizePrice(input.price, input.side, filters)
         : input.price;
     const quantity = normalizeQuantity(input.quantity, input.type, filters);
-    const effectivePrice = input.type === "limit" ? price : undefined;
+    const effectivePrice =
+      input.type === "limit"
+        ? price
+        : Number.isFinite(Number(input.price)) && Number(input.price) > 0
+          ? Number(input.price)
+          : undefined;
     const minNotional = filters.minNotional ?? 0;
     let adjustedQuantity = quantity;
 
@@ -798,7 +803,7 @@ export class BinancePaperTrading {
     validateNormalizedOrder(input, adjustedQuantity, effectivePrice, filters);
     return {
       ...input,
-      price: effectivePrice,
+      price: input.type === "limit" ? effectivePrice : input.price,
       quantity: adjustedQuantity,
     };
   }

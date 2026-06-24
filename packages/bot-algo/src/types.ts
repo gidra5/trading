@@ -49,6 +49,7 @@ export interface TickProcessingOptions {
   updateMetrics?: boolean;
   simulateLiquidation?: boolean;
   processOpenOrders?: boolean;
+  deferMarketOrderFills?: boolean;
 }
 
 export interface Candle {

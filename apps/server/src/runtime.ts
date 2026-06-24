@@ -159,7 +159,10 @@ export class TradingRuntime {
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
     const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
-    const events = this.bot.onTick(tick, { processOpenOrders: !exchangeDriven });
+    const events = this.bot.onTick(tick, {
+      processOpenOrders: !exchangeDriven,
+      deferMarketOrderFills: exchangeDriven,
+    });
     await this.submitCreatedOrdersToPaperExchange(events);
     this.recordEvents(events);
     this.scheduleStateSave();

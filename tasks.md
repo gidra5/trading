@@ -18,6 +18,7 @@
 - given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
 - stress test integration with binance paper trading apis
 - 90d samples, 30d, 180d, 365d 1800d
+- synusdt backtested over a year, but not trades was made. why?
   
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.

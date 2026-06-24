@@ -733,7 +733,7 @@ export class SimulatedTradingBot {
     this.rememberPrice(price);
 
     if (this.state.status === "running") {
-      this.evaluateStrategy(tick, false);
+      this.evaluateStrategy(tick, false, {});
     }
 
     return NO_EVENTS;
@@ -866,14 +866,19 @@ export class SimulatedTradingBot {
     }
 
     const remainingQuantity = roundAsset(Math.max(0, order.quantity - order.filledQuantity));
-    const quantity = roundAsset(
-      remainingQuantity > MIN_BASE_QUANTITY
-        ? Math.min(input.quantity, remainingQuantity)
-        : input.quantity,
-    );
+    const quantity = roundAsset(input.quantity);
     const price = roundQuote(input.price);
     if (quantity <= MIN_BASE_QUANTITY || price <= 0) {
       return undefined;
+    }
+    if (quantity > remainingQuantity + MIN_BASE_QUANTITY) {
+      order.quantity = roundAsset(order.filledQuantity + quantity);
+      if (order.side === "buy") {
+        order.estimatedQuoteCost = Math.max(
+          order.estimatedQuoteCost,
+          roundQuote((cleanPositive(input.quoteQuantity) || price * quantity) + input.feeQuote),
+        );
+      }
     }
 
     const quoteQuantity = roundQuote(
@@ -1059,7 +1064,9 @@ export class SimulatedTradingBot {
     spentQuote: number,
   ): void {
     const reservedPortion =
-      order.status === "open" ? remainingOrderReserveQuote(order, quantity) : 0;
+      order.status === "open"
+        ? Math.min(this.state.quoteReserved, remainingOrderReserveQuote(order, quantity))
+        : 0;
     if (reservedPortion > 0) {
       this.state.quoteReserved = roundQuote(
         Math.max(0, this.state.quoteReserved - reservedPortion),
@@ -1125,9 +1132,9 @@ export class SimulatedTradingBot {
 
     if (!liquidated && this.state.status === "running") {
       if (events) {
-        events.push(...this.evaluateStrategy(tick, collectEvents));
+        events.push(...this.evaluateStrategy(tick, collectEvents, options));
       } else {
-        this.evaluateStrategy(tick, collectEvents);
+        this.evaluateStrategy(tick, collectEvents, options);
       }
     }
 
@@ -1137,15 +1144,23 @@ export class SimulatedTradingBot {
     return events ?? [];
   }
 
-  private evaluateStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
-    return this.evaluateLegacyValleyPeakStrategy(tick, collectEvents);
+  private evaluateStrategy(
+    tick: PriceTick,
+    collectEvents: boolean,
+    options: TickProcessingOptions,
+  ): BotEvent[] {
+    return this.evaluateLegacyValleyPeakStrategy(tick, collectEvents, options);
   }
 
-  private evaluateLegacyValleyPeakStrategy(tick: PriceTick, collectEvents: boolean): BotEvent[] {
+  private evaluateLegacyValleyPeakStrategy(
+    tick: PriceTick,
+    collectEvents: boolean,
+    options: TickProcessingOptions,
+  ): BotEvent[] {
     const config = this.state.config;
 
     if (config.legacyValleyPeak.exitGridEnabled) {
-      return this.evaluateLegacyValleyPeakExitGridStrategy(tick, collectEvents);
+      return this.evaluateLegacyValleyPeakExitGridStrategy(tick, collectEvents, options);
     }
 
     if (this.openOrderIndexes.size >= config.maxOpenOrders) {
@@ -1224,6 +1239,7 @@ export class SimulatedTradingBot {
   private evaluateLegacyValleyPeakExitGridStrategy(
     tick: PriceTick,
     collectEvents: boolean,
+    options: TickProcessingOptions,
   ): BotEvent[] {
     const config = this.state.config;
     const legacyConfig = config.legacyValleyPeak;
@@ -1333,17 +1349,22 @@ export class SimulatedTradingBot {
           tick.eventTime,
           decision.reason,
           decision.quoteSize,
+          { fillImmediately: !options.deferMarketOrderFills },
         );
         if (result.order) {
-          acted = true;
-          this.syncLegacyExitGridMemories(
-            memory,
-            this.activeLegacyLongLots(tick.price),
-            tick.price,
-            "long",
-          );
+          if (options.deferMarketOrderFills) {
+            orders.push(result.order);
+          } else {
+            acted = true;
+            this.syncLegacyExitGridMemories(
+              memory,
+              this.activeLegacyLongLots(tick.price),
+              tick.price,
+              "long",
+            );
+          }
         }
-        if (events && result.order) {
+        if (events && result.order && !options.deferMarketOrderFills) {
           events.push(...this.immediateOrderEvents("BUY", result, tick.eventTime));
         }
       } else if (
@@ -1409,17 +1430,22 @@ export class SimulatedTradingBot {
             tick.eventTime,
             decision.reason,
             decision.quoteSize,
+            { fillImmediately: !options.deferMarketOrderFills },
           );
           if (result.order) {
-            acted = true;
-            this.syncLegacyExitGridMemories(
-              memory,
-              this.activeLegacyShortLots(tick.price),
-              tick.price,
-              "short",
-            );
+            if (options.deferMarketOrderFills) {
+              orders.push(result.order);
+            } else {
+              acted = true;
+              this.syncLegacyExitGridMemories(
+                memory,
+                this.activeLegacyShortLots(tick.price),
+                tick.price,
+                "short",
+              );
+            }
           }
-          if (events && result.order) {
+          if (events && result.order && !options.deferMarketOrderFills) {
             events.push(...this.immediateOrderEvents("SELL", result, tick.eventTime));
           }
         } else {
@@ -1452,13 +1478,17 @@ export class SimulatedTradingBot {
           message:
             order.reason.startsWith(LEGACY_EXIT_GRID_REASON)
               ? `${order.side.toUpperCase()} exit grid order created at ${order.price}`
-              : `${order.side.toUpperCase()} limit order created: ${order.reason}`,
+              : `${order.side.toUpperCase()} ${order.type} order created: ${order.reason}`,
           order: structuredClone(order),
         });
       }
-      events.push(...this.fillOpenOrders(tick, true));
+      if (!options.deferMarketOrderFills) {
+        events.push(...this.fillOpenOrders(tick, true));
+      }
     } else {
-      this.fillOpenOrders(tick, false);
+      if (!options.deferMarketOrderFills) {
+        this.fillOpenOrders(tick, false);
+      }
     }
 
     return events ?? NO_EVENTS;
@@ -1566,6 +1596,7 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
+    options: { fillImmediately?: boolean } = {},
   ): ImmediateOrderResult {
     const config = this.state.config;
     if (!config.legacyValleyPeak.longSideEnabled) {
@@ -1604,6 +1635,12 @@ export class SimulatedTradingBot {
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
 
+    if (options.fillImmediately === false) {
+      return {
+        order: this.state.orders[index],
+      };
+    }
+
     const result = this.tryFillOrder(order, index, createdAt);
     return {
       order: this.state.orders[index],
@@ -1617,6 +1654,7 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
+    options: { fillImmediately?: boolean } = {},
   ): ImmediateOrderResult {
     const config = this.state.config;
     const availableQuote = this.shortEntrySellingPowerQuote(marketPrice);
@@ -1638,6 +1676,12 @@ export class SimulatedTradingBot {
     order.positionEffect = "open";
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
+
+    if (options.fillImmediately === false) {
+      return {
+        order: this.state.orders[index],
+      };
+    }
 
     const result = this.tryFillOrder(order, index, createdAt);
     return {

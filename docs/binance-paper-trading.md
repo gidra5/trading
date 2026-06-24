@@ -99,5 +99,11 @@ BINANCE_PAPER_API_KEY=KifpW53tsEfJPBHiiUNrhvlAwmOL7tk54B8xexX7XhDDjy84Kszj3Ah9f5
 BINANCE_PAPER_API_SECRET=pkePwOWIyVLJ86HvmOMfm5fpmjnvP2dCX3t9SPrznRzlfKWUL0UYXmzmluEjKWaf \
 TRADING_SHORT_MARGIN_MODEL=futures-margin \
 TRADING_MAX_LEVERAGE=1 \
+TRADING_BINANCE_PAPER_AUTO_SUBMIT=true \
 npm run dev -w @trading/server
+```
+
+optional web ui for it:
+```bash
+npm run dev -w @trading/web
 ```
