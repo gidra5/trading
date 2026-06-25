@@ -198,6 +198,29 @@ export function createLegacyValleyPeakConfig(
   return config;
 }
 
+export function legacyValleyPeakHistoricalWarmupSec(
+  config: LegacyValleyPeakConfig,
+): number {
+  return Math.max(
+    ...config.averagingRangesSec,
+    config.saturationSec,
+    ...PRICE_RANGE_WINDOWS.map((range) => range.windowSec),
+  );
+}
+
+export function legacyValleyPeakObservedWarmupSec(
+  memory: LegacyValleyPeakMemory | undefined,
+): number {
+  if (!memory?.priceRanges?.length) {
+    return 0;
+  }
+
+  return Math.max(
+    0,
+    ...memory.priceRanges.map((range) => priceRangeSampleStats(range).spanMs / 1000),
+  );
+}
+
 export function createLegacyValleyPeakMemory(
   config: LegacyValleyPeakConfig,
 ): LegacyValleyPeakMemory {
@@ -357,6 +380,7 @@ export function createLegacyValleyPeakDebugSnapshot(
     }),
     candleRanges: config.averagingRangesSec.map((windowSec, index) => {
       const point = memory.candleRanges[index]?.points.at(-1);
+      const stats = candleRangeSampleStats(memory.candleRanges[index], windowSec);
       return {
         index,
         windowSec,
@@ -364,10 +388,13 @@ export function createLegacyValleyPeakDebugSnapshot(
         maxPct: point?.maxPct,
         currentPct: point?.currentPct,
         count: point?.count,
+        sampleCount: stats.sampleCount,
+        sampleSpanMs: stats.spanMs,
       };
     }),
     priceRanges: memory.priceRanges.map((range) => {
       const point = range.points.at(-1);
+      const stats = priceRangeSampleStats(range);
       return {
         window: range.window,
         windowSec: range.windowSec,
@@ -375,6 +402,8 @@ export function createLegacyValleyPeakDebugSnapshot(
         maxPrice: point?.maxPrice,
         rangePct: point?.rangePct,
         updatedAt: point?.updatedAt,
+        sampleCount: stats.sampleCount,
+        sampleSpanMs: stats.spanMs,
       };
     }),
     buyCheck: buildLegacyValleyPeakCheckDebug(
@@ -941,6 +970,39 @@ function recordCandleRangePointValue(
   latest.count = point.count;
 }
 
+function candleRangeSampleStats(
+  memory: RollingCandleRangeMemory | undefined,
+  rangeSec: number,
+): { sampleCount: number; spanMs: number } {
+  if (!memory || rangeSec <= 0) {
+    return { sampleCount: 0, spanMs: 0 };
+  }
+
+  const starts = [
+    ...memory.timestamps,
+    ...(memory.current ? [memory.current.bucketStartSec] : []),
+  ]
+    .filter(isNonNegativeFinite)
+    .sort((left, right) => left - right);
+  if (starts.length === 0) {
+    return { sampleCount: 0, spanMs: 0 };
+  }
+
+  const latestPoint = memory.points.at(-1);
+  const sampleCount = Math.min(starts.length, Math.max(0, latestPoint?.count ?? starts.length));
+  if (sampleCount <= 0) {
+    return { sampleCount: 0, spanMs: 0 };
+  }
+
+  const includedStarts = starts.slice(-sampleCount);
+  const first = includedStarts[0];
+  const last = includedStarts[includedStarts.length - 1];
+  return {
+    sampleCount,
+    spanMs: Math.max(0, last - first + rangeSec) * 1000,
+  };
+}
+
 function candleRangePct(bucket: RollingCandleRangeBucket): number | undefined {
   if (
     !isPositiveFinite(bucket.open) ||
@@ -1007,6 +1069,7 @@ function observePriceRangeSample(
 
   if (!current || bucketStartSec > current.bucketStartSec) {
     finalizePriceRangeBucket(memory);
+    rememberPriceRangeBucketStart(memory, bucketStartSec);
     memory.current = {
       bucketStartSec,
       low,
@@ -1052,6 +1115,12 @@ function expireRollingPriceRange(
 ): void {
   const cutoffSec = nowSec - memory.windowSec;
   while (
+    memory.bucketStarts.length > 0 &&
+    memory.bucketStarts[0] + memory.bucketSec <= cutoffSec
+  ) {
+    memory.bucketStarts.shift();
+  }
+  while (
     memory.minCandidates.length > 0 &&
     memory.minCandidates[0].bucketStartSec + memory.bucketSec <= cutoffSec
   ) {
@@ -1063,6 +1132,16 @@ function expireRollingPriceRange(
   ) {
     memory.maxCandidates.shift();
   }
+}
+
+function rememberPriceRangeBucketStart(
+  memory: RollingPriceRangeMemory,
+  bucketStartSec: number,
+): void {
+  if (memory.bucketStarts[memory.bucketStarts.length - 1] === bucketStartSec) {
+    return;
+  }
+  memory.bucketStarts.push(bucketStartSec);
 }
 
 function recordRollingPriceRangePoint(
@@ -1131,6 +1210,32 @@ function recordRollingPriceRangePointValue(
   latest.maxPrice = point.maxPrice;
   latest.rangePct = point.rangePct;
   latest.updatedAt = point.updatedAt;
+}
+
+function priceRangeSampleStats(
+  memory: RollingPriceRangeMemory | undefined,
+): { sampleCount: number; spanMs: number } {
+  if (!memory) {
+    return { sampleCount: 0, spanMs: 0 };
+  }
+
+  const starts = [
+    ...(memory.bucketStarts ?? []),
+    ...(memory.current ? [memory.current.bucketStartSec] : []),
+  ]
+    .filter(isNonNegativeFinite)
+    .sort((left, right) => left - right);
+  const uniqueStarts = [...new Set(starts)];
+  if (uniqueStarts.length === 0) {
+    return { sampleCount: 0, spanMs: 0 };
+  }
+
+  const first = uniqueStarts[0];
+  const last = uniqueStarts[uniqueStarts.length - 1];
+  return {
+    sampleCount: uniqueStarts.length,
+    spanMs: Math.max(0, last - first + memory.bucketSec) * 1000,
+  };
 }
 
 function sampleAverage(
@@ -1260,6 +1365,7 @@ function createRollingPriceRangeMemory(
     window,
     windowSec,
     bucketSec: PRICE_RANGE_BUCKET_SEC,
+    bucketStarts: [],
     minCandidates: [],
     maxCandidates: [],
     points: [],
@@ -1408,10 +1514,27 @@ function normalizePriceRange(
     windowSec,
     bucketSec: PRICE_RANGE_BUCKET_SEC,
     current: normalizePriceRangeBucket(memory?.current),
+    bucketStarts: normalizePriceRangeBucketStarts(memory),
     minCandidates: normalizePriceRangeBuckets(memory?.minCandidates),
     maxCandidates: normalizePriceRangeBuckets(memory?.maxCandidates),
     points: normalizePriceRangePoints(memory?.points, window, windowSec),
   };
+}
+
+function normalizePriceRangeBucketStarts(
+  memory: RollingPriceRangeMemory | undefined,
+): number[] {
+  const starts = Array.isArray(memory?.bucketStarts)
+    ? memory.bucketStarts
+    : [
+        ...(memory?.minCandidates ?? []).map((bucket) => bucket.bucketStartSec),
+        ...(memory?.maxCandidates ?? []).map((bucket) => bucket.bucketStartSec),
+        ...(memory?.current ? [memory.current.bucketStartSec] : []),
+      ];
+
+  return [...new Set(starts)]
+    .filter(isNonNegativeFinite)
+    .sort((left, right) => left - right);
 }
 
 function normalizePriceRangeBuckets(

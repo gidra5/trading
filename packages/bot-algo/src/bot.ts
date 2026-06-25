@@ -773,13 +773,14 @@ export class SimulatedTradingBot {
   }
 
   warmupFromCandles(candles: readonly Candle[]): number {
+    const previousMemory = this.ensureLegacyValleyPeakMemory();
+    const nextMemory = createLegacyValleyPeakMemory(this.state.config.legacyValleyPeak);
+    nextMemory.exitGrids = previousMemory.exitGrids;
+    this.state.memory.legacyValleyPeak = nextMemory;
+
     let processed = 0;
     for (const candle of candles) {
-      const duration = Math.max(1, candle.closeTime - candle.openTime);
-      processed += this.warmupPrice(candle.openTime, candle.open);
-      processed += this.warmupPrice(candle.openTime + duration * 0.33, candle.high);
-      processed += this.warmupPrice(candle.openTime + duration * 0.66, candle.low);
-      processed += this.warmupPrice(candle.closeTime, candle.close);
+      processed += this.warmupPrice(candle.closeTime, candle.close, candle);
     }
     if (processed > 0) {
       recalculateMetrics(this.state);
@@ -787,7 +788,7 @@ export class SimulatedTradingBot {
     return processed;
   }
 
-  private warmupPrice(eventTime: number, price: number): number {
+  private warmupPrice(eventTime: number, price: number, sourceCandle?: Candle): number {
     if (!Number.isFinite(price) || price <= 0) {
       return 0;
     }
@@ -807,6 +808,7 @@ export class SimulatedTradingBot {
         shortSellingPowerQuote: 0,
         baseFree: 0,
         shortBaseFree: 0,
+        sourceCandle,
       },
     );
     return 1;

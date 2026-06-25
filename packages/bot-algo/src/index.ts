@@ -18,6 +18,8 @@ export {
 export {
   createLegacyValleyPeakConfig,
   defaultLegacyValleyPeakConfig,
+  legacyValleyPeakHistoricalWarmupSec,
+  legacyValleyPeakObservedWarmupSec,
   legacyValleyPeakAsymmetricShortFavoringConfig,
   legacyValleyPeakReferenceConfigs,
   legacyValleyPeakStrictSymmetricConfig,

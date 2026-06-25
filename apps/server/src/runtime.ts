@@ -2,6 +2,8 @@ import {
   SimulatedTradingBot,
   analyzePositions,
   createStrategyConfig,
+  legacyValleyPeakHistoricalWarmupSec,
+  legacyValleyPeakObservedWarmupSec,
   runBacktestFromCandles,
   runBacktestFromOrderBook,
   type BacktestPreset,
@@ -38,6 +40,7 @@ import {
   type BinancePaperSnapshot,
   type BinancePaperTrade,
 } from "./binance-paper.js";
+import { HistoricalCandleCache } from "./historical-candle-cache.js";
 import type { TradingStorage } from "./storage.js";
 
 const PUBLIC_ORDER_LIMIT = 500;
@@ -699,7 +702,7 @@ export class TradingRuntime {
     if (processed <= 0) {
       return;
     }
-    for (const candle of candles) {
+    for (const candle of candles.slice(-500)) {
       upsertCandle(this.candles, candle, 500);
     }
     await this.flushState();
@@ -710,14 +713,21 @@ export class TradingRuntime {
     if (!memory) {
       return true;
     }
-    return memory.buyAverages.every((average) => average.timestamps.length === 0);
+    if (memory.buyAverages.every((average) => average.timestamps.length === 0)) {
+      return true;
+    }
+
+    const requiredWarmupSec = legacyValleyPeakHistoricalWarmupSec(
+      this.config.legacyValleyPeak,
+    );
+    const observedWarmupSec = legacyValleyPeakObservedWarmupSec(memory);
+    return observedWarmupSec < requiredWarmupSec * 0.95;
   }
 
   private async loadWarmupCandles(): Promise<Candle[]> {
     const intervalMs = intervalToMs(this.interval);
     const config = this.config.legacyValleyPeak;
-    const warmupMs =
-      (Math.max(...config.averagingRangesSec, 0) + config.saturationSec) * 1000;
+    const warmupMs = legacyValleyPeakHistoricalWarmupSec(config) * 1000;
     const requiredCandles = Math.max(10, Math.ceil(warmupMs / intervalMs) + 5);
     const storedCandles = this.candles
       .filter((candle) => candle.closed)
@@ -730,22 +740,42 @@ export class TradingRuntime {
       return storedCandles;
     }
 
-    const limit = Math.min(1000, requiredCandles);
     const endTime = Date.now();
-    const startTime = endTime - limit * intervalMs;
+    const startTime = endTime - requiredCandles * intervalMs;
     if (!isHistoricalVenue(this.market.venue)) {
       return storedCandles;
     }
+    const venue = this.market.venue;
+
     try {
-      return await fetchKlines({
-        venue: this.market.venue,
+      const cache = new HistoricalCandleCache({
+        dataDir: this.historicalCache.dataDir,
+        marketKey: this.market.id,
         symbol: this.market.symbol,
         interval: this.interval,
-        startTime,
-        endTime,
-        limit,
-        endpoint: this.paperTrading?.klineEndpointFor(this.market),
+        intervalMs,
+        maxBytes: this.historicalCache.maxBytes,
+        minFreeBytes: this.historicalCache.minFreeBytes,
       });
+
+      await cache.ensureRange(startTime, endTime, (request) =>
+        fetchKlines({
+          venue,
+          symbol: this.market.symbol,
+          interval: this.interval,
+          startTime: request.startTime,
+          endTime: request.endTime,
+          limit: request.limit,
+          endpoint: this.paperTrading?.klineEndpointFor(this.market),
+        }),
+      );
+
+      const candles: Candle[] = [];
+      for await (const batch of cache.readRangeBatches(startTime, endTime, 5000)) {
+        candles.push(...batch.filter((candle) => candle.closed));
+      }
+
+      return candles.length > 0 ? candles : storedCandles;
     } catch {
       return storedCandles;
     }

@@ -217,6 +217,7 @@ export interface RollingPriceRangeMemory {
   windowSec: number;
   bucketSec: number;
   current?: RollingPriceRangeBucket;
+  bucketStarts: number[];
   minCandidates: RollingPriceRangeBucket[];
   maxCandidates: RollingPriceRangeBucket[];
   points: RollingPriceRangePoint[];
@@ -277,6 +278,8 @@ export interface LegacyValleyPeakCandleRangeDebug {
   maxPct?: number;
   currentPct?: number;
   count?: number;
+  sampleCount?: number;
+  sampleSpanMs?: number;
 }
 
 export interface LegacyValleyPeakPriceRangeDebug {
@@ -286,6 +289,8 @@ export interface LegacyValleyPeakPriceRangeDebug {
   maxPrice?: number;
   rangePct?: number;
   updatedAt?: number;
+  sampleCount?: number;
+  sampleSpanMs?: number;
 }
 
 export interface LegacyEntryRiskDebug {

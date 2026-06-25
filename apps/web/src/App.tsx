@@ -1820,6 +1820,9 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
                         <div>avg {formatPercent(range.avgPct)}</div>
                         <div>max {formatPercent(range.maxPct)}</div>
                         <div>now {formatPercent(range.currentPct)}</div>
+                        <div class="text-ink-500">
+                          {formatRangeCoverage(range.sampleCount, range.sampleSpanMs)}
+                        </div>
                       </div>
                     )}
                   </For>
@@ -1835,6 +1838,9 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
                         <div class="tabular-nums">
                           ${formatQuote(range.minPrice, 2)} - ${formatQuote(range.maxPrice, 2)}
                           <span class="ml-2 text-ink-400">{formatPercent(range.rangePct)}</span>
+                          <div class="text-ink-500">
+                            {formatRangeCoverage(range.sampleCount, range.sampleSpanMs)}
+                          </div>
                         </div>
                       </div>
                     )}
@@ -1950,6 +1956,17 @@ function SmallMetric(props: { label: string; value: string }) {
       <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">{props.value}</div>
     </div>
   );
+}
+
+function formatRangeCoverage(
+  sampleCount: number | undefined,
+  spanMs: number | undefined,
+): string {
+  if (!sampleCount || sampleCount <= 0 || !spanMs || spanMs <= 0) {
+    return "no loaded samples";
+  }
+
+  return `${formatQuote(sampleCount, 0)} samples / ${formatDuration(spanMs)}`;
 }
 
 function formatLeverage(value: number | undefined): string {
