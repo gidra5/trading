@@ -52,6 +52,7 @@ export interface TickProcessingOptions {
   simulateLiquidation?: boolean;
   processOpenOrders?: boolean;
   deferMarketOrderFills?: boolean;
+  debug?: boolean;
   sourceCandle?: Candle;
 }
 

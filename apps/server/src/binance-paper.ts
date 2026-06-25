@@ -46,6 +46,8 @@ export interface BinancePaperPosition {
   updateTime?: number;
 }
 
+export type BinancePaperPositionMode = "one-way" | "hedge";
+
 export interface BinancePaperOrder {
   symbol: string;
   orderId: string;
@@ -122,6 +124,7 @@ export interface BinancePaperSnapshot {
   userDataStreamMessage?: string;
   lastSyncAt?: number;
   lastSubmitAt?: number;
+  positionMode?: BinancePaperPositionMode;
   message: string;
   error?: string;
   maxLeverage?: number;
@@ -207,6 +210,10 @@ export class BinancePaperTrading {
   private timeOffsets = new Map<string, number>();
   private symbolFilters = new Map<string, BinancePaperSymbolFilters>();
   private maxLeverageBySymbol = new Map<string, number>();
+  private positionModeByMode = new Map<BinancePaperMode, {
+    mode: BinancePaperPositionMode;
+    fetchedAt: number;
+  }>();
 
   constructor(private readonly config: BinancePaperConfig) {}
 
@@ -396,6 +403,7 @@ export class BinancePaperTrading {
       maxLeverage,
       commission,
       estimatedSlippageBps,
+      positionMode,
     ] = await Promise.all([
       this.fetchBalances(environment),
       this.fetchAccount(environment),
@@ -406,6 +414,7 @@ export class BinancePaperTrading {
       this.fetchMaxLeverage(environment, market.symbol),
       this.fetchCommission(environment, market.symbol),
       this.fetchEstimatedSlippageBps(environment, market.symbol),
+      this.fetchPositionMode(environment),
     ]);
     const ordersById = new Map(recentOrders.map((order) => [order.orderId, order]));
     const trades = recentTrades.map((trade) => ({
@@ -420,6 +429,7 @@ export class BinancePaperTrading {
       compatible: true,
       connected: true,
       lastSyncAt: Date.now(),
+      positionMode,
       message: "Binance paper account synced",
       error: undefined,
       maxLeverage,
@@ -477,6 +487,12 @@ export class BinancePaperTrading {
       return undefined;
     }
 
+    const reduceOnly = order.positionEffect === "close" ? true : undefined;
+    const positionSide =
+      environment.product === "spot"
+        ? undefined
+        : futuresPositionSideForBotOrder(order);
+
     return this.placeOrder(market, {
       symbol: market.symbol,
       side: order.side,
@@ -484,7 +500,8 @@ export class BinancePaperTrading {
       quantity: order.quantity,
       price: order.price,
       timeInForce: "GTC",
-      reduceOnly: environment.product !== "spot" && order.positionEffect === "close",
+      reduceOnly,
+      positionSide,
       clientOrderId: clientOrderIdForBotOrder(order.id),
     });
   }
@@ -825,21 +842,23 @@ export class BinancePaperTrading {
     market: BinanceMarketListing,
     input: BinancePaperPlaceOrderInput,
   ): Promise<BinancePaperPlaceOrderInput> {
+    const positionMode = await this.fetchPositionMode(environment);
+    const positionInput = normalizeFuturesPositionModeInput(input, positionMode, environment);
     const filters = await this.fetchSymbolFilters(environment, market.symbol);
     if (!filters) {
-      return input;
+      return positionInput;
     }
 
     const price =
-      input.type === "limit"
-        ? normalizePrice(input.price, input.side, filters)
-        : input.price;
-    const quantity = normalizeQuantity(input.quantity, input.type, filters);
+      positionInput.type === "limit"
+        ? normalizePrice(positionInput.price, positionInput.side, filters)
+        : positionInput.price;
+    const quantity = normalizeQuantity(positionInput.quantity, positionInput.type, filters);
     const effectivePrice =
-      input.type === "limit"
+      positionInput.type === "limit"
         ? price
-        : Number.isFinite(Number(input.price)) && Number(input.price) > 0
-          ? Number(input.price)
+        : Number.isFinite(Number(positionInput.price)) && Number(positionInput.price) > 0
+          ? Number(positionInput.price)
           : undefined;
     const minNotional = filters.minNotional ?? 0;
     let adjustedQuantity = quantity;
@@ -847,18 +866,45 @@ export class BinancePaperTrading {
     if (minNotional > 0 && effectivePrice && effectivePrice * adjustedQuantity < minNotional) {
       adjustedQuantity = normalizeQuantity(
         minNotional / effectivePrice,
-        input.type,
+        positionInput.type,
         filters,
         "ceil",
       );
     }
 
-    validateNormalizedOrder(input, adjustedQuantity, effectivePrice, filters);
+    validateNormalizedOrder(positionInput, adjustedQuantity, effectivePrice, filters);
     return {
-      ...input,
-      price: input.type === "limit" ? effectivePrice : input.price,
+      ...positionInput,
+      price: positionInput.type === "limit" ? effectivePrice : positionInput.price,
       quantity: adjustedQuantity,
     };
+  }
+
+  private async fetchPositionMode(
+    environment: ResolvedPaperEnvironment,
+  ): Promise<BinancePaperPositionMode | undefined> {
+    if (environment.product === "spot") {
+      return undefined;
+    }
+
+    const cached = this.positionModeByMode.get(environment.mode);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAt < 5 * 60_000) {
+      return cached.mode;
+    }
+
+    try {
+      const payload = await this.signedRequest<Record<string, unknown>>(
+        environment,
+        "GET",
+        positionSideModePath(environment),
+      );
+      const mode = booleanValue(payload.dualSidePosition) ? "hedge" : "one-way";
+      this.positionModeByMode.set(environment.mode, { mode, fetchedAt: now });
+      return mode;
+    } catch {
+      return cached?.mode;
+    }
   }
 
   private async signedRequest<T>(
@@ -1055,6 +1101,10 @@ function leverageBracketPath(environment: ResolvedPaperEnvironment): string {
     : "/fapi/v1/leverageBracket";
 }
 
+function positionSideModePath(environment: ResolvedPaperEnvironment): string {
+  return `${orderRestPrefix(environment)}/positionSide/dual`;
+}
+
 function userDataStreamPath(environment: ResolvedPaperEnvironment): string {
   return `${orderRestPrefix(environment)}/listenKey`;
 }
@@ -1175,6 +1225,56 @@ function decimalPrecision(step: number): number {
     return 0;
   }
   return text.length - dotIndex - 1;
+}
+
+function normalizeFuturesPositionModeInput(
+  input: BinancePaperPlaceOrderInput,
+  positionMode: BinancePaperPositionMode | undefined,
+  environment: ResolvedPaperEnvironment,
+): BinancePaperPlaceOrderInput {
+  if (environment.product === "spot") {
+    return {
+      ...input,
+      reduceOnly: undefined,
+      positionSide: undefined,
+    };
+  }
+
+  if (positionMode === "hedge") {
+    return {
+      ...input,
+      reduceOnly: undefined,
+      positionSide: input.positionSide ?? inferHedgePositionSide(input),
+    };
+  }
+
+  return {
+    ...input,
+    reduceOnly: input.reduceOnly ? true : undefined,
+    positionSide: input.positionSide === "BOTH" ? "BOTH" : undefined,
+  };
+}
+
+function inferHedgePositionSide(
+  input: BinancePaperPlaceOrderInput,
+): "LONG" | "SHORT" {
+  if (input.reduceOnly) {
+    return input.side === "sell" ? "LONG" : "SHORT";
+  }
+
+  return input.side === "buy" ? "LONG" : "SHORT";
+}
+
+function futuresPositionSideForBotOrder(
+  order: TradingOrder,
+): "LONG" | "SHORT" | undefined {
+  if (order.positionEffect === "close") {
+    return order.side === "sell" ? "LONG" : "SHORT";
+  }
+  if (order.positionEffect === "open") {
+    return order.side === "buy" ? "LONG" : "SHORT";
+  }
+  return undefined;
 }
 
 function orderParams(

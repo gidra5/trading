@@ -604,7 +604,8 @@ export class TradingRuntime {
           await this.applyExchangeSnapshot(snapshot);
         }
       } catch (error) {
-        const cancelled = this.bot.cancelOpenOrder(event.order.id, "exchange submit failed");
+        const reason = exchangeSubmitFailureReason(error);
+        const cancelled = this.bot.cancelOpenOrder(event.order.id, reason);
         this.recordEvents(cancelled);
         await this.flushState();
         if (options.throwOnFailure) {
@@ -1499,6 +1500,11 @@ function disabledExchangeSnapshot(): BinancePaperSnapshot {
     recentOrders: [],
     recentTrades: [],
   };
+}
+
+function exchangeSubmitFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message.trim() : "";
+  return message ? `exchange submit failed: ${message}` : "exchange submit failed";
 }
 
 function exchangeReconciliationFromSnapshot(

@@ -411,6 +411,7 @@ export function runBacktestFromOrderBook(
         collectEvents: false,
         updateMetrics: false,
         simulateLiquidation: true,
+        debug: false,
       },
     );
     const liquidated = bot.liquidatedPositionCount() > liquidatedBefore;
@@ -489,6 +490,7 @@ export function runBacktestFromTicks(
       collectEvents: false,
       updateMetrics: false,
       simulateLiquidation: true,
+      debug: false,
     });
     const liquidated = bot.liquidatedPositionCount() > liquidatedBefore;
     if (index % sampleEvery === 0 || index === ticks.length - 1 || liquidated) {

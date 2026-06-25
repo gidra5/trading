@@ -129,6 +129,13 @@ interface LegacyPositionLotCache {
   processedFillsLength: number;
   longs: Map<string, LegacyTrackedLongLot>;
   shorts: Map<string, LegacyTrackedShortLot>;
+  activeLongQuantity: number;
+  activeLongCostQuote: number;
+  activeShortQuantity: number;
+  activeShortProceedsQuote: number;
+  internalBorrowedQuantity: number;
+  shortInternalBorrowCapacityQuantity: number;
+  longInternalBorrowCapacityQuote: number;
 }
 
 interface LegacyTrackedLongLot extends LegacyLongExitGridLot {
@@ -766,7 +773,7 @@ export class SimulatedTradingBot {
     this.rememberPrice(price);
 
     if (this.state.status === "running") {
-      this.evaluateStrategy(tick, false, {});
+      this.evaluateStrategy(tick, false, { debug: false });
     }
 
     return NO_EVENTS;
@@ -1267,13 +1274,15 @@ export class SimulatedTradingBot {
       config.legacyValleyPeak,
       input,
     );
-    this.recordLegacyValleyPeakDebug(
-      memory,
-      input,
-      decision,
-      longEntryRisk,
-      shortEntryRisk,
-    );
+    if (options.debug !== false) {
+      this.recordLegacyValleyPeakDebug(
+        memory,
+        input,
+        decision,
+        longEntryRisk,
+        shortEntryRisk,
+      );
+    }
 
     if (decision.signal === "hold") {
       this.state.memory.lastSignal = "hold";
@@ -1379,13 +1388,15 @@ export class SimulatedTradingBot {
       legacyConfig,
       input,
     );
-    this.recordLegacyValleyPeakDebug(
-      memory,
-      input,
-      decision,
-      longEntryRisk,
-      shortEntryRisk,
-    );
+    if (options.debug !== false) {
+      this.recordLegacyValleyPeakDebug(
+        memory,
+        input,
+        decision,
+        longEntryRisk,
+        shortEntryRisk,
+      );
+    }
 
     if (decision.signal !== "buy" && decision.signal !== "sell") {
       this.state.memory.lastSignal = decision.signal;
@@ -2194,10 +2205,18 @@ export class SimulatedTradingBot {
         processedFillsLength: 0,
         longs: new Map(),
         shorts: new Map(),
+        activeLongQuantity: 0,
+        activeLongCostQuote: 0,
+        activeShortQuantity: 0,
+        activeShortProceedsQuote: 0,
+        internalBorrowedQuantity: 0,
+        shortInternalBorrowCapacityQuantity: 0,
+        longInternalBorrowCapacityQuote: 0,
       };
     }
 
     const cache = this.legacyPositionLotCache;
+    const previousProcessedFillsLength = cache.processedFillsLength;
     for (
       let index = cache.processedFillsLength;
       index < this.state.fills.length;
@@ -2224,6 +2243,68 @@ export class SimulatedTradingBot {
     }
 
     cache.processedFillsLength = this.state.fills.length;
+    if (cache.processedFillsLength !== previousProcessedFillsLength) {
+      this.refreshLegacyPositionLotCacheSummary(cache);
+    }
+  }
+
+  private refreshLegacyPositionLotCacheSummary(cache: LegacyPositionLotCache): void {
+    let activeLongQuantity = 0;
+    let activeLongCostQuote = 0;
+    let activeShortQuantity = 0;
+    let activeShortProceedsQuote = 0;
+    let internalBorrowedQuantity = 0;
+    let shortInternalBorrowCapacityQuantity = 0;
+    let longInternalBorrowCapacityQuote = 0;
+
+    for (const lot of cache.longs.values()) {
+      for (const allocation of lot.borrowAllocations) {
+        internalBorrowedQuantity += Math.max(0, allocation.quantity);
+      }
+      if (lot.remainingQuantity <= MIN_BASE_QUANTITY) {
+        continue;
+      }
+
+      activeLongQuantity += lot.remainingQuantity;
+      activeLongCostQuote += Math.max(0, lot.remainingCostQuote);
+      if (lot.borrowDepthRemaining <= 0 || hasLotLifecycleControls(lot)) {
+        continue;
+      }
+
+      shortInternalBorrowCapacityQuantity += Math.max(
+        0,
+        lot.remainingQuantity - lot.lentQuantity,
+      );
+    }
+
+    for (const lot of cache.shorts.values()) {
+      for (const allocation of lot.borrowAllocations) {
+        internalBorrowedQuantity += Math.max(0, allocation.quantity);
+      }
+      if (lot.remainingQuantity <= MIN_BASE_QUANTITY) {
+        continue;
+      }
+
+      activeShortQuantity += lot.remainingQuantity;
+      activeShortProceedsQuote += Math.max(0, lot.remainingProceedsQuote);
+      if (
+        lot.borrowDepthRemaining <= 0 ||
+        hasLotLifecycleControls(lot) ||
+        lot.remainingProceedsQuote <= 0
+      ) {
+        continue;
+      }
+
+      longInternalBorrowCapacityQuote += Math.max(0, lot.remainingProceedsQuote);
+    }
+
+    cache.activeLongQuantity = roundAsset(activeLongQuantity);
+    cache.activeLongCostQuote = roundQuote(activeLongCostQuote);
+    cache.activeShortQuantity = roundAsset(activeShortQuantity);
+    cache.activeShortProceedsQuote = roundQuote(activeShortProceedsQuote);
+    cache.internalBorrowedQuantity = roundAsset(internalBorrowedQuantity);
+    cache.shortInternalBorrowCapacityQuantity = roundAsset(shortInternalBorrowCapacityQuantity);
+    cache.longInternalBorrowCapacityQuote = roundQuote(longInternalBorrowCapacityQuote);
   }
 
   private applyLegacyBuyFillToPositionCache(
@@ -3890,29 +3971,12 @@ export class SimulatedTradingBot {
       return;
     }
 
-    let longQuantity = 0;
-    let longCost = 0;
-    for (const lot of cache.longs.values()) {
-      if (lot.remainingQuantity <= MIN_BASE_QUANTITY) {
-        continue;
-      }
-      longQuantity += lot.remainingQuantity;
-      longCost += lot.remainingCostQuote;
-    }
-
-    let shortQuantity = 0;
-    let shortProceeds = 0;
-    for (const lot of cache.shorts.values()) {
-      if (lot.remainingQuantity <= MIN_BASE_QUANTITY) {
-        continue;
-      }
-      shortQuantity += lot.remainingQuantity;
-      shortProceeds += lot.remainingProceedsQuote;
-    }
-
-    this.state.avgEntryPrice = longQuantity > 0 ? roundQuote(longCost / longQuantity) : 0;
+    const longQuantity = cache.activeLongQuantity;
+    const shortQuantity = cache.activeShortQuantity;
+    this.state.avgEntryPrice =
+      longQuantity > 0 ? roundQuote(cache.activeLongCostQuote / longQuantity) : 0;
     this.state.avgShortEntryPrice =
-      shortQuantity > 0 ? roundQuote(shortProceeds / shortQuantity) : 0;
+      shortQuantity > 0 ? roundQuote(cache.activeShortProceedsQuote / shortQuantity) : 0;
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
@@ -3978,21 +4042,21 @@ export class SimulatedTradingBot {
   }
 
   private activeLongQuantity(): number {
-    return roundAsset(
-      this.activeLegacyLongLots(this.state.lastPrice || this.state.avgEntryPrice || 0).reduce(
-        (quantity, lot) => quantity + lot.remainingQuantity,
-        0,
-      ),
-    );
+    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+      return roundAsset(Math.max(0, this.totalBase()));
+    }
+
+    this.updateLegacyPositionLotCache();
+    return this.legacyPositionLotCache?.activeLongQuantity ?? 0;
   }
 
   private activeShortQuantity(): number {
-    return roundAsset(
-      this.activeLegacyShortLots(this.state.lastPrice || this.state.avgShortEntryPrice || 0).reduce(
-        (quantity, lot) => quantity + lot.remainingQuantity,
-        0,
-      ),
-    );
+    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+      return roundAsset(Math.max(0, -this.totalBase()));
+    }
+
+    this.updateLegacyPositionLotCache();
+    return this.legacyPositionLotCache?.activeShortQuantity ?? 0;
   }
 
   private activeLongExposureQuote(marketPrice: number): number {
@@ -4468,19 +4532,7 @@ export class SimulatedTradingBot {
       return 0;
     }
 
-    let quantity = 0;
-    for (const short of cache.shorts.values()) {
-      for (const allocation of short.borrowAllocations) {
-        quantity += Math.max(0, allocation.quantity);
-      }
-    }
-    for (const long of cache.longs.values()) {
-      for (const allocation of long.borrowAllocations) {
-        quantity += Math.max(0, allocation.quantity);
-      }
-    }
-
-    return roundQuote(quantity * marketPrice);
+    return roundQuote(cache.internalBorrowedQuantity * marketPrice);
   }
 
   private shortInternalBorrowCapacityQuote(marketPrice: number): number {
@@ -4490,22 +4542,7 @@ export class SimulatedTradingBot {
       return 0;
     }
 
-    let quote = 0;
-    for (const lot of cache.longs.values()) {
-      if (lot.borrowDepthRemaining <= 0) {
-        continue;
-      }
-      if (hasLotLifecycleControls(lot)) {
-        continue;
-      }
-      const availableQuantity = Math.max(0, lot.remainingQuantity - lot.lentQuantity);
-      if (availableQuantity <= MIN_BASE_QUANTITY) {
-        continue;
-      }
-      quote += availableQuantity * marketPrice;
-    }
-
-    return roundQuote(quote);
+    return roundQuote(cache.shortInternalBorrowCapacityQuantity * marketPrice);
   }
 
   private longInternalBorrowCapacityQuote(_marketPrice: number): number {
@@ -4515,20 +4552,7 @@ export class SimulatedTradingBot {
       return 0;
     }
 
-    let quote = 0;
-    for (const lot of cache.shorts.values()) {
-      if (
-        lot.borrowDepthRemaining <= 0 ||
-        hasLotLifecycleControls(lot) ||
-        lot.remainingQuantity <= MIN_BASE_QUANTITY ||
-        lot.remainingProceedsQuote <= 0
-      ) {
-        continue;
-      }
-      quote += Math.max(0, lot.remainingProceedsQuote);
-    }
-
-    return roundQuote(quote);
+    return cache.longInternalBorrowCapacityQuote;
   }
 
   private rememberPrice(price: number): void {
