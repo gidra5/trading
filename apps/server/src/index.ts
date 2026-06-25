@@ -64,6 +64,11 @@ const runtime = new TradingRuntime(
     minFreeBytes: appConfig.historicalCache.minFreeBytes,
   },
   paperTrading,
+  {
+    hardStop: appConfig.exchangeAccountGuard.hardStop,
+    onWarning: (message) =>
+      server.log.warn({ subsystem: "exchange-account-guard" }, message),
+  },
 );
 await runtime.init();
 const correlationService = new CorrelationService({

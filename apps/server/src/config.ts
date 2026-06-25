@@ -44,6 +44,9 @@ export const appConfig = {
     lookbackDays: parseNumber(process.env.TRADING_CORRELATION_LOOKBACK_DAYS, 14),
     maxMarkets: Math.max(2, Math.round(parseNumber(process.env.TRADING_CORRELATION_MAX_MARKETS, 60))),
   },
+  exchangeAccountGuard: {
+    hardStop: parseBoolean(process.env.TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP, false),
+  },
   strategy: createStrategyConfig({
     symbol: market.symbol,
     baseAsset: market.baseAsset,

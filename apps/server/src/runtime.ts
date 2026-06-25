@@ -43,6 +43,11 @@ import type { TradingStorage } from "./storage.js";
 const PUBLIC_ORDER_LIMIT = 500;
 const PUBLIC_FILL_LIMIT = 500;
 const PUBLIC_PRICE_MEMORY_LIMIT = 100;
+const BALANCE_EPSILON = 0.000001;
+const ASSET_DRIFT_TOLERANCE_RATE = 0.0001;
+const MIN_ASSET_DRIFT_TOLERANCE = 0.00000001;
+const QUOTE_DRIFT_TOLERANCE_RATE = 0.001;
+const MIN_QUOTE_DRIFT_TOLERANCE = 2;
 
 interface BacktestStartOptions {
   preset: BacktestPreset;
@@ -83,6 +88,11 @@ export interface RuntimeSnapshot {
   exchange: BinancePaperSnapshot;
 }
 
+interface ExchangeAccountGuardOptions {
+  hardStop: boolean;
+  onWarning?: (message: string) => void;
+}
+
 export class TradingRuntime {
   private bot!: SimulatedTradingBot;
   private candles: Candle[] = [];
@@ -99,6 +109,7 @@ export class TradingRuntime {
   private lastSavedOrderBookAt = 0;
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
   private backtestAbort?: AbortController;
+  private exchangeAccountWarningMessage?: string;
 
   constructor(
     private storage: TradingStorage,
@@ -111,16 +122,26 @@ export class TradingRuntime {
       minFreeBytes: number;
     },
     private readonly paperTrading?: BinancePaperTrading,
+    private readonly exchangeAccountGuard: ExchangeAccountGuardOptions = {
+      hardStop: false,
+    },
   ) {}
 
   async init(): Promise<void> {
     await this.storage.ensureReady();
     this.candles = await this.storage.loadCandles(500);
     const savedState = await this.storage.loadBotState();
-    this.config = this.createMarketConfig(savedState);
-    this.bot = new SimulatedTradingBot(savedState, this.config);
-    await this.warmupBotFromHistory(savedState);
-    await this.recoverExchangeState();
+    const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
+    const exchangeStartingQuote = exchangeStartingQuoteForInitialState(
+      exchangeSnapshot,
+      this.market,
+      savedState,
+    );
+    const initialState = rebaseBotStateCapital(savedState, exchangeStartingQuote);
+    this.config = this.createMarketConfig(initialState ?? savedState, exchangeStartingQuote);
+    this.bot = new SimulatedTradingBot(initialState, this.config);
+    await this.warmupBotFromHistory(initialState);
+    await this.recoverExchangeState(exchangeSnapshot);
   }
 
   async switchMarket(
@@ -134,6 +155,7 @@ export class TradingRuntime {
     this.orderBook = undefined;
     this.recentEvents = [];
     this.lastSavedOrderBookAt = 0;
+    this.exchangeAccountWarningMessage = undefined;
     this.backtestAbort?.abort();
     this.backtestAbort = undefined;
     this.backtest = createIdleBacktest();
@@ -147,10 +169,17 @@ export class TradingRuntime {
     await this.storage.ensureReady();
     this.candles = await this.storage.loadCandles(500);
     const savedState = await this.storage.loadBotState();
-    this.config = this.createMarketConfig(savedState);
-    this.bot = new SimulatedTradingBot(savedState, this.config);
-    await this.warmupBotFromHistory(savedState);
-    await this.recoverExchangeState();
+    const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
+    const exchangeStartingQuote = exchangeStartingQuoteForInitialState(
+      exchangeSnapshot,
+      this.market,
+      savedState,
+    );
+    const initialState = rebaseBotStateCapital(savedState, exchangeStartingQuote);
+    this.config = this.createMarketConfig(initialState ?? savedState, exchangeStartingQuote);
+    this.bot = new SimulatedTradingBot(initialState, this.config);
+    await this.warmupBotFromHistory(initialState);
+    await this.recoverExchangeState(exchangeSnapshot);
   }
 
   handleStatus(status: MarketStreamStatus): void {
@@ -159,6 +188,14 @@ export class TradingRuntime {
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
     const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+    if (
+      exchangeDriven &&
+      this.exchangeAccountGuard.hardStop &&
+      this.exchangeAccountWarningMessage
+    ) {
+      return [];
+    }
+
     const events = this.bot.onTick(tick, {
       processOpenOrders: !exchangeDriven,
       deferMarketOrderFills: exchangeDriven,
@@ -238,7 +275,7 @@ export class TradingRuntime {
       positions: analyzePositions(bot as PaperBotState),
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
-      exchange: this.paperTrading?.snapshot(this.market) ?? disabledExchangeSnapshot(),
+      exchange: this.publicExchangeSnapshot(),
     };
   }
 
@@ -258,19 +295,30 @@ export class TradingRuntime {
 
   async resetBot(): Promise<BotEvent[]> {
     const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
+    const exchangeDrivesExecution = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+    this.exchangeAccountWarningMessage = undefined;
+    let resetSnapshot: BinancePaperSnapshot | undefined;
     if (exchangeCanSubmit) {
-      await this.paperTrading!.cancelAllOpenOrders(this.market);
-      await this.paperTrading!.closeOpenPositions(this.market, {
-        includeUnprofitable: true,
-      });
+      resetSnapshot = await this.paperTrading!.cancelAllOpenOrders(this.market);
+      if (resetSnapshot.positions.length > 0) {
+        resetSnapshot = await this.paperTrading!.closeOpenPositions(this.market, {
+          includeUnprofitable: true,
+        });
+      }
+    }
+
+    const exchangeStartingQuote = exchangeDrivesExecution
+      ? exchangeQuoteBalance(resetSnapshot, this.market)
+      : undefined;
+    if (exchangeStartingQuote !== undefined) {
+      this.config = this.createMarketConfig(undefined, exchangeStartingQuote);
     }
 
     const events = this.bot.reset(this.config);
     this.recordEvents(events);
     await this.flushState();
-    if (exchangeCanSubmit) {
-      const snapshot = await this.paperTrading!.sync(this.market);
-      await this.applyExchangeSnapshot(snapshot);
+    if (resetSnapshot) {
+      await this.applyExchangeSnapshot(resetSnapshot);
     }
     return events;
   }
@@ -615,15 +663,25 @@ export class TradingRuntime {
     return events;
   }
 
-  private async recoverExchangeState(): Promise<void> {
+  private async recoverExchangeState(snapshot?: BinancePaperSnapshot): Promise<void> {
     if (!this.paperTrading?.drivesOrderExecution(this.market)) {
       return;
     }
     try {
-      const snapshot = await this.paperTrading.sync(this.market);
-      await this.applyExchangeSnapshot(snapshot);
+      await this.applyExchangeSnapshot(snapshot ?? await this.paperTrading.sync(this.market));
     } catch {
       return;
+    }
+  }
+
+  private async syncExecutionExchangeSnapshot(): Promise<BinancePaperSnapshot | undefined> {
+    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+      return undefined;
+    }
+    try {
+      return await this.paperTrading.sync(this.market);
+    } catch {
+      return undefined;
     }
   }
 
@@ -697,18 +755,87 @@ export class TradingRuntime {
     this.applyExchangeMaxLeverage(snapshot);
     this.applyExchangeTradingRules(snapshot);
     const reconciliation = exchangeReconciliationFromSnapshot(snapshot);
+    const events: BotEvent[] = [];
     if (
-      (reconciliation.orders?.length ?? 0) === 0 &&
-      (reconciliation.fills?.length ?? 0) === 0
+      (reconciliation.orders?.length ?? 0) > 0 ||
+      (reconciliation.fills?.length ?? 0) > 0
     ) {
-      await this.flushState();
-      return [];
+      events.push(...this.bot.applyExchangeReconciliation(reconciliation));
     }
 
-    const events = this.bot.applyExchangeReconciliation(reconciliation);
+    events.push(...this.applyExchangeAccountGuard(snapshot));
     this.recordEvents(events);
     await this.flushState();
     return events;
+  }
+
+  private applyExchangeAccountGuard(snapshot: BinancePaperSnapshot): BotEvent[] {
+    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+      this.exchangeAccountWarningMessage = undefined;
+      return [];
+    }
+
+    const driftMessage = exchangeAccountDriftMessage(
+      snapshot,
+      this.market,
+      this.bot.snapshot(),
+    );
+    if (!driftMessage) {
+      this.exchangeAccountWarningMessage = undefined;
+      return [];
+    }
+
+    const message = this.exchangeAccountGuard.hardStop
+      ? `${driftMessage} Bot paused; reset or manually reconcile the exchange account before restarting.`
+      : `${driftMessage} Exchange account guard hard stop is disabled; recording warning only.`;
+    const wasAlreadyReported = this.exchangeAccountWarningMessage === message;
+    this.exchangeAccountWarningMessage = message;
+    if (!wasAlreadyReported) {
+      this.exchangeAccountGuard.onWarning?.(message);
+    }
+
+    if (!this.exchangeAccountGuard.hardStop) {
+      return [];
+    }
+
+    if (wasAlreadyReported && this.bot.view().status === "stopped") {
+      return [];
+    }
+
+    const at = Date.now();
+    const events = this.bot.setStatus("stopped", at);
+    if (events.length > 0) {
+      return events.map((event) => ({
+        ...event,
+        message,
+        state: this.bot.snapshot(),
+      }));
+    }
+
+    return [
+      {
+        type: "status_changed",
+        at,
+        message,
+        state: this.bot.snapshot(),
+      },
+    ];
+  }
+
+  private publicExchangeSnapshot(): BinancePaperSnapshot {
+    const snapshot = this.paperTrading?.snapshot(this.market) ?? disabledExchangeSnapshot();
+    if (!this.exchangeAccountWarningMessage) {
+      return snapshot;
+    }
+
+    return {
+      ...snapshot,
+      message: this.exchangeAccountWarningMessage,
+      userDataStreamMessage: this.exchangeAccountWarningMessage,
+      ...(this.exchangeAccountGuard.hardStop
+        ? { error: this.exchangeAccountWarningMessage }
+        : {}),
+    };
   }
 
   private applyExchangeMaxLeverage(snapshot: BinancePaperSnapshot): void {
@@ -917,15 +1044,334 @@ export class TradingRuntime {
     return result;
   }
 
-  private createMarketConfig(savedState?: PaperBotState): StrategyConfig {
+  private createMarketConfig(
+    savedState?: PaperBotState,
+    startingQuote?: number,
+  ): StrategyConfig {
     const config = createStrategyConfig({
       ...(savedState?.config ?? this.config),
       symbol: this.market.symbol,
       baseAsset: this.market.baseAsset,
       quoteAsset: this.market.quoteAsset,
+      ...(startingQuote !== undefined ? { startingQuote } : {}),
     });
     return applyMarketMaxLeverage(config, this.market.maxLeverage);
   }
+}
+
+function exchangeStartingQuoteForInitialState(
+  snapshot: BinancePaperSnapshot | undefined,
+  market: BinanceMarketListing,
+  savedState: PaperBotState | undefined,
+): number | undefined {
+  if (!isRebasableBotState(savedState) || hasExchangeMarketExposure(snapshot, market)) {
+    return undefined;
+  }
+  return exchangeQuoteBalance(snapshot, market);
+}
+
+function rebaseBotStateCapital(
+  savedState: PaperBotState | undefined,
+  startingQuote: number | undefined,
+): PaperBotState | undefined {
+  if (!savedState || startingQuote === undefined) {
+    return savedState;
+  }
+
+  const next = structuredClone(savedState);
+  next.startingQuote = startingQuote;
+  next.quoteFree = startingQuote;
+  next.quoteReserved = 0;
+  next.baseFree = 0;
+  next.baseReserved = 0;
+  next.avgEntryPrice = 0;
+  next.avgShortEntryPrice = 0;
+  next.realizedPnl = 0;
+  next.feesPaid = 0;
+  next.winningTrades = 0;
+  next.losingTrades = 0;
+  next.exitGridSpanTotal = 0;
+  next.exitGridSpanCount = 0;
+  next.exitGridOrderCountTotal = 0;
+  next.config = createStrategyConfig({
+    ...next.config,
+    startingQuote,
+  });
+  return next;
+}
+
+function isRebasableBotState(state: PaperBotState | undefined): boolean {
+  if (!state) {
+    return true;
+  }
+  return (
+    state.orders.length === 0 &&
+    state.fills.length === 0 &&
+    Math.abs(state.quoteReserved) <= BALANCE_EPSILON &&
+    Math.abs(state.baseFree) <= BALANCE_EPSILON &&
+    Math.abs(state.baseReserved) <= BALANCE_EPSILON
+  );
+}
+
+function hasExchangeMarketExposure(
+  snapshot: BinancePaperSnapshot | undefined,
+  market: BinanceMarketListing,
+): boolean {
+  return Boolean(
+    snapshot &&
+      (snapshot.openOrders.length > 0 ||
+        snapshot.positions.length > 0 ||
+        (exchangeAssetBalance(snapshot, market.baseAsset) ?? 0) > BALANCE_EPSILON),
+  );
+}
+
+function exchangeQuoteBalance(
+  snapshot: BinancePaperSnapshot | undefined,
+  market: BinanceMarketListing,
+): number | undefined {
+  return exchangeAssetBalance(snapshot, market.quoteAsset);
+}
+
+function exchangeAssetBalance(
+  snapshot: BinancePaperSnapshot | undefined,
+  asset: string,
+): number | undefined {
+  const targetAsset = asset.toUpperCase();
+  const balance = snapshot?.balances.find((item) => item.asset.toUpperCase() === targetAsset);
+  if (!balance) {
+    return undefined;
+  }
+
+  return firstPositiveNumber(
+    balance.availableBalance,
+    balance.free,
+    balance.walletBalance,
+    balance.free + balance.locked,
+  );
+}
+
+function firstPositiveNumber(...values: Array<number | undefined>): number | undefined {
+  for (const value of values) {
+    if (value !== undefined && Number.isFinite(value) && value > BALANCE_EPSILON) {
+      return Number(value.toFixed(6));
+    }
+  }
+  return undefined;
+}
+
+function exchangeAccountDriftMessage(
+  snapshot: BinancePaperSnapshot,
+  market: BinanceMarketListing,
+  state: PaperBotState,
+): string | undefined {
+  const localOrderIds = new Set(state.orders.map((order) => order.id));
+  const unmanagedOrder = snapshot.openOrders.find((order) => !order.localOrderId);
+  if (unmanagedOrder) {
+    return `Exchange has unmanaged open ${market.symbol} order ${unmanagedOrder.orderId}.`;
+  }
+
+  const unknownBotOrder = snapshot.openOrders.find(
+    (order) => order.localOrderId && !localOrderIds.has(order.localOrderId),
+  );
+  if (unknownBotOrder) {
+    return `Exchange open order ${unknownBotOrder.orderId} points to missing local order ${unknownBotOrder.localOrderId}.`;
+  }
+
+  if (market.venue === "spot") {
+    return spotAccountDriftMessage(snapshot, market, state);
+  }
+  if (market.venue === "usdm-futures" || market.venue === "coinm-futures") {
+    return futuresAccountDriftMessage(snapshot, market, state);
+  }
+
+  return undefined;
+}
+
+function spotAccountDriftMessage(
+  snapshot: BinancePaperSnapshot,
+  market: BinanceMarketListing,
+  state: PaperBotState,
+): string | undefined {
+  const exchangeQuote = exchangeSpotAssetTotal(snapshot, market.quoteAsset);
+  const localQuote = roundQuoteBalance(state.quoteFree + state.quoteReserved);
+  if (hasQuoteDrift(localQuote, exchangeQuote)) {
+    return `${market.quoteAsset} balance drift: local ${localQuote}, exchange ${exchangeQuote}.`;
+  }
+
+  const exchangeBase = exchangeSpotAssetTotal(snapshot, market.baseAsset);
+  const localBase = roundAssetBalance(state.baseFree + state.baseReserved);
+  if (hasAssetDrift(localBase, exchangeBase)) {
+    return `${market.baseAsset} balance drift: local ${localBase}, exchange ${exchangeBase}.`;
+  }
+
+  return undefined;
+}
+
+function futuresAccountDriftMessage(
+  snapshot: BinancePaperSnapshot,
+  market: BinanceMarketListing,
+  state: PaperBotState,
+): string | undefined {
+  const positionProfile = futuresPositionProfile(snapshot);
+  if (
+    positionProfile.longQuantity > BALANCE_EPSILON &&
+    positionProfile.shortQuantity > BALANCE_EPSILON
+  ) {
+    return "Exchange account has simultaneous long and short hedge-mode positions that the local net-position guard cannot safely reconcile.";
+  }
+
+  const localBase = roundAssetBalance(state.baseFree + state.baseReserved);
+  const exchangeBase = roundAssetBalance(positionProfile.netQuantity);
+  if (hasAssetDrift(localBase, exchangeBase)) {
+    return `${market.baseAsset} futures position drift: local ${localBase}, exchange ${exchangeBase}.`;
+  }
+
+  const markPrice =
+    positionProfile.markPrice ||
+    state.lastPrice ||
+    state.avgEntryPrice ||
+    state.avgShortEntryPrice;
+  const exchangeEquity = exchangeFuturesEquity(snapshot, market.quoteAsset);
+  if (exchangeEquity !== undefined && markPrice > 0) {
+    const localEquity = roundQuoteBalance(
+      state.quoteFree + state.quoteReserved + localBase * markPrice,
+    );
+    if (hasQuoteDrift(localEquity, exchangeEquity)) {
+      return `${market.quoteAsset} equity drift: local ${localEquity}, exchange ${exchangeEquity}.`;
+    }
+  }
+
+  const exchangeEntryPrice = positionProfile.entryPrice;
+  if (exchangeEntryPrice && Math.abs(exchangeBase) > MIN_ASSET_DRIFT_TOLERANCE) {
+    const localEntryPrice = exchangeBase > 0 ? state.avgEntryPrice : state.avgShortEntryPrice;
+    if (localEntryPrice > 0 && hasQuoteDrift(localEntryPrice, exchangeEntryPrice)) {
+      return `Futures entry price drift: local ${roundQuoteBalance(localEntryPrice)}, exchange ${roundQuoteBalance(exchangeEntryPrice)}.`;
+    }
+  }
+
+  return undefined;
+}
+
+function exchangeSpotAssetTotal(snapshot: BinancePaperSnapshot, asset: string): number {
+  const targetAsset = asset.toUpperCase();
+  const balance = snapshot.balances.find((item) => item.asset.toUpperCase() === targetAsset);
+  if (!balance) {
+    return 0;
+  }
+  return roundAssetBalance(balance.free + balance.locked);
+}
+
+function exchangeFuturesEquity(
+  snapshot: BinancePaperSnapshot,
+  quoteAsset: string,
+): number | undefined {
+  const targetAsset = quoteAsset.toUpperCase();
+  const balance = snapshot.balances.find((item) => item.asset.toUpperCase() === targetAsset);
+  if (!balance) {
+    return undefined;
+  }
+
+  const walletBalance = firstFiniteNumber(
+    balance.walletBalance,
+    balance.free + balance.locked,
+    balance.availableBalance,
+    balance.free,
+  );
+  if (walletBalance === undefined) {
+    return undefined;
+  }
+
+  const unrealizedPnl = snapshot.positions.reduce(
+    (sum, position) => sum + finiteOrZero(position.unrealizedPnl),
+    0,
+  );
+  return roundQuoteBalance(walletBalance + unrealizedPnl);
+}
+
+function futuresPositionProfile(snapshot: BinancePaperSnapshot): {
+  netQuantity: number;
+  longQuantity: number;
+  shortQuantity: number;
+  markPrice: number;
+  entryPrice?: number;
+} {
+  let netQuantity = 0;
+  let longQuantity = 0;
+  let shortQuantity = 0;
+  let markNotional = 0;
+  let entryNotional = 0;
+  let absoluteQuantity = 0;
+
+  for (const position of snapshot.positions) {
+    const quantity = finiteOrZero(position.positionAmt);
+    if (quantity > 0) {
+      longQuantity += quantity;
+    } else if (quantity < 0) {
+      shortQuantity += -quantity;
+    }
+    netQuantity += quantity;
+
+    const absQuantity = Math.abs(quantity);
+    if (absQuantity <= 0) {
+      continue;
+    }
+    absoluteQuantity += absQuantity;
+    const markPrice = finiteOrZero(position.markPrice);
+    const entryPrice = finiteOrZero(position.entryPrice);
+    if (markPrice > 0) {
+      markNotional += markPrice * absQuantity;
+    }
+    if (entryPrice > 0) {
+      entryNotional += entryPrice * absQuantity;
+    }
+  }
+
+  return {
+    netQuantity: roundAssetBalance(netQuantity),
+    longQuantity: roundAssetBalance(longQuantity),
+    shortQuantity: roundAssetBalance(shortQuantity),
+    markPrice: absoluteQuantity > 0 ? markNotional / absoluteQuantity : 0,
+    entryPrice: absoluteQuantity > 0 && entryNotional > 0
+      ? entryNotional / absoluteQuantity
+      : undefined,
+  };
+}
+
+function hasQuoteDrift(localValue: number, exchangeValue: number): boolean {
+  return Math.abs(localValue - exchangeValue) > quoteDriftTolerance(exchangeValue);
+}
+
+function hasAssetDrift(localValue: number, exchangeValue: number): boolean {
+  return Math.abs(localValue - exchangeValue) > assetDriftTolerance(exchangeValue);
+}
+
+function quoteDriftTolerance(reference: number): number {
+  return Math.max(MIN_QUOTE_DRIFT_TOLERANCE, Math.abs(reference) * QUOTE_DRIFT_TOLERANCE_RATE);
+}
+
+function assetDriftTolerance(reference: number): number {
+  return Math.max(MIN_ASSET_DRIFT_TOLERANCE, Math.abs(reference) * ASSET_DRIFT_TOLERANCE_RATE);
+}
+
+function firstFiniteNumber(...values: Array<number | undefined>): number | undefined {
+  for (const value of values) {
+    if (value !== undefined && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function finiteOrZero(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) ? value : 0;
+}
+
+function roundQuoteBalance(value: number): number {
+  return Number(value.toFixed(6));
+}
+
+function roundAssetBalance(value: number): number {
+  return Number(value.toFixed(8));
 }
 
 function disabledExchangeSnapshot(): BinancePaperSnapshot {

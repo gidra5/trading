@@ -28,6 +28,7 @@ Optional settings:
 
 ```bash
 TRADING_BINANCE_PAPER_AUTO_SUBMIT=false
+TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP=false
 BINANCE_PAPER_RECV_WINDOW_MS=5000
 BINANCE_PAPER_BASE_URL=https://custom-endpoint.example
 ```
@@ -82,6 +83,23 @@ apply bot-linked `ORDER_TRADE_UPDATE` fills immediately using the deterministic
 exchange sync so balances, positions, and REST order history stay consistent.
 Server startup runs the same sync so restart recovery restores accepted,
 cancelled, and filled bot exchange orders.
+
+When auto-submit is enabled, a fresh or empty local bot state uses the synced
+exchange quote-asset balance as `startingQuote` and initial `quoteFree` instead
+of the static `TRADING_STARTING_QUOTE` fallback. Bot reset follows the same rule
+after cancelling exchange open orders and closing futures positions, so a demo
+account with 5,000 USDT resets the local bot around 5,000 USDT. Existing saved
+states with order/fill history are not silently rebased on startup; use Reset
+when intentionally starting a new exchange-backed paper run.
+
+Every exchange sync in auto-submit mode also runs an account guard. If Binance
+reports unmanaged open orders, missing local bot orders, position drift, equity
+drift, or unsupported hedge-mode long+short exposure, the runtime logs a backend
+warning and shows the warning in the exchange status message. By default this is
+diagnostic-only and does not pause order creation. Set
+`TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP=true` to make the same guard pause the
+bot and block tick-driven order creation until the account is reset or manually
+reconciled.
 
 Spot paper modes still use explicit REST sync for account updates. Binance removed
 the old Spot listen-key stream path; adding Spot user-data streaming needs the new
