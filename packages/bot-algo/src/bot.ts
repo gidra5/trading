@@ -99,6 +99,9 @@ interface LegacyExitGridLot {
   averagePrice: number;
   originalQuantity: number;
   remainingQuantity: number;
+  lifetimeMs?: number;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
 }
 
 interface LegacyLongExitGridLot extends LegacyExitGridLot {
@@ -503,6 +506,8 @@ export class SimulatedTradingBot {
       : input.positionEffect === "open" || input.positionEffect === "close"
         ? input.positionEffect
         : "auto";
+    const lifecycleFields =
+      positionEffect === "close" ? {} : normalizedLotLifecycleFields(input);
 
     if (price <= 0) {
       throw new Error("Manual trade price must be positive.");
@@ -592,6 +597,7 @@ export class SimulatedTradingBot {
         feeQuote,
         targetPositionId: input.targetPositionId,
         positionEffect,
+        ...lifecycleFields,
         manual: true,
       };
       const fill: TradeFill = {
@@ -607,6 +613,7 @@ export class SimulatedTradingBot {
         reason,
         targetPositionId: input.targetPositionId,
         positionEffect,
+        ...lifecycleFields,
         manual: true,
       };
 
@@ -727,6 +734,7 @@ export class SimulatedTradingBot {
 
     this.cancelStaleOrders(eventTime, false);
     this.fillOpenOrders(tick, false);
+    this.applyLotLifecycleControls(tick, false, { fillImmediately: true });
     if (this.liquidateAccountIfNeeded(eventTime, price, false)) {
       return NO_EVENTS;
     }
@@ -972,6 +980,7 @@ export class SimulatedTradingBot {
       reason: input.reason?.trim() || order.reason || "exchange fill",
       targetPositionId: order.targetPositionId,
       positionEffect,
+      ...normalizedLotLifecycleFields(order),
       manual: false,
     };
     this.state.fills.push(fill);
@@ -1137,6 +1146,17 @@ export class SimulatedTradingBot {
         this.cancelStaleOrders(eventTime, collectEvents);
         this.fillOpenOrders(tick, collectEvents);
       }
+    }
+    if (events) {
+      events.push(
+        ...this.applyLotLifecycleControls(tick, collectEvents, {
+          fillImmediately: !options.deferMarketOrderFills,
+        }),
+      );
+    } else {
+      this.applyLotLifecycleControls(tick, collectEvents, {
+        fillImmediately: !options.deferMarketOrderFills,
+      });
     }
     const liquidated = options.simulateLiquidation
       ? this.liquidateAccountIfNeeded(eventTime, price, collectEvents, events)
@@ -1835,6 +1855,96 @@ export class SimulatedTradingBot {
     return order;
   }
 
+  private applyLotLifecycleControls(
+    tick: PriceTick,
+    collectEvents: boolean,
+    options: { fillImmediately: boolean },
+  ): BotEvent[] {
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+
+    const positions = analyzePositions(this.state, { currentPrice: tick.price });
+    for (const lot of [...positions.longs, ...positions.shorts]) {
+      if (
+        lot.status === "pending" ||
+        lot.remainingQuantity <= MIN_BASE_QUANTITY
+      ) {
+        continue;
+      }
+
+      const reason = lotLifecycleCloseReason(lot, tick);
+      if (!reason || this.hasOpenCloseOrderForLot(lot.id)) {
+        continue;
+      }
+
+      const side = lot.side === "long" ? "sell" : "buy";
+      const order = this.createExternalCloseOrder(
+        side,
+        tick.price,
+        lot.remainingQuantity,
+        tick.eventTime,
+        reason,
+        lot.id,
+      );
+      if (!order) {
+        continue;
+      }
+
+      if (events) {
+        events.push({
+          type: "order_created",
+          at: tick.eventTime,
+          message: `${side.toUpperCase()} lifecycle close order created for ${lot.id}: ${reason}`,
+          order: structuredClone(order),
+        });
+      }
+
+      if (!options.fillImmediately) {
+        continue;
+      }
+
+      const index = this.findOrderIndex(order.id);
+      if (index === undefined) {
+        continue;
+      }
+      const result = this.tryFillOrder(order, index, tick.eventTime, true);
+      if (!events) {
+        continue;
+      }
+      if (result.fill) {
+        events.push({
+          type: "order_filled",
+          at: tick.eventTime,
+          message: `${side.toUpperCase()} lifecycle close filled for ${lot.id}`,
+          order: structuredClone(order),
+          fill: structuredClone(result.fill),
+        });
+      } else if (result.cancelled) {
+        events.push({
+          type: "order_cancelled",
+          at: tick.eventTime,
+          message: `${side.toUpperCase()} lifecycle close cancelled for ${lot.id}`,
+          order: structuredClone(result.cancelled),
+        });
+      }
+    }
+
+    return events ?? NO_EVENTS;
+  }
+
+  private hasOpenCloseOrderForLot(lotId: string): boolean {
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (
+        order?.status === "open" &&
+        order.targetPositionId === lotId &&
+        order.positionEffect === "close"
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private buildOrder(
     side: "buy" | "sell",
     price: number,
@@ -2067,6 +2177,7 @@ export class SimulatedTradingBot {
       originalQuantity: roundAsset(quantityLeft),
       remainingQuantity: roundAsset(quantityLeft),
       remainingCostQuote: roundQuote(costLeft),
+      ...normalizedLotLifecycleFields(fill),
       lentQuantity: 0,
       borrowDepthRemaining: this.inheritedLegacyLongBorrowDepth(borrowAllocations),
       borrowAllocations,
@@ -2146,6 +2257,7 @@ export class SimulatedTradingBot {
       originalQuantity: roundAsset(quantityLeft),
       remainingQuantity: roundAsset(quantityLeft),
       remainingProceedsQuote: roundQuote(proceedsLeft),
+      ...normalizedLotLifecycleFields(fill),
       lentQuote: 0,
       borrowDepthRemaining: this.inheritedLegacyShortBorrowDepth(borrowAllocations),
       borrowAllocations,
@@ -2245,6 +2357,7 @@ export class SimulatedTradingBot {
       .filter(
         (lot) =>
           lot.borrowDepthRemaining > 0 &&
+          !hasLotLifecycleControls(lot) &&
           lot.remainingQuantity - lot.lentQuantity > MIN_BASE_QUANTITY,
       )
       .sort((left, right) => {
@@ -2304,6 +2417,7 @@ export class SimulatedTradingBot {
       .filter(
         (lot) =>
           lot.borrowDepthRemaining > 0 &&
+          !hasLotLifecycleControls(lot) &&
           lot.remainingQuantity > MIN_BASE_QUANTITY &&
           lot.remainingProceedsQuote > 0,
       )
@@ -3220,6 +3334,7 @@ export class SimulatedTradingBot {
       reason: order.reason,
       targetPositionId: order.targetPositionId,
       positionEffect: order.positionEffect,
+      ...normalizedLotLifecycleFields(order),
       manual: order.manual,
       liquidation: order.liquidation,
       liquidatedPositionCount: order.liquidatedPositionCount,
@@ -3907,6 +4022,9 @@ export class SimulatedTradingBot {
       if (lot.borrowDepthRemaining <= 0) {
         continue;
       }
+      if (hasLotLifecycleControls(lot)) {
+        continue;
+      }
       const availableQuantity = Math.max(0, lot.remainingQuantity - lot.lentQuantity);
       if (availableQuantity <= MIN_BASE_QUANTITY) {
         continue;
@@ -3928,6 +4046,7 @@ export class SimulatedTradingBot {
     for (const lot of cache.shorts.values()) {
       if (
         lot.borrowDepthRemaining <= 0 ||
+        hasLotLifecycleControls(lot) ||
         lot.remainingQuantity <= MIN_BASE_QUANTITY ||
         lot.remainingProceedsQuote <= 0
       ) {
@@ -4169,6 +4288,66 @@ function countLiquidatedPositions(fills: readonly TradeFill[]): number {
     (count, fill) =>
       fill.liquidation ? count + Math.max(1, fill.liquidatedPositionCount ?? 1) : count,
     0,
+  );
+}
+
+function lotLifecycleCloseReason(
+  lot: Pick<
+    LegacyExitGridLot,
+    "side" | "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
+  > & { openedAt: number },
+  tick: PriceTick,
+): string | undefined {
+  const stopLossPrice = cleanPositive(lot.stopLossPrice);
+  if (
+    stopLossPrice > 0 &&
+    ((lot.side === "long" && tick.price <= stopLossPrice) ||
+      (lot.side === "short" && tick.price >= stopLossPrice))
+  ) {
+    return "lot stop loss";
+  }
+
+  const takeProfitPrice = cleanPositive(lot.takeProfitPrice);
+  if (
+    takeProfitPrice > 0 &&
+    ((lot.side === "long" && tick.price >= takeProfitPrice) ||
+      (lot.side === "short" && tick.price <= takeProfitPrice))
+  ) {
+    return "lot take profit";
+  }
+
+  const lifetimeMs = cleanPositive(lot.lifetimeMs);
+  if (lifetimeMs > 0 && tick.eventTime >= lot.openedAt + lifetimeMs) {
+    return "lot lifetime";
+  }
+
+  return undefined;
+}
+
+function normalizedLotLifecycleFields(
+  source: Pick<
+    TradingOrder | TradeFill | ManualTradeInput | LegacyExitGridLot,
+    "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
+  >,
+): Pick<TradingOrder, "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"> {
+  const lifetimeMs = cleanPositive(source.lifetimeMs);
+  const stopLossPrice = cleanPositive(source.stopLossPrice);
+  const takeProfitPrice = cleanPositive(source.takeProfitPrice);
+
+  return {
+    ...(lifetimeMs > 0 ? { lifetimeMs } : {}),
+    ...(stopLossPrice > 0 ? { stopLossPrice } : {}),
+    ...(takeProfitPrice > 0 ? { takeProfitPrice } : {}),
+  };
+}
+
+function hasLotLifecycleControls(
+  lot: Pick<LegacyExitGridLot, "lifetimeMs" | "stopLossPrice" | "takeProfitPrice">,
+): boolean {
+  return (
+    cleanPositive(lot.lifetimeMs) > 0 ||
+    cleanPositive(lot.stopLossPrice) > 0 ||
+    cleanPositive(lot.takeProfitPrice) > 0
   );
 }
 

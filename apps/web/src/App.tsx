@@ -2083,6 +2083,9 @@ function PositionLedgerPanel(props: {
       price: draft.price || currentPrice(),
       priceMode: draft.priceMode ?? "current",
       positionEffect: draft.positionEffect ?? (draft.targetPositionId ? "close" : "open"),
+      lifetimeMinutes: draft.lifetimeMinutes ?? 0,
+      stopLossPrice: draft.stopLossPrice ?? 0,
+      takeProfitPrice: draft.takeProfitPrice ?? 0,
     });
   };
   const submitDraft = async () => {
@@ -2104,6 +2107,14 @@ function PositionLedgerPanel(props: {
       quantity,
       targetPositionId: value.targetPositionId,
       positionEffect: value.positionEffect,
+      lifetimeMs:
+        !value.targetPositionId && value.lifetimeMinutes > 0
+          ? value.lifetimeMinutes * 60_000
+          : undefined,
+      stopLossPrice:
+        !value.targetPositionId && value.stopLossPrice > 0 ? value.stopLossPrice : undefined,
+      takeProfitPrice:
+        !value.targetPositionId && value.takeProfitPrice > 0 ? value.takeProfitPrice : undefined,
     });
     setSubmitting(false);
     if (ok) {
@@ -2133,6 +2144,9 @@ function PositionLedgerPanel(props: {
                 price: currentPrice(),
                 priceMode: "current",
                 positionEffect: "open",
+                lifetimeMinutes: 0,
+                stopLossPrice: 0,
+                takeProfitPrice: 0,
               })
             }
             type="button"
@@ -2151,6 +2165,9 @@ function PositionLedgerPanel(props: {
                 price: currentPrice(),
                 priceMode: "current",
                 positionEffect: "open",
+                lifetimeMinutes: 0,
+                stopLossPrice: 0,
+                takeProfitPrice: 0,
               })
             }
             type="button"
@@ -2209,6 +2226,9 @@ function PositionLedgerPanel(props: {
               priceMode: "current",
               targetPositionId: lot.id,
               positionEffect: "close",
+              lifetimeMinutes: 0,
+              stopLossPrice: 0,
+              takeProfitPrice: 0,
             })
           }
         />
@@ -2226,6 +2246,9 @@ function PositionLedgerPanel(props: {
               priceMode: "current",
               targetPositionId: lot.id,
               positionEffect: "close",
+              lifetimeMinutes: 0,
+              stopLossPrice: 0,
+              takeProfitPrice: 0,
             })
           }
         />
@@ -2245,6 +2268,9 @@ type ManualTradeDraft = {
   quoteAmount: number;
   targetPositionId?: string;
   positionEffect: NonNullable<ManualTradeInput["positionEffect"]>;
+  lifetimeMinutes: number;
+  stopLossPrice: number;
+  takeProfitPrice: number;
 };
 
 function manualTradePrice(draft: ManualTradeDraft, currentPrice: number): number {
@@ -2393,6 +2419,31 @@ function ManualTradeForm(props: {
           />
         </Show>
       </div>
+      <Show when={!isClose()}>
+        <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <NumberField
+            label="Lifetime Min"
+            value={props.draft.lifetimeMinutes}
+            min={0}
+            step={1}
+            onInput={(value) => update("lifetimeMinutes", value)}
+          />
+          <NumberField
+            label="Stop Loss"
+            value={props.draft.stopLossPrice}
+            min={0}
+            step={0.01}
+            onInput={(value) => update("stopLossPrice", value)}
+          />
+          <NumberField
+            label="Take Profit"
+            value={props.draft.takeProfitPrice}
+            min={0}
+            step={0.01}
+            onInput={(value) => update("takeProfitPrice", value)}
+          />
+        </div>
+      </Show>
       <div class="mt-3 rounded-2 border border-line bg-ink-900 p-3">
         <div class="muted-label">{actionVerb()} Preview</div>
         <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">
@@ -2435,11 +2486,12 @@ function PositionLongTable(props: {
               <th class="table-head pb-2">Max Loss</th>
               <th class="table-head pb-2">Sell Now</th>
               <th class="table-head pb-2">Possible</th>
+              <th class="table-head pb-2">Rules</th>
               <th class="table-head pb-2">Actions</th>
             </tr>
           </thead>
           <tbody>
-            <For each={props.lots} fallback={<EmptyRow columns={13} label="No long lots" />}>
+            <For each={props.lots} fallback={<EmptyRow columns={14} label="No long lots" />}>
               {(lot) => (
                 <tr>
                   <td class="td-cell">
@@ -2484,6 +2536,9 @@ function PositionLongTable(props: {
                   </td>
                   <td class="td-cell">
                     <PossibleBadge possible={lot.canReachLowerBaseline} />
+                  </td>
+                  <td class="td-cell">
+                    <LotRulesCell lot={lot} />
                   </td>
                   <td class="td-cell">
                     <button
@@ -2534,11 +2589,12 @@ function PositionShortTable(props: {
               <th class="table-head pb-2">Max Loss</th>
               <th class="table-head pb-2">Buy Now</th>
               <th class="table-head pb-2">Possible</th>
+              <th class="table-head pb-2">Rules</th>
               <th class="table-head pb-2">Actions</th>
             </tr>
           </thead>
           <tbody>
-            <For each={props.lots} fallback={<EmptyRow columns={13} label="No short lots" />}>
+            <For each={props.lots} fallback={<EmptyRow columns={14} label="No short lots" />}>
               {(lot) => (
                 <tr>
                   <td class="td-cell">
@@ -2585,6 +2641,9 @@ function PositionShortTable(props: {
                     <PossibleBadge possible={lot.canReachUpperBaseline} />
                   </td>
                   <td class="td-cell">
+                    <LotRulesCell lot={lot} />
+                  </td>
+                  <td class="td-cell">
                     <button
                       class="btn px-2 py-1 text-xs"
                       disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
@@ -2601,6 +2660,47 @@ function PositionShortTable(props: {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+function LotRulesCell(props: { lot: LongPositionLot | ShortPositionLot }) {
+  if (
+    !props.lot.borrowLocked &&
+    !props.lot.lifetimeMs &&
+    !props.lot.stopLossPrice &&
+    !props.lot.takeProfitPrice
+  ) {
+    return <span class="text-ink-300">-</span>;
+  }
+
+  return (
+    <div class="flex max-w-52 flex-wrap gap-1">
+      <Show when={props.lot.borrowLocked}>
+        <span class="rounded-2 bg-warn/12 px-2 py-1 text-xs font-semibold uppercase text-warn">
+          no borrow
+        </span>
+      </Show>
+      <Show when={props.lot.lifetimeMs}>
+        <span class="rounded-2 bg-ink-700 px-2 py-1 text-xs text-ink-100">
+          Life {formatDuration(props.lot.lifetimeMs)}
+        </span>
+      </Show>
+      <Show when={props.lot.expiresAt}>
+        <span class="rounded-2 bg-ink-700 px-2 py-1 text-xs text-ink-100">
+          Exp {formatTime(props.lot.expiresAt)}
+        </span>
+      </Show>
+      <Show when={props.lot.stopLossPrice}>
+        <span class="rounded-2 bg-loss/12 px-2 py-1 text-xs font-semibold text-loss">
+          SL ${formatQuote(props.lot.stopLossPrice, 4)}
+        </span>
+      </Show>
+      <Show when={props.lot.takeProfitPrice}>
+        <span class="rounded-2 bg-gain/12 px-2 py-1 text-xs font-semibold text-gain">
+          TP ${formatQuote(props.lot.takeProfitPrice, 4)}
+        </span>
+      </Show>
     </div>
   );
 }

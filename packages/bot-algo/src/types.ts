@@ -196,6 +196,9 @@ export interface TradingOrder {
   feeQuote: number;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
+  lifetimeMs?: number;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
   manual?: boolean;
   liquidation?: boolean;
   liquidatedPositionCount?: number;
@@ -214,6 +217,9 @@ export interface TradeFill {
   reason: string;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
+  lifetimeMs?: number;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
   manual?: boolean;
   liquidation?: boolean;
   liquidatedPositionCount?: number;
@@ -226,6 +232,9 @@ export interface ManualTradeInput {
   reason?: string;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
+  lifetimeMs?: number;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
 }
 
 export interface ExchangeOrderUpdate {
@@ -351,6 +360,11 @@ export interface PositionLotBase {
   externalBorrowedQuantity: number;
   externalBorrowedQuote: number;
   borrowedFromPositionCount: number;
+  lifetimeMs?: number;
+  expiresAt?: number;
+  stopLossPrice?: number;
+  takeProfitPrice?: number;
+  borrowLocked: boolean;
 }
 
 export interface LongPositionLot extends PositionLotBase {

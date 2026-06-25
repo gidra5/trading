@@ -357,6 +357,9 @@ export class TradingRuntime {
     if (input.side !== "buy" && input.side !== "sell") {
       throw new Error("Manual trade side must be buy or sell.");
     }
+    const lifetimeMs = normalizeOptionalPositiveNumber(input.lifetimeMs, "Lot lifetime");
+    const stopLossPrice = normalizeOptionalPositiveNumber(input.stopLossPrice, "Stop loss");
+    const takeProfitPrice = normalizeOptionalPositiveNumber(input.takeProfitPrice, "Take profit");
 
     if (input.targetPositionId) {
       const positions = analyzePositions(this.bot.snapshot());
@@ -377,6 +380,9 @@ export class TradingRuntime {
       ...input,
       quantity,
       price: input.price === undefined ? undefined : Number(input.price),
+      lifetimeMs,
+      stopLossPrice,
+      takeProfitPrice,
     });
     this.recordEvents(events);
     await this.flushState();
@@ -994,6 +1000,22 @@ function hasExchangeReconciliationUpdates(
   input: ExchangeReconciliationInput | undefined,
 ): input is ExchangeReconciliationInput {
   return (input?.orders?.length ?? 0) > 0 || (input?.fills?.length ?? 0) > 0;
+}
+
+function normalizeOptionalPositiveNumber(
+  value: number | undefined,
+  label: string,
+): number | undefined {
+  if (value === undefined || value === null || value === 0) {
+    return undefined;
+  }
+
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) {
+    throw new Error(`${label} must be positive.`);
+  }
+
+  return number > 0 ? number : undefined;
 }
 
 function normalizeExchangeSide(side: string): "buy" | "sell" {

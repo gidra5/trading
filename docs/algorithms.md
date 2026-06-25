@@ -17,6 +17,103 @@ documented in [Manual Position Management](manual-position-management.md).
 The automated entry and exit-management workflow is documented in
 [Automated Position Management](automated-position-management.md).
 
+## The model
+
+### The market model
+
+The assumed model is very simple. Treat the market price as a time series consisting of the alternation of 3 states: up, down, and flat. The core assumption is that we can't have two identical states in a row, which means optimal decisions can be made only at the transition points. 
+
+To detect these 3 states, we use a derivative of the simple moving average. Given a up/down trend thresholds and a timeframe, we compute the derivative of the SMA over the timeframe and compare against thresholds:
+1. if its withing the thresholds around 0, we consider it a sideways trend
+2. if it is above the threshold upper, we consider it an uptrend
+3. if it is below the threshold, we consider it a downtrend
+
+### Timeframes
+
+We distinguish between 3 timeframes: short, medium, and long. We use them to determine market state at different scales and make decisions based on that. 
+Given some candle size ratio, for each of the timeframes we determine the following:
+1. trend
+2. volatility - average size of the candle bodies and wicks.
+3. extrema - min and max price over the timeframe
+
+short range = execution / grid / stop noise
+mid range = leverage and trade lifetime
+long range = account-level exposure and “do I still want to hold this asset?”
+
+### The trading model
+
+The trading model is much more complex that traditionally used on the platforms.
+
+The fundamental concept is a lot. A lot is an entry into the market at some price and direction. It has the following properties:
+1. size - the amount of the asset associated with the lot
+2. cost - the price we paid for the corresponding size
+3. break even price - price at which the lot an be closed and yield zero PnL
+4. internal borrow - 
+   1. the lot lends the cost
+   2. the size of the lended cost.
+5. external borrow - the part of the cost that borrowed from the platform through leverage.
+   - derived leverage of the lot=(cost-internal borrow)/(cost-internal borrow-external borrow)
+6. fractions required to sell that will move break even price to the extrema corresponding to one of the timeframes.
+
+The most notable change from the traditional model is that we have notion of internal borrow. This allow us to sell the asset associated with the lot to open the opposing lot instead of closing the current one, but with the condition that the new lot will return back at least the borrowed amount. We may also borrow from multiple lots and externally as well to build up the resulting position.
+
+That may create chains of borrowing and lending and keep money fluid, without freezing it in bad positions.
+
+In ideal prediction of the market, the chain depth is limited, or even non existent.
+
+All lots together form an aggregated position, which is basically a sum of the lots. The main difference from simple lot is that it cant have internal borrow, only external. It also has additional liquidation price
+
+Besides regular lots we can create hedged lots. These are always created in pairs of opposite lots, that are supposed to hedge each other. The main advantage is that we can create them without actually executing anything.
+
+### The entry strategy model
+
+Each up/down state represents a profit opportunity, so we must enter at the start of an trend and exit when the trend reverses. Entering during the ongoing up/down trend does not make sense, because we will immediately get loss without any opportunities for profit until we cross break-even price.
+
+Thus for long positions we look for low price in overall uptrend, and symmetrically for short positions we look for high price in overall downtrend. This basically exploits the zig-zag market pattern.
+
+Once entry price is decided, we must determine the target size. We scale it proportionally to the slope of the overall trend - the faster it moves, the smaller the target size make sense, if we want to concentrate most of the capital in certain extrema.
+
+We also must consider the current free capital and limits on order size.
+
+### The exit strategy model
+
+https://chatgpt.com/c/6a3cfff7-2978-83eb-bb5b-4c0449627fff
+
+When we hit an extrema, for every profitable lot we want to optimize the PnL given uncertainty in where the price will move.
+
+At an extrema, define a sell distribution between current price and an anchor price. The realized grid will approximate this distribution given the constraints on order sizes, price steps, and order count.
+
+the shape of the distribution is determined by our confidence in the peak quality - how likely it is that the price will move down past some threshold, like short break even price. It also should optimize expected profit given opportunity cost of skipping it.
+
+the anchor price is between break even price of the lot and break even of the overall account. if the account break even above the lot break even, we should prioritize profits on individual lots and dont risk staying below the break even longer.
+
+if after the grid was created, the market improved, we may reset the grid according to new prices if it is more profitable to do so, given some reset price. More concretely, it may be the case if the sell distribution changes significantly and the remaining orders approximate it very badly. 
+
+In total this defines these parameters:
+1. the distribution of the sell orders over the range from current price to the anchor price
+2. realized grid constraints: order size, price step, order count
+3. the anchor price
+4. the confidence in the extrema quality
+5. the reset condition
+6. the reset price
+
+### Sell distribution model
+
+The distribution is a kind of (beta distribution)[https://chatgpt.com/c/6a3cfff7-2978-83eb-bb5b-4c0449627fff]. 
+It is supposed to be skewed towards the peak if we are confident in the peak quality, and uniform otherwise.
+
+First consider the opportunity cost of the sell. Given some expected down move D and up move U, and our confidence q in the peak quality as probability between choosing either, we can compute the expected opportunity cost of the sell:
+
+C = D * q + U * (1 - q)
+
+Then the optimal sell fraction with the expectation that the peak is true, is:
+
+f = D * q / C
+
+The short-term price range and re-entry price can be used to estimate the D and U.
+
+
+
 ## Runtime Flow
 
 Every accepted price tick runs this sequence:

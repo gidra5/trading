@@ -82,6 +82,7 @@ type MutableLongLot = Omit<
   | "externalBorrowedQuantity"
   | "externalBorrowedQuote"
   | "borrowedFromPositionCount"
+  | "borrowLocked"
 > & {
   lentQuantity: number;
   borrowDepthRemaining: number;
@@ -108,6 +109,7 @@ type MutableShortLot = Omit<
   | "externalBorrowedQuantity"
   | "externalBorrowedQuote"
   | "borrowedFromPositionCount"
+  | "borrowLocked"
 > & {
   lentQuote: number;
   borrowDepthRemaining: number;
@@ -357,6 +359,7 @@ function applyBuyFill(
       costQuote: roundQuote(costLeft),
       remainingQuantity: roundAsset(quantityLeft),
       remainingCostQuote: roundQuote(costLeft),
+      ...lotLifecycleFields(sourceOrder ?? fill),
       lentQuantity: 0,
       borrowDepthRemaining: inheritedLongBorrowDepth(
         borrowAllocations,
@@ -423,6 +426,7 @@ function applySellFill(
       proceedsQuote: roundQuote(proceedsLeft),
       remainingQuantity: roundAsset(quantityLeft),
       remainingProceedsQuote: roundQuote(proceedsLeft),
+      ...lotLifecycleFields(sourceOrder ?? fill),
       lentQuote: 0,
       borrowDepthRemaining: inheritedShortBorrowDepth(
         borrowAllocations,
@@ -485,6 +489,7 @@ function allocateShortBorrowFromLongLots(
     .filter(
       (lot) =>
         lot.borrowDepthRemaining > 0 &&
+        !hasLotLifecycleControls(lot) &&
         lot.remainingQuantity - lot.lentQuantity > EPSILON,
     )
     .sort((left, right) => {
@@ -537,6 +542,7 @@ function allocateLongBorrowFromShortLots(
     .filter(
       (lot) =>
         lot.borrowDepthRemaining > 0 &&
+        !hasLotLifecycleControls(lot) &&
         lot.remainingQuantity > EPSILON &&
         lot.remainingProceedsQuote > EPSILON,
     )
@@ -734,6 +740,7 @@ function appendPendingOrderLot(
       costQuote: roundQuote(pendingQuote),
       remainingQuantity: pendingQuantity,
       remainingCostQuote: roundQuote(pendingQuote),
+      ...lotLifecycleFields(order),
       lentQuantity: 0,
       borrowDepthRemaining: context.longBorrowDepth,
       borrowAllocations: [],
@@ -758,6 +765,7 @@ function appendPendingOrderLot(
     proceedsQuote: roundQuote(pendingQuote),
     remainingQuantity: pendingQuantity,
     remainingProceedsQuote: roundQuote(pendingQuote),
+    ...lotLifecycleFields(order),
     lentQuote: 0,
     borrowDepthRemaining: context.shortBorrowDepth,
     borrowAllocations: [],
@@ -912,6 +920,8 @@ function finalizeLongLot(
     exposureQuote,
     leverage: calculateLeverage(exposureQuote, borrow.externalBorrowedQuote),
     ...roundBorrowProfile(borrow),
+    expiresAt: lotExpiresAt(lot),
+    borrowLocked: hasLotLifecycleControls(lot),
     breakEvenSellPrice: roundQuote(breakEvenSellPrice),
     maxLossSellPrice: roundQuote(maxLossSellPrice),
     recommendedSellQuote: roundQuote(recommendedSellQuote),
@@ -979,6 +989,8 @@ function finalizeShortLot(
     exposureQuote,
     leverage: calculateLeverage(exposureQuote, borrow.externalBorrowedQuote),
     ...roundBorrowProfile(borrow),
+    expiresAt: lotExpiresAt(lot),
+    borrowLocked: hasLotLifecycleControls(lot),
     breakEvenBuyPrice: roundQuote(breakEvenBuyPrice),
     maxLossBuyPrice: roundQuote(maxLossBuyPrice),
     recommendedBuyQuote: roundQuote(recommendedBuyQuote),
@@ -1093,6 +1105,40 @@ function chronologicalFills(fills: TradeFill[]): TradeFill[] {
 
     return a.id.localeCompare(b.id);
   });
+}
+
+function lotLifecycleFields(
+  source: Pick<TradingOrder | TradeFill, "lifetimeMs" | "stopLossPrice" | "takeProfitPrice">,
+): Pick<
+  LongPositionLot,
+  "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
+> {
+  const lifetimeMs = cleanPositive(source.lifetimeMs);
+  const stopLossPrice = cleanPositive(source.stopLossPrice);
+  const takeProfitPrice = cleanPositive(source.takeProfitPrice);
+
+  return {
+    ...(lifetimeMs > 0 ? { lifetimeMs } : {}),
+    ...(stopLossPrice > 0 ? { stopLossPrice } : {}),
+    ...(takeProfitPrice > 0 ? { takeProfitPrice } : {}),
+  };
+}
+
+function hasLotLifecycleControls(
+  lot: Pick<LongPositionLot | ShortPositionLot, "lifetimeMs" | "stopLossPrice" | "takeProfitPrice">,
+): boolean {
+  return (
+    cleanPositive(lot.lifetimeMs) > 0 ||
+    cleanPositive(lot.stopLossPrice) > 0 ||
+    cleanPositive(lot.takeProfitPrice) > 0
+  );
+}
+
+function lotExpiresAt(
+  lot: Pick<LongPositionLot | ShortPositionLot, "openedAt" | "lifetimeMs">,
+): number | undefined {
+  const lifetimeMs = cleanPositive(lot.lifetimeMs);
+  return lifetimeMs > 0 ? lot.openedAt + lifetimeMs : undefined;
 }
 
 function cleanNumber(value: number): number {

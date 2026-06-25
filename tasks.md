@@ -7,16 +7,12 @@
 - how is random week/length backtest compute equity and return?
 - maybe run some kind of genetic algorithm to finetune the parameters. use quick 1month backtests to verify quality and guide the search.
 - maybe we can do a kind of backpropagation to improve the parameters.
-- add partial fills and leveraged positions guided by expected short/mid/long-timeframe price ranges
+- add partial fills and leveraged positions guided by expected short/mid/long-timeframe price ranges. given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
 - add stop loss/take profit and position lifetime to the position creation parameters. add parameters to control them.
-- add profit checkpoints that will close all positions and continue work.
 - estimate how much the quality of peaks and size distributions affect the performance. add a confidence score before creating positions/closing to guide the actual decisions.
-- currently strategy compares only quick and slow SMAs to detect actual peaks and valleys. But i assume we can do better by utilizing more timeframes. maybe we can even compute continuous version of the comparisons. Instead of storing different timeframes, make a single procedure that could compute any sma in the range of timeframes.
-- sizing dependant on current net exposure?
-- explore other peak/valley detection possibilities. a continuous variant of sma, ema. 
+- currently strategy compares only quick and slow SMAs to detect actual peaks and valleys. But i assume we can do better by utilizing more timeframes. maybe we can even compute continuous version of the comparisons.
 - accomodate in some way average candle size at various levels of granularity
-- given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
-- stress test integration with binance paper trading apis
+- add more visibility into bit state
 - 90d samples, 30d, 180d, 365d 1800d
 - synusdt backtested over a year, but not trades was made. why?
   
