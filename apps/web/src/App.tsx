@@ -3805,6 +3805,7 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           smaSeries={props.chart.smaSeries}
           annotations={props.chart.annotations}
           maxCandles={0}
+          interactive
           emptyLabel="No replay candles"
         />
       </div>

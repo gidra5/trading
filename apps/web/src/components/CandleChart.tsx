@@ -1,4 +1,4 @@
-import { createEffect, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import type {
   BacktestChartAnnotation,
   BacktestChartSmaSeries,
@@ -14,12 +14,31 @@ interface CandleChartProps {
   smaSeries?: BacktestChartSmaSeries[];
   annotations?: BacktestChartAnnotation[];
   maxCandles?: number;
+  interactive?: boolean;
   emptyLabel?: string;
 }
+
+interface ChartViewport {
+  start: number;
+  end: number;
+}
+
+const MIN_INTERACTIVE_CANDLES = 12;
+const WHEEL_ZOOM_FACTOR = 0.18;
 
 export function CandleChart(props: CandleChartProps) {
   let canvas!: HTMLCanvasElement;
   let observer: ResizeObserver | undefined;
+  let lastSeriesKey = "";
+  let dragState:
+    | {
+        pointerId: number;
+        startX: number;
+        viewport: ChartViewport;
+      }
+    | undefined;
+  const [viewport, setViewport] = createSignal<ChartViewport>();
+  const [isDragging, setIsDragging] = createSignal(false);
 
   const draw = () => {
     if (!canvas) {
@@ -45,14 +64,16 @@ export function CandleChart(props: CandleChartProps) {
     ctx.fillStyle = "#101217";
     ctx.fillRect(0, 0, width, height);
 
-    const maxCandles = props.maxCandles ?? 140;
-    const candles = maxCandles > 0 ? props.candles.slice(-maxCandles) : props.candles;
+    const chartViewport = currentViewport();
+    const sourceCandles = props.candles;
+    const candles = sourceCandles.slice(chartViewport.start, chartViewport.end);
     if (candles.length < 2) {
       drawEmpty(ctx, width, height, props.emptyLabel);
       return;
     }
 
     const openOrders = props.orders.filter((order) => order.status === "open");
+    const showLastPrice = props.lastPrice > 0 && chartViewport.end >= sourceCandles.length;
     const startTime = candles[0]?.openTime ?? 0;
     const endTime = candles.at(-1)?.closeTime ?? startTime + 1;
     const smaSeries = (props.smaSeries ?? [])
@@ -67,7 +88,7 @@ export function CandleChart(props: CandleChartProps) {
       (annotation) => annotation.time >= startTime && annotation.time <= endTime,
     );
     const values = candles.flatMap((candle) => [candle.high, candle.low]);
-    if (props.lastPrice > 0) {
+    if (showLastPrice) {
       values.push(props.lastPrice);
     }
     values.push(...openOrders.map((order) => order.price));
@@ -122,7 +143,7 @@ export function CandleChart(props: CandleChartProps) {
       ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
     });
 
-    if (props.lastPrice > 0) {
+    if (showLastPrice) {
       drawPriceLine(ctx, plot, priceToY(props.lastPrice), props.lastPrice, "#38bdf8");
     }
 
@@ -142,11 +163,33 @@ export function CandleChart(props: CandleChartProps) {
   };
 
   createEffect(() => {
-    props.candles.length;
-    props.orders.length;
+    const candles = props.candles;
+    const first = candles[0]?.openTime ?? 0;
+    const last = candles.at(-1)?.closeTime ?? 0;
+    const seriesKey = `${candles.length}:${first}:${last}:${props.maxCandles ?? ""}:${
+      props.interactive ? 1 : 0
+    }`;
+    if (seriesKey !== lastSeriesKey) {
+      lastSeriesKey = seriesKey;
+      setViewport(defaultViewport(candles.length));
+    }
+  });
+
+  createEffect(() => {
+    const candles = props.candles;
+    const orders = props.orders;
+    const smaSeries = props.smaSeries;
+    const annotations = props.annotations;
+    const first = candles[0]?.openTime;
+    const last = candles.at(-1)?.closeTime;
+    candles.length;
+    first;
+    last;
+    orders.length;
     props.lastPrice;
-    props.smaSeries?.length;
-    props.annotations?.length;
+    smaSeries?.length;
+    annotations?.length;
+    viewport();
     draw();
   });
 
@@ -156,9 +199,225 @@ export function CandleChart(props: CandleChartProps) {
     draw();
   });
 
-  onCleanup(() => observer?.disconnect());
+  onCleanup(() => {
+    observer?.disconnect();
+    dragState = undefined;
+  });
 
-  return <canvas ref={canvas} class="h-full min-h-80 w-full rounded-2" />;
+  const handleWheel = (event: WheelEvent) => {
+    if (!props.interactive || props.candles.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+    canvas.focus();
+
+    if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+      panByPixels(event.deltaX || event.deltaY);
+      return;
+    }
+
+    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const anchor = clamp((event.offsetX - plot.left) / Math.max(1, plot.right - plot.left), 0, 1);
+    zoomBy(Math.exp(Math.sign(event.deltaY) * WHEEL_ZOOM_FACTOR), anchor);
+  };
+
+  const handlePointerDown = (event: PointerEvent) => {
+    if (!props.interactive || event.button !== 0 || props.candles.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+    canvas.focus();
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      viewport: currentViewport(),
+    };
+    setIsDragging(true);
+    canvas.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (event: PointerEvent) => {
+    if (!dragState || event.pointerId !== dragState.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const visible = dragState.viewport.end - dragState.viewport.start;
+    const candleWidth = Math.max(1, (plot.right - plot.left) / Math.max(1, visible));
+    const shift = Math.round((event.clientX - dragState.startX) / candleWidth);
+    const start = dragState.viewport.start - shift;
+    commitViewport({ start, end: start + visible });
+  };
+
+  const handlePointerUp = (event: PointerEvent) => {
+    if (!dragState || event.pointerId !== dragState.pointerId) {
+      return;
+    }
+
+    if (canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+    dragState = undefined;
+    setIsDragging(false);
+  };
+
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (!props.interactive || props.candles.length < 2) {
+      return;
+    }
+
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      zoomBy(0.8);
+    } else if (event.key === "-") {
+      event.preventDefault();
+      zoomBy(1.25);
+    } else if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      const visible = currentViewport().end - currentViewport().start;
+      panByCandles(-Math.max(1, Math.round(visible * 0.12)));
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      const visible = currentViewport().end - currentViewport().start;
+      panByCandles(Math.max(1, Math.round(visible * 0.12)));
+    } else if (event.key === "Home" || event.key === "0") {
+      event.preventDefault();
+      resetViewport();
+    }
+  };
+
+  const resetViewport = () => setViewport(defaultViewport(props.candles.length));
+
+  const zoomBy = (scale: number, anchor = 0.5) => {
+    const total = props.candles.length;
+    if (total < 2) {
+      return;
+    }
+
+    const current = currentViewport();
+    const visible = current.end - current.start;
+    const minVisible = Math.min(total, MIN_INTERACTIVE_CANDLES);
+    const targetVisible = clamp(Math.round(visible * scale), minVisible, total);
+    if (targetVisible === visible) {
+      return;
+    }
+
+    const anchorIndex = current.start + visible * clamp(anchor, 0, 1);
+    const start = Math.round(anchorIndex - targetVisible * clamp(anchor, 0, 1));
+    commitViewport({ start, end: start + targetVisible });
+  };
+
+  const panByPixels = (deltaPixels: number) => {
+    const current = currentViewport();
+    const visible = current.end - current.start;
+    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const candleWidth = Math.max(1, (plot.right - plot.left) / Math.max(1, visible));
+    panByCandles(Math.round(deltaPixels / candleWidth));
+  };
+
+  const panByCandles = (delta: number) => {
+    if (delta === 0) {
+      return;
+    }
+
+    const current = currentViewport();
+    commitViewport({
+      start: current.start + delta,
+      end: current.end + delta,
+    });
+  };
+
+  const commitViewport = (next: ChartViewport) => {
+    setViewport(normalizeViewport(next, props.candles.length, MIN_INTERACTIVE_CANDLES));
+  };
+
+  const currentViewport = () =>
+    props.interactive
+      ? normalizeViewport(
+          viewport() ?? defaultViewport(props.candles.length),
+          props.candles.length,
+          MIN_INTERACTIVE_CANDLES,
+        )
+      : defaultViewport(props.candles.length);
+
+  const defaultViewport = (total: number): ChartViewport => {
+    const maxCandles = props.maxCandles ?? 140;
+    if (maxCandles > 0) {
+      return normalizeViewport(
+        { start: total - maxCandles, end: total },
+        total,
+        props.interactive ? MIN_INTERACTIVE_CANDLES : 1,
+      );
+    }
+
+    return normalizeViewport(
+      { start: 0, end: total },
+      total,
+      props.interactive ? MIN_INTERACTIVE_CANDLES : 1,
+    );
+  };
+
+  return (
+    <canvas
+      ref={canvas}
+      aria-label={props.interactive ? "Interactive candle chart" : undefined}
+      class="h-full min-h-80 w-full rounded-2 outline-none focus-visible:ring-2 focus-visible:ring-accent/45"
+      classList={{
+        "cursor-grab": Boolean(props.interactive) && !isDragging(),
+        "cursor-grabbing": isDragging(),
+      }}
+      tabIndex={props.interactive ? 0 : undefined}
+      title={props.interactive ? "Drag to pan. Wheel to zoom. Double-click to reset." : undefined}
+      style={{ "touch-action": props.interactive ? "none" : "auto" }}
+      onDblClick={props.interactive ? resetViewport : undefined}
+      onKeyDown={handleKeyDown}
+      onPointerCancel={handlePointerUp}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onWheel={handleWheel}
+    />
+  );
+}
+
+function getPlotBounds(width: number, height: number): {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+} {
+  return {
+    left: 12,
+    right: width - 74,
+    top: 16,
+    bottom: height - 28,
+  };
+}
+
+function normalizeViewport(
+  viewport: ChartViewport,
+  total: number,
+  minCandles: number,
+): ChartViewport {
+  if (total <= 0) {
+    return { start: 0, end: 0 };
+  }
+
+  const minVisible = Math.min(total, Math.max(1, minCandles));
+  const visible = clamp(
+    Math.round(viewport.end - viewport.start),
+    minVisible,
+    Math.max(minVisible, total),
+  );
+  const start = clamp(Math.round(viewport.start), 0, Math.max(0, total - visible));
+
+  return {
+    start,
+    end: Math.min(total, start + visible),
+  };
 }
 
 function drawEmpty(

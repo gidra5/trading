@@ -113,6 +113,8 @@ export class TradingRuntime {
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
   private backtestAbort?: AbortController;
   private exchangeAccountWarningMessage?: string;
+  private historicalWarmupGeneration = 0;
+  private historicalWarmupPromise?: Promise<void>;
 
   constructor(
     private storage: TradingStorage,
@@ -143,7 +145,8 @@ export class TradingRuntime {
     const initialState = rebaseBotStateCapital(savedState, exchangeStartingQuote);
     this.config = this.createMarketConfig(initialState ?? savedState, exchangeStartingQuote);
     this.bot = new SimulatedTradingBot(initialState, this.config);
-    await this.warmupBotFromHistory(initialState);
+    this.warmupBotFromRecentCandles(initialState);
+    this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
   }
 
@@ -151,6 +154,7 @@ export class TradingRuntime {
     market: BinanceMarketListing,
     storage: TradingStorage,
   ): Promise<void> {
+    this.cancelHistoricalWarmup();
     await this.flushState();
     this.market = market;
     this.storage = storage;
@@ -181,7 +185,8 @@ export class TradingRuntime {
     const initialState = rebaseBotStateCapital(savedState, exchangeStartingQuote);
     this.config = this.createMarketConfig(initialState ?? savedState, exchangeStartingQuote);
     this.bot = new SimulatedTradingBot(initialState, this.config);
-    await this.warmupBotFromHistory(initialState);
+    this.warmupBotFromRecentCandles(initialState);
+    this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
   }
 
@@ -688,50 +693,125 @@ export class TradingRuntime {
     }
   }
 
-  private async warmupBotFromHistory(savedState?: PaperBotState): Promise<void> {
-    if (!this.needsHistoricalWarmup(savedState) || !isHistoricalVenue(this.market.venue)) {
+  private warmupBotFromRecentCandles(savedState?: PaperBotState): void {
+    if (this.hasUsableLegacyWarmup(savedState)) {
       return;
     }
 
-    const candles = await this.loadWarmupCandles();
+    const candles = this.candles.filter((candle) => candle.closed);
     if (candles.length === 0) {
       return;
     }
 
     const processed = this.bot.warmupFromCandles(candles);
+    if (processed > 0) {
+      for (const candle of candles.slice(-500)) {
+        upsertCandle(this.candles, candle, 500);
+      }
+    }
+  }
+
+  private startHistoricalWarmup(savedState?: PaperBotState): void {
+    const market = this.market;
+    const config = this.config;
+    if (!this.needsHistoricalWarmup(savedState, config) || !isHistoricalVenue(market.venue)) {
+      return;
+    }
+
+    const generation = ++this.historicalWarmupGeneration;
+    const endpoint = this.paperTrading?.klineEndpointFor(market);
+    let task: Promise<void>;
+    task = this.warmupBotFromHistory({
+      config,
+      endpoint,
+      generation,
+      market,
+    })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.historicalWarmupPromise === task) {
+          this.historicalWarmupPromise = undefined;
+        }
+      });
+    this.historicalWarmupPromise = task;
+  }
+
+  private cancelHistoricalWarmup(): void {
+    this.historicalWarmupGeneration += 1;
+    this.historicalWarmupPromise = undefined;
+  }
+
+  private async warmupBotFromHistory(options: {
+    config: StrategyConfig;
+    endpoint?: string;
+    generation: number;
+    market: BinanceMarketListing;
+  }): Promise<void> {
+    const candles = await this.loadWarmupCandles(
+      options.market,
+      options.config,
+      options.endpoint,
+    );
+    if (
+      options.generation !== this.historicalWarmupGeneration ||
+      options.market.id !== this.market.id ||
+      candles.length === 0
+    ) {
+      return;
+    }
+
+    const mergedCandles = mergeWarmupCandles(
+      candles,
+      this.candles.filter((candle) => candle.closed),
+    );
+    const processed = this.bot.warmupFromCandles(mergedCandles);
     if (processed <= 0) {
       return;
     }
-    for (const candle of candles.slice(-500)) {
+    for (const candle of mergedCandles.slice(-500)) {
       upsertCandle(this.candles, candle, 500);
     }
     await this.flushState();
   }
 
-  private needsHistoricalWarmup(savedState?: PaperBotState): boolean {
-    const memory = savedState?.memory.legacyValleyPeak;
-    if (!memory) {
-      return true;
-    }
-    if (memory.buyAverages.every((average) => average.timestamps.length === 0)) {
+  private needsHistoricalWarmup(
+    savedState: PaperBotState | undefined,
+    config: StrategyConfig,
+  ): boolean {
+    if (!this.hasUsableLegacyWarmup(savedState)) {
       return true;
     }
 
     const requiredWarmupSec = legacyValleyPeakHistoricalWarmupSec(
-      this.config.legacyValleyPeak,
+      config.legacyValleyPeak,
     );
-    const observedWarmupSec = legacyValleyPeakObservedWarmupSec(memory);
+    const observedWarmupSec = legacyValleyPeakObservedWarmupSec(
+      savedState!.memory.legacyValleyPeak,
+    );
     return observedWarmupSec < requiredWarmupSec * 0.95;
   }
 
-  private async loadWarmupCandles(): Promise<Candle[]> {
+  private hasUsableLegacyWarmup(savedState?: PaperBotState): boolean {
+    const memory = savedState?.memory.legacyValleyPeak;
+    return (
+      !!memory &&
+      Array.isArray(memory.buyAverages) &&
+      memory.buyAverages.some((average) => average.timestamps.length > 0)
+    );
+  }
+
+  private async loadWarmupCandles(
+    market: BinanceMarketListing,
+    config: StrategyConfig,
+    endpoint?: string,
+  ): Promise<Candle[]> {
     const intervalMs = intervalToMs(this.interval);
-    const config = this.config.legacyValleyPeak;
-    const warmupMs = legacyValleyPeakHistoricalWarmupSec(config) * 1000;
+    const warmupMs = legacyValleyPeakHistoricalWarmupSec(config.legacyValleyPeak) * 1000;
     const requiredCandles = Math.max(10, Math.ceil(warmupMs / intervalMs) + 5);
-    const storedCandles = this.candles
-      .filter((candle) => candle.closed)
-      .slice(-requiredCandles);
+    const storedCandles =
+      market.id === this.market.id
+        ? this.candles.filter((candle) => candle.closed).slice(-requiredCandles)
+        : [];
     const storedSpan =
       storedCandles.length > 0
         ? storedCandles.at(-1)!.closeTime - storedCandles[0].openTime
@@ -742,16 +822,16 @@ export class TradingRuntime {
 
     const endTime = Date.now();
     const startTime = endTime - requiredCandles * intervalMs;
-    if (!isHistoricalVenue(this.market.venue)) {
+    if (!isHistoricalVenue(market.venue)) {
       return storedCandles;
     }
-    const venue = this.market.venue;
+    const venue = market.venue;
 
     try {
       const cache = new HistoricalCandleCache({
         dataDir: this.historicalCache.dataDir,
-        marketKey: this.market.id,
-        symbol: this.market.symbol,
+        marketKey: market.id,
+        symbol: market.symbol,
         interval: this.interval,
         intervalMs,
         maxBytes: this.historicalCache.maxBytes,
@@ -761,12 +841,12 @@ export class TradingRuntime {
       await cache.ensureRange(startTime, endTime, (request) =>
         fetchKlines({
           venue,
-          symbol: this.market.symbol,
+          symbol: market.symbol,
           interval: this.interval,
           startTime: request.startTime,
           endTime: request.endTime,
           limit: request.limit,
-          endpoint: this.paperTrading?.klineEndpointFor(this.market),
+          endpoint,
         }),
       );
 
@@ -1679,6 +1759,24 @@ function buildCompletedProgress(
     message,
     result,
   };
+}
+
+function mergeWarmupCandles(
+  historicalCandles: readonly Candle[],
+  recentCandles: readonly Candle[],
+): Candle[] {
+  const byOpenTime = new Map<number, Candle>();
+  for (const candle of historicalCandles) {
+    if (candle.closed) {
+      byOpenTime.set(candle.openTime, candle);
+    }
+  }
+  for (const candle of recentCandles) {
+    if (candle.closed) {
+      byOpenTime.set(candle.openTime, candle);
+    }
+  }
+  return [...byOpenTime.values()].sort((left, right) => left.openTime - right.openTime);
 }
 
 function upsertCandle(candles: Candle[], candle: Candle, maxCandles: number): void {

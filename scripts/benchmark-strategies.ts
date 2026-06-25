@@ -11,6 +11,7 @@ import {
   type Candle,
   type EquityPoint,
   type PartialStrategyConfig,
+  type RollingPriceRangeWindow,
   type ShortMarginModel,
   type StrategyAlgorithm,
 } from "../packages/bot-algo/src/index.js";
@@ -40,6 +41,7 @@ interface BenchmarkArgs {
   lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   borrowDepthMatrix: boolean;
+  leverageRangeWindow?: RollingPriceRangeWindow;
   maxOpenOrders: number;
   cooldownSec: number;
   resampleMinutes: number;
@@ -831,16 +833,20 @@ function runBenchmark(
   if (log) {
     console.error(`Running ${benchmark.label} on ${candleCount.toLocaleString()} candles...`);
   }
-  const legacyValleyPeakConfig =
-    options.relativeRateEnabled === undefined
-      ? benchmark.config?.legacyValleyPeak
-      : {
-          ...(benchmark.config?.legacyValleyPeak ?? {}),
-          relativeRateEnabled: options.relativeRateEnabled,
-        };
+  const legacyValleyPeakConfig = {
+    ...(benchmark.config?.legacyValleyPeak ?? {}),
+    ...(options.relativeRateEnabled === undefined
+      ? {}
+      : { relativeRateEnabled: options.relativeRateEnabled }),
+    ...(options.leverageRangeWindow === undefined
+      ? {}
+      : { leverageLongTermRangeWindow: options.leverageRangeWindow }),
+  };
   const benchmarkConfig = {
     ...(benchmark.config ?? {}),
-    ...(legacyValleyPeakConfig ? { legacyValleyPeak: legacyValleyPeakConfig } : {}),
+    ...(Object.keys(legacyValleyPeakConfig).length > 0
+      ? { legacyValleyPeak: legacyValleyPeakConfig }
+      : {}),
   };
 
   const result = runBacktestFromCandles(sourceCandles, {
@@ -1330,6 +1336,7 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     borrowDepthMatrix:
       values.get("borrow-depth-matrix") === "true" ||
       values.get("depth-matrix") === "true",
+    leverageRangeWindow: parseLeverageRangeWindow(values.get("leverage-range-window")),
     maxOpenOrders: parsePositiveInt(values.get("max-open-orders"), 1024),
     cooldownSec: parsePositiveNumber(values.get("cooldown-sec"), 300),
     resampleMinutes: parsePositiveInt(values.get("resample-minutes"), 1),
@@ -1393,6 +1400,15 @@ function parseRelativeRateOverride(values: Map<string, string>): boolean | undef
 
 function parseShortMarginModel(value: string | undefined): ShortMarginModel {
   return value === "spot-borrow" ? "spot-borrow" : "futures-margin";
+}
+
+function parseLeverageRangeWindow(
+  value: string | undefined,
+): RollingPriceRangeWindow | undefined {
+  if (value === "1y" || value === "3m" || value === "2w") {
+    return value;
+  }
+  return undefined;
 }
 
 function selectBenchmarkCases(
@@ -1526,6 +1542,7 @@ function singleWindowHeader(
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     borrowDepthSummary(options),
     borrowPolicySummary(options),
+    ...optionalHeaderPart(leverageRangeWindowSummary(options)),
     maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
@@ -1555,6 +1572,7 @@ function randomLengthHeader(
     `${formatShortMarginModel(options.shortMarginModel)} short margin`,
     borrowDepthSummary(options),
     borrowPolicySummary(options),
+    ...optionalHeaderPart(leverageRangeWindowSummary(options)),
     maxOpenOrdersSummary(options),
     benchmarkCapSummary(options),
     `${options.cooldownSec}s cooldown`,
@@ -2010,6 +2028,12 @@ function borrowPolicySummary(options: BenchmarkArgs): string {
     options.borrowerProfitShareToLender,
     2,
   )}`;
+}
+
+function leverageRangeWindowSummary(options: BenchmarkArgs): string | undefined {
+  return options.leverageRangeWindow
+    ? `leverage range window ${options.leverageRangeWindow}`
+    : undefined;
 }
 
 function resampleSummary(options: BenchmarkArgs): string | undefined {
