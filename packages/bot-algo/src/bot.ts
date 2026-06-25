@@ -687,12 +687,17 @@ export class SimulatedTradingBot {
   }
 
   onCandle(candle: Candle): BotEvent[] {
-    return this.onTick({
-      symbol: candle.symbol,
-      eventTime: candle.closeTime,
-      price: candle.close,
-      quantity: candle.volume,
-    });
+    return this.onTick(
+      {
+        symbol: candle.symbol,
+        eventTime: candle.closeTime,
+        price: candle.close,
+        quantity: candle.volume,
+      },
+      {
+        sourceCandle: candle,
+      },
+    );
   }
 
   onTick(tick: PriceTick, options: TickProcessingOptions = {}): BotEvent[] {
@@ -1221,6 +1226,7 @@ export class SimulatedTradingBot {
         ),
         baseFree: this.activeLongQuantity(),
         shortBaseFree: this.activeShortQuantity(),
+        sourceCandle: options.sourceCandle,
       },
     );
 
@@ -1315,6 +1321,7 @@ export class SimulatedTradingBot {
         ),
         baseFree: activeLongQuantity,
         shortBaseFree: activeShortQuantity,
+        sourceCandle: options.sourceCandle,
       },
     );
 
@@ -4072,7 +4079,8 @@ export class SimulatedTradingBot {
     if (
       !memory ||
       memory.buyAverages.length !== rangeCount ||
-      memory.sellAverages.length !== rangeCount
+      memory.sellAverages.length !== rangeCount ||
+      memory.candleRanges?.length !== rangeCount
     ) {
       memory = normalizeLegacyValleyPeakMemory(
         memory,

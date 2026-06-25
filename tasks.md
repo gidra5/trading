@@ -2,17 +2,17 @@
 - search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or compensate variance of each other.
 - portfolio management experiments: initial strategy-portfolio harness exists; still need cached multi-symbol data for inverse-vol allocation, correlation-cluster caps, volatility-targeted leverage, market-neutral pairs, robust min-variance baskets, turnover-aware rebalancing, funding-aware overlays, and stress-mode deleveraging. Details are in docs/strategy-research.md and docs/experiment-plan.md.
 - randomized model. lets say we look at the price according to some poisson process. At each observation we decide one of the following - open new long/short position, close existing position, or do nothing. We should pick the action based on which will yield best change in equity or break-even price.
+
 - add prediction market support
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
 - maybe run some kind of genetic algorithm to finetune the parameters. use quick 1month backtests to verify quality and guide the search.
 - maybe we can do a kind of backpropagation to improve the parameters.
+
 - add partial fills and leveraged positions guided by expected short/mid/long-timeframe price ranges. given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
-- add stop loss/take profit and position lifetime to the position creation parameters. add parameters to control them.
 - estimate how much the quality of peaks and size distributions affect the performance. add a confidence score before creating positions/closing to guide the actual decisions.
-- currently strategy compares only quick and slow SMAs to detect actual peaks and valleys. But i assume we can do better by utilizing more timeframes. maybe we can even compute continuous version of the comparisons.
-- accomodate in some way average candle size at various levels of granularity
-- add more visibility into bit state
+- accomodate in some way average candle size at various levels of granularity. Use this as the expected move over the window size.
+- add more visibility into bot state
 - 90d samples, 30d, 180d, 365d 1800d
 - synusdt backtested over a year, but not trades was made. why?
   

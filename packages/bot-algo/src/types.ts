@@ -50,6 +50,7 @@ export interface TickProcessingOptions {
   simulateLiquidation?: boolean;
   processOpenOrders?: boolean;
   deferMarketOrderFills?: boolean;
+  sourceCandle?: Candle;
 }
 
 export interface Candle {
@@ -157,10 +158,63 @@ export interface RollingAverageMemory {
   points: RollingAveragePoint[];
 }
 
+export interface RollingCandleRangePoint {
+  avgPct: number;
+  maxPct: number;
+  currentPct: number;
+  count: number;
+}
+
+export interface RollingCandleRangeBucket {
+  bucketStartSec: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export interface RollingCandleRangeMemory {
+  entries: number[];
+  timestamps: number[];
+  sum: number;
+  max: number;
+  current?: RollingCandleRangeBucket;
+  points: RollingCandleRangePoint[];
+}
+
+export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
+
+export interface RollingPriceRangePoint {
+  window: RollingPriceRangeWindow;
+  windowSec: number;
+  minPrice: number;
+  maxPrice: number;
+  rangePct: number;
+  updatedAt: number;
+}
+
+export interface RollingPriceRangeBucket {
+  bucketStartSec: number;
+  low: number;
+  high: number;
+}
+
+export interface RollingPriceRangeMemory {
+  window: RollingPriceRangeWindow;
+  windowSec: number;
+  bucketSec: number;
+  current?: RollingPriceRangeBucket;
+  minCandidates: RollingPriceRangeBucket[];
+  maxCandidates: RollingPriceRangeBucket[];
+  points: RollingPriceRangePoint[];
+}
+
 export interface LegacyValleyPeakMemory {
   startedAt?: number;
   buyAverages: RollingAverageMemory[];
   sellAverages: RollingAverageMemory[];
+  candleRanges: RollingCandleRangeMemory[];
+  priceRanges: RollingPriceRangeMemory[];
   exitGrids?: Record<string, LegacyExitGridMemory>;
 }
 

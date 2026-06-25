@@ -1,6 +1,14 @@
 import type {
+  Candle,
   LegacyValleyPeakConfig,
   LegacyValleyPeakMemory,
+  RollingCandleRangeBucket,
+  RollingCandleRangeMemory,
+  RollingCandleRangePoint,
+  RollingPriceRangeBucket,
+  RollingPriceRangeMemory,
+  RollingPriceRangePoint,
+  RollingPriceRangeWindow,
   RollingAverageMemory,
   RollingAveragePoint,
 } from "./types.js";
@@ -13,6 +21,7 @@ export interface LegacyValleyPeakInput {
   shortSellingPowerQuote?: number;
   baseFree: number;
   shortBaseFree?: number;
+  sourceCandle?: Candle;
 }
 
 export type LegacyValleyPeakDecision =
@@ -65,6 +74,13 @@ export const legacyValleyPeakReferenceConfigs = {
 export const defaultLegacyValleyPeakConfig = legacyValleyPeakStrictSymmetricConfig;
 
 const ROLLING_AVERAGE_COMPACT_EXPIRED = 2048;
+const CANDLE_RANGE_WINDOW_SIZE = 1_000;
+const PRICE_RANGE_BUCKET_SEC = 5 * 60;
+const PRICE_RANGE_WINDOWS: { window: RollingPriceRangeWindow; windowSec: number }[] = [
+  { window: "1y", windowSec: 365 * 24 * 60 * 60 },
+  { window: "3m", windowSec: 90 * 24 * 60 * 60 },
+  { window: "2w", windowSec: 14 * 24 * 60 * 60 },
+];
 const MAX_EXIT_GRID_ORDER_COUNT = 5_000;
 
 export function createLegacyValleyPeakConfig(
@@ -156,6 +172,8 @@ export function createLegacyValleyPeakMemory(
   return {
     buyAverages: averages,
     sellAverages: averages,
+    candleRanges: config.averagingRangesSec.map(createRollingCandleRangeMemory),
+    priceRanges: createRollingPriceRangeMemories(),
   };
 }
 
@@ -172,6 +190,8 @@ export function normalizeLegacyValleyPeakMemory(
     startedAt: memory.startedAt,
     buyAverages: averages,
     sellAverages: averages,
+    candleRanges: normalizeCandleRangeList(memory.candleRanges, config),
+    priceRanges: normalizePriceRangeList(memory.priceRanges),
     exitGrids: memory.exitGrids,
   };
 }
@@ -186,16 +206,23 @@ export function evaluateLegacyValleyPeak(
 
   const averages = memory.buyAverages;
   memory.sellAverages = averages;
+  const candleRanges = ensureCandleRangeMemories(memory, config);
+  const priceRanges = ensurePriceRangeMemories(memory);
+  for (const priceRange of priceRanges) {
+    updateRollingPriceRange(priceRange, input, tsSec);
+  }
   for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
+    const rangeSec = config.averagingRangesSec[index];
     updateRollingAverage(
       averages[index],
       input.price,
       tsSec,
-      config.averagingRangesSec[index],
+      rangeSec,
       config.rateRatios[index],
       config.rateThresholdsLow[index],
       config.rateThresholdsHigh[index],
     );
+    updateRollingCandleRange(candleRanges[index], rangeSec, input, tsSec);
   }
 
   if (input.eventTime - memory.startedAt < config.saturationSec * 1000) {
@@ -429,6 +456,372 @@ function updateRollingAverage(
   compactRollingAverage(memory);
 }
 
+function updateRollingCandleRange(
+  memory: RollingCandleRangeMemory,
+  rangeSec: number,
+  input: LegacyValleyPeakInput,
+  tsSec: number,
+): void {
+  const source = input.sourceCandle;
+  const sourceDurationSec = source
+    ? Math.max(0, (source.closeTime - source.openTime) / 1000)
+    : 0;
+
+  if (source && sourceDurationSec <= rangeSec) {
+    observeCandleRangeSample(memory, rangeSec, {
+      openTimeSec: source.openTime / 1000,
+      open: source.open,
+      high: source.high,
+      low: source.low,
+      close: source.close,
+    });
+    return;
+  }
+
+  observeCandleRangeSample(memory, rangeSec, {
+    openTimeSec: tsSec,
+    open: input.price,
+    high: input.price,
+    low: input.price,
+    close: input.price,
+  });
+}
+
+function observeCandleRangeSample(
+  memory: RollingCandleRangeMemory,
+  rangeSec: number,
+  sample: {
+    openTimeSec: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+  },
+): void {
+  if (
+    rangeSec <= 0 ||
+    !isNonNegativeFinite(sample.openTimeSec) ||
+    !isPositiveFinite(sample.open) ||
+    !isPositiveFinite(sample.high) ||
+    !isPositiveFinite(sample.low) ||
+    !isPositiveFinite(sample.close)
+  ) {
+    return;
+  }
+
+  const bucketStartSec = Math.floor(sample.openTimeSec / rangeSec) * rangeSec;
+  const current = memory.current;
+  if (current && bucketStartSec < current.bucketStartSec) {
+    return;
+  }
+
+  if (!current || bucketStartSec > current.bucketStartSec) {
+    finalizeCandleRangeBucket(memory);
+    memory.current = {
+      bucketStartSec,
+      open: sample.open,
+      high: sample.high,
+      low: sample.low,
+      close: sample.close,
+    };
+    recordCandleRangePoint(memory);
+    return;
+  }
+
+  current.high = Math.max(current.high, sample.high);
+  current.low = Math.min(current.low, sample.low);
+  current.close = sample.close;
+  recordCandleRangePoint(memory);
+}
+
+function finalizeCandleRangeBucket(memory: RollingCandleRangeMemory): void {
+  const bucket = memory.current;
+  if (!bucket) {
+    return;
+  }
+
+  const rangePct = candleRangePct(bucket);
+  if (rangePct !== undefined) {
+    memory.entries.push(rangePct);
+    memory.timestamps.push(bucket.bucketStartSec);
+    memory.sum += rangePct;
+
+    if (memory.entries.length === 1 || rangePct > memory.max) {
+      memory.max = rangePct;
+    }
+
+    if (memory.entries.length > CANDLE_RANGE_WINDOW_SIZE) {
+      const removed = memory.entries.shift() ?? 0;
+      memory.timestamps.shift();
+      memory.sum -= removed;
+      if (removed >= memory.max) {
+        memory.max = maxNumber(memory.entries);
+      }
+    }
+  }
+
+  memory.current = undefined;
+}
+
+function recordCandleRangePoint(memory: RollingCandleRangeMemory): void {
+  const currentPct = memory.current ? candleRangePct(memory.current) : undefined;
+  const includeCurrent = currentPct !== undefined;
+  const completedLimit = includeCurrent
+    ? Math.max(0, CANDLE_RANGE_WINDOW_SIZE - 1)
+    : CANDLE_RANGE_WINDOW_SIZE;
+  const completedCount = Math.min(memory.entries.length, completedLimit);
+  const completedStart = memory.entries.length - completedCount;
+
+  let sum = 0;
+  let max = 0;
+  let count = 0;
+  for (let index = completedStart; index < memory.entries.length; index += 1) {
+    const value = memory.entries[index] ?? 0;
+    sum += value;
+    max = count === 0 ? value : Math.max(max, value);
+    count += 1;
+  }
+
+  if (currentPct !== undefined) {
+    sum += currentPct;
+    max = count === 0 ? currentPct : Math.max(max, currentPct);
+    count += 1;
+  }
+
+  if (count === 0) {
+    return;
+  }
+
+  recordCandleRangePointValue(memory, {
+    avgPct: sum / count,
+    maxPct: max,
+    currentPct: currentPct ?? 0,
+    count,
+  });
+}
+
+function recordCandleRangePointValue(
+  memory: RollingCandleRangeMemory,
+  point: RollingCandleRangePoint,
+): void {
+  const points = memory.points;
+  if (points.length === 0) {
+    points.push({ ...point });
+    return;
+  }
+  if (points.length === 1) {
+    points.push({ ...point });
+    return;
+  }
+  if (points.length > 2) {
+    points[1] = points[points.length - 1];
+    points.length = 2;
+  }
+
+  const previous = points[0];
+  const latest = points[1];
+  previous.avgPct = latest.avgPct;
+  previous.maxPct = latest.maxPct;
+  previous.currentPct = latest.currentPct;
+  previous.count = latest.count;
+  latest.avgPct = point.avgPct;
+  latest.maxPct = point.maxPct;
+  latest.currentPct = point.currentPct;
+  latest.count = point.count;
+}
+
+function candleRangePct(bucket: RollingCandleRangeBucket): number | undefined {
+  if (
+    !isPositiveFinite(bucket.open) ||
+    !isPositiveFinite(bucket.high) ||
+    !isPositiveFinite(bucket.low)
+  ) {
+    return undefined;
+  }
+
+  return Math.max(0, ((bucket.high - bucket.low) / bucket.open) * 100);
+}
+
+function updateRollingPriceRange(
+  memory: RollingPriceRangeMemory,
+  input: LegacyValleyPeakInput,
+  tsSec: number,
+): void {
+  const source = input.sourceCandle;
+  const sourceDurationSec = source
+    ? Math.max(0, (source.closeTime - source.openTime) / 1000)
+    : 0;
+
+  if (source && sourceDurationSec <= memory.bucketSec) {
+    observePriceRangeSample(
+      memory,
+      source.openTime / 1000,
+      source.low,
+      source.high,
+      tsSec,
+    );
+    return;
+  }
+
+  observePriceRangeSample(memory, tsSec, input.price, input.price, tsSec);
+}
+
+function observePriceRangeSample(
+  memory: RollingPriceRangeMemory,
+  sampleTsSec: number,
+  low: number,
+  high: number,
+  nowSec: number,
+): void {
+  if (
+    !isNonNegativeFinite(sampleTsSec) ||
+    !isPositiveFinite(low) ||
+    !isPositiveFinite(high)
+  ) {
+    return;
+  }
+
+  if (sampleTsSec + memory.bucketSec <= nowSec - memory.windowSec) {
+    return;
+  }
+
+  const bucketStartSec =
+    Math.floor(sampleTsSec / memory.bucketSec) * memory.bucketSec;
+  const current = memory.current;
+  if (current && bucketStartSec < current.bucketStartSec) {
+    expireRollingPriceRange(memory, nowSec);
+    recordRollingPriceRangePoint(memory, nowSec);
+    return;
+  }
+
+  if (!current || bucketStartSec > current.bucketStartSec) {
+    finalizePriceRangeBucket(memory);
+    memory.current = {
+      bucketStartSec,
+      low,
+      high,
+    };
+  } else {
+    current.low = Math.min(current.low, low);
+    current.high = Math.max(current.high, high);
+  }
+
+  expireRollingPriceRange(memory, nowSec);
+  recordRollingPriceRangePoint(memory, nowSec);
+}
+
+function finalizePriceRangeBucket(memory: RollingPriceRangeMemory): void {
+  const bucket = memory.current;
+  if (!bucket) {
+    return;
+  }
+
+  const finalized = { ...bucket };
+  while (
+    memory.minCandidates.length > 0 &&
+    memory.minCandidates[memory.minCandidates.length - 1].low >= finalized.low
+  ) {
+    memory.minCandidates.pop();
+  }
+  memory.minCandidates.push(finalized);
+
+  while (
+    memory.maxCandidates.length > 0 &&
+    memory.maxCandidates[memory.maxCandidates.length - 1].high <= finalized.high
+  ) {
+    memory.maxCandidates.pop();
+  }
+  memory.maxCandidates.push(finalized);
+  memory.current = undefined;
+}
+
+function expireRollingPriceRange(
+  memory: RollingPriceRangeMemory,
+  nowSec: number,
+): void {
+  const cutoffSec = nowSec - memory.windowSec;
+  while (
+    memory.minCandidates.length > 0 &&
+    memory.minCandidates[0].bucketStartSec + memory.bucketSec <= cutoffSec
+  ) {
+    memory.minCandidates.shift();
+  }
+  while (
+    memory.maxCandidates.length > 0 &&
+    memory.maxCandidates[0].bucketStartSec + memory.bucketSec <= cutoffSec
+  ) {
+    memory.maxCandidates.shift();
+  }
+}
+
+function recordRollingPriceRangePoint(
+  memory: RollingPriceRangeMemory,
+  nowSec: number,
+): void {
+  const minCandidate = memory.minCandidates[0];
+  const maxCandidate = memory.maxCandidates[0];
+  let minPrice = minCandidate?.low;
+  let maxPrice = maxCandidate?.high;
+
+  if (memory.current) {
+    minPrice =
+      minPrice === undefined
+        ? memory.current.low
+        : Math.min(minPrice, memory.current.low);
+    maxPrice =
+      maxPrice === undefined
+        ? memory.current.high
+        : Math.max(maxPrice, memory.current.high);
+  }
+
+  if (minPrice === undefined || maxPrice === undefined || minPrice <= 0) {
+    return;
+  }
+
+  recordRollingPriceRangePointValue(memory, {
+    window: memory.window,
+    windowSec: memory.windowSec,
+    minPrice,
+    maxPrice,
+    rangePct: ((maxPrice - minPrice) / minPrice) * 100,
+    updatedAt: nowSec * 1000,
+  });
+}
+
+function recordRollingPriceRangePointValue(
+  memory: RollingPriceRangeMemory,
+  point: RollingPriceRangePoint,
+): void {
+  const points = memory.points;
+  if (points.length === 0) {
+    points.push({ ...point });
+    return;
+  }
+  if (points.length === 1) {
+    points.push({ ...point });
+    return;
+  }
+  if (points.length > 2) {
+    points[1] = points[points.length - 1];
+    points.length = 2;
+  }
+
+  const previous = points[0];
+  const latest = points[1];
+  previous.window = latest.window;
+  previous.windowSec = latest.windowSec;
+  previous.minPrice = latest.minPrice;
+  previous.maxPrice = latest.maxPrice;
+  previous.rangePct = latest.rangePct;
+  previous.updatedAt = latest.updatedAt;
+  latest.window = point.window;
+  latest.windowSec = point.windowSec;
+  latest.minPrice = point.minPrice;
+  latest.maxPrice = point.maxPrice;
+  latest.rangePct = point.rangePct;
+  latest.updatedAt = point.updatedAt;
+}
+
 function sampleAverage(
   memory: RollingAverageMemory,
   ts: number,
@@ -529,11 +922,59 @@ function createRollingAverageMemory(): RollingAverageMemory {
   };
 }
 
+function createRollingCandleRangeMemory(): RollingCandleRangeMemory {
+  return {
+    entries: [],
+    timestamps: [],
+    sum: 0,
+    max: 0,
+    points: [],
+  };
+}
+
+function createRollingPriceRangeMemories(): RollingPriceRangeMemory[] {
+  return PRICE_RANGE_WINDOWS.map(({ window, windowSec }) =>
+    createRollingPriceRangeMemory(window, windowSec),
+  );
+}
+
+function createRollingPriceRangeMemory(
+  window: RollingPriceRangeWindow,
+  windowSec: number,
+): RollingPriceRangeMemory {
+  return {
+    window,
+    windowSec,
+    bucketSec: PRICE_RANGE_BUCKET_SEC,
+    minCandidates: [],
+    maxCandidates: [],
+    points: [],
+  };
+}
+
 function normalizeAverageList(
   list: RollingAverageMemory[] | undefined,
   config: LegacyValleyPeakConfig,
 ): RollingAverageMemory[] {
   return config.averagingRangesSec.map((_, index) => normalizeAverage(list?.[index]));
+}
+
+function normalizeCandleRangeList(
+  list: RollingCandleRangeMemory[] | undefined,
+  config: LegacyValleyPeakConfig,
+): RollingCandleRangeMemory[] {
+  return config.averagingRangesSec.map((_, index) =>
+    normalizeCandleRange(list?.[index]),
+  );
+}
+
+function normalizePriceRangeList(
+  list: RollingPriceRangeMemory[] | undefined,
+): RollingPriceRangeMemory[] {
+  return PRICE_RANGE_WINDOWS.map(({ window, windowSec }) => {
+    const existing = list?.find((memory) => memory.window === window);
+    return normalizePriceRange(existing, window, windowSec);
+  });
 }
 
 function normalizeAverage(memory: RollingAverageMemory | undefined): RollingAverageMemory {
@@ -552,6 +993,140 @@ function normalizeAverage(memory: RollingAverageMemory | undefined): RollingAver
     previousSampleIndex: memory?.previousSampleIndex,
     points: memory?.points ?? [],
   };
+}
+
+function normalizeCandleRange(
+  memory: RollingCandleRangeMemory | undefined,
+): RollingCandleRangeMemory {
+  const memoryEntries = Array.isArray(memory?.entries) ? memory.entries : [];
+  const memoryTimestamps = Array.isArray(memory?.timestamps) ? memory.timestamps : [];
+  const maxLength = Math.min(
+    memoryEntries.length,
+    memoryTimestamps.length,
+    CANDLE_RANGE_WINDOW_SIZE,
+  );
+  const entries = memoryEntries.slice(-maxLength);
+  const timestamps = memoryTimestamps.slice(-maxLength);
+  const sum = entries.reduce((total, value) => total + value, 0);
+
+  return {
+    entries,
+    timestamps,
+    sum,
+    max: maxNumber(entries),
+    current: normalizeCandleRangeBucket(memory?.current),
+    points: normalizeCandleRangePoints(memory?.points),
+  };
+}
+
+function normalizeCandleRangeBucket(
+  bucket: RollingCandleRangeBucket | undefined,
+): RollingCandleRangeBucket | undefined {
+  if (
+    !bucket ||
+    !isNonNegativeFinite(bucket.bucketStartSec) ||
+    !isPositiveFinite(bucket.open) ||
+    !isPositiveFinite(bucket.high) ||
+    !isPositiveFinite(bucket.low) ||
+    !isPositiveFinite(bucket.close)
+  ) {
+    return undefined;
+  }
+
+  return { ...bucket };
+}
+
+function normalizeCandleRangePoints(
+  points: RollingCandleRangePoint[] | undefined,
+): RollingCandleRangePoint[] {
+  return (points ?? [])
+    .filter(
+      (point) =>
+        Number.isFinite(point.avgPct) &&
+        Number.isFinite(point.maxPct) &&
+        Number.isFinite(point.currentPct) &&
+        Number.isFinite(point.count),
+    )
+    .slice(-2)
+    .map((point) => ({ ...point }));
+}
+
+function normalizePriceRange(
+  memory: RollingPriceRangeMemory | undefined,
+  window: RollingPriceRangeWindow,
+  windowSec: number,
+): RollingPriceRangeMemory {
+  return {
+    window,
+    windowSec,
+    bucketSec: PRICE_RANGE_BUCKET_SEC,
+    current: normalizePriceRangeBucket(memory?.current),
+    minCandidates: normalizePriceRangeBuckets(memory?.minCandidates),
+    maxCandidates: normalizePriceRangeBuckets(memory?.maxCandidates),
+    points: normalizePriceRangePoints(memory?.points, window, windowSec),
+  };
+}
+
+function normalizePriceRangeBuckets(
+  buckets: RollingPriceRangeBucket[] | undefined,
+): RollingPriceRangeBucket[] {
+  return (Array.isArray(buckets) ? buckets : [])
+    .filter(
+      (bucket) =>
+        isNonNegativeFinite(bucket.bucketStartSec) &&
+        isPositiveFinite(bucket.low) &&
+        isPositiveFinite(bucket.high),
+    )
+    .map((bucket) => ({ ...bucket }));
+}
+
+function normalizePriceRangeBucket(
+  bucket: RollingPriceRangeBucket | undefined,
+): RollingPriceRangeBucket | undefined {
+  return normalizePriceRangeBuckets(bucket ? [bucket] : [])[0];
+}
+
+function normalizePriceRangePoints(
+  points: RollingPriceRangePoint[] | undefined,
+  window: RollingPriceRangeWindow,
+  windowSec: number,
+): RollingPriceRangePoint[] {
+  return (Array.isArray(points) ? points : [])
+    .filter(
+      (point) =>
+        isPositiveFinite(point.minPrice) &&
+        isPositiveFinite(point.maxPrice) &&
+        Number.isFinite(point.rangePct) &&
+        Number.isFinite(point.updatedAt),
+    )
+    .slice(-2)
+    .map((point) => ({
+      window,
+      windowSec,
+      minPrice: point.minPrice,
+      maxPrice: point.maxPrice,
+      rangePct: point.rangePct,
+      updatedAt: point.updatedAt,
+    }));
+}
+
+function ensureCandleRangeMemories(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): RollingCandleRangeMemory[] {
+  if (memory.candleRanges?.length !== config.averagingRangesSec.length) {
+    memory.candleRanges = normalizeCandleRangeList(memory.candleRanges, config);
+  }
+  return memory.candleRanges;
+}
+
+function ensurePriceRangeMemories(
+  memory: LegacyValleyPeakMemory,
+): RollingPriceRangeMemory[] {
+  if (memory.priceRanges?.length !== PRICE_RANGE_WINDOWS.length) {
+    memory.priceRanges = normalizePriceRangeList(memory.priceRanges);
+  }
+  return memory.priceRanges;
 }
 
 function gaussian(x: number, mu: number, sigma: number): number {
@@ -613,6 +1188,18 @@ function clampInt(value: number, min: number, max: number): number {
   }
 
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function isPositiveFinite(value: number): boolean {
+  return Number.isFinite(value) && value > 0;
+}
+
+function isNonNegativeFinite(value: number): boolean {
+  return Number.isFinite(value) && value >= 0;
+}
+
+function maxNumber(values: number[]): number {
+  return values.length > 0 ? Math.max(...values) : 0;
 }
 
 function padNumbers(values: number[], length: number, fallback: number): number[] {

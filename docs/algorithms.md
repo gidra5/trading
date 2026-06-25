@@ -40,6 +40,8 @@ short range = execution / grid / stop noise
 mid range = leverage and trade lifetime
 long range = account-level exposure and “do I still want to hold this asset?”
 
+compute recent avg and max candle size for each range as candle interval
+
 ### The trading model
 
 The trading model is much more complex that traditionally used on the platforms.
@@ -166,6 +168,15 @@ This prevents tiny average movements from constantly generating valley/peak flip
 The detector shares the same average array for buy and sell memory. `buyAverages` and
 `sellAverages` are separate fields for state compatibility, but current code points both
 at the same rolling average objects.
+
+For each configured window, the detector also keeps `candleRanges`, a rolling view of
+the last 1000 synthetic candles at that window size. Each completed candle stores
+`(high - low) / open * 100`; the latest point reports average percent range, maximum
+percent range, current in-progress candle range, and sample count.
+
+The detector also keeps fixed `priceRanges` for `1y`, `3m`, and `2w`. These track
+rolling minimum and maximum prices using 5-minute high/low buckets, so long windows do
+not retain every raw trade tick. The `3m` window is modeled as 90 days.
 
 ## Valley Signal
 
