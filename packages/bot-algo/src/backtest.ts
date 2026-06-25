@@ -4,10 +4,13 @@ import {
   createStrategyConfig,
   type PartialStrategyConfig,
 } from "./bot.js";
-import { summarizeClosedPositions } from "./position-ledger.js";
+import { defaultPositionRiskConfig, summarizeClosedPositions } from "./position-ledger.js";
 import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 import type {
   BacktestSummary,
+  BacktestCandleChart,
+  BacktestChartAnnotation,
+  BacktestChartSmaSeries,
   BacktestResult,
   BacktestStopReason,
   Candle,
@@ -26,6 +29,7 @@ export interface RunBacktestOptions {
   maxEquityPoints?: number;
   maxReturnedOrders?: number;
   maxReturnedFills?: number;
+  maxChartCandles?: number;
   startIndex?: number;
   endIndex?: number;
 }
@@ -33,6 +37,19 @@ export interface RunBacktestOptions {
 const DEFAULT_MAX_EQUITY_POINTS = 800;
 const DEFAULT_MAX_RETURNED_ORDERS = 2_000;
 const DEFAULT_MAX_RETURNED_FILLS = 2_000;
+const DEFAULT_MAX_CHART_CANDLES = 2_000;
+const DEFAULT_MAX_CHART_ANNOTATIONS = 5_000;
+const SMA_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e", "#f472b6", "#eab308"];
+
+export interface BacktestChartCollector {
+  sampleEvery: number;
+  candles: Candle[];
+  smaSeries: BacktestChartSmaSeries[];
+  annotations: BacktestChartAnnotation[];
+  lastObservedOrderCount: number;
+  lastObservedFillCount: number;
+  lastObservedSignalAt?: number;
+}
 
 interface PerfectMarginBenchmarkAccumulator {
   startingQuote: number;
@@ -42,6 +59,8 @@ interface PerfectMarginBenchmarkAccumulator {
   netPnl: number;
   compoundedEquity: number;
 }
+
+const PERFECT_MARGIN_MIN_SLIPPAGE_BPS = defaultPositionRiskConfig.marketSlippageBps;
 
 type PerfectMarginBenchmark = Pick<
   BacktestSummary,
@@ -55,6 +74,198 @@ type PerfectMarginBenchmark = Pick<
   | "perfectMarginCompoundedReturnPct"
   | "perfectMarginCompoundedCapturePct"
 >;
+
+export function createBacktestChartCollector(
+  config: Readonly<StrategyConfig>,
+  totalCandles: number,
+  maxChartCandles = DEFAULT_MAX_CHART_CANDLES,
+): BacktestChartCollector {
+  const selectedIndices = selectedSmaIndices(config);
+  return {
+    sampleEvery: Math.max(1, Math.ceil(totalCandles / Math.max(1, maxChartCandles))),
+    candles: [],
+    smaSeries: selectedIndices.map((index, colorIndex) => ({
+      index,
+      windowSec: config.legacyValleyPeak.averagingRangesSec[index] ?? 0,
+      label: `${formatWindowLabel(config.legacyValleyPeak.averagingRangesSec[index] ?? 0)} SMA`,
+      color: SMA_COLORS[colorIndex % SMA_COLORS.length] ?? "#38bdf8",
+      points: [],
+    })),
+    annotations: [],
+    lastObservedOrderCount: 0,
+    lastObservedFillCount: 0,
+  };
+}
+
+export function observeBacktestChartCandle(
+  collector: BacktestChartCollector,
+  bot: SimulatedTradingBot,
+  candle: Candle,
+  processedCandles: number,
+  forceSample = false,
+): void {
+  observeBacktestChartAnnotations(collector, bot.view());
+  if (
+    !forceSample &&
+    processedCandles !== 1 &&
+    processedCandles % collector.sampleEvery !== 0
+  ) {
+    return;
+  }
+
+  const previous = collector.candles.at(-1);
+  if (previous?.openTime === candle.openTime && previous.interval === candle.interval) {
+    collector.candles[collector.candles.length - 1] = { ...candle };
+  } else {
+    collector.candles.push({ ...candle });
+  }
+
+  const averages = bot.view().memory.legacyValleyPeakDebug?.averages ?? [];
+  for (const series of collector.smaSeries) {
+    const avg = averages.find((item) => item.index === series.index)?.avg;
+    if (Number.isFinite(avg)) {
+      const lastPoint = series.points.at(-1);
+      if (lastPoint?.time === candle.closeTime) {
+        lastPoint.value = avg as number;
+      } else {
+        series.points.push({
+          time: candle.closeTime,
+          value: avg as number,
+        });
+      }
+    }
+  }
+}
+
+export function finalizeBacktestCandleChart(
+  collector: BacktestChartCollector,
+): BacktestCandleChart | undefined {
+  if (collector.candles.length === 0) {
+    return undefined;
+  }
+
+  return {
+    candles: collector.candles,
+    smaSeries: collector.smaSeries.filter((series) => series.points.length > 0),
+    annotations: collector.annotations,
+  };
+}
+
+function observeBacktestChartAnnotations(
+  collector: BacktestChartCollector,
+  state: Readonly<PaperBotState>,
+): void {
+  const memory = state.memory;
+  if (
+    memory.lastExtremaSignal &&
+    memory.lastExtremaSignalAt &&
+    memory.lastExtremaSignalAt !== collector.lastObservedSignalAt
+  ) {
+    collector.lastObservedSignalAt = memory.lastExtremaSignalAt;
+    appendBacktestAnnotation(collector, {
+      time: memory.lastExtremaSignalAt,
+      price: memory.lastExtremaSignalPrice ?? state.lastPrice,
+      kind: memory.lastExtremaSignal === "buy" ? "buy-signal" : "sell-signal",
+      label: memory.lastExtremaSignal === "buy" ? "Valley signal" : "Peak signal",
+      reason: memory.lastExtremaSignalReason,
+    });
+  }
+
+  for (
+    let index = collector.lastObservedOrderCount;
+    index < state.orders.length;
+    index += 1
+  ) {
+    const order = state.orders[index];
+    if (!order) {
+      continue;
+    }
+    appendBacktestAnnotation(collector, {
+      time: order.createdAt,
+      price: order.price,
+      kind: order.side === "buy" ? "buy-order" : "sell-order",
+      label: `${order.side.toUpperCase()} ${order.type} ${order.positionEffect ?? "auto"}`,
+      reason: order.reason,
+      orderId: order.id,
+      targetPositionId: order.targetPositionId,
+    });
+  }
+  collector.lastObservedOrderCount = state.orders.length;
+
+  for (
+    let index = collector.lastObservedFillCount;
+    index < state.fills.length;
+    index += 1
+  ) {
+    const fill = state.fills[index];
+    if (!fill) {
+      continue;
+    }
+    appendBacktestAnnotation(collector, {
+      time: fill.filledAt,
+      price: fill.price,
+      kind: fill.side === "buy" ? "buy-fill" : "sell-fill",
+      label: `${fill.side.toUpperCase()} fill ${fill.positionEffect ?? "auto"}`,
+      reason: fill.reason,
+      orderId: fill.orderId,
+      fillId: fill.id,
+      targetPositionId: fill.targetPositionId,
+    });
+  }
+  collector.lastObservedFillCount = state.fills.length;
+}
+
+function appendBacktestAnnotation(
+  collector: BacktestChartCollector,
+  annotation: BacktestChartAnnotation,
+): void {
+  if (!Number.isFinite(annotation.time) || !Number.isFinite(annotation.price)) {
+    return;
+  }
+
+  collector.annotations.push(annotation);
+  if (collector.annotations.length > DEFAULT_MAX_CHART_ANNOTATIONS) {
+    collector.annotations.splice(
+      0,
+      collector.annotations.length - DEFAULT_MAX_CHART_ANNOTATIONS,
+    );
+  }
+}
+
+function selectedSmaIndices(config: Readonly<StrategyConfig>): number[] {
+  const legacy = config.legacyValleyPeak;
+  const maxIndex = legacy.averagingRangesSec.length - 1;
+  const indices = new Set<number>();
+  const add = (index: number) => {
+    if (Number.isFinite(index) && index >= 0 && index <= maxIndex) {
+      indices.add(Math.round(index));
+    }
+  };
+
+  add(legacy.buyDataIndex);
+  add(legacy.sellDataIndex);
+  for (const offset of legacy.buyConfirmationOffsets) {
+    add(legacy.buyDataIndex + offset);
+  }
+  for (const offset of legacy.sellConfirmationOffsets) {
+    add(legacy.sellDataIndex + offset);
+  }
+
+  return [...indices].sort((a, b) => a - b);
+}
+
+function formatWindowLabel(seconds: number): string {
+  if (seconds >= 86_400 && seconds % 86_400 === 0) {
+    return `${seconds / 86_400}d`;
+  }
+  if (seconds >= 3_600 && seconds % 3_600 === 0) {
+    return `${seconds / 3_600}h`;
+  }
+  if (seconds >= 60 && seconds % 60 === 0) {
+    return `${seconds / 60}m`;
+  }
+  return `${seconds}s`;
+}
 
 export function runBacktestFromCandles(
   candles: Candle[],
@@ -82,6 +293,11 @@ export function runBacktestFromCandles(
   const bot = new SimulatedTradingBot(createInitialBotState(config));
   const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
+  const chartCollector = createBacktestChartCollector(
+    config,
+    candleCount,
+    options.maxChartCandles,
+  );
   const startedAt = Date.now();
   let stopReason: BacktestStopReason = "completed";
   let processedCandles = 0;
@@ -101,6 +317,13 @@ export function runBacktestFromCandles(
       stopReason = "liquidated";
       liquidated = true;
     }
+    observeBacktestChartCandle(
+      chartCollector,
+      bot,
+      candle,
+      processedCandles,
+      index === endIndex - 1 || liquidated,
+    );
 
     if (relativeIndex % sampleEvery === 0 || index === endIndex - 1 || liquidated) {
       const metrics = bot.markToMarket();
@@ -133,6 +356,7 @@ export function runBacktestFromCandles(
     options,
     finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
     stopReason,
+    finalizeBacktestCandleChart(chartCollector),
   );
 }
 
@@ -334,13 +558,15 @@ function replayCandle(
 function createPerfectMarginBenchmark(
   config: StrategyConfig,
 ): PerfectMarginBenchmarkAccumulator {
+  const slippageBps = Math.max(
+    PERFECT_MARGIN_MIN_SLIPPAGE_BPS,
+    Math.max(0, config.positionRisk.marketSlippageBps),
+  );
   return {
     startingQuote: config.startingQuote,
     leverage: config.maxLeverage,
     roundTripFrictionRate:
-      2 *
-      ((Math.max(0, config.feeBps) + Math.max(0, config.positionRisk.marketSlippageBps)) /
-        10_000),
+      2 * ((Math.max(0, config.feeBps) + slippageBps) / 10_000),
     netPnl: 0,
     compoundedEquity: config.startingQuote,
   };
@@ -409,6 +635,7 @@ function buildBacktestResult(
   options: Pick<RunBacktestOptions, "maxReturnedOrders" | "maxReturnedFills">,
   perfectMargin: PerfectMarginBenchmark,
   stopReason: BacktestStopReason = "completed",
+  candleChart?: BacktestCandleChart,
 ): BacktestResult {
   const resultState = compactBacktestState(finalState, options);
   const riskMetrics = calculateRiskAdjustedMetrics(
@@ -444,6 +671,7 @@ function buildBacktestResult(
       stopReason,
     },
     equityCurve,
+    candleChart,
     orders: resultState.orders,
     fills: resultState.fills,
     finalState: resultState,
@@ -489,6 +717,13 @@ function compactBacktestMemory(
     prices: tail(memory.prices, priceLimit).slice(),
     lastSignal: memory.lastSignal,
     lastActionAt: memory.lastActionAt,
+    lastExtremaSignal: memory.lastExtremaSignal,
+    lastExtremaSignalAt: memory.lastExtremaSignalAt,
+    lastExtremaSignalPrice: memory.lastExtremaSignalPrice,
+    lastExtremaSignalReason: memory.lastExtremaSignalReason,
+    legacyValleyPeakDebug: memory.legacyValleyPeakDebug
+      ? structuredClone(memory.legacyValleyPeakDebug)
+      : undefined,
   };
 }
 

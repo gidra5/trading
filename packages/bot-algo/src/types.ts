@@ -37,6 +37,8 @@ export type ExitGridPriceDistribution = "uniform" | "geometric";
 
 export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
+export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
+
 export interface PriceTick {
   symbol: string;
   eventTime: number;
@@ -114,6 +116,7 @@ export interface PositionRiskConfig {
 export interface LegacyValleyPeakConfig {
   averagingRangesSec: number[];
   rateRatios: number[];
+  relativeRateEnabled: boolean;
   rateThresholdsLow: number[];
   rateThresholdsHigh: number[];
   buyDataIndex: number;
@@ -140,6 +143,13 @@ export interface LegacyValleyPeakConfig {
   exitGridResetBps: number;
   exitGridPositionMode: "aggregate" | "per-lot";
   exitGridResetMode: "higher-peak" | "filled-grid";
+  rangeLeverageEnabled: boolean;
+  leverageLongTermRangeWindow: RollingPriceRangeWindow;
+  leverageLifetimeDataIndex: number;
+  leverageRangeEdgeFraction: number;
+  leverageExpectedMoveMultiplier: number;
+  leverageMaxEntryLeverage: number;
+  leverageLifetimeMinLeverage: number;
 }
 
 export interface RollingAveragePoint {
@@ -173,16 +183,22 @@ export interface RollingCandleRangeBucket {
   close: number;
 }
 
+export interface RollingCandleRangeMaxCandidate {
+  index: number;
+  value: number;
+}
+
 export interface RollingCandleRangeMemory {
   entries: number[];
   timestamps: number[];
   sum: number;
   max: number;
+  entryOffset: number;
+  nextIndex: number;
+  maxCandidates: RollingCandleRangeMaxCandidate[];
   current?: RollingCandleRangeBucket;
   points: RollingCandleRangePoint[];
 }
-
-export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
 
 export interface RollingPriceRangePoint {
   window: RollingPriceRangeWindow;
@@ -216,6 +232,119 @@ export interface LegacyValleyPeakMemory {
   candleRanges: RollingCandleRangeMemory[];
   priceRanges: RollingPriceRangeMemory[];
   exitGrids?: Record<string, LegacyExitGridMemory>;
+}
+
+export interface LegacyValleyPeakAverageDebug {
+  index: number;
+  windowSec: number;
+  avg?: number;
+  rate?: number;
+  rateClamped?: number;
+  thresholdLow: number;
+  thresholdHigh: number;
+  buyPrimary: boolean;
+  sellPrimary: boolean;
+  buyConfirmation: boolean;
+  sellConfirmation: boolean;
+  valley: boolean;
+  peak: boolean;
+}
+
+export interface LegacyValleyPeakConfirmationDebug {
+  index: number;
+  windowSec?: number;
+  rateClamped?: number;
+  passed: boolean;
+  expected: "positive" | "negative";
+}
+
+export interface LegacyValleyPeakCheckDebug {
+  side: "buy" | "sell";
+  passed: boolean;
+  primaryIndex: number;
+  primaryWindowSec?: number;
+  primaryRate?: number;
+  primaryRateClamped?: number;
+  primaryShape: "valley" | "peak" | "flat" | "missing";
+  confirmations: LegacyValleyPeakConfirmationDebug[];
+  quoteSize?: number;
+  quantity?: number;
+  coverQuantity?: number;
+  minTradeQuote: number;
+}
+
+export interface LegacyValleyPeakCandleRangeDebug {
+  index: number;
+  windowSec: number;
+  avgPct?: number;
+  maxPct?: number;
+  currentPct?: number;
+  count?: number;
+}
+
+export interface LegacyValleyPeakPriceRangeDebug {
+  window: RollingPriceRangeWindow;
+  windowSec: number;
+  minPrice?: number;
+  maxPrice?: number;
+  rangePct?: number;
+  updatedAt?: number;
+}
+
+export interface LegacyEntryRiskDebug {
+  side: PositionLotSide;
+  mode: "max" | "long-term-range" | "lifetime";
+  leverage: number;
+  maxLeverage: number;
+  maxEntryLeverage?: number;
+  lifetimeMinLeverage?: number;
+  lifetimeMs?: number;
+  rangePosition?: number;
+  rangeEdgeFraction?: number;
+  nearRangeEdge?: boolean;
+  longTermRangeWindow?: RollingPriceRangeWindow;
+  longTermMinPrice?: number;
+  longTermMaxPrice?: number;
+  liquidationBoundaryPrice?: number;
+  adverseDistancePct?: number;
+  lifetimeWindowSec?: number;
+  expectedMovePct?: number;
+  expectedMoveMultiplier?: number;
+}
+
+export type LegacyMarketTrendState = "rising" | "falling" | "sideways";
+
+export interface LegacyMarketStateDebug {
+  state: LegacyMarketTrendState;
+  sourceIndex?: number;
+  windowSec?: number;
+  rate?: number;
+  rateClamped?: number;
+  thresholdLow?: number;
+  thresholdHigh?: number;
+}
+
+export interface LegacyValleyPeakDebugSnapshot {
+  updatedAt: number;
+  price: number;
+  signal: BotSignal;
+  reason?: string;
+  marketState: LegacyMarketStateDebug;
+  saturated: boolean;
+  saturationRemainingMs: number;
+  lastExtremaSignal?: Exclude<BotSignal, "hold">;
+  lastExtremaSignalAt?: number;
+  lastExtremaSignalPrice?: number;
+  lastExtremaSignalReason?: string;
+  averages: LegacyValleyPeakAverageDebug[];
+  candleRanges: LegacyValleyPeakCandleRangeDebug[];
+  priceRanges: LegacyValleyPeakPriceRangeDebug[];
+  buyCheck: LegacyValleyPeakCheckDebug;
+  sellCheck: LegacyValleyPeakCheckDebug;
+  entryRisk?: {
+    long: LegacyEntryRiskDebug;
+    short: LegacyEntryRiskDebug;
+  };
 }
 
 export interface LegacyExitGridMemory {
@@ -334,7 +463,12 @@ export interface StrategyMemory {
   prices: number[];
   lastSignal: BotSignal;
   lastActionAt: number;
+  lastExtremaSignal?: Exclude<BotSignal, "hold">;
+  lastExtremaSignalAt?: number;
+  lastExtremaSignalPrice?: number;
+  lastExtremaSignalReason?: string;
   legacyValleyPeak?: LegacyValleyPeakMemory;
+  legacyValleyPeakDebug?: LegacyValleyPeakDebugSnapshot;
 }
 
 export interface BotMetrics {
@@ -613,9 +747,40 @@ export interface EquityPoint {
   price: number;
 }
 
+export interface BacktestChartPoint {
+  time: number;
+  value: number;
+}
+
+export interface BacktestChartSmaSeries {
+  index: number;
+  windowSec: number;
+  label: string;
+  color: string;
+  points: BacktestChartPoint[];
+}
+
+export interface BacktestChartAnnotation {
+  time: number;
+  price: number;
+  kind: "buy-signal" | "sell-signal" | "buy-order" | "sell-order" | "buy-fill" | "sell-fill";
+  label: string;
+  reason?: string;
+  orderId?: string;
+  fillId?: string;
+  targetPositionId?: string;
+}
+
+export interface BacktestCandleChart {
+  candles: Candle[];
+  smaSeries: BacktestChartSmaSeries[];
+  annotations: BacktestChartAnnotation[];
+}
+
 export interface BacktestResult {
   summary: BacktestSummary;
   equityCurve: EquityPoint[];
+  candleChart?: BacktestCandleChart;
   orders: TradingOrder[];
   fills: TradeFill[];
   finalState: PaperBotState;

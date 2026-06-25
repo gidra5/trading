@@ -7,9 +7,13 @@ export {
 } from "./bot.js";
 export {
   compactBacktestState,
+  createBacktestChartCollector,
+  finalizeBacktestCandleChart,
+  observeBacktestChartCandle,
   runBacktestFromCandles,
   runBacktestFromOrderBook,
   runBacktestFromTicks,
+  type BacktestChartCollector,
 } from "./backtest.js";
 export {
   createLegacyValleyPeakConfig,

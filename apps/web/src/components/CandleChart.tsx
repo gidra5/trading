@@ -1,11 +1,20 @@
 import { createEffect, onCleanup, onMount } from "solid-js";
-import type { Candle, TradingOrder } from "@trading/bot-algo";
+import type {
+  BacktestChartAnnotation,
+  BacktestChartSmaSeries,
+  Candle,
+  TradingOrder,
+} from "@trading/bot-algo";
 import { formatQuote, formatTime } from "../format";
 
 interface CandleChartProps {
   candles: Candle[];
   orders: TradingOrder[];
   lastPrice: number;
+  smaSeries?: BacktestChartSmaSeries[];
+  annotations?: BacktestChartAnnotation[];
+  maxCandles?: number;
+  emptyLabel?: string;
 }
 
 export function CandleChart(props: CandleChartProps) {
@@ -36,18 +45,34 @@ export function CandleChart(props: CandleChartProps) {
     ctx.fillStyle = "#101217";
     ctx.fillRect(0, 0, width, height);
 
-    const candles = props.candles.slice(-140);
+    const maxCandles = props.maxCandles ?? 140;
+    const candles = maxCandles > 0 ? props.candles.slice(-maxCandles) : props.candles;
     if (candles.length < 2) {
-      drawEmpty(ctx, width, height);
+      drawEmpty(ctx, width, height, props.emptyLabel);
       return;
     }
 
     const openOrders = props.orders.filter((order) => order.status === "open");
+    const startTime = candles[0]?.openTime ?? 0;
+    const endTime = candles.at(-1)?.closeTime ?? startTime + 1;
+    const smaSeries = (props.smaSeries ?? [])
+      .map((series) => ({
+        ...series,
+        points: series.points.filter(
+          (point) => point.time >= startTime && point.time <= endTime,
+        ),
+      }))
+      .filter((series) => series.points.length > 0);
+    const annotations = (props.annotations ?? []).filter(
+      (annotation) => annotation.time >= startTime && annotation.time <= endTime,
+    );
     const values = candles.flatMap((candle) => [candle.high, candle.low]);
     if (props.lastPrice > 0) {
       values.push(props.lastPrice);
     }
     values.push(...openOrders.map((order) => order.price));
+    values.push(...smaSeries.flatMap((series) => series.points.map((point) => point.value)));
+    values.push(...annotations.map((annotation) => annotation.price));
 
     const min = Math.min(...values);
     const max = Math.max(...values);
@@ -64,8 +89,13 @@ export function CandleChart(props: CandleChartProps) {
     const plotHeight = plot.bottom - plot.top;
     const priceToY = (price: number) =>
       plot.top + ((priceMax - price) / (priceMax - priceMin)) * plotHeight;
+    const timeToX = (time: number) =>
+      plot.left + ((time - startTime) / Math.max(1, endTime - startTime)) * plotWidth;
 
     drawGrid(ctx, width, height, plot, priceMin, priceMax, priceToY);
+    for (const series of smaSeries) {
+      drawLineSeries(ctx, series, plot, priceToY, timeToX);
+    }
 
     const step = plotWidth / candles.length;
     const bodyWidth = Math.max(3, Math.min(10, step * 0.62));
@@ -107,6 +137,7 @@ export function CandleChart(props: CandleChartProps) {
       );
     }
 
+    drawAnnotations(ctx, annotations, plot, priceToY, timeToX);
     drawTimeLabels(ctx, candles, plot);
   };
 
@@ -114,6 +145,8 @@ export function CandleChart(props: CandleChartProps) {
     props.candles.length;
     props.orders.length;
     props.lastPrice;
+    props.smaSeries?.length;
+    props.annotations?.length;
     draw();
   });
 
@@ -128,11 +161,16 @@ export function CandleChart(props: CandleChartProps) {
   return <canvas ref={canvas} class="h-full min-h-80 w-full rounded-2" />;
 }
 
-function drawEmpty(ctx: CanvasRenderingContext2D, width: number, height: number): void {
+function drawEmpty(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  label = "Waiting for Binance candle data",
+): void {
   ctx.fillStyle = "#aeb6c8";
   ctx.font = "14px Inter, sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText("Waiting for Binance candle data", width / 2, height / 2);
+  ctx.fillText(label, width / 2, height / 2);
 }
 
 function drawGrid(
@@ -190,6 +228,96 @@ function drawPriceLine(
   ctx.fillText(`${label} ${formatQuote(price, 2)}`, plot.right - 6, y - 4);
 }
 
+function drawLineSeries(
+  ctx: CanvasRenderingContext2D,
+  series: BacktestChartSmaSeries,
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  if (series.points.length < 2) {
+    return;
+  }
+
+  ctx.save();
+  ctx.strokeStyle = series.color;
+  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = 0.86;
+  ctx.beginPath();
+  series.points.forEach((point, index) => {
+    const x = clamp(timeToX(point.time), plot.left, plot.right);
+    const y = clamp(priceToY(point.value), plot.top, plot.bottom);
+    if (index === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  const last = series.points.at(-1);
+  if (last) {
+    ctx.fillStyle = series.color;
+    ctx.font = "11px Inter, sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(series.label, plot.right - 6, clamp(priceToY(last.value), plot.top + 8, plot.bottom - 8));
+  }
+  ctx.restore();
+}
+
+function drawAnnotations(
+  ctx: CanvasRenderingContext2D,
+  annotations: BacktestChartAnnotation[],
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  const visible = annotations.slice(-160);
+  for (const annotation of visible) {
+    const x = clamp(timeToX(annotation.time), plot.left, plot.right);
+    const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
+    const isBuy = annotation.kind.startsWith("buy");
+    const isSignal = annotation.kind.endsWith("signal");
+    const color = isBuy ? "#22c55e" : "#f05252";
+
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = "#090a0d";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (isBuy) {
+      ctx.moveTo(x, y - 8);
+      ctx.lineTo(x - 5, y + 4);
+      ctx.lineTo(x + 5, y + 4);
+    } else {
+      ctx.moveTo(x, y + 8);
+      ctx.lineTo(x - 5, y - 4);
+      ctx.lineTo(x + 5, y - 4);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fill();
+
+    if (isSignal) {
+      ctx.strokeStyle = color;
+      ctx.setLineDash([2, 5]);
+      ctx.beginPath();
+      ctx.moveTo(x, plot.top);
+      ctx.lineTo(x, plot.bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    ctx.fillStyle = color;
+    ctx.font = "10px Inter, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = isBuy ? "bottom" : "top";
+    ctx.fillText(annotation.kind.includes("signal") ? "SIG" : annotation.kind.includes("fill") ? "F" : "O", x, isBuy ? y - 9 : y + 9);
+    ctx.restore();
+  }
+}
+
 function drawTimeLabels(
   ctx: CanvasRenderingContext2D,
   candles: Candle[],
@@ -207,4 +335,8 @@ function drawTimeLabels(
     const x = plot.left + (plot.right - plot.left) * (i / Math.max(1, count - 1));
     ctx.fillText(formatTime(candle.openTime), x, plot.bottom + 8);
   }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }

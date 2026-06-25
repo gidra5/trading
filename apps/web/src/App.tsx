@@ -1,6 +1,8 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import {
   Activity,
+  ChevronDown,
+  ChevronRight,
   Check,
   MinusCircle,
   Play,
@@ -13,7 +15,12 @@ import {
   X,
 } from "lucide-solid";
 import type {
+  BacktestCandleChart,
+  BacktestChartAnnotation,
   BotEvent,
+  LegacyEntryRiskDebug,
+  LegacyMarketStateDebug,
+  LegacyValleyPeakCheckDebug,
   LongPositionLot,
   ManualTradeInput,
   PositionLedger,
@@ -637,6 +644,7 @@ export function App() {
 
           <div class="grid grid-cols-1 gap-4">
             <PerformancePanel snapshot={snapshot()} />
+            <StrategyStatePanel bot={bot()} />
             <OrderBookPanel snapshot={snapshot()} />
           </div>
         </section>
@@ -1429,6 +1437,11 @@ function AlgorithmPanel(props: {
             <div class="rounded-2 bg-ink-800 p-3">
               <div class="muted-label">Legacy Valley/Peak</div>
               <div class="mt-3 grid grid-cols-2 gap-3">
+                <BooleanField
+                  label="Relative Rates"
+                  checked={config().legacyValleyPeak.relativeRateEnabled}
+                  onInput={(value) => updateValleyPeak("relativeRateEnabled", value)}
+                />
                 <NumberField
                   label="Buy Rate"
                   value={config().legacyValleyPeak.buySpendRate}
@@ -1680,6 +1693,249 @@ function PerformancePanel(props: { snapshot?: RuntimeSnapshot }) {
   );
 }
 
+function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
+  const debug = () => props.bot?.memory.legacyValleyPeakDebug;
+  const roleAverages = () =>
+    (debug()?.averages ?? []).filter(
+      (item) =>
+        item.buyPrimary ||
+        item.sellPrimary ||
+        item.buyConfirmation ||
+        item.sellConfirmation,
+    );
+
+  return (
+    <div class="panel">
+      <div class="mb-3 flex items-center justify-between">
+        <div>
+          <div class="muted-label">Decision State</div>
+          <h2 class="text-lg font-semibold">Legacy Extrema</h2>
+        </div>
+        <Activity size={18} class="text-accent" />
+      </div>
+
+      <Show
+        when={debug()}
+        fallback={<div class="text-sm text-ink-300">Waiting for strategy evaluation</div>}
+      >
+        {(state) => (
+          <>
+            <MarketStateIndicator state={state().marketState} />
+
+            <div class="grid grid-cols-2 gap-3">
+              <SmallMetric label="Now" value={state().signal.toUpperCase()} />
+              <SmallMetric
+                label="Last Extrema"
+                value={
+                  state().lastExtremaSignal
+                    ? `${state().lastExtremaSignal?.toUpperCase()} ${formatTime(
+                        state().lastExtremaSignalAt,
+                      )}`
+                    : "-"
+                }
+              />
+              <SmallMetric
+                label="Long Risk"
+                value={formatEntryRiskSummary(state().entryRisk?.long)}
+              />
+              <SmallMetric
+                label="Short Risk"
+                value={formatEntryRiskSummary(state().entryRisk?.short)}
+              />
+            </div>
+
+            <div class="mt-3 grid grid-cols-1 gap-2">
+              <DecisionCheck check={state().buyCheck} />
+              <DecisionCheck check={state().sellCheck} />
+            </div>
+
+            <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
+              <div class="mb-2 flex items-center justify-between gap-3">
+                <div class="muted-label">SMA / Derivatives</div>
+                <div class="text-xs text-ink-300">
+                  {state().saturated
+                    ? "saturated"
+                    : `${formatDuration(state().saturationRemainingMs)} warmup`}
+                </div>
+              </div>
+              <table class="w-full min-w-120 text-sm">
+                <thead>
+                  <tr>
+                    <th class="table-head pb-2">Role</th>
+                    <th class="table-head pb-2">Window</th>
+                    <th class="table-head pb-2">SMA</th>
+                    <th class="table-head pb-2">Rate</th>
+                    <th class="table-head pb-2">Clamp</th>
+                    <th class="table-head pb-2">Shape</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={roleAverages()} fallback={<EmptyRow columns={6} label="No SMA data yet" />}>
+                    {(item) => (
+                      <tr>
+                        <td class="td-cell">
+                          <div class="flex flex-wrap gap-1">
+                            <Show when={item.buyPrimary}>
+                              <span class="rounded-2 bg-gain/12 px-2 py-1 text-xs text-gain">buy</span>
+                            </Show>
+                            <Show when={item.sellPrimary}>
+                              <span class="rounded-2 bg-loss/12 px-2 py-1 text-xs text-loss">sell</span>
+                            </Show>
+                            <Show when={item.buyConfirmation || item.sellConfirmation}>
+                              <span class="rounded-2 bg-ink-700 px-2 py-1 text-xs text-ink-200">confirm</span>
+                            </Show>
+                          </div>
+                        </td>
+                        <td class="td-cell">{formatDuration(item.windowSec * 1000)}</td>
+                        <td class="td-cell tabular-nums">${formatQuote(item.avg, 4)}</td>
+                        <td class="td-cell tabular-nums">{formatRatePerHour(item.rate)}</td>
+                        <td class="td-cell tabular-nums">{formatRatePerHour(item.rateClamped)}</td>
+                        <td class="td-cell">
+                          {item.valley ? "valley" : item.peak ? "peak" : "flat"}
+                        </td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="mt-3 grid grid-cols-1 gap-3">
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label mb-2">Candle Move Ranges</div>
+                <div class="grid grid-cols-2 gap-2 text-xs text-ink-300">
+                  <For each={state().candleRanges.slice(-4)}>
+                    {(range) => (
+                      <div class="rounded-2 bg-ink-900 p-2">
+                        <div class="font-semibold text-ink-100">
+                          {formatDuration(range.windowSec * 1000)}
+                        </div>
+                        <div>avg {formatPercent(range.avgPct)}</div>
+                        <div>max {formatPercent(range.maxPct)}</div>
+                        <div>now {formatPercent(range.currentPct)}</div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </div>
+              <div class="rounded-2 bg-ink-800 p-3">
+                <div class="muted-label mb-2">Long Range Bounds</div>
+                <div class="grid grid-cols-1 gap-2 text-xs text-ink-300">
+                  <For each={state().priceRanges}>
+                    {(range) => (
+                      <div class="grid grid-cols-[48px_minmax(0,1fr)] gap-2 rounded-2 bg-ink-900 p-2">
+                        <div class="font-semibold text-ink-100">{range.window}</div>
+                        <div class="tabular-nums">
+                          ${formatQuote(range.minPrice, 2)} - ${formatQuote(range.maxPrice, 2)}
+                          <span class="ml-2 text-ink-400">{formatPercent(range.rangePct)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function MarketStateIndicator(props: { state: LegacyMarketStateDebug }) {
+  const label = () =>
+    props.state.state === "rising"
+      ? "Rising"
+      : props.state.state === "falling"
+        ? "Falling"
+        : "Sideways";
+
+  return (
+    <div
+      class="mb-3 rounded-2 border p-3"
+      classList={{
+        "border-gain/35 bg-gain/10": props.state.state === "rising",
+        "border-loss/35 bg-loss/10": props.state.state === "falling",
+        "border-line bg-ink-800": props.state.state === "sideways",
+      }}
+    >
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Market State</div>
+          <div
+            class="mt-1 text-lg font-semibold"
+            classList={{
+              "text-gain": props.state.state === "rising",
+              "text-loss": props.state.state === "falling",
+              "text-ink-100": props.state.state === "sideways",
+            }}
+          >
+            {label()}
+          </div>
+        </div>
+        <div class="text-right text-xs text-ink-300 tabular-nums">
+          <div>{formatDuration((props.state.windowSec ?? 0) * 1000)} window</div>
+          <div>rate {formatRatePerHour(props.state.rate)}</div>
+          <div>clamp {formatRatePerHour(props.state.rateClamped)}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DecisionCheck(props: {
+  check?: LegacyValleyPeakCheckDebug;
+}) {
+  const check = () => props.check;
+  const size = () => {
+    const value = check();
+    if (!value) {
+      return "-";
+    }
+    if (value.side === "buy") {
+      return `quote $${formatQuote(value.quoteSize, 2)} / cover ${formatAsset(value.coverQuantity)}`;
+    }
+    return `base ${formatAsset(value.quantity)} / short $${formatQuote(value.quoteSize, 2)}`;
+  };
+
+  return (
+    <div class="rounded-2 bg-ink-800 p-3">
+      <div class="mb-2 flex items-center justify-between gap-3">
+        <div class="text-sm font-semibold uppercase text-ink-100">{check()?.side ?? "check"}</div>
+        <span
+          class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+          classList={{
+            "bg-gain/12 text-gain": Boolean(check()?.passed),
+            "bg-loss/12 text-loss": !check()?.passed,
+          }}
+        >
+          {check()?.passed ? "pass" : "block"}
+        </span>
+      </div>
+      <div class="text-xs text-ink-300">
+        primary {check()?.primaryIndex} {check()?.primaryShape} · rate{" "}
+        {formatRatePerHour(check()?.primaryRateClamped)}
+      </div>
+      <div class="mt-1 text-xs text-ink-300">{size()}</div>
+      <div class="mt-2 flex flex-wrap gap-1">
+        <For each={check()?.confirmations ?? []}>
+          {(item) => (
+            <span
+              class="rounded-2 px-2 py-1 text-xs"
+              classList={{
+                "bg-gain/12 text-gain": item.passed,
+                "bg-loss/12 text-loss": !item.passed,
+              }}
+            >
+              {item.index} {item.expected} {formatRatePerHour(item.rateClamped)}
+            </span>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
 function SmallMetric(props: { label: string; value: string }) {
   return (
     <div class="rounded-2 bg-ink-800 p-3">
@@ -1705,6 +1961,24 @@ function formatBps(value: number | undefined): string {
     return "-";
   }
   return `${formatQuote(value, 3)} bps`;
+}
+
+function formatRatePerHour(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+  return `${formatQuote((value as number) * 100 * 3600, 5)}%/h`;
+}
+
+function formatEntryRiskSummary(
+  risk: LegacyEntryRiskDebug | undefined,
+): string {
+  if (!risk) {
+    return "-";
+  }
+
+  const lifetime = risk.lifetimeMs ? ` ${formatDuration(risk.lifetimeMs)}` : "";
+  return `${formatLeverage(risk.leverage)} ${risk.mode}${lifetime}`;
 }
 
 function formatOptionalQuote(value: number | undefined, quoteAsset: string): string {
@@ -1784,6 +2058,7 @@ function CorrelationPanel(props: {
   onSortChange: (mode: CorrelationSortMode) => void;
   onRefresh: (refresh: boolean) => void;
 }) {
+  const [isExpanded, setIsExpanded] = createSignal(true);
   const snapshot = () => props.snapshot;
   const entries = createMemo(() =>
     sortCorrelationEntries(snapshot()?.entries ?? [], props.sortMode),
@@ -1810,22 +2085,24 @@ function CorrelationPanel(props: {
           </h2>
         </div>
         <div class="flex flex-wrap items-center gap-2">
-          <For each={correlationSortModes}>
-            {(mode) => (
-              <button
-                class="rounded-2 border px-2.5 py-1.5 text-xs font-semibold transition"
-                classList={{
-                  "border-accent bg-accent text-ink-950": props.sortMode === mode.value,
-                  "border-line bg-ink-800 text-ink-300 hover:border-accent hover:text-ink-100":
-                    props.sortMode !== mode.value,
-                }}
-                onClick={() => props.onSortChange(mode.value)}
-                type="button"
-              >
-                {mode.label}
-              </button>
-            )}
-          </For>
+          <Show when={isExpanded()}>
+            <For each={correlationSortModes}>
+              {(mode) => (
+                <button
+                  class="rounded-2 border px-2.5 py-1.5 text-xs font-semibold transition"
+                  classList={{
+                    "border-accent bg-accent text-ink-950": props.sortMode === mode.value,
+                    "border-line bg-ink-800 text-ink-300 hover:border-accent hover:text-ink-100":
+                      props.sortMode !== mode.value,
+                  }}
+                  onClick={() => props.onSortChange(mode.value)}
+                  type="button"
+                >
+                  {mode.label}
+                </button>
+              )}
+            </For>
+          </Show>
           <button
             class="btn px-2.5"
             disabled={isRunning()}
@@ -1834,97 +2111,114 @@ function CorrelationPanel(props: {
           >
             <RefreshCw size={16} class={isRunning() ? "animate-spin" : ""} />
           </button>
-        </div>
-      </div>
-
-      <Show when={props.error ?? snapshot()?.error}>
-        {(error) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{error()}</div>}
-      </Show>
-
-      <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-6">
-        <SmallMetric
-          label="Pairs"
-          value={`${formatQuote(snapshot()?.calculatedPairs, 0)} / ${formatQuote(
-            snapshot()?.expectedPairs,
-            0,
-          )}`}
-        />
-        <SmallMetric label="Markets" value={formatQuote(snapshot()?.marketCount, 0)} />
-        <SmallMetric label="Lookback" value={formatDuration(snapshot()?.lookbackMs)} />
-        <SmallMetric label="Requests" value={formatQuote(snapshot()?.requests, 0)} />
-        <SmallMetric
-          label="Cache"
-          value={snapshot()?.cacheLoaded ? "Vector" : formatQuote(snapshot()?.cacheFetchedCandles, 0)}
-        />
-        <SmallMetric label="Stream" value={snapshot()?.streamConnected ? "Live" : "Idle"} />
-      </div>
-
-      <div class="mb-4 rounded-2 bg-ink-800 p-3">
-        <div class="mb-2 flex items-center justify-between gap-3">
-          <div class="min-w-0 truncate text-sm text-ink-100">
-            {message()}
-            <Show when={snapshot()?.truncated}>
-              <span class="ml-2 text-warn">max {formatQuote(snapshot()?.marketCount, 0)} markets</span>
+          <button
+            aria-controls="correlation-panel-content"
+            aria-expanded={isExpanded()}
+            aria-label={isExpanded() ? "Collapse correlations" : "Expand correlations"}
+            class="btn px-2.5"
+            onClick={() => setIsExpanded((value) => !value)}
+            title={isExpanded() ? "Collapse correlations" : "Expand correlations"}
+            type="button"
+          >
+            <Show when={isExpanded()} fallback={<ChevronRight size={16} />}>
+              <ChevronDown size={16} />
             </Show>
-          </div>
-          <div class="shrink-0 text-sm tabular-nums text-ink-300">
-            {formatPercent(progress())}
-          </div>
-        </div>
-        <div class="h-2 overflow-hidden rounded-full bg-ink-700">
-          <div
-            class="h-full bg-accent transition-all"
-            style={{ width: `${progress()}%` }}
-          />
+          </button>
         </div>
       </div>
 
-      <div class="max-w-full overflow-x-auto">
-        <table class="w-full min-w-180">
-          <thead>
-            <tr>
-              <th class="table-head pb-2">Asset</th>
-              <th class="table-head pb-2">Correlation</th>
-              <th class="table-head pb-2">Abs</th>
-              <th class="table-head pb-2">Samples</th>
-              <th class="table-head pb-2">Window</th>
-              <th class="table-head pb-2">Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            <For each={entries()} fallback={<EmptyRow columns={6} label="No correlations yet" />}>
-              {(entry) => (
+      <Show when={isExpanded()}>
+        <div id="correlation-panel-content">
+          <Show when={props.error ?? snapshot()?.error}>
+            {(error) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{error()}</div>}
+          </Show>
+
+          <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-6">
+            <SmallMetric
+              label="Pairs"
+              value={`${formatQuote(snapshot()?.calculatedPairs, 0)} / ${formatQuote(
+                snapshot()?.expectedPairs,
+                0,
+              )}`}
+            />
+            <SmallMetric label="Markets" value={formatQuote(snapshot()?.marketCount, 0)} />
+            <SmallMetric label="Lookback" value={formatDuration(snapshot()?.lookbackMs)} />
+            <SmallMetric label="Requests" value={formatQuote(snapshot()?.requests, 0)} />
+            <SmallMetric
+              label="Cache"
+              value={snapshot()?.cacheLoaded ? "Vector" : formatQuote(snapshot()?.cacheFetchedCandles, 0)}
+            />
+            <SmallMetric label="Stream" value={snapshot()?.streamConnected ? "Live" : "Idle"} />
+          </div>
+
+          <div class="mb-4 rounded-2 bg-ink-800 p-3">
+            <div class="mb-2 flex items-center justify-between gap-3">
+              <div class="min-w-0 truncate text-sm text-ink-100">
+                {message()}
+                <Show when={snapshot()?.truncated}>
+                  <span class="ml-2 text-warn">max {formatQuote(snapshot()?.marketCount, 0)} markets</span>
+                </Show>
+              </div>
+              <div class="shrink-0 text-sm tabular-nums text-ink-300">
+                {formatPercent(progress())}
+              </div>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-ink-700">
+              <div
+                class="h-full bg-accent transition-all"
+                style={{ width: `${progress()}%` }}
+              />
+            </div>
+          </div>
+
+          <div class="max-w-full overflow-x-auto">
+            <table class="w-full min-w-180">
+              <thead>
                 <tr>
-                  <td class="td-cell">
-                    <div class="font-semibold text-ink-100">{entry.displaySymbol}</div>
-                    <div class="mt-1 text-xs text-ink-300">{entry.symbol}</div>
-                  </td>
-                  <td
-                    class="td-cell font-semibold tabular-nums"
-                    classList={{
-                      "text-gain": (entry.correlation ?? 0) > 0,
-                      "text-loss": (entry.correlation ?? 0) < 0,
-                      "text-ink-300": entry.correlation === undefined,
-                    }}
-                  >
-                    {formatCorrelation(entry.correlation)}
-                  </td>
-                  <td class="td-cell tabular-nums">
-                    {formatCorrelation(
-                      entry.correlation === undefined ? undefined : Math.abs(entry.correlation),
-                    )}
-                  </td>
-                  <td class="td-cell tabular-nums">{formatQuote(entry.samples, 0)}</td>
-                  <td class="td-cell text-ink-300">
-                    {formatDateTime(entry.startTime)} - {formatDateTime(entry.endTime)}
-                  </td>
-                  <td class="td-cell text-ink-300">{formatTime(entry.updatedAt)}</td>
+                  <th class="table-head pb-2">Asset</th>
+                  <th class="table-head pb-2">Correlation</th>
+                  <th class="table-head pb-2">Abs</th>
+                  <th class="table-head pb-2">Samples</th>
+                  <th class="table-head pb-2">Window</th>
+                  <th class="table-head pb-2">Updated</th>
                 </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
-      </div>
+              </thead>
+              <tbody>
+                <For each={entries()} fallback={<EmptyRow columns={6} label="No correlations yet" />}>
+                  {(entry) => (
+                    <tr>
+                      <td class="td-cell">
+                        <div class="font-semibold text-ink-100">{entry.displaySymbol}</div>
+                        <div class="mt-1 text-xs text-ink-300">{entry.symbol}</div>
+                      </td>
+                      <td
+                        class="td-cell font-semibold tabular-nums"
+                        classList={{
+                          "text-gain": (entry.correlation ?? 0) > 0,
+                          "text-loss": (entry.correlation ?? 0) < 0,
+                          "text-ink-300": entry.correlation === undefined,
+                        }}
+                      >
+                        {formatCorrelation(entry.correlation)}
+                      </td>
+                      <td class="td-cell tabular-nums">
+                        {formatCorrelation(
+                          entry.correlation === undefined ? undefined : Math.abs(entry.correlation),
+                        )}
+                      </td>
+                      <td class="td-cell tabular-nums">{formatQuote(entry.samples, 0)}</td>
+                      <td class="td-cell text-ink-300">
+                        {formatDateTime(entry.startTime)} - {formatDateTime(entry.endTime)}
+                      </td>
+                      <td class="td-cell text-ink-300">{formatTime(entry.updatedAt)}</td>
+                    </tr>
+                  )}
+                </For>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </Show>
     </section>
   );
 }
@@ -2076,6 +2370,7 @@ function PositionLedgerPanel(props: {
   const shorts = () => props.ledger?.shorts ?? [];
   const [draft, setDraft] = createSignal<ManualTradeDraft>();
   const [submitting, setSubmitting] = createSignal(false);
+  const [lotViewMode, setLotViewMode] = createSignal<LotViewMode>("tables");
   const currentPrice = () => props.currentPrice || summary()?.currentPrice || 0;
   const openDraft = (draft: ManualTradeDraft) => {
     setDraft({
@@ -2132,6 +2427,23 @@ function PositionLedgerPanel(props: {
         <div class="flex flex-wrap items-center gap-2">
           <div class="mr-1 text-sm text-ink-300">
             Fee + slip {formatPercent((summary()?.feeAndSlippageRate ?? 0) * 100)}
+          </div>
+          <div class="grid grid-cols-2 gap-1 rounded-2 border border-line bg-ink-900 p-1">
+            <For each={lotViewModes}>
+              {(mode) => (
+                <button
+                  class="rounded-2 px-2.5 py-1.5 text-sm font-semibold transition"
+                  classList={{
+                    "bg-accent text-ink-950": lotViewMode() === mode.value,
+                    "text-ink-300 hover:text-ink-100": lotViewMode() !== mode.value,
+                  }}
+                  onClick={() => setLotViewMode(mode.value)}
+                  type="button"
+                >
+                  {mode.label}
+                </button>
+              )}
+            </For>
           </div>
           <button
             class="btn"
@@ -2211,51 +2523,70 @@ function PositionLedgerPanel(props: {
         )}
       </Show>
 
-      <div class="grid min-w-0 grid-cols-1 gap-4 2xl:grid-cols-2">
-        <PositionLongTable
-          lots={longs()}
+      <Show
+        when={lotViewMode() === "tree"}
+        fallback={
+          <div class="grid min-w-0 grid-cols-1 gap-4 2xl:grid-cols-2">
+            <PositionLongTable
+              lots={longs()}
+              baseAsset={props.baseAsset}
+              quoteAsset={props.quoteAsset}
+              onClose={(lot) =>
+                openDraft({
+                  title: "Close Long",
+                  side: "sell",
+                  quantity: lot.remainingQuantity,
+                  quoteAmount: lot.remainingQuantity * currentPrice(),
+                  price: currentPrice(),
+                  priceMode: "current",
+                  targetPositionId: lot.id,
+                  positionEffect: "close",
+                  lifetimeMinutes: 0,
+                  stopLossPrice: 0,
+                  takeProfitPrice: 0,
+                })
+              }
+            />
+            <PositionShortTable
+              lots={shorts()}
+              baseAsset={props.baseAsset}
+              quoteAsset={props.quoteAsset}
+              onClose={(lot) =>
+                openDraft({
+                  title: "Close Short",
+                  side: "buy",
+                  quantity: lot.remainingQuantity,
+                  quoteAmount: lot.remainingQuantity * currentPrice(),
+                  price: currentPrice(),
+                  priceMode: "current",
+                  targetPositionId: lot.id,
+                  positionEffect: "close",
+                  lifetimeMinutes: 0,
+                  stopLossPrice: 0,
+                  takeProfitPrice: 0,
+                })
+              }
+            />
+          </div>
+        }
+      >
+        <LotTreeView
+          longs={longs()}
+          shorts={shorts()}
           baseAsset={props.baseAsset}
           quoteAsset={props.quoteAsset}
-          onClose={(lot) =>
-            openDraft({
-              title: "Close Long",
-              side: "sell",
-              quantity: lot.remainingQuantity,
-              quoteAmount: lot.remainingQuantity * currentPrice(),
-              price: currentPrice(),
-              priceMode: "current",
-              targetPositionId: lot.id,
-              positionEffect: "close",
-              lifetimeMinutes: 0,
-              stopLossPrice: 0,
-              takeProfitPrice: 0,
-            })
-          }
         />
-        <PositionShortTable
-          lots={shorts()}
-          baseAsset={props.baseAsset}
-          quoteAsset={props.quoteAsset}
-          onClose={(lot) =>
-            openDraft({
-              title: "Close Short",
-              side: "buy",
-              quantity: lot.remainingQuantity,
-              quoteAmount: lot.remainingQuantity * currentPrice(),
-              price: currentPrice(),
-              priceMode: "current",
-              targetPositionId: lot.id,
-              positionEffect: "close",
-              lifetimeMinutes: 0,
-              stopLossPrice: 0,
-              takeProfitPrice: 0,
-            })
-          }
-        />
-      </div>
+      </Show>
     </section>
   );
 }
+
+type LotViewMode = "tables" | "tree";
+
+const lotViewModes: Array<{ value: LotViewMode; label: string }> = [
+  { value: "tables", label: "Tables" },
+  { value: "tree", label: "Tree" },
+];
 
 type ManualTradePriceMode = "current" | "limit";
 
@@ -2456,6 +2787,165 @@ function ManualTradeForm(props: {
       </div>
     </form>
   );
+}
+
+function LotTreeView(props: {
+  longs: LongPositionLot[];
+  shorts: ShortPositionLot[];
+  baseAsset: string;
+  quoteAsset: string;
+}) {
+  const lots = () =>
+    [...props.longs, ...props.shorts].sort((left, right) => right.openedAt - left.openedAt);
+
+  return (
+    <div class="mb-4 rounded-2 bg-ink-800 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Lot Tree</div>
+          <h3 class="text-base font-semibold">Position Structure</h3>
+        </div>
+        <div class="text-sm text-ink-300">
+          {formatQuote(props.longs.length + props.shorts.length, 0)} lots
+        </div>
+      </div>
+      <div class="grid grid-cols-1 gap-2">
+        <For each={lots()} fallback={<div class="text-sm text-ink-300">No lots yet</div>}>
+          {(lot) => (
+            <details class="rounded-2 border border-line bg-ink-900 p-3" open>
+              <summary class="cursor-pointer list-none">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <span
+                      class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+                      classList={{
+                        "bg-gain/12 text-gain": lot.side === "long",
+                        "bg-loss/12 text-loss": lot.side === "short",
+                      }}
+                    >
+                      {lot.side}
+                    </span>
+                    <StatusBadge status={lot.status} />
+                    <span class="truncate text-sm font-semibold text-ink-100">{lot.id}</span>
+                  </div>
+                  <div class="text-sm tabular-nums text-ink-300">
+                    {formatAsset(lot.remainingQuantity)} {props.baseAsset} ·{" "}
+                    {formatLeverage(lot.leverage)}
+                  </div>
+                </div>
+              </summary>
+              <div class="mt-3 border-l border-line pl-3">
+                <LotTreeBranch label="Opened" value={formatDateTime(lot.openedAt)} />
+                <LotTreeBranch
+                  label="Entry"
+                  value={`$${formatQuote(lot.averagePrice, 4)} · ${formatAsset(
+                    lot.originalQuantity,
+                  )} ${props.baseAsset}`}
+                />
+                <LotTreeBranch
+                  label="Exposure"
+                  value={`$${formatQuote(lot.exposureQuote, 2)} ${props.quoteAsset}`}
+                />
+                <LotTreeBranch
+                  label="Break-even"
+                  value={`$${formatQuote(lotBreakEvenPrice(lot), 4)}`}
+                />
+                <LotTreeBranch
+                  label="Max-loss"
+                  value={`$${formatQuote(lotMaxLossPrice(lot), 4)}`}
+                />
+                <LotTreeBranch
+                  label="Recommended"
+                  value={lotRecommendedAction(lot, props.quoteAsset)}
+                />
+                <LotTreeBranch
+                  label="Borrow"
+                  value={lotBorrowLabel(lot, props.baseAsset, props.quoteAsset)}
+                />
+                <Show when={lot.pendingQuantity > 0}>
+                  <LotTreeBranch
+                    label="Pending close"
+                    value={`${formatAsset(lot.pendingQuantity)} @ $${formatQuote(
+                      lot.pendingLimitPrice,
+                      4,
+                    )}`}
+                  />
+                </Show>
+                <Show when={lot.closedQuantity > 0}>
+                  <LotTreeBranch
+                    label="Closed"
+                    value={`${formatAsset(lot.closedQuantity)} for $${formatQuote(
+                      lot.closedQuote,
+                      2,
+                    )}`}
+                  />
+                </Show>
+                <Show when={lot.lifetimeMs || lot.stopLossPrice || lot.takeProfitPrice || lot.borrowLocked}>
+                  <div class="mt-2">
+                    <LotRulesCell lot={lot} />
+                  </div>
+                </Show>
+              </div>
+            </details>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function LotTreeBranch(props: { label: string; value: string }) {
+  return (
+    <div class="grid grid-cols-[110px_minmax(0,1fr)] gap-3 border-t border-line py-2 text-sm">
+      <div class="text-ink-300">{props.label}</div>
+      <div class="min-w-0 break-words text-ink-100 tabular-nums">{props.value}</div>
+    </div>
+  );
+}
+
+function lotBreakEvenPrice(lot: LongPositionLot | ShortPositionLot): number {
+  return lot.side === "long" ? lot.breakEvenSellPrice : lot.breakEvenBuyPrice;
+}
+
+function lotMaxLossPrice(lot: LongPositionLot | ShortPositionLot): number {
+  return lot.side === "long" ? lot.maxLossSellPrice : lot.maxLossBuyPrice;
+}
+
+function lotRecommendedAction(
+  lot: LongPositionLot | ShortPositionLot,
+  quoteAsset: string,
+): string {
+  if (lot.side === "long") {
+    return `${formatAsset(lot.recommendedSellQuantity)} sell · ${formatQuote(
+      lot.recommendedSellQuote,
+      2,
+    )} ${quoteAsset}`;
+  }
+
+  return `${formatAsset(lot.recommendedBuyQuantity)} buy · ${formatQuote(
+    lot.recommendedBuyQuote,
+    2,
+  )} ${quoteAsset}`;
+}
+
+function lotBorrowLabel(
+  lot: LongPositionLot | ShortPositionLot,
+  baseAsset: string,
+  quoteAsset: string,
+): string {
+  if (lot.borrowedQuote <= 0 && lot.borrowedQuantity <= 0) {
+    return "-";
+  }
+  if (lot.side === "long") {
+    return `${formatQuote(lot.borrowedQuote, 2)} ${quoteAsset} · int ${formatQuote(
+      lot.internalBorrowedQuote,
+      2,
+    )} / ext ${formatQuote(lot.externalBorrowedQuote, 2)}`;
+  }
+
+  return `${formatAsset(lot.borrowedQuantity)} ${baseAsset} · int ${formatAsset(
+    lot.internalBorrowedQuantity,
+  )} / ext ${formatAsset(lot.externalBorrowedQuantity)}`;
 }
 
 function PositionLongTable(props: {
@@ -3228,6 +3718,11 @@ function BacktestPanel(props: {
           />
         </div>
       </div>
+
+      <Show when={result()?.candleChart}>
+        {(chart) => <BacktestReplayChart chart={chart()} />}
+      </Show>
+
       <Show when={summary()}>
         {(item) => (
           <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-300">
@@ -3252,6 +3747,85 @@ function BacktestPanel(props: {
         )}
       </Show>
     </section>
+  );
+}
+
+function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
+  const annotations = () => props.chart.annotations.slice(-18).reverse();
+
+  return (
+    <div class="mt-4 rounded-2 bg-ink-800 p-3">
+      <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+        <div>
+          <div class="muted-label">Replay Candles</div>
+          <h3 class="text-base font-semibold">Annotated Replay</h3>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <For each={props.chart.smaSeries}>
+            {(series) => (
+              <span class="inline-flex items-center gap-1 text-xs text-ink-300">
+                <span
+                  class="h-2 w-4 rounded-full"
+                  style={{ "background-color": series.color }}
+                />
+                {series.label}
+              </span>
+            )}
+          </For>
+        </div>
+      </div>
+      <div class="h-96">
+        <CandleChart
+          candles={props.chart.candles}
+          orders={[]}
+          lastPrice={props.chart.candles.at(-1)?.close ?? 0}
+          smaSeries={props.chart.smaSeries}
+          annotations={props.chart.annotations}
+          maxCandles={0}
+          emptyLabel="No replay candles"
+        />
+      </div>
+      <div class="mt-3 grid grid-cols-1 gap-2 lg:grid-cols-2">
+        <For
+          each={annotations()}
+          fallback={<div class="text-sm text-ink-300">No replay annotations</div>}
+        >
+          {(annotation) => <BacktestAnnotationRow annotation={annotation} />}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function BacktestAnnotationRow(props: { annotation: BacktestChartAnnotation }) {
+  const isBuy = () => props.annotation.kind.startsWith("buy");
+  return (
+    <div class="rounded-2 bg-ink-900 p-2 text-sm">
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex min-w-0 items-center gap-2">
+          <span
+            class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+            classList={{
+              "bg-gain/12 text-gain": isBuy(),
+              "bg-loss/12 text-loss": !isBuy(),
+            }}
+          >
+            {props.annotation.kind.replace("-", " ")}
+          </span>
+          <span class="truncate text-ink-100">{props.annotation.label}</span>
+        </div>
+        <span class="shrink-0 text-xs text-ink-300">{formatTime(props.annotation.time)}</span>
+      </div>
+      <div class="mt-1 text-xs text-ink-300 tabular-nums">
+        ${formatQuote(props.annotation.price, 4)}
+        <Show when={props.annotation.reason}>
+          {(reason) => <span> · {reason()}</span>}
+        </Show>
+        <Show when={props.annotation.targetPositionId}>
+          {(target) => <span> · {target()}</span>}
+        </Show>
+      </div>
+    </div>
   );
 }
 

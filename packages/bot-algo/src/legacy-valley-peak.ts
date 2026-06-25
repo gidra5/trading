@@ -1,9 +1,13 @@
 import type {
   Candle,
+  LegacyValleyPeakCheckDebug,
   LegacyValleyPeakConfig,
+  LegacyValleyPeakDebugSnapshot,
   LegacyValleyPeakMemory,
+  LegacyMarketStateDebug,
   RollingCandleRangeBucket,
   RollingCandleRangeMemory,
+  RollingCandleRangeMaxCandidate,
   RollingCandleRangePoint,
   RollingPriceRangeBucket,
   RollingPriceRangeMemory,
@@ -32,6 +36,7 @@ export type LegacyValleyPeakDecision =
 export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
+  relativeRateEnabled: true,
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
@@ -58,6 +63,13 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   exitGridResetBps: 10,
   exitGridPositionMode: "per-lot",
   exitGridResetMode: "filled-grid",
+  rangeLeverageEnabled: true,
+  leverageLongTermRangeWindow: "1y",
+  leverageLifetimeDataIndex: 6,
+  leverageRangeEdgeFraction: 0.2,
+  leverageExpectedMoveMultiplier: 1.5,
+  leverageMaxEntryLeverage: 1.05,
+  leverageLifetimeMinLeverage: 1.1,
 };
 
 export const legacyValleyPeakAsymmetricShortFavoringConfig: LegacyValleyPeakConfig = {
@@ -82,6 +94,8 @@ const PRICE_RANGE_WINDOWS: { window: RollingPriceRangeWindow; windowSec: number 
   { window: "2w", windowSec: 14 * 24 * 60 * 60 },
 ];
 const MAX_EXIT_GRID_ORDER_COUNT = 5_000;
+const BTC_SCALE_REFERENCE_PRICE = 100_000;
+const MAX_REASONABLE_RELATIVE_RATE_PER_SEC = 0.01;
 
 export function createLegacyValleyPeakConfig(
   overrides: Partial<LegacyValleyPeakConfig> = {},
@@ -106,8 +120,13 @@ export function createLegacyValleyPeakConfig(
 
   const rangeCount = Math.max(1, config.averagingRangesSec.length);
   config.rateRatios = padNumbers(config.rateRatios, rangeCount, 0.5);
-  config.rateThresholdsLow = padNumbers(config.rateThresholdsLow, rangeCount, 0.25);
-  config.rateThresholdsHigh = padNumbers(config.rateThresholdsHigh, rangeCount, 0.25);
+  config.relativeRateEnabled = config.relativeRateEnabled === true;
+  config.rateThresholdsLow = config.relativeRateEnabled
+    ? normalizeRelativeRates(config.rateThresholdsLow, rangeCount, 0.0000025)
+    : padNumbers(config.rateThresholdsLow, rangeCount, 0.25);
+  config.rateThresholdsHigh = config.relativeRateEnabled
+    ? normalizeRelativeRates(config.rateThresholdsHigh, rangeCount, 0.0000025)
+    : padNumbers(config.rateThresholdsHigh, rangeCount, 0.25);
   config.buyDataIndex = clampInt(config.buyDataIndex, 0, rangeCount - 1);
   config.sellDataIndex = clampInt(config.sellDataIndex, 0, rangeCount - 1);
   config.buyConfirmationOffsets = config.buyConfirmationOffsets.map((offset) =>
@@ -119,8 +138,12 @@ export function createLegacyValleyPeakConfig(
   config.saturationSec = Math.max(0, config.saturationSec);
   config.buySpendRate = Math.max(0, config.buySpendRate);
   config.sellAmountRate = Math.max(0, config.sellAmountRate);
-  config.buySigma = Math.max(0.000001, config.buySigma);
-  config.sellSigma = Math.max(0.000001, config.sellSigma);
+  config.buySigma = config.relativeRateEnabled
+    ? Math.max(0.00000001, normalizeRelativeRate(config.buySigma, 0.000003))
+    : Math.max(0.000001, config.buySigma);
+  config.sellSigma = config.relativeRateEnabled
+    ? Math.max(0.00000001, normalizeRelativeRate(config.sellSigma, 0.000001))
+    : Math.max(0.000001, config.sellSigma);
   config.minTradeQuote = Math.max(0, config.minTradeQuote);
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
   config.longSideEnabled = config.longSideEnabled !== false;
@@ -149,6 +172,35 @@ export function createLegacyValleyPeakConfig(
   config.exitGridSellFraction = clamp(config.exitGridSellFraction, 0.01, 1);
   config.exitGridMinProfitBps = Math.max(0, config.exitGridMinProfitBps);
   config.exitGridResetBps = Math.max(0, config.exitGridResetBps);
+  config.rangeLeverageEnabled = config.rangeLeverageEnabled !== false;
+  if (!PRICE_RANGE_WINDOWS.some((range) => range.window === config.leverageLongTermRangeWindow)) {
+    config.leverageLongTermRangeWindow =
+      defaultLegacyValleyPeakConfig.leverageLongTermRangeWindow;
+  }
+  config.leverageLifetimeDataIndex = clampInt(
+    config.leverageLifetimeDataIndex,
+    0,
+    rangeCount - 1,
+  );
+  config.leverageRangeEdgeFraction = clamp(config.leverageRangeEdgeFraction, 0, 0.49);
+  config.leverageExpectedMoveMultiplier = Math.max(
+    1.000001,
+    config.leverageExpectedMoveMultiplier,
+  );
+  config.leverageMaxEntryLeverage = clamp(
+    isPositiveFinite(config.leverageMaxEntryLeverage)
+      ? config.leverageMaxEntryLeverage
+      : defaultLegacyValleyPeakConfig.leverageMaxEntryLeverage,
+    1,
+    999,
+  );
+  config.leverageLifetimeMinLeverage = clamp(
+    isPositiveFinite(config.leverageLifetimeMinLeverage)
+      ? config.leverageLifetimeMinLeverage
+      : defaultLegacyValleyPeakConfig.leverageLifetimeMinLeverage,
+    1,
+    999,
+  );
   if (
     config.exitGridPositionMode !== "aggregate" &&
     config.exitGridPositionMode !== "per-lot"
@@ -221,6 +273,7 @@ export function evaluateLegacyValleyPeak(
       config.rateRatios[index],
       config.rateThresholdsLow[index],
       config.rateThresholdsHigh[index],
+      config.relativeRateEnabled,
     );
     updateRollingCandleRange(candleRanges[index], rangeSec, input, tsSec);
   }
@@ -267,6 +320,99 @@ export function evaluateLegacyValleyPeak(
   return { signal: "hold" };
 }
 
+export function createLegacyValleyPeakDebugSnapshot(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput,
+  decision: LegacyValleyPeakDecision,
+  lastExtrema?: Pick<
+    LegacyValleyPeakDebugSnapshot,
+    | "lastExtremaSignal"
+    | "lastExtremaSignalAt"
+    | "lastExtremaSignalPrice"
+    | "lastExtremaSignalReason"
+  >,
+): LegacyValleyPeakDebugSnapshot {
+  const saturated =
+    input.eventTime - (memory.startedAt ?? input.eventTime) >= config.saturationSec * 1000;
+  const feeAdjustedBuyRate = input.price / (1 - input.feeRate);
+  const feeAdjustedSellRate = input.price * (1 - input.feeRate);
+
+  return {
+    updatedAt: input.eventTime,
+    price: input.price,
+    signal: decision.signal,
+    reason: decision.signal === "hold" ? undefined : decision.reason,
+    marketState: detectLegacyMarketState(memory, config),
+    saturated,
+    saturationRemainingMs: saturated
+      ? 0
+      : Math.max(
+          0,
+          config.saturationSec * 1000 - (input.eventTime - (memory.startedAt ?? input.eventTime)),
+        ),
+    ...(lastExtrema ?? {}),
+    averages: config.averagingRangesSec.map((windowSec, index) => {
+      const point = latestPoint(memory.buyAverages[index] ?? memory.sellAverages[index]);
+      return {
+        index,
+        windowSec,
+        avg: point?.avg,
+        rate: point?.rate,
+        rateClamped: point?.rateClamped,
+        thresholdLow: config.rateThresholdsLow[index] ?? 0,
+        thresholdHigh: config.rateThresholdsHigh[index] ?? 0,
+        buyPrimary: index === config.buyDataIndex,
+        sellPrimary: index === config.sellDataIndex,
+        buyConfirmation: config.buyConfirmationOffsets.some(
+          (offset) => index === config.buyDataIndex + offset,
+        ),
+        sellConfirmation: config.sellConfirmationOffsets.some(
+          (offset) => index === config.sellDataIndex + offset,
+        ),
+        valley: isValley(memory.buyAverages[index]),
+        peak: isPeak(memory.sellAverages[index]),
+      };
+    }),
+    candleRanges: config.averagingRangesSec.map((windowSec, index) => {
+      const point = memory.candleRanges[index]?.points.at(-1);
+      return {
+        index,
+        windowSec,
+        avgPct: point?.avgPct,
+        maxPct: point?.maxPct,
+        currentPct: point?.currentPct,
+        count: point?.count,
+      };
+    }),
+    priceRanges: memory.priceRanges.map((range) => {
+      const point = range.points.at(-1);
+      return {
+        window: range.window,
+        windowSec: range.windowSec,
+        minPrice: point?.minPrice,
+        maxPrice: point?.maxPrice,
+        rangePct: point?.rangePct,
+        updatedAt: point?.updatedAt,
+      };
+    }),
+    buyCheck: buildLegacyValleyPeakCheckDebug(
+      "buy",
+      memory,
+      config,
+      input,
+      feeAdjustedBuyRate,
+    ),
+    sellCheck: buildLegacyValleyPeakCheckDebug(
+      "sell",
+      memory,
+      config,
+      input,
+      feeAdjustedSellRate,
+    ),
+  };
+}
+
 function shouldBuy(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
@@ -305,6 +451,130 @@ function shouldSell(
   }
 
   return true;
+}
+
+function buildLegacyValleyPeakCheckDebug(
+  side: "buy" | "sell",
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput,
+  rate: number,
+): LegacyValleyPeakCheckDebug {
+  const primaryIndex = side === "buy" ? config.buyDataIndex : config.sellDataIndex;
+  const primary = side === "buy"
+    ? memory.buyAverages[primaryIndex]
+    : memory.sellAverages[primaryIndex];
+  const primaryPoint = latestPoint(primary);
+  const primaryShape = !primaryPoint
+    ? "missing"
+    : side === "buy" && isValley(primary)
+      ? "valley"
+      : side === "sell" && isPeak(primary)
+        ? "peak"
+        : "flat";
+  const offsets =
+    side === "buy" ? config.buyConfirmationOffsets : config.sellConfirmationOffsets;
+  const confirmations = offsets.map((offset) => {
+    const index = primaryIndex + offset;
+    const confirmation = side === "buy"
+      ? memory.buyAverages[index]
+      : memory.sellAverages[index];
+    const point = latestPoint(confirmation);
+    const expected: "positive" | "negative" = side === "buy" ? "positive" : "negative";
+    return {
+      index,
+      windowSec: config.averagingRangesSec[index],
+      rateClamped: point?.rateClamped,
+      expected,
+      passed:
+        !point ||
+        (side === "buy" ? point.rateClamped > 0 : point.rateClamped < 0),
+    };
+  });
+
+  if (side === "buy") {
+    return {
+      side,
+      passed: shouldBuy(memory, config),
+      primaryIndex,
+      primaryWindowSec: config.averagingRangesSec[primaryIndex],
+      primaryRate: primaryPoint?.rate,
+      primaryRateClamped: primaryPoint?.rateClamped,
+      primaryShape,
+      confirmations,
+      quoteSize: buyQuoteSize(memory, config, input, rate),
+      coverQuantity: buyCoverQuantity(memory, config, input, rate),
+      minTradeQuote: config.minTradeQuote,
+    };
+  }
+
+  return {
+    side,
+    passed: shouldSell(memory, config),
+    primaryIndex,
+    primaryWindowSec: config.averagingRangesSec[primaryIndex],
+    primaryRate: primaryPoint?.rate,
+    primaryRateClamped: primaryPoint?.rateClamped,
+    primaryShape,
+    confirmations,
+    quantity: sellQuantity(memory, config, input, rate),
+    quoteSize: shortSellQuoteSize(memory, config, input, rate),
+    minTradeQuote: config.minTradeQuote,
+  };
+}
+
+function detectLegacyMarketState(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): LegacyMarketStateDebug {
+  const candidateIndices = [
+    config.buyDataIndex,
+    config.sellDataIndex,
+    ...config.buyConfirmationOffsets.map((offset) => config.buyDataIndex + offset),
+    ...config.sellConfirmationOffsets.map((offset) => config.sellDataIndex + offset),
+  ];
+  const candidates = [...new Set(candidateIndices)]
+    .filter((index) => index >= 0 && index < config.averagingRangesSec.length)
+    .map((index) => {
+      const point = latestPoint(memory.buyAverages[index] ?? memory.sellAverages[index]);
+      return {
+        index,
+        point,
+        thresholdLow: config.rateThresholdsLow[index] ?? 0,
+        thresholdHigh: config.rateThresholdsHigh[index] ?? 0,
+      };
+    })
+    .filter((candidate) => candidate.point);
+
+  const active = candidates
+    .filter((candidate) => (candidate.point?.rateClamped ?? 0) !== 0)
+    .sort(
+      (left, right) =>
+        Math.abs(right.point?.rateClamped ?? 0) - Math.abs(left.point?.rateClamped ?? 0) ||
+        (right.index - left.index),
+    )[0];
+  const selected =
+    active ??
+    candidates.sort(
+      (left, right) =>
+        Math.abs(right.point?.rate ?? 0) - Math.abs(left.point?.rate ?? 0) ||
+        (right.index - left.index),
+    )[0];
+  const rate = selected?.point?.rate;
+  const rateClamped = selected?.point?.rateClamped ?? 0;
+
+  return {
+    state: rateClamped > 0 ? "rising" : rateClamped < 0 ? "falling" : "sideways",
+    sourceIndex: selected?.index,
+    windowSec:
+      selected?.index === undefined
+        ? undefined
+        : config.averagingRangesSec[selected.index],
+    rate,
+    rateClamped,
+    thresholdLow: selected?.thresholdLow,
+    thresholdHigh: selected?.thresholdHigh,
+  };
 }
 
 function buyQuoteSize(
@@ -406,6 +676,7 @@ function updateRollingAverage(
   derivativeRatio: number,
   thresholdLow: number,
   thresholdHigh: number,
+  relativeRateEnabled: boolean,
 ): void {
   let startIndex = memory.startIndex ?? 0;
   startIndex = clampInt(startIndex, 0, memory.timestamps.length);
@@ -444,7 +715,15 @@ function updateRollingAverage(
     return;
   }
 
-  const derivative = (avg - sampleValue) / delta;
+  if (relativeRateEnabled && sampleValue <= 0) {
+    recordPoint(memory, avg, 0, 0);
+    compactRollingAverage(memory);
+    return;
+  }
+
+  const derivative = relativeRateEnabled
+    ? (avg - sampleValue) / sampleValue / delta
+    : (avg - sampleValue) / delta;
   let rateClamped = 0;
   if (derivative >= thresholdHigh) {
     rateClamped = derivative;
@@ -542,22 +821,21 @@ function finalizeCandleRangeBucket(memory: RollingCandleRangeMemory): void {
 
   const rangePct = candleRangePct(bucket);
   if (rangePct !== undefined) {
+    const entryIndex = nextCandleRangeEntryIndex(memory);
     memory.entries.push(rangePct);
     memory.timestamps.push(bucket.bucketStartSec);
     memory.sum += rangePct;
-
-    if (memory.entries.length === 1 || rangePct > memory.max) {
-      memory.max = rangePct;
-    }
+    pushCandleRangeMaxCandidate(memory, entryIndex, rangePct);
+    memory.nextIndex = entryIndex + 1;
 
     if (memory.entries.length > CANDLE_RANGE_WINDOW_SIZE) {
       const removed = memory.entries.shift() ?? 0;
       memory.timestamps.shift();
       memory.sum -= removed;
-      if (removed >= memory.max) {
-        memory.max = maxNumber(memory.entries);
-      }
+      memory.entryOffset += 1;
     }
+    expireCandleRangeMaxCandidates(memory);
+    memory.max = candleRangeMaxFromCandidates(memory, memory.entryOffset);
   }
 
   memory.current = undefined;
@@ -570,17 +848,20 @@ function recordCandleRangePoint(memory: RollingCandleRangeMemory): void {
     ? Math.max(0, CANDLE_RANGE_WINDOW_SIZE - 1)
     : CANDLE_RANGE_WINDOW_SIZE;
   const completedCount = Math.min(memory.entries.length, completedLimit);
-  const completedStart = memory.entries.length - completedCount;
+  const excludedCount = memory.entries.length - completedCount;
+  const completedStartIndex = memory.entryOffset + excludedCount;
 
-  let sum = 0;
-  let max = 0;
-  let count = 0;
-  for (let index = completedStart; index < memory.entries.length; index += 1) {
-    const value = memory.entries[index] ?? 0;
-    sum += value;
-    max = count === 0 ? value : Math.max(max, value);
-    count += 1;
+  let sum = memory.sum;
+  for (let index = 0; index < excludedCount; index += 1) {
+    sum -= memory.entries[index] ?? 0;
   }
+  let max =
+    completedCount === 0
+      ? 0
+      : completedCount === memory.entries.length
+        ? memory.max
+        : candleRangeMaxFromCandidates(memory, completedStartIndex);
+  let count = completedCount;
 
   if (currentPct !== undefined) {
     sum += currentPct;
@@ -598,6 +879,55 @@ function recordCandleRangePoint(memory: RollingCandleRangeMemory): void {
     currentPct: currentPct ?? 0,
     count,
   });
+}
+
+function nextCandleRangeEntryIndex(memory: RollingCandleRangeMemory): number {
+  const entryOffset = Number.isFinite(memory.entryOffset)
+    ? Math.max(0, Math.floor(memory.entryOffset))
+    : 0;
+  const minimumNextIndex = entryOffset + memory.entries.length;
+  const nextIndex = Number.isFinite(memory.nextIndex)
+    ? Math.max(minimumNextIndex, Math.floor(memory.nextIndex))
+    : minimumNextIndex;
+
+  memory.entryOffset = entryOffset;
+  memory.nextIndex = nextIndex;
+  return nextIndex;
+}
+
+function pushCandleRangeMaxCandidate(
+  memory: RollingCandleRangeMemory,
+  index: number,
+  value: number,
+): void {
+  while (
+    memory.maxCandidates.length > 0 &&
+    memory.maxCandidates[memory.maxCandidates.length - 1].value <= value
+  ) {
+    memory.maxCandidates.pop();
+  }
+  memory.maxCandidates.push({ index, value });
+}
+
+function expireCandleRangeMaxCandidates(memory: RollingCandleRangeMemory): void {
+  while (
+    memory.maxCandidates.length > 0 &&
+    memory.maxCandidates[0].index < memory.entryOffset
+  ) {
+    memory.maxCandidates.shift();
+  }
+}
+
+function candleRangeMaxFromCandidates(
+  memory: RollingCandleRangeMemory,
+  startIndex: number,
+): number {
+  for (const candidate of memory.maxCandidates) {
+    if (candidate.index >= startIndex) {
+      return candidate.value;
+    }
+  }
+  return 0;
 }
 
 function recordCandleRangePointValue(
@@ -928,6 +1258,9 @@ function createRollingCandleRangeMemory(): RollingCandleRangeMemory {
     timestamps: [],
     sum: 0,
     max: 0,
+    entryOffset: 0,
+    nextIndex: 0,
+    maxCandidates: [],
     points: [],
   };
 }
@@ -1008,15 +1341,48 @@ function normalizeCandleRange(
   const entries = memoryEntries.slice(-maxLength);
   const timestamps = memoryTimestamps.slice(-maxLength);
   const sum = entries.reduce((total, value) => total + value, 0);
+  const storedEntryOffset = memory?.entryOffset;
+  const storedNextIndex = memory?.nextIndex;
+  const rawEntryOffset =
+    typeof storedEntryOffset === "number" && Number.isFinite(storedEntryOffset)
+      ? Math.max(0, Math.floor(storedEntryOffset))
+      : 0;
+  const entryOffset = rawEntryOffset + Math.max(0, memoryEntries.length - maxLength);
+  const nextIndex =
+    typeof storedNextIndex === "number" && Number.isFinite(storedNextIndex)
+      ? Math.max(entryOffset + entries.length, Math.floor(storedNextIndex))
+      : entryOffset + entries.length;
+  const maxCandidates = buildCandleRangeMaxCandidates(entries, entryOffset);
 
   return {
     entries,
     timestamps,
     sum,
     max: maxNumber(entries),
+    entryOffset,
+    nextIndex,
+    maxCandidates,
     current: normalizeCandleRangeBucket(memory?.current),
     points: normalizeCandleRangePoints(memory?.points),
   };
+}
+
+function buildCandleRangeMaxCandidates(
+  entries: number[],
+  entryOffset: number,
+): RollingCandleRangeMaxCandidate[] {
+  const candidates: RollingCandleRangeMaxCandidate[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const value = entries[index];
+    while (
+      candidates.length > 0 &&
+      candidates[candidates.length - 1].value <= value
+    ) {
+      candidates.pop();
+    }
+    candidates.push({ index: entryOffset + index, value });
+  }
+  return candidates;
 }
 
 function normalizeCandleRangeBucket(
@@ -1114,10 +1480,28 @@ function ensureCandleRangeMemories(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
 ): RollingCandleRangeMemory[] {
-  if (memory.candleRanges?.length !== config.averagingRangesSec.length) {
+  if (
+    memory.candleRanges?.length !== config.averagingRangesSec.length ||
+    memory.candleRanges.some((range) => !isNormalizedCandleRangeMemory(range))
+  ) {
     memory.candleRanges = normalizeCandleRangeList(memory.candleRanges, config);
   }
   return memory.candleRanges;
+}
+
+function isNormalizedCandleRangeMemory(
+  memory: RollingCandleRangeMemory | undefined,
+): boolean {
+  return Boolean(
+    memory &&
+      Array.isArray(memory.entries) &&
+      Array.isArray(memory.timestamps) &&
+      Array.isArray(memory.maxCandidates) &&
+      Number.isFinite(memory.sum) &&
+      Number.isFinite(memory.max) &&
+      Number.isFinite(memory.entryOffset) &&
+      Number.isFinite(memory.nextIndex),
+  );
 }
 
 function ensurePriceRangeMemories(
@@ -1200,6 +1584,28 @@ function isNonNegativeFinite(value: number): boolean {
 
 function maxNumber(values: number[]): number {
   return values.length > 0 ? Math.max(...values) : 0;
+}
+
+function normalizeRelativeRates(
+  values: number[],
+  length: number,
+  fallback: number,
+): number[] {
+  return padNumbers(values, length, fallback).map((value) =>
+    normalizeRelativeRate(value, fallback),
+  );
+}
+
+function normalizeRelativeRate(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  if (value > MAX_REASONABLE_RELATIVE_RATE_PER_SEC) {
+    return value / BTC_SCALE_REFERENCE_PRICE;
+  }
+
+  return value;
 }
 
 function padNumbers(values: number[], length: number, fallback: number): number[] {

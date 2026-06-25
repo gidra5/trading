@@ -2,8 +2,12 @@ import {
   SimulatedTradingBot,
   calculateRiskAdjustedMetrics,
   compactBacktestState,
+  createBacktestChartCollector,
   createInitialBotState,
   createStrategyConfig,
+  defaultPositionRiskConfig,
+  finalizeBacktestCandleChart,
+  observeBacktestChartCandle,
   summarizeClosedPositions,
   type BacktestSummary,
   type BacktestSampleSummary,
@@ -127,6 +131,8 @@ interface PerfectMarginBenchmarkAccumulator {
   netPnl: number;
   compoundedEquity: number;
 }
+
+const PERFECT_MARGIN_MIN_SLIPPAGE_BPS = defaultPositionRiskConfig.marketSlippageBps;
 
 type PerfectMarginBenchmark = Pick<
   BacktestSummary,
@@ -647,6 +653,7 @@ async function runHistoricalRangeBacktest(
     minFreeBytes: options.cache.minFreeBytes,
   });
   const equityCurve: EquityPoint[] = [];
+  const chartCollector = createBacktestChartCollector(config, estimatedCandles);
   const sampleEvery = Math.max(1, Math.ceil(estimatedCandles / MAX_EQUITY_POINTS));
   const metricsEvery = Math.max(1, Math.min(sampleEvery, WIPEOUT_CHECK_CANDLES));
   const startedAt = Date.now();
@@ -656,6 +663,7 @@ async function runHistoricalRangeBacktest(
   let cacheStats = emptyCacheStats();
   let processedStartTime: number | undefined;
   let processedEndTime: number | undefined;
+  let lastProcessedCandle: Candle | undefined;
   let stopReason: BacktestStopReason = "completed";
   let latestMetrics = bot.view().metrics;
   let survivedMs: number | undefined;
@@ -724,6 +732,16 @@ async function runHistoricalRangeBacktest(
       throwIfCancelled(options.cancelSignal);
       emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
     }
+  }
+
+  if (lastProcessedCandle) {
+    observeBacktestChartCandle(
+      chartCollector,
+      bot,
+      lastProcessedCandle,
+      processedCandles,
+      true,
+    );
   }
 
   latestMetrics = bot.markToMarket();
@@ -797,6 +815,7 @@ async function runHistoricalRangeBacktest(
     orders: finalState.orders,
     fills: finalState.fills,
     finalState,
+    candleChart: finalizeBacktestCandleChart(chartCollector),
   };
 
   return result;
@@ -811,9 +830,17 @@ async function runHistoricalRangeBacktest(
 
     processedStartTime ??= candle.openTime;
     processedEndTime = candle.closeTime;
+    lastProcessedCandle = candle;
 
     const liquidated = replayCandle(bot, candle, perfectMargin);
     processedCandles += 1;
+    observeBacktestChartCandle(
+      chartCollector,
+      bot,
+      candle,
+      processedCandles,
+      liquidated,
+    );
     const shouldSample = processedCandles % sampleEvery === 0;
     const shouldCheckMetrics =
       shouldSample ||
@@ -1506,13 +1533,15 @@ function replayCandle(
 function createPerfectMarginBenchmark(
   config: StrategyConfig,
 ): PerfectMarginBenchmarkAccumulator {
+  const slippageBps = Math.max(
+    PERFECT_MARGIN_MIN_SLIPPAGE_BPS,
+    Math.max(0, config.positionRisk.marketSlippageBps),
+  );
   return {
     startingQuote: config.startingQuote,
     leverage: config.maxLeverage,
     roundTripFrictionRate:
-      2 *
-      ((Math.max(0, config.feeBps) + Math.max(0, config.positionRisk.marketSlippageBps)) /
-        10_000),
+      2 * ((Math.max(0, config.feeBps) + slippageBps) / 10_000),
     netPnl: 0,
     compoundedEquity: config.startingQuote,
   };

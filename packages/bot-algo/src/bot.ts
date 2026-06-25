@@ -6,6 +6,7 @@ import type {
   ExchangeOrderUpdate,
   ExchangeReconciliationInput,
   ExchangeTradeFill,
+  LegacyEntryRiskDebug,
   LegacyExitGridMemory,
   LegacyValleyPeakMemory,
   ManualTradeInput,
@@ -20,6 +21,7 @@ import type {
 import {
   createLegacyValleyPeakConfig,
   createLegacyValleyPeakMemory,
+  createLegacyValleyPeakDebugSnapshot,
   defaultLegacyValleyPeakConfig,
   evaluateLegacyValleyPeak,
   normalizeLegacyValleyPeakMemory,
@@ -92,6 +94,13 @@ interface ImmediateOrderResult {
   fill?: TradeFill;
   cancelled?: TradingOrder;
 }
+
+type OrderLifecycleFields = Pick<
+  TradingOrder,
+  "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
+>;
+
+interface EntryRiskProfile extends LegacyEntryRiskDebug {}
 
 interface LegacyExitGridLot {
   id: string;
@@ -434,17 +443,20 @@ export class SimulatedTradingBot {
       return [];
     }
 
-    const positions = analyzePositions(this.state, { currentPrice: price });
+    this.updateLegacyPositionLotCache();
+    const cache = this.legacyPositionLotCache;
+    if (!cache) {
+      return [];
+    }
+
     const events: BotEvent[] = [];
-    const longs = positions.longs.filter(
+    const longs = [...cache.longs.values()].filter(
       (lot) =>
-        lot.status !== "pending" &&
         lot.remainingQuantity > MIN_BASE_QUANTITY &&
         (options.includeUnprofitable || price >= lot.breakEvenSellPrice),
     );
-    const shorts = positions.shorts.filter(
+    const shorts = [...cache.shorts.values()].filter(
       (lot) =>
-        lot.status !== "pending" &&
         lot.remainingQuantity > MIN_BASE_QUANTITY &&
         (options.includeUnprofitable || price <= lot.breakEvenBuyPrice),
     );
@@ -637,6 +649,7 @@ export class SimulatedTradingBot {
       ];
     } catch (error) {
       this.state = previousState;
+      this.legacyPositionLotCache = undefined;
       throw error;
     }
   }
@@ -681,6 +694,7 @@ export class SimulatedTradingBot {
       return events;
     } catch (error) {
       this.state = previousState;
+      this.legacyPositionLotCache = undefined;
       this.rebuildOpenOrderIndex();
       throw error;
     }
@@ -989,6 +1003,7 @@ export class SimulatedTradingBot {
       manual: false,
     };
     this.state.fills.push(fill);
+    this.refreshAverageEntryPrices();
     this.state.lastPrice = price;
 
     return {
@@ -1210,24 +1225,35 @@ export class SimulatedTradingBot {
     }
 
     const memory = this.ensureLegacyValleyPeakMemory();
-    const targetEntryLeverage = this.targetLongEntryLeverage(tick.price);
-    const targetShortEntryLeverage = this.targetShortEntryLeverage(tick.price);
+    const longEntryRisk = this.longEntryRiskProfile(tick.price);
+    const shortEntryRisk = this.shortEntryRiskProfile(tick.price);
+    const input = {
+      eventTime: tick.eventTime,
+      price: tick.price,
+      feeRate: config.feeBps / 10_000,
+      buyingPowerQuote: this.longEntryBuyingPowerQuote(
+        tick.price,
+        longEntryRisk.leverage,
+      ),
+      shortSellingPowerQuote: this.shortEntrySellingPowerQuote(
+        tick.price,
+        shortEntryRisk.leverage,
+      ),
+      baseFree: this.activeLongQuantity(),
+      shortBaseFree: this.activeShortQuantity(),
+      sourceCandle: options.sourceCandle,
+    };
     const decision = evaluateLegacyValleyPeak(
       memory,
       config.legacyValleyPeak,
-      {
-        eventTime: tick.eventTime,
-        price: tick.price,
-        feeRate: config.feeBps / 10_000,
-        buyingPowerQuote: this.longEntryBuyingPowerQuote(tick.price, targetEntryLeverage),
-        shortSellingPowerQuote: this.shortEntrySellingPowerQuote(
-          tick.price,
-          targetShortEntryLeverage,
-        ),
-        baseFree: this.activeLongQuantity(),
-        shortBaseFree: this.activeShortQuantity(),
-        sourceCandle: options.sourceCandle,
-      },
+      input,
+    );
+    this.recordLegacyValleyPeakDebug(
+      memory,
+      input,
+      decision,
+      longEntryRisk,
+      shortEntryRisk,
     );
 
     if (decision.signal === "hold") {
@@ -1244,7 +1270,14 @@ export class SimulatedTradingBot {
               decision.reason,
               decision.coverQuantity,
             )
-          : this.createBuyOrder(tick.price, tick.eventTime, decision.reason, decision.quoteSize)
+          : this.createBuyOrder(
+              tick.price,
+              tick.eventTime,
+              decision.reason,
+              decision.quoteSize,
+              this.entryLifecycleFields(longEntryRisk),
+              longEntryRisk.leverage,
+            )
         : decision.quantity * tick.price >= config.minOrderQuote
           ? this.createSellOrder(tick.price, tick.eventTime, decision.reason, decision.quantity)
           : this.createShortSellOrder(
@@ -1252,6 +1285,8 @@ export class SimulatedTradingBot {
               tick.eventTime,
               decision.reason,
               decision.quoteSize,
+              this.entryLifecycleFields(shortEntryRisk),
+              shortEntryRisk.leverage,
             );
 
     if (!order) {
@@ -1301,28 +1336,36 @@ export class SimulatedTradingBot {
       delete memory.exitGrids?.["aggregate-short"];
     }
     this.updateLegacyExitGridExtremes(memory, tick.price);
-    const targetLongEntryLeverage = this.targetLongEntryLeverage(tick.price);
-    const targetShortEntryLeverage = this.targetShortEntryLeverage(tick.price);
+    const longEntryRisk = this.longEntryRiskProfile(tick.price);
+    const shortEntryRisk = this.shortEntryRiskProfile(tick.price);
+    const input = {
+      eventTime: tick.eventTime,
+      price: tick.price,
+      feeRate: config.feeBps / 10_000,
+      buyingPowerQuote: this.longEntryBuyingPowerQuote(
+        tick.price,
+        longEntryRisk.leverage,
+      ),
+      shortSellingPowerQuote: this.shortEntrySellingPowerQuote(
+        tick.price,
+        shortEntryRisk.leverage,
+      ),
+      baseFree: activeLongQuantity,
+      shortBaseFree: activeShortQuantity,
+      sourceCandle: options.sourceCandle,
+    };
 
     const decision = evaluateLegacyValleyPeak(
       memory,
       legacyConfig,
-      {
-        eventTime: tick.eventTime,
-        price: tick.price,
-        feeRate: config.feeBps / 10_000,
-        buyingPowerQuote: this.longEntryBuyingPowerQuote(
-          tick.price,
-          targetLongEntryLeverage,
-        ),
-        shortSellingPowerQuote: this.shortEntrySellingPowerQuote(
-          tick.price,
-          targetShortEntryLeverage,
-        ),
-        baseFree: activeLongQuantity,
-        shortBaseFree: activeShortQuantity,
-        sourceCandle: options.sourceCandle,
-      },
+      input,
+    );
+    this.recordLegacyValleyPeakDebug(
+      memory,
+      input,
+      decision,
+      longEntryRisk,
+      shortEntryRisk,
     );
 
     if (decision.signal !== "buy" && decision.signal !== "sell") {
@@ -1389,7 +1432,11 @@ export class SimulatedTradingBot {
           tick.eventTime,
           decision.reason,
           decision.quoteSize,
-          { fillImmediately: !options.deferMarketOrderFills },
+          {
+            fillImmediately: !options.deferMarketOrderFills,
+            targetEntryLeverage: longEntryRisk.leverage,
+            ...this.entryLifecycleFields(longEntryRisk),
+          },
         );
         if (result.order) {
           if (options.deferMarketOrderFills) {
@@ -1417,6 +1464,8 @@ export class SimulatedTradingBot {
           tick.eventTime,
           decision.reason,
           decision.quoteSize,
+          this.entryLifecycleFields(longEntryRisk),
+          longEntryRisk.leverage,
         );
         if (order) {
           order.positionEffect = "open";
@@ -1470,7 +1519,11 @@ export class SimulatedTradingBot {
             tick.eventTime,
             decision.reason,
             decision.quoteSize,
-            { fillImmediately: !options.deferMarketOrderFills },
+            {
+              fillImmediately: !options.deferMarketOrderFills,
+              targetEntryLeverage: shortEntryRisk.leverage,
+              ...this.entryLifecycleFields(shortEntryRisk),
+            },
           );
           if (result.order) {
             if (options.deferMarketOrderFills) {
@@ -1494,6 +1547,8 @@ export class SimulatedTradingBot {
             tick.eventTime,
             decision.reason,
             decision.quoteSize,
+            this.entryLifecycleFields(shortEntryRisk),
+            shortEntryRisk.leverage,
           );
           if (order) {
             orders.push(order);
@@ -1539,12 +1594,17 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
+    lifecycle: OrderLifecycleFields = {},
+    targetEntryLeverage = this.targetLongEntryLeverage(marketPrice),
   ): TradingOrder | undefined {
     const config = this.state.config;
     if (!config.legacyValleyPeak.longSideEnabled) {
       return undefined;
     }
-    const availableQuote = this.longEntryBuyingPowerQuote(marketPrice);
+    const availableQuote = this.longEntryBuyingPowerQuote(
+      marketPrice,
+      targetEntryLeverage,
+    );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
     if (quoteSize < config.minOrderQuote) {
@@ -1565,6 +1625,7 @@ export class SimulatedTradingBot {
 
     const order = this.buildOrder("buy", price, quantity, estimatedQuoteCost, createdAt, reason);
     order.positionEffect = "open";
+    Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
     return order;
@@ -1608,9 +1669,14 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
+    lifecycle: OrderLifecycleFields = {},
+    targetEntryLeverage = this.targetShortEntryLeverage(marketPrice),
   ): TradingOrder | undefined {
     const config = this.state.config;
-    const availableQuote = this.shortEntrySellingPowerQuote(marketPrice);
+    const availableQuote = this.shortEntrySellingPowerQuote(
+      marketPrice,
+      targetEntryLeverage,
+    );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
     if (!config.legacyValleyPeak.shortSideEnabled || quoteSize < config.minOrderQuote) {
@@ -1626,6 +1692,7 @@ export class SimulatedTradingBot {
 
     const order = this.buildOrder("sell", price, quantity, 0, createdAt, reason);
     order.positionEffect = "open";
+    Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
     return order;
@@ -1636,13 +1703,19 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
-    options: { fillImmediately?: boolean } = {},
+    options: {
+      fillImmediately?: boolean;
+      targetEntryLeverage?: number;
+    } & OrderLifecycleFields = {},
   ): ImmediateOrderResult {
     const config = this.state.config;
     if (!config.legacyValleyPeak.longSideEnabled) {
       return {};
     }
-    const availableQuote = this.longEntryBuyingPowerQuote(marketPrice);
+    const availableQuote = this.longEntryBuyingPowerQuote(
+      marketPrice,
+      options.targetEntryLeverage ?? this.targetLongEntryLeverage(marketPrice),
+    );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
     if (quoteSize < config.minOrderQuote) {
@@ -1672,6 +1745,7 @@ export class SimulatedTradingBot {
     );
     const index = this.state.orders.length;
     order.positionEffect = "open";
+    Object.assign(order, normalizedLotLifecycleFields(options));
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
 
@@ -1694,10 +1768,16 @@ export class SimulatedTradingBot {
     createdAt: number,
     reason: string,
     desiredQuoteSize: number,
-    options: { fillImmediately?: boolean } = {},
+    options: {
+      fillImmediately?: boolean;
+      targetEntryLeverage?: number;
+    } & OrderLifecycleFields = {},
   ): ImmediateOrderResult {
     const config = this.state.config;
-    const availableQuote = this.shortEntrySellingPowerQuote(marketPrice);
+    const availableQuote = this.shortEntrySellingPowerQuote(
+      marketPrice,
+      options.targetEntryLeverage ?? this.targetShortEntryLeverage(marketPrice),
+    );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
     if (!config.legacyValleyPeak.shortSideEnabled || quoteSize < config.minOrderQuote) {
@@ -1714,6 +1794,7 @@ export class SimulatedTradingBot {
     const order = this.buildOrder("sell", price, quantity, 0, createdAt, reason, "market");
     const index = this.state.orders.length;
     order.positionEffect = "open";
+    Object.assign(order, normalizedLotLifecycleFields(options));
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
 
@@ -1869,11 +1950,17 @@ export class SimulatedTradingBot {
   ): BotEvent[] {
     const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
 
-    const positions = analyzePositions(this.state, { currentPrice: tick.price });
-    for (const lot of [...positions.longs, ...positions.shorts]) {
+    this.updateLegacyPositionLotCache();
+    const cache = this.legacyPositionLotCache;
+    if (!cache) {
+      return events ?? NO_EVENTS;
+    }
+
+    const lots = [...cache.longs.values(), ...cache.shorts.values()];
+    for (const lot of lots) {
       if (
-        lot.status === "pending" ||
-        lot.remainingQuantity <= MIN_BASE_QUANTITY
+        lot.remainingQuantity <= MIN_BASE_QUANTITY ||
+        !hasLotLifecycleControls(lot)
       ) {
         continue;
       }
@@ -3524,16 +3611,9 @@ export class SimulatedTradingBot {
       return this.state.avgEntryPrice;
     }
 
+    this.updateLegacyPositionLotCache();
     const cachedLot = this.legacyPositionLotCache?.longs.get(order.targetPositionId);
-    if (cachedLot) {
-      return cachedLot.averagePrice;
-    }
-
-    const target = analyzePositions(this.state, {
-      currentPrice: this.state.lastPrice || order.price,
-    }).longs.find((lot) => lot.id === order.targetPositionId);
-
-    return cleanPositive(target?.averagePrice) || this.state.avgEntryPrice;
+    return cleanPositive(cachedLot?.averagePrice) || this.state.avgEntryPrice;
   }
 
   private shortEntryPriceForCloseOrder(order: TradingOrder): number {
@@ -3541,16 +3621,9 @@ export class SimulatedTradingBot {
       return this.state.avgShortEntryPrice;
     }
 
+    this.updateLegacyPositionLotCache();
     const cachedLot = this.legacyPositionLotCache?.shorts.get(order.targetPositionId);
-    if (cachedLot) {
-      return cachedLot.averagePrice;
-    }
-
-    const target = analyzePositions(this.state, {
-      currentPrice: this.state.lastPrice || order.price,
-    }).shorts.find((lot) => lot.id === order.targetPositionId);
-
-    return cleanPositive(target?.averagePrice) || this.state.avgShortEntryPrice;
+    return cleanPositive(cachedLot?.averagePrice) || this.state.avgShortEntryPrice;
   }
 
   private longCloseQuantityForOrder(order: TradingOrder): number {
@@ -3558,14 +3631,12 @@ export class SimulatedTradingBot {
       return 0;
     }
     if (order.targetPositionId) {
+      this.updateLegacyPositionLotCache();
       const cachedLot = this.legacyPositionLotCache?.longs.get(order.targetPositionId);
       if (cachedLot) {
         return roundAsset(Math.min(order.quantity, cachedLot.remainingQuantity));
       }
-      const target = analyzePositions(this.state, {
-        currentPrice: this.state.lastPrice || order.price,
-      }).longs.find((lot) => lot.id === order.targetPositionId);
-      return roundAsset(Math.min(order.quantity, target?.remainingQuantity ?? 0));
+      return 0;
     }
     return roundAsset(Math.min(order.quantity, this.activeLongQuantity()));
   }
@@ -3575,14 +3646,12 @@ export class SimulatedTradingBot {
       return 0;
     }
     if (order.targetPositionId) {
+      this.updateLegacyPositionLotCache();
       const cachedLot = this.legacyPositionLotCache?.shorts.get(order.targetPositionId);
       if (cachedLot) {
         return roundAsset(Math.min(order.quantity, cachedLot.remainingQuantity));
       }
-      const target = analyzePositions(this.state, {
-        currentPrice: this.state.lastPrice || order.price,
-      }).shorts.find((lot) => lot.id === order.targetPositionId);
-      return roundAsset(Math.min(order.quantity, target?.remainingQuantity ?? 0));
+      return 0;
     }
     return roundAsset(Math.min(order.quantity, this.activeShortQuantity()));
   }
@@ -3739,12 +3808,245 @@ export class SimulatedTradingBot {
     return roundQuote(pendingQuote);
   }
 
-  private targetLongEntryLeverage(_marketPrice: number): number {
-    return clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+  private recordLegacyValleyPeakDebug(
+    memory: LegacyValleyPeakMemory,
+    input: Parameters<typeof evaluateLegacyValleyPeak>[2],
+    decision: ReturnType<typeof evaluateLegacyValleyPeak>,
+    longEntryRisk: EntryRiskProfile,
+    shortEntryRisk: EntryRiskProfile,
+  ): void {
+    if (decision.signal === "buy" || decision.signal === "sell") {
+      this.state.memory.lastExtremaSignal = decision.signal;
+      this.state.memory.lastExtremaSignalAt = input.eventTime;
+      this.state.memory.lastExtremaSignalPrice = input.price;
+      this.state.memory.lastExtremaSignalReason = decision.reason;
+    }
+
+    this.state.memory.legacyValleyPeakDebug = {
+      ...createLegacyValleyPeakDebugSnapshot(
+        memory,
+        this.state.config.legacyValleyPeak,
+        input,
+        decision,
+        {
+          lastExtremaSignal: this.state.memory.lastExtremaSignal,
+          lastExtremaSignalAt: this.state.memory.lastExtremaSignalAt,
+          lastExtremaSignalPrice: this.state.memory.lastExtremaSignalPrice,
+          lastExtremaSignalReason: this.state.memory.lastExtremaSignalReason,
+        },
+      ),
+      entryRisk: {
+        long: longEntryRisk,
+        short: shortEntryRisk,
+      },
+    };
   }
 
-  private targetShortEntryLeverage(_marketPrice: number): number {
-    return clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+  private targetLongEntryLeverage(marketPrice: number): number {
+    return this.longEntryRiskProfile(marketPrice).leverage;
+  }
+
+  private targetShortEntryLeverage(marketPrice: number): number {
+    return this.shortEntryRiskProfile(marketPrice).leverage;
+  }
+
+  private longEntryRiskProfile(marketPrice: number): EntryRiskProfile {
+    return this.entryRiskProfile("long", marketPrice);
+  }
+
+  private shortEntryRiskProfile(marketPrice: number): EntryRiskProfile {
+    return this.entryRiskProfile("short", marketPrice);
+  }
+
+  private entryRiskProfile(
+    side: PositionLotSide,
+    marketPrice: number,
+  ): EntryRiskProfile {
+    const maxLeverage = clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+    const legacyConfig = this.state.config.legacyValleyPeak;
+    if (!legacyConfig.rangeLeverageEnabled || maxLeverage <= 1) {
+      return {
+        side,
+        mode: "max",
+        leverage: maxLeverage,
+        maxLeverage,
+      };
+    }
+
+    const maxEntryLeverage = clamp(
+      Math.min(maxLeverage, cleanPositive(legacyConfig.leverageMaxEntryLeverage) || 1),
+      1,
+      maxLeverage,
+    );
+    if (marketPrice <= 0) {
+      return {
+        side,
+        mode: "max",
+        leverage: maxEntryLeverage,
+        maxLeverage,
+        maxEntryLeverage,
+      };
+    }
+
+    const memory = this.ensureLegacyValleyPeakMemory();
+    const longTermRange = memory.priceRanges.find(
+      (range) => range.window === legacyConfig.leverageLongTermRangeWindow,
+    );
+    const longTermPoint = longTermRange?.points.at(-1);
+    const rangePosition = this.priceRangePosition(longTermPoint, marketPrice);
+    const nearRangeEdge =
+      rangePosition !== undefined &&
+      (rangePosition <= legacyConfig.leverageRangeEdgeFraction ||
+        rangePosition >= 1 - legacyConfig.leverageRangeEdgeFraction);
+
+    if (nearRangeEdge) {
+      const lifetimeProfile = this.lifetimeEntryRiskProfile(
+        side,
+        marketPrice,
+        maxLeverage,
+        maxEntryLeverage,
+        rangePosition,
+        longTermPoint,
+        nearRangeEdge,
+      );
+      if (lifetimeProfile) {
+        return lifetimeProfile;
+      }
+    }
+
+    const boundaryPrice =
+      side === "long" ? longTermPoint?.minPrice : longTermPoint?.maxPrice;
+    const adverseDistance =
+      boundaryPrice === undefined
+        ? undefined
+        : side === "long"
+          ? marketPrice - boundaryPrice
+          : boundaryPrice - marketPrice;
+    return {
+      side,
+      mode: "long-term-range",
+      leverage: this.longTermRangeLeverage(
+        side,
+        marketPrice,
+        maxEntryLeverage,
+        longTermPoint,
+      ),
+      maxLeverage,
+      maxEntryLeverage,
+      rangePosition,
+      rangeEdgeFraction: legacyConfig.leverageRangeEdgeFraction,
+      nearRangeEdge,
+      longTermRangeWindow: legacyConfig.leverageLongTermRangeWindow,
+      longTermMinPrice: longTermPoint?.minPrice,
+      longTermMaxPrice: longTermPoint?.maxPrice,
+      liquidationBoundaryPrice: boundaryPrice,
+      adverseDistancePct:
+        adverseDistance !== undefined && marketPrice > 0
+          ? (adverseDistance / marketPrice) * 100
+          : undefined,
+    };
+  }
+
+  private longTermRangeLeverage(
+    side: PositionLotSide,
+    marketPrice: number,
+    maxEntryLeverage: number,
+    range: { minPrice: number; maxPrice: number } | undefined,
+  ): number {
+    if (!range || marketPrice <= 0) {
+      return maxEntryLeverage;
+    }
+
+    const boundaryPrice = side === "long" ? range.minPrice : range.maxPrice;
+    if (!isPositiveNumber(boundaryPrice)) {
+      return maxEntryLeverage;
+    }
+
+    const adverseDistance =
+      side === "long" ? marketPrice - boundaryPrice : boundaryPrice - marketPrice;
+    if (adverseDistance <= 0) {
+      return maxEntryLeverage;
+    }
+
+    return clamp(marketPrice / adverseDistance, 1, maxEntryLeverage);
+  }
+
+  private lifetimeEntryRiskProfile(
+    side: PositionLotSide,
+    marketPrice: number,
+    maxLeverage: number,
+    maxEntryLeverage: number,
+    rangePosition?: number,
+    longTermPoint?: { minPrice: number; maxPrice: number },
+    nearRangeEdge?: boolean,
+  ): EntryRiskProfile | undefined {
+    const legacyConfig = this.state.config.legacyValleyPeak;
+    const rangeSec = legacyConfig.averagingRangesSec[legacyConfig.leverageLifetimeDataIndex];
+    if (!rangeSec || rangeSec <= 0 || marketPrice <= 0) {
+      return undefined;
+    }
+
+    const memory = this.ensureLegacyValleyPeakMemory();
+    const candleRange = memory.candleRanges[legacyConfig.leverageLifetimeDataIndex];
+    const maxMovePct = cleanPositive(candleRange?.points.at(-1)?.maxPct);
+    if (maxMovePct <= 0) {
+      return undefined;
+    }
+
+    const leverage = clamp(
+      100 / (maxMovePct * legacyConfig.leverageExpectedMoveMultiplier),
+      1,
+      maxEntryLeverage,
+    );
+    const lifetimeMinLeverage = clamp(
+      cleanPositive(legacyConfig.leverageLifetimeMinLeverage) || 1,
+      1,
+      maxLeverage,
+    );
+    if (leverage < lifetimeMinLeverage) {
+      return undefined;
+    }
+
+    return {
+      side,
+      mode: "lifetime",
+      leverage,
+      maxLeverage,
+      maxEntryLeverage,
+      lifetimeMinLeverage,
+      lifetimeMs: rangeSec * 1000,
+      rangePosition,
+      rangeEdgeFraction: legacyConfig.leverageRangeEdgeFraction,
+      nearRangeEdge,
+      longTermRangeWindow: legacyConfig.leverageLongTermRangeWindow,
+      longTermMinPrice: longTermPoint?.minPrice,
+      longTermMaxPrice: longTermPoint?.maxPrice,
+      lifetimeWindowSec: rangeSec,
+      expectedMovePct: maxMovePct,
+      expectedMoveMultiplier: legacyConfig.leverageExpectedMoveMultiplier,
+    };
+  }
+
+  private priceRangePosition(
+    range: { minPrice: number; maxPrice: number } | undefined,
+    marketPrice: number,
+  ): number | undefined {
+    if (
+      !range ||
+      !isPositiveNumber(range.minPrice) ||
+      !isPositiveNumber(range.maxPrice) ||
+      range.maxPrice <= range.minPrice
+    ) {
+      return undefined;
+    }
+
+    return clamp((marketPrice - range.minPrice) / (range.maxPrice - range.minPrice), 0, 1);
+  }
+
+  private entryLifecycleFields(profile: EntryRiskProfile): OrderLifecycleFields {
+    return profile.lifetimeMs && profile.lifetimeMs > 0
+      ? { lifetimeMs: profile.lifetimeMs }
+      : {};
   }
 
   private longEntryBuyingPowerQuote(
@@ -3877,6 +4179,7 @@ export class SimulatedTradingBot {
     this.state.fills.length = rollback.fillsLength;
     this.liquidatedPositionCountValue = rollback.liquidatedPositionCount;
     this.state.metrics = rollback.metrics;
+    this.legacyPositionLotCache = undefined;
   }
 
   private assertLeverageLimit(): void {
@@ -4080,7 +4383,8 @@ export class SimulatedTradingBot {
       !memory ||
       memory.buyAverages.length !== rangeCount ||
       memory.sellAverages.length !== rangeCount ||
-      memory.candleRanges?.length !== rangeCount
+      memory.candleRanges?.length !== rangeCount ||
+      memory.priceRanges?.length !== 3
     ) {
       memory = normalizeLegacyValleyPeakMemory(
         memory,
@@ -4303,7 +4607,11 @@ function lotLifecycleCloseReason(
   lot: Pick<
     LegacyExitGridLot,
     "side" | "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
-  > & { openedAt: number },
+  > & {
+    openedAt: number;
+    breakEvenSellPrice?: number;
+    breakEvenBuyPrice?: number;
+  },
   tick: PriceTick,
 ): string | undefined {
   const stopLossPrice = cleanPositive(lot.stopLossPrice);
@@ -4326,6 +4634,16 @@ function lotLifecycleCloseReason(
 
   const lifetimeMs = cleanPositive(lot.lifetimeMs);
   if (lifetimeMs > 0 && tick.eventTime >= lot.openedAt + lifetimeMs) {
+    const breakEvenSellPrice = cleanPositive(lot.breakEvenSellPrice);
+    if (lot.side === "long" && breakEvenSellPrice > 0 && tick.price >= breakEvenSellPrice) {
+      return undefined;
+    }
+
+    const breakEvenBuyPrice = cleanPositive(lot.breakEvenBuyPrice);
+    if (lot.side === "short" && breakEvenBuyPrice > 0 && tick.price <= breakEvenBuyPrice) {
+      return undefined;
+    }
+
     return "lot lifetime";
   }
 
@@ -4361,6 +4679,10 @@ function hasLotLifecycleControls(
 
 function cleanPositive(value: number | undefined): number {
   return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+}
+
+function isPositiveNumber(value: number | undefined): boolean {
+  return Number.isFinite(value) && (value as number) > 0;
 }
 
 function remainingOrderReserveQuote(

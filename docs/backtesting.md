@@ -110,8 +110,11 @@ The script reads local historical candles, runs `legacy-valley-peak` with identi
 starting capital, leverage guard, per-side position cap, fees, limit offset, and
 cooldown, then
 reports return, drawdown, trade count, trade win rate, profitable closed positions,
-liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin capture,
-and compounded perfect-margin capture.
+liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin return and
+capture, and compounded perfect-margin return and capture. The perfect-margin oracle
+uses configured fees but floors slippage at the default `10bps` assumption so live
+order-book slippage estimates near zero do not make historical oracle returns
+non-comparable.
 The benchmark script defaults to the strict-symmetric `0.35%` anchor assumptions:
 `1x`, `futures-margin`, `999/999` borrow depth, borrow lock off, `300s` cooldown, and a
 per-side position cap equal to starting capital. Fixed historical, synthetic, grid, and
@@ -170,8 +173,10 @@ price = startPrice * (1 + amplitude * sin(2pi * frequency * days) + trend * days
 ```
 
 The Brownian component is accumulated from normally distributed increments sampled at
-candle open, midpoint, and close. The default synthetic start price is `100000`, which
-keeps BTCUSDT-scale detector thresholds meaningful. Tune it with:
+candle open, midpoint, and close. The default relative-rate detector keeps signal
+eligibility price-scale-invariant across synthetic start prices and low-price symbols.
+Use `--absolute-rates` only when comparing against old absolute-rate baselines. Tune
+synthetic candles with:
 
 ```bash
 --synthetic-candles
@@ -201,7 +206,7 @@ window. Use cycle-wide random-length windows and folded checks, then record:
 - max drawdown and risk-adjusted return
 - trade count, open-order count, trade win rate, profitable closed-position count, and
   liquidated-position count
-- additive and compounded perfect-margin capture
+- additive and compounded perfect-margin return and capture
 
 Failed experiments should stay in the docs as observations, but removed algorithms
 should not be kept as runnable controls.

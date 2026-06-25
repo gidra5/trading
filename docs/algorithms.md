@@ -154,14 +154,34 @@ For each window it stores:
 - a derivative estimate sampled inside the rolling window
 - a clamped derivative point used for turning-point detection
 
-Derivative clamping is important. A small derivative is treated as zero unless it
-exceeds the configured positive or negative threshold for that window:
+Derivative clamping is important. By default, the derivative uses fractional price
+change per second, so the same detector thresholds work across BTC-scale and
+low-price symbols:
+
+```text
+derivative = (avg - sampledAvg) / sampledAvg / seconds
+```
+
+When `legacyValleyPeak.relativeRateEnabled` is disabled, the detector falls back to
+the original absolute quote-unit behavior:
+
+```text
+derivative = (avg - sampledAvg) / seconds
+```
+
+A small derivative is treated as zero unless it exceeds the configured positive
+or negative threshold for that window. In default relative mode the threshold fields
+are interpreted as relative rates:
 
 ```text
 rateClamped = derivative >= highThreshold ? derivative
             : derivative <= -lowThreshold ? derivative
             : 0
 ```
+
+Existing BTC-scale threshold and sigma values above `0.01` are normalized by the BTC
+reference price (`100000`) when relative mode is enabled, so the old `0.25` threshold
+becomes `0.0000025` per second.
 
 This prevents tiny average movements from constantly generating valley/peak flips.
 
@@ -245,15 +265,32 @@ This avoids trading from empty or underfilled rolling windows. During warmup,
 
 ## Entry Leverage
 
-New long entries now use a target leverage procedure. The procedure currently returns
-the configured maximum leverage, clamped to a positive account limit:
+New long and short entries use a range-aware target leverage procedure. When the
+current price is in the middle of the configured long-term range, the target leverage is
+capped so the approximate liquidation price stays outside that long-term range:
 
 ```text
-target entry leverage = maxLeverage
+long leverage cap  = current price / (current price - long-term minimum)
+short leverage cap = current price / (long-term maximum - current price)
 ```
 
-The hook is intentionally narrow so future versions can replace the constant with a
-range-aware value derived from historical volatility or recent swing width.
+When the current price is near either edge of the long-term range, the selector can make
+new entries lifetime-limited. The lifetime is selected from `averagingRangesSec` by
+`leverageLifetimeDataIndex`, and leverage is capped from that interval's maximum recent
+candle size:
+
+```text
+edge leverage cap = 100 / (max candle size pct * leverageExpectedMoveMultiplier)
+```
+
+The default long-term range is `1y`, the edge band is the outer `20%` of that range,
+the default lifetime interval is the `12h` window, and the expected move multiplier is
+`1.5`. The selected entry leverage is also capped by `leverageMaxEntryLeverage`, which
+defaults to `1.05`, so setting account max leverage to a higher value mostly keeps entries
+near `1x` unless this cap is explicitly raised. Lifetime controls only activate when the
+selected edge leverage is at least `leverageLifetimeMinLeverage`, default `1.1`, so the
+conservative preset does not turn near-edge `1x` entries into expiring lots. Lifetime
+expiry does not force-close a lot once the market is past that lot's break-even price.
 
 Entry buying power is the remaining quote notional that can be added without exceeding
 either `maxPositionQuote` or the target leverage guard after fees. Open buy orders count
@@ -439,6 +476,8 @@ break-even further. Borrower losses are still charged back through the lender ba
 | `lockBorrowedLenderCollateral` | `false` | Lender lots can still exit-grid collateral currently lent to borrowers. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
 | `maxPositionQuote` | `10000` | Maximum notional the strategy can build per side; matches the `$10000` starting quote. |
+| `leverageMaxEntryLeverage` | `1.05` | Conservative selector cap for new entries when account max leverage is above `1x`. |
+| `leverageLifetimeMinLeverage` | `1.1` | Minimum selected edge leverage required before near-edge entries get lifetime limits. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
 | `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
 | `cooldownMs` | `300000` | Minimum delay between newly created automated orders. |
@@ -446,10 +485,11 @@ break-even further. Borrower losses are still charged back through the lender ba
 | `minOrderQuote` | `5` | Global minimum order notional. |
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
 | `legacyValleyPeak.maxTradeQuote` | `50000` | Per-signal quote/notional clip. |
+| `legacyValleyPeak.relativeRateEnabled` | `true` | Uses price-scale-invariant relative derivatives by default; disable only for old absolute-rate baseline comparisons. |
 | `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
 | `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
-| `legacyValleyPeak.buySigma` | `0.3` | Buy Gaussian width around the sizing derivative. |
-| `legacyValleyPeak.sellSigma` | `0.1` | Sell Gaussian width around the sizing derivative. |
+| `legacyValleyPeak.buySigma` | `0.000003` | Buy Gaussian width around the sizing derivative after relative-mode normalization from the raw BTC-scale `0.3` default. |
+| `legacyValleyPeak.sellSigma` | `0.000001` | Sell Gaussian width around the sizing derivative after relative-mode normalization from the raw BTC-scale `0.1` default. |
 | `legacyValleyPeak.exitGridEnabled` | `true` | Enables the peak-to-entry exit ladder. |
 | `legacyValleyPeak.exitGridMarketEntry` | `true` | Uses immediate market-style valley entries in grid mode. |
 | `legacyValleyPeak.exitGridOrderCount` | `200` | Maximum orders in a recreated exit ladder. |

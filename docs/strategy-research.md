@@ -463,6 +463,132 @@ and `300s` settings moved from `0.35%` to `3.07%` return, `13.58%` max drawdown,
 `1808` trades. March 2026 no longer had zero activity: it produced `58` short opens and
 `16` long opens, though March-June still had no later close fills inside that anchor.
 
+Current `999/999` baseline verification, captured on 2026-06-24 after the internal-borrow
+capacity and futures-margin netting changes, used exact BTCUSDT `1m` candles from
+`data/historical/spot-btcusdt/btcusdt/1m` with no resampling. Commands used the
+strict-symmetric reference via `--only strict-symmetric`.
+
+Exact config:
+
+- `startingQuote = 10000`, `maxPositionQuote = 10000`, `maxLeverage = 1`
+- `shortMarginModel = "futures-margin"`
+- `longBorrowDepth = 999`, `shortBorrowDepth = 999`
+- `lockBorrowedLenderCollateral = false`
+- `borrowerProfitShareToLender = 1`
+- `maxOpenOrders = 1024`, `cooldownMs = 300000`, `staleOrderMs = 2592000000`
+- `feeBps = 7.5`, `limitOffsetBps = 2`, `minOrderQuote = 25`
+- detector: `buyDataIndex = 1`, `sellDataIndex = 1`,
+  `buyConfirmationOffsets = [2, 1]`, `sellConfirmationOffsets = [2, 1]`
+- detector sizing: `saturationSec = 3600`, `buySpendRate = 1`,
+  `sellAmountRate = 1`, `buySigma = 0.3`, `sellSigma = 0.1`,
+  `minTradeQuote = 25`, `maxTradeQuote = 50000`
+- exit grid: enabled, market entry enabled, `exitGridOrderCount = 6`,
+  `exitGridPriceDistribution = "uniform"`,
+  `exitGridSizeDistribution = "geometric"`, `exitGridSellFraction = 0.35`,
+  `exitGridMinProfitBps = 20`, `exitGridResetBps = 10`,
+  `exitGridPositionMode = "per-lot"`, `exitGridResetMode = "filled-grid"`
+
+Fixed-window exact runs:
+
+| Window | Interval               |     Candles |      Return |       Net PnL |  Max DD |   Risk Ret |  Sharpe |   Trades | Win Rate |              Prof Pos | Liq Pos | Oracle Capture |
+| ------ | ---------------------- | ----------: | ----------: | ------------: | ------: | ---------: | ------: | -------: | -------: | --------------------: | ------: | -------------: |
+| 30d    | 2026-05-23..2026-06-21 |    `42,982` |     `7.94%` |     `$794.47` | `3.05%` |    `2.602` | `3.977` |    `970` |  `81.5%` |     `120/135 (88.9%)` |     `0` |      `13.216%` |
+| 180d   | 2025-12-24..2026-06-21 |   `258,982` |   `124.98%` |   `$12497.64` | `9.34%` |   `13.374` | `5.982` |   `7227` |  `81.1%` |   `1048/1191 (88.0%)` |     `0` |      `24.729%` |
+| 365d   | 2025-06-22..2026-06-21 |   `525,382` |   `457.22%` |   `$45722.47` | `6.21%` |   `73.676` | `7.180` |  `22250` |  `79.2%` |   `2879/3362 (85.6%)` |     `0` |      `56.592%` |
+| 1800d  | 2021-07-18..2026-06-21 | `2,591,312` | `13212.88%` | `$1321287.67` | `4.79%` | `2759.891` | `6.070` | `100436` |  `79.7%` | `10228/12837 (79.7%)` |     `0` |     `130.083%` |
+
+The fixed-window commands were:
+
+```bash
+npm run benchmark:strategies -- --mode days --days 30 --only strict-symmetric
+npm run benchmark:strategies -- --mode days --days 180 --only strict-symmetric
+npm run benchmark:strategies -- --mode days --days 365 --only strict-symmetric
+npm run benchmark:strategies -- --mode days --days 1800 --only strict-symmetric
+```
+
+The 1800d exact run took `6245949ms` (`1h44m06s`). It also reported
+`9.60e+45%` reinvested return and `0.000000%` reinvested oracle capture; the additive
+oracle capture is the more useful comparator for this row.
+
+Random 90d exact run, seed `1337`, `50` samples, `90-90` day windows, `1825` day
+lookback, cache span `2021-07-16..2026-06-21`, first sample
+`2022-05-27..2022-08-25`, last sample `2026-01-09..2026-04-09`:
+
+| Samples | Profitable | Avg Return |   Median |      P10 | Avg Net PnL | Avg PnL/day | Avg Max DD | Avg Risk Ret | Avg Sharpe | Avg Trades |          Avg Prof Pos | Avg Liq Pos | Avg Capture |     Best |   Worst |
+| ------: | ---------: | ---------: | -------: | -------: | ----------: | ----------: | ---------: | -----------: | ---------: | ---------: | --------------------: | ----------: | ----------: | -------: | ------: |
+|    `50` |    `50/50` |   `47.99%` | `46.55%` | `13.89%` |  `$4799.29` |    `$53.33` |    `7.00%` |      `9.992` |    `5.821` |   `2180.6` | `304.7/345.7 (90.4%)` |       `0.0` |   `21.067%` | `96.34%` | `3.73%` |
+
+The random-window command was:
+
+```bash
+npm run benchmark:strategies -- --mode random-lengths --min-window-days 90 --max-window-days 90 --samples 50 --only strict-symmetric
+```
+
+Depth-tracking replays used `scripts/track-borrow-depth.ts` with the same config and
+same exact candle replay sequence. These runs measure used chain depth as
+`configuredDepth - borrowDepthRemaining` while tracked lots are active:
+
+| Window |    Return |  Max DD |  Trades |            Prof Pos | Liq Pos | Max Long Depth | Max Short Depth |
+| ------ | --------: | ------: | ------: | ------------------: | ------: | -------------: | --------------: |
+| 30d    |   `7.94%` | `3.05%` |   `970` |   `120/135 (88.9%)` |     `0` |            `3` |             `4` |
+| 180d   | `124.98%` | `9.34%` |  `7227` | `1048/1191 (88.0%)` |     `0` |            `6` |             `7` |
+| 365d   | `457.22%` | `6.21%` | `22250` | `2879/3362 (85.6%)` |     `0` |            `8` |             `9` |
+
+The depth-tracking commands were:
+
+```bash
+npx tsx scripts/track-borrow-depth.ts --days 30
+npx tsx scripts/track-borrow-depth.ts --days 180
+npx tsx scripts/track-borrow-depth.ts --days 365
+```
+
+Absolute-rate no-leverage baseline, captured on 2026-06-25 before relative rates became
+the default, used exact BTCUSDT `1m` candles with
+`--only "Legacy Valley/Peak Long/Short"` and no `--leverage` override. This kept the
+benchmark runner at `1x max leverage`, `futures-margin`, `999/999` borrow depth,
+`maxPositionQuote = 10000`, `300s` cooldown, and the old absolute derivative thresholds.
+
+Fixed-window exact reruns:
+
+| Window | Interval | Candles | Return | Net PnL | Max DD | Risk Ret | Sharpe | Trades | Win Rate | Prof Pos | Liq Pos | Oracle Ret | Oracle Capture | Reinvest Ret | Reinvest Capture |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30d | 2026-05-26..2026-06-24 | `42,940` | `30.25%` | `$3025.42` | `2.87%` | `10.528` | `13.258` | `2360` | `82.0%` | `214/239 (89.5%)` | `0` | `60.77%` | `49.784%` | `83.43%` | `36.263083%` |
+| 180d | 2025-12-27..2026-06-24 | `258,940` | `237.76%` | `$23776.29` | `1.00%` | `237.906` | `17.021` | `16193` | `84.4%` | `1533/1672 (91.7%)` | `0` | `505.68%` | `47.019%` | `15462.04%` | `1.537720%` |
+| 365d | 2025-06-25..2026-06-24 | `525,340` | `487.87%` | `$48786.66` | `1.18%` | `414.355` | `15.496` | `40074` | `81.4%` | `3746/4172 (89.8%)` | `0` | `809.31%` | `60.282%` | `318674.00%` | `0.153093%` |
+
+The same 365d benchmark with `legacyValleyPeak.relativeRateEnabled=true`, now the
+default detector mode, was rerun with `--relative-rates` before the default flip:
+
+| Window | Interval | Candles | Return | Net PnL | Max DD | Risk Ret | Sharpe | Trades | Win Rate | Prof Pos | Liq Pos | Oracle Ret | Oracle Capture | Reinvest Ret | Reinvest Capture |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 365d relative rates | 2025-06-25..2026-06-24 | `525,340` | `563.10%` | `$56310.37` | `1.17%` | `482.495` | `16.952` | `51123` | `81.1%` | `4838/5400 (89.6%)` | `0` | `809.31%` | `69.578%` | `318674.00%` | `0.176702%` |
+
+The fixed-window rerun commands were:
+
+```bash
+npm run benchmark:strategies -- --mode days --days 30 --interval 1m --symbol BTCUSDT --only "Legacy Valley/Peak Long/Short" --absolute-rates
+npm run benchmark:strategies -- --mode days --days 180 --interval 1m --symbol BTCUSDT --only "Legacy Valley/Peak Long/Short" --absolute-rates
+npm run benchmark:strategies -- --mode days --days 365 --interval 1m --symbol BTCUSDT --only "Legacy Valley/Peak Long/Short" --absolute-rates
+npm run benchmark:strategies -- --mode days --days 365 --interval 1m --symbol BTCUSDT --only "Legacy Valley/Peak Long/Short" --relative-rates
+```
+
+After relative rates became the default, rerun old absolute-rate baselines with
+`--absolute-rates`.
+
+Random 90d exact rerun, seed `1337`, `48` samples, `90-90` day windows, `1825` day
+lookback, cache span `2021-07-16..2026-06-24`, first sample
+`2022-05-28..2022-08-26`, last sample `2023-10-02..2023-12-31`:
+
+| Samples | Profitable | Avg Return |   Median |      P10 | Avg Net PnL | Avg PnL/day | Avg Max DD | Avg Risk Ret | Avg Sharpe | Avg Trades |          Avg Prof Pos | Avg Liq Pos | Avg Capture | Avg Reinvest Cap |      Best |   Worst |
+| ------: | ---------: | ---------: | -------: | -------: | ----------: | ----------: | ---------: | -----------: | ---------: | ---------: | --------------------: | ----------: | ----------: | ---------------: | --------: | ------: |
+|    `48` |    `48/48` |   `99.13%` | `89.01%` | `20.67%` |  `$9912.59` |   `$110.14` |    `4.33%` |     `64.528` |   `11.824` |   `5107.6` | `475.5/520.0 (93.6%)` |       `0.0` |   `40.592%` |     `19.717953%` | `229.48%` | `6.53%` |
+
+The random-window rerun command was:
+
+```bash
+npm run benchmark:strategies -- --mode random-lengths --interval 1m --symbol BTCUSDT --min-window-days 90 --max-window-days 90 --samples 48 --seed 1337 --lookback-days 1825 --only "Legacy Valley/Peak Long/Short"
+```
+
 Higher-sample checkpoint, 30m OHLC proxy: exact 1m 50-sample long-window matrices
 were too slow for a 30-minute checkpoint, so the benchmark runner was extended with
 `--borrow-depth-matrix` and `--resample-minutes`. The 30d and 180d matrices below

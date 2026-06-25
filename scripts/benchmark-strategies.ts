@@ -55,6 +55,7 @@ interface BenchmarkArgs {
   syntheticAmplitude: number;
   syntheticTrend: number;
   syntheticNoise: number;
+  relativeRateEnabled?: boolean;
   seed: number;
   only?: string;
   symbols?: string[];
@@ -89,6 +90,7 @@ interface BenchmarkMetrics {
   winRate: number;
   riskAdjustedReturn: number | undefined;
   sharpeRatio: number | undefined;
+  perfectReturnPct: number | undefined;
   perfectCapturePct: number | undefined;
   perfectCompoundedReturnPct: number | undefined;
   perfectCompoundedCapturePct: number | undefined;
@@ -115,6 +117,7 @@ interface RandomBenchmarkRow {
   avgTradeCount: number;
   avgRiskAdjustedReturn: number | undefined;
   avgSharpeRatio: number | undefined;
+  avgPerfectReturnPct: number | undefined;
   avgPerfectCapturePct: number | undefined;
   avgPerfectCompoundedCapturePct: number | undefined;
   avgClosedPositionCount: number;
@@ -824,6 +827,18 @@ function runBenchmark(
   if (log) {
     console.error(`Running ${benchmark.label} on ${candleCount.toLocaleString()} candles...`);
   }
+  const legacyValleyPeakConfig =
+    options.relativeRateEnabled === undefined
+      ? benchmark.config?.legacyValleyPeak
+      : {
+          ...(benchmark.config?.legacyValleyPeak ?? {}),
+          relativeRateEnabled: options.relativeRateEnabled,
+        };
+  const benchmarkConfig = {
+    ...(benchmark.config ?? {}),
+    ...(legacyValleyPeakConfig ? { legacyValleyPeak: legacyValleyPeakConfig } : {}),
+  };
+
   const result = runBacktestFromCandles(sourceCandles, {
     config: {
       symbol: options.symbol.toUpperCase(),
@@ -838,7 +853,7 @@ function runBenchmark(
       maxPositionQuote,
       maxOpenOrders: options.maxOpenOrders,
       cooldownMs: options.cooldownSec * 1000,
-      ...benchmark.config,
+      ...benchmarkConfig,
     },
     ...(maxEquityPoints ? { maxEquityPoints } : {}),
     ...(candleRange
@@ -878,6 +893,8 @@ function runRandomLengthBenchmark(
   let riskAdjustedReturnCount = 0;
   let sharpeRatio = 0;
   let sharpeRatioCount = 0;
+  let perfectReturnPct = 0;
+  let perfectReturnCount = 0;
   let perfectCapturePct = 0;
   let perfectCaptureCount = 0;
   let perfectCompoundedCapturePct = 0;
@@ -924,6 +941,10 @@ function runRandomLengthBenchmark(
       sharpeRatio += metrics.sharpeRatio;
       sharpeRatioCount += 1;
     }
+    if (metrics.perfectReturnPct !== undefined) {
+      perfectReturnPct += metrics.perfectReturnPct;
+      perfectReturnCount += 1;
+    }
     if (metrics.perfectCapturePct !== undefined) {
       perfectCapturePct += metrics.perfectCapturePct;
       perfectCaptureCount += 1;
@@ -954,6 +975,7 @@ function runRandomLengthBenchmark(
     avgTradeCount: averageRequired(tradeCount),
     avgRiskAdjustedReturn: averageOptional(riskAdjustedReturn, riskAdjustedReturnCount),
     avgSharpeRatio: averageOptional(sharpeRatio, sharpeRatioCount),
+    avgPerfectReturnPct: averageOptional(perfectReturnPct, perfectReturnCount),
     avgPerfectCapturePct: averageOptional(perfectCapturePct, perfectCaptureCount),
     avgPerfectCompoundedCapturePct: averageOptional(
       perfectCompoundedCapturePct,
@@ -978,6 +1000,7 @@ function metricsFromResult(result: BacktestResult): BenchmarkMetrics {
     winRate: summary.winRate,
     riskAdjustedReturn: summary.riskAdjustedReturn,
     sharpeRatio: summary.sharpeRatio,
+    perfectReturnPct: summary.perfectMarginReturnPct,
     perfectCapturePct: summary.perfectMarginCapturePct,
     perfectCompoundedReturnPct: summary.perfectMarginCompoundedReturnPct,
     perfectCompoundedCapturePct: summary.perfectMarginCompoundedCapturePct,
@@ -1255,6 +1278,7 @@ function parseArgs(argv: string[]): BenchmarkArgs {
   const interval = values.get("interval") ?? "1m";
   const days = parsePositiveInt(values.get("days"), FULL_BTC_CYCLE_DAYS);
   const defaultSyntheticCandles = Math.max(1, Math.ceil((days * DAY_MS) / intervalToMs(interval)));
+  const relativeRateEnabled = parseRelativeRateOverride(values);
   return {
     mode,
     marketKey: values.get("market-key"),
@@ -1301,6 +1325,7 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     syntheticAmplitude: parseNonNegativeNumber(values.get("synthetic-amplitude"), 0.1),
     syntheticTrend: parseFiniteNumber(values.get("synthetic-trend"), 0),
     syntheticNoise: parseNonNegativeNumber(values.get("synthetic-noise"), 0.02),
+    relativeRateEnabled,
     seed: parsePositiveInt(values.get("seed"), 1337),
     only: values.get("only"),
     symbols: parseSymbols(values.get("symbols")),
@@ -1319,6 +1344,24 @@ function parseMode(value: string | undefined): BenchmarkMode {
     return value;
   }
   return "random-lengths";
+}
+
+function parseRelativeRateOverride(values: Map<string, string>): boolean | undefined {
+  if (
+    values.get("absolute-rates") === "true" ||
+    values.get("absolute-rate-enabled") === "true"
+  ) {
+    return false;
+  }
+
+  const value = values.get("relative-rates") ?? values.get("relative-rate-enabled");
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  return undefined;
 }
 
 function parseShortMarginModel(value: string | undefined): ShortMarginModel {
@@ -1572,6 +1615,7 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     "Win Rate",
     "Prof Pos",
     "Liq Pos",
+    "Oracle Ret",
     "Oracle Capture",
     "Reinvest Ret",
     "Reinvest Capture",
@@ -1587,6 +1631,7 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     `${formatNumber(row.winRate, 1)}%`,
     `${row.profitableClosedPositionCount.toLocaleString()}/${row.closedPositionCount.toLocaleString()} (${formatNumber(row.profitableClosedPositionRate, 1)}%)`,
     formatNumber(row.liquidatedPositionCount, 0),
+    formatOptionalPercent(row.perfectReturnPct, 2, true),
     row.perfectCapturePct === undefined ? "-" : `${formatNumber(row.perfectCapturePct, 3)}%`,
     formatOptionalPercent(row.perfectCompoundedReturnPct, 2, true),
     formatOptionalPercent(row.perfectCompoundedCapturePct, 6, true),
@@ -1611,6 +1656,7 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     "Avg Trades",
     "Avg Prof Pos",
     "Avg Liq Pos",
+    "Avg Oracle Ret",
     "Avg Capture",
     "Avg Reinvest Cap",
     "Best Return",
@@ -1631,6 +1677,7 @@ function randomBenchmarkTable(rows: RandomBenchmarkRow[]): string {
     formatNumber(row.avgTradeCount, 1),
     `${formatNumber(row.avgProfitableClosedPositionCount, 1)}/${formatNumber(row.avgClosedPositionCount, 1)} (${formatNumber(row.avgProfitableClosedPositionRate, 1)}%)`,
     formatNumber(row.avgLiquidatedPositionCount, 1),
+    formatOptionalPercent(row.avgPerfectReturnPct, 2, true),
     row.avgPerfectCapturePct === undefined ? "-" : `${formatNumber(row.avgPerfectCapturePct, 3)}%`,
     formatOptionalPercent(row.avgPerfectCompoundedCapturePct, 6, true),
     `${formatNumber(row.bestReturnPct, 2)}%`,

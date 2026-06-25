@@ -1127,6 +1127,13 @@ function compactPublicMemory(
       .slice(),
     lastSignal: memory.lastSignal,
     lastActionAt: memory.lastActionAt,
+    lastExtremaSignal: memory.lastExtremaSignal,
+    lastExtremaSignalAt: memory.lastExtremaSignalAt,
+    lastExtremaSignalPrice: memory.lastExtremaSignalPrice,
+    lastExtremaSignalReason: memory.lastExtremaSignalReason,
+    legacyValleyPeakDebug: memory.legacyValleyPeakDebug
+      ? structuredClone(memory.legacyValleyPeakDebug)
+      : undefined,
   };
 }
 
