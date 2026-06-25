@@ -1333,6 +1333,7 @@ function AlgorithmPanel(props: {
                   label="Max Position"
                   value={config().maxPositionQuote}
                   min={1}
+                  placeholder="Uncapped"
                   onInput={(value) => update("maxPositionQuote", value)}
                 />
                 <NumberField
@@ -1574,12 +1575,17 @@ function AlgorithmPanel(props: {
 
 function NumberField(props: {
   label: string;
-  value: number;
+  value: number | null | undefined;
   min?: number;
   max?: number;
   step?: number;
+  placeholder?: string;
   onInput: (value: number) => void;
 }) {
+  const value = () =>
+    typeof props.value === "number" && Number.isFinite(props.value)
+      ? props.value
+      : "";
   return (
     <label class="block">
       <span class="muted-label">{props.label}</span>
@@ -1589,7 +1595,8 @@ function NumberField(props: {
         min={props.min}
         max={props.max}
         step={props.step ?? 1}
-        value={Number.isFinite(props.value) ? props.value : 0}
+        placeholder={props.placeholder}
+        value={value()}
         onInput={(event) => props.onInput(Number(event.currentTarget.value))}
       />
     </label>
@@ -1977,8 +1984,7 @@ function formatEntryRiskSummary(
     return "-";
   }
 
-  const lifetime = risk.lifetimeMs ? ` ${formatDuration(risk.lifetimeMs)}` : "";
-  return `${formatLeverage(risk.leverage)} ${risk.mode}${lifetime}`;
+  return `${formatLeverage(risk.leverage)} ${risk.mode}`;
 }
 
 function formatOptionalQuote(value: number | undefined, quoteAsset: string): string {

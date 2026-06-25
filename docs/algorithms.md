@@ -265,32 +265,22 @@ This avoids trading from empty or underfilled rolling windows. During warmup,
 
 ## Entry Leverage
 
-New long and short entries use a range-aware target leverage procedure. When the
-current price is in the middle of the configured long-term range, the target leverage is
-capped so the approximate liquidation price stays outside that long-term range:
+New long and short entries use the baseline long-term-range target leverage. When the
+range-leverage path is enabled and account `maxLeverage` is above `1x`, the selector
+chooses the leverage whose approximate liquidation boundary sits outside the configured
+long-term range with padding:
 
 ```text
-long leverage cap  = current price / (current price - long-term minimum)
-short leverage cap = current price / (long-term maximum - current price)
-```
+long liquidation boundary  = long-term minimum * (1 - padding pct)
+short liquidation boundary = long-term maximum * (1 + padding pct)
 
-When the current price is near either edge of the long-term range, the selector can make
-new entries lifetime-limited. The lifetime is selected from `averagingRangesSec` by
-`leverageLifetimeDataIndex`, and leverage is capped from that interval's maximum recent
-candle size:
-
-```text
-edge leverage cap = 100 / (max candle size pct * leverageExpectedMoveMultiplier)
+long leverage  = current price / (current price - long liquidation boundary)
+short leverage = current price / (short liquidation boundary - current price)
 ```
 
 The default long-term range is `1y`, the edge band is the outer `20%` of that range,
-the default lifetime interval is the `12h` window, and the expected move multiplier is
-`1.5`. The selected entry leverage is also capped by `leverageMaxEntryLeverage`, which
-defaults to `1.05`, so setting account max leverage to a higher value mostly keeps entries
-near `1x` unless this cap is explicitly raised. Lifetime controls only activate when the
-selected edge leverage is at least `leverageLifetimeMinLeverage`, default `1.1`, so the
-conservative preset does not turn near-edge `1x` entries into expiring lots. Lifetime
-expiry does not force-close a lot once the market is past that lot's break-even price.
+and the default padding is `3%`. Near-edge entries no longer receive lifetime limits
+from the leverage selector.
 
 Entry buying power is the remaining quote notional that can be added without exceeding
 either `maxPositionQuote` or the target leverage guard after fees. Open buy orders count
@@ -469,15 +459,14 @@ break-even further. Borrower losses are still charged back through the lender ba
 | Config | Default | Meaning |
 | --- | ---: | --- |
 | `algorithm` | `legacy-valley-peak` | The only automated algorithm key. |
-| `maxLeverage` | `1` | Baseline leverage guard from the strict-symmetric `0.35%` anchor replay. |
+| `maxLeverage` | `5` | Account leverage guard used by the padded long-term-range baseline selector. |
 | `shortMarginModel` | `futures-margin` | Collateral-backed short accounting used by the current baseline. |
 | `longBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original long lender. |
 | `shortBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original short lender. |
 | `lockBorrowedLenderCollateral` | `false` | Lender lots can still exit-grid collateral currently lent to borrowers. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
-| `maxPositionQuote` | `10000` | Maximum notional the strategy can build per side; matches the `$10000` starting quote. |
-| `leverageMaxEntryLeverage` | `1.05` | Conservative selector cap for new entries when account max leverage is above `1x`. |
-| `leverageLifetimeMinLeverage` | `1.1` | Minimum selected edge leverage required before near-edge entries get lifetime limits. |
+| `maxPositionQuote` | Uncapped | Optional maximum notional the strategy can build per side; finite caps are explicit overrides. |
+| `leverageLongTermRangePaddingPct` | `3` | Extra range padding used when selecting baseline entry leverage from the long-term min/max. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
 | `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
 | `cooldownMs` | `300000` | Minimum delay between newly created automated orders. |

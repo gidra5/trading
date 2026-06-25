@@ -145,11 +145,8 @@ export interface LegacyValleyPeakConfig {
   exitGridResetMode: "higher-peak" | "filled-grid";
   rangeLeverageEnabled: boolean;
   leverageLongTermRangeWindow: RollingPriceRangeWindow;
-  leverageLifetimeDataIndex: number;
   leverageRangeEdgeFraction: number;
-  leverageExpectedMoveMultiplier: number;
-  leverageMaxEntryLeverage: number;
-  leverageLifetimeMinLeverage: number;
+  leverageLongTermRangePaddingPct: number;
 }
 
 export interface RollingAveragePoint {
@@ -293,23 +290,18 @@ export interface LegacyValleyPeakPriceRangeDebug {
 
 export interface LegacyEntryRiskDebug {
   side: PositionLotSide;
-  mode: "max" | "long-term-range" | "lifetime";
+  mode: "max" | "baseline";
   leverage: number;
   maxLeverage: number;
-  maxEntryLeverage?: number;
-  lifetimeMinLeverage?: number;
-  lifetimeMs?: number;
   rangePosition?: number;
   rangeEdgeFraction?: number;
+  longTermRangePaddingPct?: number;
   nearRangeEdge?: boolean;
   longTermRangeWindow?: RollingPriceRangeWindow;
   longTermMinPrice?: number;
   longTermMaxPrice?: number;
   liquidationBoundaryPrice?: number;
   adverseDistancePct?: number;
-  lifetimeWindowSec?: number;
-  expectedMovePct?: number;
-  expectedMoveMultiplier?: number;
 }
 
 export type LegacyMarketTrendState = "rising" | "falling" | "sideways";
@@ -485,6 +477,8 @@ export interface BotMetrics {
   peakEquity: number;
   maxDrawdownPct: number;
   exposurePct: number;
+  maxEntryLeverage: number;
+  maxEffectiveLeverage: number;
   avgExitGridSpan: number;
   avgExitGridOrderCount: number;
   exitGridSpanCount: number;
@@ -695,6 +689,8 @@ export interface BacktestSummary {
   riskAdjustedReturn?: number;
   sharpeRatio?: number;
   maxDrawdownPct: number;
+  maxEntryLeverage?: number;
+  maxEffectiveLeverage?: number;
   tradeCount: number;
   winRate: number;
   closedPositionCount: number;
@@ -730,6 +726,8 @@ export interface BacktestSampleSummary {
   perfectMarginCompoundedReturnPct?: number;
   perfectMarginCompoundedCapturePct?: number;
   maxDrawdownPct: number;
+  maxEntryLeverage?: number;
+  maxEffectiveLeverage?: number;
   tradeCount: number;
   winRate: number;
   closedPositionCount: number;

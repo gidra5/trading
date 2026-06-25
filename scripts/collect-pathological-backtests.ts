@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  defaultStrategyConfig,
   runBacktestFromCandles,
   type BacktestResult,
   type Candle,
@@ -147,7 +148,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_DURATIONS = "1d,3d,5d,1w,2w,1m,2m,3m";
 const DEFAULT_OUTPUT = "docs/pathological-backtest-windows.json";
 const FULL_BTC_CYCLE_DAYS = 365 * 5;
-const MAX_POSITION_QUOTE_MULTIPLIER = 1;
 const STRATEGY_LABEL = "Legacy Valley/Peak Long/Short";
 const STRATEGY_ALGORITHM: StrategyAlgorithm = "legacy-valley-peak";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -320,7 +320,6 @@ function runPathologyBacktest(
 }
 
 function strategyConfig(symbol: string, settings: StrategySettings): PartialStrategyConfig {
-  const maxPositionQuote = settings.startingQuote * MAX_POSITION_QUOTE_MULTIPLIER;
   return {
     symbol: symbol.toUpperCase(),
     algorithm: STRATEGY_ALGORITHM,
@@ -331,7 +330,6 @@ function strategyConfig(symbol: string, settings: StrategySettings): PartialStra
     shortBorrowDepth: settings.shortBorrowDepth,
     lockBorrowedLenderCollateral: settings.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender: settings.borrowerProfitShareToLender,
-    maxPositionQuote,
     maxOpenOrders: settings.maxOpenOrders,
     cooldownMs: settings.cooldownSec * 1000,
   };
@@ -652,7 +650,7 @@ function parseArgs(argv: string[]): PathologyArgs {
     lookbackDays: parsePositiveNumber(values.get("lookback-days"), FULL_BTC_CYCLE_DAYS),
     durations: parseDurations(values.get("durations") ?? DEFAULT_DURATIONS),
     startingQuote: parsePositiveNumber(values.get("starting-quote"), 10_000),
-    leverage: parsePositiveNumber(values.get("leverage"), 1),
+    leverage: parsePositiveNumber(values.get("leverage"), defaultStrategyConfig.maxLeverage),
     shortMarginModel: parseShortMarginModel(
       values.get("short-margin") ?? values.get("short-margin-model"),
     ),

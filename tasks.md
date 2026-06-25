@@ -9,7 +9,7 @@
 - maybe run some kind of genetic algorithm to finetune the parameters. use quick 1month backtests to verify quality and guide the search.
 - maybe we can do a kind of backpropagation to improve the parameters.
 
-- add partial fills and leveraged positions guided by expected short/mid/long-timeframe price ranges. given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
+- +? add partial fills and leveraged positions guided by expected short/mid/long-timeframe price ranges. given current price, we can compute how much we need to close the position so that we will break even outside the expected price range. that way we can maximize our exposure, while controlling risk.
   - select leverage for positions using expected short/mid/long-timeframe price ranges.
   - the minimum leverage is whatever allows liquidation be outside long-term range (ltr)
   - check where in the ltr we are.
@@ -22,8 +22,6 @@
   - disable lifetime if we are above break even. 
 - estimate how much the quality of peaks and size distributions affect the performance. add a confidence score before creating positions/closing to guide the actual decisions.
 - accomodate in some way average candle size at various levels of granularity. Use this as the expected move over the window size.
-- add more visibility into bot state
-- 90d samples, 30d, 180d, 365d 1800d
   
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.

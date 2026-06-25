@@ -62,10 +62,9 @@ export const appConfig = {
       process.env.TRADING_SHORT_MARGIN_MODEL === "futures-margin"
         ? "futures-margin"
         : "spot-borrow",
-    maxPositionQuote: Number(
-      process.env.TRADING_MAX_POSITION_QUOTE ??
-        Number(process.env.TRADING_STARTING_QUOTE ?? 10_000) * 100,
-    ),
+    ...(process.env.TRADING_MAX_POSITION_QUOTE
+      ? { maxPositionQuote: Number(process.env.TRADING_MAX_POSITION_QUOTE) }
+      : {}),
     maxOpenOrders: parseNumber(process.env.TRADING_MAX_OPEN_ORDERS, 1024),
   }),
 };

@@ -192,7 +192,6 @@ function runGridBacktest(
       shortMarginModel: options.shortMarginModel,
       longBorrowDepth: options.longBorrowDepth,
       shortBorrowDepth: options.shortBorrowDepth,
-      maxPositionQuote: options.startingQuote,
       maxOpenOrders: options.maxOpenOrders,
       cooldownMs: options.cooldownSec * 1000,
       ...exitGridConfig(options, candidate),

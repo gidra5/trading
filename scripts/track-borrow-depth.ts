@@ -42,7 +42,6 @@ if (candles.length === 0) {
 
 const config = createStrategyConfig({
   symbol: args.symbol.toUpperCase(),
-  maxPositionQuote: 10_000,
 });
 const bot = new SimulatedTradingBot(createInitialBotState(config));
 const depth: DepthTracker = { maxLongDepth: 0, maxShortDepth: 0 };

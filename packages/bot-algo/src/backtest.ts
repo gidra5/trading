@@ -663,6 +663,8 @@ function buildBacktestResult(
       returnPct: finalState.metrics.returnPct,
       ...riskMetrics,
       maxDrawdownPct: finalState.metrics.maxDrawdownPct,
+      maxEntryLeverage: finalState.metrics.maxEntryLeverage,
+      maxEffectiveLeverage: finalState.metrics.maxEffectiveLeverage,
       tradeCount: finalState.metrics.tradeCount,
       winRate: finalState.metrics.winRate,
       ...closedPositionStats,

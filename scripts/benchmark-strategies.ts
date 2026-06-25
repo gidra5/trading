@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   calculateRiskAdjustedMetrics,
+  defaultStrategyConfig,
   legacyValleyPeakAsymmetricShortFavoringConfig,
   legacyValleyPeakStrictSymmetricConfig,
   runBacktestFromCandles,
@@ -29,7 +30,10 @@ interface BenchmarkArgs {
   interval: string;
   days: number;
   startingQuote: number;
+  maxPositionQuote: number;
+  skipMaxPositionQuoteCap: boolean;
   leverage: number;
+  minOrderQuote: number;
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
@@ -61,8 +65,6 @@ interface BenchmarkArgs {
   symbols?: string[];
 }
 
-const MAX_POSITION_QUOTE_MULTIPLIER = 1;
-
 interface BenchmarkCase {
   label: string;
   algorithm: StrategyAlgorithm;
@@ -86,6 +88,8 @@ interface BenchmarkMetrics {
   returnPct: number;
   netPnl: number;
   maxDrawdownPct: number;
+  maxEntryLeverage: number | undefined;
+  maxEffectiveLeverage: number | undefined;
   tradeCount: number;
   winRate: number;
   riskAdjustedReturn: number | undefined;
@@ -819,7 +823,7 @@ function runBenchmark(
   maxEquityPoints?: number,
   candleRange?: CandleReplayRange,
 ): { label: string; result: BacktestResult; elapsedMs: number } {
-  const maxPositionQuote = options.startingQuote * MAX_POSITION_QUOTE_MULTIPLIER;
+  const maxPositionQuote = options.maxPositionQuote;
   const startedAt = Date.now();
   const candleCount = candleRange
     ? candleRange.endIndex - candleRange.startIndex
@@ -851,6 +855,7 @@ function runBenchmark(
       lockBorrowedLenderCollateral: options.lockBorrowedLenderCollateral,
       borrowerProfitShareToLender: options.borrowerProfitShareToLender,
       maxPositionQuote,
+      minOrderQuote: options.minOrderQuote,
       maxOpenOrders: options.maxOpenOrders,
       cooldownMs: options.cooldownSec * 1000,
       ...benchmarkConfig,
@@ -996,6 +1001,9 @@ function metricsFromResult(result: BacktestResult): BenchmarkMetrics {
     returnPct: summary.returnPct,
     netPnl: summary.netPnl,
     maxDrawdownPct: summary.maxDrawdownPct,
+    maxEntryLeverage: summary.maxEntryLeverage ?? result.finalState.metrics.maxEntryLeverage,
+    maxEffectiveLeverage:
+      summary.maxEffectiveLeverage ?? result.finalState.metrics.maxEffectiveLeverage,
     tradeCount: summary.tradeCount,
     winRate: summary.winRate,
     riskAdjustedReturn: summary.riskAdjustedReturn,
@@ -1279,14 +1287,33 @@ function parseArgs(argv: string[]): BenchmarkArgs {
   const days = parsePositiveInt(values.get("days"), FULL_BTC_CYCLE_DAYS);
   const defaultSyntheticCandles = Math.max(1, Math.ceil((days * DAY_MS) / intervalToMs(interval)));
   const relativeRateEnabled = parseRelativeRateOverride(values);
+  const startingQuote = parsePositiveNumber(values.get("starting-quote"), 10_000);
+  const leverage = parsePositiveNumber(values.get("leverage"), defaultStrategyConfig.maxLeverage);
+  const skipMaxPositionQuoteCap =
+    values.get("skip-max-position-quote-cap") === "true" ||
+    values.get("no-max-position-quote-cap") === "true";
+  const maxPositionQuote = values.has("max-position-quote")
+    ? parsePositiveNumber(
+        values.get("max-position-quote"),
+        defaultStrategyConfig.maxPositionQuote,
+      )
+    : defaultStrategyConfig.maxPositionQuote;
   return {
     mode,
     marketKey: values.get("market-key"),
     symbol: values.get("symbol") ?? "BTCUSDT",
     interval,
     days,
-    startingQuote: parsePositiveNumber(values.get("starting-quote"), 10_000),
-    leverage: parsePositiveNumber(values.get("leverage"), 1),
+    startingQuote,
+    maxPositionQuote: skipMaxPositionQuoteCap
+      ? Number.POSITIVE_INFINITY
+      : maxPositionQuote,
+    skipMaxPositionQuoteCap,
+    leverage,
+    minOrderQuote: parsePositiveNumber(
+      values.get("min-order-quote"),
+      defaultStrategyConfig.minOrderQuote,
+    ),
     shortMarginModel: parseShortMarginModel(
       values.get("short-margin") ?? values.get("short-margin-model"),
     ),
@@ -1611,6 +1638,8 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     "Max DD",
     "Risk Ret",
     "Sharpe",
+    "Max Entry Lev",
+    "Max Eff Lev",
     "Trades",
     "Win Rate",
     "Prof Pos",
@@ -1627,6 +1656,8 @@ function singleBenchmarkTable(rows: SingleBenchmarkRow[]): string {
     `${formatNumber(row.maxDrawdownPct, 2)}%`,
     formatOptionalNumber(row.riskAdjustedReturn, 3),
     formatOptionalNumber(row.sharpeRatio, 3),
+    formatOptionalLeverage(row.maxEntryLeverage),
+    formatOptionalLeverage(row.maxEffectiveLeverage),
     row.tradeCount.toLocaleString(),
     `${formatNumber(row.winRate, 1)}%`,
     `${row.profitableClosedPositionCount.toLocaleString()}/${row.closedPositionCount.toLocaleString()} (${formatNumber(row.profitableClosedPositionRate, 1)}%)`,
@@ -1931,6 +1962,10 @@ function formatOptionalNumber(value: number | undefined, digits: number): string
   return Number.isFinite(value) ? (value as number).toFixed(digits) : "-";
 }
 
+function formatOptionalLeverage(value: number | undefined): string {
+  return Number.isFinite(value) ? `${(value as number).toFixed(3)}x` : "-";
+}
+
 function formatOptionalPercent(
   value: number | undefined,
   digits: number,
@@ -1948,14 +1983,17 @@ function formatOptionalPercent(
 }
 
 function benchmarkCapSummary(options: BenchmarkArgs): string {
-  const configuredCap = options.startingQuote * MAX_POSITION_QUOTE_MULTIPLIER;
+  const configuredCap = options.maxPositionQuote;
   const grossMarginCap = options.startingQuote * options.leverage;
+  const targetCapSummary = Number.isFinite(configuredCap)
+    ? `target cap ${formatMoney(configuredCap)}`
+    : "target cap skipped";
   if (options.shortMarginModel === "futures-margin") {
-    return `target cap ${formatMoney(configuredCap)}, gross margin cap ${formatMoney(grossMarginCap)}`;
+    return `${targetCapSummary}, gross margin cap ${formatMoney(grossMarginCap)}`;
   }
 
   const initialShortDebtCap = options.startingQuote * Math.max(0, options.leverage - 1) * 0.98;
-  return `target cap ${formatMoney(configuredCap)}, initial debt cap ${formatMoney(
+  return `${targetCapSummary}, initial debt cap ${formatMoney(
     Math.min(configuredCap, initialShortDebtCap),
   )}`;
 }

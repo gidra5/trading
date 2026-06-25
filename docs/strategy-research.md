@@ -575,6 +575,37 @@ npm run benchmark:strategies -- --mode days --days 365 --interval 1m --symbol BT
 After relative rates became the default, rerun old absolute-rate baselines with
 `--absolute-rates`.
 
+Previous `$10000`-cap padded-range leverage baseline, captured on 2026-06-25, used
+`maxLeverage = 5`, `maxPositionQuote = 10000`, and the relative-rate detector default. Entry
+leverage is selected from the 1y price range with `3%` padding: long liquidation below
+`1y min * 0.97`, short liquidation above `1y max * 1.03`. The near-edge lifetime branch
+is disabled. `Max Entry Lev` is the highest selected entry leverage on created entry
+orders; `Max Eff Lev` is the highest sampled account effective leverage.
+
+Fixed-window exact runs:
+
+| Window | Interval | Candles | Return | Net PnL | Max DD | Risk Ret | Sharpe | Max Entry Lev | Max Eff Lev | Trades | Win Rate | Prof Pos | Liq Pos | Oracle Ret | Oracle Capture | Reinvest Ret | Reinvest Capture |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 30d | 2026-05-26..2026-06-24 | `42,940` | `48.61%` | `$4861.11` | `0.86%` | `56.684` | `23.731` | `5.000x` | `1.000x` | `5485` | `78.9%` | `537/603 (89.1%)` | `0` | `303.85%` | `15.998%` | `1934.45%` | `2.512919%` |
+| 180d | 2025-12-27..2026-06-24 | `258,940` | `323.70%` | `$32369.79` | `0.67%` | `479.893` | `20.894` | `5.000x` | `1.000x` | `29868` | `81.1%` | `2861/3176 (90.1%)` | `0` | `2528.40%` | `12.803%` | `7.60e+12%` | `0.000000%` |
+| 365d | 2025-06-25..2026-06-24 | `525,340` | `559.16%` | `$55916.39` | `1.24%` | `450.350` | `17.101` | `5.000x` | `1.000x` | `51136` | `81.3%` | `4859/5401 (90.0%)` | `0` | `4046.56%` | `13.818%` | `2.02e+19%` | `0.000000%` |
+
+The 30d and 180d commands were run after `5x` became the benchmark default, but before
+the default position cap changed to `startingQuote * maxLeverage`. To reproduce those
+rows now, add `--max-position-quote 10000`:
+
+```bash
+npm run benchmark:strategies -- --mode days --days 30 --only "Legacy Valley/Peak Long/Short"
+npm run benchmark:strategies -- --mode days --days 180 --only "Legacy Valley/Peak Long/Short"
+```
+
+The 365d row was run with the equivalent explicit flag before the benchmark default was
+updated:
+
+```bash
+npm run benchmark:strategies -- --mode days --days 365 --leverage 5 --only "Legacy Valley/Peak Long/Short"
+```
+
 Random 90d exact rerun, seed `1337`, `48` samples, `90-90` day windows, `1825` day
 lookback, cache span `2021-07-16..2026-06-24`, first sample
 `2022-05-28..2022-08-26`, last sample `2023-10-02..2023-12-31`:
@@ -626,6 +657,58 @@ The higher-sample proxy keeps the same broad ranking as the smaller exact checks
 `L2/S1` remains inferior to the one-hop long-origin variants. The proxy also makes
 the cost of deeper chains clearer: the best-return variants roughly double trade
 count versus `0/0`, and `2/2` is the highest-activity case.
+
+## Skipped Position-Cap Baselines, 2026-06-25
+
+The default position cap was changed to uncapped on 2026-06-25. These rows use exact
+BTCUSDT `1m` candle replays, `futures-margin`, `999/999` borrow depth, borrow lock off,
+lender profit share `1`, open-order cap `1024`, and `300s` cooldown. `Max Eff Lev` is
+account-level gross exposure divided by current equity after mark-to-market. The
+effective leverage cap now force-reduces exposure when mark-to-market drift would push
+the account over the configured max leverage.
+
+Standard capital, default `$5` minimum order, `5x` max leverage, no position cap:
+
+| Window | Return | Net PnL | Max DD | Risk Ret | Sharpe | Max Entry | Max Eff | Trades | Prof Pos | Liq |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7d | `24.12%` | `$2411.79` | `4.61%` | `5.230` | `11.056` | `5.000x` | `5.000x` | `831` | `69/88 (78.4%)` | `0` |
+| 30d | `367.56%` | `$36755.55` | `10.26%` | `35.828` | `15.704` | `5.000x` | `4.993x` | `7259` | `492/644 (76.4%)` | `0` |
+| 90d | `2147.91%` | `$214790.90` | `10.09%` | `212.948` | `14.518` | `5.000x` | `5.000x` | `20746` | `1142/1302 (87.7%)` | `0` |
+| 180d | `9124.22%` | `$912421.87` | `3.38%` | `2696.861` | `14.489` | `5.000x` | `5.000x` | `59620` | `3197/3601 (88.8%)` | `0` |
+| 365d | `16396.91%` | `$1639691.25` | `6.77%` | `2421.286` | `10.359` | `5.000x` | `4.993x` | `104465` | `5410/6089 (88.8%)` | `0` |
+
+Small capital, `$134` starting quote, `$50` minimum order, `5x` max leverage, no
+position cap:
+
+| Window | Return | Net PnL | Max DD | Risk Ret | Sharpe | Max Entry | Max Eff | Trades | Prof Pos | Liq |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7d | `19.08%` | `$25.56` | `5.23%` | `3.646` | `9.449` | `5.000x` | `4.935x` | `93` | `19/27 (70.4%)` | `0` |
+| 30d | `289.88%` | `$388.44` | `13.01%` | `22.287` | `13.729` | `5.000x` | `4.978x` | `802` | `148/214 (69.2%)` | `0` |
+| 180d | `283531.06%` | `$379931.63` | `24.67%` | `11492.184` | `13.238` | `5.000x` | `5.000x` | `24555` | `2001/2431 (82.3%)` | `0` |
+
+Small capital, `$134` starting quote, `$50` minimum order, `100x` max leverage, no
+position cap:
+
+| Window | Return | Net PnL | Max DD | Risk Ret | Sharpe | Max Entry | Max Eff | Trades | Prof Pos | Liq |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7d | `210.65%` | `$282.27` | `20.71%` | `10.170` | `14.177` | `27.164x` | `28.123x` | `235` | `44/47 (93.6%)` | `0` |
+| 30d | `18118.42%` | `$24278.68` | `34.47%` | `525.671` | `15.572` | `26.258x` | `27.645x` | `3392` | `356/410 (86.8%)` | `0` |
+| 90d | `116978.32%` | `$156750.95` | `20.78%` | `5630.115` | `14.528` | `27.345x` | `23.554x` | `12024` | `931/1064 (87.5%)` | `0` |
+| 180d | `680515.10%` | `$911890.24` | `15.75%` | `43210.629` | `11.306` | `26.797x` | `24.285x` | `39631` | `2642/2998 (88.1%)` | `0` |
+| 365d | `1197896.60%` | `$1605181.44` | `27.89%` | `42943.453` | `8.178` | `27.751x` | `26.689x` | `70714` | `4566/5198 (87.8%)` | `0` |
+
+Tiny capital, `$34` starting quote, `$50` minimum order, `100x` max leverage, no
+position cap:
+
+| Window | Return | Net PnL | Max DD | Risk Ret | Sharpe | Max Entry | Max Eff | Trades | Prof Pos | Liq |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7d | `111.60%` | `$37.94` | `21.37%` | `5.222` | `11.089` | `27.164x` | `25.422x` | `98` | `19/26 (73.1%)` | `0` |
+| 30d | `5656.74%` | `$1923.29` | `77.36%` | `73.119` | `9.819` | `26.258x` | `70.038x` | `1281` | `207/260 (79.6%)` | `0` |
+
+With `100x` max leverage the padded-range selector still usually chooses only about
+`26x` to `28x`. Effective leverage can exceed selected entry leverage after
+mark-to-market because account equity changes while exposure remains open; the enforced
+hard cap is the configured max leverage.
 
 The most important next improvement is better signal qualification. The strategy needs
 to know whether a detected valley/peak has enough expected move after costs and fill

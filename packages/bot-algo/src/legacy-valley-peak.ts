@@ -65,11 +65,8 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   exitGridResetMode: "filled-grid",
   rangeLeverageEnabled: true,
   leverageLongTermRangeWindow: "1y",
-  leverageLifetimeDataIndex: 6,
   leverageRangeEdgeFraction: 0.2,
-  leverageExpectedMoveMultiplier: 1.5,
-  leverageMaxEntryLeverage: 1.05,
-  leverageLifetimeMinLeverage: 1.1,
+  leverageLongTermRangePaddingPct: 3,
 };
 
 export const legacyValleyPeakAsymmetricShortFavoringConfig: LegacyValleyPeakConfig = {
@@ -177,29 +174,13 @@ export function createLegacyValleyPeakConfig(
     config.leverageLongTermRangeWindow =
       defaultLegacyValleyPeakConfig.leverageLongTermRangeWindow;
   }
-  config.leverageLifetimeDataIndex = clampInt(
-    config.leverageLifetimeDataIndex,
-    0,
-    rangeCount - 1,
-  );
   config.leverageRangeEdgeFraction = clamp(config.leverageRangeEdgeFraction, 0, 0.49);
-  config.leverageExpectedMoveMultiplier = Math.max(
-    1.000001,
-    config.leverageExpectedMoveMultiplier,
-  );
-  config.leverageMaxEntryLeverage = clamp(
-    isPositiveFinite(config.leverageMaxEntryLeverage)
-      ? config.leverageMaxEntryLeverage
-      : defaultLegacyValleyPeakConfig.leverageMaxEntryLeverage,
-    1,
-    999,
-  );
-  config.leverageLifetimeMinLeverage = clamp(
-    isPositiveFinite(config.leverageLifetimeMinLeverage)
-      ? config.leverageLifetimeMinLeverage
-      : defaultLegacyValleyPeakConfig.leverageLifetimeMinLeverage,
-    1,
-    999,
+  config.leverageLongTermRangePaddingPct = clamp(
+    isPositiveFinite(config.leverageLongTermRangePaddingPct)
+      ? config.leverageLongTermRangePaddingPct
+      : defaultLegacyValleyPeakConfig.leverageLongTermRangePaddingPct,
+    0,
+    100,
   );
   if (
     config.exitGridPositionMode !== "aggregate" &&

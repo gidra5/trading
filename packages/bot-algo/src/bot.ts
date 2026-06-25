@@ -38,14 +38,14 @@ export const defaultStrategyConfig: StrategyConfig = {
   quoteAsset: "USDT",
   algorithm: "legacy-valley-peak",
   startingQuote: 10_000,
-  maxLeverage: 1,
+  maxLeverage: 5,
   shortMarginModel: "futures-margin",
   longBorrowDepth: 999,
   shortBorrowDepth: 999,
   lockBorrowedLenderCollateral: false,
   borrowerProfitShareToLender: 1,
   feeBps: 7.5,
-  maxPositionQuote: 10_000,
+  maxPositionQuote: Number.POSITIVE_INFINITY,
   limitOffsetBps: 2,
   maxOpenOrders: 1024,
   cooldownMs: 300_000,
@@ -166,17 +166,20 @@ const roundQuote = (value: number) => Number(value.toFixed(6));
 const NO_EVENTS: BotEvent[] = [];
 const MIN_BASE_QUANTITY = 0.00000001;
 const LEGACY_EXIT_GRID_REASON = "legacy exit grid";
+const MIN_ENTRY_LEVERAGE = 1;
 
 export function createStrategyConfig(
   overrides: PartialStrategyConfig = {},
 ): StrategyConfig {
+  const startingQuote = overrides.startingQuote ?? defaultStrategyConfig.startingQuote;
+  const maxLeverage = overrides.maxLeverage ?? defaultStrategyConfig.maxLeverage;
   const config: StrategyConfig = {
     symbol: overrides.symbol ?? defaultStrategyConfig.symbol,
     baseAsset: overrides.baseAsset ?? defaultStrategyConfig.baseAsset,
     quoteAsset: overrides.quoteAsset ?? defaultStrategyConfig.quoteAsset,
     algorithm: overrides.algorithm ?? defaultStrategyConfig.algorithm,
-    startingQuote: overrides.startingQuote ?? defaultStrategyConfig.startingQuote,
-    maxLeverage: overrides.maxLeverage ?? defaultStrategyConfig.maxLeverage,
+    startingQuote,
+    maxLeverage,
     shortMarginModel: normalizeShortMarginModel(
       overrides.shortMarginModel ?? defaultStrategyConfig.shortMarginModel,
     ),
@@ -311,6 +314,7 @@ export class SimulatedTradingBot {
 
   markToMarket(): Readonly<BotMetrics> {
     recalculateMetrics(this.state);
+    this.recordEffectiveLeverage();
     return this.state.metrics;
   }
 
@@ -751,9 +755,11 @@ export class SimulatedTradingBot {
     tick.price = price;
     tick.quantity = undefined;
 
+    this.enforceEffectiveLeverageLimit(eventTime, price, false);
     this.cancelStaleOrders(eventTime, false);
     this.fillOpenOrders(tick, false);
     this.applyLotLifecycleControls(tick, false, { fillImmediately: true });
+    this.enforceEffectiveLeverageLimit(eventTime, price, false);
     if (this.liquidateAccountIfNeeded(eventTime, price, false)) {
       return NO_EVENTS;
     }
@@ -1158,6 +1164,12 @@ export class SimulatedTradingBot {
     tick.price = price;
     tick.quantity = quantity;
 
+    if (events) {
+      events.push(...this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents));
+    } else {
+      this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents);
+    }
+
     if (options.processOpenOrders ?? true) {
       if (events) {
         events.push(...this.cancelStaleOrders(eventTime, collectEvents));
@@ -1177,6 +1189,11 @@ export class SimulatedTradingBot {
       this.applyLotLifecycleControls(tick, collectEvents, {
         fillImmediately: !options.deferMarketOrderFills,
       });
+    }
+    if (events) {
+      events.push(...this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents));
+    } else {
+      this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents);
     }
     const liquidated = options.simulateLiquidation
       ? this.liquidateAccountIfNeeded(eventTime, price, collectEvents, events)
@@ -1275,7 +1292,7 @@ export class SimulatedTradingBot {
               tick.eventTime,
               decision.reason,
               decision.quoteSize,
-              this.entryLifecycleFields(longEntryRisk),
+              {},
               longEntryRisk.leverage,
             )
         : decision.quantity * tick.price >= config.minOrderQuote
@@ -1285,7 +1302,7 @@ export class SimulatedTradingBot {
               tick.eventTime,
               decision.reason,
               decision.quoteSize,
-              this.entryLifecycleFields(shortEntryRisk),
+              {},
               shortEntryRisk.leverage,
             );
 
@@ -1435,7 +1452,6 @@ export class SimulatedTradingBot {
           {
             fillImmediately: !options.deferMarketOrderFills,
             targetEntryLeverage: longEntryRisk.leverage,
-            ...this.entryLifecycleFields(longEntryRisk),
           },
         );
         if (result.order) {
@@ -1464,7 +1480,7 @@ export class SimulatedTradingBot {
           tick.eventTime,
           decision.reason,
           decision.quoteSize,
-          this.entryLifecycleFields(longEntryRisk),
+          {},
           longEntryRisk.leverage,
         );
         if (order) {
@@ -1522,7 +1538,6 @@ export class SimulatedTradingBot {
             {
               fillImmediately: !options.deferMarketOrderFills,
               targetEntryLeverage: shortEntryRisk.leverage,
-              ...this.entryLifecycleFields(shortEntryRisk),
             },
           );
           if (result.order) {
@@ -1547,7 +1562,7 @@ export class SimulatedTradingBot {
             tick.eventTime,
             decision.reason,
             decision.quoteSize,
-            this.entryLifecycleFields(shortEntryRisk),
+            {},
             shortEntryRisk.leverage,
           );
           if (order) {
@@ -1628,6 +1643,7 @@ export class SimulatedTradingBot {
     Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
+    this.recordEntryLeverage(targetEntryLeverage);
     return order;
   }
 
@@ -1695,6 +1711,7 @@ export class SimulatedTradingBot {
     Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
+    this.recordEntryLeverage(targetEntryLeverage);
     return order;
   }
 
@@ -1748,6 +1765,9 @@ export class SimulatedTradingBot {
     Object.assign(order, normalizedLotLifecycleFields(options));
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
+    this.recordEntryLeverage(
+      options.targetEntryLeverage ?? this.targetLongEntryLeverage(marketPrice),
+    );
 
     if (options.fillImmediately === false) {
       return {
@@ -1797,6 +1817,9 @@ export class SimulatedTradingBot {
     Object.assign(order, normalizedLotLifecycleFields(options));
     this.state.orders.push(order);
     this.openOrderIndexes.add(index);
+    this.recordEntryLeverage(
+      options.targetEntryLeverage ?? this.targetShortEntryLeverage(marketPrice),
+    );
 
     if (options.fillImmediately === false) {
       return {
@@ -3323,6 +3346,7 @@ export class SimulatedTradingBot {
       const fill = this.fillOrder(order, index, filledAt);
       if (!skipLeverageCheck) {
         this.assertLeverageLimit();
+        this.recordEffectiveLeverage();
       }
       return { fill };
     } catch (error) {
@@ -3520,6 +3544,205 @@ export class SimulatedTradingBot {
     }
     recalculateMetrics(this.state);
     return true;
+  }
+
+  private enforceEffectiveLeverageLimit(
+    at: number,
+    price: number,
+    collectEvents: boolean,
+  ): BotEvent[] {
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+    if (this.state.config.shortMarginModel !== "futures-margin" || price <= 0) {
+      return events ?? NO_EVENTS;
+    }
+
+    const maxLeverage = clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+    if (maxLeverage >= 999) {
+      return events ?? NO_EVENTS;
+    }
+
+    let cancelledOrders = false;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const effectiveLeverage = this.grossExposureLeverage();
+      if (effectiveLeverage <= maxLeverage + 0.0001) {
+        return events ?? NO_EVENTS;
+      }
+
+      const grossExposureQuote = this.marginGrossExposureQuote(price);
+      if (grossExposureQuote <= 0) {
+        return events ?? NO_EVENTS;
+      }
+
+      if (!cancelledOrders) {
+        this.cancelAllOpenOrdersForLeverageLimit(at, events);
+        cancelledOrders = true;
+      }
+
+      const longQuantity = this.activeLongQuantity();
+      const shortQuantity = this.activeShortQuantity();
+      const longExposureQuote = longQuantity * price;
+      const shortExposureQuote = shortQuantity * price;
+      const closeLong =
+        longExposureQuote >= shortExposureQuote
+          ? longQuantity > MIN_BASE_QUANTITY
+          : shortQuantity <= MIN_BASE_QUANTITY;
+      const availableQuantity = closeLong ? longQuantity : shortQuantity;
+      if (availableQuantity <= MIN_BASE_QUANTITY) {
+        return events ?? NO_EVENTS;
+      }
+
+      const closeQuote = Math.min(
+        availableQuantity * price,
+        this.leverageReductionCloseQuote(price, maxLeverage),
+      );
+      const quantity = roundAsset(closeQuote / price);
+      if (quantity <= MIN_BASE_QUANTITY) {
+        return events ?? NO_EVENTS;
+      }
+
+      const event = this.createLeverageReductionMarketOrder(
+        closeLong ? "sell" : "buy",
+        price,
+        quantity,
+        at,
+      );
+      if (event && events) {
+        events.push(event);
+      }
+    }
+
+    this.closeAllExposureForLeverageLimit(at, price, events);
+    this.assertLeverageLimit();
+    return events ?? NO_EVENTS;
+  }
+
+  private leverageReductionCloseQuote(price: number, maxLeverage: number): number {
+    const grossExposureQuote = this.marginGrossExposureQuote(price);
+    const equity = this.equityAt(price);
+    if (grossExposureQuote <= 0) {
+      return 0;
+    }
+    if (equity <= 0) {
+      return grossExposureQuote;
+    }
+
+    const feeRate = this.state.config.feeBps / 10_000;
+    const denominator = Math.max(0.000001, 1 - maxLeverage * feeRate);
+    const excessQuote = (grossExposureQuote - maxLeverage * equity) / denominator;
+    return roundQuote(Math.max(0, excessQuote) * 1.001);
+  }
+
+  private cancelAllOpenOrdersForLeverageLimit(
+    at: number,
+    events: BotEvent[] | undefined,
+  ): void {
+    for (const index of [...this.openOrderIndexes]) {
+      const order = this.state.orders[index];
+      if (order?.status !== "open") {
+        this.openOrderIndexes.delete(index);
+        continue;
+      }
+
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = at;
+      order.updatedAt = at;
+      order.reason = `${order.reason}; leverage limit`;
+      this.openOrderIndexes.delete(index);
+
+      if (events) {
+        events.push({
+          type: "order_cancelled",
+          at,
+          message: `${order.side.toUpperCase()} order cancelled by leverage limit`,
+          order: structuredClone(order),
+        });
+      }
+    }
+  }
+
+  private createLeverageReductionMarketOrder(
+    side: "buy" | "sell",
+    price: number,
+    quantity: number,
+    at: number,
+  ): BotEvent | undefined {
+    const roundedQuantity = roundAsset(quantity);
+    if (roundedQuantity <= MIN_BASE_QUANTITY || price <= 0) {
+      return undefined;
+    }
+
+    const feeRate = this.state.config.feeBps / 10_000;
+    const quoteQuantity = roundQuote(price * roundedQuantity);
+    const estimatedQuoteCost =
+      side === "buy" ? roundQuote(quoteQuantity * (1 + feeRate)) : 0;
+
+    if (side === "buy") {
+      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
+      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    } else {
+      this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
+      this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+    }
+
+    const order = this.buildOrder(
+      side,
+      price,
+      roundedQuantity,
+      estimatedQuoteCost,
+      at,
+      "leverage cap reduction",
+      "market",
+    );
+    order.positionEffect = "close";
+
+    const index = this.state.orders.length;
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(index);
+    const result = this.tryFillOrder(order, index, at, true);
+    if (!result.fill) {
+      return undefined;
+    }
+
+    return {
+      type: "order_filled",
+      at,
+      message: `${side.toUpperCase()} leverage-cap reduction filled at ${price}`,
+      order: structuredClone(this.state.orders[index]),
+      fill: structuredClone(result.fill),
+    };
+  }
+
+  private closeAllExposureForLeverageLimit(
+    at: number,
+    price: number,
+    events: BotEvent[] | undefined,
+  ): void {
+    const longQuantity = this.activeLongQuantity();
+    if (longQuantity > MIN_BASE_QUANTITY) {
+      const event = this.createLeverageReductionMarketOrder(
+        "sell",
+        price,
+        longQuantity,
+        at,
+      );
+      if (event && events) {
+        events.push(event);
+      }
+    }
+
+    const shortQuantity = this.activeShortQuantity();
+    if (shortQuantity > MIN_BASE_QUANTITY) {
+      const event = this.createLeverageReductionMarketOrder(
+        "buy",
+        price,
+        shortQuantity,
+        at,
+      );
+      if (event && events) {
+        events.push(event);
+      }
+    }
   }
 
   private cancelAllOpenOrdersForLiquidation(
@@ -3873,18 +4096,12 @@ export class SimulatedTradingBot {
       };
     }
 
-    const maxEntryLeverage = clamp(
-      Math.min(maxLeverage, cleanPositive(legacyConfig.leverageMaxEntryLeverage) || 1),
-      1,
-      maxLeverage,
-    );
     if (marketPrice <= 0) {
       return {
         side,
         mode: "max",
-        leverage: maxEntryLeverage,
+        leverage: MIN_ENTRY_LEVERAGE,
         maxLeverage,
-        maxEntryLeverage,
       };
     }
 
@@ -3898,43 +4115,32 @@ export class SimulatedTradingBot {
       rangePosition !== undefined &&
       (rangePosition <= legacyConfig.leverageRangeEdgeFraction ||
         rangePosition >= 1 - legacyConfig.leverageRangeEdgeFraction);
-
-    if (nearRangeEdge) {
-      const lifetimeProfile = this.lifetimeEntryRiskProfile(
-        side,
-        marketPrice,
-        maxLeverage,
-        maxEntryLeverage,
-        rangePosition,
-        longTermPoint,
-        nearRangeEdge,
-      );
-      if (lifetimeProfile) {
-        return lifetimeProfile;
-      }
-    }
-
-    const boundaryPrice =
-      side === "long" ? longTermPoint?.minPrice : longTermPoint?.maxPrice;
+    const rangePaddingPct = legacyConfig.leverageLongTermRangePaddingPct;
+    const boundaryPrice = this.paddedLongTermRangeBoundary(
+      side,
+      longTermPoint,
+      rangePaddingPct,
+    );
     const adverseDistance =
       boundaryPrice === undefined
         ? undefined
         : side === "long"
           ? marketPrice - boundaryPrice
           : boundaryPrice - marketPrice;
+    const leverage =
+      adverseDistance === undefined
+        ? MIN_ENTRY_LEVERAGE
+        : adverseDistance > 0
+          ? clamp(marketPrice / adverseDistance, MIN_ENTRY_LEVERAGE, maxLeverage)
+          : maxLeverage;
     return {
       side,
-      mode: "long-term-range",
-      leverage: this.longTermRangeLeverage(
-        side,
-        marketPrice,
-        maxEntryLeverage,
-        longTermPoint,
-      ),
+      mode: "baseline",
+      leverage,
       maxLeverage,
-      maxEntryLeverage,
       rangePosition,
       rangeEdgeFraction: legacyConfig.leverageRangeEdgeFraction,
+      longTermRangePaddingPct: rangePaddingPct,
       nearRangeEdge,
       longTermRangeWindow: legacyConfig.leverageLongTermRangeWindow,
       longTermMinPrice: longTermPoint?.minPrice,
@@ -3947,84 +4153,19 @@ export class SimulatedTradingBot {
     };
   }
 
-  private longTermRangeLeverage(
+  private paddedLongTermRangeBoundary(
     side: PositionLotSide,
-    marketPrice: number,
-    maxEntryLeverage: number,
     range: { minPrice: number; maxPrice: number } | undefined,
-  ): number {
-    if (!range || marketPrice <= 0) {
-      return maxEntryLeverage;
+    paddingPct: number,
+  ): number | undefined {
+    const padding = clamp(paddingPct, 0, 100) / 100;
+    if (side === "long") {
+      const minPrice = range?.minPrice;
+      return isPositiveNumber(minPrice) ? (minPrice ?? 0) * (1 - padding) : undefined;
     }
 
-    const boundaryPrice = side === "long" ? range.minPrice : range.maxPrice;
-    if (!isPositiveNumber(boundaryPrice)) {
-      return maxEntryLeverage;
-    }
-
-    const adverseDistance =
-      side === "long" ? marketPrice - boundaryPrice : boundaryPrice - marketPrice;
-    if (adverseDistance <= 0) {
-      return maxEntryLeverage;
-    }
-
-    return clamp(marketPrice / adverseDistance, 1, maxEntryLeverage);
-  }
-
-  private lifetimeEntryRiskProfile(
-    side: PositionLotSide,
-    marketPrice: number,
-    maxLeverage: number,
-    maxEntryLeverage: number,
-    rangePosition?: number,
-    longTermPoint?: { minPrice: number; maxPrice: number },
-    nearRangeEdge?: boolean,
-  ): EntryRiskProfile | undefined {
-    const legacyConfig = this.state.config.legacyValleyPeak;
-    const rangeSec = legacyConfig.averagingRangesSec[legacyConfig.leverageLifetimeDataIndex];
-    if (!rangeSec || rangeSec <= 0 || marketPrice <= 0) {
-      return undefined;
-    }
-
-    const memory = this.ensureLegacyValleyPeakMemory();
-    const candleRange = memory.candleRanges[legacyConfig.leverageLifetimeDataIndex];
-    const maxMovePct = cleanPositive(candleRange?.points.at(-1)?.maxPct);
-    if (maxMovePct <= 0) {
-      return undefined;
-    }
-
-    const leverage = clamp(
-      100 / (maxMovePct * legacyConfig.leverageExpectedMoveMultiplier),
-      1,
-      maxEntryLeverage,
-    );
-    const lifetimeMinLeverage = clamp(
-      cleanPositive(legacyConfig.leverageLifetimeMinLeverage) || 1,
-      1,
-      maxLeverage,
-    );
-    if (leverage < lifetimeMinLeverage) {
-      return undefined;
-    }
-
-    return {
-      side,
-      mode: "lifetime",
-      leverage,
-      maxLeverage,
-      maxEntryLeverage,
-      lifetimeMinLeverage,
-      lifetimeMs: rangeSec * 1000,
-      rangePosition,
-      rangeEdgeFraction: legacyConfig.leverageRangeEdgeFraction,
-      nearRangeEdge,
-      longTermRangeWindow: legacyConfig.leverageLongTermRangeWindow,
-      longTermMinPrice: longTermPoint?.minPrice,
-      longTermMaxPrice: longTermPoint?.maxPrice,
-      lifetimeWindowSec: rangeSec,
-      expectedMovePct: maxMovePct,
-      expectedMoveMultiplier: legacyConfig.leverageExpectedMoveMultiplier,
-    };
+    const maxPrice = range?.maxPrice;
+    return isPositiveNumber(maxPrice) ? (maxPrice ?? 0) * (1 + padding) : undefined;
   }
 
   private priceRangePosition(
@@ -4041,12 +4182,6 @@ export class SimulatedTradingBot {
     }
 
     return clamp((marketPrice - range.minPrice) / (range.maxPrice - range.minPrice), 0, 1);
-  }
-
-  private entryLifecycleFields(profile: EntryRiskProfile): OrderLifecycleFields {
-    return profile.lifetimeMs && profile.lifetimeMs > 0
-      ? { lifetimeMs: profile.lifetimeMs }
-      : {};
   }
 
   private longEntryBuyingPowerQuote(
@@ -4209,6 +4344,32 @@ export class SimulatedTradingBot {
         `Leverage limit exceeded: ${formatLeverageForError(effectiveLeverage)}x > ${formatLeverageForError(maxLeverage)}x.`,
       );
     }
+  }
+
+  private recordEffectiveLeverage(): void {
+    const leverage =
+      this.state.config.shortMarginModel === "futures-margin"
+        ? this.grossExposureLeverage()
+        : this.estimateDebtLeverage();
+    if (!Number.isFinite(leverage) || leverage <= 0) {
+      return;
+    }
+
+    this.state.metrics.maxEffectiveLeverage = Math.max(
+      this.state.metrics.maxEffectiveLeverage,
+      leverage,
+    );
+  }
+
+  private recordEntryLeverage(leverage: number): void {
+    if (!Number.isFinite(leverage) || leverage <= 0) {
+      return;
+    }
+
+    this.state.metrics.maxEntryLeverage = Math.max(
+      this.state.metrics.maxEntryLeverage,
+      leverage,
+    );
   }
 
   private estimateDebtLeverage(): number {
@@ -4523,6 +4684,8 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
     peakEquity,
     maxDrawdownPct: Math.max(state.metrics?.maxDrawdownPct ?? 0, drawdown),
     exposurePct: equity > 0 ? (exposureValue / equity) * 100 : 0,
+    maxEntryLeverage: state.metrics?.maxEntryLeverage ?? 1,
+    maxEffectiveLeverage: state.metrics?.maxEffectiveLeverage ?? 1,
     avgExitGridSpan:
       exitGridSpanCount > 0
         ? roundQuote((state.exitGridSpanTotal ?? 0) / exitGridSpanCount)
@@ -4589,6 +4752,8 @@ function emptyMetrics(startingQuote: number): BotMetrics {
     peakEquity: startingQuote,
     maxDrawdownPct: 0,
     exposurePct: 0,
+    maxEntryLeverage: 1,
+    maxEffectiveLeverage: 1,
     avgExitGridSpan: 0,
     avgExitGridOrderCount: 0,
     exitGridSpanCount: 0,

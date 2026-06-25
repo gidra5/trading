@@ -107,8 +107,8 @@ npm run benchmark:strategies -- --mode days --days 30 --leverage 1 --only "short
 ```
 
 The script reads local historical candles, runs `legacy-valley-peak` with identical
-starting capital, leverage guard, per-side position cap, fees, limit offset, and
-cooldown, then
+starting capital, leverage guard, optional per-side position cap, fees, limit offset,
+and cooldown, then
 reports return, drawdown, trade count, trade win rate, profitable closed positions,
 liquidated positions, risk-adjusted return, Sharpe, additive perfect-margin return and
 capture, and compounded perfect-margin return and capture. The perfect-margin oracle
@@ -116,8 +116,8 @@ uses configured fees but floors slippage at the default `10bps` assumption so li
 order-book slippage estimates near zero do not make historical oracle returns
 non-comparable.
 The benchmark script defaults to the strict-symmetric `0.35%` anchor assumptions:
-`1x`, `futures-margin`, `999/999` borrow depth, borrow lock off, `300s` cooldown, and a
-per-side position cap equal to starting capital. Fixed historical, synthetic, grid, and
+`5x`, `futures-margin`, `999/999` borrow depth, borrow lock off, `300s` cooldown, and a
+skipped per-side position cap unless `--max-position-quote` is supplied. Fixed historical, synthetic, grid, and
 portfolio checks should generally stay no-leverage first; run paired `1x` and `5x`
 comparisons mainly for random-window validation. The `--only relaxed` comparison includes
 the current relaxed per-lot long/short default, long-only, and short-only variants. Use
