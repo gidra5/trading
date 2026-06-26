@@ -84,6 +84,11 @@ exchange sync so balances, positions, and REST order history stay consistent.
 Server startup runs the same sync so restart recovery restores accepted,
 cancelled, and filled bot exchange orders.
 
+The default legacy per-lot exit-grid strategy can hold local long and short lots at
+the same time. Binance futures one-way position mode cannot represent that state as
+separate reducible legs, so auto-submit should run in Binance hedge mode or use an
+aggregate/net strategy configuration.
+
 When auto-submit is enabled, a fresh or empty local bot state uses the synced
 exchange quote-asset balance as `startingQuote` and initial `quoteFree` instead
 of the static `TRADING_STARTING_QUOTE` fallback. Bot reset follows the same rule

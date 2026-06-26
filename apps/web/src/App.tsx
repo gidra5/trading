@@ -1,4 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { createStore, reconcile, unwrap } from "solid-js/store";
 import {
   Activity,
   ChevronDown,
@@ -87,7 +88,8 @@ const defaultBacktestSettings: BacktestSettings = {
 };
 
 export function App() {
-  const [snapshot, setSnapshot] = createSignal<RuntimeSnapshot>();
+  const [snapshotStore, setSnapshotStore] = createStore<{ snapshot?: RuntimeSnapshot }>({});
+  const snapshot = () => snapshotStore.snapshot;
   const [connection, setConnection] = createSignal<"connecting" | "live" | "offline">(
     "connecting",
   );
@@ -136,7 +138,7 @@ export function App() {
   createEffect(() => {
     const config = bot()?.config;
     if (config && (!configDraft() || configDraft()?.symbol !== config.symbol)) {
-      setConfigDraft(structuredClone(config));
+      setConfigDraft(structuredClone(unwrap(config)));
     }
   });
 
@@ -150,7 +152,7 @@ export function App() {
     }
 
     lastSnapshotSeq = next.snapshotSeq;
-    setSnapshot(next);
+    setSnapshotStore("snapshot", reconcile(next, { merge: true }));
     return true;
   };
 
@@ -1930,11 +1932,11 @@ function DecisionCheck(props: {
         {formatRatePerHour(check()?.primaryRateClamped)}
       </div>
       <div class="mt-1 text-xs text-ink-300">{size()}</div>
-      <div class="mt-2 flex flex-wrap gap-1">
+      <div class="mt-2 grid grid-cols-[repeat(auto-fit,minmax(10rem,1fr))] gap-1">
         <For each={check()?.confirmations ?? []}>
           {(item) => (
             <span
-              class="rounded-2 px-2 py-1 text-xs"
+              class="min-w-0 whitespace-nowrap rounded-2 px-2 py-1 text-center text-xs tabular-nums"
               classList={{
                 "bg-gain/12 text-gain": item.passed,
                 "bg-loss/12 text-loss": !item.passed,

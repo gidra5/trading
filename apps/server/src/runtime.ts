@@ -33,6 +33,7 @@ import {
   type HistoricalBacktestMarket,
 } from "./historical-backtest.js";
 import {
+  BinancePaperOrderSubmissionSkipped,
   BinancePaperTrading,
   type BinancePaperCancelOrderInput,
   type BinancePaperOrder,
@@ -610,6 +611,9 @@ export class TradingRuntime {
         await this.flushState();
         if (options.throwOnFailure) {
           throw error;
+        }
+        if (error instanceof BinancePaperOrderSubmissionSkipped) {
+          continue;
         }
         return;
       }
@@ -1331,6 +1335,19 @@ function futuresAccountDriftMessage(
     return "Exchange account has simultaneous long and short hedge-mode positions that the local net-position guard cannot safely reconcile.";
   }
 
+  if (
+    snapshot.positionMode === "one-way" &&
+    state.config.legacyValleyPeak.exitGridPositionMode === "per-lot"
+  ) {
+    const localLedger = analyzePositions(state);
+    if (
+      hasActivePositionLots(localLedger.longs) &&
+      hasActivePositionLots(localLedger.shorts)
+    ) {
+      return "Local bot has simultaneous long and short per-lot exposure, but the Binance futures account is in one-way position mode. Enable hedge mode or reset to an aggregate/net strategy before auto-submitting orders.";
+    }
+  }
+
   const localBase = roundAssetBalance(state.baseFree + state.baseReserved);
   const exchangeBase = roundAssetBalance(positionProfile.netQuantity);
   if (hasAssetDrift(localBase, exchangeBase)) {
@@ -1361,6 +1378,16 @@ function futuresAccountDriftMessage(
   }
 
   return undefined;
+}
+
+function hasActivePositionLots(
+  lots: Array<{ remainingQuantity: number; status?: string }>,
+): boolean {
+  return lots.some(
+    (lot) =>
+      lot.remainingQuantity > BALANCE_EPSILON &&
+      lot.status !== "closed",
+  );
 }
 
 function exchangeSpotAssetTotal(snapshot: BinancePaperSnapshot, asset: string): number {
@@ -1503,6 +1530,9 @@ function disabledExchangeSnapshot(): BinancePaperSnapshot {
 }
 
 function exchangeSubmitFailureReason(error: unknown): string {
+  if (error instanceof BinancePaperOrderSubmissionSkipped) {
+    return error.message;
+  }
   const message = error instanceof Error ? error.message.trim() : "";
   return message ? `exchange submit failed: ${message}` : "exchange submit failed";
 }
@@ -1530,7 +1560,7 @@ function exchangeReconciliationFromSnapshot(
     quoteQuantity: order.cumulativeQuoteQuantity,
     createdAt: order.createdAt,
     updatedAt: order.updatedAt,
-    positionEffect: order.reduceOnly ? "close" as const : undefined,
+    positionEffect: futuresExchangeOrderPositionEffect(order),
     reason: `exchange order ${order.status}`,
   }));
 
@@ -1551,7 +1581,9 @@ function exchangeReconciliationFromSnapshot(
         realizedPnl: trade.realizedPnl,
         filledAt: trade.time,
         reason: "exchange fill",
-        positionEffect: order?.reduceOnly ? "close" as const : undefined,
+        positionEffect: order
+          ? futuresExchangeOrderPositionEffect(order)
+          : futuresPositionEffectFromFields(trade.side, false, trade.positionSide),
       };
     });
 
@@ -1582,6 +1614,35 @@ function normalizeOptionalPositiveNumber(
 
 function normalizeExchangeSide(side: string): "buy" | "sell" {
   return side.toUpperCase() === "SELL" ? "sell" : "buy";
+}
+
+function futuresExchangeOrderPositionEffect(
+  order: BinancePaperOrder,
+): "open" | "close" | undefined {
+  return futuresPositionEffectFromFields(
+    normalizeExchangeSide(order.side),
+    order.reduceOnly === true,
+    order.positionSide,
+  );
+}
+
+function futuresPositionEffectFromFields(
+  side: "buy" | "sell",
+  reduceOnly: boolean,
+  positionSide: string | undefined,
+): "open" | "close" | undefined {
+  if (reduceOnly) {
+    return "close";
+  }
+
+  const normalizedPositionSide = (positionSide ?? "").toUpperCase();
+  if (normalizedPositionSide === "LONG") {
+    return side === "buy" ? "open" : "close";
+  }
+  if (normalizedPositionSide === "SHORT") {
+    return side === "sell" ? "open" : "close";
+  }
+  return undefined;
 }
 
 function normalizeExchangeType(type: string): "limit" | "market" {

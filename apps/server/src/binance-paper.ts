@@ -171,6 +171,15 @@ export interface BinancePaperCancelOrderInput {
   clientOrderId?: string;
 }
 
+export class BinancePaperOrderSubmissionSkipped extends Error {
+  readonly recoverable = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "BinancePaperOrderSubmissionSkipped";
+  }
+}
+
 export type BinancePaperStreamEnvironment =
   | "live"
   | "spot-testnet"
@@ -493,6 +502,10 @@ export class BinancePaperTrading {
         ? undefined
         : futuresPositionSideForBotOrder(order);
 
+    if (environment.product !== "spot" && order.positionEffect === "close") {
+      await this.assertReducibleFuturesPosition(environment, market, order);
+    }
+
     return this.placeOrder(market, {
       symbol: market.symbol,
       side: order.side,
@@ -504,6 +517,40 @@ export class BinancePaperTrading {
       positionSide,
       clientOrderId: clientOrderIdForBotOrder(order.id),
     });
+  }
+
+  private async assertReducibleFuturesPosition(
+    environment: ResolvedPaperEnvironment,
+    market: BinanceMarketListing,
+    order: TradingOrder,
+  ): Promise<void> {
+    const positionMode = await this.fetchPositionMode(environment);
+    const snapshot = await this.latestSnapshotForSubmission(environment, market);
+    const availableQuantity = reducibleFuturesQuantityForOrder(
+      snapshot,
+      order,
+      positionMode,
+    );
+    const tolerance = Math.max(0.00000001, order.quantity * 0.000001);
+    if (order.quantity <= availableQuantity + tolerance) {
+      return;
+    }
+
+    const targetSide = order.side === "buy" ? "short" : "long";
+    throw new BinancePaperOrderSubmissionSkipped(
+      `Binance paper submit skipped: ${order.side.toUpperCase()} close order ${order.id} requires ${formatQuantity(order.quantity)} ${market.baseAsset}, but only ${formatQuantity(availableQuantity)} ${targetSide} ${market.baseAsset} is reducible after open close orders.`,
+    );
+  }
+
+  private async latestSnapshotForSubmission(
+    environment: ResolvedPaperEnvironment,
+    market: BinanceMarketListing,
+  ): Promise<BinancePaperSnapshot> {
+    const cached = this.snapshots.get(snapshotKey(environment, market.symbol));
+    if (cached?.connected) {
+      return cached;
+    }
+    return this.sync(market);
   }
 
   async cancelOrder(
@@ -1277,6 +1324,90 @@ function futuresPositionSideForBotOrder(
   return undefined;
 }
 
+function reducibleFuturesQuantityForOrder(
+  snapshot: BinancePaperSnapshot,
+  order: TradingOrder,
+  positionMode: BinancePaperPositionMode | undefined,
+): number {
+  const mode = positionMode ?? snapshot.positionMode ?? "one-way";
+  const positionQuantity = futuresPositionQuantityForClose(snapshot, order, mode);
+  const openCloseQuantity = openFuturesCloseOrderQuantity(snapshot, order, mode);
+  return Math.max(0, positionQuantity - openCloseQuantity);
+}
+
+function futuresPositionQuantityForClose(
+  snapshot: BinancePaperSnapshot,
+  order: TradingOrder,
+  positionMode: BinancePaperPositionMode,
+): number {
+  let quantity = 0;
+  for (const position of snapshot.positions) {
+    const positionSide = stringValue(position.positionSide).toUpperCase();
+    const positionAmt = position.positionAmt;
+    if (positionMode === "hedge") {
+      if (order.side === "buy" && positionSide === "SHORT") {
+        quantity += Math.abs(positionAmt);
+      } else if (order.side === "sell" && positionSide === "LONG") {
+        quantity += Math.abs(positionAmt);
+      }
+      continue;
+    }
+
+    if (order.side === "buy" && positionAmt < 0) {
+      quantity += -positionAmt;
+    } else if (order.side === "sell" && positionAmt > 0) {
+      quantity += positionAmt;
+    }
+  }
+  return quantity;
+}
+
+function openFuturesCloseOrderQuantity(
+  snapshot: BinancePaperSnapshot,
+  order: TradingOrder,
+  positionMode: BinancePaperPositionMode,
+): number {
+  let quantity = 0;
+  for (const openOrder of snapshot.openOrders) {
+    if (!isOpenFuturesCloseOrderForSide(openOrder, order.side, positionMode)) {
+      continue;
+    }
+    quantity += Math.max(0, openOrder.originalQuantity - openOrder.executedQuantity);
+  }
+  return quantity;
+}
+
+function isOpenFuturesCloseOrderForSide(
+  order: BinancePaperOrder,
+  side: TradingOrder["side"],
+  positionMode: BinancePaperPositionMode,
+): boolean {
+  const orderSide = normalizeOrderSide(order.side);
+  if (orderSide !== side) {
+    return false;
+  }
+  if (positionMode === "hedge") {
+    const positionSide = stringValue(order.positionSide).toUpperCase();
+    return (
+      order.reduceOnly === true ||
+      (orderSide === "buy" && positionSide === "SHORT") ||
+      (orderSide === "sell" && positionSide === "LONG")
+    );
+  }
+  return order.reduceOnly === true;
+}
+
+function normalizeOrderSide(side: string): TradingOrder["side"] {
+  return side.toUpperCase() === "SELL" ? "sell" : "buy";
+}
+
+function formatQuantity(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+  return Number(value.toFixed(8)).toString();
+}
+
 function orderParams(
   environment: ResolvedPaperEnvironment,
   symbol: string,
@@ -1589,6 +1720,25 @@ function tradeSide(item: Record<string, unknown>): "buy" | "sell" {
   return booleanValue(item.isBuyer) ? "buy" : "sell";
 }
 
+function futuresPositionEffectFromFields(
+  side: "buy" | "sell",
+  reduceOnly: boolean,
+  positionSide: string | undefined,
+): "open" | "close" | undefined {
+  if (reduceOnly) {
+    return "close";
+  }
+
+  const normalizedPositionSide = stringValue(positionSide).toUpperCase();
+  if (normalizedPositionSide === "LONG") {
+    return side === "buy" ? "open" : "close";
+  }
+  if (normalizedPositionSide === "SHORT") {
+    return side === "sell" ? "open" : "close";
+  }
+  return undefined;
+}
+
 function futuresReconciliationFromUserDataEvent(
   market: BinanceMarketListing,
   payload: unknown,
@@ -1617,8 +1767,9 @@ function futuresReconciliationFromUserDataEvent(
   const orderPrice = numberValue(order.ap) || numberValue(order.p) || numberValue(order.L);
   const filledQuantity = numberValue(order.z);
   const quoteQuantity = orderPrice > 0 ? orderPrice * filledQuantity : undefined;
-  const reduceOnly = booleanValue(order.R);
-  const positionEffect = reduceOnly ? "close" as const : undefined;
+  const reduceOnly = booleanValue(order.R) === true;
+  const positionSide = stringValue(order.ps);
+  const positionEffect = futuresPositionEffectFromFields(side, reduceOnly, positionSide);
   const orders = [{
     localOrderId,
     externalOrderId,
