@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import {
   SimulatedTradingBot,
   analyzePositions,
@@ -52,6 +54,8 @@ const ASSET_DRIFT_TOLERANCE_RATE = 0.0001;
 const MIN_ASSET_DRIFT_TOLERANCE = 0.00000001;
 const QUOTE_DRIFT_TOLERANCE_RATE = 0.001;
 const MIN_QUOTE_DRIFT_TOLERANCE = 2;
+const FUTURES_UNRELIABLE_MARK_EQUITY_DRIFT_TOLERANCE_RATE = 0.001;
+const EXCHANGE_ACCOUNT_GUARD_SETTLEMENT_GRACE_MS = 15_000;
 
 interface BacktestStartOptions {
   preset: BacktestPreset;
@@ -114,8 +118,10 @@ export class TradingRuntime {
   private backtest: BacktestProgressSnapshot = createIdleBacktest();
   private backtestAbort?: AbortController;
   private exchangeAccountWarningMessage?: string;
+  private lastExchangeExecutionAt = 0;
   private historicalWarmupGeneration = 0;
   private historicalWarmupPromise?: Promise<void>;
+  private botOperationQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private storage: TradingStorage,
@@ -196,23 +202,25 @@ export class TradingRuntime {
   }
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
-    const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
-    if (
-      exchangeDriven &&
-      this.exchangeAccountGuard.hardStop &&
-      this.exchangeAccountWarningMessage
-    ) {
-      return [];
-    }
+    return this.withBotOperation(async () => {
+      const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+      if (
+        exchangeDriven &&
+        this.exchangeAccountGuard.hardStop &&
+        this.exchangeAccountWarningMessage
+      ) {
+        return [];
+      }
 
-    const events = this.bot.onTick(tick, {
-      processOpenOrders: !exchangeDriven,
-      deferMarketOrderFills: exchangeDriven,
+      const events = this.bot.onTick(tick, {
+        processOpenOrders: !exchangeDriven,
+        deferMarketOrderFills: exchangeDriven,
+      });
+      await this.submitCreatedOrdersToPaperExchange(events);
+      this.recordEvents(events);
+      this.scheduleStateSave();
+      return events;
     });
-    await this.submitCreatedOrdersToPaperExchange(events);
-    this.recordEvents(events);
-    this.scheduleStateSave();
-    return events;
   }
 
   async handleCandle(candle: Candle): Promise<void> {
@@ -233,30 +241,33 @@ export class TradingRuntime {
   }
 
   async handleExchangeUserData(payload: unknown): Promise<BotEvent[]> {
-    if (!this.paperTrading) {
-      return [];
-    }
+    return this.withBotOperation(async () => {
+      if (!this.paperTrading) {
+        return [];
+      }
 
-    const events: BotEvent[] = [];
-    const reconciliation = this.paperTrading.reconciliationFromUserDataEvent(
-      this.market,
-      payload,
-    );
-    if (hasExchangeReconciliationUpdates(reconciliation)) {
-      const directEvents = this.bot.applyExchangeReconciliation(reconciliation);
-      this.recordEvents(directEvents);
-      events.push(...directEvents);
-      await this.flushState();
-    }
+      const events: BotEvent[] = [];
+      const reconciliation = this.paperTrading.reconciliationFromUserDataEvent(
+        this.market,
+        payload,
+      );
+      if (hasExchangeReconciliationUpdates(reconciliation)) {
+        const directEvents = this.bot.applyExchangeReconciliation(reconciliation);
+        this.noteExchangeExecutions(directEvents);
+        this.recordEvents(directEvents);
+        events.push(...directEvents);
+        await this.flushState();
+      }
 
-    try {
-      const snapshot = await this.paperTrading.sync(this.market);
-      events.push(...(await this.applyExchangeSnapshot(snapshot)));
-    } catch {
+      try {
+        const snapshot = await this.paperTrading.sync(this.market);
+        events.push(...(await this.applyExchangeSnapshot(snapshot)));
+      } catch {
+        return events;
+      }
+
       return events;
-    }
-
-    return events;
+    });
   }
 
   snapshot(): RuntimeSnapshot {
@@ -303,6 +314,11 @@ export class TradingRuntime {
   }
 
   async resetBot(): Promise<BotEvent[]> {
+    return this.withBotOperation(() => this.resetBotUnlocked());
+  }
+
+  private async resetBotUnlocked(): Promise<BotEvent[]> {
+    const previousStatus = this.bot.view().status;
     const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
     const exchangeDrivesExecution = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
     this.exchangeAccountWarningMessage = undefined;
@@ -324,6 +340,11 @@ export class TradingRuntime {
     }
 
     const events = this.bot.reset(this.config);
+    this.warmupBotFromRecentCandles();
+    this.startHistoricalWarmup();
+    if (previousStatus === "stopped") {
+      events.push(...this.bot.setStatus("stopped"));
+    }
     this.recordEvents(events);
     await this.flushState();
     if (resetSnapshot) {
@@ -333,6 +354,12 @@ export class TradingRuntime {
   }
 
   async closePositions(
+    options: { includeUnprofitable?: boolean } = {},
+  ): Promise<BotEvent[]> {
+    return this.withBotOperation(() => this.closePositionsUnlocked(options));
+  }
+
+  private async closePositionsUnlocked(
     options: { includeUnprofitable?: boolean } = {},
   ): Promise<BotEvent[]> {
     const at = Date.now();
@@ -353,8 +380,10 @@ export class TradingRuntime {
 
     if (exchangeCanSubmit) {
       if (options.includeUnprofitable) {
-        this.recordEvents(events);
         const snapshot = await this.paperTrading!.closeOpenPositions(this.market, options);
+        events.push(...this.closePositionsLocally(options, at));
+        events.push(...this.resetFlatBotFromExchangeSnapshot(snapshot));
+        this.recordEvents(events);
         await this.applyExchangeSnapshot(snapshot);
         await this.flushState();
         return events;
@@ -379,6 +408,11 @@ export class TradingRuntime {
   }
 
   async updateBotConfig(patch: PartialStrategyConfig): Promise<BotEvent[]> {
+    return this.withBotOperation(() => this.updateBotConfigUnlocked(patch));
+  }
+
+  private async updateBotConfigUnlocked(patch: PartialStrategyConfig): Promise<BotEvent[]> {
+    const previousStatus = this.bot.view().status;
     this.config = applyMarketMaxLeverage(
       createStrategyConfig({
         ...this.config,
@@ -398,6 +432,11 @@ export class TradingRuntime {
       this.market.maxLeverage,
     );
     const events = this.bot.reset(this.config);
+    this.warmupBotFromRecentCandles();
+    this.startHistoricalWarmup();
+    if (previousStatus === "stopped") {
+      events.push(...this.bot.setStatus("stopped"));
+    }
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -576,6 +615,21 @@ export class TradingRuntime {
     }, 2_000);
   }
 
+  private async withBotOperation<T>(operation: () => Promise<T> | T): Promise<T> {
+    const previous = this.botOperationQueue;
+    let release!: () => void;
+    this.botOperationQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   private recordEvents(events: BotEvent[]): void {
     if (events.length === 0) {
       return;
@@ -673,6 +727,50 @@ export class TradingRuntime {
         }, at),
       );
     }
+    if (options.includeUnprofitable) {
+      events.push(...this.closeResidualBaseLocally(price, reason, at));
+    }
+    return events;
+  }
+
+  private closeResidualBaseLocally(
+    price: number,
+    reason: string,
+    at: number,
+  ): BotEvent[] {
+    const state = this.bot.snapshot();
+    const residualBase = roundAssetBalance(state.baseFree + state.baseReserved);
+    if (Math.abs(residualBase) <= BALANCE_EPSILON) {
+      return [];
+    }
+
+    return this.bot.recordManualTrade({
+      side: residualBase > 0 ? "sell" : "buy",
+      price,
+      quantity: Math.abs(residualBase),
+      positionEffect: "close",
+      reason: `${reason} residual settlement`,
+    }, at);
+  }
+
+  private resetFlatBotFromExchangeSnapshot(snapshot: BinancePaperSnapshot): BotEvent[] {
+    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+      return [];
+    }
+    if (hasExchangeOpenOrdersOrPositions(snapshot)) {
+      return [];
+    }
+
+    const startingQuote = exchangeQuoteBalance(snapshot, this.market);
+    if (startingQuote === undefined) {
+      return [];
+    }
+
+    this.config = this.createMarketConfig(undefined, startingQuote);
+    const events = this.bot.reset(this.config);
+    this.warmupBotFromRecentCandles();
+    this.startHistoricalWarmup();
+    events.push(...this.bot.setStatus("stopped"));
     return events;
   }
 
@@ -827,8 +925,21 @@ export class TradingRuntime {
 
     const endTime = Date.now();
     const startTime = endTime - requiredCandles * intervalMs;
+    const legacyCandles = await readLegacyHistoricalCandles(
+      this.historicalCache.dataDir,
+      market.symbol,
+      this.interval,
+      startTime,
+      endTime,
+    );
+    const legacyMergedCandles = mergeWarmupCandles(legacyCandles, storedCandles);
+    const legacySpan = candleSpanMs(legacyMergedCandles);
+    if (legacySpan >= warmupMs) {
+      return legacyMergedCandles;
+    }
+
     if (!isHistoricalVenue(market.venue)) {
-      return storedCandles;
+      return legacyMergedCandles.length > 0 ? legacyMergedCandles : storedCandles;
     }
     const venue = market.venue;
 
@@ -860,9 +971,10 @@ export class TradingRuntime {
         candles.push(...batch.filter((candle) => candle.closed));
       }
 
-      return candles.length > 0 ? candles : storedCandles;
+      const merged = mergeWarmupCandles(candles, legacyMergedCandles);
+      return merged.length > 0 ? merged : storedCandles;
     } catch {
-      return storedCandles;
+      return legacyMergedCandles.length > 0 ? legacyMergedCandles : storedCandles;
     }
   }
 
@@ -875,7 +987,9 @@ export class TradingRuntime {
       (reconciliation.orders?.length ?? 0) > 0 ||
       (reconciliation.fills?.length ?? 0) > 0
     ) {
-      events.push(...this.bot.applyExchangeReconciliation(reconciliation));
+      const reconciliationEvents = this.bot.applyExchangeReconciliation(reconciliation);
+      this.noteExchangeExecutions(reconciliationEvents);
+      events.push(...reconciliationEvents);
     }
 
     events.push(...this.applyExchangeAccountGuard(snapshot));
@@ -894,6 +1008,9 @@ export class TradingRuntime {
       snapshot,
       this.market,
       this.bot.snapshot(),
+      {
+        suppressTransientFuturesDrift: this.isExchangeSettlementGraceActive(),
+      },
     );
     if (!driftMessage) {
       this.exchangeAccountWarningMessage = undefined;
@@ -935,6 +1052,16 @@ export class TradingRuntime {
         state: this.bot.snapshot(),
       },
     ];
+  }
+
+  private noteExchangeExecutions(events: readonly BotEvent[]): void {
+    if (events.some((event) => event.type === "order_filled")) {
+      this.lastExchangeExecutionAt = Date.now();
+    }
+  }
+
+  private isExchangeSettlementGraceActive(): boolean {
+    return Date.now() - this.lastExchangeExecutionAt <= EXCHANGE_ACCOUNT_GUARD_SETTLEMENT_GRACE_MS;
   }
 
   private publicExchangeSnapshot(): BinancePaperSnapshot {
@@ -1240,6 +1367,13 @@ function hasExchangeMarketExposure(
   );
 }
 
+function hasExchangeOpenOrdersOrPositions(snapshot: BinancePaperSnapshot): boolean {
+  return (
+    snapshot.openOrders.length > 0 ||
+    snapshot.positions.some((position) => Math.abs(finiteOrZero(position.positionAmt)) > BALANCE_EPSILON)
+  );
+}
+
 function exchangeQuoteBalance(
   snapshot: BinancePaperSnapshot | undefined,
   market: BinanceMarketListing,
@@ -1278,6 +1412,7 @@ function exchangeAccountDriftMessage(
   snapshot: BinancePaperSnapshot,
   market: BinanceMarketListing,
   state: PaperBotState,
+  options: { suppressTransientFuturesDrift?: boolean } = {},
 ): string | undefined {
   const localOrderIds = new Set(state.orders.map((order) => order.id));
   const unmanagedOrder = snapshot.openOrders.find((order) => !order.localOrderId);
@@ -1296,7 +1431,7 @@ function exchangeAccountDriftMessage(
     return spotAccountDriftMessage(snapshot, market, state);
   }
   if (market.venue === "usdm-futures" || market.venue === "coinm-futures") {
-    return futuresAccountDriftMessage(snapshot, market, state);
+    return futuresAccountDriftMessage(snapshot, market, state, options);
   }
 
   return undefined;
@@ -1326,6 +1461,7 @@ function futuresAccountDriftMessage(
   snapshot: BinancePaperSnapshot,
   market: BinanceMarketListing,
   state: PaperBotState,
+  options: { suppressTransientFuturesDrift?: boolean } = {},
 ): string | undefined {
   const positionProfile = futuresPositionProfile(snapshot);
   if (
@@ -1348,9 +1484,13 @@ function futuresAccountDriftMessage(
     }
   }
 
+  if (options.suppressTransientFuturesDrift) {
+    return undefined;
+  }
+
   const localBase = roundAssetBalance(state.baseFree + state.baseReserved);
   const exchangeBase = roundAssetBalance(positionProfile.netQuantity);
-  if (hasAssetDrift(localBase, exchangeBase)) {
+  if (Math.abs(localBase - exchangeBase) > futuresAssetDriftTolerance(snapshot, exchangeBase)) {
     return `${market.baseAsset} futures position drift: local ${localBase}, exchange ${exchangeBase}.`;
   }
 
@@ -1364,7 +1504,13 @@ function futuresAccountDriftMessage(
     const localEquity = roundQuoteBalance(
       state.quoteFree + state.quoteReserved + localBase * markPrice,
     );
-    if (hasQuoteDrift(localEquity, exchangeEquity)) {
+    const tolerance = futuresEquityDriftTolerance(
+      exchangeEquity,
+      localBase,
+      markPrice,
+      positionProfile.markPrice > 0,
+    );
+    if (Math.abs(localEquity - exchangeEquity) > tolerance) {
       return `${market.quoteAsset} equity drift: local ${localEquity}, exchange ${exchangeEquity}.`;
     }
   }
@@ -1487,8 +1633,37 @@ function quoteDriftTolerance(reference: number): number {
   return Math.max(MIN_QUOTE_DRIFT_TOLERANCE, Math.abs(reference) * QUOTE_DRIFT_TOLERANCE_RATE);
 }
 
+function futuresEquityDriftTolerance(
+  exchangeEquity: number,
+  localBase: number,
+  markPrice: number,
+  hasReliableExchangeMarkPrice: boolean,
+): number {
+  const baseTolerance = quoteDriftTolerance(exchangeEquity);
+  if (hasReliableExchangeMarkPrice || Math.abs(localBase) <= MIN_ASSET_DRIFT_TOLERANCE) {
+    return baseTolerance;
+  }
+
+  const openNotional = Math.abs(localBase * markPrice);
+  return Math.max(
+    baseTolerance,
+    openNotional * FUTURES_UNRELIABLE_MARK_EQUITY_DRIFT_TOLERANCE_RATE,
+  );
+}
+
 function assetDriftTolerance(reference: number): number {
   return Math.max(MIN_ASSET_DRIFT_TOLERANCE, Math.abs(reference) * ASSET_DRIFT_TOLERANCE_RATE);
+}
+
+function futuresAssetDriftTolerance(
+  snapshot: BinancePaperSnapshot,
+  reference: number,
+): number {
+  return Math.max(
+    assetDriftTolerance(reference),
+    finiteOrZero(snapshot.symbolFilters?.stepSize),
+    finiteOrZero(snapshot.symbolFilters?.marketStepSize),
+  );
 }
 
 function firstFiniteNumber(...values: Array<number | undefined>): number | undefined {
@@ -1547,22 +1722,52 @@ function exchangeReconciliationFromSnapshot(
     }
   }
 
-  const orders = [...orderById.values()].map((order) => ({
-    localOrderId: order.localOrderId,
-    externalOrderId: order.orderId,
-    clientOrderId: order.clientOrderId,
-    side: normalizeExchangeSide(order.side),
-    type: normalizeExchangeType(order.type),
-    status: normalizeExchangeOrderStatus(order.status),
-    price: order.avgPrice || order.price,
-    quantity: order.originalQuantity,
-    filledQuantity: order.executedQuantity,
-    quoteQuantity: order.cumulativeQuoteQuantity,
-    createdAt: order.createdAt,
-    updatedAt: order.updatedAt,
-    positionEffect: futuresExchangeOrderPositionEffect(order),
-    reason: `exchange order ${order.status}`,
-  }));
+  const tradeQuantityByOrderId = new Map<string, { quantity: number; quoteQuantity: number }>();
+  for (const trade of snapshot.recentTrades) {
+    if (!trade.localOrderId) {
+      continue;
+    }
+    const current = tradeQuantityByOrderId.get(trade.orderId) ?? {
+      quantity: 0,
+      quoteQuantity: 0,
+    };
+    current.quantity += trade.quantity;
+    current.quoteQuantity += trade.quoteQuantity;
+    tradeQuantityByOrderId.set(trade.orderId, current);
+  }
+
+  const orders = [...orderById.values()].map((order) => {
+    const tradeTotals = tradeQuantityByOrderId.get(order.orderId);
+    const filledQuantity = Math.min(
+      order.executedQuantity,
+      tradeTotals?.quantity ?? 0,
+    );
+    const status =
+      order.executedQuantity > filledQuantity + 0.00000001
+        ? "open"
+        : normalizeExchangeOrderStatus(order.status);
+    const averageTradePrice =
+      tradeTotals && tradeTotals.quantity > 0
+        ? tradeTotals.quoteQuantity / tradeTotals.quantity
+        : undefined;
+
+    return {
+      localOrderId: order.localOrderId,
+      externalOrderId: order.orderId,
+      clientOrderId: order.clientOrderId,
+      side: normalizeExchangeSide(order.side),
+      type: normalizeExchangeType(order.type),
+      status,
+      price: averageTradePrice || order.avgPrice || order.price,
+      quantity: order.originalQuantity,
+      filledQuantity,
+      quoteQuantity: tradeTotals?.quoteQuantity,
+      createdAt: order.createdAt,
+      updatedAt: order.updatedAt,
+      positionEffect: futuresExchangeOrderPositionEffect(order),
+      reason: `exchange order ${order.status}`,
+    };
+  });
 
   const fills = snapshot.recentTrades
     .filter((trade) => trade.localOrderId)
@@ -1844,6 +2049,75 @@ function mergeWarmupCandles(
     }
   }
   return [...byOpenTime.values()].sort((left, right) => left.openTime - right.openTime);
+}
+
+async function readLegacyHistoricalCandles(
+  dataDir: string,
+  symbol: string,
+  interval: string,
+  startTime: number,
+  endTime: number,
+): Promise<Candle[]> {
+  const root = path.join(
+    dataDir,
+    "historical",
+    safeHistoricalPathPart(symbol),
+    safeHistoricalPathPart(interval),
+  );
+  let files: string[];
+  try {
+    files = await fs.readdir(root);
+  } catch {
+    return [];
+  }
+
+  const candles: Candle[] = [];
+  for (const file of files.sort()) {
+    if (!file.endsWith(".jsonl")) {
+      continue;
+    }
+    const filePath = path.join(root, file);
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, "utf8");
+    } catch {
+      continue;
+    }
+
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      try {
+        const candle = JSON.parse(trimmed) as Candle;
+        if (
+          candle.closed &&
+          candle.interval === interval &&
+          candle.symbol.toUpperCase() === symbol.toUpperCase() &&
+          candle.openTime >= startTime &&
+          candle.closeTime <= endTime
+        ) {
+          candles.push(candle);
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return candles.sort((left, right) => left.openTime - right.openTime);
+}
+
+function candleSpanMs(candles: readonly Candle[]): number {
+  if (candles.length === 0) {
+    return 0;
+  }
+  return candles.at(-1)!.closeTime - candles[0].openTime;
+}
+
+function safeHistoricalPathPart(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
 }
 
 function upsertCandle(candles: Candle[], candle: Candle, maxCandles: number): void {

@@ -549,7 +549,7 @@ export class SimulatedTradingBot {
       const quoteQuantity = roundQuote(price * quantity);
       const feeQuote = roundQuote(quoteQuantity * feeRate);
       const reason = input.reason?.trim() || "manual position fill";
-      const orderId = `ord_${this.nextSequence().toString().padStart(6, "0")}`;
+      const orderId = `ord_${orderRunId(this.state.createdAt)}_${this.nextSequence().toString().padStart(6, "0")}`;
       let realizedPnl = 0;
       const opensPosition = positionEffect === "open";
 
@@ -624,7 +624,7 @@ export class SimulatedTradingBot {
         manual: true,
       };
       const fill: TradeFill = {
-        id: `fill_${this.nextSequence().toString().padStart(6, "0")}`,
+        id: `fill_${orderRunId(this.state.createdAt)}_${this.nextSequence().toString().padStart(6, "0")}`,
         orderId,
         side: input.side,
         price: roundQuote(price),
