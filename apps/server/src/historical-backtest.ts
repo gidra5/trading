@@ -86,6 +86,7 @@ export interface HistoricalBacktestOptions {
   interval: string;
   config: StrategyConfig;
   cache: HistoricalCacheOptions;
+  historicalStartTime?: number;
   historicalRangeMs?: number;
   randomSampleCount?: number;
   randomWindowMs?: number;
@@ -194,6 +195,7 @@ export async function runHistoricalCandleBacktest(
 
   const targetEndTime = Date.now();
   const intervalMs = intervalToMs(options.interval);
+  const configuredStartTime = Number(options.historicalStartTime);
   const durationMs =
     options.preset === "last-x"
       ? normalizeDurationMs(
@@ -202,7 +204,15 @@ export async function runHistoricalCandleBacktest(
           intervalMs,
         )
       : periodDurations[options.preset];
-  const targetStartTime = targetEndTime - durationMs;
+  const fallbackStartTime = targetEndTime - durationMs;
+  const explicitStartTime =
+    Number.isFinite(configuredStartTime) && configuredStartTime > 0
+      ? configuredStartTime
+      : undefined;
+  const targetStartTime =
+    explicitStartTime && explicitStartTime < targetEndTime
+      ? explicitStartTime
+      : fallbackStartTime;
 
   return runHistoricalRangeBacktest(
     {
@@ -987,6 +997,7 @@ function buildRandomAggregateResult(input: {
       returnPct: result.summary.returnPct,
       riskAdjustedReturn: result.summary.riskAdjustedReturn,
       sharpeRatio: result.summary.sharpeRatio,
+      backtestSharpeRatio: result.summary.backtestSharpeRatio,
       netPnlPerDay: rate.netPnlPerDay,
       returnPctPerDay: rate.returnPctPerDay,
       perfectMarginLeverage: result.summary.perfectMarginLeverage,
@@ -1031,6 +1042,9 @@ function buildRandomAggregateResult(input: {
     .filter((value): value is number => Number.isFinite(value));
   const sharpeRatioValues = samples
     .map((sample) => sample.sharpeRatio)
+    .filter((value): value is number => Number.isFinite(value));
+  const backtestSharpeRatioValues = samples
+    .map((sample) => sample.backtestSharpeRatio)
     .filter((value): value is number => Number.isFinite(value));
   const netPnlPerDayValues = samples.map((sample) => sample.netPnlPerDay);
   const returnPctPerDayValues = samples.map((sample) => sample.returnPctPerDay);
@@ -1120,6 +1134,10 @@ function buildRandomAggregateResult(input: {
       riskAdjustedReturn:
         riskAdjustedReturnValues.length > 0 ? average(riskAdjustedReturnValues) : undefined,
       sharpeRatio: sharpeRatioValues.length > 0 ? average(sharpeRatioValues) : undefined,
+      backtestSharpeRatio:
+        backtestSharpeRatioValues.length > 0
+          ? average(backtestSharpeRatioValues)
+          : undefined,
       maxDrawdownPct: metrics.maxDrawdownPct,
       maxEntryLeverage: metrics.maxEntryLeverage,
       maxEffectiveLeverage: metrics.maxEffectiveLeverage,

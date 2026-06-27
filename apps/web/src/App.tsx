@@ -26,6 +26,7 @@ import type {
   ManualTradeInput,
   PositionLedger,
   ShortPositionLot,
+  EquityPoint,
   StrategyConfig,
   TradeFill,
   TradingOrder,
@@ -55,6 +56,7 @@ import type {
 } from "./types";
 
 const apiBase =
+  window.runtimeConfig.apiBase ??
   import.meta.env.VITE_API_URL ??
   (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
 const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
@@ -62,6 +64,8 @@ const buttonBaseClass =
   "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
 const buttonPrimaryClass =
   `${buttonBaseClass} border border-accent bg-accent text-ink-950 shadow-[0_10px_24px_rgba(56,189,248,0.18)] hover:bg-accent/88 focus-visible:ring-accent/55`;
+const buttonPanelClass =
+  `${buttonBaseClass} border border-line bg-ink-800 text-ink-100 hover:bg-ink-700 focus-visible:ring-ink-600/55`;
 const buttonDangerClass =
   `${buttonBaseClass} border border-loss/55 bg-loss/14 text-loss hover:border-loss hover:bg-loss/22 focus-visible:ring-loss/40`;
 
@@ -90,6 +94,7 @@ const defaultBacktestSettings: BacktestSettings = {
 export function App() {
   const [snapshotStore, setSnapshotStore] = createStore<{ snapshot?: RuntimeSnapshot }>({});
   const snapshot = () => snapshotStore.snapshot;
+  const [now, setNow] = createSignal(Date.now());
   const [connection, setConnection] = createSignal<"connecting" | "live" | "offline">(
     "connecting",
   );
@@ -111,6 +116,7 @@ export function App() {
   const [correlationError, setCorrelationError] = createSignal<string>();
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
+  let runClockTimer: number | undefined;
   let requestedCorrelationMarketId: string | undefined;
   let lastSnapshotSource: string | undefined;
   let lastSnapshotSeq = 0;
@@ -134,6 +140,22 @@ export function App() {
           Math.abs(summary.shortQuantity) > 0.00000001),
     );
   });
+  const botRunStartedAt = createMemo(() => {
+    if (bot()?.status !== "running") {
+      return undefined;
+    }
+    return bot()?.runStartedAt ?? bot()?.createdAt;
+  });
+  const botRunDurationMs = createMemo(() => {
+    const startedAt = botRunStartedAt();
+    if (!startedAt) {
+      return undefined;
+    }
+    const elapsed = now() - startedAt;
+    return elapsed > 0 ? elapsed : 0;
+  });
+  const liveEquityCurve = () => snapshot()?.equityCurve ?? [];
+  const isBotRunning = () => bot()?.status === "running";
 
   createEffect(() => {
     const config = bot()?.config;
@@ -260,13 +282,14 @@ export function App() {
     }
   };
 
-  const runBacktest = async () => {
+  const runBacktest = async (historicalStartTime?: number) => {
     setBacktestError(undefined);
     const preset = backtestPreset();
     const settings = backtestSettings();
     const body: {
       preset: BacktestSelection;
       limit: number;
+      historicalStartTime?: number;
       historicalDays?: number;
       randomSampleCount?: number;
       randomWindowDays?: number;
@@ -296,6 +319,9 @@ export function App() {
       body.randomMaxWindowDays = settings.randomMaxWindowDays;
       body.randomLookbackDays = settings.randomLookbackDays;
       body.randomPairCount = settings.randomPairCount;
+    }
+    if (historicalStartTime && historicalStartTime > 0) {
+      body.historicalStartTime = historicalStartTime;
     }
 
     const response = await fetch(`${apiBase}/api/backtest`, {
@@ -514,12 +540,16 @@ export function App() {
       setMarketError(error instanceof Error ? error.message : "Market list request failed"),
     );
     connect();
+    runClockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
   });
 
   onCleanup(() => {
     socket?.close();
     if (reconnectTimer) {
       window.clearTimeout(reconnectTimer);
+    }
+    if (runClockTimer) {
+      window.clearInterval(runClockTimer);
     }
   });
 
@@ -550,6 +580,13 @@ export function App() {
               />
               <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
             </div>
+            <Show when={isBotRunning()} fallback={<div class="text-sm text-ink-400">Bot stopped</div>}>
+              <div class="text-sm text-ink-300">
+                Start: {formatDateTime(botRunStartedAt())}
+                <span class="mx-2">·</span>
+                Duration: {formatDuration(botRunDurationMs())}
+              </div>
+            </Show>
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
@@ -676,16 +713,21 @@ export function App() {
           onRecordTrade={recordManualTrade}
         />
 
-        <BacktestPanel
-          preset={backtestPreset()}
-          onPresetChange={setBacktestPreset}
-          settings={backtestSettings()}
-          onSettingChange={updateBacktestSetting}
-          progress={backtest()}
-          error={backtestError()}
-          onRun={() => void runBacktest()}
-          onStop={() => void stopBacktest()}
-        />
+        <section class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
+          <BacktestPanel
+            preset={backtestPreset()}
+            onPresetChange={setBacktestPreset}
+            settings={backtestSettings()}
+            onSettingChange={updateBacktestSetting}
+            progress={backtest()}
+            error={backtestError()}
+            liveStartAt={botRunStartedAt()}
+            onRun={() => void runBacktest()}
+            onRunFromLiveStart={() => void runBacktest(botRunStartedAt())}
+            onStop={() => void stopBacktest()}
+          />
+          <LiveEquityPanel points={liveEquityCurve()} />
+        </section>
       </div>
     </main>
   );
@@ -1702,6 +1744,22 @@ function PerformancePanel(props: { snapshot?: RuntimeSnapshot }) {
   );
 }
 
+function LiveEquityPanel(props: { points: EquityPoint[] }) {
+  return (
+    <div class="panel">
+      <div class="mb-3 flex items-center justify-between">
+        <div>
+          <div class="muted-label">Live Performance</div>
+          <h2 class="text-lg font-semibold">Equity Curve</h2>
+        </div>
+      </div>
+      <div class="h-48">
+        <EquityChart points={props.points} emptyText="No live equity samples yet" />
+      </div>
+    </div>
+  );
+}
+
 function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
   const debug = () => props.bot?.memory.legacyValleyPeakDebug;
   const roleAverages = () =>
@@ -2391,8 +2449,8 @@ function PositionLedgerPanel(props: {
   onRecordTrade: (input: ManualTradeInput) => Promise<boolean>;
 }) {
   const summary = () => props.ledger?.summary;
-  const longs = () => props.ledger?.longs ?? [];
-  const shorts = () => props.ledger?.shorts ?? [];
+  const longs = () => (props.ledger?.longs ?? []).filter((lot) => lot.status !== "closed");
+  const shorts = () => (props.ledger?.shorts ?? []).filter((lot) => lot.status !== "closed");
   const [draft, setDraft] = createSignal<ManualTradeDraft>();
   const [submitting, setSubmitting] = createSignal(false);
   const [lotViewMode, setLotViewMode] = createSignal<LotViewMode>("tables");
@@ -3390,7 +3448,9 @@ function BacktestPanel(props: {
   ) => void;
   progress?: BacktestProgressSnapshot;
   error?: string;
+  liveStartAt?: number;
   onRun: () => void;
+  onRunFromLiveStart: () => void;
   onStop: () => void;
 }) {
   const result = () => props.progress?.result;
@@ -3414,6 +3474,14 @@ function BacktestPanel(props: {
     cacheProgressPercent() !== undefined &&
     cacheFetchedCandles() < cacheMissCandles();
   const error = () => props.error ?? props.progress?.error;
+  const canRunFromLiveStart = () =>
+    Boolean(
+      props.liveStartAt &&
+        (props.preset === "last-x" ||
+          props.preset === "week" ||
+          props.preset === "month" ||
+          props.preset === "year"),
+    );
   const processedLabel = () => {
     const processed = props.progress?.processedCandles ?? summary()?.candlesProcessed ?? 0;
     const estimated = props.progress?.estimatedCandles ?? 0;
@@ -3430,6 +3498,20 @@ function BacktestPanel(props: {
           <h2 class="text-lg font-semibold">Market Replay</h2>
         </div>
         <div class="flex flex-wrap gap-2">
+          <button
+            class={buttonPanelClass}
+            disabled={isRunning() || !canRunFromLiveStart()}
+            onClick={props.onRunFromLiveStart}
+            title={
+              canRunFromLiveStart()
+                ? "Run from live bot start date to now"
+                : "Enable with a live bot and Last X / week / month / year preset"
+            }
+            type="button"
+          >
+            <Play size={16} />
+            From Live Start
+          </button>
           <select
             class="rounded-2 border border-line bg-ink-800 px-3 py-2 text-sm text-ink-100"
             value={props.preset}
@@ -3617,7 +3699,11 @@ function BacktestPanel(props: {
             value={formatPercent(props.progress?.returnPct ?? summary()?.returnPct)}
           />
           <SmallMetric label="Risk Ret" value={formatRatio(summary()?.riskAdjustedReturn)} />
-          <SmallMetric label="Sharpe" value={formatRatio(summary()?.sharpeRatio)} />
+          <SmallMetric label="Sharpe (Annual)" value={formatRatio(summary()?.sharpeRatio)} />
+          <SmallMetric
+            label="Sharpe (BT Length)"
+            value={formatRatio(summary()?.backtestSharpeRatio)}
+          />
           <SmallMetric
             label="Perfect Ret"
             value={formatPercent(summary()?.perfectMarginReturnPct)}
@@ -3639,8 +3725,8 @@ function BacktestPanel(props: {
             value={formatPercent(summary()?.perfectMarginCompoundedCapturePct)}
           />
           <SmallMetric
-            label="Bench Lev"
-            value={formatLeverage(summary()?.perfectMarginLeverage)}
+            label="Max Acct Lev"
+            value={formatLeverage(summary()?.maxEffectiveLeverage ?? summary()?.perfectMarginLeverage)}
           />
           <SmallMetric label="Trades" value={formatQuote(summary()?.tradeCount, 0)} />
           <SmallMetric label="Win Rate" value={formatPercent(summary()?.winRate)} />

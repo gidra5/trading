@@ -267,6 +267,7 @@ export function createInitialBotState(
     sequence: 0,
     createdAt: now,
     updatedAt: now,
+    runStartedAt: now,
     realizedPnl: 0,
     feesPaid: 0,
     exitGridSpanTotal: 0,
@@ -343,11 +344,18 @@ export class SimulatedTradingBot {
 
   setStatus(status: BotStatus, at = Date.now()): BotEvent[] {
     if (this.state.status === status) {
+      if (status === "running" && !isPositiveNumber(this.state.runStartedAt)) {
+        this.state.runStartedAt = at;
+        this.state.updatedAt = at;
+      }
       return [];
     }
 
     this.state.status = status;
     this.state.updatedAt = at;
+    if (status === "running") {
+      this.state.runStartedAt = at;
+    }
     return [
       {
         type: "status_changed",
@@ -4626,6 +4634,9 @@ function normalizeLoadedState(
   normalized.winningTrades ??= 0;
   normalized.losingTrades ??= 0;
   normalized.sequence ??= normalized.orders.length + normalized.fills.length;
+  normalized.runStartedAt = isPositiveNumber(normalized.runStartedAt)
+    ? normalized.runStartedAt
+    : normalized.createdAt;
   return recalculateMetrics(normalized);
 }
 

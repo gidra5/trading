@@ -3,6 +3,7 @@
 - portfolio management experiments: initial strategy-portfolio harness exists; still need cached multi-symbol data for inverse-vol allocation, correlation-cluster caps, volatility-targeted leverage, market-neutral pairs, robust min-variance baskets, turnover-aware rebalancing, funding-aware overlays, and stress-mode deleveraging. Details are in docs/strategy-research.md and docs/experiment-plan.md.
 - randomized model. lets say we look at the price according to some poisson process. At each observation we decide one of the following - open new long/short position, close existing position, or do nothing. We should pick the action based on which will yield best change in equity or break-even price.
 
+- error when using prod tokens: Binance market request failed: HTTP 401 {"code":-1002,"msg":"You are not authorized to execute this request."}
 - add prediction market support
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
@@ -14,7 +15,33 @@
 
 - avoid position drift by using the actual order results from binance - how much was actually sold and bought and use that as ground truth. Ideally in live run we should use binance account info, position info, order info, etc, as the source of truth. that should make sure that there is no drift possible.
 - as base for extrema pick sma window in which there is enough movement on average to get over round trip cost (buy-sell fees).
+
+1. use simple `dS_m=(p_t-p_{t-m})/m` and `dS_m^2=(p_t-p_{t-m}-(p_{t-1}-p_{t-m-1}))/m` to get sma first and second derivatives
+2. anticipate the extrema for early entry. the extrema will happen at least half window size in future.
+3. use derivatives to estimate order of SMAs with `d_{m,n}=(m-n)/2*dS_m+m(m-n)/6*dS_m^2`.
+4. Measure entry error. We can see good entries post fact and compare with actual entries. We can probably get this by using shifted SMAs by half window. We may compute it incrementally during the run. Explore ways to improve entry time.
+5. Treat strategy as a derivative. Given some bot executing a strategy, track proportion of investment that it makes - what part of its leveraged equity invested where. Run another bot that monitors that proportion and can accept its own initial equity, that will be invested proportionally to the initial strategy, or even against it. This basically defines an investable derivative over which we can run another bot. Investing in that derivative proportionally invests it into the asset, and realising profit proportionally reduces the investment.
+6. Portfolio trading. We can borrow from other asset positions internally. This incurs conversion cost that should be accounted the same way fees are, but double since it is double converted.
+7.  Get assets sorted by 24h abs change, volume/market cap, and keep portfolio consisting of best 10 entries
+8.  Look for negatively correlated assets with good sharpe and mix to improve overall sharpe. Leverage the better one to keep profits?
+9.  Exit signal should be more permissive/absolute?
   
+add a button to run the backtest from live bot start date to now.
+
+Simulation and live trading mismatch
+Simulation says we should already have 16% profit, but we only have 2%. The trades roughly match but maybe there were more in the simulation than or live, or they were having different size. Run live bot, record enough activity to reproduce in a backtest, compare with simulation on the same interval.
+
+Hedge mode reconcile warning
+
+Half the confirmation windows
+equal sigmas
+for Long Range Bounds use largest suitable candle width instead of 1m granularity
+try ema instead of sma
+
+Can lender position close before the borrower?
+
+Before transitioning trend to sideways we wait until rate crosses 0. Then if it gets through either rate threshold or absolute threshold relative to point when we entered sideways trend, then we transition into directional trend. The qbs threshold is about the size of fees
+
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
   - the optimal strategy will maximize utility from peaks and valleys, while avoiding loosing too much profit on fees.

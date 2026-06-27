@@ -267,6 +267,7 @@ server.post("/api/backtest", async (request, reply) => {
     preset?: BacktestPreset;
     source?: "candles" | "orderbook-mid";
     limit?: number;
+    historicalStartTime?: number;
     startingQuote?: number;
     historicalDays?: number;
     randomSampleCount?: number;
@@ -293,6 +294,10 @@ server.post("/api/backtest", async (request, reply) => {
     runtime.startBacktest({
       preset,
       limit: clampInt(Number(body.limit ?? 1_000), 10, 10_000),
+      historicalStartTime:
+        body.historicalStartTime === undefined || !Number.isFinite(Number(body.historicalStartTime))
+          ? undefined
+          : Number(body.historicalStartTime),
       startingQuote: body.startingQuote,
       historicalDays:
         body.historicalDays === undefined

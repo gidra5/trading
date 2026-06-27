@@ -4,6 +4,9 @@ import UnoCSS from "unocss/vite";
 
 export default defineConfig({
   plugins: [solid(), UnoCSS()],
+  build: {
+    target: "esnext",
+  },
   server: {
     port: 5173,
     proxy: {

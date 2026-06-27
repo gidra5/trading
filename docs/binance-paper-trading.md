@@ -131,3 +131,19 @@ optional web ui for it:
 ```bash
 npm run dev -w @trading/web
 ```
+
+prod:
+```bash
+BINANCE_API_KEY=... \
+BINANCE_API_SECRET=... \
+TRADING_MARKET_ID=usdm-futures:SOLUSDT \
+TRADING_SHORT_MARGIN_MODEL=futures-margin \
+TRADING_MAX_LEVERAGE=100 \
+TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP=false \
+TRADING_STARTING_QUOTE=50 \
+PORT=3002 \
+pm2 start npm --name trading-server-prod -- start -w @trading/server
+pm2 start npm --name trading-web-prod -- start -w @trading/web -- --host 0.0.0.0 --port 4173
+
+VITE_API_URL=http://207.180.247.128:3002 npm run build -w @trading/web
+```

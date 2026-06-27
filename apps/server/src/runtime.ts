@@ -19,6 +19,7 @@ import {
   type PartialStrategyConfig,
   type PaperBotState,
   type PriceTick,
+  type EquityPoint,
   type PositionLedger,
   type StrategyMemory,
   type StrategyConfig,
@@ -56,10 +57,13 @@ const QUOTE_DRIFT_TOLERANCE_RATE = 0.001;
 const MIN_QUOTE_DRIFT_TOLERANCE = 2;
 const FUTURES_UNRELIABLE_MARK_EQUITY_DRIFT_TOLERANCE_RATE = 0.001;
 const EXCHANGE_ACCOUNT_GUARD_SETTLEMENT_GRACE_MS = 15_000;
+const LIVE_EQUITY_CURVE_CAP = 1_200;
+const LIVE_EQUITY_SAMPLE_MIN_SPACING_MS = 500;
 
 interface BacktestStartOptions {
   preset: BacktestPreset;
   limit: number;
+  historicalStartTime?: number;
   startingQuote?: number;
   historicalDays?: number;
   randomSampleCount?: number;
@@ -93,6 +97,7 @@ export interface RuntimeSnapshot {
   positions: PositionLedger;
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
+  equityCurve: EquityPoint[];
   exchange: BinancePaperSnapshot;
 }
 
@@ -122,6 +127,8 @@ export class TradingRuntime {
   private historicalWarmupGeneration = 0;
   private historicalWarmupPromise?: Promise<void>;
   private botOperationQueue: Promise<void> = Promise.resolve();
+  private liveEquityCurve: EquityPoint[] = [];
+  private lastLiveEquitySampleAt = 0;
 
   constructor(
     private storage: TradingStorage,
@@ -155,6 +162,7 @@ export class TradingRuntime {
     this.warmupBotFromRecentCandles(initialState);
     this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
+    this.recordLiveEquity(Date.now());
   }
 
   async switchMarket(
@@ -170,6 +178,8 @@ export class TradingRuntime {
     this.recentEvents = [];
     this.lastSavedOrderBookAt = 0;
     this.exchangeAccountWarningMessage = undefined;
+    this.liveEquityCurve = [];
+    this.lastLiveEquitySampleAt = 0;
     this.backtestAbort?.abort();
     this.backtestAbort = undefined;
     this.backtest = createIdleBacktest();
@@ -195,6 +205,7 @@ export class TradingRuntime {
     this.warmupBotFromRecentCandles(initialState);
     this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
+    this.recordLiveEquity(Date.now());
   }
 
   handleStatus(status: MarketStreamStatus): void {
@@ -218,6 +229,7 @@ export class TradingRuntime {
       });
       await this.submitCreatedOrdersToPaperExchange(events);
       this.recordEvents(events);
+      this.recordLiveEquity(tick.eventTime);
       this.scheduleStateSave();
       return events;
     });
@@ -263,6 +275,9 @@ export class TradingRuntime {
         const snapshot = await this.paperTrading.sync(this.market);
         events.push(...(await this.applyExchangeSnapshot(snapshot)));
       } catch {
+        if (events.length > 0) {
+          this.recordLiveEquity(Date.now());
+        }
         return events;
       }
 
@@ -295,12 +310,21 @@ export class TradingRuntime {
       positions: analyzePositions(bot as PaperBotState),
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
+      equityCurve: this.liveEquityCurve,
       exchange: this.publicExchangeSnapshot(),
     };
   }
 
   async startBot(): Promise<BotEvent[]> {
+    const wasStopped = this.bot.view().status !== "running";
+    if (wasStopped) {
+      this.liveEquityCurve = [];
+      this.lastLiveEquitySampleAt = 0;
+    }
     const events = this.bot.setStatus("running");
+    if (wasStopped) {
+      this.recordLiveEquity(Date.now(), this.bot.snapshot(), true);
+    }
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -318,6 +342,8 @@ export class TradingRuntime {
   }
 
   private async resetBotUnlocked(): Promise<BotEvent[]> {
+    this.liveEquityCurve = [];
+    this.lastLiveEquitySampleAt = 0;
     const previousStatus = this.bot.view().status;
     const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
     const exchangeDrivesExecution = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
@@ -636,6 +662,45 @@ export class TradingRuntime {
     }
 
     this.recentEvents = [...events.map(compactPublicEvent), ...this.recentEvents].slice(0, 60);
+  }
+
+  private recordLiveEquity(
+    time: number,
+    state: PaperBotState = this.bot.snapshot(),
+    force = false,
+  ): void {
+    if (!Number.isFinite(time)) {
+      return;
+    }
+
+    const equity = state.metrics.equity;
+    const price = state.lastPrice;
+    if (!Number.isFinite(equity) || !Number.isFinite(price)) {
+      return;
+    }
+    if (state.status !== "running") {
+      return;
+    }
+
+    if (!force && this.lastLiveEquitySampleAt > 0) {
+      if (time - this.lastLiveEquitySampleAt < LIVE_EQUITY_SAMPLE_MIN_SPACING_MS) {
+        return;
+      }
+    }
+
+    const point: EquityPoint = { time, equity, price };
+    const lastPoint = this.liveEquityCurve.at(-1);
+    if (lastPoint && lastPoint.time === time) {
+      this.liveEquityCurve[this.liveEquityCurve.length - 1] = point;
+    } else {
+      this.liveEquityCurve.push(point);
+    }
+
+    if (this.liveEquityCurve.length > LIVE_EQUITY_CURVE_CAP) {
+      this.liveEquityCurve = this.liveEquityCurve.slice(-LIVE_EQUITY_CURVE_CAP);
+    }
+
+    this.lastLiveEquitySampleAt = time;
   }
 
   private async submitCreatedOrdersToPaperExchange(
@@ -993,6 +1058,7 @@ export class TradingRuntime {
     }
 
     events.push(...this.applyExchangeAccountGuard(snapshot));
+    this.recordLiveEquity(Date.now());
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -1230,6 +1296,7 @@ export class TradingRuntime {
           interval: this.interval,
           config,
           cache: this.historicalCache,
+          historicalStartTime: options.historicalStartTime,
           historicalRangeMs:
             options.historicalDays === undefined
               ? undefined
@@ -1964,6 +2031,7 @@ function compactPublicMemory(
       : undefined,
   };
 }
+
 
 function compactPublicOrders(orders: readonly TradingOrder[]): readonly TradingOrder[] {
   const recentStart = Math.max(0, orders.length - PUBLIC_ORDER_LIMIT);

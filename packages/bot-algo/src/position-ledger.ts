@@ -163,7 +163,7 @@ export function analyzePositions(
   }
 
   for (const order of state.orders) {
-    if (order.status === "open") {
+    if (order.status === "open" && order.positionEffect !== "close") {
       appendPendingOrderLot(order, state.config.feeBps / 10_000, context, longs, shorts);
     }
   }

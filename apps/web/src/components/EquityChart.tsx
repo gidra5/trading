@@ -4,6 +4,7 @@ import { formatQuote } from "../format";
 
 interface EquityChartProps {
   points: EquityPoint[];
+  emptyText?: string;
 }
 
 export function EquityChart(props: EquityChartProps) {
@@ -35,7 +36,7 @@ export function EquityChart(props: EquityChartProps) {
       ctx.fillStyle = "#aeb6c8";
       ctx.font = "13px Inter, sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("No backtest result", width / 2, height / 2);
+      ctx.fillText(props.emptyText ?? "No equity history yet", width / 2, height / 2);
       return;
     }
 

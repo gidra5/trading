@@ -4,6 +4,7 @@ import type {
   BotEvent,
   Candle,
   OrderBookSnapshot,
+  EquityPoint,
   PaperBotState,
   PositionLedger,
 } from "@trading/bot-algo";
@@ -94,6 +95,7 @@ export interface RuntimeSnapshot {
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
   correlations: CorrelationSnapshot;
+  equityCurve: EquityPoint[];
   exchange: BinancePaperSnapshot;
 }
 

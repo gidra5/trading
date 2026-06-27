@@ -507,6 +507,7 @@ export interface PaperBotState {
   sequence: number;
   createdAt: number;
   updatedAt: number;
+  runStartedAt: number;
   realizedPnl: number;
   feesPaid: number;
   exitGridSpanTotal: number;
@@ -694,6 +695,7 @@ export interface BacktestSummary {
   returnPct: number;
   riskAdjustedReturn?: number;
   sharpeRatio?: number;
+  backtestSharpeRatio?: number;
   maxDrawdownPct: number;
   maxEntryLeverage?: number;
   maxEffectiveLeverage?: number;
@@ -720,6 +722,7 @@ export interface BacktestSampleSummary {
   returnPct: number;
   riskAdjustedReturn?: number;
   sharpeRatio?: number;
+  backtestSharpeRatio?: number;
   netPnlPerDay: number;
   returnPctPerDay: number;
   perfectMarginLeverage?: number;
