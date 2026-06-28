@@ -7,7 +7,7 @@ import { App } from "./App";
 declare global {
   interface Window {
     runtimeConfig: {
-      apiBase?: string;
+      apiUrl?: string;
     };
   }
 }

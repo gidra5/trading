@@ -56,7 +56,7 @@ import type {
 } from "./types";
 
 const apiBase =
-  window.runtimeConfig.apiBase ??
+  window.runtimeConfig.apiUrl ??
   import.meta.env.VITE_API_URL ??
   (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
 const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
