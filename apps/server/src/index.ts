@@ -439,7 +439,12 @@ function normalizeExchangeOrderInput(
   input: BinancePaperPlaceOrderInput,
 ): BinancePaperPlaceOrderInput {
   const side = input.side === "sell" ? "sell" : "buy";
-  const type = input.type === "market" ? "market" : "limit";
+  const type =
+    input.type === "market"
+      ? "market"
+      : input.type === "stop-market"
+        ? "stop-market"
+        : "limit";
   const quantity = Number(input.quantity);
   if (!Number.isFinite(quantity) || quantity <= 0) {
     throw new Error("Positive order quantity is required.");
@@ -448,13 +453,23 @@ function normalizeExchangeOrderInput(
   if (type === "limit" && (!Number.isFinite(price) || (price as number) <= 0)) {
     throw new Error("Positive limit order price is required.");
   }
+  const stopPrice =
+    input.stopPrice === undefined
+      ? type === "stop-market"
+        ? price
+        : undefined
+      : Number(input.stopPrice);
+  if (type === "stop-market" && (!Number.isFinite(stopPrice) || (stopPrice as number) <= 0)) {
+    throw new Error("Positive stop-market stop price is required.");
+  }
   return {
     ...input,
     side,
     type,
     quantity,
-    price,
-    timeInForce: input.timeInForce ?? "GTC",
+    price: type === "limit" ? price : undefined,
+    stopPrice,
+    timeInForce: type === "limit" ? input.timeInForce ?? "GTC" : undefined,
   };
 }
 

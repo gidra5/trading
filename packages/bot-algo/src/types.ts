@@ -4,13 +4,15 @@ export type OrderSide = "buy" | "sell";
 
 export type OrderStatus = "open" | "filled" | "cancelled";
 
-export type OrderType = "limit" | "market";
+export type OrderType = "limit" | "market" | "stop-market";
 
 export type BotSignal = "buy" | "sell" | "hold";
 
 export type StrategyAlgorithm = "legacy-valley-peak";
 
 export type ShortMarginModel = "spot-borrow" | "futures-margin";
+
+export type InternalBorrowAccounting = "principal" | "pnl-only";
 
 export type BacktestPreset =
   | "saved-candles"
@@ -91,6 +93,7 @@ export interface StrategyConfig {
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
+  internalBorrowAccounting: InternalBorrowAccounting;
   lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   feeBps: number;
@@ -111,7 +114,6 @@ export interface PositionRiskConfig {
   upperBaselinePrice: number;
   maxLossPct: number;
   marketSlippageBps: number;
-  quantityFloor: number;
 }
 
 export interface LegacyValleyPeakConfig {
@@ -354,6 +356,7 @@ export interface LegacyExitGridMemory {
   gridPeakPrice: number;
   troughPrice?: number;
   gridTroughPrice?: number;
+  resetPrice?: number;
   gridCreatedAt?: number;
   gridOrderIds: string[];
 }
@@ -490,12 +493,22 @@ export interface BotMetrics {
   exitGridSpanCount: number;
 }
 
-export interface PaperBotState {
+export interface BotCoreState {
   id: string;
   status: BotStatus;
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
+  lastPrice: number;
+  sequence: number;
+  createdAt: number;
+  updatedAt: number;
+  runStartedAt: number;
+  memory: StrategyMemory;
+  config: StrategyConfig;
+}
+
+export interface PaperBotState extends BotCoreState {
   startingQuote: number;
   quoteFree: number;
   quoteReserved: number;
@@ -503,11 +516,6 @@ export interface PaperBotState {
   baseReserved: number;
   avgEntryPrice: number;
   avgShortEntryPrice: number;
-  lastPrice: number;
-  sequence: number;
-  createdAt: number;
-  updatedAt: number;
-  runStartedAt: number;
   realizedPnl: number;
   feesPaid: number;
   exitGridSpanTotal: number;
@@ -517,9 +525,7 @@ export interface PaperBotState {
   losingTrades: number;
   orders: TradingOrder[];
   fills: TradeFill[];
-  memory: StrategyMemory;
   metrics: BotMetrics;
-  config: StrategyConfig;
 }
 
 export type PositionLotSide = "long" | "short";
@@ -559,6 +565,7 @@ export interface PositionLotBase {
 export interface LongPositionLot extends PositionLotBase {
   side: "long";
   costQuote: number;
+  lentQuantity: number;
   remainingQuantity: number;
   remainingCostQuote: number;
   breakEvenSellPrice: number;
@@ -574,6 +581,7 @@ export interface LongPositionLot extends PositionLotBase {
 export interface ShortPositionLot extends PositionLotBase {
   side: "short";
   proceedsQuote: number;
+  lentQuote: number;
   remainingQuantity: number;
   remainingProceedsQuote: number;
   breakEvenBuyPrice: number;

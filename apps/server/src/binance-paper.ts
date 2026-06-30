@@ -53,10 +53,12 @@ export interface BinancePaperOrder {
   orderId: string;
   clientOrderId: string;
   localOrderId?: string;
+  algo?: boolean;
   side: string;
   type: string;
   status: string;
   price: number;
+  stopPrice?: number;
   originalQuantity: number;
   executedQuantity: number;
   cumulativeQuoteQuantity?: number;
@@ -156,9 +158,10 @@ export interface BinancePaperUserDataStreamStatus {
 export interface BinancePaperPlaceOrderInput {
   symbol?: string;
   side: "buy" | "sell";
-  type: "limit" | "market";
+  type: "limit" | "market" | "stop-market";
   quantity: number;
   price?: number;
+  stopPrice?: number;
   timeInForce?: "GTC" | "IOC" | "FOK" | "GTX";
   reduceOnly?: boolean;
   positionSide?: "BOTH" | "LONG" | "SHORT";
@@ -169,6 +172,7 @@ export interface BinancePaperCancelOrderInput {
   symbol?: string;
   orderId?: string | number;
   clientOrderId?: string;
+  algo?: boolean;
 }
 
 export class BinancePaperOrderSubmissionSkipped extends Error {
@@ -465,7 +469,7 @@ export class BinancePaperTrading {
     const payload = await this.signedRequest<Record<string, unknown>>(
       environment,
       "POST",
-      `${orderRestPrefix(environment)}/order`,
+      orderSubmissionPath(environment, normalizedInput),
       orderParams(environment, market.symbol, normalizedInput),
     );
     const lastOrder = normalizeOrder(payload);
@@ -511,8 +515,9 @@ export class BinancePaperTrading {
       side: order.side,
       type: order.type,
       quantity: order.quantity,
-      price: order.price,
-      timeInForce: "GTC",
+      price: order.type === "stop-market" ? undefined : order.price,
+      stopPrice: order.type === "stop-market" ? order.price : undefined,
+      timeInForce: order.type === "limit" ? "GTC" : undefined,
       reduceOnly,
       positionSide,
       clientOrderId: clientOrderIdForBotOrder(order.id),
@@ -558,23 +563,27 @@ export class BinancePaperTrading {
     input: BinancePaperCancelOrderInput,
   ): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
-    const params: Record<string, string> = {
+    const algo = input.algo === true && environment.product !== "spot";
+    const params: Record<string, string> = algo ? {} : {
       symbol: (input.symbol ?? market.symbol).toUpperCase(),
     };
     if (input.orderId !== undefined) {
-      params.orderId = String(input.orderId);
+      params[algo ? "algoId" : "orderId"] = String(input.orderId);
     }
     if (input.clientOrderId) {
-      params.origClientOrderId = input.clientOrderId;
+      params[algo ? "clientAlgoId" : "origClientOrderId"] = input.clientOrderId;
     }
-    if (!params.orderId && !params.origClientOrderId) {
+    if (
+      (!algo && !params.orderId && !params.origClientOrderId) ||
+      (algo && !params.algoId && !params.clientAlgoId)
+    ) {
       throw new Error("Provide orderId or clientOrderId to cancel a Binance paper order.");
     }
 
     const payload = await this.signedRequest<Record<string, unknown>>(
       environment,
       "DELETE",
-      `${orderRestPrefix(environment)}/order`,
+      algo ? `${orderRestPrefix(environment)}/algoOrder` : `${orderRestPrefix(environment)}/order`,
       params,
     );
     const lastOrder = normalizeOrder(payload);
@@ -591,12 +600,30 @@ export class BinancePaperTrading {
 
   async cancelAllOpenOrders(market: BinanceMarketListing): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
-    await this.signedRequest<unknown>(
-      environment,
-      "DELETE",
-      cancelAllOpenOrdersPath(environment),
-      { symbol: market.symbol },
-    );
+    const symbol = market.symbol;
+    if (environment.product === "spot") {
+      await this.signedRequest<unknown>(
+        environment,
+        "DELETE",
+        "/api/v3/openOrders",
+        { symbol },
+      );
+    } else {
+      await Promise.all([
+        this.signedRequest<unknown>(
+          environment,
+          "DELETE",
+          `${orderRestPrefix(environment)}/allOpenOrders`,
+          { symbol },
+        ),
+        this.signedRequest<unknown>(
+          environment,
+          "DELETE",
+          `${orderRestPrefix(environment)}/algoOpenOrders`,
+          { symbol },
+        ),
+      ]);
+    }
     const synced = await this.sync(market);
     const snapshot: BinancePaperSnapshot = {
       ...synced,
@@ -755,7 +782,11 @@ export class BinancePaperTrading {
       `${orderRestPrefix(environment)}/openOrders`,
       { symbol },
     );
-    return payload.map(normalizeOrder);
+    const orders = payload.map(normalizeOrder);
+    if (environment.product === "spot") {
+      return orders;
+    }
+    return [...orders, ...(await this.fetchOpenAlgoOrders(environment, symbol))];
   }
 
   private async fetchRecentOrders(
@@ -767,6 +798,44 @@ export class BinancePaperTrading {
         environment,
         "GET",
         `${orderRestPrefix(environment)}/allOrders`,
+        { symbol, limit: 100 },
+      );
+      const orders = payload.map(normalizeOrder);
+      if (environment.product === "spot") {
+        return orders;
+      }
+      return [...orders, ...(await this.fetchRecentAlgoOrders(environment, symbol))];
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchOpenAlgoOrders(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<BinancePaperOrder[]> {
+    try {
+      const payload = await this.signedRequest<unknown[]>(
+        environment,
+        "GET",
+        `${orderRestPrefix(environment)}/openAlgoOrders`,
+        { symbol },
+      );
+      return payload.map(normalizeOrder);
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchRecentAlgoOrders(
+    environment: ResolvedPaperEnvironment,
+    symbol: string,
+  ): Promise<BinancePaperOrder[]> {
+    try {
+      const payload = await this.signedRequest<unknown[]>(
+        environment,
+        "GET",
+        `${orderRestPrefix(environment)}/allAlgoOrders`,
         { symbol, limit: 100 },
       );
       return payload.map(normalizeOrder);
@@ -900,13 +969,19 @@ export class BinancePaperTrading {
       positionInput.type === "limit"
         ? normalizePrice(positionInput.price, positionInput.side, filters)
         : positionInput.price;
+    const stopPrice =
+      positionInput.type === "stop-market"
+        ? normalizeStopPrice(positionInput.stopPrice ?? positionInput.price, positionInput.side, filters)
+        : positionInput.stopPrice;
     const quantity = normalizeQuantity(positionInput.quantity, positionInput.type, filters);
     const effectivePrice =
       positionInput.type === "limit"
         ? price
-        : Number.isFinite(Number(positionInput.price)) && Number(positionInput.price) > 0
-          ? Number(positionInput.price)
-          : undefined;
+        : positionInput.type === "stop-market"
+          ? stopPrice
+          : Number.isFinite(Number(positionInput.price)) && Number(positionInput.price) > 0
+            ? Number(positionInput.price)
+            : undefined;
     const minNotional = filters.minNotional ?? 0;
     let adjustedQuantity = quantity;
 
@@ -923,6 +998,7 @@ export class BinancePaperTrading {
     return {
       ...positionInput,
       price: positionInput.type === "limit" ? effectivePrice : positionInput.price,
+      stopPrice,
       quantity: adjustedQuantity,
     };
   }
@@ -1112,12 +1188,6 @@ function orderRestPrefix(
   return environment.restPrefix === "/dapi/v1" ? "/dapi/v1" : "/fapi/v1";
 }
 
-function cancelAllOpenOrdersPath(environment: ResolvedPaperEnvironment): string {
-  return environment.product === "spot"
-    ? "/api/v3/openOrders"
-    : `${orderRestPrefix(environment)}/allOpenOrders`;
-}
-
 function exchangeInfoPath(environment: ResolvedPaperEnvironment): string {
   if (environment.product === "spot") {
     return "/api/v3/exchangeInfo";
@@ -1196,9 +1266,30 @@ function normalizePrice(
     : roundToStep(price, tickSize, "ceil");
 }
 
+function normalizeStopPrice(
+  value: number | undefined,
+  side: "buy" | "sell",
+  filters: BinancePaperSymbolFilters,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error("Stop-market paper orders require a positive stop price.");
+  }
+  const tickSize = filters.tickSize ?? 0;
+  if (tickSize <= 0) {
+    return price;
+  }
+  return side === "buy"
+    ? roundToStep(price, tickSize, "ceil")
+    : roundToStep(price, tickSize, "floor");
+}
+
 function normalizeQuantity(
   value: number,
-  type: "limit" | "market",
+  type: BinancePaperPlaceOrderInput["type"],
   filters: BinancePaperSymbolFilters,
   mode: "floor" | "ceil" = "floor",
 ): number {
@@ -1207,7 +1298,7 @@ function normalizeQuantity(
     throw new Error("Binance order quantity must be positive.");
   }
   const stepSize =
-    type === "market" && filters.marketStepSize
+    isMarketLikeOrderType(type) && filters.marketStepSize
       ? filters.marketStepSize
       : filters.stepSize;
   if (!stepSize || stepSize <= 0) {
@@ -1223,11 +1314,11 @@ function validateNormalizedOrder(
   filters: BinancePaperSymbolFilters,
 ): void {
   const minQuantity =
-    input.type === "market" && filters.minMarketQuantity
+    isMarketLikeOrderType(input.type) && filters.minMarketQuantity
       ? filters.minMarketQuantity
       : filters.minQuantity;
   const maxQuantity =
-    input.type === "market" && filters.maxMarketQuantity
+    isMarketLikeOrderType(input.type) && filters.maxMarketQuantity
       ? filters.maxMarketQuantity
       : filters.maxQuantity;
   if (minQuantity && quantity < minQuantity) {
@@ -1401,6 +1492,10 @@ function normalizeOrderSide(side: string): TradingOrder["side"] {
   return side.toUpperCase() === "SELL" ? "sell" : "buy";
 }
 
+function isMarketLikeOrderType(type: BinancePaperPlaceOrderInput["type"]): boolean {
+  return type === "market" || type === "stop-market";
+}
+
 function formatQuantity(value: number): string {
   if (!Number.isFinite(value)) {
     return "0";
@@ -1408,25 +1503,53 @@ function formatQuantity(value: number): string {
   return Number(value.toFixed(8)).toString();
 }
 
+function orderSubmissionPath(
+  environment: ResolvedPaperEnvironment,
+  input: BinancePaperPlaceOrderInput,
+): string {
+  if (input.type === "stop-market" && environment.product !== "spot") {
+    return `${orderRestPrefix(environment)}/algoOrder`;
+  }
+  return `${orderRestPrefix(environment)}/order`;
+}
+
 function orderParams(
   environment: ResolvedPaperEnvironment,
   symbol: string,
   input: BinancePaperPlaceOrderInput,
 ): Record<string, string | boolean | undefined> {
-  const type = input.type.toUpperCase();
+  const orderType = binanceOrderType(environment, input);
+  const clientOrderId = input.clientOrderId ?? createClientOrderId();
   const params: Record<string, string | boolean | undefined> = {
     symbol: (input.symbol ?? symbol).toUpperCase(),
     side: input.side.toUpperCase(),
-    type,
+    type: orderType,
     quantity: decimalParam(input.quantity),
-    newClientOrderId: input.clientOrderId ?? createClientOrderId(),
   };
 
-  if (type === "LIMIT") {
+  if (input.type === "stop-market" && environment.product !== "spot") {
+    params.algoType = "CONDITIONAL";
+    params.triggerPrice = decimalParam(input.stopPrice ?? input.price);
+    params.clientAlgoId = clientOrderId;
+    if (!params.triggerPrice) {
+      throw new Error("Stop-market paper orders require stopPrice.");
+    }
+  } else {
+    params.newClientOrderId = clientOrderId;
+  }
+
+  if (orderType === "LIMIT") {
     params.timeInForce = input.timeInForce ?? "GTC";
     params.price = decimalParam(input.price);
     if (!params.price) {
       throw new Error("Limit paper orders require price.");
+    }
+  }
+
+  if (orderType === "STOP_LOSS") {
+    params.stopPrice = decimalParam(input.stopPrice ?? input.price);
+    if (!params.stopPrice) {
+      throw new Error("Stop-market paper orders require stopPrice.");
     }
   }
 
@@ -1440,6 +1563,16 @@ function orderParams(
   }
 
   return params;
+}
+
+function binanceOrderType(
+  environment: ResolvedPaperEnvironment,
+  input: BinancePaperPlaceOrderInput,
+): string {
+  if (input.type === "stop-market") {
+    return environment.product === "spot" ? "STOP_LOSS" : "STOP_MARKET";
+  }
+  return input.type.toUpperCase();
 }
 
 function decimalParam(value: number | undefined): string | undefined {
@@ -1571,25 +1704,32 @@ function normalizePositionSideForOrder(
 
 function normalizeOrder(raw: unknown): BinancePaperOrder {
   const item = asRecord(raw);
-  const clientOrderId = stringValue(item.clientOrderId);
+  const clientOrderId = stringValue(
+    item.clientOrderId ??
+      item.clientAlgoId ??
+      item.newClientStrategyId,
+  );
+  const stopPrice = optionalNumber(item.stopPrice ?? item.triggerPrice);
   return {
     symbol: stringValue(item.symbol),
-    orderId: stringValue(item.orderId),
+    orderId: stringValue(item.orderId ?? item.algoId ?? item.strategyId),
     clientOrderId,
     localOrderId: localOrderIdFromClientOrderId(clientOrderId),
+    algo: item.algoId !== undefined || item.clientAlgoId !== undefined || item.strategyId !== undefined,
     side: stringValue(item.side),
-    type: stringValue(item.type),
-    status: stringValue(item.status),
-    price: numberValue(item.price),
-    originalQuantity: numberValue(item.origQty),
+    type: stringValue(item.type ?? item.orderType ?? item.strategyType),
+    status: stringValue(item.status ?? item.algoStatus ?? item.strategyStatus),
+    price: numberValue(item.price) || stopPrice || 0,
+    stopPrice,
+    originalQuantity: numberValue(item.origQty ?? item.quantity),
     executedQuantity: numberValue(item.executedQty),
     cumulativeQuoteQuantity: numberValue(item.cummulativeQuoteQty ?? item.cumQuote),
     avgPrice: numberValue(item.avgPrice),
     timeInForce: stringValue(item.timeInForce),
     reduceOnly: booleanValue(item.reduceOnly),
     positionSide: stringValue(item.positionSide),
-    createdAt: numberValue(item.time),
-    updatedAt: numberValue(item.updateTime ?? item.transactTime),
+    createdAt: numberValue(item.time ?? item.createTime ?? item.bookTime),
+    updatedAt: numberValue(item.updateTime ?? item.transactTime ?? item.createTime ?? item.bookTime),
   };
 }
 
@@ -1744,7 +1884,11 @@ function futuresReconciliationFromUserDataEvent(
   payload: unknown,
 ): ExchangeReconciliationInput | undefined {
   const event = asRecord(payload);
-  if (stringValue(event.e) !== "ORDER_TRADE_UPDATE") {
+  const eventType = stringValue(event.e);
+  if (eventType === "ALGO_UPDATE") {
+    return futuresAlgoReconciliationFromUserDataEvent(market, event);
+  }
+  if (eventType !== "ORDER_TRADE_UPDATE") {
     return undefined;
   }
 
@@ -1820,12 +1964,64 @@ function futuresReconciliationFromUserDataEvent(
   return { orders, fills };
 }
 
+function futuresAlgoReconciliationFromUserDataEvent(
+  market: BinanceMarketListing,
+  event: Record<string, unknown>,
+): ExchangeReconciliationInput | undefined {
+  const order = asRecord(event.o);
+  if (stringValue(order.s) !== market.symbol) {
+    return undefined;
+  }
+
+  const clientOrderId = stringValue(order.caid);
+  const localOrderId = localOrderIdFromClientOrderId(clientOrderId);
+  if (!localOrderId) {
+    return undefined;
+  }
+
+  const side = normalizeUserDataSide(order.S);
+  const reduceOnly = booleanValue(order.R) === true;
+  const positionSide = stringValue(order.ps);
+  const transactionTime = numberValue(event.T) || numberValue(event.E);
+  const avgPrice = numberValue(order.ap);
+  const orderPrice = avgPrice || numberValue(order.p) || numberValue(order.tp);
+  const filledQuantity = numberValue(order.aq);
+  return {
+    orders: [{
+      localOrderId,
+      externalOrderId: stringValue(order.aid) || stringValue(order.ai),
+      clientOrderId,
+      side,
+      type: normalizeUserDataOrderType(order.o),
+      status: normalizeUserDataAlgoOrderStatus(order.X, filledQuantity),
+      price: orderPrice,
+      quantity: numberValue(order.q),
+      filledQuantity,
+      quoteQuantity: orderPrice > 0 && filledQuantity > 0
+        ? orderPrice * filledQuantity
+        : undefined,
+      createdAt: transactionTime,
+      updatedAt: transactionTime,
+      positionEffect: futuresPositionEffectFromFields(side, reduceOnly, positionSide),
+      reason: `user-data algo ${stringValue(order.X) || "update"}`,
+    }],
+    fills: [],
+  };
+}
+
 function normalizeUserDataSide(value: unknown): "buy" | "sell" {
   return stringValue(value).toUpperCase() === "SELL" ? "sell" : "buy";
 }
 
-function normalizeUserDataOrderType(value: unknown): "limit" | "market" {
-  return stringValue(value).toUpperCase() === "MARKET" ? "market" : "limit";
+function normalizeUserDataOrderType(value: unknown): "limit" | "market" | "stop-market" {
+  const type = stringValue(value).toUpperCase();
+  if (type === "MARKET") {
+    return "market";
+  }
+  if (type === "STOP_MARKET" || type === "STOP_LOSS") {
+    return "stop-market";
+  }
+  return "limit";
 }
 
 function normalizeUserDataOrderStatus(value: unknown): "open" | "filled" | "cancelled" {
@@ -1840,6 +2036,20 @@ function normalizeUserDataOrderStatus(value: unknown): "open" | "filled" | "canc
     status === "EXPIRED_IN_MATCH" ||
     status === "REJECTED"
   ) {
+    return "cancelled";
+  }
+  return "open";
+}
+
+function normalizeUserDataAlgoOrderStatus(
+  value: unknown,
+  filledQuantity: number,
+): "open" | "filled" | "cancelled" {
+  const status = stringValue(value).toUpperCase();
+  if (status === "FINISHED") {
+    return filledQuantity > 0 ? "filled" : "cancelled";
+  }
+  if (status === "CANCELED" || status === "EXPIRED" || status === "REJECTED") {
     return "cancelled";
   }
   return "open";

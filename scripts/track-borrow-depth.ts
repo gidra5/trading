@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  SimulatedTradingBot,
+  SimulatedExecutionEngine,
   createInitialBotState,
   createStrategyConfig,
   summarizeClosedPositions,
@@ -28,7 +28,7 @@ interface LegacyPositionLotCacheView {
   shorts: Map<string, { borrowDepthRemaining: number }>;
 }
 
-type TrackableBot = SimulatedTradingBot & {
+type TrackableBot = SimulatedExecutionEngine & {
   updateLegacyPositionLotCache: () => void;
   legacyPositionLotCache?: LegacyPositionLotCacheView;
 };
@@ -43,7 +43,7 @@ if (candles.length === 0) {
 const config = createStrategyConfig({
   symbol: args.symbol.toUpperCase(),
 });
-const bot = new SimulatedTradingBot(createInitialBotState(config));
+const bot = new SimulatedExecutionEngine(createInitialBotState(config));
 const depth: DepthTracker = { maxLongDepth: 0, maxShortDepth: 0 };
 const sampleEvery = Math.max(1, Math.ceil(candles.length / 800));
 
@@ -112,7 +112,7 @@ console.log(
 );
 
 function replayCandle(
-  bot: SimulatedTradingBot,
+  bot: SimulatedExecutionEngine,
   candle: Candle,
   depth: DepthTracker,
 ): void {
@@ -127,7 +127,7 @@ function replayCandle(
 }
 
 function replayTick(
-  bot: SimulatedTradingBot,
+  bot: SimulatedExecutionEngine,
   eventTime: number,
   price: number,
   depth: DepthTracker,
@@ -136,7 +136,7 @@ function replayTick(
   observeDepth(bot, depth);
 }
 
-function observeDepth(bot: SimulatedTradingBot, depth: DepthTracker): void {
+function observeDepth(bot: SimulatedExecutionEngine, depth: DepthTracker): void {
   const trackable = bot as TrackableBot;
   trackable.updateLegacyPositionLotCache();
   const cache = trackable.legacyPositionLotCache;

@@ -1,9 +1,19 @@
 export {
-  SimulatedTradingBot,
+  SimulatedExecutionEngine,
   createInitialBotState,
   createStrategyConfig,
   defaultStrategyConfig,
   type PartialStrategyConfig,
+} from "./execution-simulator.js";
+export {
+  PeakValleyBotCore,
+  createBotCoreMemory,
+  createBotCoreState,
+  evaluateBot,
+  type BotConfig,
+  type BotDecision,
+  type BotInput,
+  type BotMemory,
 } from "./bot.js";
 export {
   compactBacktestState,
@@ -30,5 +40,15 @@ export {
   defaultPositionRiskConfig,
   summarizeClosedPositions,
 } from "./position-ledger.js";
+export {
+  FuturesMarginBalanceModel,
+  LeveragedBalanceModel,
+  SpotBorrowBalanceModel,
+  createLeveragedBalanceModel,
+  type BalanceEntryCapacityInput,
+  type BalanceEntrySide,
+  type BalanceLiquidationInput,
+  type BalanceProjection,
+} from "./leveraged-balance.js";
 export { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 export type * from "./types.js";

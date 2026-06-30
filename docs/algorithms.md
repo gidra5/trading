@@ -426,29 +426,34 @@ instead of waiting for the next replay/live price update.
 
 When a short is opened while long lots are active, the ledger records which long lots
 supplied internal borrowed base, prioritizing underwater longs. The short sale proceeds
-immediately reduce those long lots' remaining cost basis and break-even, without
-treating the short open as a long close. Buying that short back charges the cover cost
-back to the same source longs, so the completed borrow cycle applies the short's net
-profit or loss to the long cost basis.
+immediately reduce those long lots' remaining cost basis and available BTC quantity,
+without treating the short open as a long close. If the borrowed BTC was sold below the
+long's current break-even, the source long's break-even for its remaining sellable BTC
+rises. Buying that short back returns the BTC to the same source longs and charges the
+cover cost back into their basis, so a profitable borrow cycle naturally lowers the
+long break-even after settlement.
 
 Long entries mirror this with quote borrowed from active short lots. The borrowed quote
 is tied to the base quantity it funded, and closing that long returns the corresponding
 sale value to the same source shorts. Borrow chains are limited by `longBorrowDepth`
 for chains that start from a long lender and `shortBorrowDepth` for chains that start
-from a short lender.
+from a short lender. A covered short lender remains partially closed while its
+`lentQuote` is still outstanding, so borrower losses stay attached to the source short
+until the funded long settles.
 
-Entry capacity is split into two buckets. Free-capital capacity is limited by the
-per-side cap and leverage headroom. Internal borrow capacity is the sum of currently
-unlent opposite-side lots and is added on top of free-capital capacity. That lets a
-short entry borrow base from several long lots, or a long entry borrow quote from
-several short lots, when one lender lot is too small for the desired entry. Settlement
-already follows the recorded allocation list, so borrower profit or loss is returned to
-each source lot proportionally.
+Entry capacity is exchange-level first. The selected leveraged balance model
+(`futures-margin` or `spot-borrow`) computes the largest projected order that stays
+inside the requested leverage, then the per-side cap is applied. Internal borrow no
+longer adds buying power on top of that cap; it only records which existing long or
+short lots funded the new opposing lot. Settlement uses the recorded allocation list,
+but partial borrower closes settle every outstanding allocation by the same
+remaining-quantity ratio. Borrower profit or loss is therefore shared across all active
+source lots instead of being assigned FIFO.
 
-When `lockBorrowedLenderCollateral` is enabled, a lender lot cannot place exit-grid
-orders against collateral that is currently lent to a borrower. Long lenders lock
-`lentQuantity`; short lenders lock the cover quantity represented by `lentQuote` at
-the current break-even grid price. `borrowerProfitShareToLender` controls how much of a
+Lent BTC is removed from a long lender's sellable `remainingQuantity`, so long exit
+grids cannot sell borrowed-out BTC. When `lockBorrowedLenderCollateral` is enabled,
+short lenders also lock the cover quantity represented by `lentQuote` at the current
+break-even grid price. `borrowerProfitShareToLender` controls how much of a
 profitable borrower close is credited back into the lender's lot basis. `1` preserves
 the older behavior where the lender receives the full borrower profit, while `0` keeps
 the borrower's profit free at the account level instead of lowering the lender's
@@ -460,7 +465,7 @@ break-even further. Borrower losses are still charged back through the lender ba
 | --- | ---: | --- |
 | `algorithm` | `legacy-valley-peak` | The only automated algorithm key. |
 | `maxLeverage` | `5` | Account leverage guard used by the padded long-term-range baseline selector. |
-| `shortMarginModel` | `futures-margin` | Collateral-backed short accounting used by the current baseline. |
+| `shortMarginModel` | `futures-margin` | Exchange-level leverage model; futures uses signed net exposure, spot-borrow uses borrowed liabilities. |
 | `longBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original long lender. |
 | `shortBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original short lender. |
 | `lockBorrowedLenderCollateral` | `false` | Lender lots can still exit-grid collateral currently lent to borrowers. |

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   BacktestResult,
+  BotCoreState,
   Candle,
   OrderBookSnapshot,
   PaperBotState,
@@ -29,6 +30,14 @@ export class TradingStorage {
 
   async saveBotState(state: PaperBotState): Promise<void> {
     await writeJsonAtomic(this.botStatePath, state);
+  }
+
+  async loadLiveBotCoreState(): Promise<BotCoreState | undefined> {
+    return readJson<BotCoreState>(this.liveBotCoreStatePath);
+  }
+
+  async saveLiveBotCoreState(state: BotCoreState): Promise<void> {
+    await writeJsonAtomic(this.liveBotCoreStatePath, state);
   }
 
   async loadCandles(limit = 500): Promise<Candle[]> {
@@ -81,6 +90,13 @@ export class TradingStorage {
     return path.join(
       this.stateDir,
       `paper-bot-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
+    );
+  }
+
+  private get liveBotCoreStatePath(): string {
+    return path.join(
+      this.stateDir,
+      `live-bot-core-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
     );
   }
 }

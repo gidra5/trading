@@ -1,14 +1,15 @@
 # Trading Model and Position Ledger
 
-The bot keeps one persisted paper-trading state and derives the position ledger from
-that state. The persisted state is the source of truth for balances, orders, fills,
-strategy memory, and metrics. The ledger is a reconstructed view used by position-risk
-helpers, benchmark metrics, and presentation layers.
+The execution simulator keeps one persisted paper-trading state and derives the
+position ledger from that state. The persisted state is the source of truth for
+balances, orders, fills, strategy memory, and metrics. The ledger is a reconstructed
+view used by position-risk helpers, benchmark metrics, and presentation layers.
 
 The implementation lives in:
 
-- `packages/bot-algo/src/bot.ts` for account state, order lifecycle, fills, leverage
-  checks, and strategy execution
+- `packages/bot-algo/src/bot.ts` for pure strategy decision evaluation
+- `packages/bot-algo/src/execution-simulator.ts` for account state, order lifecycle,
+  fills, leverage checks, liquidation, and calling the strategy bot
 - `packages/bot-algo/src/position-ledger.ts` for derived long/short lots, break-even
   prices, borrow attribution, and risk suggestions
 
@@ -120,25 +121,26 @@ Callers can force a new lot with `positionEffect = "open"` or close a specific l
 The account does not model exchange margin buckets directly. It derives debt from
 balances and attributes that debt back to lots for inspection.
 
-`shortMarginModel` controls how standalone shorts count against the leverage guard:
+`shortMarginModel` selects the exchange-level balance model used by the execution
+simulator:
 
 - `futures-margin` is the default baseline. It treats shorts as collateral-backed
-  futures-style exposure. Account balances are still represented the same way, but
-  summary leverage and fill rejection use gross notional exposure over equity.
+  one-way futures-style exposure. Account balances are represented synthetically as
+  quote plus signed base exposure, and summary leverage/fill rejection use absolute
+  net exposure over equity.
 - `spot-borrow` models a short as borrowed base, so an unhedged short at `1x` has no
   headroom because the borrowed base value counts as external debt.
 
-In `spot-borrow`, summary leverage uses external borrowed value:
+In `futures-margin`, summary leverage uses signed net exposure:
 
 ```text
-effective leverage = 1 + externalBorrowedQuote / equity
+effective leverage = abs(net base quantity * mark price) / equity
 ```
 
-In `futures-margin`, summary leverage uses gross exposure net of internally borrowed
-paired exposure:
+In `spot-borrow`, summary leverage uses borrowed asset/liability value:
 
 ```text
-effective leverage = (grossExposureQuote - internalBorrowedExposureQuote) / equity
+effective leverage = 1 + borrowed value / equity
 ```
 
 Lot leverage uses the portion of that lot's exposure that required external borrowing:
@@ -161,6 +163,9 @@ Borrow attribution distinguishes internal and external borrowing:
   recorded, its available proceeds are lent out while the long is open, and closing
   the long returns sale value to the same source short in proportion to the funded
   base quantity.
+- Partial borrower closes settle all outstanding lender allocations proportionally by
+  remaining borrowed quantity. Profits and losses are shared across lenders instead of
+  being assigned to the first allocation in the list.
 - Borrow chains are depth-limited. `longBorrowDepth` controls how many alternating
   internal borrow hops can start from a long lender; `shortBorrowDepth` does the same
   for a short lender. A depth of `0` disables that origin side as an internal lender,
@@ -169,23 +174,22 @@ Borrow attribution distinguishes internal and external borrowing:
   borrowed quote if the account quote balance is negative.
 - In `spot-borrow`, `externalBorrowedQuote` is the amount that counts toward effective
   leverage.
-- In `futures-margin`, `externalBorrowedQuote` is still shown for inspection, but gross
-  exposure controls effective leverage.
+- In `futures-margin`, `externalBorrowedQuote` is still shown for inspection, but
+  exchange-level leverage is controlled by signed net exposure.
 - `internalBorrowedQuote` and `internalBorrowedQuantity` show how much opposing
-  position value is being reused inside the account model.
+  position value is being reused inside the lot ledger.
 
-The leverage guard runs after every fill. In `spot-borrow`, it uses a fast debt-leverage
-estimate before rebuilding the full ledger if needed. In `futures-margin`, it checks
-gross exposure after subtracting exposure funded by internal long/short borrow chains.
-If effective leverage is above
-`maxLeverage`, the fill is rolled back and the order is cancelled with a leverage-limit
-reason.
+The leverage guard runs after every fill through
+`packages/bot-algo/src/leveraged-balance.ts`. `FuturesMarginBalanceModel` rejects fills
+whose projected net exposure exceeds `equity * maxLeverage`.
+`SpotBorrowBalanceModel` rejects fills whose projected borrowed-asset value exceeds the
+selected debt leverage. If effective leverage is above `maxLeverage`, the fill is
+rolled back and the order is cancelled with a leverage-limit reason.
 
-Automated entry sizing treats free-capital capacity and internal borrow capacity
-separately. The per-side `maxPositionQuote` and leverage headroom cap the free-capital
-portion. Unlent opposite-side lots add internal borrow capacity on top of that cap, so
-a short can borrow base from multiple long lots, and a long can borrow quote from
-multiple short lots, before any external exposure is needed.
+Automated entry sizing asks the selected balance model for projected exchange-level
+capacity, then applies the per-side `maxPositionQuote` cap. Internal borrow no longer
+adds exchange buying power on top of leverage headroom; it only records which existing
+lots funded the new opposing lot.
 
 ## Account Liquidation
 
@@ -221,27 +225,45 @@ Long lots use the spreadsheet recovery model:
 
 ```text
 average buy price = cost quote / bought quantity
-remaining cost = original cost - allocated sell proceeds
-break-even sell price = remaining cost / max(remaining quantity, quantity floor) * (1 + fee + slippage)
-max-loss sell price = max(0, remaining cost - max loss pct * original cost) / max(remaining quantity, quantity floor) * (1 + fee + slippage)
+remaining quantity = bought quantity - sold quantity - quantity lent to shorts
+lent quantity = base currently borrowed by internal short lots
+remaining cost = original cost - allocated sell proceeds - internal short-sale proceeds + internal short cover costs
+break-even sell price = remaining cost / remaining quantity * (1 + fee + slippage)
+max-loss sell price = max(0, remaining cost - max loss pct * original cost) / remaining quantity * (1 + fee + slippage)
 sell-now quote = max(0, (remaining cost - lower baseline * remaining quantity) / (net market sell - lower baseline) * net market sell)
 can reach lower baseline = sell-now quote > 0 and sell-now quote < remaining cost and quantity is available
 ```
+
+Long exposure counts `remaining quantity + lent quantity`, but long exit grids can only
+sell `remaining quantity`. When an internal short borrows BTC from a long, both the sale
+proceeds and the borrowed BTC leave the long's sellable remainder. When the short
+closes, the borrowed BTC returns and the cover cost is added back to the long basis.
 
 Short lots use the mirrored sell-side formulas:
 
 ```text
 average sell price = proceeds quote / sold quantity
 remaining proceeds = original proceeds - allocated buyback cost
-break-even buy price = remaining proceeds / max(remaining quantity, quantity floor) / (1 + fee + slippage)^2
-max-loss buy price = remaining proceeds / max(remaining quantity - max loss pct * original quantity, quantity floor) / (1 + fee + slippage)^2
+lent quote = quote currently borrowed by internal long lots
+break-even buy price = remaining proceeds / remaining quantity / (1 + fee + slippage)^2
+max-loss buy price = remaining proceeds / (remaining quantity - max loss pct * original quantity) / (1 + fee + slippage)^2
 buy-now quote = max(0, (remaining proceeds - upper baseline * remaining quantity) / (gross market buy - upper baseline) * gross market buy)
 can reach upper baseline = buy-now quote > 0 and buy-now quote < remaining proceeds and quantity is available
 ```
 
-The default quantity floor is `0.01`, matching the spreadsheet guard against
-divide-by-zero rows. Fee is the bot configured Binance fee. Slippage is a separate
-market-order estimate.
+Short lots are not fully closed while `lent quote` is still outstanding. A short can
+cover all of its BTC debt first, but it remains partially closed until the borrower long
+returns the quote it funded.
+
+Closed or fully projected lots use `0` for break-even fields instead of dividing by
+zero. Fee is the bot configured Binance fee. Slippage is a separate market-order
+estimate.
+
+Closed-position profitability is measured from the final ledger remainder, not from
+original entry quote versus final exit quote. A closed long is profitable when its
+remaining cost is negative, so closed long PnL is `-remaining cost`. A closed short is
+profitable when it has positive remaining proceeds, so closed short PnL is `remaining
+proceeds`. This keeps borrower/lender settlements in the lot's reported profitability.
 
 ## Workflow Boundaries
 

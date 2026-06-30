@@ -1,5 +1,5 @@
 import {
-  SimulatedTradingBot,
+  SimulatedExecutionEngine,
   calculateRiskAdjustedMetrics,
   compactBacktestState,
   createBacktestChartCollector,
@@ -651,7 +651,7 @@ async function runHistoricalRangeBacktest(
     quoteAsset: options.quoteAsset ?? options.config.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, options.maxLeverage),
   });
-  const bot = new SimulatedTradingBot(createInitialBotState(config));
+  const bot = new SimulatedExecutionEngine(createInitialBotState(config));
   const perfectMargin = createPerfectMarginBenchmark(config);
   const cache = new HistoricalCandleCache({
     dataDir: options.cache.dataDir,
@@ -1527,7 +1527,7 @@ function upperBoundCandleOpenTime(candles: readonly Candle[], time: number): num
 }
 
 function replayCandle(
-  bot: SimulatedTradingBot,
+  bot: SimulatedExecutionEngine,
   candle: Candle,
   perfectMargin?: PerfectMarginBenchmarkAccumulator,
 ): boolean {

@@ -180,10 +180,12 @@ export interface BinancePaperOrder {
   orderId: string;
   clientOrderId: string;
   localOrderId?: string;
+  algo?: boolean;
   side: string;
   type: string;
   status: string;
   price: number;
+  stopPrice?: number;
   originalQuantity: number;
   executedQuantity: number;
   cumulativeQuoteQuantity?: number;

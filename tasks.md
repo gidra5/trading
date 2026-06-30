@@ -2,8 +2,7 @@
 - search for a good portfolio that will lower risks while keeping profits based on correlations - the assets should be orthogonal or compensate variance of each other.
 - portfolio management experiments: initial strategy-portfolio harness exists; still need cached multi-symbol data for inverse-vol allocation, correlation-cluster caps, volatility-targeted leverage, market-neutral pairs, robust min-variance baskets, turnover-aware rebalancing, funding-aware overlays, and stress-mode deleveraging. Details are in docs/strategy-research.md and docs/experiment-plan.md.
 - randomized model. lets say we look at the price according to some poisson process. At each observation we decide one of the following - open new long/short position, close existing position, or do nothing. We should pick the action based on which will yield best change in equity or break-even price.
-
-- error when using prod tokens: Binance market request failed: HTTP 401 {"code":-1002,"msg":"You are not authorized to execute this request."}
+- 
 - add prediction market support
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
@@ -28,9 +27,6 @@
   
 add a button to run the backtest from live bot start date to now.
 
-Simulation and live trading mismatch
-Simulation says we should already have 16% profit, but we only have 2%. The trades roughly match but maybe there were more in the simulation than or live, or they were having different size. Run live bot, record enough activity to reproduce in a backtest, compare with simulation on the same interval.
-
 Hedge mode reconcile warning
 
 Half the confirmation windows
@@ -38,9 +34,15 @@ equal sigmas
 for Long Range Bounds use largest suitable candle width instead of 1m granularity
 try ema instead of sma
 
-Can lender position close before the borrower?
+Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size
 
 Before transitioning trend to sideways we wait until rate crosses 0. Then if it gets through either rate threshold or absolute threshold relative to point when we entered sideways trend, then we transition into directional trend. The qbs threshold is about the size of fees
+
+0.1	0.3	0/999 both sides swings from +16 on 0/0 to -20.67%
+0.3	0.3	0/0 both sides suddenly drops even more to -41.81%, the deeper borrows only make things worse up to -60.73% in 999/0 case. the 0.1 case is basically the same but scaled down.
+the best results are short-side only - 0.3 sigma with +21.02%, and 0.1 sigma with +4.31%. buy sigma and depth are irrelevant here, since longs are not created at all.
+
+the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
 
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.

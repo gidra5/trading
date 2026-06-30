@@ -442,9 +442,10 @@ export function App() {
 
   const placeExchangeOrder = async (input: {
     side: "buy" | "sell";
-    type: "limit" | "market";
+    type: "limit" | "market" | "stop-market";
     quantity: number;
     price?: number;
+    stopPrice?: number;
     reduceOnly?: boolean;
   }) => {
     setExchangeError(undefined);
@@ -470,7 +471,11 @@ export function App() {
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ orderId: order.orderId, clientOrderId: order.clientOrderId }),
+      body: JSON.stringify({
+        orderId: order.orderId,
+        clientOrderId: order.clientOrderId,
+        algo: order.algo,
+      }),
     });
     const payload = await response.json();
     if (!response.ok) {
@@ -811,9 +816,10 @@ function ExchangePaperPanel(props: {
   onSync: () => void;
   onPlaceOrder: (input: {
     side: "buy" | "sell";
-    type: "limit" | "market";
+    type: "limit" | "market" | "stop-market";
     quantity: number;
     price?: number;
+    stopPrice?: number;
     reduceOnly?: boolean;
   }) => void;
   onCancelOrder: (order: BinancePaperOrder) => void;
@@ -821,7 +827,7 @@ function ExchangePaperPanel(props: {
   onSetLeverage: (leverage: number) => void;
 }) {
   const [side, setSide] = createSignal<"buy" | "sell">("buy");
-  const [type, setType] = createSignal<"limit" | "market">("limit");
+  const [type, setType] = createSignal<"limit" | "market" | "stop-market">("limit");
   const [quantity, setQuantity] = createSignal(0.001);
   const [price, setPrice] = createSignal(0);
   const [reduceOnly, setReduceOnly] = createSignal(false);
@@ -850,6 +856,7 @@ function ExchangePaperPanel(props: {
       type: type(),
       quantity: quantity(),
       price: type() === "limit" ? price() : undefined,
+      stopPrice: type() === "stop-market" ? price() : undefined,
       reduceOnly: reduceOnly(),
     });
   };
@@ -992,8 +999,17 @@ function ExchangePaperPanel(props: {
               options={[
                 { value: "limit", label: "Limit" },
                 { value: "market", label: "Market" },
+                { value: "stop-market", label: "Stop Market" },
               ]}
-              onInput={(value) => setType(value === "market" ? "market" : "limit")}
+              onInput={(value) =>
+                setType(
+                  value === "market"
+                    ? "market"
+                    : value === "stop-market"
+                      ? "stop-market"
+                      : "limit",
+                )
+              }
             />
             <NumberField
               label="Quantity"
@@ -1002,9 +1018,9 @@ function ExchangePaperPanel(props: {
               step={0.000001}
               onInput={setQuantity}
             />
-            <Show when={type() === "limit"}>
+            <Show when={type() === "limit" || type() === "stop-market"}>
               <NumberField
-                label={`Price ${quoteAsset()}`}
+                label={`${type() === "stop-market" ? "Stop" : "Price"} ${quoteAsset()}`}
                 value={price()}
                 min={0}
                 step={0.01}
@@ -1600,13 +1616,6 @@ function AlgorithmPanel(props: {
                   min={0}
                   step={0.1}
                   onInput={(value) => updateRisk("marketSlippageBps", value)}
-                />
-                <NumberField
-                  label="Qty Floor"
-                  value={config().positionRisk.quantityFloor}
-                  min={0}
-                  step={0.00000001}
-                  onInput={(value) => updateRisk("quantityFloor", value)}
                 />
               </div>
             </div>

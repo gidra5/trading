@@ -1,9 +1,9 @@
 import {
-  SimulatedTradingBot,
+  SimulatedExecutionEngine,
   createInitialBotState,
   createStrategyConfig,
   type PartialStrategyConfig,
-} from "./bot.js";
+} from "./execution-simulator.js";
 import { defaultPositionRiskConfig, summarizeClosedPositions } from "./position-ledger.js";
 import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 import type {
@@ -99,7 +99,7 @@ export function createBacktestChartCollector(
 
 export function observeBacktestChartCandle(
   collector: BacktestChartCollector,
-  bot: SimulatedTradingBot,
+  bot: SimulatedExecutionEngine,
   candle: Candle,
   processedCandles: number,
   forceSample = false,
@@ -290,7 +290,7 @@ export function runBacktestFromCandles(
     ...(options.config ?? {}),
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
-  const bot = new SimulatedTradingBot(createInitialBotState(config));
+  const bot = new SimulatedExecutionEngine(createInitialBotState(config));
   const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const chartCollector = createBacktestChartCollector(
@@ -374,7 +374,7 @@ export function runBacktestFromOrderBook(
     ...(options.config ?? {}),
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
-  const bot = new SimulatedTradingBot(createInitialBotState(config));
+  const bot = new SimulatedExecutionEngine(createInitialBotState(config));
   const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const startedAt = Date.now();
@@ -468,7 +468,7 @@ export function runBacktestFromTicks(
     ...(options.startingQuote ? { startingQuote: options.startingQuote } : {}),
   });
   const state = createInitialBotState(config);
-  const bot = new SimulatedTradingBot(state);
+  const bot = new SimulatedExecutionEngine(state);
   const perfectMargin = createPerfectMarginBenchmark(config);
   const equityCurve: EquityPoint[] = [];
   const startedAt = Date.now();
@@ -528,7 +528,7 @@ export function runBacktestFromTicks(
 }
 
 function replayCandle(
-  bot: SimulatedTradingBot,
+  bot: SimulatedExecutionEngine,
   candle: Candle,
   perfectMargin?: PerfectMarginBenchmarkAccumulator,
 ): boolean {
