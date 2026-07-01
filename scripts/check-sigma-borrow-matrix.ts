@@ -15,7 +15,6 @@ interface Args {
   longBorrowDepth?: number;
   shortBorrowDepth?: number;
   internalBorrowAccounting: InternalBorrowAccounting;
-  lockBorrowedLenderCollateral: boolean;
 }
 
 type SideMode = "both" | "long-only" | "short-only";
@@ -36,7 +35,6 @@ for (const testCase of cases) {
       longBorrowDepth: testCase.longBorrowDepth,
       shortBorrowDepth: testCase.shortBorrowDepth,
       internalBorrowAccounting: args.internalBorrowAccounting,
-      lockBorrowedLenderCollateral: args.lockBorrowedLenderCollateral,
       legacyValleyPeak: legacyConfig(args, testCase.mode),
     },
     maxReturnedOrders: 0,
@@ -53,11 +51,10 @@ for (const testCase of cases) {
       longBorrowDepth: testCase.longBorrowDepth,
       shortBorrowDepth: testCase.shortBorrowDepth,
       internalBorrowAccounting: args.internalBorrowAccounting,
-      lockBorrowedLenderCollateral: args.lockBorrowedLenderCollateral,
       returnPct: round(summary.returnPct, 4),
       netPnl: round(summary.netPnl, 2),
       maxDrawdownPct: round(summary.maxDrawdownPct, 4),
-      maxEffectiveLeverage: round(summary.maxEffectiveLeverage, 4),
+      maxEffectiveLeverage: round(summary.maxEffectiveLeverage ?? 0, 4),
       trades: summary.tradeCount,
       winRate: round(summary.winRate, 2),
       profitableClosedPositionCount: summary.profitableClosedPositionCount,
@@ -149,22 +146,19 @@ function parseArgs(argv: string[]): Args {
     internalBorrowAccounting: parseInternalBorrowAccounting(
       values.get("internal-borrow-accounting"),
     ),
-    lockBorrowedLenderCollateral:
-      values.get("lock-borrowed-lender-collateral") === "true" ||
-      values.get("lock-borrowed-collateral") === "true",
   };
 }
 
 function parseInternalBorrowAccounting(
   value: string | undefined,
 ): InternalBorrowAccounting {
-  if (value === undefined || value === "principal") {
-    return "principal";
+  if (value === undefined || value === "active") {
+    return "active";
   }
-  if (value === "pnl-only") {
-    return "pnl-only";
+  if (value === "inactive") {
+    return "inactive";
   }
-  throw new Error("--internal-borrow-accounting must be principal or pnl-only.");
+  throw new Error("--internal-borrow-accounting must be active or inactive.");
 }
 
 function parseMode(value: string | undefined): SideMode | undefined {

@@ -75,7 +75,7 @@ console.log(
     `${state.config.maxLeverage}x max leverage`,
     `${state.config.shortMarginModel} short margin`,
     `borrow depth L${state.config.longBorrowDepth}/S${state.config.shortBorrowDepth}`,
-    `borrow lock ${state.config.lockBorrowedLenderCollateral ? "on" : "off"}`,
+    `internal borrow ${state.config.internalBorrowAccounting}`,
     `target cap ${formatMoney(state.config.maxPositionQuote)}`,
     `${state.config.cooldownMs / 1000}s cooldown`,
     `elapsed ${elapsedMs.toLocaleString()}ms`,

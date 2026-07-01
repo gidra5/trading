@@ -12,7 +12,7 @@ export type StrategyAlgorithm = "legacy-valley-peak";
 
 export type ShortMarginModel = "spot-borrow" | "futures-margin";
 
-export type InternalBorrowAccounting = "principal" | "pnl-only";
+export type InternalBorrowAccounting = "active" | "inactive";
 
 export type BacktestPreset =
   | "saved-candles"
@@ -94,7 +94,6 @@ export interface StrategyConfig {
   longBorrowDepth: number;
   shortBorrowDepth: number;
   internalBorrowAccounting: InternalBorrowAccounting;
-  lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   feeBps: number;
   maxPositionQuote: number;

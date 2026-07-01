@@ -289,7 +289,7 @@ function buildContext(state: PaperBotState, currentPriceOverride?: number): Ledg
     longBorrowDepth: normalizeBorrowDepth(state.config.longBorrowDepth),
     shortBorrowDepth: normalizeBorrowDepth(state.config.shortBorrowDepth),
     internalBorrowAccounting:
-      state.config.internalBorrowAccounting === "pnl-only" ? "pnl-only" : "principal",
+      state.config.internalBorrowAccounting === "inactive" ? "inactive" : "active",
     borrowerProfitShareToLender: clamp(
       cleanNumber(state.config.borrowerProfitShareToLender ?? 1),
       0,
@@ -466,9 +466,6 @@ function closeLongLot(
   settleLongBorrowAllocations(long, quantity, unitProceeds, shorts, context);
   long.remainingQuantity = roundAsset(long.remainingQuantity - quantity);
   long.remainingCostQuote = roundQuote(long.remainingCostQuote - quote);
-  if (context.internalBorrowAccounting === "principal") {
-    long.lentQuantity = roundAsset(Math.min(long.lentQuantity, long.remainingQuantity));
-  }
   long.closedQuantity = roundAsset(long.closedQuantity + quantity);
   long.closedQuote = roundQuote(long.closedQuote + quote);
   return {
@@ -483,6 +480,10 @@ function allocateShortBorrowFromLongLots(
   unitProceeds: number,
   context: LedgerContext,
 ): ShortBorrowAllocation[] {
+  if (context.internalBorrowAccounting === "inactive") {
+    return [];
+  }
+
   let quantityLeft = roundAsset(quantity);
   const allocations: ShortBorrowAllocation[] = [];
   const sources = [...longs]
@@ -490,9 +491,7 @@ function allocateShortBorrowFromLongLots(
       (lot) =>
         lot.borrowDepthRemaining > 0 &&
         !hasLotLifecycleControls(lot) &&
-        (context.internalBorrowAccounting === "principal"
-          ? lot.remainingQuantity - lot.lentQuantity
-          : lot.remainingQuantity) > EPSILON,
+        lot.remainingQuantity > EPSILON,
     )
     .sort((left, right) => {
       const leftBreakEven = longLotBreakEvenBeforeFees(left);
@@ -510,24 +509,16 @@ function allocateShortBorrowFromLongLots(
       break;
     }
 
-    const available = Math.max(
-      0,
-      context.internalBorrowAccounting === "principal"
-        ? source.remainingQuantity - source.lentQuantity
-        : source.remainingQuantity,
-    );
+    const available = Math.max(0, source.remainingQuantity);
     const borrowedQuantity = roundAsset(Math.min(quantityLeft, available));
     if (borrowedQuantity <= EPSILON) {
       continue;
     }
 
     const borrowedQuote = roundQuote(borrowedQuantity * unitProceeds);
-    if (context.internalBorrowAccounting === "principal") {
-      source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
-      source.remainingCostQuote = roundQuote(
-        source.remainingCostQuote - borrowedQuote,
-      );
-    }
+    source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
+    source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
+    source.remainingCostQuote = roundQuote(source.remainingCostQuote - borrowedQuote);
     quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
     allocations.push({
       longLotId: source.id,
@@ -546,6 +537,10 @@ function allocateLongBorrowFromShortLots(
   unitCost: number,
   context: LedgerContext,
 ): LongBorrowAllocation[] {
+  if (context.internalBorrowAccounting === "inactive") {
+    return [];
+  }
+
   let quantityLeft = roundAsset(quantity);
   const allocations: LongBorrowAllocation[] = [];
   const sources = [...shorts]
@@ -572,19 +567,21 @@ function allocateLongBorrowFromShortLots(
       break;
     }
 
-    const affordableQuantity = source.remainingProceedsQuote / unitCost;
+    const affordableQuantity = Math.min(
+      source.remainingQuantity,
+      source.remainingProceedsQuote / unitCost,
+    );
     const borrowedQuantity = roundAsset(Math.min(quantityLeft, affordableQuantity));
     if (borrowedQuantity <= EPSILON) {
       continue;
     }
 
     const borrowedQuote = roundQuote(borrowedQuantity * unitCost);
-    if (context.internalBorrowAccounting === "principal") {
-      source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
-      source.remainingProceedsQuote = roundQuote(
-        source.remainingProceedsQuote - borrowedQuote,
-      );
-    }
+    source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
+    source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
+    source.remainingProceedsQuote = roundQuote(
+      source.remainingProceedsQuote - borrowedQuote,
+    );
     quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
     allocations.push({
       shortLotId: source.id,
@@ -648,24 +645,15 @@ function settleShortBorrowAllocations(
     const long = longs.find((lot) => lot.id === allocation.longLotId);
     if (long) {
       const profitQuote = principalQuote - coverQuote;
-      if (context.internalBorrowAccounting === "principal") {
-        long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
-        const returnedQuote =
-          profitQuote > 0
-            ? roundQuote(
-                principalQuote - profitQuote * context.borrowerProfitShareToLender,
-              )
-            : coverQuote;
-        long.remainingCostQuote = roundQuote(
-          long.remainingCostQuote + returnedQuote,
-        );
-      } else {
-        const lenderCostDelta =
-          profitQuote > 0
-            ? -profitQuote * context.borrowerProfitShareToLender
-            : -profitQuote;
-        long.remainingCostQuote = roundQuote(long.remainingCostQuote + lenderCostDelta);
-      }
+      long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
+      long.remainingQuantity = roundAsset(long.remainingQuantity + quantity);
+      const returnedQuote =
+        profitQuote > 0
+          ? roundQuote(
+              principalQuote - profitQuote * context.borrowerProfitShareToLender,
+            )
+          : coverQuote;
+      long.remainingCostQuote = roundQuote(long.remainingCostQuote + returnedQuote);
     }
 
     allocation.quantity = roundAsset(allocation.quantity - quantity);
@@ -730,26 +718,17 @@ function settleLongBorrowAllocations(
     const short = shorts.find((lot) => lot.id === allocation.shortLotId);
     if (short) {
       const profitQuote = returnedQuote - principalQuote;
-      if (context.internalBorrowAccounting === "principal") {
-        short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
-        const lenderQuote =
-          profitQuote > 0
-            ? roundQuote(
-                principalQuote + profitQuote * context.borrowerProfitShareToLender,
-              )
-            : returnedQuote;
-        short.remainingProceedsQuote = roundQuote(
-          short.remainingProceedsQuote + lenderQuote,
-        );
-      } else {
-        const lenderProceedsDelta =
-          profitQuote > 0
-            ? profitQuote * context.borrowerProfitShareToLender
-            : profitQuote;
-        short.remainingProceedsQuote = roundQuote(
-          short.remainingProceedsQuote + lenderProceedsDelta,
-        );
-      }
+      short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
+      short.remainingQuantity = roundAsset(short.remainingQuantity + quantity);
+      const lenderQuote =
+        profitQuote > 0
+          ? roundQuote(
+              principalQuote + profitQuote * context.borrowerProfitShareToLender,
+            )
+          : returnedQuote;
+      short.remainingProceedsQuote = roundQuote(
+        short.remainingProceedsQuote + lenderQuote,
+      );
     }
 
     allocation.quantity = roundAsset(allocation.quantity - quantity);
@@ -1007,6 +986,7 @@ function finalizeLongLot(
       lot.filledQuantity,
       lot.pendingQuantity,
       lot.remainingQuantity,
+      lot.lentQuantity,
     ),
     closedQuantity: roundAsset(lot.closedQuantity),
     closedQuote: roundQuote(lot.closedQuote),
@@ -1149,7 +1129,7 @@ function lotStatus(
   filledQuantity: number,
   pendingQuantity: number,
   remainingQuantity: number,
-  lentQuote = 0,
+  outstandingLent = 0,
 ): "pending" | "open" | "partially-closed" | "closed" {
   if (pendingQuantity > EPSILON && filledQuantity <= EPSILON) {
     return "pending";
@@ -1157,7 +1137,7 @@ function lotStatus(
   if (
     remainingQuantity <= EPSILON &&
     pendingQuantity <= EPSILON &&
-    lentQuote <= EPSILON
+    outstandingLent <= EPSILON
   ) {
     return "closed";
   }

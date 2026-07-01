@@ -38,7 +38,6 @@ interface BenchmarkArgs {
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
-  lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   borrowDepthMatrix: boolean;
   leverageRangeWindow?: RollingPriceRangeWindow;
@@ -858,7 +857,6 @@ function runBenchmark(
       shortMarginModel: options.shortMarginModel,
       longBorrowDepth: options.longBorrowDepth,
       shortBorrowDepth: options.shortBorrowDepth,
-      lockBorrowedLenderCollateral: options.lockBorrowedLenderCollateral,
       borrowerProfitShareToLender: options.borrowerProfitShareToLender,
       maxPositionQuote,
       minOrderQuote: options.minOrderQuote,
@@ -1325,9 +1323,6 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     ),
     longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 999),
     shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 999),
-    lockBorrowedLenderCollateral:
-      values.get("lock-borrowed-lender-collateral") === "true" ||
-      values.get("lock-borrowed-collateral") === "true",
     borrowerProfitShareToLender: clamp(
       parseFiniteNumber(values.get("borrower-profit-share-to-lender"), 1),
       0,
@@ -2024,7 +2019,7 @@ function borrowDepthSummary(options: BenchmarkArgs): string {
 }
 
 function borrowPolicySummary(options: BenchmarkArgs): string {
-  return `borrow lock ${options.lockBorrowedLenderCollateral ? "on" : "off"}, lender profit share ${formatNumber(
+  return `internal borrow ${options.longBorrowDepth > 0 || options.shortBorrowDepth > 0 ? "active" : "inactive"}, lender profit share ${formatNumber(
     options.borrowerProfitShareToLender,
     2,
   )}`;
@@ -2080,9 +2075,6 @@ function formatGridConfig(config: PartialStrategyConfig): string {
   }
   if (config.shortBorrowDepth !== undefined) {
     parts.push(`shortBorrowDepth=${config.shortBorrowDepth}`);
-  }
-  if (config.lockBorrowedLenderCollateral !== undefined) {
-    parts.push(`lockBorrowed=${config.lockBorrowedLenderCollateral}`);
   }
   if (config.borrowerProfitShareToLender !== undefined) {
     parts.push(`profitShare=${config.borrowerProfitShareToLender}`);

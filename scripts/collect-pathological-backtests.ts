@@ -30,7 +30,6 @@ interface PathologyArgs {
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
-  lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   maxOpenOrders: number;
   cooldownSec: number;
@@ -48,7 +47,6 @@ interface StrategySettings {
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
-  lockBorrowedLenderCollateral: boolean;
   borrowerProfitShareToLender: number;
   maxOpenOrders: number;
   cooldownSec: number;
@@ -255,7 +253,6 @@ function rerunSavedPathologies(args: PathologyArgs): void {
     shortMarginModel: suite.strategy.settings.shortMarginModel,
     longBorrowDepth: suite.strategy.settings.longBorrowDepth,
     shortBorrowDepth: suite.strategy.settings.shortBorrowDepth,
-    lockBorrowedLenderCollateral: suite.strategy.settings.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender: suite.strategy.settings.borrowerProfitShareToLender,
     maxOpenOrders: suite.strategy.settings.maxOpenOrders,
     cooldownSec: suite.strategy.settings.cooldownSec,
@@ -328,7 +325,6 @@ function strategyConfig(symbol: string, settings: StrategySettings): PartialStra
     shortMarginModel: settings.shortMarginModel,
     longBorrowDepth: settings.longBorrowDepth,
     shortBorrowDepth: settings.shortBorrowDepth,
-    lockBorrowedLenderCollateral: settings.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender: settings.borrowerProfitShareToLender,
     maxOpenOrders: settings.maxOpenOrders,
     cooldownMs: settings.cooldownSec * 1000,
@@ -656,9 +652,6 @@ function parseArgs(argv: string[]): PathologyArgs {
     ),
     longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 999),
     shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 999),
-    lockBorrowedLenderCollateral:
-      values.get("lock-borrowed-lender-collateral") === "true" ||
-      values.get("lock-borrowed-collateral") === "true",
     borrowerProfitShareToLender: clamp(
       parseFiniteNumber(values.get("borrower-profit-share-to-lender"), 1),
       0,
@@ -722,7 +715,6 @@ function strategySettingsFromArgs(args: PathologyArgs): StrategySettings {
     shortMarginModel: args.shortMarginModel,
     longBorrowDepth: args.longBorrowDepth,
     shortBorrowDepth: args.shortBorrowDepth,
-    lockBorrowedLenderCollateral: args.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender: args.borrowerProfitShareToLender,
     maxOpenOrders: args.maxOpenOrders,
     cooldownSec: args.cooldownSec,

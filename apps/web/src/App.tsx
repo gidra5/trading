@@ -1464,11 +1464,6 @@ function AlgorithmPanel(props: {
                   step={1}
                   onInput={(value) => update("shortBorrowDepth", Math.round(value))}
                 />
-                <BooleanField
-                  label="Lock Lent Collateral"
-                  checked={config().lockBorrowedLenderCollateral}
-                  onInput={(value) => update("lockBorrowedLenderCollateral", value)}
-                />
                 <NumberField
                   label="Profit Share"
                   value={config().borrowerProfitShareToLender}

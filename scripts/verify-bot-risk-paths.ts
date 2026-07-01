@@ -68,7 +68,6 @@ function verifyInternalBaseBorrow(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    lockBorrowedLenderCollateral: true,
   });
   bot.recordManualTrade(
     { side: "buy", price: 10_000, quantity: 0.05, positionEffect: "open" },
@@ -84,7 +83,7 @@ function verifyInternalBaseBorrow(): string {
   const short = ledger.shorts.find((lot) => lot.remainingQuantity > 0);
   assert.ok(long, "Expected the lending long lot.");
   assert.ok(short, "Expected an active short lot.");
-  expectApprox(long.remainingQuantity, 0.05, "lender long remaining quantity");
+  expectApprox(long.remainingQuantity, 0.02, "lender long remaining quantity");
   expectApprox(long.lentQuantity ?? 0, 0.03, "lender long lent quantity");
   expectApprox(long.remainingCostQuote, 170, "lender long remaining cost after lend");
   expectApprox(ledger.summary.internalBorrowedBaseQuantity, 0.03, "internal short base borrow");
@@ -99,7 +98,6 @@ function verifyInternalQuoteBorrow(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    lockBorrowedLenderCollateral: true,
   });
   bot.recordManualTrade(
     { side: "sell", price: 11_000, quantity: 0.05, positionEffect: "open" },
@@ -385,7 +383,6 @@ function verifyClosedPositionRemainderProfit(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    lockBorrowedLenderCollateral: true,
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -399,7 +396,7 @@ function verifyClosedPositionRemainderProfit(): string {
   const afterBorrow = activeLedger(bot, 80);
   const borrowedLong = afterBorrow.longs.find((lot) => lot.lentQuantity > 0);
   assert.ok(borrowedLong, "Expected the long lot to lend base to the short.");
-  expectApprox(borrowedLong.remainingQuantity, 1, "borrowed long remaining quantity");
+  expectApprox(borrowedLong.remainingQuantity, 0, "borrowed long remaining quantity");
   expectApprox(borrowedLong.lentQuantity ?? 0, 1, "borrowed long lent quantity");
   expectApprox(borrowedLong.remainingCostQuote, 20, "borrowed long remaining cost");
 
@@ -434,7 +431,6 @@ function verifyShortLenderStaysOpenUntilQuoteReturns(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    lockBorrowedLenderCollateral: true,
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -449,30 +445,25 @@ function verifyShortLenderStaysOpenUntilQuoteReturns(): string {
   const afterBorrow = activeLedger(bot, 90);
   const lendingShort = afterBorrow.shorts.find((lot) => lot.lentQuote > 0);
   assert.ok(lendingShort, "Expected the short lot to lend quote to the long.");
-  expectApprox(lendingShort.remainingQuantity, 1, "lending short quantity before cover");
+  expectApprox(lendingShort.remainingQuantity, 0, "lending short quantity before cover");
   expectApprox(lendingShort.remainingProceedsQuote, 10, "lending short remaining proceeds");
   expectApprox(lendingShort.lentQuote, 90, "lending short lent quote");
 
   bot.recordManualTrade(
-    { side: "buy", price: 80, quantity: 1, positionEffect: "close" },
+    { side: "sell", price: 95, quantity: 1, positionEffect: "close" },
     3,
   );
-  const afterCover = activeLedger(bot, 80);
-  const coveredShort = afterCover.shorts.find((lot) => lot.lentQuote > 0);
-  assert.ok(coveredShort, "Expected the covered short to remain while quote is lent.");
-  assert.equal(coveredShort.status, "partially-closed");
-  expectApprox(coveredShort.remainingQuantity, 0, "covered short remaining quantity");
-  expectApprox(coveredShort.lentQuote, 90, "covered short still-lent quote");
+  const afterReturn = activeLedger(bot, 95);
+  const settledShort = afterReturn.shorts.find((lot) => lot.id === lendingShort.id);
+  assert.ok(settledShort, "Expected the short lot to remain in the ledger.");
+  assert.equal(settledShort.status, "open");
+  expectApprox(settledShort.remainingQuantity, 1, "settled short returned quantity");
+  expectApprox(settledShort.lentQuote, 0, "settled short lent quote");
 
   bot.recordManualTrade(
-    { side: "sell", price: 95, quantity: 1, positionEffect: "close" },
+    { side: "buy", price: 80, quantity: 1, positionEffect: "close" },
     4,
   );
-  const afterReturn = activeLedger(bot, 95);
-  const settledShort = afterReturn.shorts.find((lot) => lot.id === coveredShort.id);
-  assert.ok(settledShort, "Expected the short lot to remain in the ledger.");
-  assert.equal(settledShort.status, "closed");
-  expectApprox(settledShort.lentQuote, 0, "settled short lent quote");
 
   const stats = summarizeClosedPositions(bot.snapshot());
   assert.equal(stats.closedPositionCount, 2);
@@ -484,7 +475,6 @@ function verifyBorrowerProfitDistributedAcrossLenders(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    lockBorrowedLenderCollateral: true,
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -525,12 +515,11 @@ function verifyBorrowerProfitDistributedAcrossLenders(): string {
   return "borrower profit distributed across lenders";
 }
 
-function verifyUnlockedInternalBaseBorrowLeavesLenderSellable(): string {
+function verifyInactiveInternalBorrowDoesNotMutateLender(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
-    internalBorrowAccounting: "pnl-only",
-    lockBorrowedLenderCollateral: false,
+    internalBorrowAccounting: "inactive",
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -546,11 +535,12 @@ function verifyUnlockedInternalBaseBorrowLeavesLenderSellable(): string {
   const long = afterBorrow.longs.find((lot) => lot.remainingQuantity > 0);
   const short = afterBorrow.shorts.find((lot) => lot.remainingQuantity > 0);
   assert.ok(long, "Expected the base-lending long lot.");
-  assert.ok(short, "Expected the internally borrowed short lot.");
-  expectApprox(long.remainingQuantity, 1, "unlocked lender available quantity");
-  expectApprox(long.lentQuantity ?? 0, 0, "unlocked lender lent quantity");
-  expectApprox(long.remainingCostQuote, 100, "unlocked lender cost before settlement");
-  expectApprox(short.internalBorrowedQuantity, 1, "unlocked short internal borrow");
+  assert.ok(short, "Expected the short lot.");
+  expectApprox(long.remainingQuantity, 1, "inactive lender available quantity");
+  expectApprox(long.lentQuantity ?? 0, 0, "inactive lender lent quantity");
+  expectApprox(long.remainingCostQuote, 100, "inactive lender cost before settlement");
+  expectApprox(short.internalBorrowedQuantity, 0, "inactive short internal borrow");
+  expectApprox(short.externalBorrowedQuantity, 1, "inactive short external borrow");
 
   bot.recordManualTrade(
     { side: "buy", price: 70, quantity: 1, positionEffect: "close" },
@@ -558,9 +548,9 @@ function verifyUnlockedInternalBaseBorrowLeavesLenderSellable(): string {
   );
   const afterShortClose = activeLedger(bot, 70);
   const settledLong = afterShortClose.longs.find((lot) => lot.id === long.id);
-  assert.ok(settledLong, "Expected the long lot to receive borrower settlement.");
-  expectApprox(settledLong.remainingQuantity, 1, "unlocked settled lender quantity");
-  expectApprox(settledLong.remainingCostQuote, 90, "unlocked lender cost after short profit");
+  assert.ok(settledLong, "Expected the long lot to remain unchanged.");
+  expectApprox(settledLong.remainingQuantity, 1, "inactive settled lender quantity");
+  expectApprox(settledLong.remainingCostQuote, 100, "inactive lender cost after short profit");
 
   bot.recordManualTrade(
     { side: "sell", price: 95, quantity: 1, positionEffect: "close" },
@@ -569,8 +559,8 @@ function verifyUnlockedInternalBaseBorrowLeavesLenderSellable(): string {
   const closedLong = activeLedger(bot, 95).longs.find((lot) => lot.id === long.id);
   assert.ok(closedLong, "Expected the long lot to remain in the ledger.");
   assert.equal(closedLong.status, "closed");
-  expectApprox(closedLong.remainingCostQuote, -5, "unlocked closed long remainder profit");
-  return "unlocked internal base borrow leaves lender sellable";
+  expectApprox(closedLong.remainingCostQuote, 5, "inactive closed long remainder loss");
+  return "inactive internal borrow does not mutate lender";
 }
 
 const checks = [
@@ -587,7 +577,7 @@ const checks = [
   verifyClosedPositionRemainderProfit,
   verifyShortLenderStaysOpenUntilQuoteReturns,
   verifyBorrowerProfitDistributedAcrossLenders,
-  verifyUnlockedInternalBaseBorrowLeavesLenderSellable,
+  verifyInactiveInternalBorrowDoesNotMutateLender,
 ];
 
 for (const check of checks) {

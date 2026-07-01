@@ -55,8 +55,6 @@ export const appConfig = {
     maxLeverage: Number(process.env.TRADING_MAX_LEVERAGE ?? 5),
     longBorrowDepth: parseNumber(process.env.TRADING_LONG_BORROW_DEPTH, 7),
     shortBorrowDepth: parseNumber(process.env.TRADING_SHORT_BORROW_DEPTH, 7),
-    lockBorrowedLenderCollateral:
-      process.env.TRADING_LOCK_BORROWED_LENDER_COLLATERAL !== "false",
     borrowerProfitShareToLender: parseNumber(
       process.env.TRADING_BORROWER_PROFIT_SHARE_TO_LENDER,
       1,

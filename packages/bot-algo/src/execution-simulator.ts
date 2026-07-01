@@ -56,8 +56,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   shortMarginModel: "futures-margin",
   longBorrowDepth: 999,
   shortBorrowDepth: 999,
-  internalBorrowAccounting: "principal",
-  lockBorrowedLenderCollateral: false,
+  internalBorrowAccounting: "active",
   borrowerProfitShareToLender: 1,
   feeBps: 7.5,
   maxPositionQuote: Number.POSITIVE_INFINITY,
@@ -216,9 +215,6 @@ export function createStrategyConfig(
       overrides.internalBorrowAccounting ??
         defaultStrategyConfig.internalBorrowAccounting,
     ),
-    lockBorrowedLenderCollateral:
-      overrides.lockBorrowedLenderCollateral ??
-      defaultStrategyConfig.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender: clamp(
       cleanFiniteNumber(
         overrides.borrowerProfitShareToLender ??
@@ -2287,7 +2283,7 @@ export class SimulatedExecutionEngine {
       for (const allocation of lot.borrowAllocations) {
         internalBorrowedQuantity += Math.max(0, allocation.quantity);
       }
-      const exposureQuantity = Math.max(0, lot.remainingQuantity + lot.lentQuantity);
+      const exposureQuantity = Math.max(0, lot.remainingQuantity);
       if (exposureQuantity > MIN_BASE_QUANTITY) {
         longExposureQuantity += exposureQuantity;
       }
@@ -2518,9 +2514,6 @@ export class SimulatedExecutionEngine {
     );
     lot.remainingQuantity = roundAsset(lot.remainingQuantity - quantity);
     lot.remainingCostQuote = roundQuote(lot.remainingCostQuote - quote);
-    if (this.state.config.internalBorrowAccounting === "principal") {
-      lot.lentQuantity = roundAsset(Math.min(lot.lentQuantity, lot.remainingQuantity));
-    }
     lot.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
       lot,
       feeAndSlippageRate,
@@ -2574,6 +2567,10 @@ export class SimulatedExecutionEngine {
     unitProceeds: number,
     feeAndSlippageRate: number,
   ): LegacyShortBorrowAllocation[] {
+    if (this.state.config.internalBorrowAccounting === "inactive") {
+      return [];
+    }
+
     let quantityLeft = roundAsset(quantity);
     const allocations: LegacyShortBorrowAllocation[] = [];
     const sources = [...cache.longs.values()]
@@ -2581,9 +2578,7 @@ export class SimulatedExecutionEngine {
         (lot) =>
           lot.borrowDepthRemaining > 0 &&
           !hasLotLifecycleControls(lot) &&
-          (this.state.config.internalBorrowAccounting === "principal"
-            ? lot.remainingQuantity - lot.lentQuantity
-            : lot.remainingQuantity) > MIN_BASE_QUANTITY,
+          lot.remainingQuantity > MIN_BASE_QUANTITY,
       )
       .sort((left, right) => {
         const leftBreakEven = this.legacyLongLotBreakEvenBeforeFees(left);
@@ -2601,28 +2596,20 @@ export class SimulatedExecutionEngine {
         break;
       }
 
-      const available = Math.max(
-        0,
-        this.state.config.internalBorrowAccounting === "principal"
-          ? source.remainingQuantity - source.lentQuantity
-          : source.remainingQuantity,
-      );
+      const available = Math.max(0, source.remainingQuantity);
       const borrowedQuantity = roundAsset(Math.min(quantityLeft, available));
       if (borrowedQuantity <= MIN_BASE_QUANTITY) {
         continue;
       }
 
       const borrowedQuote = roundQuote(borrowedQuantity * unitProceeds);
-      if (this.state.config.internalBorrowAccounting === "principal") {
-        source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
-        source.remainingCostQuote = roundQuote(
-          source.remainingCostQuote - borrowedQuote,
-        );
-        source.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
-          source,
-          feeAndSlippageRate,
-        );
-      }
+      source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
+      source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
+      source.remainingCostQuote = roundQuote(source.remainingCostQuote - borrowedQuote);
+      source.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
+        source,
+        feeAndSlippageRate,
+      );
       quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
       allocations.push({
         longLotId: source.id,
@@ -2641,6 +2628,10 @@ export class SimulatedExecutionEngine {
     unitCost: number,
     feeFactor: number,
   ): LegacyLongBorrowAllocation[] {
+    if (this.state.config.internalBorrowAccounting === "inactive") {
+      return [];
+    }
+
     let quantityLeft = roundAsset(quantity);
     const allocations: LegacyLongBorrowAllocation[] = [];
     const sources = [...cache.shorts.values()]
@@ -2667,23 +2658,25 @@ export class SimulatedExecutionEngine {
         break;
       }
 
-      const affordableQuantity = source.remainingProceedsQuote / unitCost;
+      const affordableQuantity = Math.min(
+        source.remainingQuantity,
+        source.remainingProceedsQuote / unitCost,
+      );
       const borrowedQuantity = roundAsset(Math.min(quantityLeft, affordableQuantity));
       if (borrowedQuantity <= MIN_BASE_QUANTITY) {
         continue;
       }
 
       const borrowedQuote = roundQuote(borrowedQuantity * unitCost);
-      if (this.state.config.internalBorrowAccounting === "principal") {
-        source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
-        source.remainingProceedsQuote = roundQuote(
-          source.remainingProceedsQuote - borrowedQuote,
-        );
-        source.breakEvenBuyPrice = this.legacyShortLotBreakEvenBuyPrice(
-          source,
-          feeFactor,
-        );
-      }
+      source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
+      source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
+      source.remainingProceedsQuote = roundQuote(
+        source.remainingProceedsQuote - borrowedQuote,
+      );
+      source.breakEvenBuyPrice = this.legacyShortLotBreakEvenBuyPrice(
+        source,
+        feeFactor,
+      );
       quantityLeft = roundAsset(quantityLeft - borrowedQuantity);
       allocations.push({
         shortLotId: source.id,
@@ -2748,25 +2741,16 @@ export class SimulatedExecutionEngine {
       const long = cache.longs.get(allocation.longLotId);
       if (long) {
         const profitQuote = principalQuote - coverQuote;
-        if (this.state.config.internalBorrowAccounting === "principal") {
-          long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
-          const returnedQuote =
-            profitQuote > 0
-              ? roundQuote(
-                  principalQuote -
-                    profitQuote * this.state.config.borrowerProfitShareToLender,
-                )
-              : coverQuote;
-          long.remainingCostQuote = roundQuote(
-            long.remainingCostQuote + returnedQuote,
-          );
-        } else {
-          const lenderCostDelta =
-            profitQuote > 0
-              ? -profitQuote * this.state.config.borrowerProfitShareToLender
-              : -profitQuote;
-          long.remainingCostQuote = roundQuote(long.remainingCostQuote + lenderCostDelta);
-        }
+        long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
+        long.remainingQuantity = roundAsset(long.remainingQuantity + quantity);
+        const returnedQuote =
+          profitQuote > 0
+            ? roundQuote(
+                principalQuote -
+                  profitQuote * this.state.config.borrowerProfitShareToLender,
+              )
+            : coverQuote;
+        long.remainingCostQuote = roundQuote(long.remainingCostQuote + returnedQuote);
         long.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
           long,
           feeAndSlippageRate,
@@ -2838,27 +2822,18 @@ export class SimulatedExecutionEngine {
       const short = cache.shorts.get(allocation.shortLotId);
       if (short) {
         const profitQuote = returnedQuote - principalQuote;
-        if (this.state.config.internalBorrowAccounting === "principal") {
-          short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
-          const lenderQuote =
-            profitQuote > 0
-              ? roundQuote(
-                  principalQuote +
-                    profitQuote * this.state.config.borrowerProfitShareToLender,
-                )
-              : returnedQuote;
-          short.remainingProceedsQuote = roundQuote(
-            short.remainingProceedsQuote + lenderQuote,
-          );
-        } else {
-          const lenderProceedsDelta =
-            profitQuote > 0
-              ? profitQuote * this.state.config.borrowerProfitShareToLender
-              : profitQuote;
-          short.remainingProceedsQuote = roundQuote(
-            short.remainingProceedsQuote + lenderProceedsDelta,
-          );
-        }
+        short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
+        short.remainingQuantity = roundAsset(short.remainingQuantity + quantity);
+        const lenderQuote =
+          profitQuote > 0
+            ? roundQuote(
+                principalQuote +
+                  profitQuote * this.state.config.borrowerProfitShareToLender,
+              )
+            : returnedQuote;
+        short.remainingProceedsQuote = roundQuote(
+          short.remainingProceedsQuote + lenderQuote,
+        );
         short.breakEvenBuyPrice = this.legacyShortLotBreakEvenBuyPrice(
           short,
           feeFactor,
@@ -3202,10 +3177,7 @@ export class SimulatedExecutionEngine {
     const upperPrice = roundQuote(cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice);
     const lowerPrice = roundQuote(Math.min(grid.troughPrice ?? upperPrice, upperPrice));
     const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
-    const lockedQuantity = config.lockBorrowedLenderCollateral
-      ? (lot.lentQuote ?? 0) / Math.max(upperPrice, MIN_BASE_QUANTITY)
-      : 0;
-    const availableQuantity = Math.max(0, lot.remainingQuantity - lockedQuantity);
+    const availableQuantity = Math.max(0, lot.remainingQuantity);
     const orderCount = this.legacyExitGridOrderCount({
       lowerPrice,
       upperPrice,
@@ -4558,8 +4530,6 @@ function mergeStrategyOverrides(
     shortBorrowDepth: overrides.shortBorrowDepth ?? base.shortBorrowDepth,
     internalBorrowAccounting:
       overrides.internalBorrowAccounting ?? base.internalBorrowAccounting,
-    lockBorrowedLenderCollateral:
-      overrides.lockBorrowedLenderCollateral ?? base.lockBorrowedLenderCollateral,
     borrowerProfitShareToLender:
       overrides.borrowerProfitShareToLender ?? base.borrowerProfitShareToLender,
     feeBps: overrides.feeBps ?? base.feeBps,
@@ -4589,7 +4559,7 @@ function normalizeShortMarginModel(
 function normalizeInternalBorrowAccounting(
   value: InternalBorrowAccounting | undefined,
 ): InternalBorrowAccounting {
-  return value === "pnl-only" ? "pnl-only" : "principal";
+  return value === "inactive" ? "inactive" : "active";
 }
 
 function normalizeBorrowDepth(value: number): number {

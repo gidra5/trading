@@ -450,14 +450,16 @@ but partial borrower closes settle every outstanding allocation by the same
 remaining-quantity ratio. Borrower profit or loss is therefore shared across all active
 source lots instead of being assigned FIFO.
 
-Lent BTC is removed from a long lender's sellable `remainingQuantity`, so long exit
-grids cannot sell borrowed-out BTC. When `lockBorrowedLenderCollateral` is enabled,
-short lenders also lock the cover quantity represented by `lentQuote` at the current
-break-even grid price. `borrowerProfitShareToLender` controls how much of a
-profitable borrower close is credited back into the lender's lot basis. `1` preserves
-the older behavior where the lender receives the full borrower profit, while `0` keeps
-the borrower's profit free at the account level instead of lowering the lender's
-break-even further. Borrower losses are still charged back through the lender basis.
+Active internal borrow removes both the asset quantity and the quote basis/proceeds
+from lender lots. Lent BTC is removed from a long lender's sellable
+`remainingQuantity`, so long exit grids cannot sell borrowed-out BTC. Quote borrowed
+from a short lender also removes the paired cover quantity from that short lot until
+the funded long settles. `internalBorrowAccounting = "inactive"` disables these
+internal allocations entirely, so lenders are not mutated and borrower PnL is not
+settled back into them. `borrowerProfitShareToLender` controls how much of a
+profitable borrower close is credited back into the lender's lot basis/proceeds.
+Borrower losses are still charged back through the lender basis/proceeds in active
+mode.
 
 ## Current Defaults To Watch
 
@@ -468,7 +470,7 @@ break-even further. Borrower losses are still charged back through the lender ba
 | `shortMarginModel` | `futures-margin` | Exchange-level leverage model; futures uses signed net exposure, spot-borrow uses borrowed liabilities. |
 | `longBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original long lender. |
 | `shortBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original short lender. |
-| `lockBorrowedLenderCollateral` | `false` | Lender lots can still exit-grid collateral currently lent to borrowers. |
+| `internalBorrowAccounting` | `active` | Internal borrowers remove lender asset and quote principal; `inactive` disables internal allocation and settlement. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
 | `maxPositionQuote` | Uncapped | Optional maximum notional the strategy can build per side; finite caps are explicit overrides. |
 | `leverageLongTermRangePaddingPct` | `3` | Extra range padding used when selecting baseline entry leverage from the long-term min/max. |

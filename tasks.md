@@ -42,6 +42,9 @@ Before transitioning trend to sideways we wait until rate crosses 0. Then if it 
 0.3	0.3	0/0 both sides suddenly drops even more to -41.81%, the deeper borrows only make things worse up to -60.73% in 999/0 case. the 0.1 case is basically the same but scaled down.
 the best results are short-side only - 0.3 sigma with +21.02%, and 0.1 sigma with +4.31%. buy sigma and depth are irrelevant here, since longs are not created at all.
 
+sell sigma=ae^-x, a some constant, x derivative higher level sma
+buy sigma=ae^x
+
 the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
 
 - develop strategy
