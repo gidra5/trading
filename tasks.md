@@ -48,6 +48,8 @@ buy sigma=b+a*ln(e^-x+c)
 3 representative interavals, but sideways with a rally inbetween defied expectations. 
 st “sideways but choppy” candidates:
 
+static with different sigmas (0.1, 0.3)
+
 Window	Close/Open	Low	High	Span	Movement score
 2022-07-28..2022-08-03	-0.59%	22582.13	24668	9.09%	highest OHLC churn
 2022-05-14..2022-05-20	-0.29%	28630	31460	9.66%	highest close-to-close churn
