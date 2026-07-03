@@ -1522,6 +1522,20 @@ function AlgorithmPanel(props: {
                   checked={config().legacyValleyPeak.shortSideEnabled}
                   onInput={(value) => updateValleyPeak("shortSideEnabled", value)}
                 />
+                <SelectField
+                  label="Sigma Mode"
+                  value={config().legacyValleyPeak.sigmaMode}
+                  options={[
+                    { value: "trend", label: "Trend" },
+                    { value: "static", label: "Static" },
+                  ]}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "sigmaMode",
+                      value as StrategyConfig["legacyValleyPeak"]["sigmaMode"],
+                    )
+                  }
+                />
                 <NumberField
                   label="Buy Sigma"
                   value={config().legacyValleyPeak.buySigma}
@@ -1535,6 +1549,27 @@ function AlgorithmPanel(props: {
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("sellSigma", value)}
+                />
+                <NumberField
+                  label="Sigma A"
+                  value={config().legacyValleyPeak.trendSigmaA}
+                  min={0.000001}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("trendSigmaA", value)}
+                />
+                <NumberField
+                  label="Sell b1"
+                  value={config().legacyValleyPeak.trendSigmaSellB1}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("trendSigmaSellB1", value)}
+                />
+                <NumberField
+                  label="Buy b2"
+                  value={config().legacyValleyPeak.trendSigmaBuyB2}
+                  min={0}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("trendSigmaBuyB2", value)}
                 />
                 <NumberField
                   label="Signal Min"
@@ -1993,6 +2028,10 @@ function DecisionCheck(props: {
         primary {check()?.primaryIndex} {check()?.primaryShape} · rate{" "}
         {formatRatePerHour(check()?.primaryRateClamped)}
       </div>
+      <div class="mt-1 text-xs text-ink-300">
+        sigma {formatSmallNumber(check()?.effectiveSigma)} · trend{" "}
+        {formatSmallNumber(check()?.trendRate)}
+      </div>
       <div class="mt-1 text-xs text-ink-300">{size()}</div>
       <div class="mt-2 grid grid-cols-[repeat(auto-fit,minmax(10rem,1fr))] gap-1">
         <For each={check()?.confirmations ?? []}>
@@ -2056,6 +2095,18 @@ function formatRatePerHour(value: number | undefined): string {
     return "-";
   }
   return `${formatQuote((value as number) * 100 * 3600, 5)}%/h`;
+}
+
+function formatSmallNumber(value: number | undefined): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  const finite = value as number;
+  if (Math.abs(finite) > 0 && Math.abs(finite) < 0.0001) {
+    return finite.toExponential(3);
+  }
+  return formatQuote(finite, 6);
 }
 
 function formatEntryRiskSummary(

@@ -34,7 +34,7 @@ equal sigmas
 for Long Range Bounds use largest suitable candle width instead of 1m granularity
 try ema instead of sma
 
-Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size
+Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size. maybw makes sense for exit as well.
 
 Before transitioning trend to sideways we wait until rate crosses 0. Then if it gets through either rate threshold or absolute threshold relative to point when we entered sideways trend, then we transition into directional trend. The qbs threshold is about the size of fees
 
@@ -42,8 +42,24 @@ Before transitioning trend to sideways we wait until rate crosses 0. Then if it 
 0.3	0.3	0/0 both sides suddenly drops even more to -41.81%, the deeper borrows only make things worse up to -60.73% in 999/0 case. the 0.1 case is basically the same but scaled down.
 the best results are short-side only - 0.3 sigma with +21.02%, and 0.1 sigma with +4.31%. buy sigma and depth are irrelevant here, since longs are not created at all.
 
-sell sigma=ae^-x, a some constant, x derivative higher level sma
-buy sigma=ae^x
+sell sigma=b+a*ln(e^x+c), a some constant, x derivative of higher level sma
+buy sigma=b+a*ln(e^-x+c)
+
+3 representative interavals, but sideways with a rally inbetween defied expectations. 
+st “sideways but choppy” candidates:
+
+Window	Close/Open	Low	High	Span	Movement score
+2022-07-28..2022-08-03	-0.59%	22582.13	24668	9.09%	highest OHLC churn
+2022-05-14..2022-05-20	-0.29%	28630	31460	9.66%	highest close-to-close churn
+2021-12-14..2021-12-20	+0.45%	45456	49500	8.66%	very choppy
+2021-09-08..2021-09-14	+0.52%	43370	47399.97	8.60%	very choppy
+2023-03-18..2023-03-24	+0.22%	26578	28868.05	8.36%	choppy, near-flat close
+
+Regime	Window	Market move	Static sigmas	Return	Max DD	Trades
+Uptrend	2023-03-11..2023-03-17	+35.95%	buy 0.3, sell 0.1	+17.32%	5.32%	1,778
+Sideways	2026-04-22..2026-04-28	+0.009%	buy 0.1, sell 0.1	+0.27%	0.35%	160
+Downtrend	2022-06-12..2022-06-18	-33.26%	buy 0.1, sell 0.3	+29.58%	7.79%	3,533
+
 
 the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
 

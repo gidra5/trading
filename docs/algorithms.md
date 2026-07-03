@@ -298,17 +298,25 @@ entry buying power =
 ## Buy Sizing
 
 On a confirmed valley, the strategy computes a desired quote notional from leveraged
-entry buying power and the 30m derivative:
+entry buying power and the 30m derivative. The Gaussian sigma is adjusted by the
+overall 1h SMA trend:
 
 ```text
+buy sigma =
+  legacyValleyPeak.trendSigmaA
+  * exp(legacyValleyPeak.trendSigmaBuyB2 * derivative1h)
+
 desired buy quote =
   entry buying power
   * legacyValleyPeak.buySpendRate
-  * gaussian(derivative30m, 0, legacyValleyPeak.buySigma)
+  * gaussian(derivative30m, 0, buy sigma)
 ```
 
 The Gaussian term is largest when the derivative is near zero and smaller when the
-average is moving sharply. That keeps the largest buys near smooth turning points.
+average is moving sharply. In an upward 1h trend, buy sigma widens and sell sigma
+tightens; in a downward 1h trend, sell sigma widens and buy sigma tightens.
+When relative rates are enabled, `derivative1h` is multiplied by the same BTC reference
+price used for raw sigma normalization before it is used in the exponent.
 
 The final buy quote is clamped by:
 
@@ -325,10 +333,14 @@ On a confirmed peak, the strategy computes a desired base quantity from availabl
 and the same 30m derivative style:
 
 ```text
+sell sigma =
+  legacyValleyPeak.trendSigmaA
+  * exp(-legacyValleyPeak.trendSigmaSellB1 * derivative1h)
+
 desired sell base =
   baseFree
   * legacyValleyPeak.sellAmountRate
-  * gaussian(derivative30m, 0, legacyValleyPeak.sellSigma)
+  * gaussian(derivative30m, 0, sell sigma)
 ```
 
 The final sell quantity is clamped by:
@@ -470,7 +482,7 @@ mode.
 | `shortMarginModel` | `futures-margin` | Exchange-level leverage model; futures uses signed net exposure, spot-borrow uses borrowed liabilities. |
 | `longBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original long lender. |
 | `shortBorrowDepth` | `999` | Number of alternating internal borrow hops allowed from an original short lender. |
-| `internalBorrowAccounting` | `active` | Internal borrowers remove lender asset and quote principal; `inactive` disables internal allocation and settlement. |
+| `internalBorrowAccounting` | `inactive` | Internal allocation and settlement are disabled by default; `active` removes lender asset and quote principal. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
 | `maxPositionQuote` | Uncapped | Optional maximum notional the strategy can build per side; finite caps are explicit overrides. |
 | `leverageLongTermRangePaddingPct` | `3` | Extra range padding used when selecting baseline entry leverage from the long-term min/max. |
@@ -484,8 +496,9 @@ mode.
 | `legacyValleyPeak.relativeRateEnabled` | `true` | Uses price-scale-invariant relative derivatives by default; disable only for old absolute-rate baseline comparisons. |
 | `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
 | `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
-| `legacyValleyPeak.buySigma` | `0.000003` | Buy Gaussian width around the sizing derivative after relative-mode normalization from the raw BTC-scale `0.3` default. |
-| `legacyValleyPeak.sellSigma` | `0.000001` | Sell Gaussian width around the sizing derivative after relative-mode normalization from the raw BTC-scale `0.1` default. |
+| `legacyValleyPeak.trendSigmaA` | `1` | Raw base Gaussian width; relative mode normalizes the effective sigma from BTC-scale units. |
+| `legacyValleyPeak.trendSigmaSellB1` | `1` | Sell sigma exponent multiplier in `a * exp(-b1 * derivative1h)`. |
+| `legacyValleyPeak.trendSigmaBuyB2` | `1` | Buy sigma exponent multiplier in `a * exp(b2 * derivative1h)`. |
 | `legacyValleyPeak.exitGridEnabled` | `true` | Enables the peak-to-entry exit ladder. |
 | `legacyValleyPeak.exitGridMarketEntry` | `true` | Uses immediate market-style valley entries in grid mode. |
 | `legacyValleyPeak.exitGridOrderCount` | `200` | Maximum orders in a recreated exit ladder. |

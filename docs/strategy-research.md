@@ -480,7 +480,8 @@ Exact config:
 - detector: `buyDataIndex = 1`, `sellDataIndex = 1`,
   `buyConfirmationOffsets = [2, 1]`, `sellConfirmationOffsets = [2, 1]`
 - detector sizing: `saturationSec = 3600`, `buySpendRate = 1`,
-  `sellAmountRate = 1`, `buySigma = 0.3`, `sellSigma = 0.1`,
+  `sellAmountRate = 1`, `trendSigmaA = 1`, `trendSigmaSellB1 = 1`,
+  `trendSigmaBuyB2 = 1`,
   `minTradeQuote = 25`, `maxTradeQuote = 50000`
 - exit grid: enabled, market entry enabled, `exitGridOrderCount = 6`,
   `exitGridPriceDistribution = "uniform"`,

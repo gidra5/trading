@@ -116,7 +116,8 @@ uses configured fees but floors slippage at the default `10bps` assumption so li
 order-book slippage estimates near zero do not make historical oracle returns
 non-comparable.
 The benchmark script defaults to the strict-symmetric `0.35%` anchor assumptions:
-`5x`, `futures-margin`, active `999/999` internal borrow depth, `300s` cooldown, and a
+`5x`, `futures-margin`, inactive internal borrow accounting, `999/999` borrow depth,
+`300s` cooldown, and a
 skipped per-side position cap unless `--max-position-quote` is supplied. Fixed historical, synthetic, grid, and
 portfolio checks should generally stay no-leverage first; run paired `1x` and `5x`
 comparisons mainly for random-window validation. The `--only relaxed` comparison includes
@@ -124,8 +125,8 @@ the current relaxed per-lot long/short default, long-only, and short-only varian
 `--short-margin spot-borrow` to test borrowed-base spot-margin debt instead of
 collateral-backed futures-style gross exposure.
 Use `--long-borrow-depth` and `--short-borrow-depth` to test depth-limited internal
-borrow chains by origin side. Active internal borrow removes lender asset and quote
-principal. Use `--borrower-profit-share-to-lender` with a value from `0` to `1` to decide how much
+borrow chains by origin side when active internal borrow accounting is enabled. Active
+internal borrow removes lender asset and quote principal. Use `--borrower-profit-share-to-lender` with a value from `0` to `1` to decide how much
 profitable borrower closes lower the lender's break-even. Use
 `--max-open-orders` to test the strategy-level resting order cap. Use
 `--borrow-depth-matrix` to expand the selected case across the standard `0/0`, `1/0`,

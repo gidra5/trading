@@ -206,7 +206,6 @@ function exitGridConfig(options: Args, candidate: GridCandidate): PartialStrateg
   return {
     staleOrderMs: 30 * DAY_MS,
     legacyValleyPeak: {
-      buySigma: 0.3,
       longSideEnabled: true,
       shortSideEnabled: true,
       exitGridEnabled: true,

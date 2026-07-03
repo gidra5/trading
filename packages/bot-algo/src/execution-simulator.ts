@@ -56,7 +56,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   shortMarginModel: "futures-margin",
   longBorrowDepth: 999,
   shortBorrowDepth: 999,
-  internalBorrowAccounting: "active",
+  internalBorrowAccounting: "inactive",
   borrowerProfitShareToLender: 1,
   feeBps: 7.5,
   maxPositionQuote: Number.POSITIVE_INFINITY,

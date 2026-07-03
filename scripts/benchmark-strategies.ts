@@ -10,6 +10,7 @@ import {
   type BacktestResult,
   type Candle,
   type EquityPoint,
+  type InternalBorrowAccounting,
   type PartialStrategyConfig,
   type RollingPriceRangeWindow,
   type ShortMarginModel,
@@ -38,6 +39,7 @@ interface BenchmarkArgs {
   shortMarginModel: ShortMarginModel;
   longBorrowDepth: number;
   shortBorrowDepth: number;
+  internalBorrowAccounting: InternalBorrowAccounting;
   borrowerProfitShareToLender: number;
   borrowDepthMatrix: boolean;
   leverageRangeWindow?: RollingPriceRangeWindow;
@@ -432,12 +434,12 @@ function createGridCandidates(): GridCandidate[] {
     {
       label: "Legacy tighter sigma",
       algorithm: "legacy-valley-peak",
-      config: { legacyValleyPeak: { buySigma: 0.06, sellSigma: 0.06 } },
+      config: { legacyValleyPeak: { trendSigmaA: 0.6 } },
     },
     {
       label: "Legacy wider sigma",
       algorithm: "legacy-valley-peak",
-      config: { legacyValleyPeak: { buySigma: 0.16, sellSigma: 0.16 } },
+      config: { legacyValleyPeak: { trendSigmaA: 1.6 } },
     },
     {
       label: "Legacy conservative clips",
@@ -447,8 +449,7 @@ function createGridCandidates(): GridCandidate[] {
           buySpendRate: 0.6,
           sellAmountRate: 0.8,
           maxTradeQuote: 500,
-          buySigma: 0.08,
-          sellSigma: 0.12,
+          trendSigmaA: 0.8,
           buyConfirmationOffsets: [8],
         },
       },
@@ -857,6 +858,7 @@ function runBenchmark(
       shortMarginModel: options.shortMarginModel,
       longBorrowDepth: options.longBorrowDepth,
       shortBorrowDepth: options.shortBorrowDepth,
+      internalBorrowAccounting: options.internalBorrowAccounting,
       borrowerProfitShareToLender: options.borrowerProfitShareToLender,
       maxPositionQuote,
       minOrderQuote: options.minOrderQuote,
@@ -1323,6 +1325,9 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     ),
     longBorrowDepth: parseNonNegativeInt(values.get("long-borrow-depth"), 999),
     shortBorrowDepth: parseNonNegativeInt(values.get("short-borrow-depth"), 999),
+    internalBorrowAccounting: parseInternalBorrowAccounting(
+      values.get("internal-borrow-accounting"),
+    ),
     borrowerProfitShareToLender: clamp(
       parseFiniteNumber(values.get("borrower-profit-share-to-lender"), 1),
       0,
@@ -1395,6 +1400,18 @@ function parseRelativeRateOverride(values: Map<string, string>): boolean | undef
 
 function parseShortMarginModel(value: string | undefined): ShortMarginModel {
   return value === "spot-borrow" ? "spot-borrow" : "futures-margin";
+}
+
+function parseInternalBorrowAccounting(
+  value: string | undefined,
+): InternalBorrowAccounting {
+  if (value === undefined || value === "inactive") {
+    return "inactive";
+  }
+  if (value === "active") {
+    return "active";
+  }
+  throw new Error("--internal-borrow-accounting must be active or inactive.");
 }
 
 function parseLeverageRangeWindow(
@@ -1501,7 +1518,6 @@ function peakExitGridConfig(
   return {
     staleOrderMs: 30 * DAY_MS,
     legacyValleyPeak: {
-      buySigma: 0.3,
       longSideEnabled: sideMode !== "short-only",
       shortSideEnabled: sideMode !== "long-only",
       exitGridEnabled: true,
@@ -2019,7 +2035,7 @@ function borrowDepthSummary(options: BenchmarkArgs): string {
 }
 
 function borrowPolicySummary(options: BenchmarkArgs): string {
-  return `internal borrow ${options.longBorrowDepth > 0 || options.shortBorrowDepth > 0 ? "active" : "inactive"}, lender profit share ${formatNumber(
+  return `internal borrow ${options.internalBorrowAccounting}, lender profit share ${formatNumber(
     options.borrowerProfitShareToLender,
     2,
   )}`;
@@ -2076,6 +2092,9 @@ function formatGridConfig(config: PartialStrategyConfig): string {
   if (config.shortBorrowDepth !== undefined) {
     parts.push(`shortBorrowDepth=${config.shortBorrowDepth}`);
   }
+  if (config.internalBorrowAccounting !== undefined) {
+    parts.push(`internalBorrow=${config.internalBorrowAccounting}`);
+  }
   if (config.borrowerProfitShareToLender !== undefined) {
     parts.push(`profitShare=${config.borrowerProfitShareToLender}`);
   }
@@ -2089,8 +2108,9 @@ function formatGridConfig(config: PartialStrategyConfig): string {
       `buyRate=${value.buySpendRate ?? "-"}`,
       `sellRate=${value.sellAmountRate ?? "-"}`,
       `maxTrade=${value.maxTradeQuote ?? "-"}`,
-      `buySigma=${value.buySigma ?? "-"}`,
-      `sellSigma=${value.sellSigma ?? "-"}`,
+      `trendSigmaA=${value.trendSigmaA ?? "-"}`,
+      `sellB1=${value.trendSigmaSellB1 ?? "-"}`,
+      `buyB2=${value.trendSigmaBuyB2 ?? "-"}`,
       `longs=${value.longSideEnabled ?? "-"}`,
       `shorts=${value.shortSideEnabled ?? "-"}`,
       `buyConfirms=${value.buyConfirmationOffsets?.join("/") ?? "-"}`,

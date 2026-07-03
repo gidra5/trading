@@ -39,6 +39,8 @@ export type ExitGridPriceDistribution = "uniform" | "geometric";
 
 export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
+export type LegacySigmaMode = "trend" | "static";
+
 export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
 
 export interface PriceTick {
@@ -128,8 +130,12 @@ export interface LegacyValleyPeakConfig {
   saturationSec: number;
   buySpendRate: number;
   sellAmountRate: number;
+  sigmaMode: LegacySigmaMode;
   buySigma: number;
   sellSigma: number;
+  trendSigmaA: number;
+  trendSigmaSellB1: number;
+  trendSigmaBuyB2: number;
   minTradeQuote: number;
   maxTradeQuote: number;
   longSideEnabled: boolean;
@@ -270,6 +276,8 @@ export interface LegacyValleyPeakCheckDebug {
   quoteSize?: number;
   quantity?: number;
   coverQuantity?: number;
+  trendRate?: number;
+  effectiveSigma?: number;
   minTradeQuote: number;
 }
 

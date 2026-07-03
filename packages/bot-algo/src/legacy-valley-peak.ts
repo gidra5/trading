@@ -46,8 +46,12 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
+  sigmaMode: "trend",
   buySigma: 0.3,
   sellSigma: 0.1,
+  trendSigmaA: 1,
+  trendSigmaSellB1: 1,
+  trendSigmaBuyB2: 1,
   minTradeQuote: 25,
   maxTradeQuote: 50_000,
   longSideEnabled: true,
@@ -90,6 +94,10 @@ const PRICE_RANGE_WINDOWS: { window: RollingPriceRangeWindow; windowSec: number 
   { window: "3m", windowSec: 90 * 24 * 60 * 60 },
   { window: "2w", windowSec: 14 * 24 * 60 * 60 },
 ];
+const TREND_SIGMA_WINDOW_SEC = 3600;
+const MIN_RELATIVE_SIGMA = 0.00000001;
+const MIN_ABSOLUTE_SIGMA = 0.000001;
+const MAX_TREND_SIGMA_EXPONENT = 50;
 const MAX_EXIT_GRID_ORDER_COUNT = 5_000;
 const BTC_SCALE_REFERENCE_PRICE = 100_000;
 const MAX_REASONABLE_RELATIVE_RATE_PER_SEC = 0.01;
@@ -135,12 +143,27 @@ export function createLegacyValleyPeakConfig(
   config.saturationSec = Math.max(0, config.saturationSec);
   config.buySpendRate = Math.max(0, config.buySpendRate);
   config.sellAmountRate = Math.max(0, config.sellAmountRate);
-  config.buySigma = config.relativeRateEnabled
-    ? Math.max(0.00000001, normalizeRelativeRate(config.buySigma, 0.000003))
-    : Math.max(0.000001, config.buySigma);
-  config.sellSigma = config.relativeRateEnabled
-    ? Math.max(0.00000001, normalizeRelativeRate(config.sellSigma, 0.000001))
-    : Math.max(0.000001, config.sellSigma);
+  if (config.sigmaMode !== "static" && config.sigmaMode !== "trend") {
+    config.sigmaMode = defaultLegacyValleyPeakConfig.sigmaMode;
+  }
+  config.buySigma = Math.max(
+    MIN_ABSOLUTE_SIGMA,
+    Number.isFinite(config.buySigma) ? config.buySigma : defaultLegacyValleyPeakConfig.buySigma,
+  );
+  config.sellSigma = Math.max(
+    MIN_ABSOLUTE_SIGMA,
+    Number.isFinite(config.sellSigma) ? config.sellSigma : defaultLegacyValleyPeakConfig.sellSigma,
+  );
+  const trendSigmaA = Number.isFinite(config.trendSigmaA)
+    ? config.trendSigmaA
+    : defaultLegacyValleyPeakConfig.trendSigmaA;
+  config.trendSigmaA = Math.max(MIN_ABSOLUTE_SIGMA, trendSigmaA);
+  config.trendSigmaSellB1 = Number.isFinite(config.trendSigmaSellB1)
+    ? Math.max(0, config.trendSigmaSellB1)
+    : defaultLegacyValleyPeakConfig.trendSigmaSellB1;
+  config.trendSigmaBuyB2 = Number.isFinite(config.trendSigmaBuyB2)
+    ? Math.max(0, config.trendSigmaBuyB2)
+    : defaultLegacyValleyPeakConfig.trendSigmaBuyB2;
   config.minTradeQuote = Math.max(0, config.minTradeQuote);
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
   config.longSideEnabled = config.longSideEnabled !== false;
@@ -514,6 +537,8 @@ function buildLegacyValleyPeakCheckDebug(
       confirmations,
       quoteSize: buyQuoteSize(memory, config, input, rate),
       coverQuantity: buyCoverQuantity(memory, config, input, rate),
+      trendRate: trendSigmaRate(memory, config),
+      effectiveSigma: buySizingSigma(memory, config),
       minTradeQuote: config.minTradeQuote,
     };
   }
@@ -529,6 +554,8 @@ function buildLegacyValleyPeakCheckDebug(
     confirmations,
     quantity: sellQuantity(memory, config, input, rate),
     quoteSize: shortSellQuoteSize(memory, config, input, rate),
+    trendRate: trendSigmaRate(memory, config),
+    effectiveSigma: sellSizingSigma(memory, config),
     minTradeQuote: config.minTradeQuote,
   };
 }
@@ -587,6 +614,96 @@ function detectLegacyMarketState(
   };
 }
 
+function buySizingSigma(memory: LegacyValleyPeakMemory, config: LegacyValleyPeakConfig): number {
+  return config.sigmaMode === "static"
+    ? staticSigma(config, config.buySigma, defaultLegacyValleyPeakConfig.buySigma)
+    : buyTrendSigma(memory, config);
+}
+
+function sellSizingSigma(memory: LegacyValleyPeakMemory, config: LegacyValleyPeakConfig): number {
+  return config.sigmaMode === "static"
+    ? staticSigma(config, config.sellSigma, defaultLegacyValleyPeakConfig.sellSigma)
+    : sellTrendSigma(memory, config);
+}
+
+function staticSigma(config: LegacyValleyPeakConfig, rawSigma: number, fallbackRawSigma: number): number {
+  return config.relativeRateEnabled
+    ? Math.max(
+        MIN_RELATIVE_SIGMA,
+        normalizeRelativeRate(rawSigma, normalizeRelativeRate(fallbackRawSigma, MIN_RELATIVE_SIGMA)),
+      )
+    : Math.max(MIN_ABSOLUTE_SIGMA, rawSigma);
+}
+
+function buyTrendSigma(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): number {
+  return trendAdjustedSigma(memory, config, config.trendSigmaBuyB2);
+}
+
+function sellTrendSigma(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): number {
+  return trendAdjustedSigma(memory, config, -config.trendSigmaSellB1);
+}
+
+function trendAdjustedSigma(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  exponentScale: number,
+): number {
+  const exponent = clamp(
+    exponentScale * trendSigmaRate(memory, config),
+    -MAX_TREND_SIGMA_EXPONENT,
+    MAX_TREND_SIGMA_EXPONENT,
+  );
+  const sigma = trendSigmaBase(config) * Math.exp(exponent);
+  return Math.max(
+    config.relativeRateEnabled ? MIN_RELATIVE_SIGMA : MIN_ABSOLUTE_SIGMA,
+    sigma,
+  );
+}
+
+function trendSigmaBase(config: LegacyValleyPeakConfig): number {
+  return config.relativeRateEnabled
+    ? Math.max(MIN_RELATIVE_SIGMA, normalizeRelativeRate(config.trendSigmaA, 0.00001))
+    : Math.max(MIN_ABSOLUTE_SIGMA, config.trendSigmaA);
+}
+
+function trendSigmaRate(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): number {
+  const index = trendSigmaWindowIndex(config);
+  const point = latestPoint(memory.buyAverages[index] ?? memory.sellAverages[index]);
+  const rate = point?.rate ?? 0;
+  if (!Number.isFinite(rate)) {
+    return 0;
+  }
+
+  return config.relativeRateEnabled ? rate * BTC_SCALE_REFERENCE_PRICE : rate;
+}
+
+function trendSigmaWindowIndex(config: LegacyValleyPeakConfig): number {
+  const exact = config.averagingRangesSec.indexOf(TREND_SIGMA_WINDOW_SEC);
+  if (exact >= 0) {
+    return exact;
+  }
+
+  let closest = 0;
+  let closestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
+    const distance = Math.abs(config.averagingRangesSec[index] - TREND_SIGMA_WINDOW_SEC);
+    if (distance < closestDistance) {
+      closest = index;
+      closestDistance = distance;
+    }
+  }
+  return closest;
+}
+
 function buyQuoteSize(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
@@ -600,10 +717,7 @@ function buyQuoteSize(
   const data = memory.buyAverages[Math.min(3, memory.buyAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
   const buyingPowerQuote = Math.max(0, input.buyingPowerQuote);
-  const desired =
-    buyingPowerQuote *
-    config.buySpendRate *
-    gaussian(derivative, 0, config.buySigma);
+  const desired = buyingPowerQuote * config.buySpendRate * gaussian(derivative, 0, buySizingSigma(memory, config));
 
   return clamp(
     desired,
@@ -625,8 +739,7 @@ function buyCoverQuantity(
   const data = memory.buyAverages[Math.min(3, memory.buyAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
   const shortBaseFree = Math.max(0, input.shortBaseFree ?? 0);
-  const desired =
-    shortBaseFree * config.buySpendRate * gaussian(derivative, 0, config.buySigma);
+  const desired = shortBaseFree * config.buySpendRate * gaussian(derivative, 0, buySizingSigma(memory, config));
   const minQuantity = config.minTradeQuote / rate;
   const maxQuantity = Math.min(config.maxTradeQuote / rate, shortBaseFree);
 
@@ -645,8 +758,7 @@ function sellQuantity(
 
   const data = memory.sellAverages[Math.min(3, memory.sellAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
-  const desired =
-    input.baseFree * config.sellAmountRate * gaussian(derivative, 0, config.sellSigma);
+  const desired = input.baseFree * config.sellAmountRate * gaussian(derivative, 0, sellSizingSigma(memory, config));
   const minQuantity = config.minTradeQuote / rate;
   const maxQuantity = Math.min(config.maxTradeQuote / rate, input.baseFree);
 
@@ -666,10 +778,7 @@ function shortSellQuoteSize(
   const data = memory.sellAverages[Math.min(3, memory.sellAverages.length - 1)];
   const derivative = latestPoint(data)?.rate ?? 0;
   const sellingPowerQuote = Math.max(0, input.shortSellingPowerQuote ?? 0);
-  const desired =
-    sellingPowerQuote *
-    config.sellAmountRate *
-    gaussian(derivative, 0, config.sellSigma);
+  const desired = sellingPowerQuote * config.sellAmountRate * gaussian(derivative, 0, sellSizingSigma(memory, config));
 
   return clamp(
     desired,
@@ -1700,6 +1809,7 @@ function normalizeRelativeRates(
   );
 }
 
+// todo: bake into constants
 function normalizeRelativeRate(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) {
     return fallback;

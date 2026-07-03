@@ -68,6 +68,7 @@ function verifyInternalBaseBorrow(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
   });
   bot.recordManualTrade(
     { side: "buy", price: 10_000, quantity: 0.05, positionEffect: "open" },
@@ -98,6 +99,7 @@ function verifyInternalQuoteBorrow(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
   });
   bot.recordManualTrade(
     { side: "sell", price: 11_000, quantity: 0.05, positionEffect: "open" },
@@ -228,6 +230,7 @@ function verifyBalanceModelsUseExchangeLevelCapacity(): string {
     maxLeverage: 1,
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
   });
   futuresBot.recordManualTrade(
     { side: "buy", price: 10_000, quantity: 0.05, positionEffect: "open" },
@@ -383,6 +386,7 @@ function verifyClosedPositionRemainderProfit(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -431,6 +435,7 @@ function verifyShortLenderStaysOpenUntilQuoteReturns(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
@@ -475,6 +480,7 @@ function verifyBorrowerProfitDistributedAcrossLenders(): string {
   const bot = createBot({
     longBorrowDepth: 1,
     shortBorrowDepth: 1,
+    internalBorrowAccounting: "active",
     borrowerProfitShareToLender: 1,
   });
   bot.recordManualTrade(
