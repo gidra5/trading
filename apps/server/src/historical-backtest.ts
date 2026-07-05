@@ -127,10 +127,14 @@ interface RandomReplayWindow extends RandomBacktestWindow {
 interface PerfectMarginBenchmarkAccumulator {
   startingQuote: number;
   leverage: number;
-  roundTripFrictionRate: number;
+  oneWayFrictionRate: number;
   previousPrice?: number;
-  netPnl: number;
-  compoundedEquity: number;
+  flatPnl: number;
+  longPnl: number;
+  shortPnl: number;
+  flatEquity: number;
+  longEquity: number;
+  shortEquity: number;
 }
 
 const PERFECT_MARGIN_MIN_SLIPPAGE_BPS = defaultPositionRiskConfig.marketSlippageBps;
@@ -1563,13 +1567,17 @@ function createPerfectMarginBenchmark(
     PERFECT_MARGIN_MIN_SLIPPAGE_BPS,
     Math.max(0, config.positionRisk.marketSlippageBps),
   );
+  const oneWayFrictionRate = (Math.max(0, config.feeBps) + slippageBps) / 10_000;
   return {
     startingQuote: config.startingQuote,
     leverage: config.maxLeverage,
-    roundTripFrictionRate:
-      2 * ((Math.max(0, config.feeBps) + slippageBps) / 10_000),
-    netPnl: 0,
-    compoundedEquity: config.startingQuote,
+    oneWayFrictionRate,
+    flatPnl: 0,
+    longPnl: Number.NEGATIVE_INFINITY,
+    shortPnl: Number.NEGATIVE_INFINITY,
+    flatEquity: config.startingQuote,
+    longEquity: Number.NEGATIVE_INFINITY,
+    shortEquity: Number.NEGATIVE_INFINITY,
   };
 }
 
@@ -1581,26 +1589,138 @@ function observePerfectMarginPrice(
     return;
   }
 
+  const openCost = benchmark.startingQuote * benchmark.leverage * benchmark.oneWayFrictionRate;
+  if (benchmark.previousPrice === undefined) {
+    benchmark.longPnl = Math.max(benchmark.longPnl, benchmark.flatPnl - openCost);
+    benchmark.shortPnl = Math.max(benchmark.shortPnl, benchmark.flatPnl - openCost);
+    benchmark.longEquity = Math.max(
+      benchmark.longEquity,
+      transitionCompoundedEquity(
+        benchmark.flatEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+    );
+    benchmark.shortEquity = Math.max(
+      benchmark.shortEquity,
+      transitionCompoundedEquity(
+        benchmark.flatEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+    );
+    benchmark.previousPrice = price;
+    return;
+  }
+
   if (benchmark.previousPrice && benchmark.previousPrice > 0) {
-    const changeRate = Math.abs(price - benchmark.previousPrice) / benchmark.previousPrice;
-    const netRate = changeRate - benchmark.roundTripFrictionRate;
-    if (netRate > 0) {
-      benchmark.netPnl += benchmark.startingQuote * benchmark.leverage * netRate;
-      benchmark.compoundedEquity *= 1 + benchmark.leverage * netRate;
-    }
+    const relativeMove = price / benchmark.previousPrice - 1;
+    const longMovePnl = benchmark.startingQuote * benchmark.leverage * relativeMove;
+    const shortMovePnl = -longMovePnl;
+    const markedFlatPnl = benchmark.flatPnl;
+    const markedLongPnl = addFinite(benchmark.longPnl, longMovePnl);
+    const markedShortPnl = addFinite(benchmark.shortPnl, shortMovePnl);
+    const closeCost = benchmark.startingQuote * benchmark.leverage * benchmark.oneWayFrictionRate;
+    const switchCost = closeCost * 2;
+
+    benchmark.flatPnl = Math.max(
+      markedFlatPnl,
+      addFinite(markedLongPnl, -closeCost),
+      addFinite(markedShortPnl, -closeCost),
+    );
+    benchmark.longPnl = Math.max(
+      markedLongPnl,
+      addFinite(markedFlatPnl, -openCost),
+      addFinite(markedShortPnl, -switchCost),
+    );
+    benchmark.shortPnl = Math.max(
+      markedShortPnl,
+      addFinite(markedFlatPnl, -openCost),
+      addFinite(markedLongPnl, -switchCost),
+    );
+
+    const longHoldFactor = 1 + benchmark.leverage * relativeMove;
+    const shortHoldFactor = 1 - benchmark.leverage * relativeMove;
+    const markedFlatEquity = benchmark.flatEquity;
+    const markedLongEquity = multiplyFinite(benchmark.longEquity, longHoldFactor);
+    const markedShortEquity = multiplyFinite(benchmark.shortEquity, shortHoldFactor);
+
+    benchmark.flatEquity = Math.max(
+      markedFlatEquity,
+      transitionCompoundedEquity(
+        markedLongEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+      transitionCompoundedEquity(
+        markedShortEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+    );
+    benchmark.longEquity = Math.max(
+      markedLongEquity,
+      transitionCompoundedEquity(
+        markedFlatEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+      transitionCompoundedEquity(
+        markedShortEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate * 2,
+      ),
+    );
+    benchmark.shortEquity = Math.max(
+      markedShortEquity,
+      transitionCompoundedEquity(
+        markedFlatEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate,
+      ),
+      transitionCompoundedEquity(
+        markedLongEquity,
+        benchmark.leverage,
+        benchmark.oneWayFrictionRate * 2,
+      ),
+    );
   }
   benchmark.previousPrice = price;
+}
+
+function addFinite(value: number, delta: number): number {
+  return Number.isFinite(value) ? value + delta : Number.NEGATIVE_INFINITY;
+}
+
+function multiplyFinite(value: number, factor: number): number {
+  if (!Number.isFinite(value) || !Number.isFinite(factor) || factor <= 0) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return value * factor;
+}
+
+function transitionCompoundedEquity(
+  equity: number,
+  leverage: number,
+  oneWayFrictionRate: number,
+): number {
+  const factor = 1 - leverage * oneWayFrictionRate;
+  return multiplyFinite(equity, factor);
 }
 
 function finalizePerfectMarginBenchmark(
   benchmark: PerfectMarginBenchmarkAccumulator,
   actualNetPnl: number,
 ): PerfectMarginBenchmark {
-  const netPnl = benchmark.netPnl;
+  const netPnl = Math.max(benchmark.flatPnl, benchmark.longPnl, benchmark.shortPnl);
   const finalEquity = benchmark.startingQuote + netPnl;
   const returnPct =
     benchmark.startingQuote > 0 ? (netPnl / benchmark.startingQuote) * 100 : 0;
-  const compoundedFinalEquity = benchmark.compoundedEquity;
+  const compoundedFinalEquity = Math.max(
+    benchmark.flatEquity,
+    benchmark.longEquity,
+    benchmark.shortEquity,
+  );
   const compoundedNetPnl = compoundedFinalEquity - benchmark.startingQuote;
   const compoundedReturnPct =
     benchmark.startingQuote > 0

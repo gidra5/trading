@@ -52,6 +52,9 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   trendSigmaA: 1,
   trendSigmaSellB1: 1,
   trendSigmaBuyB2: 1,
+  trendSigmaWindowSec: 3600,
+  sigmoidSigmaLow: 0.05,
+  sigmoidSigmaHigh: 0.3,
   minTradeQuote: 25,
   maxTradeQuote: 50_000,
   longSideEnabled: true,
@@ -143,7 +146,11 @@ export function createLegacyValleyPeakConfig(
   config.saturationSec = Math.max(0, config.saturationSec);
   config.buySpendRate = Math.max(0, config.buySpendRate);
   config.sellAmountRate = Math.max(0, config.sellAmountRate);
-  if (config.sigmaMode !== "static" && config.sigmaMode !== "trend") {
+  if (
+    config.sigmaMode !== "static" &&
+    config.sigmaMode !== "trend" &&
+    config.sigmaMode !== "sigmoid-trend"
+  ) {
     config.sigmaMode = defaultLegacyValleyPeakConfig.sigmaMode;
   }
   config.buySigma = Math.max(
@@ -164,6 +171,21 @@ export function createLegacyValleyPeakConfig(
   config.trendSigmaBuyB2 = Number.isFinite(config.trendSigmaBuyB2)
     ? Math.max(0, config.trendSigmaBuyB2)
     : defaultLegacyValleyPeakConfig.trendSigmaBuyB2;
+  config.trendSigmaWindowSec = isPositiveFinite(config.trendSigmaWindowSec)
+    ? config.trendSigmaWindowSec
+    : defaultLegacyValleyPeakConfig.trendSigmaWindowSec;
+  config.sigmoidSigmaLow = Math.max(
+    MIN_ABSOLUTE_SIGMA,
+    Number.isFinite(config.sigmoidSigmaLow)
+      ? config.sigmoidSigmaLow
+      : defaultLegacyValleyPeakConfig.sigmoidSigmaLow,
+  );
+  config.sigmoidSigmaHigh = Math.max(
+    config.sigmoidSigmaLow,
+    Number.isFinite(config.sigmoidSigmaHigh)
+      ? config.sigmoidSigmaHigh
+      : defaultLegacyValleyPeakConfig.sigmoidSigmaHigh,
+  );
   config.minTradeQuote = Math.max(0, config.minTradeQuote);
   config.maxTradeQuote = Math.max(config.minTradeQuote, config.maxTradeQuote);
   config.longSideEnabled = config.longSideEnabled !== false;
@@ -615,15 +637,23 @@ function detectLegacyMarketState(
 }
 
 function buySizingSigma(memory: LegacyValleyPeakMemory, config: LegacyValleyPeakConfig): number {
-  return config.sigmaMode === "static"
-    ? staticSigma(config, config.buySigma, defaultLegacyValleyPeakConfig.buySigma)
-    : buyTrendSigma(memory, config);
+  if (config.sigmaMode === "static") {
+    return staticSigma(config, config.buySigma, defaultLegacyValleyPeakConfig.buySigma);
+  }
+  if (config.sigmaMode === "sigmoid-trend") {
+    return sigmoidTrendSigma(memory, config, "buy");
+  }
+  return buyTrendSigma(memory, config);
 }
 
 function sellSizingSigma(memory: LegacyValleyPeakMemory, config: LegacyValleyPeakConfig): number {
-  return config.sigmaMode === "static"
-    ? staticSigma(config, config.sellSigma, defaultLegacyValleyPeakConfig.sellSigma)
-    : sellTrendSigma(memory, config);
+  if (config.sigmaMode === "static") {
+    return staticSigma(config, config.sellSigma, defaultLegacyValleyPeakConfig.sellSigma);
+  }
+  if (config.sigmaMode === "sigmoid-trend") {
+    return sigmoidTrendSigma(memory, config, "sell");
+  }
+  return sellTrendSigma(memory, config);
 }
 
 function staticSigma(config: LegacyValleyPeakConfig, rawSigma: number, fallbackRawSigma: number): number {
@@ -647,6 +677,22 @@ function sellTrendSigma(
   config: LegacyValleyPeakConfig,
 ): number {
   return trendAdjustedSigma(memory, config, -config.trendSigmaSellB1);
+}
+
+function sigmoidTrendSigma(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  side: "buy" | "sell",
+): number {
+  const trend = trendSigmaRate(memory, config);
+  const weight =
+    side === "buy"
+      ? sigmoid(-trend, config.trendSigmaBuyB2)
+      : sigmoid(trend, config.trendSigmaSellB1);
+  const rawSigma =
+    config.sigmoidSigmaLow * weight +
+    config.sigmoidSigmaHigh * (1 - weight);
+  return staticSigma(config, rawSigma, rawSigma);
 }
 
 function trendAdjustedSigma(
@@ -687,7 +733,8 @@ function trendSigmaRate(
 }
 
 function trendSigmaWindowIndex(config: LegacyValleyPeakConfig): number {
-  const exact = config.averagingRangesSec.indexOf(TREND_SIGMA_WINDOW_SEC);
+  const targetWindowSec = config.trendSigmaWindowSec || TREND_SIGMA_WINDOW_SEC;
+  const exact = config.averagingRangesSec.indexOf(targetWindowSec);
   if (exact >= 0) {
     return exact;
   }
@@ -695,7 +742,7 @@ function trendSigmaWindowIndex(config: LegacyValleyPeakConfig): number {
   let closest = 0;
   let closestDistance = Number.POSITIVE_INFINITY;
   for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
-    const distance = Math.abs(config.averagingRangesSec[index] - TREND_SIGMA_WINDOW_SEC);
+    const distance = Math.abs(config.averagingRangesSec[index] - targetWindowSec);
     if (distance < closestDistance) {
       closest = index;
       closestDistance = distance;
@@ -1729,6 +1776,15 @@ function ensurePriceRangeMemories(
 function gaussian(x: number, mu: number, sigma: number): number {
   const w = (x - mu) / sigma;
   return Math.exp(-(w ** 2) / 2);
+}
+
+function sigmoid(value: number, slope: number): number {
+  return 1 / (
+    1 +
+    Math.exp(
+      -clamp(value * slope, -MAX_TREND_SIGMA_EXPONENT, MAX_TREND_SIGMA_EXPONENT),
+    )
+  );
 }
 
 function interpolate(nextValue: number, prevValue: number, fraction: number): number {

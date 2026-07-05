@@ -48,7 +48,7 @@ buy sigma=b+a*ln(e^-x+c)
 3 representative interavals, but sideways with a rally inbetween defied expectations. 
 st “sideways but choppy” candidates:
 
-static with different sigmas (0.1, 0.3)
+static with different sigmas (0.1, 0.3), 7d
 
 Window	Close/Open	Low	High	Span	Movement score
 2022-07-28..2022-08-03	-0.59%	22582.13	24668	9.09%	highest OHLC churn
@@ -62,8 +62,50 @@ Uptrend	2023-03-11..2023-03-17	+35.95%	buy 0.3, sell 0.1	+17.32%	5.32%	1,778
 Sideways	2026-04-22..2026-04-28	+0.009%	buy 0.1, sell 0.1	+0.27%	0.35%	160
 Downtrend	2022-06-12..2022-06-18	-33.26%	buy 0.1, sell 0.3	+29.58%	7.79%	3,533
 
+I found these 3d UTC intervals. Definitions used:
+
+`returnPct` = end vs start  
+`biasPct` = 15m average price vs start/end midpoint  
+`turns05` = number of 0.5% zigzag turns on 15m closes, used as churn proxy
+
+| case                           | interval                 |        ret |      span |      bias | turns05 |        low |        high |
+| ------------------------------ | ------------------------ | ---------: | --------: | --------: | ------: | ---------: | ----------: |
+| uptrend, low churn             | `2024-02-24..2024-02-26` |  `+7.355%` |  `8.523%` | `-1.715%` |     `4` |    `50585` |     `54910` |
+| uptrend, high churn            | `2022-06-19..2022-06-21` |  `+9.239%` | `19.834%` | `+1.854%` |    `71` | `17960.41` |     `21723` |
+| downtrend, low churn           | `2023-06-03..2023-06-05` |  `-5.559%` |  `7.587%` | `+1.626%` |     `4` |    `25388` |  `27455.02` |
+| downtrend, high churn          | `2022-06-13..2022-06-15` | `-15.017%` | `25.529%` | `-8.069%` |    `94` | `20111.62` |  `26895.84` |
+| sideways, high bias, churn     | `2021-10-19..2021-10-21` |  `+0.302%` |  `9.157%` | `+3.062%` |    `38` | `61322.22` |     `67000` |
+| sideways, high bias, low churn | `2025-02-14..2025-02-16` |  `-0.507%` |  `2.877%` | `+0.954%` |     `6` | `96046.18` |     `98826` |
+| sideways, low bias, churn      | `2024-07-07..2024-07-09` |  `-0.309%` |  `7.194%` | `-1.966%` |    `40` | `54260.16` |  `58449.46` |
+| sideways, low bias, low churn  | `2025-07-04..2025-07-06` |  `-0.348%` |  `2.302%` | `-0.959%` |     `0` |   `107245` | `109767.59` |
+| sideways, mid bias, churn      | `2024-01-02..2024-01-04` |  `-0.064%` | `11.611%` | `+0.084%` |    `36` |    `40750` |  `45879.63` |
+| sideways, mid bias, low churn  | `2023-09-15..2023-09-17` |  `+0.018%` |  `2.504%` | `+0.006%` |     `4` |    `26224` |     `26888` |
+
+For running one:
+
+```bash
+npx tsx scripts/check-sigma-borrow-matrix.ts \
+  --start-date 2024-01-02 --end-date 2024-01-04 \
+  --sigma-mode static --buy-sigma 0.1 --sell-sigma 0.1 \
+  --mode both --long-borrow-depth 999 --short-borrow-depth 999
+```
+
+((sigmaX*a+(1-a)*sigmaY), (sigmaX*b+(1-b)*sigmaY))
+a=sigmoid(trend, slopeA) 
+b=sigmoid(-trend, slopeB)
+sigmaX=0.05
+sigmaY=0.3
+tested 2026-07-04 as `sigmaMode=sigmoid-trend`: best observed among bounded return sweep was 12h trend, slopeA=15, slopeB=300, avg -1.6123% over the ten 3d cases. Not competitive with static 0.1/0.1; needs separate neutral/range gate so both sides can stay low in sideways churn.
+
+add "parallel" giid strategy that would place limit orders with fixed interval between prices in some range (short/mid price range) and some price distribution among them. Then assume mean reversion/adjust based on high window sma the bias. the exact mechanics are this:
+1. place grid of limit orders accordigng to price range, mean, and size distibution
+2. when price crosses long order we place a short order at the cell we left. symmentrically for short orders.
+3. long grids assume the trend is upwards and accumulate long position as grid crosses any cell and then sell it when price crosses grid cell against assume trend. the short is symmtric
+4. neutral grids assume the trend is mean reversing an create short grid above mid, and long below.
 
 the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
+
+separate entry/exit signals
 
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.

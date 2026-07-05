@@ -39,7 +39,7 @@ export type ExitGridPriceDistribution = "uniform" | "geometric";
 
 export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
-export type LegacySigmaMode = "trend" | "static";
+export type LegacySigmaMode = "trend" | "static" | "sigmoid-trend";
 
 export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
 
@@ -136,6 +136,9 @@ export interface LegacyValleyPeakConfig {
   trendSigmaA: number;
   trendSigmaSellB1: number;
   trendSigmaBuyB2: number;
+  trendSigmaWindowSec: number;
+  sigmoidSigmaLow: number;
+  sigmoidSigmaHigh: number;
   minTradeQuote: number;
   maxTradeQuote: number;
   longSideEnabled: boolean;

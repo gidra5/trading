@@ -15,6 +15,9 @@ interface Args {
   trendSigmaA: number;
   trendSigmaSellB1: number;
   trendSigmaBuyB2: number;
+  trendSigmaWindowSec: number;
+  sigmoidSigmaLow: number;
+  sigmoidSigmaHigh: number;
   days: number;
   startDate?: string;
   endDate?: string;
@@ -66,6 +69,9 @@ for (const testCase of cases) {
       trendSigmaA: args.trendSigmaA,
       trendSigmaSellB1: args.trendSigmaSellB1,
       trendSigmaBuyB2: args.trendSigmaBuyB2,
+      trendSigmaWindowSec: args.trendSigmaWindowSec,
+      sigmoidSigmaLow: args.sigmoidSigmaLow,
+      sigmoidSigmaHigh: args.sigmoidSigmaHigh,
       days: args.days,
       startDate: args.startDate,
       endDate: args.endDate,
@@ -143,6 +149,9 @@ function legacyConfig(args: Args, mode: SideMode): PartialStrategyConfig["legacy
     trendSigmaA: args.trendSigmaA,
     trendSigmaSellB1: args.trendSigmaSellB1,
     trendSigmaBuyB2: args.trendSigmaBuyB2,
+    trendSigmaWindowSec: args.trendSigmaWindowSec,
+    sigmoidSigmaLow: args.sigmoidSigmaLow,
+    sigmoidSigmaHigh: args.sigmoidSigmaHigh,
     ...signalProfileConfig(args.signalProfile),
     longSideEnabled: mode !== "short-only",
     shortSideEnabled: mode !== "long-only",
@@ -199,6 +208,12 @@ function parseArgs(argv: string[]): Args {
     trendSigmaA: positiveNumber(values.get("sigma-a") ?? "1", "sigma-a"),
     trendSigmaSellB1: Number(values.get("sell-b1") ?? "1"),
     trendSigmaBuyB2: Number(values.get("buy-b2") ?? "1"),
+    trendSigmaWindowSec: positiveNumber(
+      values.get("trend-window-sec") ?? "3600",
+      "trend-window-sec",
+    ),
+    sigmoidSigmaLow: positiveNumber(values.get("sigmoid-low") ?? "0.05", "sigmoid-low"),
+    sigmoidSigmaHigh: positiveNumber(values.get("sigmoid-high") ?? "0.3", "sigmoid-high"),
     days: positiveInteger(values.get("days") ?? "30", "days"),
     startDate: parseDate(values.get("start-date"), "start-date"),
     endDate: parseDate(values.get("end-date"), "end-date"),
@@ -245,10 +260,10 @@ function parseSigmaMode(value: string | undefined): LegacySigmaMode {
   if (value === undefined || value === "trend") {
     return "trend";
   }
-  if (value === "static") {
-    return "static";
+  if (value === "static" || value === "sigmoid-trend") {
+    return value;
   }
-  throw new Error("--sigma-mode must be trend or static.");
+  throw new Error("--sigma-mode must be trend, static, or sigmoid-trend.");
 }
 
 function parseInternalBorrowAccounting(

@@ -1528,6 +1528,7 @@ function AlgorithmPanel(props: {
                   options={[
                     { value: "trend", label: "Trend" },
                     { value: "static", label: "Static" },
+                    { value: "sigmoid-trend", label: "Sigmoid" },
                   ]}
                   onInput={(value) =>
                     updateValleyPeak(
@@ -1570,6 +1571,27 @@ function AlgorithmPanel(props: {
                   min={0}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("trendSigmaBuyB2", value)}
+                />
+                <NumberField
+                  label="Trend Window"
+                  value={config().legacyValleyPeak.trendSigmaWindowSec / 60}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("trendSigmaWindowSec", value * 60)}
+                />
+                <NumberField
+                  label="Sigmoid Low"
+                  value={config().legacyValleyPeak.sigmoidSigmaLow}
+                  min={0.000001}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("sigmoidSigmaLow", value)}
+                />
+                <NumberField
+                  label="Sigmoid High"
+                  value={config().legacyValleyPeak.sigmoidSigmaHigh}
+                  min={0.000001}
+                  step={0.01}
+                  onInput={(value) => updateValleyPeak("sigmoidSigmaHigh", value)}
                 />
                 <NumberField
                   label="Signal Min"
