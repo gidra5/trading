@@ -61,6 +61,7 @@ const apiBase =
   import.meta.env.VITE_API_URL ??
   (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
 const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
+const SOCKET_SNAPSHOT_APPLY_MS = 500;
 const buttonBaseClass =
   "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
 const buttonPrimaryClass =
@@ -118,6 +119,9 @@ export function App() {
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
   let runClockTimer: number | undefined;
+  let pendingSocketSnapshot: RuntimeSnapshot | undefined;
+  let socketSnapshotTimer: number | undefined;
+  let disposed = false;
   let requestedCorrelationMarketId: string | undefined;
   let lastSnapshotSource: string | undefined;
   let lastSnapshotSeq = 0;
@@ -199,28 +203,61 @@ export function App() {
     setMarketCatalog(payload as BinanceMarketCatalog);
   };
 
-  const connect = () => {
-    setConnection("connecting");
-    socket = new WebSocket(wsUrl);
+  const flushSocketSnapshot = () => {
+    socketSnapshotTimer = undefined;
+    const next = pendingSocketSnapshot;
+    pendingSocketSnapshot = undefined;
+    if (next) {
+      applySnapshot(next);
+    }
+  };
 
-    socket.onopen = () => setConnection("live");
-    socket.onmessage = (event) => {
-      const message = JSON.parse(event.data) as {
-        type: "snapshot";
-        sequence?: number;
-        sentAt?: number;
-        payload: RuntimeSnapshot;
-      };
-      if (message.type === "snapshot") {
-        applySnapshot(message.payload);
+  const queueSocketSnapshot = (next: RuntimeSnapshot) => {
+    if (!snapshot()) {
+      applySnapshot(next);
+      return;
+    }
+
+    pendingSocketSnapshot = next;
+    if (socketSnapshotTimer !== undefined) {
+      return;
+    }
+    socketSnapshotTimer = window.setTimeout(flushSocketSnapshot, SOCKET_SNAPSHOT_APPLY_MS);
+  };
+
+  const connect = () => {
+    if (disposed) {
+      return;
+    }
+    setConnection("connecting");
+    const nextSocket = new WebSocket(wsUrl);
+    socket = nextSocket;
+
+    nextSocket.onopen = () => setConnection("live");
+    nextSocket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as {
+          type: "snapshot";
+          sequence?: number;
+          sentAt?: number;
+          payload: RuntimeSnapshot;
+        };
+        if (message.type === "snapshot") {
+          queueSocketSnapshot(message.payload);
+        }
+      } catch {
+        nextSocket.close();
       }
     };
-    socket.onclose = () => {
+    nextSocket.onclose = () => {
+      if (socket !== nextSocket || disposed) {
+        return;
+      }
       setConnection("offline");
       reconnectTimer = window.setTimeout(connect, 1_500);
     };
-    socket.onerror = () => {
-      socket?.close();
+    nextSocket.onerror = () => {
+      nextSocket.close();
     };
   };
 
@@ -550,12 +587,16 @@ export function App() {
   });
 
   onCleanup(() => {
+    disposed = true;
     socket?.close();
     if (reconnectTimer) {
       window.clearTimeout(reconnectTimer);
     }
     if (runClockTimer) {
       window.clearInterval(runClockTimer);
+    }
+    if (socketSnapshotTimer) {
+      window.clearTimeout(socketSnapshotTimer);
     }
   });
 

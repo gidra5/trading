@@ -895,6 +895,24 @@ trades. Hysteresis improved return on only `7/28` intervals and lowered drawdown
 only `1/28`. The June 2022 stress cases are decisive: KAMA deadband returned
 `+5.535%` and `+5.483%`, while KAMA hysteresis returned `-10.591%` and `-22.353%`.
 
+Inner-threshold follow-up report:
+`docs/derivative-threshold-grid-2026-07-05-180107.md`
+
+Added `legacyValleyPeak.derivativeClampInnerThresholdRatio` so hysteresis can exit
+at a threshold between zero and the outer deadband instead of waiting for raw zero
+cross. On the KAMA grid, inner thresholds did reduce the damage from zero-cross
+persistence, but they did not beat the clean larger-deadband candidate. Best practical
+setting in this sweep was KAMA `deadband` with `2x` outer thresholds: average return
+improved from `-0.163%` to `+0.247%`, average max drawdown fell from `1.960%` to
+`0.492%`, max drawdown fell from `15.333%` to `5.833%`, and average trades fell from
+`106.6` to `14.5`.
+
+The top average-return row was KAMA `4x` zero-cross hysteresis at `+0.292%`, but it
+was mostly a sparse stress-case capture: only `9/28` intervals were positive and the
+median return was `0.000%`. Treat it as an experiment, not a default candidate. The
+more actionable region is KAMA with moderately wider outer thresholds, especially
+`2x` deadband or `2x` with `inner=1`, which is effectively the same boundary behavior.
+
 ## Research Backlog
 
 | Direction | Why it may help legacy | Main risk |

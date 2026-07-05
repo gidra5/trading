@@ -598,11 +598,27 @@ const wss = new WebSocketServer({
 });
 const snapshotSource = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 const MAX_SOCKET_BUFFER_BYTES = 1_000_000;
+const DASHBOARD_BROADCAST_MIN_INTERVAL_MS = 500;
 
 wss.on("connection", (socket) => {
   sockets.add(socket);
+  server.log.info({ clients: sockets.size }, "Dashboard websocket connected");
   sendSnapshot(socket, publicSnapshot());
-  socket.on("close", () => sockets.delete(socket));
+  socket.on("close", (code, reason) => {
+    sockets.delete(socket);
+    server.log.info(
+      {
+        clients: sockets.size,
+        code,
+        reason: reason.toString(),
+      },
+      "Dashboard websocket closed",
+    );
+  });
+  socket.on("error", (error) => {
+    sockets.delete(socket);
+    server.log.warn({ error: error.message }, "Dashboard websocket error");
+  });
 });
 
 stream.start();
@@ -614,6 +630,8 @@ let broadcastTimer: NodeJS.Timeout | undefined;
 let broadcastImmediate: NodeJS.Immediate | undefined;
 let broadcastRunning = false;
 let broadcastDirty = false;
+let lastBroadcastAt = 0;
+let broadcastTimerDueAt = 0;
 let snapshotSeq = 0;
 
 function scheduleBroadcast(): void {
@@ -630,23 +648,41 @@ function queueBroadcast(delayMs: number): void {
   }
 
   broadcastDirty = true;
-  if (delayMs <= 0) {
+  const now = Date.now();
+  const minimumDelay = Math.max(0, lastBroadcastAt + DASHBOARD_BROADCAST_MIN_INTERVAL_MS - now);
+  const effectiveDelayMs = Math.max(delayMs, minimumDelay);
+
+  if (effectiveDelayMs <= 0) {
     if (broadcastTimer) {
       clearTimeout(broadcastTimer);
       broadcastTimer = undefined;
+      broadcastTimerDueAt = 0;
     }
     queueBroadcastFlush();
     return;
   }
 
+  const dueAt = now + effectiveDelayMs;
   if (broadcastTimer || broadcastImmediate) {
+    if (broadcastTimer && broadcastTimerDueAt > dueAt) {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = undefined;
+      broadcastTimerDueAt = 0;
+    } else {
+      return;
+    }
+  }
+
+  if (broadcastImmediate) {
     return;
   }
 
   broadcastTimer = setTimeout(() => {
     broadcastTimer = undefined;
+    broadcastTimerDueAt = 0;
     queueBroadcastFlush();
-  }, delayMs);
+  }, effectiveDelayMs);
+  broadcastTimerDueAt = dueAt;
 }
 
 function queueBroadcastFlush(): void {
@@ -688,6 +724,7 @@ function flushBroadcast(): void {
         }
         sendMessage(socket, message);
       }
+      lastBroadcastAt = Date.now();
     })
     .catch((error) => {
       server.log.warn(
@@ -719,6 +756,7 @@ function sendMessage(socket: WebSocket, message: string): void {
     socket.send(message, (error) => {
       if (error) {
         sockets.delete(socket);
+        server.log.warn({ error: error.message }, "Dashboard websocket send failed");
         socket.close();
       }
     });
