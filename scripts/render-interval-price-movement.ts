@@ -8,6 +8,7 @@ import {
 
 interface CaseRow {
   label: string;
+  group: string;
   intervalLabel: string;
   startDate: string;
   endDate: string;
@@ -17,6 +18,7 @@ interface CaseRow {
   tableTurns05: string;
   tableLow: string;
   tableHigh: string;
+  note?: string;
 }
 
 interface LinePoint {
@@ -74,6 +76,9 @@ const smaConfigs: SmaConfig[] = [
   { label: "12h SMA", periods: 48, color: "var(--sma-12h)" },
 ];
 const smaWarmupCandles = Math.max(...smaConfigs.map((series) => series.periods)) - 1;
+const centeredSmaLookaheadCandles = Math.ceil(
+  Math.max(...smaConfigs.map((series) => series.periods)) / 2,
+);
 const strategyWarmupMs = 12 * 60 * 60 * 1000;
 const strategyWarmupCandles = Math.ceil(strategyWarmupMs / strategyIntervalMs);
 
@@ -98,6 +103,7 @@ async function main(): Promise<void> {
       interval: chartInterval,
       intervalMs: chartIntervalMs,
       warmupCandles: smaWarmupCandles,
+      lookaheadCandles: centeredSmaLookaheadCandles,
     });
     const replayCandles = await fetchCaseCandles(row, {
       interval: strategyInterval,
@@ -117,7 +123,12 @@ async function main(): Promise<void> {
     if (intervalReplayCandles.length < 2) {
       throw new Error(`Not enough strategy candles for ${row.label} ${row.intervalLabel}.`);
     }
-    rendered.push({ row, candles, smaCandles: chartCandles, replayCandles });
+    rendered.push({
+      row: withComputedMetrics(row, candles),
+      candles,
+      smaCandles: chartCandles,
+      replayCandles,
+    });
   }
 
   const browserBundle = await createBrowserStrategyBundle();
@@ -243,6 +254,77 @@ async function createBrowserStrategyBundle(): Promise<string> {
 }
 
 function parseCaseRows(markdown: string): CaseRow[] {
+  return uniqueRows([
+    ...parseChoppyWindowRows(markdown),
+    ...parseRegimeRows(markdown),
+    ...parseSelectedMarkdownRows(markdown),
+    ...parseSharpeRows(markdown),
+    ...parseStressRows(markdown),
+  ]);
+}
+
+function parseChoppyWindowRows(markdown: string): CaseRow[] {
+  return parseTsvBlock(markdown, "Window\tClose/Open\tLow\tHigh\tSpan\tMovement score").flatMap(
+    (columns) => {
+      if (columns.length < 6) {
+        return [];
+      }
+      const [startDate, endDate] = columns[0].split("..");
+      if (!isIsoDate(startDate) || !isIsoDate(endDate)) {
+        return [];
+      }
+      return [
+        {
+          label: `sideways churn candidate, ${columns[5]}`,
+          group: "7d choppy candidates",
+          intervalLabel: columns[0],
+          startDate,
+          endDate,
+          tableRet: columns[1],
+          tableSpan: columns[4],
+          tableBias: "",
+          tableTurns05: "",
+          tableLow: columns[2],
+          tableHigh: columns[3],
+          note: columns[5],
+        },
+      ];
+    },
+  );
+}
+
+function parseRegimeRows(markdown: string): CaseRow[] {
+  return parseTsvBlock(
+    markdown,
+    "Regime\tWindow\tMarket move\tStatic sigmas\tReturn\tMax DD\tTrades",
+  ).flatMap((columns) => {
+    if (columns.length < 7) {
+      return [];
+    }
+    const [startDate, endDate] = columns[1].split("..");
+    if (!isIsoDate(startDate) || !isIsoDate(endDate)) {
+      return [];
+    }
+    return [
+      {
+        label: `${columns[0].toLowerCase()} static benchmark`,
+        group: "7d static benchmarks",
+        intervalLabel: columns[1],
+        startDate,
+        endDate,
+        tableRet: columns[2],
+        tableSpan: "",
+        tableBias: "",
+        tableTurns05: "",
+        tableLow: "",
+        tableHigh: "",
+        note: `${columns[3]}, bot ${columns[4]}, max DD ${columns[5]}, trades ${columns[6]}`,
+      },
+    ];
+  });
+}
+
+function parseSelectedMarkdownRows(markdown: string): CaseRow[] {
   const start = markdown.indexOf("| case");
   if (start === -1) {
     return [];
@@ -273,6 +355,7 @@ function parseCaseRows(markdown: string): CaseRow[] {
 
     rows.push({
       label: columns[0],
+      group: "3d selected cases",
       intervalLabel: columns[1],
       startDate,
       endDate,
@@ -288,6 +371,105 @@ function parseCaseRows(markdown: string): CaseRow[] {
   return rows;
 }
 
+function parseSharpeRows(markdown: string): CaseRow[] {
+  return parseTsvBlock(
+    markdown,
+    "duration\ttrend\tinterval\tmarket Sharpe\tmarket move\tbot return\tbot max DD\tbot ann. Sharpe",
+  ).flatMap((columns) => {
+    if (columns.length < 8) {
+      return [];
+    }
+    const [startDate, endDate] = columns[2].split("..");
+    if (!isIsoDate(startDate) || !isIsoDate(endDate)) {
+      return [];
+    }
+    return [
+      {
+        label: `${columns[0]} ${columns[1]} Sharpe trend, market ${columns[4]}`,
+        group: "Sharpe trend cases",
+        intervalLabel: columns[2],
+        startDate,
+        endDate,
+        tableRet: columns[4],
+        tableSpan: "",
+        tableBias: "",
+        tableTurns05: "",
+        tableLow: "",
+        tableHigh: "",
+        note: `market Sharpe ${columns[3]}, bot ${columns[5]}, max DD ${columns[6]}, bot ann. Sharpe ${columns[7]}`,
+      },
+    ];
+  });
+}
+
+function parseStressRows(markdown: string): CaseRow[] {
+  return parseTsvBlock(
+    markdown,
+    "duration\tinterval\tmarket Sharpe\tmarket move\tbot return",
+  ).flatMap((columns) => {
+    if (columns.length < 2) {
+      return [];
+    }
+    const [startDate, endDate] = columns[1].split("..");
+    if (!isIsoDate(startDate) || !isIsoDate(endDate)) {
+      return [];
+    }
+    const marketMove = columns[3] ?? "";
+    const botReturn = columns[4] ?? "";
+    return [
+      {
+        label: `${columns[0]} downtrend stress${marketMove ? `, market ${marketMove}` : ""}`,
+        group: "Downtrend stress cases",
+        intervalLabel: columns[1],
+        startDate,
+        endDate,
+        tableRet: marketMove,
+        tableSpan: "",
+        tableBias: "",
+        tableTurns05: "",
+        tableLow: "",
+        tableHigh: "",
+        note: [
+          columns[2] ? `market Sharpe ${columns[2]}` : "",
+          botReturn ? `bot ${botReturn}` : "",
+        ]
+          .filter(Boolean)
+          .join(", "),
+      },
+    ];
+  });
+}
+
+function parseTsvBlock(markdown: string, header: string): string[][] {
+  const start = markdown.indexOf(header);
+  if (start === -1) {
+    return [];
+  }
+
+  const blockStart = start + header.length;
+  const end = markdown.indexOf("\n\n", blockStart);
+  const block = markdown.slice(blockStart, end === -1 ? undefined : end);
+  return block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("\t").map((column) => column.trim()));
+}
+
+function uniqueRows(rows: CaseRow[]): CaseRow[] {
+  const seen = new Set<string>();
+  const unique: CaseRow[] = [];
+  for (const row of rows) {
+    const key = `${row.group}|${row.label}|${row.intervalLabel}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(row);
+  }
+  return unique;
+}
+
 function stripMarkdownCode(value: string): string {
   return value.replace(/^`|`$/g, "");
 }
@@ -298,15 +480,22 @@ function isIsoDate(value: string | undefined): value is string {
 
 async function fetchCaseCandles(
   row: CaseRow,
-  options: { interval: string; intervalMs: number; warmupCandles: number },
+  options: {
+    interval: string;
+    intervalMs: number;
+    warmupCandles: number;
+    lookaheadCandles?: number;
+  },
 ): Promise<Candle[]> {
   const { startTime, endExclusive } = caseTimeRange(row);
   const fetchStartTime = startTime - options.warmupCandles * options.intervalMs;
+  const fetchEndExclusive =
+    endExclusive + (options.lookaheadCandles ?? 0) * options.intervalMs;
   const candles: Candle[] = [];
   let cursor = fetchStartTime;
 
-  while (cursor < endExclusive) {
-    const requestEnd = endExclusive - 1;
+  while (cursor < fetchEndExclusive) {
+    const requestEnd = fetchEndExclusive - 1;
     const url = new URL("https://api.binance.com/api/v3/klines");
     url.search = new URLSearchParams({
       symbol,
@@ -329,7 +518,7 @@ async function fetchCaseCandles(
 
     const parsed = rows
       .map((item) => parseKline(item, options.interval))
-      .filter((candle) => candle.openTime < endExclusive);
+      .filter((candle) => candle.openTime < fetchEndExclusive);
     candles.push(...parsed);
     const last = parsed.at(-1);
     if (!last || last.openTime < cursor) {
@@ -339,7 +528,7 @@ async function fetchCaseCandles(
   }
 
   return uniqueCandles(candles).filter(
-    (candle) => candle.openTime >= fetchStartTime && candle.openTime < endExclusive,
+    (candle) => candle.openTime >= fetchStartTime && candle.openTime < fetchEndExclusive,
   );
 }
 
@@ -399,23 +588,95 @@ function browserCandle(candle: Candle): BrowserCandle {
   };
 }
 
+function withComputedMetrics(row: CaseRow, candles: Candle[]): CaseRow {
+  const first = candles[0];
+  const last = candles.at(-1);
+  if (!first || !last) {
+    return row;
+  }
+
+  const low = Math.min(...candles.map((candle) => candle.low));
+  const high = Math.max(...candles.map((candle) => candle.high));
+  const returnPct = ((last.close - first.open) / first.open) * 100;
+  const spanPct = ((high - low) / first.open) * 100;
+  const midpoint = (first.open + last.close) / 2;
+  const averagePrice =
+    candles.reduce((sum, candle) => sum + (candle.open + candle.high + candle.low + candle.close) / 4, 0) /
+    candles.length;
+  const biasPct = midpoint > 0 ? ((averagePrice - midpoint) / midpoint) * 100 : 0;
+
+  return {
+    ...row,
+    tableRet: row.tableRet || formatPercent(returnPct, 3),
+    tableSpan: row.tableSpan || formatPercent(spanPct, 3),
+    tableBias: row.tableBias || formatPercent(biasPct, 3),
+    tableTurns05: row.tableTurns05 || String(countZigzagTurns(candles, 0.5)),
+    tableLow: row.tableLow || formatPrice(low),
+    tableHigh: row.tableHigh || formatPrice(high),
+  };
+}
+
+function countZigzagTurns(candles: Candle[], thresholdPct: number): number {
+  const closes = candles.map((candle) => candle.close);
+  if (closes.length < 2) {
+    return 0;
+  }
+
+  let anchor = closes[0];
+  let direction = 0;
+  let turns = 0;
+
+  for (const close of closes.slice(1)) {
+    const movePct = anchor > 0 ? ((close - anchor) / anchor) * 100 : 0;
+    if (direction === 0) {
+      if (Math.abs(movePct) >= thresholdPct) {
+        direction = movePct > 0 ? 1 : -1;
+        anchor = close;
+      }
+      continue;
+    }
+
+    if (direction > 0) {
+      if (close > anchor) {
+        anchor = close;
+      } else if (((anchor - close) / anchor) * 100 >= thresholdPct) {
+        turns += 1;
+        direction = -1;
+        anchor = close;
+      }
+    } else if (close < anchor) {
+      anchor = close;
+    } else if (((close - anchor) / anchor) * 100 >= thresholdPct) {
+      turns += 1;
+      direction = 1;
+      anchor = close;
+    }
+  }
+
+  return turns;
+}
+
 function renderHtml(cases: RenderedCase[], browserBundle: string): string {
   const generatedAt = new Date().toISOString();
   const sections = cases.map((item, index) => renderCaseSection(item, index)).join("\n");
   const browserCases = safeJson(cases.map(browserCaseFromRenderedCase));
   const overviewRows = cases
     .map(
-      ({ row }) => `
+      ({ row }, index) => {
+        const sectionId = caseSectionId(row, index);
+        return `
         <tr>
-          <td>${escapeHtml(row.label)}</td>
-          <td>${escapeHtml(row.intervalLabel)}</td>
+          <td>${escapeHtml(row.group)}</td>
+          <td><a class="case-link" href="#${sectionId}">${escapeHtml(row.label)}</a></td>
+          <td><a class="case-link muted" href="#${sectionId}">${escapeHtml(row.intervalLabel)}</a></td>
           <td class="${row.tableRet.startsWith("-") ? "negative" : "positive"}">${escapeHtml(
             row.tableRet,
           )}</td>
           <td>${escapeHtml(row.tableSpan)}</td>
           <td>${escapeHtml(row.tableLow)}</td>
           <td>${escapeHtml(row.tableHigh)}</td>
-        </tr>`,
+        </tr>`;
+      },
     )
     .join("");
 
@@ -456,6 +717,14 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       color: var(--text);
       font-family:
         Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    a {
+      color: inherit;
     }
 
     main {
@@ -582,7 +851,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 720px;
+      min-width: 860px;
     }
 
     th,
@@ -597,7 +866,9 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
     th:first-child,
     td:first-child,
     th:nth-child(2),
-    td:nth-child(2) {
+    td:nth-child(2),
+    th:nth-child(3),
+    td:nth-child(3) {
       text-align: left;
     }
 
@@ -624,6 +895,12 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       background: var(--panel);
       border-radius: 8px;
       overflow: hidden;
+      scroll-margin-top: 16px;
+    }
+
+    section:target {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 1px rgba(73, 167, 255, 0.35);
     }
 
     .section-head {
@@ -642,6 +919,34 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       letter-spacing: 0;
     }
 
+    .case-link {
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .case-link:hover {
+      color: var(--blue);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .case-link.muted {
+      color: var(--muted);
+    }
+
+    .title-stack {
+      display: grid;
+      gap: 4px;
+    }
+
+    .case-group {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
     .interval {
       color: var(--muted);
       font-size: 13px;
@@ -654,6 +959,13 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       flex-wrap: wrap;
       gap: 8px;
       padding: 10px 16px 0;
+    }
+
+    .case-note {
+      padding: 8px 16px 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
     }
 
     .metric {
@@ -735,6 +1047,10 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       display: none;
     }
 
+    .sma-centered {
+      display: none;
+    }
+
     .source {
       margin-top: 22px;
       font-size: 13px;
@@ -745,7 +1061,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
   <main>
     <header>
       <h1>BTCUSDT interval price movement</h1>
-      <p>Each panel renders the three-day UTC window from the interval table in <code>tasks.md</code>, using Binance spot ${chartInterval} klines. The close path is overlaid on the intraperiod high/low envelope, with the dashed line marking the opening price. SMA overlays use 1h, 4h, and 12h close windows with pre-interval warmup candles. Entry thickness overlays are simulated from ${strategyInterval} strategy replays.</p>
+      <p>Each panel renders one UTC interval from the interval blocks in <code>tasks.md</code>, using Binance spot ${chartInterval} klines. The close path is overlaid on the intraperiod high/low envelope, with the dashed line marking the opening price. SMA overlays use 1h, 4h, and 12h close windows with pre-interval warmup candles; the centered SMA toggle shifts each average left by half its window and uses post-interval SMA candles to preserve coverage. Entry thickness overlays are simulated from ${strategyInterval} strategy replays.</p>
     </header>
     <div class="controls">
       <label class="control">
@@ -788,8 +1104,12 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
         <input id="trendBuyB2" type="number" step="1" value="300">
       </label>
       <label class="control inline">
-        <input id="entryToggle" type="checkbox" checked>
+        <input id="entryToggle" type="checkbox">
         Show entries
+      </label>
+      <label class="control inline">
+        <input id="centerSmaToggle" type="checkbox">
+        Center SMA
       </label>
       <label class="control">
         Thickness scale
@@ -810,6 +1130,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       <table>
         <thead>
           <tr>
+            <th>Group</th>
             <th>Case</th>
             <th>Interval</th>
             <th>Return</th>
@@ -841,6 +1162,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
     const trendSellB1 = document.getElementById("trendSellB1");
     const trendBuyB2 = document.getElementById("trendBuyB2");
     const entryToggle = document.getElementById("entryToggle");
+    const centerSmaToggle = document.getElementById("centerSmaToggle");
     const entryScale = document.getElementById("entryScale");
     const entryStatus = document.getElementById("entryStatus");
     let renderTimer;
@@ -848,6 +1170,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
     let latestEntries = [];
 
     const plot = { left: 74, right: 916, top: 28, bottom: 288 };
+    const chartIntervalMs = ${chartIntervalMs};
 
     function settingsFromControls() {
       return {
@@ -872,10 +1195,26 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       });
     }
 
+    function updateSmaMode() {
+      const centered = centerSmaToggle.checked;
+      document.querySelectorAll(".sma-trailing").forEach((node) => {
+        node.style.display = centered ? "none" : "inline";
+      });
+      document.querySelectorAll(".sma-centered").forEach((node) => {
+        node.style.display = centered ? "inline" : "none";
+      });
+    }
+
     function scheduleRerender() {
       clearTimeout(renderTimer);
       const version = ++renderVersion;
       updateModeControls();
+      if (!entryToggle.checked) {
+        latestEntries = chartCases.map(() => []);
+        drawLatestEntries();
+        entryStatus.textContent = "Entry overlay hidden.";
+        return;
+      }
       entryStatus.textContent = "Computing strategy overlay...";
       renderTimer = setTimeout(() => {
         void rerenderEntryLayers(version);
@@ -988,9 +1327,10 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       const lastOpenTime = testCase.candles[testCase.candles.length - 1].openTime;
       const lastTime = testCase.candles[testCase.candles.length - 1].closeTime;
       const smaSeries = [4, 16, 48].flatMap((periods) =>
-        movingAverage(testCase.smaCandles, periods).filter(
-          (point) => point.time >= firstTime && point.time <= lastOpenTime,
-        ),
+        [
+          ...movingAverage(testCase.smaCandles, periods),
+          ...shiftPoints(movingAverage(testCase.smaCandles, periods), centeredSmaShiftMs(periods)),
+        ].filter((point) => point.time >= firstTime && point.time <= lastOpenTime),
       );
       const prices = [
         ...testCase.candles.flatMap((candle) => [candle.low, candle.high]),
@@ -1016,6 +1356,14 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
         }
       }
       return points;
+    }
+
+    function shiftPoints(points, shiftMs) {
+      return points.map((point) => ({ time: point.time - shiftMs, value: point.value }));
+    }
+
+    function centeredSmaShiftMs(periods) {
+      return (periods * chartIntervalMs) / 2;
     }
 
     function xFor(geometry, time) {
@@ -1077,9 +1425,11 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
       trendSellB1,
       trendBuyB2,
     ].forEach((control) => control.addEventListener("input", scheduleRerender));
-    entryToggle.addEventListener("change", drawLatestEntries);
+    entryToggle.addEventListener("change", scheduleRerender);
+    centerSmaToggle.addEventListener("change", updateSmaMode);
     entryScale.addEventListener("input", drawLatestEntries);
     updateModeControls();
+    updateSmaMode();
     scheduleRerender();
   </script>
 </body>
@@ -1093,9 +1443,14 @@ function renderCaseSection({
   smaCandles,
 }: RenderedCase, caseIndex: number): string {
   const stroke = row.tableRet.startsWith("-") ? "var(--red)" : "var(--green)";
-  return `<section>
+  const note = row.note ? `<div class="case-note">${escapeHtml(row.note)}</div>` : "";
+  const sectionId = caseSectionId(row, caseIndex);
+  return `<section id="${sectionId}">
   <div class="section-head">
-    <h2>${escapeHtml(row.label)}</h2>
+    <div class="title-stack">
+      <div class="case-group">${escapeHtml(row.group)}</div>
+      <h2><a class="case-link" href="#${sectionId}">${escapeHtml(row.label)}</a></h2>
+    </div>
     <div class="interval">${escapeHtml(row.intervalLabel)}</div>
   </div>
   <div class="metrics">
@@ -1106,10 +1461,23 @@ function renderCaseSection({
     ${metric("Low", row.tableLow, "")}
     ${metric("High", row.tableHigh, "")}
   </div>
+  ${note}
   ${renderLegend()}
   <div class="entry-summary" data-case-index="${caseIndex}"></div>
   ${renderSvg(candles, smaCandles, stroke, caseIndex)}
 </section>`;
+}
+
+function caseSectionId(row: CaseRow, index: number): string {
+  return `case-${index + 1}-${slugify(row.intervalLabel)}-${slugify(row.label)}`;
+}
+
+function slugify(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "interval";
 }
 
 function metric(label: string, value: string, className: string): string {
@@ -1157,15 +1525,24 @@ function renderSvg(
   const firstTime = candles[0].openTime;
   const lastOpenTime = candles[candles.length - 1].openTime;
   const lastTime = candles[candles.length - 1].closeTime;
-  const smaSeries = smaConfigs.map((series) => ({
+  const trailingSmaSeries = smaConfigs.map((series) => ({
     ...series,
-    points: movingAverage(smaCandles, series.periods).filter(
-      (point) => point.time >= firstTime && point.time <= lastOpenTime,
+    points: visibleSmaPoints(smaCandles, series.periods, firstTime, lastOpenTime, 0),
+  }));
+  const centeredSmaSeries = smaConfigs.map((series) => ({
+    ...series,
+    points: visibleSmaPoints(
+      smaCandles,
+      series.periods,
+      firstTime,
+      lastOpenTime,
+      centeredSmaShiftMs(series.periods),
     ),
   }));
   const prices = [
     ...candles.flatMap((candle) => [candle.low, candle.high]),
-    ...smaSeries.flatMap((series) => series.points.map((point) => point.value)),
+    ...trailingSmaSeries.flatMap((series) => series.points.map((point) => point.value)),
+    ...centeredSmaSeries.flatMap((series) => series.points.map((point) => point.value)),
   ];
   const min = Math.min(...prices);
   const max = Math.max(...prices);
@@ -1182,12 +1559,8 @@ function renderSvg(
     plot.top + ((high - price) / Math.max(1, high - low)) * (plot.bottom - plot.top);
 
   const closePath = linePath(candles.map((candle) => [xFor(candle.openTime), yFor(candle.close)]));
-  const smaPaths = smaSeries
-    .filter((series) => series.points.length > 1)
-    .map((series) => ({
-      ...series,
-      path: linePath(series.points.map((point) => [xFor(point.time), yFor(point.value)])),
-    }));
+  const trailingSmaPaths = renderSmaPaths(trailingSmaSeries, xFor, yFor);
+  const centeredSmaPaths = renderSmaPaths(centeredSmaSeries, xFor, yFor);
   const highPath = linePath(candles.map((candle) => [xFor(candle.openTime), yFor(candle.high)]));
   const lowPath = linePath(
     [...candles].reverse().map((candle) => [xFor(candle.openTime), yFor(candle.low)]),
@@ -1223,12 +1596,12 @@ function renderSvg(
       yFor(openPrice),
     )}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="5 5" opacity="0.75" />
     <path d="${envelopePath}" fill="rgba(73, 167, 255, 0.12)" stroke="none" />
-    ${smaPaths
-      .map(
-        (series) =>
-          `<path d="${series.path}" fill="none" stroke="${series.color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" opacity="0.92" />`,
-      )
-      .join("")}
+    <g class="sma-layer sma-trailing">
+      ${trailingSmaPaths}
+    </g>
+    <g class="sma-layer sma-centered">
+      ${centeredSmaPaths}
+    </g>
     <path d="${closePath}" fill="none" stroke="${stroke}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round" />
     <g class="entry-layer" data-case-index="${caseIndex}"></g>
     <circle cx="${round(xFor(candles[0].openTime))}" cy="${round(
@@ -1264,6 +1637,36 @@ function movingAverage(candles: Candle[], periods: number): LinePoint[] {
   }
 
   return points;
+}
+
+function visibleSmaPoints(
+  candles: Candle[],
+  periods: number,
+  firstTime: number,
+  lastOpenTime: number,
+  shiftMs: number,
+): LinePoint[] {
+  return movingAverage(candles, periods)
+    .map((point) => ({ time: point.time - shiftMs, value: point.value }))
+    .filter((point) => point.time >= firstTime && point.time <= lastOpenTime);
+}
+
+function centeredSmaShiftMs(periods: number): number {
+  return (periods * chartIntervalMs) / 2;
+}
+
+function renderSmaPaths(
+  series: Array<SmaConfig & { points: LinePoint[] }>,
+  xFor: (time: number) => number,
+  yFor: (price: number) => number,
+): string {
+  return series
+    .filter((item) => item.points.length > 1)
+    .map((item) => {
+      const path = linePath(item.points.map((point) => [xFor(point.time), yFor(point.value)]));
+      return `<path d="${path}" fill="none" stroke="${item.color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" opacity="0.92" />`;
+    })
+    .join("");
 }
 
 function linePath(points: Array<[number, number]>, includeMove = true): string {
@@ -1315,6 +1718,19 @@ function formatUsd(value: number): string {
   return value.toLocaleString("en-US", {
     maximumFractionDigits: value >= 10_000 ? 0 : 2,
     minimumFractionDigits: 0,
+  });
+}
+
+function formatPercent(value: number, digits: number): string {
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(digits)}%`;
+}
+
+function formatPrice(value: number): string {
+  return value.toLocaleString("en-US", {
+    maximumFractionDigits: value >= 10_000 ? 2 : 4,
+    minimumFractionDigits: 0,
+    useGrouping: false,
   });
 }
 

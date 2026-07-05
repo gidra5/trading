@@ -498,7 +498,7 @@ mode.
 | `internalBorrowAccounting` | `inactive` | Internal allocation and settlement are disabled by default; `active` removes lender asset and quote principal. |
 | `borrowerProfitShareToLender` | `1` | Fraction of profitable borrower closes credited back to the lender lot basis. |
 | `maxPositionQuote` | Uncapped | Optional maximum notional the strategy can build per side; finite caps are explicit overrides. |
-| `leverageLongTermRangePaddingPct` | `3` | Extra range padding used when selecting baseline entry leverage from the long-term min/max. |
+| `leverageLongTermRangePaddingPct` | `20` | Extra range padding used when selecting baseline entry leverage from the long-term min/max. |
 | `limitOffsetBps` | `2` | Distance from current price for new limit orders. |
 | `maxOpenOrders` | `1024` | Maximum number of resting automated orders across entries and exit-grid ladders. |
 | `cooldownMs` | `300000` | Minimum delay between newly created automated orders. |

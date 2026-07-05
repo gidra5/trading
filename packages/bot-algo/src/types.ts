@@ -156,6 +156,9 @@ export interface LegacyValleyPeakConfig {
   exitGridResetBps: number;
   exitGridPositionMode: "aggregate" | "per-lot";
   exitGridResetMode: "higher-peak" | "filled-grid";
+  anticipatoryConfirmationEnabled: boolean;
+  anticipatoryConfirmationWindowSec: number;
+  anticipatoryConfirmationLookaheadFraction: number;
   rangeLeverageEnabled: boolean;
   leverageLongTermRangeWindow: RollingPriceRangeWindow;
   leverageRangeEdgeFraction: number;
@@ -266,6 +269,7 @@ export interface LegacyValleyPeakConfirmationDebug {
   windowSec?: number;
   rateClamped?: number;
   passed: boolean;
+  anticipated?: boolean;
   expected: "positive" | "negative";
 }
 

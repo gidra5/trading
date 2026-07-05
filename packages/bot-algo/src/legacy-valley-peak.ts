@@ -6,6 +6,7 @@ import type {
   LegacyValleyPeakDebugSnapshot,
   LegacyValleyPeakMemory,
   LegacyMarketStateDebug,
+  PositionLotSide,
   RollingCandleRangeBucket,
   RollingCandleRangeMemory,
   RollingCandleRangeMaxCandidate,
@@ -104,10 +105,13 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   exitGridResetBps: 10,
   exitGridPositionMode: "per-lot",
   exitGridResetMode: "filled-grid",
+  anticipatoryConfirmationEnabled: true,
+  anticipatoryConfirmationWindowSec: 30 * 60,
+  anticipatoryConfirmationLookaheadFraction: 0.1,
   rangeLeverageEnabled: true,
   leverageLongTermRangeWindow: "1y",
   leverageRangeEdgeFraction: 0.2,
-  leverageLongTermRangePaddingPct: 3,
+  leverageLongTermRangePaddingPct: 20,
 };
 
 export const legacyValleyPeakAsymmetricShortFavoringConfig: LegacyValleyPeakConfig = {
@@ -132,6 +136,9 @@ const PRICE_RANGE_WINDOWS: { window: RollingPriceRangeWindow; windowSec: number 
   { window: "2w", windowSec: 14 * 24 * 60 * 60 },
 ];
 const TREND_SIGMA_WINDOW_SEC = 3600;
+const ANTICIPATORY_CONFIRMATION_WINDOW_SEC = 30 * 60;
+const ANTICIPATORY_CONFIRMATION_LOOKAHEAD_FRACTION = 0.1;
+const MIN_ANTICIPATORY_CONFIRMATION_SAMPLES = 8;
 const MIN_RELATIVE_SIGMA = 0.00000001;
 const MIN_ABSOLUTE_SIGMA = 0.000001;
 const MAX_TREND_SIGMA_EXPONENT = 50;
@@ -285,6 +292,19 @@ export function createLegacyValleyPeakConfig(
   ) {
     config.exitGridResetMode = defaultLegacyValleyPeakConfig.exitGridResetMode;
   }
+  config.anticipatoryConfirmationEnabled = config.anticipatoryConfirmationEnabled !== false;
+  config.anticipatoryConfirmationWindowSec = isPositiveFinite(
+    config.anticipatoryConfirmationWindowSec,
+  )
+    ? Math.max(60, config.anticipatoryConfirmationWindowSec)
+    : ANTICIPATORY_CONFIRMATION_WINDOW_SEC;
+  config.anticipatoryConfirmationLookaheadFraction = clamp(
+    Number.isFinite(config.anticipatoryConfirmationLookaheadFraction)
+      ? config.anticipatoryConfirmationLookaheadFraction
+      : ANTICIPATORY_CONFIRMATION_LOOKAHEAD_FRACTION,
+    0.01,
+    1,
+  );
 
   return config;
 }
@@ -295,6 +315,7 @@ export function legacyValleyPeakHistoricalWarmupSec(
   return Math.max(
     ...config.averagingRangesSec,
     config.saturationSec,
+    config.anticipatoryConfirmationWindowSec,
     ...PRICE_RANGE_WINDOWS.map((range) => range.windowSec),
   );
 }
@@ -380,8 +401,8 @@ export function evaluateLegacyValleyPeak(
   const feeAdjustedBuyRate = input.price / (1 - input.feeRate);
   const feeAdjustedSellRate = input.price * (1 - input.feeRate);
 
-  const buyEntryPassed = shouldBuy(memory, config, config.buyConfirmationOffsets);
-  const buyExitPassed = shouldBuy(memory, config, config.buyExitConfirmationOffsets);
+  const buyEntryPassed = shouldBuy(memory, config, config.buyConfirmationOffsets, input);
+  const buyExitPassed = shouldBuy(memory, config, config.buyExitConfirmationOffsets, input);
   if (buyEntryPassed || buyExitPassed) {
     const quoteSize = buyQuoteSize(memory, config, input, feeAdjustedBuyRate);
     const coverQuantity = buyCoverQuantity(memory, config, input, feeAdjustedBuyRate);
@@ -408,8 +429,8 @@ export function evaluateLegacyValleyPeak(
     }
   }
 
-  const sellEntryPassed = shouldSell(memory, config, config.sellConfirmationOffsets);
-  const sellExitPassed = shouldSell(memory, config, config.sellExitConfirmationOffsets);
+  const sellEntryPassed = shouldSell(memory, config, config.sellConfirmationOffsets, input);
+  const sellExitPassed = shouldSell(memory, config, config.sellExitConfirmationOffsets, input);
   if (sellEntryPassed || sellExitPassed) {
     const quantity = sellQuantity(memory, config, input, feeAdjustedSellRate);
     const quoteSize = shortSellQuoteSize(memory, config, input, feeAdjustedSellRate);
@@ -448,6 +469,222 @@ function holdLegacyValleyPeakDecision(): LegacyValleyPeakDecision {
 
 function hasLegacyValleyPeakSignal(decision: LegacyValleyPeakDecision): boolean {
   return decision.entrySignal.signal !== "hold" || decision.exitSignal.signal !== "hold";
+}
+
+interface AnticipatoryConfirmationPrediction {
+  side: PositionLotSide;
+  extremaX: number;
+  extremaPrice: number;
+}
+
+function canAnticipateConfirmationFailure(
+  side: PositionLotSide,
+  pricePrediction: AnticipatoryConfirmationPrediction | undefined,
+  failedConfirmationCount: number,
+): boolean {
+  return failedConfirmationCount === 1 && pricePrediction?.side === side;
+}
+
+function predictAnticipatoryConfirmationExtremum(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput | undefined,
+): AnticipatoryConfirmationPrediction | undefined {
+  if (
+    !config.anticipatoryConfirmationEnabled ||
+    !input ||
+    input.price <= 0
+  ) {
+    return undefined;
+  }
+
+  const windowSec = config.anticipatoryConfirmationWindowSec;
+  const trendMemory = anticipatoryTrendMemory(memory, config, windowSec);
+  const fit = fitRollingAverageEntries(trendMemory, windowSec, input);
+  if (!fit || Math.abs(fit.a) <= Number.EPSILON) {
+    return undefined;
+  }
+
+  const extremaX = -fit.b / (2 * fit.a);
+  const { minExtremaX, maxExtremaX } = anticipatoryExtremaXRange(config);
+  if (extremaX < minExtremaX || extremaX > maxExtremaX) {
+    return undefined;
+  }
+
+  const extremaPrice = fit.a * extremaX ** 2 + fit.b * extremaX + fit.c;
+  if (!isPositiveFinite(extremaPrice)) {
+    return undefined;
+  }
+
+  const side: PositionLotSide = fit.a > 0 ? "long" : "short";
+  if (side === "long") {
+    if (extremaPrice >= input.price) {
+      return undefined;
+    }
+  } else if (extremaPrice <= input.price) {
+    return undefined;
+  }
+
+  return {
+    side,
+    extremaX,
+    extremaPrice,
+  };
+}
+
+function fitRollingAverageEntries(
+  memory: RollingAverageMemory | undefined,
+  windowSec: number,
+  input: LegacyValleyPeakInput | undefined,
+): { a: number; b: number; c: number } | undefined {
+  if (!memory || !input) {
+    return undefined;
+  }
+
+  const latestTs = input.eventTime / 1000;
+  const windowStartTs = latestTs - windowSec;
+  const samples: Array<{ x: number; y: number; ts: number }> = [];
+  const startIndex = clampInt(memory.startIndex ?? 0, 0, memory.timestamps.length);
+  for (let index = startIndex; index < memory.timestamps.length; index += 1) {
+    const ts = memory.timestamps[index];
+    const value = memory.entries[index];
+    if (
+      ts >= windowStartTs &&
+      ts <= latestTs &&
+      isPositiveFinite(value)
+    ) {
+      samples.push({
+        x: (ts - windowStartTs) / windowSec,
+        y: value,
+        ts,
+      });
+    }
+  }
+
+  if (samples.length < MIN_ANTICIPATORY_CONFIRMATION_SAMPLES) {
+    return undefined;
+  }
+
+  const spanSec = samples[samples.length - 1].ts - samples[0].ts;
+  if (spanSec < windowSec * 0.8) {
+    return undefined;
+  }
+
+  return fitQuadratic(samples);
+}
+
+function anticipatoryExtremaXRange(
+  config: LegacyValleyPeakConfig,
+): { minExtremaX: number; maxExtremaX: number } {
+  const lookaround = config.anticipatoryConfirmationLookaheadFraction;
+  return {
+    minExtremaX: 1 - lookaround,
+    maxExtremaX: 1 + lookaround,
+  };
+}
+
+function anticipatoryTrendMemory(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  targetWindowSec: number,
+): RollingAverageMemory | undefined {
+  const exact = config.averagingRangesSec.indexOf(targetWindowSec);
+  if (exact >= 0) {
+    return memory.buyAverages[exact] ?? memory.sellAverages[exact];
+  }
+
+  let closest = 0;
+  let closestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
+    const distance = Math.abs(config.averagingRangesSec[index] - targetWindowSec);
+    if (distance < closestDistance) {
+      closest = index;
+      closestDistance = distance;
+    }
+  }
+  return memory.buyAverages[closest] ?? memory.sellAverages[closest];
+}
+
+function fitQuadratic(
+  samples: Array<{ x: number; y: number }>,
+): { a: number; b: number; c: number } | undefined {
+  let s0 = 0;
+  let s1 = 0;
+  let s2 = 0;
+  let s3 = 0;
+  let s4 = 0;
+  let sy = 0;
+  let sxy = 0;
+  let sx2y = 0;
+
+  for (const sample of samples) {
+    const x = sample.x;
+    const x2 = x * x;
+    s0 += 1;
+    s1 += x;
+    s2 += x2;
+    s3 += x2 * x;
+    s4 += x2 * x2;
+    sy += sample.y;
+    sxy += x * sample.y;
+    sx2y += x2 * sample.y;
+  }
+
+  const solution = solve3x3(
+    [
+      [s4, s3, s2],
+      [s3, s2, s1],
+      [s2, s1, s0],
+    ],
+    [sx2y, sxy, sy],
+  );
+  if (!solution) {
+    return undefined;
+  }
+
+  const [a, b, c] = solution;
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) {
+    return undefined;
+  }
+  return { a, b, c };
+}
+
+function solve3x3(matrix: number[][], vector: number[]): number[] | undefined {
+  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+
+  for (let pivot = 0; pivot < 3; pivot += 1) {
+    let selected = pivot;
+    for (let row = pivot + 1; row < 3; row += 1) {
+      if (Math.abs(augmented[row][pivot]) > Math.abs(augmented[selected][pivot])) {
+        selected = row;
+      }
+    }
+    if (Math.abs(augmented[selected][pivot]) < 1e-12) {
+      return undefined;
+    }
+    if (selected !== pivot) {
+      const tmp = augmented[pivot];
+      augmented[pivot] = augmented[selected];
+      augmented[selected] = tmp;
+    }
+
+    const pivotValue = augmented[pivot][pivot];
+    for (let column = pivot; column < 4; column += 1) {
+      augmented[pivot][column] /= pivotValue;
+    }
+
+    for (let row = 0; row < 3; row += 1) {
+      if (row === pivot) {
+        continue;
+      }
+      const factor = augmented[row][pivot];
+      for (let column = pivot; column < 4; column += 1) {
+        augmented[row][column] -= factor * augmented[pivot][column];
+      }
+    }
+  }
+
+  return [augmented[0][3], augmented[1][3], augmented[2][3]];
 }
 
 function legacyValleyPeakSignalReason(
@@ -583,17 +820,29 @@ function shouldBuy(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   confirmationOffsets: number[],
+  input?: LegacyValleyPeakInput,
 ): boolean {
   const primary = memory.buyAverages[config.buyDataIndex];
   if (!isValley(primary)) {
     return false;
   }
 
+  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  let failedConfirmationCount = 0;
   for (const offset of confirmationOffsets) {
     const confirmation = memory.buyAverages[config.buyDataIndex + offset];
     const confirmationPoint = latestPoint(confirmation);
     if (confirmationPoint && confirmationPoint.rateClamped <= 0) {
-      return false;
+      failedConfirmationCount += 1;
+      if (
+        !canAnticipateConfirmationFailure(
+          "long",
+          pricePrediction,
+          failedConfirmationCount,
+        )
+      ) {
+        return false;
+      }
     }
   }
 
@@ -604,17 +853,29 @@ function shouldSell(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   confirmationOffsets: number[],
+  input?: LegacyValleyPeakInput,
 ): boolean {
   const primary = memory.sellAverages[config.sellDataIndex];
   if (!isPeak(primary)) {
     return false;
   }
 
+  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  let failedConfirmationCount = 0;
   for (const offset of confirmationOffsets) {
     const confirmation = memory.sellAverages[config.sellDataIndex + offset];
     const confirmationPoint = latestPoint(confirmation);
     if (confirmationPoint && confirmationPoint.rateClamped >= 0) {
-      return false;
+      failedConfirmationCount += 1;
+      if (
+        !canAnticipateConfirmationFailure(
+          "short",
+          pricePrediction,
+          failedConfirmationCount,
+        )
+      ) {
+        return false;
+      }
     }
   }
 
@@ -641,6 +902,19 @@ function buildLegacyValleyPeakCheckDebug(
       : side === "sell" && isPeak(primary)
         ? "peak"
         : "flat";
+  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  const failedConfirmationCount = confirmationOffsets.reduce((count, offset) => {
+    const index = primaryIndex + offset;
+    const confirmation = side === "buy"
+      ? memory.buyAverages[index]
+      : memory.sellAverages[index];
+    const point = latestPoint(confirmation);
+    if (!point) {
+      return count;
+    }
+    const failed = side === "buy" ? point.rateClamped <= 0 : point.rateClamped >= 0;
+    return failed ? count + 1 : count;
+  }, 0);
   const confirmations = confirmationOffsets.map((offset) => {
     const index = primaryIndex + offset;
     const confirmation = side === "buy"
@@ -648,21 +922,30 @@ function buildLegacyValleyPeakCheckDebug(
       : memory.sellAverages[index];
     const point = latestPoint(confirmation);
     const expected: "positive" | "negative" = side === "buy" ? "positive" : "negative";
+    const actualPassed =
+      !point ||
+      (side === "buy" ? point.rateClamped > 0 : point.rateClamped < 0);
+    const anticipated =
+      !actualPassed &&
+      canAnticipateConfirmationFailure(
+        side === "buy" ? "long" : "short",
+        pricePrediction,
+        failedConfirmationCount,
+      );
     return {
       index,
       windowSec: config.averagingRangesSec[index],
       rateClamped: point?.rateClamped,
       expected,
-      passed:
-        !point ||
-        (side === "buy" ? point.rateClamped > 0 : point.rateClamped < 0),
+      passed: actualPassed || anticipated,
+      anticipated: anticipated || undefined,
     };
   });
 
   if (side === "buy") {
     return {
       side,
-      passed: shouldBuy(memory, config, confirmationOffsets),
+      passed: shouldBuy(memory, config, confirmationOffsets, input),
       primaryIndex,
       primaryWindowSec: config.averagingRangesSec[primaryIndex],
       primaryRate: primaryPoint?.rate,
@@ -679,7 +962,7 @@ function buildLegacyValleyPeakCheckDebug(
 
   return {
     side,
-    passed: shouldSell(memory, config, confirmationOffsets),
+    passed: shouldSell(memory, config, confirmationOffsets, input),
     primaryIndex,
     primaryWindowSec: config.averagingRangesSec[primaryIndex],
     primaryRate: primaryPoint?.rate,

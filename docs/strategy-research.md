@@ -715,6 +715,104 @@ The most important next improvement is better signal qualification. The strategy
 to know whether a detected valley/peak has enough expected move after costs and fill
 risk before it opens or exits exposure.
 
+## Reproducible Candidate Configs
+
+### Static 0.1 Anticipatory Confirmation 10%
+
+Recorded on 2026-07-05 after changing anticipation to confirm signals instead of
+placing anticipatory limit orders. This variant keeps the normal valley/peak primary
+trigger, but allows exactly one lagging confirmation to pass when a quadratic fit of
+the recent 30m price trend predicts the matching extremum within 10% of the fit
+window. If both confirmations are still failing, the signal remains blocked.
+
+Backtest scope:
+
+- Market: BTCUSDT `1m` candles from `data/historical/spot-btcusdt/btcusdt/1m`.
+- Files: `2026-06-22.jsonl` through `2026-06-28.jsonl`.
+- Exact replay span: `2026-06-22T00:00:00.000Z` to
+  `2026-06-28T17:23:59.999Z`.
+- Candles: `9,684`.
+- Account/model: default strategy account settings, including `10000` USDT starting
+  quote, `5x` max leverage, futures-margin shorts, and default borrow depths.
+
+Config override:
+
+```ts
+const config = {
+  symbol: "BTCUSDT",
+  algorithm: "legacy-valley-peak",
+  startingQuote: defaultStrategyConfig.startingQuote,
+  maxLeverage: defaultStrategyConfig.maxLeverage,
+  shortMarginModel: defaultStrategyConfig.shortMarginModel,
+  longBorrowDepth: defaultStrategyConfig.longBorrowDepth,
+  shortBorrowDepth: defaultStrategyConfig.shortBorrowDepth,
+  internalBorrowAccounting: defaultStrategyConfig.internalBorrowAccounting,
+  borrowerProfitShareToLender: defaultStrategyConfig.borrowerProfitShareToLender,
+  maxPositionQuote: defaultStrategyConfig.maxPositionQuote,
+  minOrderQuote: defaultStrategyConfig.minOrderQuote,
+  maxOpenOrders: defaultStrategyConfig.maxOpenOrders,
+  cooldownMs: defaultStrategyConfig.cooldownMs,
+  staleOrderMs: defaultStrategyConfig.staleOrderMs,
+  legacyValleyPeak: {
+    sigmaMode: "static",
+    buySigma: 0.1,
+    sellSigma: 0.1,
+    exitGridEnabled: true,
+    exitGridMarketEntry: true,
+    exitGridPositionMode: "per-lot",
+    exitGridResetMode: "filled-grid",
+    anticipatoryConfirmationEnabled: true,
+    anticipatoryConfirmationWindowSec: 30 * 60,
+    anticipatoryConfirmationLookaheadFraction: 0.1,
+  },
+};
+```
+
+Observed result:
+
+| Return | Net PnL | Final Equity | Max DD | Oracle Return | Oracle Capture | Trades | Win Rate | Closed Profitable | Liq |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `28.6894%` | `$2868.94` | `$12868.94` | `7.2934%` | `675.2428%` | `4.2487%` | `1118` | `99.2639%` | `90/90` | `0` |
+
+Extrema order-mass metrics:
+
+| Side | Fills | Quote | Threshold Mass | P99 Frame | P99 Price Distance |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Buy near valleys | `754` | `$273279.77` | `2.7686%` | `40.00m` | `0.8743%` |
+| Sell near peaks | `364` | `$285247.35` | `0.0000%` | `41.66m` | `1.0139%` |
+
+Baseline on the same window with `anticipatoryConfirmationEnabled=false` returned
+`-1.2826%` with `-0.1899%` oracle capture. The same anticipation rule made the current
+default sizing worse on this window (`-37.3103%` return), so this is a reproducible
+signal/sizing candidate rather than a promoted default.
+
+Stress test on hand-picked intervals from `tasks.md`, using fresh memory per interval
+and UTC day-inclusive windows. The candidate was profitable on `4/18` intervals, had
+zero liquidations, and averaged roughly `-9.26%` return across the set. This failed the
+robustness check: it worked on some high-churn reversal/range intervals, but lost
+heavily in sustained trend weeks and several choppy near-flat weeks.
+
+| Group | Interval | Market | Return | Max DD | Capture | Trades |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Choppy week | `2022-07-28..2022-08-03` | `-0.59%` | `-29.38%` | `29.95%` | `-2.49%` | `1987` |
+| Choppy week | `2022-05-14..2022-05-20` | `-0.29%` | `-19.27%` | `29.50%` | `-1.32%` | `3258` |
+| Choppy week | `2021-12-14..2021-12-20` | `+0.45%` | `-29.48%` | `31.72%` | `-2.14%` | `2216` |
+| Choppy week | `2021-09-08..2021-09-14` | `+0.52%` | `-6.02%` | `30.10%` | `-0.41%` | `1960` |
+| Choppy week | `2023-03-18..2023-03-24` | `+0.22%` | `+20.20%` | `10.15%` | `+1.46%` | `2381` |
+| Regime week up | `2023-03-11..2023-03-17` | `+35.95%` | `-42.93%` | `43.61%` | `-1.76%` | `1768` |
+| Regime week sideways | `2026-04-22..2026-04-28` | `+0.01%` | `+12.82%` | `6.91%` | `+4.66%` | `612` |
+| Regime week down | `2022-06-12..2022-06-18` | `-33.26%` | `-46.38%` | `59.26%` | `-0.68%` | `3163` |
+| 3d up low churn | `2024-02-24..2024-02-26` | `+7.36%` | `-1.84%` | `1.95%` | `-1.48%` | `24` |
+| 3d up high churn | `2022-06-19..2022-06-21` | `+9.24%` | `-4.53%` | `14.53%` | `-0.24%` | `1955` |
+| 3d down low churn | `2023-06-03..2023-06-05` | `-5.56%` | `-23.77%` | `25.79%` | `-14.63%` | `27` |
+| 3d down high churn | `2022-06-13..2022-06-15` | `-15.02%` | `+21.39%` | `32.59%` | `+0.46%` | `1662` |
+| 3d sideways high bias churn | `2021-10-19..2021-10-21` | `+0.30%` | `-4.76%` | `17.96%` | `-0.67%` | `918` |
+| 3d sideways high bias low churn | `2025-02-14..2025-02-16` | `-0.51%` | `-6.46%` | `6.87%` | `-8.53%` | `98` |
+| 3d sideways low bias churn | `2024-07-07..2024-07-09` | `-0.31%` | `-13.64%` | `16.09%` | `-2.81%` | `570` |
+| 3d sideways low bias low churn | `2025-07-04..2025-07-06` | `-0.35%` | `-0.22%` | `0.22%` | `-0.59%` | `6` |
+| 3d sideways mid bias churn | `2024-01-02..2024-01-04` | `-0.06%` | `+7.82%` | `14.03%` | `+1.23%` | `363` |
+| 3d sideways mid bias low churn | `2023-09-15..2023-09-17` | `+0.02%` | `-0.19%` | `0.24%` | `-0.39%` | `5` |
+
 ## Research Backlog
 
 | Direction | Why it may help legacy | Main risk |

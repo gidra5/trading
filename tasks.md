@@ -45,6 +45,8 @@ the best results are short-side only - 0.3 sigma with +21.02%, and 0.1 sigma wit
 sell sigma=b+a*ln(e^x+c), a some constant, x derivative of higher level sma
 buy sigma=b+a*ln(e^-x+c)
 
+extrapolate other signals used for sizing.in the same manner
+
 3 representative interavals, but sideways with a rally inbetween defied expectations. 
 st “sideways but choppy” candidates:
 
@@ -81,6 +83,21 @@ I found these 3d UTC intervals. Definitions used:
 | sideways, mid bias, churn      | `2024-01-02..2024-01-04` |  `-0.064%` | `11.611%` | `+0.084%` |    `36` |    `40750` |  `45879.63` |
 | sideways, mid bias, low churn  | `2023-09-15..2023-09-17` |  `+0.018%` |  `2.504%` | `+0.006%` |     `4` |    `26224` |     `26888` |
 
+duration	trend	interval	market Sharpe	market move	bot return	bot max DD	bot ann. Sharpe
+3d	up	2024-11-09..2024-11-11	2.806	+15.865%	+5.559%	1.690%	14.909
+3d	up	2023-12-03..2023-12-05	2.707	+11.718%	+2.642%	2.224%	8.140
+3d	down	2026-06-01..2026-06-03	2.842	-12.938%	+8.955%	2.231%	22.167
+3d	down	2023-03-07..2023-03-09	2.608	-9.135%	+3.516%	2.059%	9.828
+7d	up	2023-11-29..2023-12-05	2.959	+16.538%	+6.331%	2.082%	9.809
+7d	up	2024-11-05..2024-11-11	3.454	+30.653%	+5.269%	3.765%	6.039
+7d	down	2023-03-03..2023-03-09	2.540	-13.224%	+3.269%	1.936%	5.096
+7d	down	2026-05-27..2026-06-02	2.626	-12.076%	+2.525%	4.195%	4.088
+I also found two strong market downtrends that are useful as stress cases because the current static short-favoring bot loses there:
+
+duration	interval	market Sharpe	market move	bot return
+3d	2022-06-11..2022-06-13	2.602	-22.702%	-3.455%
+7d	2022-06-07..2022-06-13
+
 For running one:
 
 ```bash
@@ -89,6 +106,8 @@ npx tsx scripts/check-sigma-borrow-matrix.ts \
   --sigma-mode static --buy-sigma 0.1 --sell-sigma 0.1 \
   --mode both --long-borrow-depth 999 --short-borrow-depth 999
 ```
+
+use kama as a source
 
 ((sigmaX*a+(1-a)*sigmaY), (sigmaX*b+(1-b)*sigmaY))
 a=sigmoid(trend, slopeA) 

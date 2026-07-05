@@ -783,6 +783,7 @@ export class SimulatedExecutionEngine {
     tick.price = price;
     tick.quantity = undefined;
 
+    this.recordEffectiveLeverage();
     if (this.liquidateAccountIfNeeded(eventTime, price, false)) {
       return NO_EVENTS;
     }
@@ -790,6 +791,7 @@ export class SimulatedExecutionEngine {
     this.cancelStaleOrders(eventTime, false);
     this.fillOpenOrders(tick, false);
     this.applyLotLifecycleControls(tick, false, { fillImmediately: true });
+    this.recordEffectiveLeverage();
     if (this.liquidateAccountIfNeeded(eventTime, price, false)) {
       return NO_EVENTS;
     }
