@@ -9,18 +9,6 @@
 
 <body>
   <div id="root"></div>
-  <script type="module">
-      await fetch(new URL("/config.json", window.location.origin),).then(async (response) => {
-      if (response.ok) {
-        window.runtimeConfig = await response.json();
-      } else {
-        window.runtimeConfig = {};
-      }
-    }).catch((e) => {
-      console.error(e);
-      window.runtimeConfig = {};
-    });
-      </script>
   <script type="module" src="/src/main.tsx"></script>
 </body>
 

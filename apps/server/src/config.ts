@@ -7,6 +7,7 @@ import type { BinancePaperMode } from "./binance-paper.js";
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(sourceDir, "../../..");
 
+const environment = normalizeEnvironment(process.env.TRADING_ENV);
 const symbol = (process.env.TRADING_SYMBOL ?? "BTCUSDT").toUpperCase();
 const interval = process.env.TRADING_INTERVAL ?? "1m";
 const market = createConfiguredMarketListing({
@@ -18,6 +19,7 @@ const market = createConfiguredMarketListing({
 });
 
 export const appConfig = {
+  environment: environment ?? "local",
   host: process.env.HOST ?? "0.0.0.0",
   port: Number(process.env.PORT ?? 3001),
   symbol: market.symbol,
@@ -34,7 +36,7 @@ export const appConfig = {
     autoSubmit: parseBoolean(process.env.TRADING_BINANCE_PAPER_AUTO_SUBMIT, false),
     baseUrlOverride: process.env.BINANCE_PAPER_BASE_URL,
   },
-  dataDir: process.env.TRADING_DATA_DIR ? path.resolve(process.env.TRADING_DATA_DIR) : path.join(repoRoot, "data"),
+  dataDir: resolveDataDir(environment),
   webDistDir: path.join(repoRoot, "apps/web/dist"),
   historicalCache: {
     maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 1024 * 1024 * 1024),
@@ -69,6 +71,35 @@ export const appConfig = {
     maxOpenOrders: parseNumber(process.env.TRADING_MAX_OPEN_ORDERS, 1024),
   }),
 };
+
+function resolveDataDir(environmentName: string | undefined): string {
+  if (process.env.TRADING_DATA_DIR) {
+    return path.resolve(process.env.TRADING_DATA_DIR);
+  }
+
+  if (environmentName) {
+    return path.join(repoRoot, "data", environmentName);
+  }
+
+  return path.join(repoRoot, "data");
+}
+
+function normalizeEnvironment(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === "production") {
+    return "prod";
+  }
+  if (normalized === "staging") {
+    return "stage";
+  }
+
+  const safe = normalized.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe || undefined;
+}
 
 function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
   if (

@@ -138,3 +138,9 @@ the single side case need an interpretation to be cleared. because it simply con
   - after we get to some suitable level of performance, explore portfolio management strategies. hedging, rebalancing, correlation reduction, maybe something else.
   - the strategies currently account for jagged up or down trend, but possibly breaks when the trend changes. Need to account for transition periods as well.
   - for portfolio, the perfect trader would pick to move all equity to the asset with best abs move. As an approximation, we can extend borrowing logic to work across assets, and at the entry point we borrow from the worst performing position across all assets.
+
+PORT=3001 TRADING_DATA_DIR=/var/lib/trading/prod npm run start -w @trading/server
+TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://127.0.0.1:3001 npm run start -w @trading/web
+
+PORT=3002 TRADING_DATA_DIR=/var/lib/trading/stage npm run start -w @trading/server
+TRADING_WEB_PORT=4174 TRADING_BACKEND_URL=http://127.0.0.1:3002 npm run start -w @trading/web

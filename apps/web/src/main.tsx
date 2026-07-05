@@ -4,14 +4,6 @@ import "./styles.css";
 import { render } from "solid-js/web";
 import { App } from "./App";
 
-declare global {
-  interface Window {
-    runtimeConfig: {
-      apiUrl?: string;
-    };
-  }
-}
-
 const root = document.getElementById("root");
 
 if (!root) {

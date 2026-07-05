@@ -56,11 +56,8 @@ import type {
   RuntimeSnapshot,
 } from "./types";
 
-const apiBase =
-  window.runtimeConfig.apiUrl ??
-  import.meta.env.VITE_API_URL ??
-  (window.location.port === "5173" ? "http://localhost:3001" : window.location.origin);
-const wsUrl = apiBase.replace(/^http/, "ws").replace(/\/$/, "") + "/ws";
+const apiBase = "/backend";
+const wsUrl = websocketUrl(apiBase, "/ws");
 const SOCKET_SNAPSHOT_APPLY_MS = 500;
 const buttonBaseClass =
   "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
@@ -70,6 +67,14 @@ const buttonPanelClass =
   `${buttonBaseClass} border border-line bg-ink-800 text-ink-100 hover:bg-ink-700 focus-visible:ring-ink-600/55`;
 const buttonDangerClass =
   `${buttonBaseClass} border border-loss/55 bg-loss/14 text-loss hover:border-loss hover:bg-loss/22 focus-visible:ring-loss/40`;
+
+function websocketUrl(basePath: string, socketPath: string): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const normalizedBase = basePath.replace(/\/$/, "");
+  const normalizedSocketPath = socketPath.startsWith("/") ? socketPath : `/${socketPath}`;
+
+  return `${protocol}//${window.location.host}${normalizedBase}${normalizedSocketPath}`;
+}
 
 interface BacktestSettings {
   historicalDays: number;

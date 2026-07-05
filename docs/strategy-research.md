@@ -913,6 +913,17 @@ median return was `0.000%`. Treat it as an experiment, not a default candidate. 
 more actionable region is KAMA with moderately wider outer thresholds, especially
 `2x` deadband or `2x` with `inner=1`, which is effectively the same boundary behavior.
 
+Recent-window 100x follow-up:
+`docs/recent-kama-thresholds-2026-07-05-partial.md`
+
+Ran `2x` KAMA deadband on the latest local BTCUSDT suffixes with `maxLeverage=100`.
+The local candle cache ended at `2026-06-28 17:23 UTC`, so these are not July 5 live
+windows. Completed 3d/7d/30d rows were defensive: normal range-leverage mode returned
+`+0.000%`, `+0.008%`, and `+0.113%` with no liquidations; forced max-entry leverage
+returned `+0.000%`, `+0.009%`, and `+1.089%` with no liquidations. The 90d row did
+not complete in a reasonable runtime in either mode, so long-window validation is
+blocked on benchmark-runner performance rather than strategy result quality.
+
 ## Research Backlog
 
 | Direction | Why it may help legacy | Main risk |

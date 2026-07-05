@@ -15,7 +15,9 @@ import {
   BinanceMarketCatalog,
   getMarketStorageKey,
   isStreamVenue,
+  type BinanceMarketCatalogSnapshot,
   type BinanceMarketListing,
+  type MarketGroup,
 } from "./binance-markets.js";
 import { TradingRuntime } from "./runtime.js";
 import { TradingStorage } from "./storage.js";
@@ -34,6 +36,7 @@ const server = Fastify({
 });
 
 const MAX_RANDOM_PAIR_COUNT = 25;
+const MARKET_CATALOG_RESPONSE_TIMEOUT_MS = 5_000;
 
 await server.register(cors, {
   origin: true,
@@ -84,6 +87,7 @@ const correlationService = new CorrelationService({
 
 server.get("/health", async () => ({
   ok: true,
+  environment: appConfig.environment,
   market: appConfig.market.id,
   symbol: appConfig.market.symbol,
   dataDir: appConfig.dataDir,
@@ -93,7 +97,22 @@ server.get("/api/state", async () => publicSnapshot());
 
 server.get("/api/markets", async (request) => {
   const query = request.query as { refresh?: string };
-  return marketCatalog.list(query.refresh === "1" || query.refresh === "true");
+  const refresh = query.refresh === "1" || query.refresh === "true";
+  const catalogRequest = marketCatalog.list(refresh).catch((error) => {
+    const message = error instanceof Error ? error.message : "Binance market catalog failed.";
+    server.log.warn({ error: message }, "Binance market catalog request failed");
+    return fallbackMarketCatalog(activeMarket, message);
+  });
+
+  return Promise.race([
+    catalogRequest,
+    delay(MARKET_CATALOG_RESPONSE_TIMEOUT_MS).then(() =>
+      fallbackMarketCatalog(
+        activeMarket,
+        `Binance market catalog did not respond within ${MARKET_CATALOG_RESPONSE_TIMEOUT_MS}ms.`,
+      ),
+    ),
+  ]);
 });
 
 server.post("/api/market", async (request, reply) => {
@@ -584,6 +603,48 @@ function shuffle<T>(items: T[]): T[] {
     [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
   }
   return shuffled;
+}
+
+function fallbackMarketCatalog(
+  market: BinanceMarketListing,
+  warning: string,
+): BinanceMarketCatalogSnapshot {
+  const markets = [market];
+  return {
+    markets,
+    counts: countCatalogGroups(markets),
+    sources: [
+      {
+        source: market.venue,
+        status: "failed",
+        count: 0,
+        message: warning,
+      },
+    ],
+    warnings: [warning],
+    refreshedAt: Date.now(),
+  };
+}
+
+function countCatalogGroups(
+  markets: readonly BinanceMarketListing[],
+): Record<MarketGroup, number> {
+  return {
+    spot: 0,
+    bstocks: 0,
+    futures: 0,
+    tradfi: 0,
+    options: 0,
+    predictions: 0,
+    ...markets.reduce<Partial<Record<MarketGroup, number>>>((counts, market) => {
+      counts[market.group] = (counts[market.group] ?? 0) + 1;
+      return counts;
+    }, {}),
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const address = await server.listen({
