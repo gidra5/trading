@@ -25,6 +25,8 @@ import {
   createLegacyValleyPeakMemory,
   createLegacyValleyPeakDebugSnapshot,
   defaultLegacyValleyPeakConfig,
+  legacyValleyPeakDecisionReason,
+  legacyValleyPeakDecisionSignal,
   normalizeLegacyValleyPeakMemory,
 } from "./legacy-valley-peak.js";
 import {
@@ -1311,44 +1313,58 @@ export class SimulatedExecutionEngine {
       );
     }
 
-    if (decision.signal === "hold") {
+    const signal = legacyValleyPeakDecisionSignal(decision);
+    if (signal === "hold") {
       this.state.memory.lastSignal = "hold";
       return [];
     }
 
-    const order =
-      decision.signal === "buy"
-        ? decision.coverQuantity * tick.price >= config.minOrderQuote
-          ? this.createBuyToCoverOrder(
-              tick.price,
-              tick.eventTime,
-              decision.reason,
-              decision.coverQuantity,
-            )
-          : this.createBuyOrder(
-              tick.price,
-              tick.eventTime,
-              decision.reason,
-              decision.quoteSize,
-              {},
-              longEntryRisk.leverage,
-            )
-        : decision.quantity * tick.price >= config.minOrderQuote
-          ? this.createSellOrder(tick.price, tick.eventTime, decision.reason, decision.quantity)
-          : this.createShortSellOrder(
-              tick.price,
-              tick.eventTime,
-              decision.reason,
-              decision.quoteSize,
-              {},
-              shortEntryRisk.leverage,
-            );
+    let order: TradingOrder | undefined;
+    if (
+      decision.exitSignal.signal === "buy" &&
+      decision.exitSignal.coverQuantity * tick.price >= config.minOrderQuote
+    ) {
+      order = this.createBuyToCoverOrder(
+        tick.price,
+        tick.eventTime,
+        decision.exitSignal.reason,
+        decision.exitSignal.coverQuantity,
+      );
+    } else if (
+      decision.exitSignal.signal === "sell" &&
+      decision.exitSignal.quantity * tick.price >= config.minOrderQuote
+    ) {
+      order = this.createSellOrder(
+        tick.price,
+        tick.eventTime,
+        decision.exitSignal.reason,
+        decision.exitSignal.quantity,
+      );
+    } else if (decision.entrySignal.signal === "buy") {
+      order = this.createBuyOrder(
+        tick.price,
+        tick.eventTime,
+        decision.entrySignal.reason,
+        decision.entrySignal.quoteSize,
+        {},
+        longEntryRisk.leverage,
+      );
+    } else if (decision.entrySignal.signal === "sell") {
+      order = this.createShortSellOrder(
+        tick.price,
+        tick.eventTime,
+        decision.entrySignal.reason,
+        decision.entrySignal.quoteSize,
+        {},
+        shortEntryRisk.leverage,
+      );
+    }
 
     if (!order) {
       return [];
     }
 
-    this.state.memory.lastSignal = decision.signal;
+    this.state.memory.lastSignal = signal;
     this.state.memory.lastActionAt = tick.eventTime;
 
     if (!collectEvents) {
@@ -1359,7 +1375,7 @@ export class SimulatedExecutionEngine {
       {
         type: "order_created",
         at: tick.eventTime,
-        message: `${decision.signal.toUpperCase()} limit order created: ${decision.reason}`,
+        message: `${order.side.toUpperCase()} limit order created: ${order.reason}`,
         order: structuredClone(order),
       },
     ];
@@ -1421,8 +1437,9 @@ export class SimulatedExecutionEngine {
       );
     }
 
-    if (decision.signal !== "buy" && decision.signal !== "sell") {
-      this.state.memory.lastSignal = decision.signal;
+    const signal = legacyValleyPeakDecisionSignal(decision);
+    if (signal === "hold") {
+      this.state.memory.lastSignal = signal;
       return events ?? NO_EVENTS;
     }
 
@@ -1433,7 +1450,7 @@ export class SimulatedExecutionEngine {
     const orders: TradingOrder[] = [];
     let acted = false;
 
-    if (decision.signal === "buy") {
+    if (decision.exitSignal.signal === "buy") {
       if (legacyConfig.shortSideEnabled && activeShortQuantity > MIN_BASE_QUANTITY) {
         const activeShorts = this.activeLegacyShortLots(tick.price);
         this.syncLegacyExitGridMemories(memory, activeShorts, tick.price, "short");
@@ -1468,63 +1485,9 @@ export class SimulatedExecutionEngine {
           }
         }
       }
+    }
 
-      if (
-        legacyConfig.exitGridPositionMode === "aggregate" &&
-        activeLongQuantity > MIN_BASE_QUANTITY
-      ) {
-        acted = orders.length > 0;
-      } else if (
-        legacyConfig.longSideEnabled &&
-        this.openOrderIndexes.size < config.maxOpenOrders &&
-        decision.quoteSize >= config.minOrderQuote &&
-        legacyConfig.exitGridMarketEntry
-      ) {
-        const result = this.createMarketBuyOrder(
-          tick.price,
-          tick.eventTime,
-          decision.reason,
-          decision.quoteSize,
-          {
-            fillImmediately: !options.deferMarketOrderFills,
-            targetEntryLeverage: longEntryRisk.leverage,
-          },
-        );
-        if (result.order) {
-          if (options.deferMarketOrderFills) {
-            orders.push(result.order);
-          } else {
-            acted = true;
-            this.syncLegacyExitGridMemories(
-              memory,
-              this.activeLegacyLongLots(tick.price),
-              tick.price,
-              "long",
-            );
-          }
-        }
-        if (events && result.order && !options.deferMarketOrderFills) {
-          events.push(...this.immediateOrderEvents("BUY", result, tick.eventTime));
-        }
-      } else if (
-        legacyConfig.longSideEnabled &&
-        this.openOrderIndexes.size < config.maxOpenOrders &&
-        decision.quoteSize >= config.minOrderQuote
-      ) {
-        const order = this.createBuyOrder(
-          tick.price,
-          tick.eventTime,
-          decision.reason,
-          decision.quoteSize,
-          {},
-          longEntryRisk.leverage,
-        );
-        if (order) {
-          order.positionEffect = "open";
-          orders.push(order);
-        }
-      }
-    } else {
+    if (decision.exitSignal.signal === "sell") {
       if (legacyConfig.longSideEnabled && activeLongQuantity > MIN_BASE_QUANTITY) {
         const activeLongs = this.activeLegacyLongLots(tick.price);
         this.syncLegacyExitGridMemories(memory, activeLongs, tick.price, "long");
@@ -1555,11 +1518,71 @@ export class SimulatedExecutionEngine {
           }
         }
       }
+    }
 
+    if (decision.entrySignal.signal === "buy") {
+      if (
+        legacyConfig.exitGridPositionMode === "aggregate" &&
+        activeLongQuantity > MIN_BASE_QUANTITY
+      ) {
+        acted = orders.length > 0;
+      } else if (
+        legacyConfig.longSideEnabled &&
+        this.openOrderIndexes.size < config.maxOpenOrders &&
+        decision.entrySignal.quoteSize >= config.minOrderQuote &&
+        legacyConfig.exitGridMarketEntry
+      ) {
+        const result = this.createMarketBuyOrder(
+          tick.price,
+          tick.eventTime,
+          decision.entrySignal.reason,
+          decision.entrySignal.quoteSize,
+          {
+            fillImmediately: !options.deferMarketOrderFills,
+            targetEntryLeverage: longEntryRisk.leverage,
+          },
+        );
+        if (result.order) {
+          if (options.deferMarketOrderFills) {
+            orders.push(result.order);
+          } else {
+            acted = true;
+            this.syncLegacyExitGridMemories(
+              memory,
+              this.activeLegacyLongLots(tick.price),
+              tick.price,
+              "long",
+            );
+          }
+        }
+        if (events && result.order && !options.deferMarketOrderFills) {
+          events.push(...this.immediateOrderEvents("BUY", result, tick.eventTime));
+        }
+      } else if (
+        legacyConfig.longSideEnabled &&
+        this.openOrderIndexes.size < config.maxOpenOrders &&
+        decision.entrySignal.quoteSize >= config.minOrderQuote
+      ) {
+        const order = this.createBuyOrder(
+          tick.price,
+          tick.eventTime,
+          decision.entrySignal.reason,
+          decision.entrySignal.quoteSize,
+          {},
+          longEntryRisk.leverage,
+        );
+        if (order) {
+          order.positionEffect = "open";
+          orders.push(order);
+        }
+      }
+    }
+
+    if (decision.entrySignal.signal === "sell") {
       if (
         legacyConfig.shortSideEnabled &&
         this.openOrderIndexes.size < config.maxOpenOrders &&
-        decision.quoteSize >= config.minOrderQuote &&
+        decision.entrySignal.quoteSize >= config.minOrderQuote &&
         !(
           legacyConfig.exitGridPositionMode === "aggregate" &&
           activeShortQuantity > MIN_BASE_QUANTITY
@@ -1569,8 +1592,8 @@ export class SimulatedExecutionEngine {
           const result = this.createMarketSellOrder(
             tick.price,
             tick.eventTime,
-            decision.reason,
-            decision.quoteSize,
+            decision.entrySignal.reason,
+            decision.entrySignal.quoteSize,
             {
               fillImmediately: !options.deferMarketOrderFills,
               targetEntryLeverage: shortEntryRisk.leverage,
@@ -1596,8 +1619,8 @@ export class SimulatedExecutionEngine {
           const order = this.createShortSellOrder(
             tick.price,
             tick.eventTime,
-            decision.reason,
-            decision.quoteSize,
+            decision.entrySignal.reason,
+            decision.entrySignal.quoteSize,
             {},
             shortEntryRisk.leverage,
           );
@@ -1609,11 +1632,11 @@ export class SimulatedExecutionEngine {
     }
 
     if (orders.length === 0 && !acted) {
-      this.state.memory.lastSignal = decision.signal;
+      this.state.memory.lastSignal = signal;
       return events ?? NO_EVENTS;
     }
 
-    this.state.memory.lastSignal = decision.signal;
+    this.state.memory.lastSignal = signal;
     this.state.memory.lastActionAt = tick.eventTime;
 
     if (events) {
@@ -4103,11 +4126,12 @@ export class SimulatedExecutionEngine {
     longEntryRisk: EntryRiskProfile,
     shortEntryRisk: EntryRiskProfile,
   ): void {
-    if (decision.signal === "buy" || decision.signal === "sell") {
-      this.state.memory.lastExtremaSignal = decision.signal;
+    const signal = legacyValleyPeakDecisionSignal(decision);
+    if (signal === "buy" || signal === "sell") {
+      this.state.memory.lastExtremaSignal = signal;
       this.state.memory.lastExtremaSignalAt = input.eventTime;
       this.state.memory.lastExtremaSignalPrice = input.price;
-      this.state.memory.lastExtremaSignalReason = decision.reason;
+      this.state.memory.lastExtremaSignalReason = legacyValleyPeakDecisionReason(decision);
     }
 
     this.state.memory.legacyValleyPeakDebug = {

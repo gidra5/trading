@@ -127,6 +127,8 @@ export interface LegacyValleyPeakConfig {
   sellDataIndex: number;
   buyConfirmationOffsets: number[];
   sellConfirmationOffsets: number[];
+  buyExitConfirmationOffsets: number[];
+  sellExitConfirmationOffsets: number[];
   saturationSec: number;
   buySpendRate: number;
   sellAmountRate: number;
@@ -337,8 +339,10 @@ export interface LegacyMarketStateDebug {
 export interface LegacyValleyPeakDebugSnapshot {
   updatedAt: number;
   price: number;
-  signal: BotSignal;
-  reason?: string;
+  entrySignal: BotSignal;
+  exitSignal: BotSignal;
+  entryReason?: string;
+  exitReason?: string;
   marketState: LegacyMarketStateDebug;
   saturated: boolean;
   saturationRemainingMs: number;
@@ -351,6 +355,8 @@ export interface LegacyValleyPeakDebugSnapshot {
   priceRanges: LegacyValleyPeakPriceRangeDebug[];
   buyCheck: LegacyValleyPeakCheckDebug;
   sellCheck: LegacyValleyPeakCheckDebug;
+  buyExitCheck: LegacyValleyPeakCheckDebug;
+  sellExitCheck: LegacyValleyPeakCheckDebug;
   entryRisk?: {
     long: LegacyEntryRiskDebug;
     short: LegacyEntryRiskDebug;

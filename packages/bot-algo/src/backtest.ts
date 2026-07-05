@@ -254,6 +254,12 @@ function selectedSmaIndices(config: Readonly<StrategyConfig>): number[] {
   for (const offset of legacy.sellConfirmationOffsets) {
     add(legacy.sellDataIndex + offset);
   }
+  for (const offset of legacy.buyExitConfirmationOffsets) {
+    add(legacy.buyDataIndex + offset);
+  }
+  for (const offset of legacy.sellExitConfirmationOffsets) {
+    add(legacy.sellDataIndex + offset);
+  }
 
   return [...indices].sort((a, b) => a - b);
 }

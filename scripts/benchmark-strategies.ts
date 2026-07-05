@@ -1525,7 +1525,7 @@ function peakExitGridConfig(
       exitGridOrderCount: 6,
       exitGridPriceDistribution: "uniform",
       exitGridSizeDistribution: "geometric",
-      exitGridSellFraction: 0.35,
+      exitGridSellFraction: 0.2,
       exitGridMinProfitBps: 20,
       exitGridResetBps: 10,
       exitGridPositionMode: isAggregate ? "aggregate" : "per-lot",

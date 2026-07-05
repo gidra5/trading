@@ -105,8 +105,6 @@ add "parallel" giid strategy that would place limit orders with fixed interval b
 
 the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
 
-separate entry/exit signals
-
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
   - the optimal strategy will maximize utility from peaks and valleys, while avoiding loosing too much profit on fees.

@@ -1,4 +1,5 @@
 import type {
+  BotSignal,
   Candle,
   LegacyValleyPeakCheckDebug,
   LegacyValleyPeakConfig,
@@ -28,10 +29,41 @@ export interface LegacyValleyPeakInput {
   sourceCandle?: Candle;
 }
 
-export type LegacyValleyPeakDecision =
+export type LegacyValleyPeakEntrySignal =
   | { signal: "hold" }
-  | { signal: "buy"; reason: string; quoteSize: number; coverQuantity: number }
-  | { signal: "sell"; reason: string; quantity: number; quoteSize: number };
+  | { signal: "buy"; reason: string; quoteSize: number }
+  | { signal: "sell"; reason: string; quoteSize: number };
+
+export type LegacyValleyPeakExitSignal =
+  | { signal: "hold" }
+  | { signal: "buy"; reason: string; coverQuantity: number }
+  | { signal: "sell"; reason: string; quantity: number };
+
+export interface LegacyValleyPeakDecision {
+  entrySignal: LegacyValleyPeakEntrySignal;
+  exitSignal: LegacyValleyPeakExitSignal;
+}
+
+export function legacyValleyPeakDecisionSignal(
+  decision: LegacyValleyPeakDecision,
+): BotSignal {
+  return decision.exitSignal.signal !== "hold"
+    ? decision.exitSignal.signal
+    : decision.entrySignal.signal;
+}
+
+export function legacyValleyPeakDecisionReason(
+  decision: LegacyValleyPeakDecision,
+): string | undefined {
+  const signal = legacyValleyPeakDecisionSignal(decision);
+  if (decision.exitSignal.signal === signal && decision.exitSignal.signal !== "hold") {
+    return decision.exitSignal.reason;
+  }
+  if (decision.entrySignal.signal === signal && decision.entrySignal.signal !== "hold") {
+    return decision.entrySignal.reason;
+  }
+  return undefined;
+}
 
 export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
@@ -41,8 +73,10 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
   sellDataIndex: 1,
-  buyConfirmationOffsets: [2, 1],
-  sellConfirmationOffsets: [2, 1],
+  buyConfirmationOffsets: [1, 2],
+  sellConfirmationOffsets: [1, 2],
+  buyExitConfirmationOffsets: [1, 2],
+  sellExitConfirmationOffsets: [1, 2],
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
@@ -65,7 +99,7 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   exitGridMaxStepPct: 0.006,
   exitGridPriceDistribution: "uniform",
   exitGridSizeDistribution: "geometric",
-  exitGridSellFraction: 0.35,
+  exitGridSellFraction: 0.2,
   exitGridMinProfitBps: 20,
   exitGridResetBps: 10,
   exitGridPositionMode: "per-lot",
@@ -124,6 +158,12 @@ export function createLegacyValleyPeakConfig(
     sellConfirmationOffsets:
       overrides.sellConfirmationOffsets ??
       defaultLegacyValleyPeakConfig.sellConfirmationOffsets,
+    buyExitConfirmationOffsets:
+      overrides.buyExitConfirmationOffsets ??
+      defaultLegacyValleyPeakConfig.buyExitConfirmationOffsets,
+    sellExitConfirmationOffsets:
+      overrides.sellExitConfirmationOffsets ??
+      defaultLegacyValleyPeakConfig.sellExitConfirmationOffsets,
   };
 
   const rangeCount = Math.max(1, config.averagingRangesSec.length);
@@ -141,6 +181,12 @@ export function createLegacyValleyPeakConfig(
     Math.max(0, Math.round(offset)),
   );
   config.sellConfirmationOffsets = config.sellConfirmationOffsets.map((offset) =>
+    Math.max(0, Math.round(offset)),
+  );
+  config.buyExitConfirmationOffsets = config.buyExitConfirmationOffsets.map((offset) =>
+    Math.max(0, Math.round(offset)),
+  );
+  config.sellExitConfirmationOffsets = config.sellExitConfirmationOffsets.map((offset) =>
     Math.max(0, Math.round(offset)),
   );
   config.saturationSec = Math.max(0, config.saturationSec);
@@ -328,45 +374,86 @@ export function evaluateLegacyValleyPeak(
   }
 
   if (input.eventTime - memory.startedAt < config.saturationSec * 1000) {
-    return { signal: "hold" };
+    return holdLegacyValleyPeakDecision();
   }
 
   const feeAdjustedBuyRate = input.price / (1 - input.feeRate);
   const feeAdjustedSellRate = input.price * (1 - input.feeRate);
 
-  if (shouldBuy(memory, config)) {
+  const buyEntryPassed = shouldBuy(memory, config, config.buyConfirmationOffsets);
+  const buyExitPassed = shouldBuy(memory, config, config.buyExitConfirmationOffsets);
+  if (buyEntryPassed || buyExitPassed) {
     const quoteSize = buyQuoteSize(memory, config, input, feeAdjustedBuyRate);
     const coverQuantity = buyCoverQuantity(memory, config, input, feeAdjustedBuyRate);
-    if (
-      quoteSize >= config.minTradeQuote ||
-      coverQuantity * feeAdjustedBuyRate >= config.minTradeQuote
-    ) {
-      return {
-        signal: "buy",
-        reason: "legacy valley detected",
-        quoteSize,
-        coverQuantity,
-      };
+    const decision: LegacyValleyPeakDecision = {
+      entrySignal:
+        buyEntryPassed && quoteSize >= config.minTradeQuote
+          ? {
+              signal: "buy",
+              reason: "legacy valley detected",
+              quoteSize,
+            }
+          : { signal: "hold" },
+      exitSignal:
+        buyExitPassed && coverQuantity * feeAdjustedBuyRate >= config.minTradeQuote
+          ? {
+              signal: "buy",
+              reason: "legacy valley detected",
+              coverQuantity,
+            }
+          : { signal: "hold" },
+    };
+    if (hasLegacyValleyPeakSignal(decision)) {
+      return decision;
     }
   }
 
-  if (shouldSell(memory, config)) {
+  const sellEntryPassed = shouldSell(memory, config, config.sellConfirmationOffsets);
+  const sellExitPassed = shouldSell(memory, config, config.sellExitConfirmationOffsets);
+  if (sellEntryPassed || sellExitPassed) {
     const quantity = sellQuantity(memory, config, input, feeAdjustedSellRate);
     const quoteSize = shortSellQuoteSize(memory, config, input, feeAdjustedSellRate);
-    if (
-      quantity * feeAdjustedSellRate >= config.minTradeQuote ||
-      quoteSize >= config.minTradeQuote
-    ) {
-      return {
-        signal: "sell",
-        reason: "legacy peak detected",
-        quantity,
-        quoteSize,
-      };
+    const decision: LegacyValleyPeakDecision = {
+      entrySignal:
+        sellEntryPassed && quoteSize >= config.minTradeQuote
+          ? {
+              signal: "sell",
+              reason: "legacy peak detected",
+              quoteSize,
+            }
+          : { signal: "hold" },
+      exitSignal:
+        sellExitPassed && quantity * feeAdjustedSellRate >= config.minTradeQuote
+          ? {
+              signal: "sell",
+              reason: "legacy peak detected",
+              quantity,
+            }
+          : { signal: "hold" },
+    };
+    if (hasLegacyValleyPeakSignal(decision)) {
+      return decision;
     }
   }
 
-  return { signal: "hold" };
+  return holdLegacyValleyPeakDecision();
+}
+
+function holdLegacyValleyPeakDecision(): LegacyValleyPeakDecision {
+  return {
+    entrySignal: { signal: "hold" },
+    exitSignal: { signal: "hold" },
+  };
+}
+
+function hasLegacyValleyPeakSignal(decision: LegacyValleyPeakDecision): boolean {
+  return decision.entrySignal.signal !== "hold" || decision.exitSignal.signal !== "hold";
+}
+
+function legacyValleyPeakSignalReason(
+  signal: LegacyValleyPeakEntrySignal | LegacyValleyPeakExitSignal,
+): string | undefined {
+  return signal.signal === "hold" ? undefined : signal.reason;
 }
 
 export function createLegacyValleyPeakDebugSnapshot(
@@ -390,8 +477,10 @@ export function createLegacyValleyPeakDebugSnapshot(
   return {
     updatedAt: input.eventTime,
     price: input.price,
-    signal: decision.signal,
-    reason: decision.signal === "hold" ? undefined : decision.reason,
+    entrySignal: decision.entrySignal.signal,
+    exitSignal: decision.exitSignal.signal,
+    entryReason: legacyValleyPeakSignalReason(decision.entrySignal),
+    exitReason: legacyValleyPeakSignalReason(decision.exitSignal),
     marketState: detectLegacyMarketState(memory, config),
     saturated,
     saturationRemainingMs: saturated
@@ -415,8 +504,12 @@ export function createLegacyValleyPeakDebugSnapshot(
         sellPrimary: index === config.sellDataIndex,
         buyConfirmation: config.buyConfirmationOffsets.some(
           (offset) => index === config.buyDataIndex + offset,
+        ) || config.buyExitConfirmationOffsets.some(
+          (offset) => index === config.buyDataIndex + offset,
         ),
         sellConfirmation: config.sellConfirmationOffsets.some(
+          (offset) => index === config.sellDataIndex + offset,
+        ) || config.sellExitConfirmationOffsets.some(
           (offset) => index === config.sellDataIndex + offset,
         ),
         valley: isValley(memory.buyAverages[index]),
@@ -457,6 +550,7 @@ export function createLegacyValleyPeakDebugSnapshot(
       config,
       input,
       feeAdjustedBuyRate,
+      config.buyConfirmationOffsets,
     ),
     sellCheck: buildLegacyValleyPeakCheckDebug(
       "sell",
@@ -464,6 +558,23 @@ export function createLegacyValleyPeakDebugSnapshot(
       config,
       input,
       feeAdjustedSellRate,
+      config.sellConfirmationOffsets,
+    ),
+    buyExitCheck: buildLegacyValleyPeakCheckDebug(
+      "buy",
+      memory,
+      config,
+      input,
+      feeAdjustedBuyRate,
+      config.buyExitConfirmationOffsets,
+    ),
+    sellExitCheck: buildLegacyValleyPeakCheckDebug(
+      "sell",
+      memory,
+      config,
+      input,
+      feeAdjustedSellRate,
+      config.sellExitConfirmationOffsets,
     ),
   };
 }
@@ -471,13 +582,14 @@ export function createLegacyValleyPeakDebugSnapshot(
 function shouldBuy(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
+  confirmationOffsets: number[],
 ): boolean {
   const primary = memory.buyAverages[config.buyDataIndex];
   if (!isValley(primary)) {
     return false;
   }
 
-  for (const offset of config.buyConfirmationOffsets) {
+  for (const offset of confirmationOffsets) {
     const confirmation = memory.buyAverages[config.buyDataIndex + offset];
     const confirmationPoint = latestPoint(confirmation);
     if (confirmationPoint && confirmationPoint.rateClamped <= 0) {
@@ -491,13 +603,14 @@ function shouldBuy(
 function shouldSell(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
+  confirmationOffsets: number[],
 ): boolean {
   const primary = memory.sellAverages[config.sellDataIndex];
   if (!isPeak(primary)) {
     return false;
   }
 
-  for (const offset of config.sellConfirmationOffsets) {
+  for (const offset of confirmationOffsets) {
     const confirmation = memory.sellAverages[config.sellDataIndex + offset];
     const confirmationPoint = latestPoint(confirmation);
     if (confirmationPoint && confirmationPoint.rateClamped >= 0) {
@@ -514,6 +627,7 @@ function buildLegacyValleyPeakCheckDebug(
   config: LegacyValleyPeakConfig,
   input: LegacyValleyPeakInput,
   rate: number,
+  confirmationOffsets: number[],
 ): LegacyValleyPeakCheckDebug {
   const primaryIndex = side === "buy" ? config.buyDataIndex : config.sellDataIndex;
   const primary = side === "buy"
@@ -527,9 +641,7 @@ function buildLegacyValleyPeakCheckDebug(
       : side === "sell" && isPeak(primary)
         ? "peak"
         : "flat";
-  const offsets =
-    side === "buy" ? config.buyConfirmationOffsets : config.sellConfirmationOffsets;
-  const confirmations = offsets.map((offset) => {
+  const confirmations = confirmationOffsets.map((offset) => {
     const index = primaryIndex + offset;
     const confirmation = side === "buy"
       ? memory.buyAverages[index]
@@ -550,7 +662,7 @@ function buildLegacyValleyPeakCheckDebug(
   if (side === "buy") {
     return {
       side,
-      passed: shouldBuy(memory, config),
+      passed: shouldBuy(memory, config, confirmationOffsets),
       primaryIndex,
       primaryWindowSec: config.averagingRangesSec[primaryIndex],
       primaryRate: primaryPoint?.rate,
@@ -567,7 +679,7 @@ function buildLegacyValleyPeakCheckDebug(
 
   return {
     side,
-    passed: shouldSell(memory, config),
+    passed: shouldSell(memory, config, confirmationOffsets),
     primaryIndex,
     primaryWindowSec: config.averagingRangesSec[primaryIndex],
     primaryRate: primaryPoint?.rate,
@@ -591,6 +703,8 @@ function detectLegacyMarketState(
     config.sellDataIndex,
     ...config.buyConfirmationOffsets.map((offset) => config.buyDataIndex + offset),
     ...config.sellConfirmationOffsets.map((offset) => config.sellDataIndex + offset),
+    ...config.buyExitConfirmationOffsets.map((offset) => config.buyDataIndex + offset),
+    ...config.sellExitConfirmationOffsets.map((offset) => config.sellDataIndex + offset),
   ];
   const candidates = [...new Set(candidateIndices)]
     .filter((index) => index >= 0 && index < config.averagingRangesSec.length)

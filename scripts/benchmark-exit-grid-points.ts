@@ -214,7 +214,7 @@ function exitGridConfig(options: Args, candidate: GridCandidate): PartialStrateg
       exitGridMaxStepPct: options.maxStepPct,
       exitGridPriceDistribution: "uniform",
       exitGridSizeDistribution: "geometric",
-      exitGridSellFraction: 0.35,
+      exitGridSellFraction: 0.2,
       exitGridMinProfitBps: 20,
       exitGridResetBps: 10,
       exitGridPositionMode: "per-lot",

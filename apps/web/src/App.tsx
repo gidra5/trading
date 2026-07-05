@@ -1334,7 +1334,11 @@ function AlgorithmPanel(props: {
     });
   };
   const updateValleyPeakOffsets = (
-    key: "buyConfirmationOffsets" | "sellConfirmationOffsets",
+    key:
+      | "buyConfirmationOffsets"
+      | "sellConfirmationOffsets"
+      | "buyExitConfirmationOffsets"
+      | "sellExitConfirmationOffsets",
     value: number[],
   ) => updateValleyPeak(key, value);
   const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
@@ -1621,6 +1625,20 @@ function AlgorithmPanel(props: {
                   value={config().legacyValleyPeak.sellConfirmationOffsets}
                   onInput={(value) => updateValleyPeakOffsets("sellConfirmationOffsets", value)}
                 />
+                <NumberListField
+                  label="Buy Exit Confirms"
+                  value={config().legacyValleyPeak.buyExitConfirmationOffsets}
+                  onInput={(value) =>
+                    updateValleyPeakOffsets("buyExitConfirmationOffsets", value)
+                  }
+                />
+                <NumberListField
+                  label="Sell Exit Confirms"
+                  value={config().legacyValleyPeak.sellExitConfirmationOffsets}
+                  onInput={(value) =>
+                    updateValleyPeakOffsets("sellExitConfirmationOffsets", value)
+                  }
+                />
               </div>
             </div>
 
@@ -1851,7 +1869,8 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
             <MarketStateIndicator state={state().marketState} />
 
             <div class="grid grid-cols-2 gap-3">
-              <SmallMetric label="Now" value={state().signal.toUpperCase()} />
+              <SmallMetric label="Entry" value={state().entrySignal.toUpperCase()} />
+              <SmallMetric label="Exit" value={state().exitSignal.toUpperCase()} />
               <SmallMetric
                 label="Last Extrema"
                 value={
@@ -1873,8 +1892,10 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
             </div>
 
             <div class="mt-3 grid grid-cols-1 gap-2">
-              <DecisionCheck check={state().buyCheck} />
-              <DecisionCheck check={state().sellCheck} />
+              <DecisionCheck label="Entry Buy" check={state().buyCheck} />
+              <DecisionCheck label="Entry Sell" check={state().sellCheck} />
+              <DecisionCheck label="Exit Buy" check={state().buyExitCheck} />
+              <DecisionCheck label="Exit Sell" check={state().sellExitCheck} />
             </div>
 
             <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
@@ -2018,6 +2039,7 @@ function MarketStateIndicator(props: { state: LegacyMarketStateDebug }) {
 }
 
 function DecisionCheck(props: {
+  label?: string;
   check?: LegacyValleyPeakCheckDebug;
 }) {
   const check = () => props.check;
@@ -2035,7 +2057,9 @@ function DecisionCheck(props: {
   return (
     <div class="rounded-2 bg-ink-800 p-3">
       <div class="mb-2 flex items-center justify-between gap-3">
-        <div class="text-sm font-semibold uppercase text-ink-100">{check()?.side ?? "check"}</div>
+        <div class="text-sm font-semibold uppercase text-ink-100">
+          {props.label ?? check()?.side ?? "check"}
+        </div>
         <span
           class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
           classList={{

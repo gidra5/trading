@@ -216,12 +216,19 @@ legacyValleyPeak.buyDataIndex = 1
 The default buy confirmation windows are:
 
 ```text
-legacyValleyPeak.buyConfirmationOffsets = [2, 1]
+legacyValleyPeak.buyConfirmationOffsets = [1, 2]
 ```
 
-That checks the 30m and 10m windows relative to the 1m source and requires each
+That checks the 10m and 30m windows relative to the 1m source and requires each
 confirmation window to still be rising (`rateClamped > 0`). That makes valley entries
 stricter, slower, and aligned with broader upward context.
+
+Exit signals use the same confirmation offsets on both sides:
+
+```text
+legacyValleyPeak.buyExitConfirmationOffsets = [1, 2]
+legacyValleyPeak.sellExitConfirmationOffsets = [1, 2]
+```
 
 ## Peak Signal
 
@@ -241,12 +248,18 @@ legacyValleyPeak.sellDataIndex = 1
 The default sell confirmations are:
 
 ```text
-legacyValleyPeak.sellConfirmationOffsets = [2, 1]
+legacyValleyPeak.sellConfirmationOffsets = [1, 2]
 ```
 
-That checks the 30m and 10m windows relative to the 1m source and requires each
+That checks the 10m and 30m windows relative to the 1m source and requires each
 confirmation window to still be falling (`rateClamped < 0`). This is the
 strict-symmetric baseline used by the `0.35%` 180d anchor replay.
+
+Sell-side exits use the same default confirmation offsets as buy-side exits:
+
+```text
+legacyValleyPeak.sellExitConfirmationOffsets = [1, 2]
+```
 
 The asymmetric short-favoring detector is saved as a reference config. It keeps strict
 buys, but uses `sellDataIndex = 0` and `sellConfirmationOffsets = [6]` for faster peak
@@ -496,6 +509,8 @@ mode.
 | `legacyValleyPeak.relativeRateEnabled` | `true` | Uses price-scale-invariant relative derivatives by default; disable only for old absolute-rate baseline comparisons. |
 | `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
 | `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
+| `legacyValleyPeak.buyExitConfirmationOffsets` | `[1, 2]` | Confirmation offsets used by buy signals that cover shorts. |
+| `legacyValleyPeak.sellExitConfirmationOffsets` | `[1, 2]` | Confirmation offsets used by sell signals that close longs. |
 | `legacyValleyPeak.trendSigmaA` | `1` | Raw base Gaussian width; relative mode normalizes the effective sigma from BTC-scale units. |
 | `legacyValleyPeak.trendSigmaSellB1` | `1` | Sell sigma exponent multiplier in `a * exp(-b1 * derivative1h)`. |
 | `legacyValleyPeak.trendSigmaBuyB2` | `1` | Buy sigma exponent multiplier in `a * exp(b2 * derivative1h)`. |
@@ -505,7 +520,7 @@ mode.
 | `legacyValleyPeak.exitGridMaxStepPct` | `0.006` | Maximum target grid price step as a percentage of current price; `0` disables this cap. |
 | `legacyValleyPeak.exitGridPriceDistribution` | `uniform` | Spacing procedure for ladder prices. |
 | `legacyValleyPeak.exitGridSizeDistribution` | `geometric` | Sizing procedure for ladder quantities. |
-| `legacyValleyPeak.exitGridSellFraction` | `0.35` | Fraction of remaining base sold by each non-final grid order. |
+| `legacyValleyPeak.exitGridSellFraction` | `0.2` | Fraction of remaining base sold by each non-final grid order. |
 | `legacyValleyPeak.exitGridMinProfitBps` | `20` | Minimum peak distance above break-even before creating a ladder. |
 | `legacyValleyPeak.exitGridResetBps` | `10` | Higher-peak improvement used only when manually selecting strict reset mode. |
 | `legacyValleyPeak.exitGridPositionMode` | `per-lot` | Uses position-ledger lots for independent ladders. |
