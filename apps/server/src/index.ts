@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import staticFiles from "@fastify/static";
@@ -37,6 +38,18 @@ const server = Fastify({
 
 const MAX_RANDOM_PAIR_COUNT = 25;
 const MARKET_CATALOG_RESPONSE_TIMEOUT_MS = 5_000;
+const DASHBOARD_WS_HEARTBEAT_MS = 30_000;
+const HEARTBEAT_LOG_MS = Math.max(0, Number(process.env.TRADING_HEARTBEAT_LOG_MS ?? 60_000));
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+let tcpConnectionCount = 0;
+
+eventLoopDelay.enable();
+server.server.on("connection", (socket) => {
+  tcpConnectionCount += 1;
+  socket.on("close", () => {
+    tcpConnectionCount = Math.max(0, tcpConnectionCount - 1);
+  });
+});
 
 await server.register(cors, {
   origin: true,
@@ -92,6 +105,8 @@ server.get("/health", async () => ({
   symbol: appConfig.market.symbol,
   dataDir: appConfig.dataDir,
 }));
+
+server.get("/api/diagnostics", async () => diagnosticsSnapshot());
 
 server.get("/api/state", async () => publicSnapshot());
 
@@ -647,12 +662,21 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let broadcastTimer: NodeJS.Timeout | undefined;
+let broadcastImmediate: NodeJS.Immediate | undefined;
+let broadcastRunning = false;
+let broadcastDirty = false;
+let lastBroadcastAt = 0;
+let broadcastTimerDueAt = 0;
+let snapshotSeq = 0;
+
 const address = await server.listen({
   host: appConfig.host,
   port: appConfig.port,
 });
 
 const sockets = new Set<WebSocket>();
+const socketAlive = new WeakMap<WebSocket, boolean>();
 const wss = new WebSocketServer({
   server: server.server,
   path: "/ws",
@@ -663,10 +687,15 @@ const DASHBOARD_BROADCAST_MIN_INTERVAL_MS = 500;
 
 wss.on("connection", (socket) => {
   sockets.add(socket);
+  socketAlive.set(socket, true);
   server.log.info({ clients: sockets.size }, "Dashboard websocket connected");
   sendSnapshot(socket, publicSnapshot());
+  socket.on("pong", () => {
+    socketAlive.set(socket, true);
+  });
   socket.on("close", (code, reason) => {
     sockets.delete(socket);
+    socketAlive.delete(socket);
     server.log.info(
       {
         clients: sockets.size,
@@ -678,22 +707,58 @@ wss.on("connection", (socket) => {
   });
   socket.on("error", (error) => {
     sockets.delete(socket);
+    socketAlive.delete(socket);
     server.log.warn({ error: error.message }, "Dashboard websocket error");
   });
 });
+
+const dashboardSocketHeartbeat = setInterval(() => {
+  for (const socket of sockets) {
+    if (socket.readyState !== socket.OPEN) {
+      sockets.delete(socket);
+      socketAlive.delete(socket);
+      continue;
+    }
+
+    if (socketAlive.get(socket) === false) {
+      sockets.delete(socket);
+      socketAlive.delete(socket);
+      server.log.warn({ clients: sockets.size }, "Dashboard websocket heartbeat missed");
+      socket.terminate();
+      continue;
+    }
+
+    socketAlive.set(socket, false);
+    socket.ping();
+  }
+}, DASHBOARD_WS_HEARTBEAT_MS);
+dashboardSocketHeartbeat.unref();
 
 stream.start();
 userDataStream.start();
 server.log.info(`Trading server listening at ${address}`);
 server.log.info(`Dashboard websocket available at ws://localhost:${appConfig.port}/ws`);
 
-let broadcastTimer: NodeJS.Timeout | undefined;
-let broadcastImmediate: NodeJS.Immediate | undefined;
-let broadcastRunning = false;
-let broadcastDirty = false;
-let lastBroadcastAt = 0;
-let broadcastTimerDueAt = 0;
-let snapshotSeq = 0;
+const heartbeatLogTimer =
+  HEARTBEAT_LOG_MS > 0
+    ? setInterval(() => {
+        const diagnostics = diagnosticsSnapshot();
+        server.log.info(
+          {
+            uptimeSec: diagnostics.uptimeSec,
+            tcpConnections: diagnostics.connections.tcp,
+            dashboardWebSockets: diagnostics.connections.dashboardWebSockets,
+            eventLoopDelayMaxMs: diagnostics.eventLoopDelayMs.max,
+            eventLoopDelayP99Ms: diagnostics.eventLoopDelayMs.p99,
+            rssBytes: diagnostics.memory.rss,
+            correlationStatus: diagnostics.correlations.status,
+            correlationMessage: diagnostics.correlations.message,
+          },
+          "Trading server heartbeat",
+        );
+      }, HEARTBEAT_LOG_MS)
+    : undefined;
+heartbeatLogTimer?.unref();
 
 function scheduleBroadcast(): void {
   queueBroadcast(500);
@@ -839,6 +904,77 @@ function publicSnapshot() {
   };
 }
 
+function diagnosticsSnapshot() {
+  const elu = performance.eventLoopUtilization();
+  const delayStats = eventLoopDelayStats();
+  return {
+    ok: true,
+    at: Date.now(),
+    pid: process.pid,
+    uptimeSec: process.uptime(),
+    environment: appConfig.environment,
+    market: activeMarket.id,
+    symbol: activeMarket.symbol,
+    memory: process.memoryUsage(),
+    cpuUsage: process.cpuUsage(),
+    eventLoopUtilization: elu,
+    eventLoopDelayMs: delayStats,
+    connections: {
+      tcp: tcpConnectionCount,
+      dashboardWebSockets: sockets.size,
+      dashboardWebSocketStates: countSocketStates(),
+    },
+    broadcast: {
+      running: broadcastRunning,
+      dirty: broadcastDirty,
+      timerActive: Boolean(broadcastTimer),
+      timerDueAt: broadcastTimerDueAt || undefined,
+      immediateActive: Boolean(broadcastImmediate),
+      lastBroadcastAt: lastBroadcastAt || undefined,
+      snapshotSeq,
+    },
+    correlations: correlationService.snapshotForMarket(activeMarket.id),
+  };
+}
+
+function eventLoopDelayStats() {
+  return {
+    min: nanosecondsToMilliseconds(eventLoopDelay.min),
+    mean: nanosecondsToMilliseconds(eventLoopDelay.mean),
+    max: nanosecondsToMilliseconds(eventLoopDelay.max),
+    p95: nanosecondsToMilliseconds(eventLoopDelay.percentile(95)),
+    p99: nanosecondsToMilliseconds(eventLoopDelay.percentile(99)),
+  };
+}
+
+function nanosecondsToMilliseconds(value: number): number {
+  return Number.isFinite(value) ? value / 1_000_000 : 0;
+}
+
+function countSocketStates(): Record<string, number> {
+  const counts: Record<string, number> = {
+    connecting: 0,
+    open: 0,
+    closing: 0,
+    closed: 0,
+    other: 0,
+  };
+  for (const socket of sockets) {
+    if (socket.readyState === socket.CONNECTING) {
+      counts.connecting += 1;
+    } else if (socket.readyState === socket.OPEN) {
+      counts.open += 1;
+    } else if (socket.readyState === socket.CLOSING) {
+      counts.closing += 1;
+    } else if (socket.readyState === socket.CLOSED) {
+      counts.closed += 1;
+    } else {
+      counts.other += 1;
+    }
+  }
+  return counts;
+}
+
 function clampInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) {
     return min;
@@ -849,6 +985,10 @@ function clampInt(value: number, min: number, max: number): number {
 
 async function shutdown(): Promise<void> {
   streamGeneration += 1;
+  if (heartbeatLogTimer) {
+    clearInterval(heartbeatLogTimer);
+  }
+  clearInterval(dashboardSocketHeartbeat);
   stream.stop();
   await correlationService.flush();
   correlationService.stop();
