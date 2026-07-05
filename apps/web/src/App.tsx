@@ -18,6 +18,7 @@ import {
 import type {
   BacktestCandleChart,
   BacktestChartAnnotation,
+  BacktestExtremaOrderMassSideSummary,
   BotEvent,
   LegacyEntryRiskDebug,
   LegacyMarketStateDebug,
@@ -3556,6 +3557,7 @@ function BacktestPanel(props: {
 }) {
   const result = () => props.progress?.result;
   const summary = () => result()?.summary;
+  const extremaOrderMass = () => summary()?.extremaOrderMass;
   const isRunning = () => props.progress?.status === "running";
   const progressPercent = () => Math.max(0, Math.min(100, props.progress?.percent ?? 0));
   const cacheMissCandles = () =>
@@ -3574,6 +3576,28 @@ function BacktestPanel(props: {
     props.progress?.status === "running" &&
     cacheProgressPercent() !== undefined &&
     cacheFetchedCandles() < cacheMissCandles();
+  const formatExtremaThresholdMass = (
+    side: BacktestExtremaOrderMassSideSummary | undefined,
+  ) =>
+    side
+      ? `${formatPercent(side.thresholdMassPct)} / $${formatQuote(side.thresholdQuote, 0)}`
+      : "-";
+  const formatExtremaAverageDistance = (
+    side: BacktestExtremaOrderMassSideSummary | undefined,
+  ) =>
+    side
+      ? `${formatDuration(side.weightedAvgTimeDistanceMs)} / ${formatPercent(
+          side.weightedAvgPriceDistancePct,
+        )}`
+      : "-";
+  const formatExtremaP99Frame = (
+    side: BacktestExtremaOrderMassSideSummary | undefined,
+  ) =>
+    side
+      ? `${formatDuration(side.massP99JointTimeDistanceMs)} / ${formatPercent(
+          side.massP99JointPriceDistancePct,
+        )}`
+      : "-";
   const error = () => props.error ?? props.progress?.error;
   const canRunFromLiveStart = () =>
     Boolean(
@@ -3813,6 +3837,36 @@ function BacktestPanel(props: {
             label="Capture"
             value={formatPercent(summary()?.perfectMarginCapturePct)}
           />
+          <Show when={extremaOrderMass()}>
+            {(mass) => (
+              <>
+                <SmallMetric
+                  label="Buy Valley Mass"
+                  value={formatExtremaThresholdMass(mass().buy)}
+                />
+                <SmallMetric
+                  label="Sell Peak Mass"
+                  value={formatExtremaThresholdMass(mass().sell)}
+                />
+                <SmallMetric
+                  label="Buy Avg Dist"
+                  value={formatExtremaAverageDistance(mass().buy)}
+                />
+                <SmallMetric
+                  label="Sell Avg Dist"
+                  value={formatExtremaAverageDistance(mass().sell)}
+                />
+                <SmallMetric
+                  label="Buy 99% Frame"
+                  value={formatExtremaP99Frame(mass().buy)}
+                />
+                <SmallMetric
+                  label="Sell 99% Frame"
+                  value={formatExtremaP99Frame(mass().sell)}
+                />
+              </>
+            )}
+          </Show>
           <SmallMetric
             label="Perfect PnL"
             value={`$${formatQuote(summary()?.perfectMarginNetPnl, 2)}`}

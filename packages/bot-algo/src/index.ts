@@ -26,6 +26,13 @@ export {
   type BacktestChartCollector,
 } from "./backtest.js";
 export {
+  aggregateExtremaOrderMassSummaries,
+  createExtremaOrderMassCollector,
+  observeExtremaOrderMassCandle,
+  summarizeExtremaOrderMass,
+  type ExtremaOrderMassCollector,
+} from "./extrema-order-mass.js";
+export {
   createLegacyValleyPeakConfig,
   defaultLegacyValleyPeakConfig,
   legacyValleyPeakHistoricalWarmupSec,

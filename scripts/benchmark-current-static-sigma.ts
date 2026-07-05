@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   defaultStrategyConfig,
   runBacktestFromCandles,
+  type BacktestExtremaOrderMassSummary,
   type BacktestResult,
   type Candle,
   type PartialStrategyConfig,
@@ -82,6 +83,14 @@ interface JsonResultRow {
   perfectMarginCapturePct?: number;
   perfectMarginCompoundedReturnPct?: number;
   perfectMarginCompoundedCapturePct?: number;
+  buyValleyThresholdMassPct?: number;
+  sellPeakThresholdMassPct?: number;
+  buyValleyTotalQuote?: number;
+  sellPeakTotalQuote?: number;
+  buyValleyP99FrameMin?: number;
+  buyValleyP99FramePricePct?: number;
+  sellPeakP99FrameMin?: number;
+  sellPeakP99FramePricePct?: number;
   realizedPnl: number;
   unrealizedPnl: number;
   feesPaid: number;
@@ -335,6 +344,7 @@ function resultRow(
   const market = marketSummary(candles, window.startIndex, window.endIndex);
   const summary = result.summary;
   const metrics = result.finalState.metrics;
+  const extremaOrderMass = compactExtremaOrderMass(summary.extremaOrderMass);
   const actualDays = Math.max((last.closeTime - first.openTime + 1) / DAY_MS, 1 / 24 / 60);
 
   return {
@@ -371,6 +381,26 @@ function resultRow(
       summary.perfectMarginCompoundedCapturePct,
       4,
     ),
+    buyValleyThresholdMassPct: optionalRound(
+      extremaOrderMass?.buy.thresholdMassPct,
+      4,
+    ),
+    sellPeakThresholdMassPct: optionalRound(
+      extremaOrderMass?.sell.thresholdMassPct,
+      4,
+    ),
+    buyValleyTotalQuote: optionalRound(extremaOrderMass?.buy.totalQuote, 2),
+    sellPeakTotalQuote: optionalRound(extremaOrderMass?.sell.totalQuote, 2),
+    buyValleyP99FrameMin: optionalRound(extremaOrderMass?.buy.p99FrameMin, 2),
+    buyValleyP99FramePricePct: optionalRound(
+      extremaOrderMass?.buy.p99FramePricePct,
+      4,
+    ),
+    sellPeakP99FrameMin: optionalRound(extremaOrderMass?.sell.p99FrameMin, 2),
+    sellPeakP99FramePricePct: optionalRound(
+      extremaOrderMass?.sell.p99FramePricePct,
+      4,
+    ),
     realizedPnl: round(metrics.realizedPnl, 2),
     unrealizedPnl: round(metrics.unrealizedPnl, 2),
     feesPaid: round(metrics.feesPaid, 2),
@@ -390,6 +420,49 @@ function resultRow(
     ),
     stopReason: summary.stopReason,
     elapsedMs,
+  };
+}
+
+function compactExtremaOrderMass(
+  summary: BacktestExtremaOrderMassSummary | undefined,
+):
+  | {
+      buy: {
+        thresholdMassPct: number;
+        totalQuote: number;
+        p99FrameMin?: number;
+        p99FramePricePct?: number;
+      };
+      sell: {
+        thresholdMassPct: number;
+        totalQuote: number;
+        p99FrameMin?: number;
+        p99FramePricePct?: number;
+      };
+    }
+  | undefined {
+  if (!summary) {
+    return undefined;
+  }
+  return {
+    buy: {
+      thresholdMassPct: summary.buy.thresholdMassPct,
+      totalQuote: summary.buy.totalQuote,
+      p99FrameMin:
+        summary.buy.massP99JointTimeDistanceMs === undefined
+          ? undefined
+          : summary.buy.massP99JointTimeDistanceMs / 60_000,
+      p99FramePricePct: summary.buy.massP99JointPriceDistancePct,
+    },
+    sell: {
+      thresholdMassPct: summary.sell.thresholdMassPct,
+      totalQuote: summary.sell.totalQuote,
+      p99FrameMin:
+        summary.sell.massP99JointTimeDistanceMs === undefined
+          ? undefined
+          : summary.sell.massP99JointTimeDistanceMs / 60_000,
+      p99FramePricePct: summary.sell.massP99JointPriceDistancePct,
+    },
   };
 }
 
@@ -428,8 +501,8 @@ function renderReport(inputPath: string, targetReportPath: string): void {
   lines.push("");
   lines.push("## Fixed Windows");
   lines.push("");
-  lines.push("| window | actual span | candles | market | return | net PnL | max DD | perfect | capture | trades | closed win | liq | stop |");
-  lines.push("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+  lines.push("| window | actual span | candles | market | return | net PnL | max DD | perfect | capture | <=5m/0.02% mass | 99% frame | trades | closed win | liq | stop |");
+  lines.push("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
   for (const row of fixed) {
     lines.push(
       [
@@ -442,6 +515,8 @@ function renderReport(inputPath: string, targetReportPath: string): void {
         formatPct(row.maxDrawdownPct),
         formatOptionalPct(row.perfectMarginReturnPct),
         formatOptionalPct(row.perfectMarginCapturePct),
+        formatExtremaMass(row),
+        formatExtremaFrame(row),
         row.tradeCount.toLocaleString(),
         `${row.profitableClosedPositionCount.toLocaleString()}/${row.closedPositionCount.toLocaleString()}`,
         row.liquidatedPositionCount.toLocaleString(),
@@ -450,7 +525,7 @@ function renderReport(inputPath: string, targetReportPath: string): void {
     );
   }
   if (fixed.length === 0) {
-    lines.push("| _none completed_ |  |  |  |  |  |  |  |  |  |  |  |  |");
+    lines.push("| _none completed_ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |");
   }
   lines.push("");
   lines.push("## Random Window Aggregates");
@@ -756,6 +831,31 @@ function formatSignedPct(value: number): string {
 
 function formatOptionalPct(value: number | undefined): string {
   return value === undefined ? "-" : formatSignedPct(value);
+}
+
+function formatOptionalUnsignedPct(value: number | undefined): string {
+  return value === undefined || !Number.isFinite(value) ? "-" : formatPct(value);
+}
+
+function formatExtremaMass(row: JsonResultRow): string {
+  return `B ${formatOptionalUnsignedPct(row.buyValleyThresholdMassPct)} / S ${formatOptionalUnsignedPct(row.sellPeakThresholdMassPct)}`;
+}
+
+function formatExtremaFrame(row: JsonResultRow): string {
+  return `B ${formatDurationMinutes(row.buyValleyP99FrameMin)}/${formatOptionalUnsignedPct(row.buyValleyP99FramePricePct)} / S ${formatDurationMinutes(row.sellPeakP99FrameMin)}/${formatOptionalUnsignedPct(row.sellPeakP99FramePricePct)}`;
+}
+
+function formatDurationMinutes(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "-";
+  }
+  if (value >= 24 * 60) {
+    return `${(value / (24 * 60)).toFixed(1)}d`;
+  }
+  if (value >= 60) {
+    return `${(value / 60).toFixed(1)}h`;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)}m`;
 }
 
 function formatCurrency(value: number): string {

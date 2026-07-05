@@ -6,7 +6,13 @@ import {
 } from "./execution-simulator.js";
 import { defaultPositionRiskConfig, summarizeClosedPositions } from "./position-ledger.js";
 import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
+import {
+  createExtremaOrderMassCollector,
+  observeExtremaOrderMassCandle,
+  summarizeExtremaOrderMass,
+} from "./extrema-order-mass.js";
 import type {
+  BacktestExtremaOrderMassSummary,
   BacktestSummary,
   BacktestCandleChart,
   BacktestChartAnnotation,
@@ -308,6 +314,7 @@ export function runBacktestFromCandles(
     candleCount,
     options.maxChartCandles,
   );
+  const extremaOrderMassCollector = createExtremaOrderMassCollector();
   const startedAt = Date.now();
   let stopReason: BacktestStopReason = "completed";
   let processedCandles = 0;
@@ -327,6 +334,7 @@ export function runBacktestFromCandles(
       stopReason = "liquidated";
       liquidated = true;
     }
+    observeExtremaOrderMassCandle(extremaOrderMassCollector, candle);
     observeBacktestChartCandle(
       chartCollector,
       bot,
@@ -367,6 +375,7 @@ export function runBacktestFromCandles(
     finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
     stopReason,
     finalizeBacktestCandleChart(chartCollector),
+    summarizeExtremaOrderMass(extremaOrderMassCollector, finalState.fills),
   );
 }
 
@@ -764,6 +773,7 @@ function buildBacktestResult(
   perfectMargin: PerfectMarginBenchmark,
   stopReason: BacktestStopReason = "completed",
   candleChart?: BacktestCandleChart,
+  extremaOrderMass?: BacktestExtremaOrderMassSummary,
 ): BacktestResult {
   const resultState = compactBacktestState(finalState, options);
   const riskMetrics = calculateRiskAdjustedMetrics(
@@ -797,6 +807,7 @@ function buildBacktestResult(
       winRate: finalState.metrics.winRate,
       ...closedPositionStats,
       ...perfectMargin,
+      extremaOrderMass,
       stoppedEarly: stopReason !== "completed",
       stopReason,
     },

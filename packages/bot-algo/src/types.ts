@@ -662,6 +662,44 @@ export interface BotEvent {
   state?: PaperBotState;
 }
 
+export interface BacktestExtremaOrderMassSideSummary {
+  target: "peak" | "valley";
+  targetExtremaCount: number;
+  fillCount: number;
+  matchedFillCount: number;
+  totalQuote: number;
+  totalQuantity: number;
+  matchedQuote: number;
+  matchedQuantity: number;
+  matchedMassPct: number;
+  thresholdFillCount: number;
+  thresholdQuote: number;
+  thresholdQuantity: number;
+  thresholdMassPct: number;
+  weightedAvgTimeDistanceMs?: number;
+  weightedAvgPriceDistancePct?: number;
+  massP50TimeDistanceMs?: number;
+  massP90TimeDistanceMs?: number;
+  massP99TimeDistanceMs?: number;
+  massP50PriceDistancePct?: number;
+  massP90PriceDistancePct?: number;
+  massP99PriceDistancePct?: number;
+  massP99JointScale?: number;
+  massP99JointTimeDistanceMs?: number;
+  massP99JointPriceDistancePct?: number;
+}
+
+export interface BacktestExtremaOrderMassSummary {
+  smaWindowMs: number;
+  smaShiftMs: number;
+  thresholdTimeMs: number;
+  thresholdPriceDistancePct: number;
+  peakCount: number;
+  valleyCount: number;
+  buy: BacktestExtremaOrderMassSideSummary;
+  sell: BacktestExtremaOrderMassSideSummary;
+}
+
 export interface BacktestSummary {
   symbol: string;
   marketId?: string;
@@ -729,6 +767,7 @@ export interface BacktestSummary {
   profitableClosedPositionCount: number;
   profitableClosedPositionRate: number;
   liquidatedPositionCount: number;
+  extremaOrderMass?: BacktestExtremaOrderMassSummary;
 }
 
 export interface BacktestSampleSummary {
@@ -770,6 +809,7 @@ export interface BacktestSampleSummary {
   stoppedEarly?: boolean;
   stopReason?: BacktestStopReason;
   survivedMs?: number;
+  extremaOrderMass?: BacktestExtremaOrderMassSummary;
 }
 
 export interface EquityPoint {

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   runBacktestFromCandles,
+  type BacktestExtremaOrderMassSummary,
   type Candle,
   type InternalBorrowAccounting,
   type LegacySigmaMode,
@@ -94,6 +95,7 @@ for (const testCase of cases) {
       profitableClosedPositionCount: summary.profitableClosedPositionCount,
       closedPositionCount: summary.closedPositionCount,
       liquidatedPositionCount: summary.liquidatedPositionCount,
+      extremaOrderMass: compactExtremaOrderMass(summary.extremaOrderMass),
       stopReason: summary.stopReason,
       elapsedMs: Date.now() - started,
     }),
@@ -389,4 +391,69 @@ function summarizeMarket(candles: Candle[]): {
 
 function round(value: number, digits: number): number {
   return Number(value.toFixed(digits));
+}
+
+function compactExtremaOrderMass(
+  summary: BacktestExtremaOrderMassSummary | undefined,
+):
+  | {
+      smaWindowMin: number;
+      smaShiftMin: number;
+      thresholdTimeMin: number;
+      thresholdPricePct: number;
+      peaks: number;
+      valleys: number;
+      buy: ReturnType<typeof compactExtremaSide>;
+      sell: ReturnType<typeof compactExtremaSide>;
+    }
+  | undefined {
+  if (!summary) {
+    return undefined;
+  }
+  return {
+    smaWindowMin: round(summary.smaWindowMs / 60_000, 2),
+    smaShiftMin: round(summary.smaShiftMs / 60_000, 2),
+    thresholdTimeMin: round(summary.thresholdTimeMs / 60_000, 2),
+    thresholdPricePct: round(summary.thresholdPriceDistancePct, 4),
+    peaks: summary.peakCount,
+    valleys: summary.valleyCount,
+    buy: compactExtremaSide(summary.buy),
+    sell: compactExtremaSide(summary.sell),
+  };
+}
+
+function compactExtremaSide(side: BacktestExtremaOrderMassSummary["buy"]): {
+  target: "peak" | "valley";
+  fills: number;
+  totalQuote: number;
+  thresholdQuote: number;
+  thresholdMassPct: number;
+  avgTimeMin?: number;
+  avgPricePct?: number;
+  p99FrameMin?: number;
+  p99FramePricePct?: number;
+} {
+  return {
+    target: side.target,
+    fills: side.fillCount,
+    totalQuote: round(side.totalQuote, 2),
+    thresholdQuote: round(side.thresholdQuote, 2),
+    thresholdMassPct: round(side.thresholdMassPct, 4),
+    avgTimeMin:
+      side.weightedAvgTimeDistanceMs === undefined
+        ? undefined
+        : round(side.weightedAvgTimeDistanceMs / 60_000, 2),
+    avgPricePct:
+      side.weightedAvgPriceDistancePct === undefined
+        ? undefined
+        : round(side.weightedAvgPriceDistancePct, 4),
+    p99FrameMin:
+      side.massP99JointTimeDistanceMs === undefined
+        ? undefined
+        : round(side.massP99JointTimeDistanceMs / 60_000, 2),
+    p99FramePricePct:
+      side.massP99JointPriceDistancePct === undefined
+        ? undefined
+        : round(side.massP99JointPriceDistancePct, 4),
+  };
 }

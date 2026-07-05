@@ -1,13 +1,17 @@
 import {
   SimulatedExecutionEngine,
+  aggregateExtremaOrderMassSummaries,
   calculateRiskAdjustedMetrics,
   compactBacktestState,
   createBacktestChartCollector,
+  createExtremaOrderMassCollector,
   createInitialBotState,
   createStrategyConfig,
   defaultPositionRiskConfig,
   finalizeBacktestCandleChart,
+  observeExtremaOrderMassCandle,
   observeBacktestChartCandle,
+  summarizeExtremaOrderMass,
   summarizeClosedPositions,
   type BacktestSummary,
   type BacktestSampleSummary,
@@ -668,6 +672,7 @@ async function runHistoricalRangeBacktest(
   });
   const equityCurve: EquityPoint[] = [];
   const chartCollector = createBacktestChartCollector(config, estimatedCandles);
+  const extremaOrderMassCollector = createExtremaOrderMassCollector();
   const sampleEvery = Math.max(1, Math.ceil(estimatedCandles / MAX_EQUITY_POINTS));
   const metricsEvery = Math.max(1, Math.min(sampleEvery, WIPEOUT_CHECK_CANDLES));
   const startedAt = Date.now();
@@ -761,6 +766,10 @@ async function runHistoricalRangeBacktest(
   latestMetrics = bot.markToMarket();
   const fullFinalState = bot.view();
   const closedPositionStats = summarizeClosedPositions(fullFinalState);
+  const extremaOrderMass = summarizeExtremaOrderMass(
+    extremaOrderMassCollector,
+    fullFinalState.fills,
+  );
   const finalState = compactBacktestState(
     fullFinalState,
     options.sampleCount
@@ -826,6 +835,7 @@ async function runHistoricalRangeBacktest(
       winRate: finalState.metrics.winRate,
       ...closedPositionStats,
       ...finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
+      extremaOrderMass,
     },
     equityCurve,
     orders: finalState.orders,
@@ -850,6 +860,7 @@ async function runHistoricalRangeBacktest(
 
     const liquidated = replayCandle(bot, candle, perfectMargin);
     processedCandles += 1;
+    observeExtremaOrderMassCandle(extremaOrderMassCollector, candle);
     observeBacktestChartCandle(
       chartCollector,
       bot,
@@ -1028,6 +1039,7 @@ function buildRandomAggregateResult(input: {
       stoppedEarly: result.summary.stoppedEarly,
       stopReason: result.summary.stopReason,
       survivedMs: result.summary.survivedMs,
+      extremaOrderMass: result.summary.extremaOrderMass,
     };
   });
   const cacheStats = mergedCacheStats(
@@ -1153,6 +1165,9 @@ function buildRandomAggregateResult(input: {
       ),
       profitableClosedPositionRate: average(
         samples.map((sample) => sample.profitableClosedPositionRate),
+      ),
+      extremaOrderMass: aggregateExtremaOrderMassSummaries(
+        results.map((result) => result.summary.extremaOrderMass),
       ),
     },
     equityCurve: averageEquityCurves(results),
