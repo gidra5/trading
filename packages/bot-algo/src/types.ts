@@ -41,6 +41,10 @@ export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
 export type LegacySigmaMode = "trend" | "static" | "sigmoid-trend";
 
+export type LegacyDerivativeSource = "price" | "kama";
+
+export type LegacyDerivativeClampMode = "deadband" | "hysteresis";
+
 export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
 
 export interface PriceTick {
@@ -121,6 +125,13 @@ export interface LegacyValleyPeakConfig {
   averagingRangesSec: number[];
   rateRatios: number[];
   relativeRateEnabled: boolean;
+  derivativeSource: LegacyDerivativeSource;
+  derivativeClampMode: LegacyDerivativeClampMode;
+  derivativeClampInnerThresholdRatio: number;
+  kamaErLen: number;
+  kamaFastLen: number;
+  kamaSlowLen: number;
+  kamaPower: number;
   rateThresholdsLow: number[];
   rateThresholdsHigh: number[];
   buyDataIndex: number;
@@ -179,6 +190,11 @@ export interface RollingAverageMemory {
   startIndex?: number;
   previousSampleIndex?: number;
   points: RollingAveragePoint[];
+}
+
+export interface RollingKamaMemory {
+  sources: number[];
+  ama?: number;
 }
 
 export interface RollingCandleRangePoint {
@@ -241,6 +257,9 @@ export interface RollingPriceRangeMemory {
 
 export interface LegacyValleyPeakMemory {
   startedAt?: number;
+  kama: RollingKamaMemory;
+  kamaBuySignal: RollingAverageMemory;
+  kamaSellSignal: RollingAverageMemory;
   buyAverages: RollingAverageMemory[];
   sellAverages: RollingAverageMemory[];
   candleRanges: RollingCandleRangeMemory[];
@@ -343,6 +362,8 @@ export interface LegacyMarketStateDebug {
 export interface LegacyValleyPeakDebugSnapshot {
   updatedAt: number;
   price: number;
+  derivativeSource: LegacyDerivativeSource;
+  derivativeSourceValue: number;
   entrySignal: BotSignal;
   exitSignal: BotSignal;
   entryReason?: string;

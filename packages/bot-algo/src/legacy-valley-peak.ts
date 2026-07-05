@@ -1,6 +1,7 @@
 import type {
   BotSignal,
   Candle,
+  LegacyDerivativeClampMode,
   LegacyValleyPeakCheckDebug,
   LegacyValleyPeakConfig,
   LegacyValleyPeakDebugSnapshot,
@@ -11,6 +12,7 @@ import type {
   RollingCandleRangeMemory,
   RollingCandleRangeMaxCandidate,
   RollingCandleRangePoint,
+  RollingKamaMemory,
   RollingPriceRangeBucket,
   RollingPriceRangeMemory,
   RollingPriceRangePoint,
@@ -70,6 +72,13 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
   relativeRateEnabled: true,
+  derivativeSource: "price",
+  derivativeClampMode: "deadband",
+  derivativeClampInnerThresholdRatio: 0,
+  kamaErLen: 20,
+  kamaFastLen: 5,
+  kamaSlowLen: 50,
+  kamaPower: 1,
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
@@ -176,6 +185,37 @@ export function createLegacyValleyPeakConfig(
   const rangeCount = Math.max(1, config.averagingRangesSec.length);
   config.rateRatios = padNumbers(config.rateRatios, rangeCount, 0.5);
   config.relativeRateEnabled = config.relativeRateEnabled === true;
+  config.derivativeSource = config.derivativeSource === "kama" ? "kama" : "price";
+  config.derivativeClampMode =
+    config.derivativeClampMode === "hysteresis" ? "hysteresis" : "deadband";
+  config.derivativeClampInnerThresholdRatio = clamp(
+    Number.isFinite(config.derivativeClampInnerThresholdRatio)
+      ? config.derivativeClampInnerThresholdRatio
+      : defaultLegacyValleyPeakConfig.derivativeClampInnerThresholdRatio,
+    0,
+    1,
+  );
+  config.kamaErLen = clampInt(
+    config.kamaErLen,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  config.kamaFastLen = clampInt(
+    config.kamaFastLen,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  config.kamaSlowLen = clampInt(
+    config.kamaSlowLen,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  config.kamaPower = Math.max(
+    0.1,
+    Number.isFinite(config.kamaPower)
+      ? config.kamaPower
+      : defaultLegacyValleyPeakConfig.kamaPower,
+  );
   config.rateThresholdsLow = config.relativeRateEnabled
     ? normalizeRelativeRates(config.rateThresholdsLow, rangeCount, 0.0000025)
     : padNumbers(config.rateThresholdsLow, rangeCount, 0.25);
@@ -338,6 +378,9 @@ export function createLegacyValleyPeakMemory(
 ): LegacyValleyPeakMemory {
   const averages = config.averagingRangesSec.map(createRollingAverageMemory);
   return {
+    kama: createRollingKamaMemory(),
+    kamaBuySignal: createRollingAverageMemory(),
+    kamaSellSignal: createRollingAverageMemory(),
     buyAverages: averages,
     sellAverages: averages,
     candleRanges: config.averagingRangesSec.map(createRollingCandleRangeMemory),
@@ -356,6 +399,9 @@ export function normalizeLegacyValleyPeakMemory(
   const averages = normalizeAverageList(memory.buyAverages ?? memory.sellAverages, config);
   return {
     startedAt: memory.startedAt,
+    kama: normalizeKama(memory.kama),
+    kamaBuySignal: normalizeAverage(memory.kamaBuySignal),
+    kamaSellSignal: normalizeAverage(memory.kamaSellSignal),
     buyAverages: averages,
     sellAverages: averages,
     candleRanges: normalizeCandleRangeList(memory.candleRanges, config),
@@ -379,6 +425,7 @@ export function evaluateLegacyValleyPeak(
   for (const priceRange of priceRanges) {
     updateRollingPriceRange(priceRange, input, tsSec);
   }
+  updateSignalSource(memory, config, input.price, tsSec);
   for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
     const rangeSec = config.averagingRangesSec[index];
     updateRollingAverage(
@@ -390,6 +437,8 @@ export function evaluateLegacyValleyPeak(
       config.rateThresholdsLow[index],
       config.rateThresholdsHigh[index],
       config.relativeRateEnabled,
+      config.derivativeClampMode,
+      config.derivativeClampInnerThresholdRatio,
     );
     updateRollingCandleRange(candleRanges[index], rangeSec, input, tsSec);
   }
@@ -714,6 +763,8 @@ export function createLegacyValleyPeakDebugSnapshot(
   return {
     updatedAt: input.eventTime,
     price: input.price,
+    derivativeSource: config.derivativeSource,
+    derivativeSourceValue: currentDerivativeSourceValue(memory, config, input.price),
     entrySignal: decision.entrySignal.signal,
     exitSignal: decision.exitSignal.signal,
     entryReason: legacyValleyPeakSignalReason(decision.entrySignal),
@@ -822,7 +873,7 @@ function shouldBuy(
   confirmationOffsets: number[],
   input?: LegacyValleyPeakInput,
 ): boolean {
-  const primary = memory.buyAverages[config.buyDataIndex];
+  const primary = primarySignalMemory("buy", memory, config);
   if (!isValley(primary)) {
     return false;
   }
@@ -855,7 +906,7 @@ function shouldSell(
   confirmationOffsets: number[],
   input?: LegacyValleyPeakInput,
 ): boolean {
-  const primary = memory.sellAverages[config.sellDataIndex];
+  const primary = primarySignalMemory("sell", memory, config);
   if (!isPeak(primary)) {
     return false;
   }
@@ -891,9 +942,7 @@ function buildLegacyValleyPeakCheckDebug(
   confirmationOffsets: number[],
 ): LegacyValleyPeakCheckDebug {
   const primaryIndex = side === "buy" ? config.buyDataIndex : config.sellDataIndex;
-  const primary = side === "buy"
-    ? memory.buyAverages[primaryIndex]
-    : memory.sellAverages[primaryIndex];
+  const primary = primarySignalMemory(side, memory, config);
   const primaryPoint = latestPoint(primary);
   const primaryShape = !primaryPoint
     ? "missing"
@@ -1231,6 +1280,148 @@ function shortSellQuoteSize(
   );
 }
 
+function updateSignalSource(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  price: number,
+  tsSec: number,
+): void {
+  if (config.derivativeSource !== "kama") {
+    return;
+  }
+
+  const value = updateKama(memory.kama, config, price);
+  updateSignalDerivative(
+    memory.kamaBuySignal,
+    value,
+    tsSec,
+    config.rateThresholdsLow[config.buyDataIndex] ?? 0,
+    config.rateThresholdsHigh[config.buyDataIndex] ?? 0,
+    config.relativeRateEnabled,
+    config.derivativeClampMode,
+    config.derivativeClampInnerThresholdRatio,
+  );
+  updateSignalDerivative(
+    memory.kamaSellSignal,
+    value,
+    tsSec,
+    config.rateThresholdsLow[config.sellDataIndex] ?? 0,
+    config.rateThresholdsHigh[config.sellDataIndex] ?? 0,
+    config.relativeRateEnabled,
+    config.derivativeClampMode,
+    config.derivativeClampInnerThresholdRatio,
+  );
+}
+
+function primarySignalMemory(
+  side: "buy" | "sell",
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+): RollingAverageMemory | undefined {
+  if (config.derivativeSource === "kama") {
+    return side === "buy" ? memory.kamaBuySignal : memory.kamaSellSignal;
+  }
+
+  return side === "buy"
+    ? memory.buyAverages[config.buyDataIndex]
+    : memory.sellAverages[config.sellDataIndex];
+}
+
+function currentDerivativeSourceValue(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  price: number,
+): number {
+  if (config.derivativeSource !== "kama") {
+    return latestPoint(memory.buyAverages[config.buyDataIndex])?.avg ?? price;
+  }
+  return memory.kama.ama ?? price;
+}
+
+function updateSignalDerivative(
+  memory: RollingAverageMemory,
+  value: number,
+  tsSec: number,
+  thresholdLow: number,
+  thresholdHigh: number,
+  relativeRateEnabled: boolean,
+  clampMode: LegacyDerivativeClampMode,
+  innerThresholdRatio: number,
+): void {
+  const previousValue = memory.averages.at(-1);
+  const previousTsSec = memory.timestamps.at(-1);
+  let derivative = 0;
+
+  if (
+    previousValue !== undefined &&
+    previousTsSec !== undefined &&
+    tsSec > previousTsSec &&
+    (!relativeRateEnabled || previousValue > 0)
+  ) {
+    const delta = tsSec - previousTsSec;
+    derivative = relativeRateEnabled
+      ? (value - previousValue) / previousValue / delta
+      : (value - previousValue) / delta;
+  }
+
+  const rateClamped = clampDerivativeRate(
+    derivative,
+    latestPoint(memory)?.rateClamped ?? 0,
+    thresholdLow,
+    thresholdHigh,
+    clampMode,
+    innerThresholdRatio,
+  );
+
+  recordPoint(memory, value, derivative, rateClamped);
+  memory.entries.push(value);
+  memory.averages.push(value);
+  memory.timestamps.push(tsSec);
+  memory.sum = value;
+  if (memory.entries.length > 2) {
+    memory.entries.splice(0, memory.entries.length - 2);
+    memory.averages.splice(0, memory.averages.length - 2);
+    memory.timestamps.splice(0, memory.timestamps.length - 2);
+  }
+  memory.startIndex = 0;
+  memory.previousSampleIndex = undefined;
+}
+
+function updateKama(
+  memory: RollingKamaMemory,
+  config: LegacyValleyPeakConfig,
+  source: number,
+): number {
+  if (!isPositiveFinite(source)) {
+    return memory.ama ?? source;
+  }
+
+  memory.sources.push(source);
+  const erLen = config.kamaErLen;
+  let efficiencyRatio = 0;
+
+  if (memory.sources.length > erLen) {
+    const latestIndex = memory.sources.length - 1;
+    const previousIndex = latestIndex - erLen;
+    const change = Math.abs(source - memory.sources[previousIndex]);
+    let volatility = 0;
+    for (let index = previousIndex + 1; index <= latestIndex; index += 1) {
+      volatility += Math.abs(memory.sources[index] - memory.sources[index - 1]);
+    }
+    efficiencyRatio = volatility !== 0 ? change / volatility : 0;
+  }
+
+  const chop = Math.pow(clamp(efficiencyRatio, 0, 1), config.kamaPower);
+  const alphaFast = 2 / (config.kamaFastLen + 1);
+  const alphaSlow = 2 / (config.kamaSlowLen + 1);
+  const alpha = alphaSlow + chop * (alphaFast - alphaSlow);
+  memory.ama = memory.ama === undefined
+    ? source
+    : memory.ama + alpha * (source - memory.ama);
+  compactKama(memory, erLen);
+  return memory.ama;
+}
+
 function updateRollingAverage(
   memory: RollingAverageMemory,
   value: number,
@@ -1240,6 +1431,8 @@ function updateRollingAverage(
   thresholdLow: number,
   thresholdHigh: number,
   relativeRateEnabled: boolean,
+  clampMode: LegacyDerivativeClampMode,
+  innerThresholdRatio: number,
 ): void {
   let startIndex = memory.startIndex ?? 0;
   startIndex = clampInt(startIndex, 0, memory.timestamps.length);
@@ -1287,15 +1480,54 @@ function updateRollingAverage(
   const derivative = relativeRateEnabled
     ? (avg - sampleValue) / sampleValue / delta
     : (avg - sampleValue) / delta;
-  let rateClamped = 0;
-  if (derivative >= thresholdHigh) {
-    rateClamped = derivative;
-  } else if (derivative <= -thresholdLow) {
-    rateClamped = derivative;
-  }
+  const rateClamped = clampDerivativeRate(
+    derivative,
+    latestPoint(memory)?.rateClamped ?? 0,
+    thresholdLow,
+    thresholdHigh,
+    clampMode,
+    innerThresholdRatio,
+  );
 
   recordPoint(memory, avg, derivative, rateClamped);
   compactRollingAverage(memory);
+}
+
+function clampDerivativeRate(
+  derivative: number,
+  previousClamped: number,
+  thresholdLow: number,
+  thresholdHigh: number,
+  mode: LegacyDerivativeClampMode,
+  innerThresholdRatio: number,
+): number {
+  if (mode !== "hysteresis") {
+    return deadbandClampDerivativeRate(derivative, thresholdLow, thresholdHigh);
+  }
+
+  const positiveExitThreshold = thresholdHigh * innerThresholdRatio;
+  const negativeExitThreshold = thresholdLow * innerThresholdRatio;
+  if (previousClamped > 0 && derivative > positiveExitThreshold) {
+    return derivative;
+  }
+  if (previousClamped < 0 && derivative < -negativeExitThreshold) {
+    return derivative;
+  }
+  return deadbandClampDerivativeRate(derivative, thresholdLow, thresholdHigh);
+}
+
+function deadbandClampDerivativeRate(
+  derivative: number,
+  thresholdLow: number,
+  thresholdHigh: number,
+): number {
+  if (derivative >= thresholdHigh) {
+    return derivative;
+  }
+  if (derivative <= -thresholdLow) {
+    return derivative;
+  }
+  return 0;
 }
 
 function updateRollingCandleRange(
@@ -1891,6 +2123,12 @@ function createRollingAverageMemory(): RollingAverageMemory {
   };
 }
 
+function createRollingKamaMemory(): RollingKamaMemory {
+  return {
+    sources: [],
+  };
+}
+
 function createRollingCandleRangeMemory(): RollingCandleRangeMemory {
   return {
     entries: [],
@@ -1965,6 +2203,13 @@ function normalizeAverage(memory: RollingAverageMemory | undefined): RollingAver
     startIndex,
     previousSampleIndex: memory?.previousSampleIndex,
     points: memory?.points ?? [],
+  };
+}
+
+function normalizeKama(memory: RollingKamaMemory | undefined): RollingKamaMemory {
+  return {
+    sources: (Array.isArray(memory?.sources) ? memory.sources : []).filter(isPositiveFinite),
+    ama: isPositiveFinite(memory?.ama ?? 0) ? memory?.ama : undefined,
   };
 }
 
@@ -2204,6 +2449,14 @@ function compactRollingAverage(memory: RollingAverageMemory): void {
     memory.previousSampleIndex = Math.max(0, memory.previousSampleIndex - startIndex);
   }
   memory.startIndex = 0;
+}
+
+function compactKama(memory: RollingKamaMemory, erLen: number): void {
+  const keep = Math.max(2, erLen + 1);
+  if (memory.sources.length <= keep * 2) {
+    return;
+  }
+  memory.sources.splice(0, memory.sources.length - keep);
 }
 
 function binarySearchLeft(

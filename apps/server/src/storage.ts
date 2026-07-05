@@ -25,7 +25,9 @@ export class TradingStorage {
   }
 
   async loadBotState(): Promise<PaperBotState | undefined> {
-    return readJson<PaperBotState>(this.botStatePath);
+    return unwrapStateFile(
+      await readJson<PaperBotState | StateFile<PaperBotState>>(this.botStatePath),
+    );
   }
 
   async saveBotState(state: PaperBotState): Promise<void> {
@@ -33,7 +35,9 @@ export class TradingStorage {
   }
 
   async loadLiveBotCoreState(): Promise<BotCoreState | undefined> {
-    return readJson<BotCoreState>(this.liveBotCoreStatePath);
+    return unwrapStateFile(
+      await readJson<BotCoreState | StateFile<BotCoreState>>(this.liveBotCoreStatePath),
+    );
   }
 
   async saveLiveBotCoreState(state: BotCoreState): Promise<void> {
@@ -101,8 +105,30 @@ export class TradingStorage {
   }
 }
 
+interface StateFile<T> {
+  state?: T;
+}
+
 function safePathPart(value: string): string {
   return value.replace(/[^a-z0-9_-]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
+}
+
+function unwrapStateFile<T>(value: T | StateFile<T> | undefined): T | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (isRecord(value)) {
+    const record = value as Record<string, unknown>;
+    const state = record.state;
+    if (isRecord(state)) {
+      return state as T;
+    }
+  }
+  return value as T;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 async function readJson<T>(filePath: string): Promise<T | undefined> {

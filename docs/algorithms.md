@@ -185,6 +185,49 @@ becomes `0.0000025` per second.
 
 This prevents tiny average movements from constantly generating valley/peak flips.
 
+`legacyValleyPeak.derivativeClampMode` selects how that deadband is applied:
+
+- `deadband` is stateless and uses the formula above on every sample.
+- `hysteresis` requires a threshold breakout to leave zero, then keeps the active
+  positive or negative derivative unclamped until it crosses an inner threshold.
+
+In hysteresis mode the state machine is:
+
+```text
+innerHigh = highThreshold * derivativeClampInnerThresholdRatio
+innerLow  = lowThreshold * derivativeClampInnerThresholdRatio
+
+zero     -> positive when derivative >= highThreshold
+zero     -> negative when derivative <= -lowThreshold
+positive -> positive while derivative > innerHigh
+negative -> negative while derivative < -innerLow
+otherwise clamp to zero until the next threshold breakout
+```
+
+The default `derivativeClampInnerThresholdRatio = 0` preserves the first hysteresis
+experiment, where active states exited only after raw derivative zero-cross. A ratio
+closer to `1` exits earlier; at `1`, hysteresis nearly collapses back to the outer
+deadband threshold.
+
+The primary valley/peak signal source is selected by
+`legacyValleyPeak.derivativeSource`. The default `price` source preserves the original
+behavior: primary extrema are detected on the configured buy/sell source SMA windows,
+usually the 1m SMA. The optional `kama` source detects the primary extrema on the
+PineScript-style KAMA instead:
+
+```text
+change = abs(src - src[erLen])
+volatility = sum(abs(src[i] - src[i + 1]), i = 0..erLen - 1)
+er = volatility != 0 ? change / volatility : 0
+alpha = alphaSlow + er^power * (alphaFast - alphaSlow)
+ama = previousAma + alpha * (src - previousAma)
+```
+
+Confirmation windows, exit confirmations, trend sigma sizing, market state detection,
+range diagnostics, and chart SMA series still use raw candle prices. KAMA only replaces
+the primary source whose extrema start a buy/sell signal before those raw-price
+confirmations are checked.
+
 The detector shares the same average array for buy and sell memory. `buyAverages` and
 `sellAverages` are separate fields for state compatibility, but current code points both
 at the same rolling average objects.
@@ -507,6 +550,13 @@ mode.
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
 | `legacyValleyPeak.maxTradeQuote` | `50000` | Per-signal quote/notional clip. |
 | `legacyValleyPeak.relativeRateEnabled` | `true` | Uses price-scale-invariant relative derivatives by default; disable only for old absolute-rate baseline comparisons. |
+| `legacyValleyPeak.derivativeSource` | `price` | Primary extrema source; `kama` uses KAMA extrema for the initial buy/sell signal while confirmations stay on raw-price SMAs. |
+| `legacyValleyPeak.derivativeClampMode` | `deadband` | Derivative thresholding mode; `hysteresis` keeps an active sign until an inner threshold is crossed. |
+| `legacyValleyPeak.derivativeClampInnerThresholdRatio` | `0` | Hysteresis exit threshold as a fraction of the outer derivative threshold; `0` means zero-cross exit. |
+| `legacyValleyPeak.kamaErLen` | `20` | KAMA efficiency-ratio length in observed samples. |
+| `legacyValleyPeak.kamaFastLen` | `5` | KAMA fast EMA length. |
+| `legacyValleyPeak.kamaSlowLen` | `50` | KAMA slow EMA length. |
+| `legacyValleyPeak.kamaPower` | `1` | Exponent applied to the KAMA efficiency ratio before alpha interpolation. |
 | `legacyValleyPeak.longSideEnabled` | `true` | Allows confirmed valleys to open long lots and confirmed peaks to close them. |
 | `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
 | `legacyValleyPeak.buyExitConfirmationOffsets` | `[1, 2]` | Confirmation offsets used by buy signals that cover shorts. |

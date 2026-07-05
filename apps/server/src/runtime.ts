@@ -1611,12 +1611,14 @@ function isRebasableBotState(state: PaperBotState | undefined): boolean {
   if (!state) {
     return true;
   }
+  const orders = Array.isArray(state.orders) ? state.orders : [];
+  const fills = Array.isArray(state.fills) ? state.fills : [];
   return (
-    state.orders.length === 0 &&
-    state.fills.length === 0 &&
-    Math.abs(state.quoteReserved) <= BALANCE_EPSILON &&
-    Math.abs(state.baseFree) <= BALANCE_EPSILON &&
-    Math.abs(state.baseReserved) <= BALANCE_EPSILON
+    orders.length === 0 &&
+    fills.length === 0 &&
+    Math.abs(finiteOrZero(state.quoteReserved)) <= BALANCE_EPSILON &&
+    Math.abs(finiteOrZero(state.baseFree)) <= BALANCE_EPSILON &&
+    Math.abs(finiteOrZero(state.baseReserved)) <= BALANCE_EPSILON
   );
 }
 

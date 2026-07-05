@@ -92,7 +92,6 @@ duration	trend	interval	market Sharpe	market move	bot return	bot max DD	bot ann.
 7d	up	2024-11-05..2024-11-11	3.454	+30.653%	+5.269%	3.765%	6.039
 7d	down	2023-03-03..2023-03-09	2.540	-13.224%	+3.269%	1.936%	5.096
 7d	down	2026-05-27..2026-06-02	2.626	-12.076%	+2.525%	4.195%	4.088
-I also found two strong market downtrends that are useful as stress cases because the current static short-favoring bot loses there:
 
 duration	interval	market Sharpe	market move	bot return
 3d	2022-06-11..2022-06-13	2.602	-22.702%	-3.455%

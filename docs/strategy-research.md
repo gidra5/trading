@@ -813,6 +813,88 @@ heavily in sustained trend weeks and several choppy near-flat weeks.
 | 3d sideways mid bias churn | `2024-01-02..2024-01-04` | `-0.06%` | `+7.82%` | `14.03%` | `+1.23%` | `363` |
 | 3d sideways mid bias low churn | `2023-09-15..2023-09-17` | `+0.02%` | `-0.19%` | `0.24%` | `-0.39%` | `5` |
 
+## KAMA Derivative Source Test
+
+Implemented `legacyValleyPeak.derivativeSource = "kama"` as a primary extrema
+source only. In `price` mode, the primary signal source remains the configured raw
+price SMA, usually the 1m SMA. In `kama` mode, the primary valley/peak extrema come
+from KAMA, while confirmation windows, exit confirmations, trend sigma sizing, market
+state, and chart SMAs still use raw prices.
+
+The test below interprets the provided KAMA lengths as minutes. The candle backtest
+replays each 1m candle as four OHLC ticks, so `erLen=5m`, `fastLen=5m`,
+`slowLen=50m` were run as `kamaErLen=20`, `kamaFastLen=20`, `kamaSlowLen=200`,
+`kamaPower=1`. Static sigmas are `buySigma=0.1`, `sellSigma=0.1`, mode `both`,
+borrow depths `999/999`.
+
+Corrected KAMA is still better than raw price source on average, but it is not a
+universal improvement. It cuts average drawdown and trade count substantially, and
+rescues the June 2022 stress downtrends, but introduces a severe `-11.67%` loss on
+the `2022-06-19..2022-06-21` high-churn uptrend.
+
+| Version | Avg return | Avg DD | Avg trades | Positive / flat / negative |
+| --- | ---: | ---: | ---: | ---: |
+| Raw price source | `-2.38%` | `4.22%` | `449` | `4 / 0 / 16` |
+| KAMA primary source | `+0.37%` | `1.53%` | `68.7` | `14 / 1 / 5` |
+
+| Case | Interval | KAMA return | KAMA DD | KAMA trades |
+| --- | --- | ---: | ---: | ---: |
+| Up low churn | `2024-02-24..2024-02-26` | `-0.01%` | `0.01%` | `2` |
+| Up high churn | `2022-06-19..2022-06-21` | `-11.67%` | `11.68%` | `68` |
+| Down low churn | `2023-06-03..2023-06-05` | `+0.06%` | `0.06%` | `6` |
+| Down high churn | `2022-06-13..2022-06-15` | `+0.49%` | `0.41%` | `266` |
+| Side high bias churn | `2021-10-19..2021-10-21` | `-0.06%` | `0.99%` | `92` |
+| Side high bias low churn | `2025-02-14..2025-02-16` | `+0.00%` | `0.00%` | `1` |
+| Side low bias churn | `2024-07-07..2024-07-09` | `-1.31%` | `3.45%` | `13` |
+| Side low bias low churn | `2025-07-04..2025-07-06` | `+0.00%` | `0.00%` | `1` |
+| Side mid bias churn | `2024-01-02..2024-01-04` | `+0.56%` | `0.33%` | `51` |
+| Side mid bias low churn | `2023-09-15..2023-09-17` | `0.00%` | `0.00%` | `0` |
+| Trend 3d up 2024-11 | `2024-11-09..2024-11-11` | `+1.86%` | `0.78%` | `51` |
+| Trend 3d up 2023-12 | `2023-12-03..2023-12-05` | `+0.28%` | `1.15%` | `66` |
+| Trend 3d down 2026-06 | `2026-06-01..2026-06-03` | `-2.42%` | `2.89%` | `49` |
+| Trend 3d down 2023-03 | `2023-03-07..2023-03-09` | `+3.69%` | `1.98%` | `16` |
+| Trend 7d up 2023-12 | `2023-11-29..2023-12-05` | `+0.43%` | `0.42%` | `81` |
+| Trend 7d up 2024-11 | `2024-11-05..2024-11-11` | `+2.00%` | `1.11%` | `128` |
+| Trend 7d down 2023-03 | `2023-03-03..2023-03-09` | `+2.34%` | `1.55%` | `37` |
+| Trend 7d down 2026-06 | `2026-05-27..2026-06-02` | `+0.18%` | `0.00%` | `3` |
+| Stress 3d down 2022-06 | `2022-06-11..2022-06-13` | `+5.54%` | `2.18%` | `197` |
+| Stress 7d down 2022-06 | `2022-06-07..2022-06-13` | `+5.48%` | `1.53%` | `245` |
+
+## Derivative Clamp Hysteresis Test
+
+Implemented `legacyValleyPeak.derivativeClampMode = "hysteresis"` as an experimental
+alternative to the previous stateless deadband clamp. In this mode a derivative leaves
+zero only after crossing the configured threshold, then keeps its active positive or
+negative sign until the raw derivative crosses zero.
+
+Benchmark report:
+`docs/derivative-clamp-mode-benchmark-2026-07-05-170933.md`
+
+Scope: the 28 UTC day-inclusive intervals from `tasks.md`, BTCUSDT 1m candles, static
+`buySigma=0.1`, `sellSigma=0.1`, price derivative source, both sides enabled,
+futures-margin shorts, borrow depths `999/999`, and `1x` max leverage.
+
+Result: hysteresis was worse overall. It improved return on only `6/28` intervals and
+lowered max drawdown on `4/28`. Average return moved from `-2.647%` with deadband to
+`-8.485%`; average max drawdown moved from `5.038%` to `10.321%`; average trades almost
+doubled from `747.6` to `1485`.
+
+Main read: zero-cross persistence is too slow for the current price-source detector.
+It keeps directional state active through churn, causing more orders and deeper adverse
+inventory. Keep `deadband` as the default; use hysteresis only as an explicit experiment
+or retest it later with a smoother derivative source/regime gate.
+
+KAMA follow-up report:
+`docs/derivative-clamp-mode-benchmark-2026-07-05-173814.md`
+
+Using the same benchmark scope with `derivativeSource=kama` and minute-scaled KAMA
+parameters `erLen=20`, `fastLen=20`, `slowLen=200`, hysteresis still failed. KAMA
+deadband averaged `-0.163%` return, `2.175%` max drawdown, and `106.6` trades;
+KAMA hysteresis averaged `-6.256%` return, `8.225%` max drawdown, and `272.8`
+trades. Hysteresis improved return on only `7/28` intervals and lowered drawdown on
+only `1/28`. The June 2022 stress cases are decisive: KAMA deadband returned
+`+5.535%` and `+5.483%`, while KAMA hysteresis returned `-10.591%` and `-22.353%`.
+
 ## Research Backlog
 
 | Direction | Why it may help legacy | Main risk |

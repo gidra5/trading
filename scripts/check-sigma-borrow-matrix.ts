@@ -5,6 +5,8 @@ import {
   type BacktestExtremaOrderMassSummary,
   type Candle,
   type InternalBorrowAccounting,
+  type LegacyDerivativeClampMode,
+  type LegacyDerivativeSource,
   type LegacySigmaMode,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
@@ -19,6 +21,13 @@ interface Args {
   trendSigmaWindowSec: number;
   sigmoidSigmaLow: number;
   sigmoidSigmaHigh: number;
+  derivativeSource: LegacyDerivativeSource;
+  derivativeClampMode: LegacyDerivativeClampMode;
+  derivativeClampInnerThresholdRatio: number;
+  kamaErLen: number;
+  kamaFastLen: number;
+  kamaSlowLen: number;
+  kamaPower: number;
   days: number;
   startDate?: string;
   endDate?: string;
@@ -73,6 +82,13 @@ for (const testCase of cases) {
       trendSigmaWindowSec: args.trendSigmaWindowSec,
       sigmoidSigmaLow: args.sigmoidSigmaLow,
       sigmoidSigmaHigh: args.sigmoidSigmaHigh,
+      derivativeSource: args.derivativeSource,
+      derivativeClampMode: args.derivativeClampMode,
+      derivativeClampInnerThresholdRatio: args.derivativeClampInnerThresholdRatio,
+      kamaErLen: args.kamaErLen,
+      kamaFastLen: args.kamaFastLen,
+      kamaSlowLen: args.kamaSlowLen,
+      kamaPower: args.kamaPower,
       days: args.days,
       startDate: args.startDate,
       endDate: args.endDate,
@@ -154,6 +170,13 @@ function legacyConfig(args: Args, mode: SideMode): PartialStrategyConfig["legacy
     trendSigmaWindowSec: args.trendSigmaWindowSec,
     sigmoidSigmaLow: args.sigmoidSigmaLow,
     sigmoidSigmaHigh: args.sigmoidSigmaHigh,
+    derivativeSource: args.derivativeSource,
+    derivativeClampMode: args.derivativeClampMode,
+    derivativeClampInnerThresholdRatio: args.derivativeClampInnerThresholdRatio,
+    kamaErLen: args.kamaErLen,
+    kamaFastLen: args.kamaFastLen,
+    kamaSlowLen: args.kamaSlowLen,
+    kamaPower: args.kamaPower,
     ...signalProfileConfig(args.signalProfile),
     longSideEnabled: mode !== "short-only",
     shortSideEnabled: mode !== "long-only",
@@ -216,6 +239,16 @@ function parseArgs(argv: string[]): Args {
     ),
     sigmoidSigmaLow: positiveNumber(values.get("sigmoid-low") ?? "0.05", "sigmoid-low"),
     sigmoidSigmaHigh: positiveNumber(values.get("sigmoid-high") ?? "0.3", "sigmoid-high"),
+    derivativeSource: parseDerivativeSource(values.get("derivative-source")),
+    derivativeClampMode: parseDerivativeClampMode(values.get("derivative-clamp-mode")),
+    derivativeClampInnerThresholdRatio: ratioNumber(
+      values.get("derivative-clamp-inner-ratio") ?? "0",
+      "derivative-clamp-inner-ratio",
+    ),
+    kamaErLen: positiveInteger(values.get("kama-er-len") ?? "20", "kama-er-len"),
+    kamaFastLen: positiveInteger(values.get("kama-fast-len") ?? "5", "kama-fast-len"),
+    kamaSlowLen: positiveInteger(values.get("kama-slow-len") ?? "50", "kama-slow-len"),
+    kamaPower: positiveNumber(values.get("kama-power") ?? "1", "kama-power"),
     days: positiveInteger(values.get("days") ?? "30", "days"),
     startDate: parseDate(values.get("start-date"), "start-date"),
     endDate: parseDate(values.get("end-date"), "end-date"),
@@ -229,6 +262,26 @@ function parseArgs(argv: string[]): Args {
       : undefined,
     internalBorrowAccounting: parseInternalBorrowAccounting(values.get("internal-borrow-accounting")),
   };
+}
+
+function parseDerivativeClampMode(value: string | undefined): LegacyDerivativeClampMode {
+  if (value === undefined || value === "deadband") {
+    return "deadband";
+  }
+  if (value === "hysteresis") {
+    return "hysteresis";
+  }
+  throw new Error("--derivative-clamp-mode must be deadband or hysteresis.");
+}
+
+function parseDerivativeSource(value: string | undefined): LegacyDerivativeSource {
+  if (value === undefined || value === "price") {
+    return "price";
+  }
+  if (value === "kama") {
+    return "kama";
+  }
+  throw new Error("--derivative-source must be price or kama.");
 }
 
 function parseSignalProfile(value: string | undefined): SignalProfile {
@@ -302,6 +355,14 @@ function nonNegativeNumber(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     throw new Error(`--${label} must be non-negative.`);
+  }
+  return parsed;
+}
+
+function ratioNumber(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    throw new Error(`--${label} must be between 0 and 1.`);
   }
   return parsed;
 }

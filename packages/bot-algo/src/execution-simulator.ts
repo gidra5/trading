@@ -4478,6 +4478,9 @@ export class SimulatedExecutionEngine {
       !memory ||
       memory.buyAverages.length !== rangeCount ||
       memory.sellAverages.length !== rangeCount ||
+      !memory.kama ||
+      !memory.kamaBuySignal ||
+      !memory.kamaSellSignal ||
       memory.candleRanges?.length !== rangeCount ||
       memory.priceRanges?.length !== 3
     ) {

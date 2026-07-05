@@ -1503,6 +1503,47 @@ function AlgorithmPanel(props: {
                   checked={config().legacyValleyPeak.relativeRateEnabled}
                   onInput={(value) => updateValleyPeak("relativeRateEnabled", value)}
                 />
+                <SelectField
+                  label="Derivative Source"
+                  value={config().legacyValleyPeak.derivativeSource}
+                  options={[
+                    { value: "price", label: "Price" },
+                    { value: "kama", label: "KAMA" },
+                  ]}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "derivativeSource",
+                      value as StrategyConfig["legacyValleyPeak"]["derivativeSource"],
+                    )
+                  }
+                />
+                <SelectField
+                  label="Clamp Mode"
+                  value={config().legacyValleyPeak.derivativeClampMode}
+                  options={[
+                    { value: "deadband", label: "Deadband" },
+                    { value: "hysteresis", label: "Hysteresis" },
+                  ]}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "derivativeClampMode",
+                      value as StrategyConfig["legacyValleyPeak"]["derivativeClampMode"],
+                    )
+                  }
+                />
+                <NumberField
+                  label="Clamp Inner"
+                  value={config().legacyValleyPeak.derivativeClampInnerThresholdRatio}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "derivativeClampInnerThresholdRatio",
+                      value,
+                    )
+                  }
+                />
                 <NumberField
                   label="Buy Rate"
                   value={config().legacyValleyPeak.buySpendRate}
@@ -1597,6 +1638,34 @@ function AlgorithmPanel(props: {
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("sigmoidSigmaHigh", value)}
+                />
+                <NumberField
+                  label="KAMA ER"
+                  value={config().legacyValleyPeak.kamaErLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaErLen", Math.round(value))}
+                />
+                <NumberField
+                  label="KAMA Fast"
+                  value={config().legacyValleyPeak.kamaFastLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaFastLen", Math.round(value))}
+                />
+                <NumberField
+                  label="KAMA Slow"
+                  value={config().legacyValleyPeak.kamaSlowLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaSlowLen", Math.round(value))}
+                />
+                <NumberField
+                  label="KAMA Power"
+                  value={config().legacyValleyPeak.kamaPower}
+                  min={0.1}
+                  step={0.1}
+                  onInput={(value) => updateValleyPeak("kamaPower", value)}
                 />
                 <NumberField
                   label="Signal Min"
@@ -1901,11 +1970,14 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
 
             <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
               <div class="mb-2 flex items-center justify-between gap-3">
-                <div class="muted-label">SMA / Derivatives</div>
+                <div class="muted-label">Raw SMA Derivatives</div>
                 <div class="text-xs text-ink-300">
                   {state().saturated
                     ? "saturated"
                     : `${formatDuration(state().saturationRemainingMs)} warmup`}
+                  <span class="ml-2 tabular-nums">
+                    signal {state().derivativeSource === "kama" ? "KAMA" : "SMA"} ${formatQuote(state().derivativeSourceValue, 4)}
+                  </span>
                 </div>
               </div>
               <table class="w-full min-w-120 text-sm">
@@ -1913,7 +1985,7 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
                   <tr>
                     <th class="table-head pb-2">Role</th>
                     <th class="table-head pb-2">Window</th>
-                    <th class="table-head pb-2">SMA</th>
+                    <th class="table-head pb-2">Avg</th>
                     <th class="table-head pb-2">Rate</th>
                     <th class="table-head pb-2">Clamp</th>
                     <th class="table-head pb-2">Shape</th>
