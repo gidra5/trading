@@ -28,6 +28,7 @@ import {
   legacyValleyPeakDecisionReason,
   legacyValleyPeakDecisionSignal,
   normalizeLegacyValleyPeakMemory,
+  warmupLegacyValleyPeakPriceRanges,
 } from "./legacy-valley-peak.js";
 import {
   PeakValleyBotCore,
@@ -81,6 +82,12 @@ export type PartialStrategyConfig = Partial<
   legacyValleyPeak?: Partial<StrategyConfig["legacyValleyPeak"]>;
   positionRisk?: Partial<StrategyConfig["positionRisk"]>;
 };
+
+export interface WarmupFromCandlesOptions {
+  batchSize?: number;
+  priceRangeCandles?: readonly Candle[];
+  shouldContinue?: () => boolean;
+}
 
 interface ImmediateFillRollback {
   quoteFree: number;
@@ -815,6 +822,57 @@ export class SimulatedExecutionEngine {
     for (const candle of candles) {
       processed += this.warmupPrice(candle.closeTime, candle.close, candle);
     }
+    if (processed > 0) {
+      recalculateMetrics(this.state);
+    }
+    return processed;
+  }
+
+  async warmupFromCandlesCooperative(
+    candles: readonly Candle[],
+    options: WarmupFromCandlesOptions = {},
+  ): Promise<number> {
+    const batchSize = Math.max(1, Math.floor(options.batchSize ?? 2_000));
+    const previousMemory = structuredClone(this.ensureLegacyValleyPeakMemory());
+    const nextMemory = createLegacyValleyPeakMemory(this.state.config.legacyValleyPeak);
+    nextMemory.exitGrids = previousMemory.exitGrids;
+    this.state.memory.legacyValleyPeak = nextMemory;
+
+    let processed = 0;
+    try {
+      if (options.priceRangeCandles?.length) {
+        if (options.shouldContinue?.() === false) {
+          this.state.memory.legacyValleyPeak = previousMemory;
+          return 0;
+        }
+        processed += warmupLegacyValleyPeakPriceRanges(
+          nextMemory,
+          options.priceRangeCandles,
+        );
+        if (options.shouldContinue?.() === false) {
+          this.state.memory.legacyValleyPeak = previousMemory;
+          return 0;
+        }
+      }
+
+      for (let index = 0; index < candles.length; index += 1) {
+        if (options.shouldContinue?.() === false) {
+          this.state.memory.legacyValleyPeak = previousMemory;
+          return 0;
+        }
+
+        const candle = candles[index];
+        processed += this.warmupPrice(candle.closeTime, candle.close, candle);
+
+        if ((index + 1) % batchSize === 0) {
+          await yieldToScheduler();
+        }
+      }
+    } catch (error) {
+      this.state.memory.legacyValleyPeak = previousMemory;
+      throw error;
+    }
+
     if (processed > 0) {
       recalculateMetrics(this.state);
     }
@@ -4825,4 +4883,8 @@ function isLeverageLimitError(error: unknown): boolean {
 
 function formatLeverageForError(value: number): string {
   return (Number.isFinite(value) ? value : 999).toFixed(2);
+}
+
+function yieldToScheduler(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }

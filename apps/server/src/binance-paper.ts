@@ -8,16 +8,24 @@ import type { BinanceMarketListing } from "./binance-markets.js";
 
 export type BinancePaperMode =
   | "auto"
+  | "live"
+  | "spot-live"
+  | "usdm-futures-live"
+  | "coinm-futures-live"
   | "spot-testnet"
   | "spot-demo"
   | "usdm-futures-testnet"
   | "coinm-futures-testnet";
+
+export type ResolvedBinancePaperMode = Exclude<BinancePaperMode, "auto" | "live">;
 
 export interface BinancePaperConfig {
   enabled: boolean;
   mode: BinancePaperMode;
   apiKey?: string;
   apiSecret?: string;
+  liveApiKey?: string;
+  liveApiSecret?: string;
   recvWindowMs: number;
   autoSubmit: boolean;
   baseUrlOverride?: string;
@@ -116,7 +124,8 @@ export interface BinancePaperSnapshot {
   configured: boolean;
   compatible: boolean;
   mode: BinancePaperMode;
-  resolvedMode?: Exclude<BinancePaperMode, "auto">;
+  resolvedMode?: ResolvedBinancePaperMode;
+  live: boolean;
   baseUrl?: string;
   streamEnvironment?: BinancePaperStreamEnvironment;
   autoSubmit: boolean;
@@ -145,7 +154,7 @@ export interface BinancePaperSnapshot {
 export interface BinancePaperUserDataStreamSession {
   listenKey: string;
   url: string;
-  mode: Exclude<BinancePaperMode, "auto">;
+  mode: ResolvedBinancePaperMode;
 }
 
 export interface BinancePaperUserDataStreamStatus {
@@ -192,8 +201,9 @@ export type BinancePaperStreamEnvironment =
   | "coinm-futures-testnet";
 
 interface ResolvedPaperEnvironment {
-  mode: Exclude<BinancePaperMode, "auto">;
+  mode: ResolvedBinancePaperMode;
   product: "spot" | "usdm-futures" | "coinm-futures";
+  live: boolean;
   baseUrl: string;
   restPrefix: "/api/v3" | "/fapi/v1" | "/dapi/v1";
   accountPath: string;
@@ -223,39 +233,45 @@ export class BinancePaperTrading {
   private timeOffsets = new Map<string, number>();
   private symbolFilters = new Map<string, BinancePaperSymbolFilters>();
   private maxLeverageBySymbol = new Map<string, number>();
-  private positionModeByMode = new Map<BinancePaperMode, {
+  private positionModeByMode = new Map<ResolvedBinancePaperMode, {
     mode: BinancePaperPositionMode;
     fetchedAt: number;
   }>();
 
   constructor(private readonly config: BinancePaperConfig) {}
 
+  updateConfig(patch: Partial<BinancePaperConfig>): void {
+    Object.assign(this.config, patch);
+    this.snapshots.clear();
+  }
+
   drivesOrderExecution(market: BinanceMarketListing): boolean {
     return Boolean(
       this.config.enabled &&
         this.config.autoSubmit &&
-        this.config.apiKey &&
-        this.config.apiSecret &&
-        this.resolveEnvironment(market),
+        this.canSubmitOrders(market),
     );
   }
 
   canSubmitOrders(market: BinanceMarketListing): boolean {
+    const environment = this.resolveEnvironment(market);
+    const credentials = environment ? this.credentialsFor(environment) : undefined;
     return Boolean(
       this.config.enabled &&
-        this.config.apiKey &&
-        this.config.apiSecret &&
-        this.resolveEnvironment(market),
+        environment &&
+        credentials?.apiKey &&
+        credentials?.apiSecret,
     );
   }
 
   canStreamUserData(market: BinanceMarketListing): boolean {
     const environment = this.resolveEnvironment(market);
+    const credentials = environment ? this.credentialsFor(environment) : undefined;
     return Boolean(
       this.config.enabled &&
-        this.config.apiKey &&
-        this.config.apiSecret &&
         environment &&
+        credentials?.apiKey &&
+        credentials?.apiSecret &&
         environment.product !== "spot",
     );
   }
@@ -273,7 +289,7 @@ export class BinancePaperTrading {
   ): Promise<BinancePaperUserDataStreamSession> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
-      throw new Error("Spot paper user-data streams require WebSocket API auth and are not enabled yet.");
+      throw new Error("Spot user-data streams require WebSocket API auth and are not enabled yet.");
     }
     const payload = await this.apiKeyRequest<Record<string, unknown>>(
       environment,
@@ -282,7 +298,7 @@ export class BinancePaperTrading {
     );
     const listenKey = stringValue(payload.listenKey);
     if (!listenKey) {
-      throw new Error("Binance paper user-data stream did not return a listenKey.");
+      throw new Error("Binance user-data stream did not return a listenKey.");
     }
     return {
       listenKey,
@@ -370,8 +386,9 @@ export class BinancePaperTrading {
         configured: false,
         compatible: true,
         mode: this.config.mode,
+        live: false,
         autoSubmit: this.config.autoSubmit,
-        message: "Binance paper trading disabled",
+        message: "Binance exchange trading disabled",
       };
     }
 
@@ -379,28 +396,33 @@ export class BinancePaperTrading {
       return {
         ...EMPTY_SNAPSHOT,
         enabled: true,
-        configured: Boolean(this.config.apiKey && this.config.apiSecret),
+        configured: false,
         compatible: false,
         mode: this.config.mode,
+        live: false,
         autoSubmit: this.config.autoSubmit,
-        message: `Binance paper mode ${this.config.mode} is not compatible with ${market.venue}`,
+        message: `Binance exchange mode ${this.config.mode} is not compatible with ${market.venue}`,
       };
     }
 
+    const credentials = this.credentialsFor(environment);
     return {
       ...EMPTY_SNAPSHOT,
       enabled: true,
-      configured: Boolean(this.config.apiKey && this.config.apiSecret),
+      configured: Boolean(credentials.apiKey && credentials.apiSecret),
       compatible: true,
       mode: this.config.mode,
       resolvedMode: environment.mode,
+      live: environment.live,
       baseUrl: environment.baseUrl,
       streamEnvironment: environment.streamEnvironment,
       autoSubmit: this.config.autoSubmit,
       message:
-        this.config.apiKey && this.config.apiSecret
-          ? "Binance paper trading ready; sync not run yet"
-          : "Set BINANCE_PAPER_API_KEY and BINANCE_PAPER_API_SECRET to enable signed requests",
+        credentials.apiKey && credentials.apiSecret
+          ? `${environment.live ? "Live" : "Sandbox"} Binance exchange ready; sync not run yet`
+          : environment.live
+            ? "Add live Binance tokens in the dashboard to enable signed requests"
+            : "Add sandbox Binance tokens in the dashboard to enable signed requests",
     };
   }
 
@@ -443,7 +465,7 @@ export class BinancePaperTrading {
       connected: true,
       lastSyncAt: Date.now(),
       positionMode,
-      message: "Binance paper account synced",
+      message: `${environment.live ? "Live" : "Sandbox"} Binance account synced`,
       error: undefined,
       maxLeverage,
       symbolFilters,
@@ -543,7 +565,7 @@ export class BinancePaperTrading {
 
     const targetSide = order.side === "buy" ? "short" : "long";
     throw new BinancePaperOrderSubmissionSkipped(
-      `Binance paper submit skipped: ${order.side.toUpperCase()} close order ${order.id} requires ${formatQuantity(order.quantity)} ${market.baseAsset}, but only ${formatQuantity(availableQuantity)} ${targetSide} ${market.baseAsset} is reducible after open close orders.`,
+      `Binance submit skipped: ${order.side.toUpperCase()} close order ${order.id} requires ${formatQuantity(order.quantity)} ${market.baseAsset}, but only ${formatQuantity(availableQuantity)} ${targetSide} ${market.baseAsset} is reducible after open close orders.`,
     );
   }
 
@@ -577,7 +599,7 @@ export class BinancePaperTrading {
       (!algo && !params.orderId && !params.origClientOrderId) ||
       (algo && !params.algoId && !params.clientAlgoId)
     ) {
-      throw new Error("Provide orderId or clientOrderId to cancel a Binance paper order.");
+      throw new Error("Provide orderId or clientOrderId to cancel a Binance order.");
     }
 
     const payload = await this.signedRequest<Record<string, unknown>>(
@@ -640,7 +662,7 @@ export class BinancePaperTrading {
   ): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
-      throw new Error("Exchange position close is only available for futures paper modes.");
+      throw new Error("Exchange position close is only available for futures modes.");
     }
 
     const initial = await this.sync(market);
@@ -650,7 +672,7 @@ export class BinancePaperTrading {
     if (positions.length === 0) {
       return {
         ...initial,
-        message: "No open Binance paper positions to close",
+        message: "No open Binance positions to close",
       };
     }
 
@@ -680,8 +702,8 @@ export class BinancePaperTrading {
       lastSubmitAt: Date.now(),
       message:
         closedCount === 1
-          ? `Closed 1 open ${market.symbol} Binance paper position`
-          : `Closed ${closedCount} open ${market.symbol} Binance paper positions`,
+          ? `Closed 1 open ${market.symbol} Binance position`
+          : `Closed ${closedCount} open ${market.symbol} Binance positions`,
     };
     this.snapshots.set(snapshotKey(environment, market.symbol), snapshot);
     return snapshot;
@@ -693,7 +715,7 @@ export class BinancePaperTrading {
   ): Promise<BinancePaperSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
-      throw new Error("Leverage is only available for futures paper modes.");
+      throw new Error("Leverage is only available for futures modes.");
     }
     const maxLeverage = await this.fetchMaxLeverage(environment, market.symbol);
     const leverageCap = maxLeverage && maxLeverage > 0 ? maxLeverage : 125;
@@ -714,15 +736,20 @@ export class BinancePaperTrading {
 
   private requireReadyEnvironment(market: BinanceMarketListing): ResolvedPaperEnvironment {
     if (!this.config.enabled) {
-      throw new Error("Binance paper trading is disabled.");
-    }
-    if (!this.config.apiKey || !this.config.apiSecret) {
-      throw new Error("BINANCE_PAPER_API_KEY and BINANCE_PAPER_API_SECRET are required.");
+      throw new Error("Binance exchange trading is disabled.");
     }
     const environment = this.resolveEnvironment(market);
     if (!environment) {
       throw new Error(
-        `Binance paper mode ${this.config.mode} is not compatible with ${market.venue}.`,
+        `Binance exchange mode ${this.config.mode} is not compatible with ${market.venue}.`,
+      );
+    }
+    const credentials = this.credentialsFor(environment);
+    if (!credentials.apiKey || !credentials.apiSecret) {
+      throw new Error(
+        environment.live
+          ? "BINANCE_API_KEY and BINANCE_API_SECRET are required for live Binance exchange requests."
+          : "BINANCE_PAPER_API_KEY and BINANCE_PAPER_API_SECRET are required for sandbox Binance exchange requests.",
       );
     }
     return environment;
@@ -731,7 +758,12 @@ export class BinancePaperTrading {
   private resolveEnvironment(
     market: BinanceMarketListing,
   ): ResolvedPaperEnvironment | undefined {
-    const mode = this.config.mode === "auto" ? defaultModeForVenue(market.venue) : this.config.mode;
+    const mode =
+      this.config.mode === "auto"
+        ? defaultModeForVenue(market.venue, "sandbox")
+        : this.config.mode === "live"
+          ? defaultModeForVenue(market.venue, "live")
+          : this.config.mode;
     if (!mode) {
       return undefined;
     }
@@ -739,6 +771,20 @@ export class BinancePaperTrading {
       return undefined;
     }
     return environmentForMode(mode, this.config.baseUrlOverride);
+  }
+
+  private credentialsFor(
+    environment: ResolvedPaperEnvironment,
+  ): { apiKey?: string; apiSecret?: string } {
+    return environment.live
+      ? {
+          apiKey: this.config.liveApiKey,
+          apiSecret: this.config.liveApiSecret,
+        }
+      : {
+          apiKey: this.config.apiKey,
+          apiSecret: this.config.apiSecret,
+        };
   }
 
   private async fetchBalances(
@@ -1045,7 +1091,8 @@ export class BinancePaperTrading {
     }
     search.set("recvWindow", String(this.config.recvWindowMs));
     search.set("timestamp", String(Date.now() + (this.timeOffsets.get(environment.mode) ?? 0)));
-    const signature = createHmac("sha256", this.config.apiSecret ?? "")
+    const credentials = this.credentialsFor(environment);
+    const signature = createHmac("sha256", credentials.apiSecret ?? "")
       .update(search.toString())
       .digest("hex");
     search.set("signature", signature);
@@ -1053,7 +1100,7 @@ export class BinancePaperTrading {
     return requestJson<T>(new URL(`${path}?${search.toString()}`, environment.baseUrl), {
       method,
       headers: {
-        "X-MBX-APIKEY": this.config.apiKey ?? "",
+        "X-MBX-APIKEY": credentials.apiKey ?? "",
       },
     });
   }
@@ -1072,10 +1119,11 @@ export class BinancePaperTrading {
     }
     const query = search.toString();
     const pathWithQuery = query ? `${path}?${query}` : path;
+    const credentials = this.credentialsFor(environment);
     return requestJson<T>(new URL(pathWithQuery, environment.baseUrl), {
       method,
       headers: {
-        "X-MBX-APIKEY": this.config.apiKey ?? "",
+        "X-MBX-APIKEY": credentials.apiKey ?? "",
       },
     });
   }
@@ -1104,7 +1152,21 @@ export class BinancePaperTrading {
 
 function defaultModeForVenue(
   venue: BinanceMarketListing["venue"],
-): Exclude<BinancePaperMode, "auto"> | undefined {
+  environment: "sandbox" | "live",
+): ResolvedBinancePaperMode | undefined {
+  if (environment === "live") {
+    if (venue === "spot") {
+      return "spot-live";
+    }
+    if (venue === "usdm-futures") {
+      return "usdm-futures-live";
+    }
+    if (venue === "coinm-futures") {
+      return "coinm-futures-live";
+    }
+    return undefined;
+  }
+
   if (venue === "spot") {
     return "spot-testnet";
   }
@@ -1118,29 +1180,41 @@ function defaultModeForVenue(
 }
 
 function modeIsCompatibleWithVenue(
-  mode: Exclude<BinancePaperMode, "auto">,
+  mode: ResolvedBinancePaperMode,
   venue: BinanceMarketListing["venue"],
 ): boolean {
-  if (mode === "spot-testnet" || mode === "spot-demo") {
+  if (mode === "spot-testnet" || mode === "spot-demo" || mode === "spot-live") {
     return venue === "spot";
   }
-  if (mode === "usdm-futures-testnet") {
+  if (mode === "usdm-futures-testnet" || mode === "usdm-futures-live") {
     return venue === "usdm-futures";
   }
-  if (mode === "coinm-futures-testnet") {
+  if (mode === "coinm-futures-testnet" || mode === "coinm-futures-live") {
     return venue === "coinm-futures";
   }
   return false;
 }
 
 function environmentForMode(
-  mode: Exclude<BinancePaperMode, "auto">,
+  mode: ResolvedBinancePaperMode,
   baseUrlOverride: string | undefined,
 ): ResolvedPaperEnvironment {
+  if (mode === "spot-live") {
+    return {
+      mode,
+      product: "spot",
+      live: true,
+      baseUrl: baseUrlOverride ?? "https://api.binance.com",
+      restPrefix: "/api/v3",
+      accountPath: "/api/v3/account",
+      streamEnvironment: "live",
+    };
+  }
   if (mode === "spot-testnet") {
     return {
       mode,
       product: "spot",
+      live: false,
       baseUrl: baseUrlOverride ?? "https://testnet.binance.vision",
       restPrefix: "/api/v3",
       accountPath: "/api/v3/account",
@@ -1151,16 +1225,30 @@ function environmentForMode(
     return {
       mode,
       product: "spot",
+      live: false,
       baseUrl: baseUrlOverride ?? "https://demo-api.binance.com",
       restPrefix: "/api/v3",
       accountPath: "/api/v3/account",
       streamEnvironment: "spot-demo",
     };
   }
+  if (mode === "usdm-futures-live") {
+    return {
+      mode,
+      product: "usdm-futures",
+      live: true,
+      baseUrl: baseUrlOverride ?? "https://fapi.binance.com",
+      restPrefix: "/fapi/v1",
+      accountPath: "/fapi/v3/account",
+      balancePath: "/fapi/v3/balance",
+      streamEnvironment: "live",
+    };
+  }
   if (mode === "usdm-futures-testnet") {
     return {
       mode,
       product: "usdm-futures",
+      live: false,
       baseUrl: baseUrlOverride ?? "https://demo-fapi.binance.com",
       restPrefix: "/fapi/v1",
       accountPath: "/fapi/v3/account",
@@ -1171,11 +1259,14 @@ function environmentForMode(
   return {
     mode,
     product: "coinm-futures",
-    baseUrl: baseUrlOverride ?? "https://demo-dapi.binance.com",
+    live: mode === "coinm-futures-live",
+    baseUrl: baseUrlOverride ?? (mode === "coinm-futures-live"
+      ? "https://dapi.binance.com"
+      : "https://demo-dapi.binance.com"),
     restPrefix: "/dapi/v1",
     accountPath: "/dapi/v1/account",
     balancePath: "/dapi/v1/balance",
-    streamEnvironment: "coinm-futures-testnet",
+    streamEnvironment: mode === "coinm-futures-live" ? "live" : "coinm-futures-testnet",
   };
 }
 
@@ -1255,7 +1346,7 @@ function normalizePrice(
   }
   const price = Number(value);
   if (!Number.isFinite(price) || price <= 0) {
-    throw new Error("Limit paper orders require a positive price.");
+    throw new Error("Limit Binance orders require a positive price.");
   }
   const tickSize = filters.tickSize ?? 0;
   if (tickSize <= 0) {
@@ -1276,7 +1367,7 @@ function normalizeStopPrice(
   }
   const price = Number(value);
   if (!Number.isFinite(price) || price <= 0) {
-    throw new Error("Stop-market paper orders require a positive stop price.");
+    throw new Error("Stop-market Binance orders require a positive stop price.");
   }
   const tickSize = filters.tickSize ?? 0;
   if (tickSize <= 0) {
@@ -1532,7 +1623,7 @@ function orderParams(
     params.triggerPrice = decimalParam(input.stopPrice ?? input.price);
     params.clientAlgoId = clientOrderId;
     if (!params.triggerPrice) {
-      throw new Error("Stop-market paper orders require stopPrice.");
+      throw new Error("Stop-market Binance orders require stopPrice.");
     }
   } else {
     params.newClientOrderId = clientOrderId;
@@ -1542,14 +1633,14 @@ function orderParams(
     params.timeInForce = input.timeInForce ?? "GTC";
     params.price = decimalParam(input.price);
     if (!params.price) {
-      throw new Error("Limit paper orders require price.");
+      throw new Error("Limit Binance orders require price.");
     }
   }
 
   if (orderType === "STOP_LOSS") {
     params.stopPrice = decimalParam(input.stopPrice ?? input.price);
     if (!params.stopPrice) {
-      throw new Error("Stop-market paper orders require stopPrice.");
+      throw new Error("Stop-market Binance orders require stopPrice.");
     }
   }
 
@@ -2066,7 +2157,7 @@ async function requestJson<T>(url: URL, init: RequestInit): Promise<T> {
       typeof errorPayload.msg === "string"
         ? errorPayload.msg
         : `HTTP ${response.status} ${text.slice(0, 240)}`;
-    throw new Error(`Binance paper request failed:${code} ${message}`.trim());
+    throw new Error(`Binance request failed:${code} ${message}`.trim());
   }
   return payload as T;
 }

@@ -8,6 +8,33 @@ import type {
   PaperBotState,
 } from "@trading/bot-algo";
 
+export type TradingExecutionMode = "simulated" | "binance";
+export type TradingExchangeMode =
+  | "auto"
+  | "live"
+  | "spot-live"
+  | "usdm-futures-live"
+  | "coinm-futures-live"
+  | "spot-testnet"
+  | "spot-demo"
+  | "usdm-futures-testnet"
+  | "coinm-futures-testnet";
+
+export interface TradingExchangeCredentials {
+  mode: TradingExchangeMode;
+  sandboxApiKey?: string;
+  sandboxApiSecret?: string;
+  liveApiKey?: string;
+  liveApiSecret?: string;
+  updatedAt: number;
+}
+
+export interface TradingRuntimeSettings {
+  executionMode: TradingExecutionMode;
+  exchange?: TradingExchangeCredentials;
+  updatedAt: number;
+}
+
 export class TradingStorage {
   constructor(
     private readonly dataDir: string,
@@ -42,6 +69,18 @@ export class TradingStorage {
 
   async saveLiveBotCoreState(state: BotCoreState): Promise<void> {
     await writeJsonAtomic(this.liveBotCoreStatePath, state);
+  }
+
+  async loadRuntimeSettings(): Promise<TradingRuntimeSettings | undefined> {
+    return unwrapStateFile(
+      await readJson<TradingRuntimeSettings | StateFile<TradingRuntimeSettings>>(
+        this.runtimeSettingsPath,
+      ),
+    );
+  }
+
+  async saveRuntimeSettings(settings: TradingRuntimeSettings): Promise<void> {
+    await writeJsonAtomic(this.runtimeSettingsPath, settings);
   }
 
   async loadCandles(limit = 500): Promise<Candle[]> {
@@ -101,6 +140,13 @@ export class TradingStorage {
     return path.join(
       this.stateDir,
       `live-bot-core-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
+    );
+  }
+
+  private get runtimeSettingsPath(): string {
+    return path.join(
+      this.stateDir,
+      `runtime-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
     );
   }
 }

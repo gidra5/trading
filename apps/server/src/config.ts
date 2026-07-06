@@ -10,6 +10,12 @@ const repoRoot = path.resolve(sourceDir, "../../..");
 const environment = normalizeEnvironment(process.env.TRADING_ENV);
 const symbol = (process.env.TRADING_SYMBOL ?? "BTCUSDT").toUpperCase();
 const interval = process.env.TRADING_INTERVAL ?? "1m";
+const binanceExchangeMode = parseBinancePaperMode(
+  process.env.TRADING_BINANCE_EXCHANGE_MODE ??
+    (parseBoolean(process.env.TRADING_BINANCE_LIVE_ENABLED, false)
+      ? "live"
+      : process.env.TRADING_BINANCE_PAPER_MODE),
+);
 const market = createConfiguredMarketListing({
   marketId: process.env.TRADING_MARKET_ID,
   venue: parseMarketVenue(process.env.TRADING_MARKET_VENUE),
@@ -28,10 +34,15 @@ export const appConfig = {
   binanceApiKey: process.env.BINANCE_API_KEY,
   binanceApiSecret: process.env.BINANCE_API_SECRET,
   binancePaper: {
-    enabled: parseBoolean(process.env.TRADING_BINANCE_PAPER_ENABLED, false),
-    mode: parseBinancePaperMode(process.env.TRADING_BINANCE_PAPER_MODE),
+    enabled:
+      parseBoolean(process.env.TRADING_BINANCE_PAPER_ENABLED, false) ||
+      parseBoolean(process.env.TRADING_BINANCE_LIVE_ENABLED, false) ||
+      isLiveBinanceMode(binanceExchangeMode),
+    mode: binanceExchangeMode,
     apiKey: process.env.BINANCE_PAPER_API_KEY,
     apiSecret: process.env.BINANCE_PAPER_API_SECRET,
+    liveApiKey: process.env.BINANCE_API_KEY,
+    liveApiSecret: process.env.BINANCE_API_SECRET,
     recvWindowMs: Math.max(1_000, parseNumber(process.env.BINANCE_PAPER_RECV_WINDOW_MS, 5_000)),
     autoSubmit: parseBoolean(process.env.TRADING_BINANCE_PAPER_AUTO_SUBMIT, false),
     baseUrlOverride: process.env.BINANCE_PAPER_BASE_URL,
@@ -117,6 +128,10 @@ function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
 
 function parseBinancePaperMode(value: string | undefined): BinancePaperMode {
   if (
+    value === "live" ||
+    value === "spot-live" ||
+    value === "usdm-futures-live" ||
+    value === "coinm-futures-live" ||
     value === "spot-testnet" ||
     value === "spot-demo" ||
     value === "usdm-futures-testnet" ||
@@ -126,6 +141,10 @@ function parseBinancePaperMode(value: string | undefined): BinancePaperMode {
   }
 
   return "auto";
+}
+
+function isLiveBinanceMode(value: BinancePaperMode): boolean {
+  return value === "live" || value.endsWith("-live");
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {

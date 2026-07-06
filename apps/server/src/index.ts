@@ -43,6 +43,7 @@ const HEARTBEAT_LOG_MS = Math.max(0, Number(process.env.TRADING_HEARTBEAT_LOG_MS
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 let tcpConnectionCount = 0;
 
+configureProcessReports();
 eventLoopDelay.enable();
 server.server.on("connection", (socket) => {
   tcpConnectionCount += 1;
@@ -204,6 +205,18 @@ server.put("/api/bot/config", async (request) => {
   return publicSnapshot();
 });
 
+server.put("/api/bot/execution", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as { mode?: string };
+    await runtime.setExecutionMode(body.mode === "binance" ? "binance" : "simulated");
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Execution mode update failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
 server.post("/api/bot/manual-trade", async (request, reply) => {
   try {
     const body = (request.body ?? {}) as ManualTradeInput;
@@ -222,7 +235,23 @@ server.post("/api/exchange/sync", async (_request, reply) => {
     broadcastState();
     return publicSnapshot();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Binance paper sync failed";
+    const message = error instanceof Error ? error.message : "Binance exchange sync failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.put("/api/exchange/credentials", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as {
+      mode?: string;
+      apiKey?: string;
+      apiSecret?: string;
+    };
+    await runtime.setExchangeCredentials(body);
+    broadcastState();
+    return publicSnapshot();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Binance credential update failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -234,7 +263,7 @@ server.post("/api/exchange/order", async (request, reply) => {
     broadcastState();
     return publicSnapshot();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Binance paper order failed";
+    const message = error instanceof Error ? error.message : "Binance exchange order failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -246,7 +275,7 @@ server.delete("/api/exchange/order", async (request, reply) => {
     broadcastState();
     return publicSnapshot();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Binance paper cancel failed";
+    const message = error instanceof Error ? error.message : "Binance exchange cancel failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -257,7 +286,7 @@ server.delete("/api/exchange/open-orders", async (_request, reply) => {
     broadcastState();
     return publicSnapshot();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Binance paper cancel-all failed";
+    const message = error instanceof Error ? error.message : "Binance exchange cancel-all failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -273,7 +302,7 @@ server.post("/api/exchange/leverage", async (request, reply) => {
     broadcastState();
     return publicSnapshot();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Binance paper leverage update failed";
+    const message = error instanceof Error ? error.message : "Binance exchange leverage update failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -660,6 +689,28 @@ function countCatalogGroups(
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function configureProcessReports(): void {
+  if (!process.report) {
+    return;
+  }
+
+  try {
+    fs.mkdirSync(appConfig.dataDir, { recursive: true });
+    process.report.directory = appConfig.dataDir;
+    process.report.reportOnFatalError = true;
+    process.report.reportOnSignal = true;
+    process.report.reportOnUncaughtException = true;
+    process.report.signal = "SIGUSR2";
+  } catch (error) {
+    server.log.warn(
+      {
+        error: error instanceof Error ? error.message : "Unknown process report setup error",
+      },
+      "Process report setup failed",
+    );
+  }
 }
 
 let broadcastTimer: NodeJS.Timeout | undefined;

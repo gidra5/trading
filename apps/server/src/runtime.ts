@@ -5,8 +5,10 @@ import {
   analyzePositions,
   createInitialBotState,
   createStrategyConfig,
-  legacyValleyPeakHistoricalWarmupSec,
-  legacyValleyPeakObservedWarmupSec,
+  legacyValleyPeakObservedPriceRangeWarmupRatio,
+  legacyValleyPeakObservedSignalWarmupSec,
+  legacyValleyPeakPriceRangeWarmupSec,
+  legacyValleyPeakSignalWarmupSec,
   runBacktestFromCandles,
   runBacktestFromOrderBook,
   type BacktestPreset,
@@ -40,6 +42,7 @@ import {
 import {
   BinancePaperOrderSubmissionSkipped,
   BinancePaperTrading,
+  type BinancePaperConfig,
   type BinancePaperCancelOrderInput,
   type BinancePaperOrder,
   type BinancePaperPlaceOrderInput,
@@ -47,7 +50,13 @@ import {
   type BinancePaperTrade,
 } from "./binance-paper.js";
 import { HistoricalCandleCache } from "./historical-candle-cache.js";
-import type { TradingStorage } from "./storage.js";
+import type {
+  TradingExchangeCredentials,
+  TradingExchangeMode,
+  TradingExecutionMode,
+  TradingRuntimeSettings,
+  TradingStorage,
+} from "./storage.js";
 
 const PUBLIC_ORDER_LIMIT = 500;
 const PUBLIC_FILL_LIMIT = 500;
@@ -61,6 +70,8 @@ const FUTURES_UNRELIABLE_MARK_EQUITY_DRIFT_TOLERANCE_RATE = 0.001;
 const EXCHANGE_ACCOUNT_GUARD_SETTLEMENT_GRACE_MS = 15_000;
 const LIVE_EQUITY_CURVE_CAP = 1_200;
 const LIVE_EQUITY_SAMPLE_MIN_SPACING_MS = 500;
+const HISTORICAL_WARMUP_COMPLETENESS_RATIO = 0.95;
+const PRICE_RANGE_WARMUP_INTERVAL = "1d";
 
 interface BacktestStartOptions {
   preset: BacktestPreset;
@@ -75,6 +86,17 @@ interface BacktestStartOptions {
   randomLookbackDays?: number;
   randomPairCount?: number;
   randomMarkets?: HistoricalBacktestMarket[];
+}
+
+interface ExchangeCredentialsUpdateInput {
+  mode?: string;
+  apiKey?: string;
+  apiSecret?: string;
+}
+
+interface HistoricalWarmupCandles {
+  signalCandles: Candle[];
+  priceRangeCandles: Candle[];
 }
 
 export interface RuntimeSnapshot {
@@ -100,6 +122,13 @@ export interface RuntimeSnapshot {
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
   equityCurve: EquityPoint[];
+  execution: {
+    mode: TradingExecutionMode;
+    exchangeDriven: boolean;
+    canUseExchange: boolean;
+    live: boolean;
+    message: string;
+  };
   exchange: BinancePaperSnapshot;
 }
 
@@ -131,6 +160,11 @@ export class TradingRuntime {
   private botOperationQueue: Promise<void> = Promise.resolve();
   private liveEquityCurve: EquityPoint[] = [];
   private lastLiveEquitySampleAt = 0;
+  private executionMode: TradingExecutionMode = "simulated";
+  private runtimeSettings: TradingRuntimeSettings = {
+    executionMode: "simulated",
+    updatedAt: 0,
+  };
 
   constructor(
     private storage: TradingStorage,
@@ -150,6 +184,7 @@ export class TradingRuntime {
 
   async init(): Promise<void> {
     await this.storage.ensureReady();
+    await this.loadRuntimeSettings();
     this.candles = await this.storage.loadCandles(500);
     const exchangeDriven = this.isExchangeDrivenExecution();
     const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
@@ -196,6 +231,7 @@ export class TradingRuntime {
     };
 
     await this.storage.ensureReady();
+    await this.loadRuntimeSettings();
     this.candles = await this.storage.loadCandles(500);
     const exchangeDriven = this.isExchangeDrivenExecution();
     const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
@@ -222,7 +258,7 @@ export class TradingRuntime {
 
   async handleTick(tick: PriceTick): Promise<BotEvent[]> {
     return this.withBotOperation(async () => {
-      const exchangeDriven = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+      const exchangeDriven = this.isExchangeDrivenExecution();
       if (
         exchangeDriven &&
         this.exchangeAccountGuard.hardStop &&
@@ -235,7 +271,7 @@ export class TradingRuntime {
         processOpenOrders: !exchangeDriven,
         deferMarketOrderFills: exchangeDriven,
       });
-      await this.submitCreatedOrdersToPaperExchange(events);
+      await this.submitCreatedOrdersToPaperExchange(events, { force: exchangeDriven });
       this.recordEvents(events);
       this.recordLiveEquity(tick.eventTime);
       this.scheduleStateSave();
@@ -272,7 +308,7 @@ export class TradingRuntime {
         this.market,
         payload,
       );
-      if (!exchangeDriven && hasExchangeReconciliationUpdates(reconciliation)) {
+      if (hasExchangeReconciliationUpdates(reconciliation)) {
         const directEvents = this.bot.applyExchangeReconciliation(reconciliation);
         this.noteExchangeExecutions(directEvents);
         this.recordEvents(directEvents);
@@ -325,6 +361,7 @@ export class TradingRuntime {
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
       equityCurve: this.liveEquityCurve,
+      execution: this.publicExecutionSnapshot(exchangeSnapshot),
       exchange: exchangeSnapshot,
     };
   }
@@ -360,7 +397,7 @@ export class TradingRuntime {
     this.lastLiveEquitySampleAt = 0;
     const previousStatus = this.bot.view().status;
     const exchangeCanSubmit = this.paperTrading?.canSubmitOrders(this.market) ?? false;
-    const exchangeDrivesExecution = this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+    const exchangeDrivesExecution = this.isExchangeDrivenExecution();
     this.exchangeAccountWarningMessage = undefined;
     let resetSnapshot: BinancePaperSnapshot | undefined;
     if (exchangeCanSubmit) {
@@ -546,7 +583,7 @@ export class TradingRuntime {
 
   async syncExchange(): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
-      throw new Error("Binance paper trading is not configured.");
+      throw new Error("Binance exchange trading is not configured.");
     }
     const snapshot = await this.paperTrading.sync(this.market);
     await this.applyExchangeSnapshot(snapshot);
@@ -557,7 +594,7 @@ export class TradingRuntime {
     input: BinancePaperPlaceOrderInput,
   ): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
-      throw new Error("Binance paper trading is not configured.");
+      throw new Error("Binance exchange trading is not configured.");
     }
     const snapshot = await this.paperTrading.placeOrder(this.market, input);
     await this.applyExchangeSnapshot(snapshot);
@@ -568,7 +605,7 @@ export class TradingRuntime {
     input: BinancePaperCancelOrderInput,
   ): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
-      throw new Error("Binance paper trading is not configured.");
+      throw new Error("Binance exchange trading is not configured.");
     }
     const snapshot = await this.paperTrading.cancelOrder(this.market, input);
     await this.applyExchangeSnapshot(snapshot);
@@ -577,7 +614,7 @@ export class TradingRuntime {
 
   async cancelAllExchangeOrders(): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
-      throw new Error("Binance paper trading is not configured.");
+      throw new Error("Binance exchange trading is not configured.");
     }
     const snapshot = await this.paperTrading.cancelAllOpenOrders(this.market);
     await this.applyExchangeSnapshot(snapshot);
@@ -586,12 +623,178 @@ export class TradingRuntime {
 
   async setExchangeLeverage(leverage: number): Promise<BinancePaperSnapshot> {
     if (!this.paperTrading) {
-      throw new Error("Binance paper trading is not configured.");
+      throw new Error("Binance exchange trading is not configured.");
     }
     const snapshot = await this.paperTrading.changeLeverage(this.market, leverage);
     this.applyExchangeMaxLeverage(snapshot);
     await this.flushState();
     return snapshot;
+  }
+
+  async setExchangeCredentials(
+    input: ExchangeCredentialsUpdateInput,
+  ): Promise<BinancePaperSnapshot> {
+    return this.withBotOperation(async () => {
+      if (!this.paperTrading) {
+        throw new Error("Binance exchange trading is not configured.");
+      }
+      if (this.bot.view().status === "running") {
+        throw new Error("Stop the bot before changing Binance credentials.");
+      }
+
+      const now = Date.now();
+      const current = this.runtimeSettings.exchange;
+      const mode =
+        normalizeTradingExchangeMode(input.mode) ??
+        current?.mode ??
+        normalizeTradingExchangeMode(this.paperTrading.snapshot(this.market).mode) ??
+        "live";
+      const next: TradingExchangeCredentials = {
+        mode,
+        sandboxApiKey: current?.sandboxApiKey,
+        sandboxApiSecret: current?.sandboxApiSecret,
+        liveApiKey: current?.liveApiKey,
+        liveApiSecret: current?.liveApiSecret,
+        updatedAt: now,
+      };
+      const apiKey = normalizeCredentialInput(input.apiKey);
+      const apiSecret = normalizeCredentialInput(input.apiSecret);
+      if (exchangeModeUsesLiveCredentials(mode)) {
+        if (apiKey !== undefined) {
+          next.liveApiKey = apiKey;
+        }
+        if (apiSecret !== undefined) {
+          next.liveApiSecret = apiSecret;
+        }
+      } else {
+        if (apiKey !== undefined) {
+          next.sandboxApiKey = apiKey;
+        }
+        if (apiSecret !== undefined) {
+          next.sandboxApiSecret = apiSecret;
+        }
+      }
+
+      this.runtimeSettings = {
+        ...this.runtimeSettings,
+        exchange: next,
+        updatedAt: now,
+      };
+      this.applyRuntimeExchangeCredentials();
+      if (this.executionMode === "binance" && !this.canUseExchangeForBotExecution()) {
+        this.executionMode = "simulated";
+        this.runtimeSettings.executionMode = "simulated";
+      }
+      await this.saveRuntimeSettings();
+      this.exchangeAccountWarningMessage = undefined;
+      return this.publicExchangeSnapshot();
+    });
+  }
+
+  async setExecutionMode(mode: TradingExecutionMode): Promise<BotEvent[]> {
+    return this.withBotOperation(() => this.setExecutionModeUnlocked(mode));
+  }
+
+  private async setExecutionModeUnlocked(mode: TradingExecutionMode): Promise<BotEvent[]> {
+    const nextMode = normalizeTradingExecutionMode(mode) ?? "simulated";
+    if (nextMode === this.executionMode) {
+      return [];
+    }
+    if (this.bot.view().status === "running") {
+      throw new Error("Stop the bot before changing execution mode.");
+    }
+
+    let exchangeSnapshot: BinancePaperSnapshot | undefined;
+    if (nextMode === "binance") {
+      exchangeSnapshot = await this.prepareExchangeExecutionSwitch();
+    } else if (this.executionMode === "binance") {
+      exchangeSnapshot = await this.prepareSimulatedExecutionSwitch();
+    }
+
+    await this.flushState();
+    this.executionMode = nextMode;
+    await this.saveExecutionMode();
+    this.exchangeAccountWarningMessage = undefined;
+    this.liveEquityCurve = [];
+    this.lastLiveEquitySampleAt = 0;
+
+    const at = Date.now();
+    const events =
+      nextMode === "binance"
+        ? this.rebuildBotForExchangeExecution(exchangeSnapshot, at)
+        : await this.rebuildBotForSimulatedExecution(at);
+    if (exchangeSnapshot) {
+      events.push(...(await this.applyExchangeSnapshot(exchangeSnapshot)));
+    }
+    this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  private async prepareExchangeExecutionSwitch(): Promise<BinancePaperSnapshot> {
+    if (!this.canUseExchangeForBotExecution()) {
+      throw new Error(this.exchangeExecutionUnavailableMessage());
+    }
+    const snapshot = await this.paperTrading!.sync(this.market);
+    assertExchangeAccountFlatForExecutionSwitch(snapshot, this.market);
+    return snapshot;
+  }
+
+  private async prepareSimulatedExecutionSwitch(): Promise<BinancePaperSnapshot | undefined> {
+    if (!this.paperTrading?.canSubmitOrders(this.market)) {
+      return undefined;
+    }
+    const snapshot = await this.paperTrading.sync(this.market);
+    if (hasExchangeMarketExposure(snapshot, this.market)) {
+      throw new Error(
+        "Cancel Binance open orders and close the selected market position before switching back to simulated execution.",
+      );
+    }
+    return snapshot;
+  }
+
+  private rebuildBotForExchangeExecution(
+    exchangeSnapshot: BinancePaperSnapshot | undefined,
+    at: number,
+  ): BotEvent[] {
+    const previous = this.bot.snapshot();
+    const exchangeStartingQuote =
+      exchangeQuoteBalance(exchangeSnapshot, this.market) ?? this.config.startingQuote;
+    this.config = this.createMarketConfig(undefined, exchangeStartingQuote);
+    const state = createInitialBotState(this.config);
+    state.id = previous.id;
+    state.status = "stopped";
+    state.lastPrice = previous.lastPrice;
+    state.sequence = previous.sequence;
+    state.createdAt = at;
+    state.updatedAt = at;
+    state.runStartedAt = previous.runStartedAt;
+    state.memory = structuredClone(previous.memory);
+    state.config = this.config;
+    this.bot = new SimulatedExecutionEngine(state, this.config);
+    this.warmupBotFromRecentCandles(state);
+    this.startHistoricalWarmup(state);
+    return [{
+      type: "state_reset",
+      at,
+      message: "Binance execution enabled; local simulated positions cleared",
+      state: this.bot.snapshot(),
+    }];
+  }
+
+  private async rebuildBotForSimulatedExecution(at: number): Promise<BotEvent[]> {
+    const savedState = await this.storage.loadBotState();
+    this.config = this.createMarketConfig(savedState);
+    this.bot = new SimulatedExecutionEngine(savedState, this.config);
+    this.warmupBotFromRecentCandles(savedState);
+    this.startHistoricalWarmup(savedState);
+    this.bot.setStatus("stopped", at);
+    return [{
+      type: "state_reset",
+      at,
+      message: "Simulated execution enabled",
+      state: this.bot.snapshot(),
+    }];
   }
 
   startBacktest(
@@ -864,7 +1067,7 @@ export class TradingRuntime {
   }
 
   private resetFlatBotFromExchangeSnapshot(snapshot: BinancePaperSnapshot): BotEvent[] {
-    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+    if (!this.isExchangeDrivenExecution()) {
       return [];
     }
     if (hasExchangeOpenOrdersOrPositions(snapshot)) {
@@ -880,22 +1083,22 @@ export class TradingRuntime {
   }
 
   private async recoverExchangeState(snapshot?: BinancePaperSnapshot): Promise<void> {
-    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+    if (!this.isExchangeDrivenExecution()) {
       return;
     }
     try {
-      await this.applyExchangeSnapshot(snapshot ?? await this.paperTrading.sync(this.market));
+      await this.applyExchangeSnapshot(snapshot ?? await this.paperTrading!.sync(this.market));
     } catch {
       return;
     }
   }
 
   private async syncExecutionExchangeSnapshot(): Promise<BinancePaperSnapshot | undefined> {
-    if (!this.paperTrading?.drivesOrderExecution(this.market)) {
+    if (!this.isExchangeDrivenExecution()) {
       return undefined;
     }
     try {
-      return await this.paperTrading.sync(this.market);
+      return await this.paperTrading!.sync(this.market);
     } catch {
       return undefined;
     }
@@ -955,7 +1158,7 @@ export class TradingRuntime {
     generation: number;
     market: BinanceMarketListing;
   }): Promise<void> {
-    const candles = await this.loadWarmupCandles(
+    const warmupCandles = await this.loadWarmupCandles(
       options.market,
       options.config,
       options.endpoint,
@@ -963,16 +1166,28 @@ export class TradingRuntime {
     if (
       options.generation !== this.historicalWarmupGeneration ||
       options.market.id !== this.market.id ||
-      candles.length === 0
+      (warmupCandles.signalCandles.length === 0 &&
+        warmupCandles.priceRangeCandles.length === 0)
     ) {
       return;
     }
 
     const mergedCandles = mergeWarmupCandles(
-      candles,
+      warmupCandles.signalCandles,
       this.candles.filter((candle) => candle.closed),
     );
-    const processed = this.bot.warmupFromCandles(mergedCandles);
+    const processed = await this.bot.warmupFromCandlesCooperative(mergedCandles, {
+      priceRangeCandles: warmupCandles.priceRangeCandles,
+      shouldContinue: () =>
+        options.generation === this.historicalWarmupGeneration &&
+        options.market.id === this.market.id,
+    });
+    if (
+      options.generation !== this.historicalWarmupGeneration ||
+      options.market.id !== this.market.id
+    ) {
+      return;
+    }
     if (processed <= 0) {
       return;
     }
@@ -990,13 +1205,19 @@ export class TradingRuntime {
       return true;
     }
 
-    const requiredWarmupSec = legacyValleyPeakHistoricalWarmupSec(
+    const requiredSignalWarmupSec = legacyValleyPeakSignalWarmupSec(
       config.legacyValleyPeak,
     );
-    const observedWarmupSec = legacyValleyPeakObservedWarmupSec(
-      savedState!.memory.legacyValleyPeak,
+    const memory = savedState!.memory.legacyValleyPeak;
+    const observedSignalWarmupSec = legacyValleyPeakObservedSignalWarmupSec(memory);
+    const observedPriceRangeWarmupRatio = legacyValleyPeakObservedPriceRangeWarmupRatio(
+      memory,
     );
-    return observedWarmupSec < requiredWarmupSec * 0.95;
+    return (
+      observedSignalWarmupSec <
+        requiredSignalWarmupSec * HISTORICAL_WARMUP_COMPLETENESS_RATIO ||
+      observedPriceRangeWarmupRatio < HISTORICAL_WARMUP_COMPLETENESS_RATIO
+    );
   }
 
   private hasUsableLegacyWarmup(savedState?: PaperBotState): boolean {
@@ -1012,13 +1233,45 @@ export class TradingRuntime {
     market: BinanceMarketListing,
     config: StrategyConfig,
     endpoint?: string,
+  ): Promise<HistoricalWarmupCandles> {
+    const signalWarmupMs = legacyValleyPeakSignalWarmupSec(
+      config.legacyValleyPeak,
+    ) * 1000;
+    const priceRangeWarmupMs = legacyValleyPeakPriceRangeWarmupSec() * 1000;
+    const [signalCandles, priceRangeCandles] = await Promise.all([
+      this.loadWarmupCandlesForInterval(
+        market,
+        endpoint,
+        this.interval,
+        signalWarmupMs,
+        true,
+      ),
+      this.loadWarmupCandlesForInterval(
+        market,
+        endpoint,
+        PRICE_RANGE_WARMUP_INTERVAL,
+        priceRangeWarmupMs,
+        this.interval === PRICE_RANGE_WARMUP_INTERVAL,
+      ),
+    ]);
+
+    return { signalCandles, priceRangeCandles };
+  }
+
+  private async loadWarmupCandlesForInterval(
+    market: BinanceMarketListing,
+    endpoint: string | undefined,
+    interval: string,
+    warmupMs: number,
+    includeStoredCandles: boolean,
   ): Promise<Candle[]> {
-    const intervalMs = intervalToMs(this.interval);
-    const warmupMs = legacyValleyPeakHistoricalWarmupSec(config.legacyValleyPeak) * 1000;
+    const intervalMs = intervalToMs(interval);
     const requiredCandles = Math.max(10, Math.ceil(warmupMs / intervalMs) + 5);
     const storedCandles =
-      market.id === this.market.id
-        ? this.candles.filter((candle) => candle.closed).slice(-requiredCandles)
+      includeStoredCandles && market.id === this.market.id
+        ? this.candles
+            .filter((candle) => candle.closed && candle.interval === interval)
+            .slice(-requiredCandles)
         : [];
     const storedSpan =
       storedCandles.length > 0
@@ -1033,7 +1286,7 @@ export class TradingRuntime {
     const legacyCandles = await readLegacyHistoricalCandles(
       this.historicalCache.dataDir,
       market.symbol,
-      this.interval,
+      interval,
       startTime,
       endTime,
     );
@@ -1053,7 +1306,7 @@ export class TradingRuntime {
         dataDir: this.historicalCache.dataDir,
         marketKey: market.id,
         symbol: market.symbol,
-        interval: this.interval,
+        interval,
         intervalMs,
         maxBytes: this.historicalCache.maxBytes,
         minFreeBytes: this.historicalCache.minFreeBytes,
@@ -1063,7 +1316,7 @@ export class TradingRuntime {
         fetchKlines({
           venue,
           symbol: market.symbol,
-          interval: this.interval,
+          interval,
           startTime: request.startTime,
           endTime: request.endTime,
           limit: request.limit,
@@ -1090,7 +1343,6 @@ export class TradingRuntime {
     const events: BotEvent[] = [];
     const exchangeDriven = this.isExchangeDrivenExecution();
     if (
-      !exchangeDriven &&
       ((reconciliation.orders?.length ?? 0) > 0 ||
         (reconciliation.fills?.length ?? 0) > 0)
     ) {
@@ -1111,7 +1363,7 @@ export class TradingRuntime {
   }
 
   private applyExchangeAccountGuard(snapshot: BinancePaperSnapshot): BotEvent[] {
-    if (this.isExchangeDrivenExecution() || !this.paperTrading?.drivesOrderExecution(this.market)) {
+    if (this.isExchangeDrivenExecution() || !(this.paperTrading?.canSubmitOrders(this.market) ?? false)) {
       this.exchangeAccountWarningMessage = undefined;
       return [];
     }
@@ -1399,8 +1651,109 @@ export class TradingRuntime {
     return result;
   }
 
+  private async loadRuntimeSettings(): Promise<void> {
+    this.runtimeSettings = normalizeTradingRuntimeSettings(
+      await this.storage.loadRuntimeSettings(),
+    );
+    this.applyRuntimeExchangeCredentials();
+    this.executionMode = this.resolveExecutionMode(this.runtimeSettings.executionMode);
+  }
+
+  private resolveExecutionMode(saved: TradingExecutionMode | undefined): TradingExecutionMode {
+    if (saved === "binance") {
+      return this.canUseExchangeForBotExecution() ? "binance" : "simulated";
+    }
+    if (saved === "simulated") {
+      return "simulated";
+    }
+    return this.paperTrading?.drivesOrderExecution(this.market) &&
+      this.canUseExchangeForBotExecution()
+      ? "binance"
+      : "simulated";
+  }
+
+  private async saveExecutionMode(): Promise<void> {
+    this.runtimeSettings = {
+      ...this.runtimeSettings,
+      executionMode: this.executionMode,
+      updatedAt: Date.now(),
+    };
+    await this.saveRuntimeSettings();
+  }
+
+  private async saveRuntimeSettings(): Promise<void> {
+    await this.storage.saveRuntimeSettings(this.runtimeSettings);
+  }
+
+  private applyRuntimeExchangeCredentials(): void {
+    const exchange = this.runtimeSettings.exchange;
+    if (!exchange || !this.paperTrading) {
+      return;
+    }
+
+    const patch: Partial<BinancePaperConfig> = {
+      enabled: true,
+      mode: exchange.mode,
+    };
+    if (exchange.sandboxApiKey !== undefined) {
+      patch.apiKey = exchange.sandboxApiKey;
+    }
+    if (exchange.sandboxApiSecret !== undefined) {
+      patch.apiSecret = exchange.sandboxApiSecret;
+    }
+    if (exchange.liveApiKey !== undefined) {
+      patch.liveApiKey = exchange.liveApiKey;
+    }
+    if (exchange.liveApiSecret !== undefined) {
+      patch.liveApiSecret = exchange.liveApiSecret;
+    }
+    this.paperTrading.updateConfig(patch);
+  }
+
   private isExchangeDrivenExecution(): boolean {
-    return this.paperTrading?.drivesOrderExecution(this.market) ?? false;
+    return this.executionMode === "binance" && this.canUseExchangeForBotExecution();
+  }
+
+  private canUseExchangeForBotExecution(): boolean {
+    return Boolean(
+      this.paperTrading?.canSubmitOrders(this.market) &&
+        isAutomatedExchangeExecutionVenue(this.market.venue),
+    );
+  }
+
+  private exchangeExecutionUnavailableMessage(): string {
+    if (!isAutomatedExchangeExecutionVenue(this.market.venue)) {
+      return "Automated Binance execution is only enabled for USD-M and COIN-M futures markets.";
+    }
+    const snapshot = this.paperTrading?.snapshot(this.market);
+    if (!snapshot?.enabled) {
+      return "Binance exchange trading is disabled.";
+    }
+    if (!snapshot.compatible) {
+      return snapshot.message;
+    }
+    if (!snapshot.configured) {
+      return snapshot.message;
+    }
+    return "Binance exchange trading is not ready.";
+  }
+
+  private publicExecutionSnapshot(exchangeSnapshot: BinancePaperSnapshot): RuntimeSnapshot["execution"] {
+    const exchangeDriven = this.isExchangeDrivenExecution();
+    const canUseExchange = this.canUseExchangeForBotExecution();
+    return {
+      mode: this.executionMode,
+      exchangeDriven,
+      canUseExchange,
+      live: exchangeSnapshot.live,
+      message: executionModeMessage({
+        mode: this.executionMode,
+        exchangeDriven,
+        canUseExchange,
+        exchange: exchangeSnapshot,
+        venue: this.market.venue,
+      }),
+    };
   }
 
   private restorePaperStateFromBotCoreState(
@@ -1747,7 +2100,7 @@ function futuresAccountDriftMessage(
       hasActivePositionLots(localLedger.longs) &&
       hasActivePositionLots(localLedger.shorts)
     ) {
-      return "Local bot has simultaneous long and short per-lot exposure, but the Binance futures account is in one-way position mode. Enable hedge mode or reset to an aggregate/net strategy before auto-submitting orders.";
+      return "Local bot has simultaneous long and short per-lot exposure, but the Binance futures account is in one-way position mode. Enable hedge mode or reset to an aggregate/net strategy before enabling Binance execution.";
     }
   }
 
@@ -1960,9 +2313,10 @@ function disabledExchangeSnapshot(): BinancePaperSnapshot {
     configured: false,
     compatible: true,
     mode: "auto",
+    live: false,
     autoSubmit: false,
     connected: false,
-    message: "Binance paper trading disabled",
+    message: "Binance exchange trading disabled",
     balances: [],
     positions: [],
     openOrders: [],
@@ -2156,6 +2510,116 @@ function applyMarketMaxLeverage(
     ...config,
     maxLeverage: Math.min(config.maxLeverage, marketMaxLeverage as number),
   };
+}
+
+function normalizeTradingExecutionMode(value: unknown): TradingExecutionMode | undefined {
+  return value === "binance" || value === "simulated" ? value : undefined;
+}
+
+function normalizeTradingExchangeMode(value: unknown): TradingExchangeMode | undefined {
+  return value === "auto" ||
+    value === "live" ||
+    value === "spot-live" ||
+    value === "usdm-futures-live" ||
+    value === "coinm-futures-live" ||
+    value === "spot-testnet" ||
+    value === "spot-demo" ||
+    value === "usdm-futures-testnet" ||
+    value === "coinm-futures-testnet"
+    ? value
+    : undefined;
+}
+
+function normalizeTradingRuntimeSettings(
+  value: TradingRuntimeSettings | undefined,
+): TradingRuntimeSettings {
+  const exchange = normalizeTradingExchangeCredentials(value?.exchange);
+  return {
+    executionMode: normalizeTradingExecutionMode(value?.executionMode) ?? "simulated",
+    ...(exchange ? { exchange } : {}),
+    updatedAt: finiteOrZero(value?.updatedAt) || 0,
+  };
+}
+
+function normalizeTradingExchangeCredentials(
+  value: TradingExchangeCredentials | undefined,
+): TradingExchangeCredentials | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const mode = normalizeTradingExchangeMode(value.mode);
+  if (!mode) {
+    return undefined;
+  }
+  return {
+    mode,
+    sandboxApiKey: normalizeCredentialInput(value.sandboxApiKey),
+    sandboxApiSecret: normalizeCredentialInput(value.sandboxApiSecret),
+    liveApiKey: normalizeCredentialInput(value.liveApiKey),
+    liveApiSecret: normalizeCredentialInput(value.liveApiSecret),
+    updatedAt: finiteOrZero(value.updatedAt) || 0,
+  };
+}
+
+function normalizeCredentialInput(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function exchangeModeUsesLiveCredentials(mode: TradingExchangeMode): boolean {
+  return mode === "live" || mode.endsWith("-live");
+}
+
+function isAutomatedExchangeExecutionVenue(venue: string): boolean {
+  return venue === "usdm-futures" || venue === "coinm-futures";
+}
+
+function assertExchangeAccountFlatForExecutionSwitch(
+  snapshot: BinancePaperSnapshot,
+  market: BinanceMarketListing,
+): void {
+  if (snapshot.openOrders.length > 0) {
+    throw new Error(
+      `Cancel ${snapshot.openOrders.length} open ${market.symbol} Binance order(s) before enabling Binance execution.`,
+    );
+  }
+  if (hasExchangeOpenOrdersOrPositions(snapshot)) {
+    throw new Error(
+      `Close the open ${market.symbol} Binance position before enabling Binance execution.`,
+    );
+  }
+  const baseBalance = exchangeAssetBalance(snapshot, market.baseAsset) ?? 0;
+  if (Math.abs(baseBalance) > BALANCE_EPSILON) {
+    throw new Error(
+      `Clear the ${market.baseAsset} Binance balance before enabling Binance execution for ${market.symbol}.`,
+    );
+  }
+}
+
+function executionModeMessage(options: {
+  mode: TradingExecutionMode;
+  exchangeDriven: boolean;
+  canUseExchange: boolean;
+  exchange: BinancePaperSnapshot;
+  venue: string;
+}): string {
+  if (options.exchangeDriven) {
+    const prefix = options.exchange.live ? "Live" : "Sandbox";
+    return `${prefix} Binance execution active`;
+  }
+  if (options.mode === "binance") {
+    if (!isAutomatedExchangeExecutionVenue(options.venue)) {
+      return "Binance bot execution requires a futures market.";
+    }
+    if (!options.canUseExchange) {
+      return options.exchange.message;
+    }
+    return "Binance execution selected but not active.";
+  }
+  return "Bot orders execute in the local simulator.";
 }
 
 function isHistoricalVenue(venue: string): venue is StreamVenue {

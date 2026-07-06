@@ -46,6 +46,8 @@ import {
 import type {
   BacktestProgressSnapshot,
   BacktestSelection,
+  BotExecutionMode,
+  BinancePaperMode,
   BinancePaperOrder,
   BinancePaperSnapshot,
   BinanceMarketCatalog,
@@ -558,6 +560,45 @@ export function App() {
     applySnapshot(payload as RuntimeSnapshot);
   };
 
+  const setBotExecutionMode = async (mode: BotExecutionMode) => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/bot/execution`, {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ mode }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Execution mode update failed");
+      return;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+  };
+
+  const saveExchangeCredentials = async (input: {
+    mode: BinancePaperMode;
+    apiKey?: string;
+    apiSecret?: string;
+  }): Promise<boolean> => {
+    setExchangeError(undefined);
+    const response = await fetch(`${apiBase}/api/exchange/credentials`, {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(input),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      setExchangeError(payload.error ?? "Credential update failed");
+      return false;
+    }
+    applySnapshot(payload as RuntimeSnapshot);
+    return true;
+  };
+
   const updateBacktestSetting = <K extends keyof BacktestSettings>(
     key: K,
     value: BacktestSettings[K],
@@ -629,6 +670,10 @@ export function App() {
               <StatusPill
                 label={exchangeStatusLabel(exchange())}
                 active={Boolean(exchange()?.connected)}
+              />
+              <StatusPill
+                label={snapshot()?.execution?.exchangeDriven ? "Binance execution" : "Simulated execution"}
+                active={Boolean(snapshot()?.execution?.exchangeDriven)}
               />
               <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
             </div>
@@ -705,7 +750,11 @@ export function App() {
         <ExchangePaperPanel
           market={market()}
           snapshot={exchange()}
+          execution={snapshot()?.execution}
+          botRunning={isBotRunning()}
           error={exchangeError()}
+          onSetExecutionMode={(mode) => void setBotExecutionMode(mode)}
+          onSaveCredentials={saveExchangeCredentials}
           onSync={() => void syncExchange()}
           onPlaceOrder={(input) => void placeExchangeOrder(input)}
           onCancelOrder={(order) => void cancelExchangeOrder(order)}
@@ -840,26 +889,35 @@ function ExchangeRule(props: { label: string; value: string }) {
 
 function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string {
   if (!exchange?.enabled) {
-    return "Paper off";
+    return "Exchange off";
   }
   if (!exchange.configured) {
-    return "Paper keys missing";
+    return "Exchange keys missing";
   }
   if (!exchange.compatible) {
-    return "Paper incompatible";
+    return "Exchange incompatible";
   }
+  const prefix = exchange.live ? "Live" : "Sandbox";
   if (exchange.userDataStreamConnected) {
-    return `${exchange.resolvedMode ?? exchange.mode} streaming`;
+    return `${prefix} streaming`;
   }
   return exchange.connected
-    ? `${exchange.resolvedMode ?? exchange.mode} synced`
-    : `${exchange.resolvedMode ?? exchange.mode} ready`;
+    ? `${prefix} synced`
+    : `${prefix} ready`;
 }
 
 function ExchangePaperPanel(props: {
   market?: RuntimeSnapshot["market"];
   snapshot?: BinancePaperSnapshot;
+  execution?: RuntimeSnapshot["execution"];
+  botRunning: boolean;
   error?: string;
+  onSetExecutionMode: (mode: BotExecutionMode) => void;
+  onSaveCredentials: (input: {
+    mode: BinancePaperMode;
+    apiKey?: string;
+    apiSecret?: string;
+  }) => Promise<boolean>;
   onSync: () => void;
   onPlaceOrder: (input: {
     side: "buy" | "sell";
@@ -879,7 +937,13 @@ function ExchangePaperPanel(props: {
   const [price, setPrice] = createSignal(0);
   const [reduceOnly, setReduceOnly] = createSignal(false);
   const [leverage, setLeverage] = createSignal(1);
+  const [credentialMode, setCredentialMode] = createSignal<BinancePaperMode>("live");
+  const [credentialApiKey, setCredentialApiKey] = createSignal("");
+  const [credentialApiSecret, setCredentialApiSecret] = createSignal("");
   let initializedPrice = false;
+  let observedExchangeMode: string | undefined;
+  const exchange = () => props.snapshot;
+  const execution = () => props.execution;
 
   createEffect(() => {
     const lastPrice = props.market?.lastPrice;
@@ -889,12 +953,23 @@ function ExchangePaperPanel(props: {
     }
   });
 
-  const exchange = () => props.snapshot;
+  createEffect(() => {
+    const mode = exchange()?.mode;
+    if (mode && mode !== observedExchangeMode) {
+      observedExchangeMode = mode;
+      setCredentialMode(normalizeBinanceCredentialMode(mode));
+    }
+  });
+
+  const executionMode = () => execution()?.mode ?? "simulated";
+  const canChangeExecution = () => !props.botRunning;
   const canTrade = () =>
     Boolean(exchange()?.enabled && exchange()?.configured && exchange()?.compatible);
   const isFutures = () =>
     exchange()?.resolvedMode === "usdm-futures-testnet" ||
-    exchange()?.resolvedMode === "coinm-futures-testnet";
+    exchange()?.resolvedMode === "coinm-futures-testnet" ||
+    exchange()?.resolvedMode === "usdm-futures-live" ||
+    exchange()?.resolvedMode === "coinm-futures-live";
   const quoteAsset = () => props.market?.quoteAsset ?? "USDT";
 
   const submitOrder = () => {
@@ -908,11 +983,23 @@ function ExchangePaperPanel(props: {
     });
   };
 
+  const saveCredentials = async () => {
+    const saved = await props.onSaveCredentials({
+      mode: credentialMode(),
+      apiKey: credentialApiKey().trim() || undefined,
+      apiSecret: credentialApiSecret().trim() || undefined,
+    });
+    if (saved) {
+      setCredentialApiKey("");
+      setCredentialApiSecret("");
+    }
+  };
+
   return (
     <section class="panel min-w-0 overflow-hidden">
       <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <div class="muted-label">Binance Paper</div>
+          <div class="muted-label">Binance Exchange</div>
           <h2 class="text-lg font-semibold">
             {exchange()?.resolvedMode ?? exchange()?.mode ?? "disabled"}
           </h2>
@@ -944,6 +1031,88 @@ function ExchangePaperPanel(props: {
           <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{message()}</div>
         )}
       </Show>
+
+      <div class="mb-4 rounded-2 bg-ink-800 p-3">
+        <div class="mb-3 flex flex-col gap-1">
+          <div class="muted-label">Binance Tokens</div>
+          <div class="text-xs text-ink-300">
+            {exchange()?.configured ? "Credentials saved for this endpoint" : "Credentials missing"}
+          </div>
+        </div>
+        <div class="grid grid-cols-1 gap-3 lg:grid-cols-[180px_minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-end">
+          <SelectField
+            label="Endpoint"
+            value={credentialMode()}
+            options={[
+              { value: "live", label: "Live" },
+              { value: "auto", label: "Sandbox" },
+            ]}
+            onInput={(value) => setCredentialMode(normalizeBinanceCredentialMode(value))}
+          />
+          <TextField
+            label="API Key"
+            value={credentialApiKey()}
+            placeholder={exchange()?.configured ? "Saved" : "Required"}
+            autocomplete="off"
+            onInput={setCredentialApiKey}
+          />
+          <TextField
+            label="API Secret"
+            value={credentialApiSecret()}
+            placeholder={exchange()?.configured ? "Saved" : "Required"}
+            type="password"
+            autocomplete="new-password"
+            onInput={setCredentialApiSecret}
+          />
+          <button
+            class={buttonPrimaryClass}
+            type="button"
+            disabled={props.botRunning}
+            onClick={() => void saveCredentials()}
+          >
+            <Save size={16} />
+            Save
+          </button>
+        </div>
+      </div>
+
+      <div class="mb-4 rounded-2 bg-ink-800 p-3">
+        <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div class="muted-label">Bot Execution</div>
+            <div class="mt-1 text-sm font-semibold text-ink-100">
+              {executionMode() === "binance" ? "Binance account" : "Local simulator"}
+            </div>
+            <div class="mt-1 text-xs text-ink-300">
+              {execution()?.message ?? "Bot orders execute in the local simulator."}
+            </div>
+          </div>
+          <div class="grid grid-cols-2 gap-2 sm:w-80">
+            <button
+              class={executionMode() === "simulated" ? buttonPrimaryClass : buttonPanelClass}
+              type="button"
+              disabled={!canChangeExecution() || executionMode() === "simulated"}
+              onClick={() => props.onSetExecutionMode("simulated")}
+            >
+              <Check size={16} />
+              Simulated
+            </button>
+            <button
+              class={executionMode() === "binance" ? buttonDangerClass : buttonPanelClass}
+              type="button"
+              disabled={
+                !canChangeExecution() ||
+                executionMode() === "binance" ||
+                !execution()?.canUseExchange
+              }
+              onClick={() => props.onSetExecutionMode("binance")}
+            >
+              <Activity size={16} />
+              Binance
+            </button>
+          </div>
+        </div>
+      </div>
 
       <div class="mb-4 grid grid-cols-2 gap-2 lg:grid-cols-6">
         <ExchangeRule
@@ -1029,7 +1198,7 @@ function ExchangePaperPanel(props: {
         </div>
 
         <div class="rounded-2 bg-ink-800 p-3">
-          <div class="muted-label">Place Paper Order</div>
+          <div class="muted-label">Place Exchange Order</div>
           <div class="mt-3 grid grid-cols-2 gap-3">
             <SelectField
               label="Side"
@@ -1097,7 +1266,7 @@ function ExchangePaperPanel(props: {
             onClick={submitOrder}
           >
             <Plus size={16} />
-            Submit Paper Order
+            Submit Exchange Order
           </button>
         </div>
       </div>
@@ -1867,6 +2036,30 @@ function NumberListField(props: {
   );
 }
 
+function TextField(props: {
+  label: string;
+  value: string;
+  type?: "text" | "password";
+  placeholder?: string;
+  autocomplete?: string;
+  onInput: (value: string) => void;
+}) {
+  return (
+    <label class="block">
+      <span class="muted-label">{props.label}</span>
+      <input
+        class="mt-1 w-full rounded-2 border border-line bg-ink-900 px-2 py-2 text-sm text-ink-100"
+        type={props.type ?? "text"}
+        value={props.value}
+        placeholder={props.placeholder}
+        autocomplete={props.autocomplete}
+        spellcheck={false}
+        onInput={(event) => props.onInput(event.currentTarget.value)}
+      />
+    </label>
+  );
+}
+
 function SelectField(props: {
   label: string;
   value: string;
@@ -1919,7 +2112,9 @@ function PerformancePanel(props: { snapshot?: RuntimeSnapshot }) {
       <div class="mb-3 flex items-center justify-between">
         <div>
           <div class="muted-label">Performance</div>
-          <h2 class="text-lg font-semibold">Paper Bot</h2>
+          <h2 class="text-lg font-semibold">
+            {props.snapshot?.execution?.exchangeDriven ? "Binance Bot" : "Paper Bot"}
+          </h2>
         </div>
         <Activity size={18} class="text-accent" />
       </div>
@@ -4250,6 +4445,10 @@ function BacktestNumberInput(props: {
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
+}
+
+function normalizeBinanceCredentialMode(value: string | undefined): BinancePaperMode {
+  return value === "live" || value?.endsWith("-live") ? "live" : "auto";
 }
 
 function Side(props: { side: "buy" | "sell" }) {

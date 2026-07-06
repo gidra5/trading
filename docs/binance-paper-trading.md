@@ -1,12 +1,12 @@
-# Binance Paper Trading
+# Binance Exchange Trading
 
-The server can connect to Binance testnet/demo trading endpoints separately from the
-local simulator. This is forward paper trading only; historical backtests still run
-locally.
+The server can connect to Binance testnet/demo endpoints or live Binance endpoints
+separately from the local simulator. Historical backtests still run locally.
 
 demo binance: https://demo.binance.com/en/trade/BTC_USDT?type=spot
 
-Enable it with separate paper credentials:
+Enable sandbox credentials either from the dashboard's Binance Tokens form or
+from environment variables:
 
 ```bash
 TRADING_BINANCE_PAPER_ENABLED=true
@@ -19,6 +19,11 @@ Supported modes:
 
 - `auto`: `spot` markets use Spot Testnet, USD-M futures use USD-M Futures Testnet,
   and COIN-M futures use COIN-M Futures Testnet.
+- `live`: `spot` markets use live Spot, USD-M futures use live USD-M Futures,
+  and COIN-M futures use live COIN-M Futures.
+- `spot-live`: live Spot.
+- `usdm-futures-live`: live USD-M Futures.
+- `coinm-futures-live`: live COIN-M Futures.
 - `spot-testnet`: Spot Testnet REST and WebSocket streams.
 - `spot-demo`: Spot Demo Mode REST and WebSocket streams.
 - `usdm-futures-testnet`: USD-M Futures Testnet.
@@ -28,6 +33,8 @@ Optional settings:
 
 ```bash
 TRADING_BINANCE_PAPER_AUTO_SUBMIT=false
+TRADING_BINANCE_EXCHANGE_MODE=auto
+TRADING_BINANCE_LIVE_ENABLED=false
 TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP=false
 BINANCE_PAPER_RECV_WINDOW_MS=5000
 BINANCE_PAPER_BASE_URL=https://custom-endpoint.example
@@ -46,38 +53,61 @@ TRADING_MAX_LEVERAGE=999
 ```
 
 `TRADING_MAX_LEVERAGE` is treated as the requested strategy cap. For futures
-paper modes the server fetches Binance notional/leverage brackets through the
-active paper endpoint and caps the running bot config to the exchange maximum.
+exchange modes the server fetches Binance notional/leverage brackets through the
+active exchange endpoint and caps the running bot config to the exchange maximum.
 Leverage changes submitted through the dashboard/API are capped the same way.
+
+Live futures trading uses the normal Binance API credentials. Enter them in the
+dashboard's Binance Tokens form with endpoint `Live`, or provide them as env vars:
+
+```bash
+TRADING_MARKET_ID=usdm-futures:BTCUSDT
+TRADING_BINANCE_LIVE_ENABLED=true
+TRADING_BINANCE_EXCHANGE_MODE=live
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
+TRADING_SHORT_MARGIN_MODEL=futures-margin
+TRADING_MAX_LEVERAGE=100
+```
 
 On startup the live bot warms its SMA/valley-peak memory from stored closed
 candles. If the local candle store does not cover the configured averaging window
 plus saturation period, the server fetches recent klines from the active Binance
-paper/demo endpoint. That means a fresh process does not need to sit idle for the
+exchange endpoint. That means a fresh process does not need to sit idle for the
 whole SMA warmup period before the strategy can evaluate signals.
 
-When paper trading is enabled, the dashboard exposes:
+When exchange trading is enabled, the dashboard exposes:
 
+- Binance token entry for sandbox or live endpoints
 - exchange account sync
-- paper order placement
+- exchange order placement
 - open order cancellation
 - futures leverage updates
 - exchange balances, positions, and open orders
+- a Bot Execution toggle between local simulated execution and Binance account
+  execution
 - a position close control that pauses the bot and cancels open strategy orders;
   by default it closes only positions that are profitable at the current price,
   while the force option closes all open positions
 
-The server normalizes every outgoing paper order against Binance symbol filters
+The server normalizes every outgoing exchange order against Binance symbol filters
 from `exchangeInfo`: price tick size, quantity step size, min/max quantity, and
 min/max notional. It also fetches account commission rates when the active
-paper endpoint supports them and updates the running bot `feeBps` from the taker
+exchange endpoint supports them and updates the running bot `feeBps` from the taker
 rate. Binance does not expose a static slippage constant, so the server estimates
 `positionRisk.marketSlippageBps` from the current best bid/ask half-spread.
 
-`TRADING_BINANCE_PAPER_AUTO_SUBMIT=true` submits strategy-created orders to the
-active paper exchange. In this mode local tick processing does not fill or stale-cancel
+The dashboard Bot Execution toggle submits strategy-created orders to the active
+Binance exchange. Mode changes are persisted per market and require the bot to be
+stopped. Enabling Binance execution also requires the selected symbol to have no
+open exchange orders or open position, so the local strategy state starts from the
+synced Binance quote balance instead of fake simulator lots. `TRADING_BINANCE_PAPER_AUTO_SUBMIT=true`
+is still accepted as a startup default for existing sandbox setups, but the UI
+toggle and token form are the normal runtime controls.
+
+In Binance execution mode local tick processing does not fill or stale-cancel
 open orders; Binance order/trade updates are the order-status source. Futures
-paper modes open a private user-data websocket, keep its listen key alive, and
+exchange modes open a private user-data websocket, keep its listen key alive, and
 apply bot-linked `ORDER_TRADE_UPDATE` fills immediately using the deterministic
 `bot_<localOrderId>` client order id. Each user-data event also triggers an
 exchange sync so balances, positions, and REST order history stay consistent.
@@ -86,18 +116,18 @@ cancelled, and filled bot exchange orders.
 
 The default legacy per-lot exit-grid strategy can hold local long and short lots at
 the same time. Binance futures one-way position mode cannot represent that state as
-separate reducible legs, so auto-submit should run in Binance hedge mode or use an
-aggregate/net strategy configuration.
+separate reducible legs, so Binance execution should run in Binance hedge mode or
+use an aggregate/net strategy configuration.
 
-When auto-submit is enabled, a fresh or empty local bot state uses the synced
+When Binance execution is enabled, a fresh local bot state uses the synced
 exchange quote-asset balance as `startingQuote` and initial `quoteFree` instead
 of the static `TRADING_STARTING_QUOTE` fallback. Bot reset follows the same rule
 after cancelling exchange open orders and closing futures positions, so a demo
 account with 5,000 USDT resets the local bot around 5,000 USDT. Existing saved
 states with order/fill history are not silently rebased on startup; use Reset
-when intentionally starting a new exchange-backed paper run.
+when intentionally starting a new exchange-backed run.
 
-Every exchange sync in auto-submit mode also runs an account guard. If Binance
+Every exchange sync while the bot is locally simulated can run an account guard. If Binance
 reports unmanaged open orders, missing local bot orders, position drift, equity
 drift, or unsupported hedge-mode long+short exposure, the runtime logs a backend
 warning and shows the warning in the exchange status message. By default this is
@@ -106,12 +136,13 @@ diagnostic-only and does not pause order creation. Set
 bot and block tick-driven order creation until the account is reset or manually
 reconciled.
 
-Spot paper modes still use explicit REST sync for account updates. Binance removed
+Spot modes still use explicit REST sync for account updates. Binance removed
 the old Spot listen-key stream path; adding Spot user-data streaming needs the new
 WebSocket API authentication flow.
 
-Keep live trading disabled until the same reconciliation path has been exercised
-for long-running futures sessions.
+Automated Binance bot execution is enabled only for USD-M and COIN-M futures
+markets because they have the listen-key user-data stream path used by this
+runtime.
 
 to run demo futures bot server locally execute this:
 ```bash

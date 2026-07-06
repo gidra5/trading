@@ -96,8 +96,17 @@ export interface RuntimeSnapshot {
   backtest: BacktestProgressSnapshot;
   correlations: CorrelationSnapshot;
   equityCurve: EquityPoint[];
+  execution: {
+    mode: BotExecutionMode;
+    exchangeDriven: boolean;
+    canUseExchange: boolean;
+    live: boolean;
+    message: string;
+  };
   exchange: BinancePaperSnapshot;
 }
+
+export type BotExecutionMode = "simulated" | "binance";
 
 export type BacktestSelection = BacktestPreset;
 export type { BacktestProgressSnapshot };
@@ -147,6 +156,10 @@ export interface CorrelationSnapshot {
 
 export type BinancePaperMode =
   | "auto"
+  | "live"
+  | "spot-live"
+  | "usdm-futures-live"
+  | "coinm-futures-live"
   | "spot-testnet"
   | "spot-demo"
   | "usdm-futures-testnet"
@@ -243,7 +256,8 @@ export interface BinancePaperSnapshot {
   configured: boolean;
   compatible: boolean;
   mode: BinancePaperMode;
-  resolvedMode?: Exclude<BinancePaperMode, "auto">;
+  resolvedMode?: Exclude<BinancePaperMode, "auto" | "live">;
+  live: boolean;
   baseUrl?: string;
   streamEnvironment?: string;
   autoSubmit: boolean;

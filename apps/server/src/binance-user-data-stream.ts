@@ -37,7 +37,7 @@ export class BinancePaperUserDataStream {
     }
     this.stopped = false;
     if (!this.options.paperTrading.canStreamUserData(this.options.market)) {
-      this.emitStatus(false, "Binance paper user-data stream unavailable for this market");
+      this.emitStatus(false, "Binance user-data stream unavailable for this market");
       return;
     }
     void this.openAndConnect();
@@ -74,7 +74,7 @@ export class BinancePaperUserDataStream {
     } catch (error) {
       this.emitStatus(
         false,
-        `Binance paper user-data stream failed: ${errorMessage(error)}`,
+        `Binance user-data stream failed: ${errorMessage(error)}`,
       );
       this.scheduleReconnect();
     }
@@ -117,7 +117,7 @@ export class BinancePaperUserDataStream {
     }
 
     if (isListenKeyExpired(payload)) {
-      this.emitStatus(false, "Binance paper user-data listenKey expired");
+      this.emitStatus(false, "Binance user-data listenKey expired");
       this.recreateListenKey();
       return;
     }
@@ -159,11 +159,11 @@ export class BinancePaperUserDataStream {
     }
     try {
       await this.options.paperTrading.keepAliveUserDataStream(this.options.market, listenKey);
-      this.emitStatus(true, "Binance paper user-data stream keepalive sent");
+      this.emitStatus(true, "Binance user-data stream keepalive sent");
     } catch (error) {
       this.emitStatus(
         false,
-        `Binance paper user-data keepalive failed: ${errorMessage(error)}`,
+        `Binance user-data keepalive failed: ${errorMessage(error)}`,
       );
       this.recreateListenKey();
     }

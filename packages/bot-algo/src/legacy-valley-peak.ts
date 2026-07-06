@@ -353,10 +353,50 @@ export function legacyValleyPeakHistoricalWarmupSec(
   config: LegacyValleyPeakConfig,
 ): number {
   return Math.max(
+    legacyValleyPeakSignalWarmupSec(config),
+    legacyValleyPeakPriceRangeWarmupSec(),
+  );
+}
+
+export function legacyValleyPeakSignalWarmupSec(
+  config: LegacyValleyPeakConfig,
+): number {
+  return Math.max(
     ...config.averagingRangesSec,
     config.saturationSec,
     config.anticipatoryConfirmationWindowSec,
-    ...PRICE_RANGE_WINDOWS.map((range) => range.windowSec),
+  );
+}
+
+export function legacyValleyPeakPriceRangeWarmupSec(): number {
+  return Math.max(...PRICE_RANGE_WINDOWS.map((range) => range.windowSec));
+}
+
+export function legacyValleyPeakObservedSignalWarmupSec(
+  memory: LegacyValleyPeakMemory | undefined,
+): number {
+  if (!memory?.buyAverages?.length) {
+    return 0;
+  }
+
+  const latestTsSec = Math.max(
+    0,
+    ...memory.buyAverages
+      .map((average) => average.timestamps.at(-1))
+      .filter((value): value is number =>
+        value !== undefined && isNonNegativeFinite(value),
+      ),
+  );
+  const startedAtSec = memory.startedAt === undefined ? undefined : memory.startedAt / 1000;
+  const replaySpanSec =
+    startedAtSec !== undefined && isNonNegativeFinite(startedAtSec)
+      ? Math.max(0, latestTsSec - startedAtSec)
+      : 0;
+
+  return Math.max(
+    0,
+    replaySpanSec,
+    ...memory.buyAverages.map((average) => rollingAverageSampleSpanSec(average)),
   );
 }
 
@@ -371,6 +411,50 @@ export function legacyValleyPeakObservedWarmupSec(
     0,
     ...memory.priceRanges.map((range) => priceRangeSampleStats(range).spanMs / 1000),
   );
+}
+
+export function legacyValleyPeakObservedPriceRangeWarmupRatio(
+  memory: LegacyValleyPeakMemory | undefined,
+): number {
+  if (!memory?.priceRanges?.length) {
+    return 0;
+  }
+
+  return Math.min(
+    1,
+    ...PRICE_RANGE_WINDOWS.map(({ window, windowSec }) => {
+      const range = memory.priceRanges.find((item) => item.window === window);
+      return windowSec > 0 ? priceRangeSampleStats(range).spanMs / 1000 / windowSec : 0;
+    }),
+  );
+}
+
+export function warmupLegacyValleyPeakPriceRanges(
+  memory: LegacyValleyPeakMemory,
+  candles: readonly Candle[],
+): number {
+  const priceRanges = ensurePriceRangeMemories(memory);
+  let processed = 0;
+  for (const candle of candles) {
+    if (
+      !candle.closed ||
+      !isPositiveFinite(candle.low) ||
+      !isPositiveFinite(candle.high) ||
+      candle.high < candle.low ||
+      !isNonNegativeFinite(candle.openTime) ||
+      !isNonNegativeFinite(candle.closeTime)
+    ) {
+      continue;
+    }
+
+    const sampleTsSec = candle.openTime / 1000;
+    const nowSec = candle.closeTime / 1000;
+    for (const priceRange of priceRanges) {
+      observePriceRangeSample(priceRange, sampleTsSec, candle.low, candle.high, nowSec);
+    }
+    processed += 1;
+  }
+  return processed;
 }
 
 export function createLegacyValleyPeakMemory(
@@ -2021,6 +2105,16 @@ function priceRangeSampleStats(
     sampleCount: uniqueStarts.length,
     spanMs: Math.max(0, last - first + memory.bucketSec) * 1000,
   };
+}
+
+function rollingAverageSampleSpanSec(memory: RollingAverageMemory | undefined): number {
+  const timestamps = memory?.timestamps ?? [];
+  if (timestamps.length === 0) {
+    return 0;
+  }
+
+  const startIndex = clampInt(memory?.startIndex ?? 0, 0, timestamps.length - 1);
+  return Math.max(0, timestamps[timestamps.length - 1] - timestamps[startIndex]);
 }
 
 function sampleAverage(
