@@ -121,7 +121,7 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   exitGridResetBps: 10,
   exitGridPositionMode: "per-lot",
   exitGridResetMode: "filled-grid",
-  anticipatoryConfirmationEnabled: true,
+  anticipatoryConfirmationMaxMisses: 0,
   anticipatoryConfirmationWindowSec: 30 * 60,
   anticipatoryConfirmationLookaheadFraction: 0.1,
   rangeLeverageEnabled: true,
@@ -352,7 +352,14 @@ export function createLegacyValleyPeakConfig(
   ) {
     config.exitGridResetMode = defaultLegacyValleyPeakConfig.exitGridResetMode;
   }
-  config.anticipatoryConfirmationEnabled = config.anticipatoryConfirmationEnabled !== false;
+  delete (config as { anticipatoryConfirmationEnabled?: unknown }).anticipatoryConfirmationEnabled;
+  config.anticipatoryConfirmationMaxMisses = clampInt(
+    Number.isFinite(config.anticipatoryConfirmationMaxMisses)
+      ? config.anticipatoryConfirmationMaxMisses
+      : defaultLegacyValleyPeakConfig.anticipatoryConfirmationMaxMisses,
+    0,
+    1,
+  );
   config.anticipatoryConfirmationWindowSec = isPositiveFinite(
     config.anticipatoryConfirmationWindowSec,
   )
@@ -384,7 +391,9 @@ export function legacyValleyPeakSignalWarmupSec(
   return Math.max(
     ...config.averagingRangesSec,
     config.saturationSec,
-    config.anticipatoryConfirmationWindowSec,
+    hasAnticipatoryConfirmationMissBudget(config)
+      ? config.anticipatoryConfirmationWindowSec
+      : 0,
   );
 }
 
@@ -659,8 +668,33 @@ function canAnticipateConfirmationFailure(
   side: PositionLotSide,
   pricePrediction: AnticipatoryConfirmationPrediction | undefined,
   failedConfirmationCount: number,
+  missBudget: number,
 ): boolean {
-  return failedConfirmationCount === 1 && pricePrediction?.side === side;
+  return (
+    missBudget > 0 &&
+    failedConfirmationCount > 0 &&
+    failedConfirmationCount <= missBudget &&
+    pricePrediction?.side === side
+  );
+}
+
+function anticipatoryConfirmationMissBudget(
+  config: LegacyValleyPeakConfig,
+  confirmationOffsets: readonly number[],
+): number {
+  return Math.min(
+    config.anticipatoryConfirmationMaxMisses,
+    Math.max(0, confirmationOffsets.length - 1),
+  );
+}
+
+function hasAnticipatoryConfirmationMissBudget(config: LegacyValleyPeakConfig): boolean {
+  return (
+    anticipatoryConfirmationMissBudget(config, config.buyConfirmationOffsets) > 0 ||
+    anticipatoryConfirmationMissBudget(config, config.sellConfirmationOffsets) > 0 ||
+    anticipatoryConfirmationMissBudget(config, config.buyExitConfirmationOffsets) > 0 ||
+    anticipatoryConfirmationMissBudget(config, config.sellExitConfirmationOffsets) > 0
+  );
 }
 
 function predictAnticipatoryConfirmationExtremum(
@@ -669,7 +703,7 @@ function predictAnticipatoryConfirmationExtremum(
   input: LegacyValleyPeakInput | undefined,
 ): AnticipatoryConfirmationPrediction | undefined {
   if (
-    !config.anticipatoryConfirmationEnabled ||
+    config.anticipatoryConfirmationMaxMisses <= 0 ||
     !input ||
     input.price <= 0
   ) {
@@ -1013,7 +1047,11 @@ function shouldBuy(
     return false;
   }
 
-  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  const missBudget = anticipatoryConfirmationMissBudget(config, confirmationOffsets);
+  const pricePrediction =
+    missBudget > 0
+      ? predictAnticipatoryConfirmationExtremum(memory, config, input)
+      : undefined;
   let failedConfirmationCount = 0;
   for (const offset of confirmationOffsets) {
     const confirmation = memory.buyAverages[config.buyDataIndex + offset];
@@ -1025,6 +1063,7 @@ function shouldBuy(
           "long",
           pricePrediction,
           failedConfirmationCount,
+          missBudget,
         )
       ) {
         return false;
@@ -1047,7 +1086,11 @@ function shouldSell(
     return false;
   }
 
-  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  const missBudget = anticipatoryConfirmationMissBudget(config, confirmationOffsets);
+  const pricePrediction =
+    missBudget > 0
+      ? predictAnticipatoryConfirmationExtremum(memory, config, input)
+      : undefined;
   let failedConfirmationCount = 0;
   for (const offset of confirmationOffsets) {
     const confirmation = memory.sellAverages[config.sellDataIndex + offset];
@@ -1059,6 +1102,7 @@ function shouldSell(
           "short",
           pricePrediction,
           failedConfirmationCount,
+          missBudget,
         )
       ) {
         return false;
@@ -1088,7 +1132,11 @@ function buildLegacyValleyPeakCheckDebug(
       : side === "sell" && isPeak(primary, timing)
         ? "peak"
         : "flat";
-  const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
+  const missBudget = anticipatoryConfirmationMissBudget(config, confirmationOffsets);
+  const pricePrediction =
+    missBudget > 0
+      ? predictAnticipatoryConfirmationExtremum(memory, config, input)
+      : undefined;
   const failedConfirmationCount = confirmationOffsets.reduce((count, offset) => {
     const index = primaryIndex + offset;
     const confirmation = side === "buy"
@@ -1117,6 +1165,7 @@ function buildLegacyValleyPeakCheckDebug(
         side === "buy" ? "long" : "short",
         pricePrediction,
         failedConfirmationCount,
+        missBudget,
       );
     return {
       index,

@@ -1986,6 +1986,41 @@ function AlgorithmPanel(props: {
                     updateValleyPeakOffsets("sellExitConfirmationOffsets", value)
                   }
                 />
+                <NumberField
+                  label="Ant Misses"
+                  value={config().legacyValleyPeak.anticipatoryConfirmationMaxMisses}
+                  min={0}
+                  max={1}
+                  step={1}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "anticipatoryConfirmationMaxMisses",
+                      Math.round(value),
+                    )
+                  }
+                />
+                <NumberField
+                  label="Ant Window"
+                  value={config().legacyValleyPeak.anticipatoryConfirmationWindowSec / 60}
+                  min={1}
+                  step={1}
+                  onInput={(value) =>
+                    updateValleyPeak("anticipatoryConfirmationWindowSec", value * 60)
+                  }
+                />
+                <NumberField
+                  label="Ant Lookahead %"
+                  value={config().legacyValleyPeak.anticipatoryConfirmationLookaheadFraction * 100}
+                  min={1}
+                  max={100}
+                  step={1}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "anticipatoryConfirmationLookaheadFraction",
+                      value / 100,
+                    )
+                  }
+                />
               </div>
             </div>
 
@@ -2480,6 +2515,9 @@ function DecisionCheck(props: {
               }}
             >
               {item.index} {item.expected} {formatRatePerHour(item.rateClamped)}
+              <Show when={item.anticipated}>
+                <span class="ml-1 text-accent">ant</span>
+              </Show>
             </span>
           )}
         </For>

@@ -340,6 +340,31 @@ The asymmetric short-favoring detector is saved as a reference config. It keeps 
 buys, but uses `sellDataIndex = 0` and `sellConfirmationOffsets = [6]` for faster peak
 detection in broader downward context.
 
+## Anticipatory Confirmation
+
+Anticipation is controlled by a confirmation miss budget, not a separate enable flag.
+The default is the exact non-anticipatory baseline:
+
+```text
+legacyValleyPeak.anticipatoryConfirmationMaxMisses = 0
+```
+
+When set to `1`, the strategy still waits for the normal valley/peak primary trigger,
+then allows one lagging confirmation to pass if a quadratic fit of the recent price
+window predicts the matching extremum near the current sample. The miss budget is also
+capped to keep at least one configured confirmation passing normally, so the default
+two-confirmation setup can only replace one failed confirmation.
+
+The fit window and tolerated lookaround are:
+
+```text
+legacyValleyPeak.anticipatoryConfirmationWindowSec = 1800
+legacyValleyPeak.anticipatoryConfirmationLookaheadFraction = 0.1
+```
+
+Window and lookahead have no trading effect while
+`anticipatoryConfirmationMaxMisses = 0`.
+
 ## Warmup
 
 The detector records rolling state immediately but refuses to trade before warmup:
@@ -350,6 +375,10 @@ legacyValleyPeak.saturationSec = 3600
 
 This avoids trading from empty or underfilled rolling windows. During warmup,
 `evaluateLegacyValleyPeak` always returns `hold`.
+
+When `anticipatoryConfirmationMaxMisses > 0`, signal warmup also includes
+`anticipatoryConfirmationWindowSec` so the quadratic fit has enough history. With the
+default miss budget of `0`, anticipation does not add warmup time.
 
 ## Entry Leverage
 

@@ -176,7 +176,7 @@ export interface LegacyValleyPeakConfig {
   exitGridResetBps: number;
   exitGridPositionMode: "aggregate" | "per-lot";
   exitGridResetMode: "higher-peak" | "filled-grid";
-  anticipatoryConfirmationEnabled: boolean;
+  anticipatoryConfirmationMaxMisses: number;
   anticipatoryConfirmationWindowSec: number;
   anticipatoryConfirmationLookaheadFraction: number;
   rangeLeverageEnabled: boolean;

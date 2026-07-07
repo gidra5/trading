@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createStrategyConfig } from "@trading/bot-algo";
+import { createStrategyConfig, type PartialStrategyConfig } from "@trading/bot-algo";
 import { createConfiguredMarketListing, type MarketVenue } from "./binance-markets.js";
 import type { BinancePaperMode } from "./binance-paper.js";
 
@@ -23,6 +23,7 @@ const market = createConfiguredMarketListing({
   baseAsset: process.env.TRADING_BASE_ASSET,
   quoteAsset: process.env.TRADING_QUOTE_ASSET,
 });
+const legacyValleyPeakEnv = parseLegacyValleyPeakEnv();
 
 export const appConfig = {
   environment: environment ?? "local",
@@ -80,6 +81,7 @@ export const appConfig = {
       ? { maxPositionQuote: Number(process.env.TRADING_MAX_POSITION_QUOTE) }
       : {}),
     maxOpenOrders: parseNumber(process.env.TRADING_MAX_OPEN_ORDERS, 1024),
+    ...(legacyValleyPeakEnv ? { legacyValleyPeak: legacyValleyPeakEnv } : {}),
   }),
 };
 
@@ -167,6 +169,44 @@ function parseNumber(value: string | undefined, fallback: number): number {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseOptionalNumber(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseLegacyValleyPeakEnv():
+  | NonNullable<PartialStrategyConfig["legacyValleyPeak"]>
+  | undefined {
+  const overrides: NonNullable<PartialStrategyConfig["legacyValleyPeak"]> = {};
+
+  const maxMisses = parseOptionalNumber(
+    process.env.TRADING_ANTICIPATORY_CONFIRMATION_MAX_MISSES,
+  );
+  if (maxMisses !== undefined) {
+    overrides.anticipatoryConfirmationMaxMisses = maxMisses;
+  }
+
+  const windowSec = parseOptionalNumber(
+    process.env.TRADING_ANTICIPATORY_CONFIRMATION_WINDOW_SEC,
+  );
+  if (windowSec !== undefined) {
+    overrides.anticipatoryConfirmationWindowSec = windowSec;
+  }
+
+  const lookaheadFraction = parseOptionalNumber(
+    process.env.TRADING_ANTICIPATORY_CONFIRMATION_LOOKAHEAD_FRACTION,
+  );
+  if (lookaheadFraction !== undefined) {
+    overrides.anticipatoryConfirmationLookaheadFraction = lookaheadFraction;
+  }
+
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
 }
 
 function parseBytes(value: string | undefined, fallback: number): number {

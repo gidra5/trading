@@ -761,7 +761,7 @@ const config = {
     exitGridMarketEntry: true,
     exitGridPositionMode: "per-lot",
     exitGridResetMode: "filled-grid",
-    anticipatoryConfirmationEnabled: true,
+    anticipatoryConfirmationMaxMisses: 1,
     anticipatoryConfirmationWindowSec: 30 * 60,
     anticipatoryConfirmationLookaheadFraction: 0.1,
   },
@@ -781,7 +781,7 @@ Extrema order-mass metrics:
 | Buy near valleys | `754` | `$273279.77` | `2.7686%` | `40.00m` | `0.8743%` |
 | Sell near peaks | `364` | `$285247.35` | `0.0000%` | `41.66m` | `1.0139%` |
 
-Baseline on the same window with `anticipatoryConfirmationEnabled=false` returned
+Baseline on the same window with `anticipatoryConfirmationMaxMisses=0` returned
 `-1.2826%` with `-0.1899%` oracle capture. The same anticipation rule made the current
 default sizing worse on this window (`-37.3103%` return), so this is a reproducible
 signal/sizing candidate rather than a promoted default.
