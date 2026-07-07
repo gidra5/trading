@@ -59,6 +59,7 @@ const AVERAGE_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e", "#f472b6", "
 export interface BacktestChartCollector {
   sampleEvery: number;
   candles: Candle[];
+  pendingCandle?: Candle;
   smaSeries: BacktestChartSmaSeries[];
   annotations: BacktestChartAnnotation[];
   frames: BacktestReplayFrame[];
@@ -105,6 +106,7 @@ export function createBacktestChartCollector(
   return {
     sampleEvery: Math.max(1, Math.ceil(totalCandles / Math.max(1, maxChartCandles))),
     candles: [],
+    pendingCandle: undefined,
     smaSeries: selectedIndices.map((index, colorIndex) => ({
       index,
       windowSec: config.legacyValleyPeak.averagingRangesSec[index] ?? 0,
@@ -127,21 +129,37 @@ export function observeBacktestChartCandle(
   forceSample = false,
 ): void {
   observeBacktestChartAnnotations(collector, bot.view());
+  const lastEmitted = collector.candles.at(-1);
+  if (
+    forceSample &&
+    !collector.pendingCandle &&
+    lastEmitted?.closeTime === candle.closeTime &&
+    lastEmitted.interval === candle.interval
+  ) {
+    return;
+  }
+
+  collector.pendingCandle = mergeBacktestChartCandle(collector.pendingCandle, candle);
   if (
     !forceSample &&
-    processedCandles !== 1 &&
     processedCandles % collector.sampleEvery !== 0
   ) {
     return;
   }
 
+  const chartCandle = collector.pendingCandle;
+  if (!chartCandle) {
+    return;
+  }
+  collector.pendingCandle = undefined;
+
   const previous = collector.candles.at(-1);
   const replaceLast =
-    previous?.openTime === candle.openTime && previous.interval === candle.interval;
+    previous?.openTime === chartCandle.openTime && previous.interval === chartCandle.interval;
   if (replaceLast) {
-    collector.candles[collector.candles.length - 1] = { ...candle };
+    collector.candles[collector.candles.length - 1] = { ...chartCandle };
   } else {
-    collector.candles.push({ ...candle });
+    collector.candles.push({ ...chartCandle });
   }
 
   const averages = bot.view().memory.legacyValleyPeakDebug?.averages ?? [];
@@ -149,18 +167,18 @@ export function observeBacktestChartCandle(
     const avg = averages.find((item) => item.index === series.index)?.avg;
     if (Number.isFinite(avg)) {
       const lastPoint = series.points.at(-1);
-      if (lastPoint?.time === candle.closeTime) {
+      if (lastPoint?.time === chartCandle.closeTime) {
         lastPoint.value = avg as number;
       } else {
         series.points.push({
-          time: candle.closeTime,
+          time: chartCandle.closeTime,
           value: avg as number,
         });
       }
     }
   }
 
-  const frame = createBacktestReplayFrame(bot, candle);
+  const frame = createBacktestReplayFrame(bot, chartCandle);
   if (replaceLast && collector.frames.length > 0) {
     collector.frames[collector.frames.length - 1] = frame;
   } else {
@@ -180,6 +198,22 @@ export function finalizeBacktestCandleChart(
     smaSeries: collector.smaSeries.filter((series) => series.points.length > 0),
     annotations: collector.annotations,
     frames: collector.frames,
+  };
+}
+
+function mergeBacktestChartCandle(current: Candle | undefined, next: Candle): Candle {
+  if (!current) {
+    return { ...next };
+  }
+
+  return {
+    ...current,
+    closeTime: next.closeTime,
+    high: Math.max(current.high, next.high),
+    low: Math.min(current.low, next.low),
+    close: next.close,
+    volume: current.volume + next.volume,
+    closed: next.closed,
   };
 }
 

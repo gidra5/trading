@@ -19,6 +19,7 @@ import type {
   RollingPriceRangeMemory,
   RollingPriceRangePoint,
   RollingPriceRangeWindow,
+  LegacyValleyPeakAnticipationDebug,
   RollingAverageMemory,
   RollingAveragePoint,
 } from "./types.js";
@@ -47,6 +48,15 @@ export type LegacyValleyPeakExitSignal =
 export interface LegacyValleyPeakDecision {
   entrySignal: LegacyValleyPeakEntrySignal;
   exitSignal: LegacyValleyPeakExitSignal;
+  anticipation?: LegacyValleyPeakAnticipation;
+}
+
+export interface LegacyValleyPeakAnticipation {
+  side: PositionLotSide;
+  windowSec: number;
+  extremaX: number;
+  extremaPrice: number;
+  extremaAt: number;
 }
 
 export function legacyValleyPeakDecisionSignal(
@@ -124,6 +134,8 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   anticipatoryConfirmationMaxMisses: 0,
   anticipatoryConfirmationWindowSec: 30 * 60,
   anticipatoryConfirmationLookaheadFraction: 0.1,
+  anticipatoryGridWindowSec: 0,
+  anticipatoryGridOrderCount: 20,
   rangeLeverageEnabled: true,
   leverageLongTermRangeWindow: "1y",
   leverageRangeEdgeFraction: 0.2,
@@ -155,6 +167,8 @@ const TREND_SIGMA_WINDOW_SEC = 3600;
 const ANTICIPATORY_CONFIRMATION_WINDOW_SEC = 30 * 60;
 const ANTICIPATORY_CONFIRMATION_LOOKAHEAD_FRACTION = 0.1;
 const MIN_ANTICIPATORY_CONFIRMATION_SAMPLES = 8;
+const MIN_ANTICIPATORY_GRID_SAMPLES = 4;
+const MAX_ANTICIPATORY_GRID_ORDER_COUNT = 1_000;
 const MIN_RELATIVE_SIGMA = 0.00000001;
 const MIN_ABSOLUTE_SIGMA = 0.000001;
 const MAX_TREND_SIGMA_EXPONENT = 50;
@@ -372,6 +386,16 @@ export function createLegacyValleyPeakConfig(
     0.01,
     1,
   );
+  config.anticipatoryGridWindowSec = Number.isFinite(config.anticipatoryGridWindowSec)
+    ? Math.max(0, config.anticipatoryGridWindowSec)
+    : defaultLegacyValleyPeakConfig.anticipatoryGridWindowSec;
+  config.anticipatoryGridOrderCount = clampInt(
+    Number.isFinite(config.anticipatoryGridOrderCount)
+      ? config.anticipatoryGridOrderCount
+      : defaultLegacyValleyPeakConfig.anticipatoryGridOrderCount,
+    1,
+    MAX_ANTICIPATORY_GRID_ORDER_COUNT,
+  );
 
   return config;
 }
@@ -394,6 +418,7 @@ export function legacyValleyPeakSignalWarmupSec(
     hasAnticipatoryConfirmationMissBudget(config)
       ? config.anticipatoryConfirmationWindowSec
       : 0,
+    config.anticipatoryGridWindowSec,
   );
 }
 
@@ -563,6 +588,7 @@ export function evaluateLegacyValleyPeak(
 
   const feeAdjustedBuyRate = input.price / (1 - input.feeRate);
   const feeAdjustedSellRate = input.price * (1 - input.feeRate);
+  const anticipation = predictAnticipatoryGridExtremum(memory, config, input);
 
   const buyEntryPassed = shouldBuy(
     memory,
@@ -600,7 +626,7 @@ export function evaluateLegacyValleyPeak(
           : { signal: "hold" },
     };
     if (hasLegacyValleyPeakSignal(decision)) {
-      return decision;
+      return withLegacyValleyPeakAnticipation(decision, anticipation);
     }
   }
 
@@ -640,17 +666,20 @@ export function evaluateLegacyValleyPeak(
           : { signal: "hold" },
     };
     if (hasLegacyValleyPeakSignal(decision)) {
-      return decision;
+      return withLegacyValleyPeakAnticipation(decision, anticipation);
     }
   }
 
-  return holdLegacyValleyPeakDecision();
+  return holdLegacyValleyPeakDecision(anticipation);
 }
 
-function holdLegacyValleyPeakDecision(): LegacyValleyPeakDecision {
+function holdLegacyValleyPeakDecision(
+  anticipation?: LegacyValleyPeakAnticipation,
+): LegacyValleyPeakDecision {
   return {
     entrySignal: { signal: "hold" },
     exitSignal: { signal: "hold" },
+    anticipation,
   };
 }
 
@@ -658,15 +687,16 @@ function hasLegacyValleyPeakSignal(decision: LegacyValleyPeakDecision): boolean 
   return decision.entrySignal.signal !== "hold" || decision.exitSignal.signal !== "hold";
 }
 
-interface AnticipatoryConfirmationPrediction {
-  side: PositionLotSide;
-  extremaX: number;
-  extremaPrice: number;
+function withLegacyValleyPeakAnticipation(
+  decision: LegacyValleyPeakDecision,
+  anticipation: LegacyValleyPeakAnticipation | undefined,
+): LegacyValleyPeakDecision {
+  return anticipation ? { ...decision, anticipation } : decision;
 }
 
 function canAnticipateConfirmationFailure(
   side: PositionLotSide,
-  pricePrediction: AnticipatoryConfirmationPrediction | undefined,
+  pricePrediction: LegacyValleyPeakAnticipation | undefined,
   failedConfirmationCount: number,
   missBudget: number,
 ): boolean {
@@ -701,7 +731,7 @@ function predictAnticipatoryConfirmationExtremum(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   input: LegacyValleyPeakInput | undefined,
-): AnticipatoryConfirmationPrediction | undefined {
+): LegacyValleyPeakAnticipation | undefined {
   if (
     config.anticipatoryConfirmationMaxMisses <= 0 ||
     !input ||
@@ -710,16 +740,65 @@ function predictAnticipatoryConfirmationExtremum(
     return undefined;
   }
 
-  const windowSec = config.anticipatoryConfirmationWindowSec;
+  const { minExtremaX, maxExtremaX } = anticipatoryExtremaXRange(config);
+  return predictAnticipatoryExtremum(memory, config, input, {
+    windowSec: config.anticipatoryConfirmationWindowSec,
+    minExtremaX,
+    maxExtremaX,
+    minSampleCount: MIN_ANTICIPATORY_CONFIRMATION_SAMPLES,
+    minSpanFraction: 0.8,
+  });
+}
+
+function predictAnticipatoryGridExtremum(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput | undefined,
+): LegacyValleyPeakAnticipation | undefined {
+  if (config.anticipatoryGridWindowSec <= 0 || !input || input.price <= 0) {
+    return undefined;
+  }
+
+  return predictAnticipatoryExtremum(memory, config, input, {
+    windowSec: config.anticipatoryGridWindowSec,
+    minExtremaX: 1,
+    maxExtremaX: 2,
+    minSampleCount: MIN_ANTICIPATORY_GRID_SAMPLES,
+    minSpanFraction: 0.6,
+  });
+}
+
+function predictAnticipatoryExtremum(
+  memory: LegacyValleyPeakMemory,
+  config: LegacyValleyPeakConfig,
+  input: LegacyValleyPeakInput,
+  options: {
+    windowSec: number;
+    minExtremaX: number;
+    maxExtremaX: number;
+    minSampleCount: number;
+    minSpanFraction: number;
+  },
+): LegacyValleyPeakAnticipation | undefined {
+  const windowSec = options.windowSec;
+  if (!isPositiveFinite(windowSec)) {
+    return undefined;
+  }
+
   const trendMemory = anticipatoryTrendMemory(memory, config, windowSec);
-  const fit = fitRollingAverageEntries(trendMemory, windowSec, input);
+  const fit = fitRollingAverageEntries(
+    trendMemory,
+    windowSec,
+    input,
+    options.minSampleCount,
+    options.minSpanFraction,
+  );
   if (!fit || Math.abs(fit.a) <= Number.EPSILON) {
     return undefined;
   }
 
   const extremaX = -fit.b / (2 * fit.a);
-  const { minExtremaX, maxExtremaX } = anticipatoryExtremaXRange(config);
-  if (extremaX < minExtremaX || extremaX > maxExtremaX) {
+  if (extremaX < options.minExtremaX || extremaX > options.maxExtremaX) {
     return undefined;
   }
 
@@ -739,8 +818,10 @@ function predictAnticipatoryConfirmationExtremum(
 
   return {
     side,
+    windowSec,
     extremaX,
     extremaPrice,
+    extremaAt: input.eventTime + (extremaX - 1) * windowSec * 1000,
   };
 }
 
@@ -748,6 +829,8 @@ function fitRollingAverageEntries(
   memory: RollingAverageMemory | undefined,
   windowSec: number,
   input: LegacyValleyPeakInput | undefined,
+  minSampleCount: number,
+  minSpanFraction: number,
 ): { a: number; b: number; c: number } | undefined {
   if (!memory || !input) {
     return undefined;
@@ -773,12 +856,12 @@ function fitRollingAverageEntries(
     }
   }
 
-  if (samples.length < MIN_ANTICIPATORY_CONFIRMATION_SAMPLES) {
+  if (samples.length < minSampleCount) {
     return undefined;
   }
 
   const spanSec = samples[samples.length - 1].ts - samples[0].ts;
-  if (spanSec < windowSec * 0.8) {
+  if (spanSec < windowSec * minSpanFraction) {
     return undefined;
   }
 
@@ -942,6 +1025,7 @@ export function createLegacyValleyPeakDebugSnapshot(
           config.saturationSec * 1000 - (input.eventTime - (memory.startedAt ?? input.eventTime)),
         ),
     ...(lastExtrema ?? {}),
+    anticipation: legacyValleyPeakAnticipationDebug(decision.anticipation),
     averages: config.averagingRangesSec.map((windowSec, index) => {
       const point = latestPoint(memory.buyAverages[index] ?? memory.sellAverages[index]);
       return {
@@ -1032,6 +1116,20 @@ export function createLegacyValleyPeakDebugSnapshot(
       config.sellExitConfirmationOffsets,
       config.sellExitSignalTiming,
     ),
+  };
+}
+
+function legacyValleyPeakAnticipationDebug(
+  anticipation: LegacyValleyPeakAnticipation | undefined,
+): LegacyValleyPeakAnticipationDebug | undefined {
+  if (!anticipation) {
+    return undefined;
+  }
+  return {
+    side: anticipation.side,
+    windowSec: anticipation.windowSec,
+    extremaPrice: anticipation.extremaPrice,
+    extremaAt: anticipation.extremaAt,
   };
 }
 

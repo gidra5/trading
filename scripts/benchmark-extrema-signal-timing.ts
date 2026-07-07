@@ -25,6 +25,7 @@ interface Args {
   sellSigma: number;
   derivativeSource: LegacyDerivativeSource;
   movingAverageTypes: LegacyMovingAverageType[];
+  anticipatoryGridWindowSec: number;
 }
 
 interface ResultRow {
@@ -118,6 +119,7 @@ function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPa
       derivativeSource: configArgs.derivativeSource,
       movingAverageTypes: configArgs.movingAverageTypes,
       derivativeClampMode: "deadband",
+      anticipatoryGridWindowSec: configArgs.anticipatoryGridWindowSec,
     },
   });
 
@@ -179,6 +181,7 @@ function benchmarkConfig(
       sellSigma: configArgs.sellSigma,
       derivativeSource: configArgs.derivativeSource,
       derivativeClampMode: "deadband",
+      anticipatoryGridWindowSec: configArgs.anticipatoryGridWindowSec,
     },
   };
 }
@@ -236,6 +239,7 @@ function renderReport(
   lines.push("- Market: BTCUSDT 1m spot candles, UTC day-inclusive intervals from `tasks.md`.");
   lines.push(`- Strategy: static sigma \`buySigma=${configArgs.buySigma}\`, \`sellSigma=${configArgs.sellSigma}\`, mode both, futures-margin shorts, borrow depths \`999/999\`, max leverage \`1x\`.`);
   lines.push(`- Derivative source: \`${configArgs.derivativeSource}\`; derivative clamp mode: \`deadband\`.`);
+  lines.push(`- Anticipatory entry/exit grid window: \`${configArgs.anticipatoryGridWindowSec}s\`.`);
   lines.push(`- Moving average type(s): \`${configArgs.movingAverageTypes.join("`, `")}\`. EMA uses a continuous-time alpha with \`tau = window / 2\`, matching the SMA window's average sample age.`);
   lines.push("");
   lines.push("## Summary");
@@ -331,6 +335,10 @@ function parseArgs(argv: string[]): Args {
     sellSigma: positiveNumber(values.get("sell-sigma") ?? "0.1", "sell-sigma"),
     derivativeSource: parseDerivativeSource(values.get("derivative-source")),
     movingAverageTypes: parseMovingAverageTypes(values.get("moving-average-type")),
+    anticipatoryGridWindowSec: nonNegativeNumber(
+      values.get("anticipatory-grid-window-sec") ?? "0",
+      "anticipatory-grid-window-sec",
+    ),
   };
 }
 
@@ -382,6 +390,14 @@ function positiveNumber(value: string, label: string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     throw new Error(`--${label} must be positive.`);
+  }
+  return parsed;
+}
+
+function nonNegativeNumber(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`--${label} must be non-negative.`);
   }
   return parsed;
 }

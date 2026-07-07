@@ -18,9 +18,12 @@ interface CandleChartProps {
   emptyLabel?: string;
   selectedTime?: number;
   viewport?: CandleChartViewport;
+  priceDisplay?: CandleChartPriceDisplay;
   onSelectionChange?: (selection: CandleChartSelection | undefined) => void;
   onViewportChange?: (viewport: CandleChartViewport) => void;
 }
+
+export type CandleChartPriceDisplay = "candles" | "line";
 
 export interface CandleChartViewport {
   start: number;
@@ -129,30 +132,38 @@ export function CandleChart(props: CandleChartProps) {
       drawLineSeries(ctx, series, plot, priceToY, timeToX);
     }
 
-    const step = plotWidth / candles.length;
-    const bodyWidth = Math.max(3, Math.min(10, step * 0.62));
+    if ((props.priceDisplay ?? "candles") === "line") {
+      drawContinuousPriceLine(ctx, candles, plot, priceToY, timeToX);
+    } else {
+      candles.forEach((candle) => {
+        const openX = clamp(timeToX(candle.openTime), plot.left, plot.right);
+        const closeX = clamp(timeToX(candle.closeTime), plot.left, plot.right);
+        const x = (openX + closeX) / 2;
+        const slotWidth =
+          closeX > openX
+            ? closeX - openX
+            : plotWidth / Math.max(1, candles.length);
+        const bodyWidth = Math.max(1, Math.min(12, slotWidth * 0.68));
+        const openY = priceToY(candle.open);
+        const closeY = priceToY(candle.close);
+        const highY = priceToY(candle.high);
+        const lowY = priceToY(candle.low);
+        const rising = candle.close >= candle.open;
+        const color = rising ? "#22c55e" : "#f05252";
 
-    candles.forEach((candle, index) => {
-      const x = plot.left + index * step + step / 2;
-      const openY = priceToY(candle.open);
-      const closeY = priceToY(candle.close);
-      const highY = priceToY(candle.high);
-      const lowY = priceToY(candle.low);
-      const rising = candle.close >= candle.open;
-      const color = rising ? "#22c55e" : "#f05252";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, highY);
+        ctx.lineTo(x, lowY);
+        ctx.stroke();
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x, highY);
-      ctx.lineTo(x, lowY);
-      ctx.stroke();
-
-      ctx.fillStyle = color;
-      const bodyTop = Math.min(openY, closeY);
-      const bodyHeight = Math.max(2, Math.abs(openY - closeY));
-      ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
-    });
+        ctx.fillStyle = color;
+        const bodyTop = Math.min(openY, closeY);
+        const bodyHeight = Math.max(2, Math.abs(openY - closeY));
+        ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+      });
+    }
 
     if (showLastPrice) {
       drawPriceLine(ctx, plot, priceToY(props.lastPrice), props.lastPrice, "#38bdf8");
@@ -171,10 +182,10 @@ export function CandleChart(props: CandleChartProps) {
 
     drawAnnotationMarkers(ctx, annotations, selectedCandle, plot, priceToY, timeToX);
     if (selectedCandle) {
-      drawSelectedCandle(ctx, selectedCandle, plot, priceToY, timeToX);
+      drawSelectedCandle(ctx, selectedCandle, selectedTime(), plot, priceToY, timeToX);
     }
     drawAnnotations(ctx, selectedAnnotations, plot, priceToY, timeToX);
-    drawTimeLabels(ctx, candles, plot);
+    drawTimeLabels(ctx, candles, plot, timeToX);
   };
 
   createEffect(() => {
@@ -210,6 +221,7 @@ export function CandleChart(props: CandleChartProps) {
     props.selectedTime;
     props.viewport?.start;
     props.viewport?.end;
+    props.priceDisplay;
     internalSelectedTime();
     viewport();
     draw();
@@ -236,12 +248,14 @@ export function CandleChart(props: CandleChartProps) {
 
     if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
       panByPixels(event.deltaX || event.deltaY);
+      updateSelectionFromPointer(event);
       return;
     }
 
     const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
     const anchor = clamp((event.offsetX - plot.left) / Math.max(1, plot.right - plot.left), 0, 1);
     zoomBy(Math.exp(Math.sign(event.deltaY) * WHEEL_ZOOM_FACTOR), anchor);
+    updateSelectionFromPointer(event);
   };
 
   const handlePointerDown = (event: PointerEvent) => {
@@ -364,7 +378,7 @@ export function CandleChart(props: CandleChartProps) {
 
   const selectedTime = () => props.selectedTime ?? internalSelectedTime();
 
-  const updateSelectionFromPointer = (event: PointerEvent) => {
+  const updateSelectionFromPointer = (event: { offsetX: number }) => {
     const selection = selectionAtOffset(event.offsetX);
     if (!selection) {
       return;
@@ -385,15 +399,17 @@ export function CandleChart(props: CandleChartProps) {
     }
 
     const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
-    const step = (plot.right - plot.left) / candles.length;
-    const index = clamp(Math.floor((offsetX - plot.left) / Math.max(1, step)), 0, candles.length - 1);
-    const candle = candles[index];
+    const startTime = candles[0]?.openTime ?? 0;
+    const endTime = candles.at(-1)?.closeTime ?? startTime + 1;
+    const normalized = clamp((offsetX - plot.left) / Math.max(1, plot.right - plot.left), 0, 1);
+    const time = startTime + normalized * Math.max(1, endTime - startTime);
+    const candle = findCandleForTime(candles, time);
     if (!candle) {
       return undefined;
     }
 
     return {
-      time: candle.closeTime,
+      time,
       candle,
       annotations: annotationsForCandle(props.annotations ?? [], candle),
     };
@@ -594,6 +610,47 @@ function drawLineSeries(
   ctx.restore();
 }
 
+function drawContinuousPriceLine(
+  ctx: CanvasRenderingContext2D,
+  candles: Candle[],
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  if (candles.length === 0) {
+    return;
+  }
+
+  ctx.save();
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.beginPath();
+
+  candles.forEach((candle, index) => {
+    const openX = clamp(timeToX(candle.openTime), plot.left, plot.right);
+    const openY = clamp(priceToY(candle.open), plot.top, plot.bottom);
+    const closeX = clamp(timeToX(candle.closeTime), plot.left, plot.right);
+    const closeY = clamp(priceToY(candle.close), plot.top, plot.bottom);
+
+    if (index === 0) {
+      ctx.moveTo(openX, openY);
+    } else {
+      ctx.lineTo(openX, openY);
+    }
+    ctx.lineTo(closeX, closeY);
+  });
+
+  ctx.globalAlpha = 0.24;
+  ctx.lineWidth = 6;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
 function findCandleForTime(candles: Candle[], time: number | undefined): Candle | undefined {
   if (!time || candles.length === 0) {
     return undefined;
@@ -677,11 +734,18 @@ function drawAnnotationMarkers(
 function drawSelectedCandle(
   ctx: CanvasRenderingContext2D,
   candle: Candle,
+  selectedTime: number | undefined,
   plot: { left: number; right: number; top: number; bottom: number },
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
 ): void {
-  const x = clamp(timeToX((candle.openTime + candle.closeTime) / 2), plot.left, plot.right);
+  const markerTime = selectedTime ?? (candle.openTime + candle.closeTime) / 2;
+  const x = clamp(timeToX(markerTime), plot.left, plot.right);
+  const candleX = clamp(
+    timeToX((candle.openTime + candle.closeTime) / 2),
+    plot.left,
+    plot.right,
+  );
   const highY = clamp(priceToY(candle.high), plot.top, plot.bottom);
   const lowY = clamp(priceToY(candle.low), plot.top, plot.bottom);
 
@@ -698,7 +762,7 @@ function drawSelectedCandle(
 
   ctx.globalAlpha = 0.95;
   ctx.strokeStyle = "#f4f6fb";
-  ctx.strokeRect(x - 6, highY - 4, 12, Math.max(8, lowY - highY + 8));
+  ctx.strokeRect(candleX - 6, highY - 4, 12, Math.max(8, lowY - highY + 8));
   ctx.restore();
 }
 
@@ -767,6 +831,7 @@ function drawTimeLabels(
   ctx: CanvasRenderingContext2D,
   candles: Candle[],
   plot: { left: number; right: number; bottom: number },
+  timeToX: (time: number) => number,
 ): void {
   ctx.fillStyle = "#aeb6c8";
   ctx.font = "11px Inter, sans-serif";
@@ -776,7 +841,7 @@ function drawTimeLabels(
   for (let i = 0; i < count; i += 1) {
     const index = Math.round((candles.length - 1) * (i / Math.max(1, count - 1)));
     const candle = candles[index];
-    const x = plot.left + (plot.right - plot.left) * (i / Math.max(1, count - 1));
+    const x = clamp(timeToX(candle.openTime), plot.left, plot.right);
     ctx.textAlign = i === 0 ? "left" : i === count - 1 ? "right" : "center";
     ctx.fillText(formatTime(candle.openTime), x, plot.bottom + 8);
   }

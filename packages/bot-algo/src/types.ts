@@ -179,6 +179,8 @@ export interface LegacyValleyPeakConfig {
   anticipatoryConfirmationMaxMisses: number;
   anticipatoryConfirmationWindowSec: number;
   anticipatoryConfirmationLookaheadFraction: number;
+  anticipatoryGridWindowSec: number;
+  anticipatoryGridOrderCount: number;
   rangeLeverageEnabled: boolean;
   leverageLongTermRangeWindow: RollingPriceRangeWindow;
   leverageRangeEdgeFraction: number;
@@ -368,6 +370,13 @@ export interface LegacyMarketStateDebug {
   thresholdHigh?: number;
 }
 
+export interface LegacyValleyPeakAnticipationDebug {
+  side: PositionLotSide;
+  windowSec: number;
+  extremaPrice: number;
+  extremaAt: number;
+}
+
 export interface LegacyValleyPeakDebugSnapshot {
   updatedAt: number;
   price: number;
@@ -385,6 +394,7 @@ export interface LegacyValleyPeakDebugSnapshot {
   lastExtremaSignalAt?: number;
   lastExtremaSignalPrice?: number;
   lastExtremaSignalReason?: string;
+  anticipation?: LegacyValleyPeakAnticipationDebug;
   averages: LegacyValleyPeakAverageDebug[];
   candleRanges: LegacyValleyPeakCandleRangeDebug[];
   priceRanges: LegacyValleyPeakPriceRangeDebug[];

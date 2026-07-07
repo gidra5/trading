@@ -206,6 +206,20 @@ function parseLegacyValleyPeakEnv():
     overrides.anticipatoryConfirmationLookaheadFraction = lookaheadFraction;
   }
 
+  const gridWindowSec = parseOptionalNumber(
+    process.env.TRADING_ANTICIPATORY_GRID_WINDOW_SEC,
+  );
+  if (gridWindowSec !== undefined) {
+    overrides.anticipatoryGridWindowSec = gridWindowSec;
+  }
+
+  const gridOrderCount = parseOptionalNumber(
+    process.env.TRADING_ANTICIPATORY_GRID_ORDER_COUNT,
+  );
+  if (gridOrderCount !== undefined) {
+    overrides.anticipatoryGridOrderCount = gridOrderCount;
+  }
+
   return Object.keys(overrides).length > 0 ? overrides : undefined;
 }
 

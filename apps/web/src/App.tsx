@@ -34,7 +34,11 @@ import type {
   TradeFill,
   TradingOrder,
 } from "@trading/bot-algo";
-import { CandleChart, type CandleChartViewport } from "./components/CandleChart";
+import {
+  CandleChart,
+  type CandleChartPriceDisplay,
+  type CandleChartViewport,
+} from "./components/CandleChart";
 import { EquityChart } from "./components/EquityChart";
 import {
   formatAsset,
@@ -2020,6 +2024,24 @@ function AlgorithmPanel(props: {
                       "anticipatoryConfirmationLookaheadFraction",
                       value / 100,
                     )
+                  }
+                />
+                <NumberField
+                  label="Grid Ant min"
+                  value={config().legacyValleyPeak.anticipatoryGridWindowSec / 60}
+                  min={0}
+                  step={1}
+                  onInput={(value) =>
+                    updateValleyPeak("anticipatoryGridWindowSec", value * 60)
+                  }
+                />
+                <NumberField
+                  label="Grid Ant Orders"
+                  value={config().legacyValleyPeak.anticipatoryGridOrderCount}
+                  min={1}
+                  step={1}
+                  onInput={(value) =>
+                    updateValleyPeak("anticipatoryGridOrderCount", Math.round(value))
                   }
                 />
               </div>
@@ -4719,6 +4741,8 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
   const [chartViewport, setChartViewport] = createSignal<CandleChartViewport>();
   const [selectedMetricKey, setSelectedMetricKey] =
     createSignal<BacktestReplayMetricKey>("equity");
+  const [priceDisplay, setPriceDisplay] =
+    createSignal<CandleChartPriceDisplay>("candles");
   let chartKey = "";
 
   createEffect(() => {
@@ -4765,6 +4789,30 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
+          <div class="inline-grid grid-cols-2 overflow-hidden rounded-2 border border-line bg-ink-900">
+            <button
+              class="px-3 py-1.5 text-xs font-semibold transition"
+              classList={{
+                "bg-accent text-ink-950": priceDisplay() === "candles",
+                "text-ink-300 hover:text-ink-100": priceDisplay() !== "candles",
+              }}
+              type="button"
+              onClick={() => setPriceDisplay("candles")}
+            >
+              Candles
+            </button>
+            <button
+              class="border-l border-line px-3 py-1.5 text-xs font-semibold transition"
+              classList={{
+                "bg-accent text-ink-950": priceDisplay() === "line",
+                "text-ink-300 hover:text-ink-100": priceDisplay() !== "line",
+              }}
+              type="button"
+              onClick={() => setPriceDisplay("line")}
+            >
+              Line
+            </button>
+          </div>
           <Show when={selectedCandle()}>
             {(candle) => (
               <span class="rounded-2 border border-line bg-ink-900 px-2.5 py-1 text-xs tabular-nums text-ink-200">
@@ -4794,6 +4842,7 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           annotations={props.chart.annotations}
           selectedTime={selectedTime()}
           viewport={chartViewport()}
+          priceDisplay={priceDisplay()}
           onSelectionChange={(selection) => setSelectedTime(selection?.time)}
           onViewportChange={setChartViewport}
           maxCandles={0}

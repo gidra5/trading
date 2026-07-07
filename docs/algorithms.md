@@ -365,6 +365,28 @@ legacyValleyPeak.anticipatoryConfirmationLookaheadFraction = 0.1
 Window and lookahead have no trading effect while
 `anticipatoryConfirmationMaxMisses = 0`.
 
+## Anticipatory Grids
+
+`legacyValleyPeak.anticipatoryGridWindowSec` enables a less restricted quadratic
+extrema prediction path. The default is disabled:
+
+```text
+legacyValleyPeak.anticipatoryGridWindowSec = 0
+```
+
+When the value is above `0`, the strategy fits the recent configured window and accepts
+a predicted valley/peak up to one full window ahead. On hold ticks, the execution layer
+can place a constant-notional entry grid between the current offset limit price and the
+predicted extremum. `legacyValleyPeak.anticipatoryGridOrderCount` caps the number of
+entry orders; the existing `exitGridMaxStepPct`, order slot count, and minimum order
+notional can reduce it further.
+
+If a predicted peak/trough can already form a profitable exit ladder for active lots,
+the strategy creates that exit grid as if price had reached the predicted extremum.
+Exit prices ahead of the current market rest as regular limit orders. Exit prices behind
+the current market become stop-market orders, so already-favorable movement is protected
+without requiring an actual extrema signal first.
+
 ## Warmup
 
 The detector records rolling state immediately but refuses to trade before warmup:
@@ -377,8 +399,9 @@ This avoids trading from empty or underfilled rolling windows. During warmup,
 `evaluateLegacyValleyPeak` always returns `hold`.
 
 When `anticipatoryConfirmationMaxMisses > 0`, signal warmup also includes
-`anticipatoryConfirmationWindowSec` so the quadratic fit has enough history. With the
-default miss budget of `0`, anticipation does not add warmup time.
+`anticipatoryConfirmationWindowSec` so the quadratic fit has enough history.
+`anticipatoryGridWindowSec` is also included when it is above `0`. With the default miss
+budget and grid window of `0`, anticipation does not add warmup time.
 
 ## Entry Leverage
 
@@ -543,11 +566,11 @@ The default distribution is a uniform price grid with geometric size decay:
   the ladder sweeps the whole remaining lot at that grid level when the full remainder
   is tradable.
 
-The simulator represents these exit-grid orders as sell limit orders with
-`trigger = "below"`, so they fill when replay/live price falls through a ladder level.
-That models the intended peak-to-entry exit ladder, but it is stop-like behavior rather
-than a normal exchange sell limit resting above market.
-Short cover ladders mirror this with buy limit orders using `trigger = "above"`, so they
+The simulator represents exit-grid levels beyond the current market as regular limit
+orders. Levels already behind the current market are stop-market orders with an
+explicit trigger direction, so they fill when replay/live price crosses back through a
+ladder level.
+Short cover ladders mirror this with buy orders, so they
 fill when replay/live price rises back through a ladder level after a trough.
 After creating a new exit grid, the simulator immediately evaluates the new orders
 against the same tick. This lets the extrema-side grid point fill on the signal tick
@@ -627,6 +650,8 @@ mode.
 | `legacyValleyPeak.shortSideEnabled` | `true` | Allows confirmed peaks to open short lots and confirmed valleys to cover them. |
 | `legacyValleyPeak.buyExitConfirmationOffsets` | `[1, 2]` | Confirmation offsets used by buy signals that cover shorts. |
 | `legacyValleyPeak.sellExitConfirmationOffsets` | `[1, 2]` | Confirmation offsets used by sell signals that close longs. |
+| `legacyValleyPeak.anticipatoryGridWindowSec` | `0` | Future-extrema fit window for anticipated entry/exit grids; `0` disables this path. |
+| `legacyValleyPeak.anticipatoryGridOrderCount` | `20` | Maximum orders in an anticipated entry grid before slot, step, and minimum-notional caps. |
 | `legacyValleyPeak.trendSigmaA` | `1` | Raw base Gaussian width; relative mode normalizes the effective sigma from BTC-scale units. |
 | `legacyValleyPeak.trendSigmaSellB1` | `1` | Sell sigma exponent multiplier in `a * exp(-b1 * derivative1h)`. |
 | `legacyValleyPeak.trendSigmaBuyB2` | `1` | Buy sigma exponent multiplier in `a * exp(b2 * derivative1h)`. |

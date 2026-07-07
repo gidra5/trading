@@ -29,6 +29,7 @@ import {
   legacyValleyPeakDecisionSignal,
   normalizeLegacyValleyPeakMemory,
   warmupLegacyValleyPeakPriceRanges,
+  type LegacyValleyPeakAnticipation,
 } from "./legacy-valley-peak.js";
 import {
   PeakValleyBotCore,
@@ -197,6 +198,7 @@ const roundQuote = (value: number) => Number(value.toFixed(6));
 const NO_EVENTS: BotEvent[] = [];
 const MIN_BASE_QUANTITY = 0.00000001;
 const LEGACY_EXIT_GRID_REASON = "legacy exit grid";
+const LEGACY_ANTICIPATORY_ENTRY_GRID_REASON = "legacy anticipatory entry grid";
 const MIN_ENTRY_LEVERAGE = 1;
 
 export function createStrategyConfig(
@@ -1498,7 +1500,8 @@ export class SimulatedExecutionEngine {
     }
 
     const signal = legacyValleyPeakDecisionSignal(decision);
-    if (signal === "hold") {
+    const anticipation = decision.anticipation;
+    if (signal === "hold" && !anticipation) {
       this.state.memory.lastSignal = signal;
       return events ?? NO_EVENTS;
     }
@@ -1513,6 +1516,17 @@ export class SimulatedExecutionEngine {
     if (decision.exitSignal.signal === "buy") {
       if (legacyConfig.shortSideEnabled && activeShortQuantity > MIN_BASE_QUANTITY) {
         const activeShorts = this.activeLegacyShortLots(tick.price);
+        if (events) {
+          events.push(
+            ...this.cancelLegacyAnticipatoryEntryGridOrders(
+              tick.eventTime,
+              true,
+              "short",
+            ),
+          );
+        } else {
+          this.cancelLegacyAnticipatoryEntryGridOrders(tick.eventTime, false, "short");
+        }
         this.syncLegacyExitGridMemories(memory, activeShorts, tick.price, "short");
 
         for (const lot of activeShorts) {
@@ -1550,6 +1564,17 @@ export class SimulatedExecutionEngine {
     if (decision.exitSignal.signal === "sell") {
       if (legacyConfig.longSideEnabled && activeLongQuantity > MIN_BASE_QUANTITY) {
         const activeLongs = this.activeLegacyLongLots(tick.price);
+        if (events) {
+          events.push(
+            ...this.cancelLegacyAnticipatoryEntryGridOrders(
+              tick.eventTime,
+              true,
+              "long",
+            ),
+          );
+        } else {
+          this.cancelLegacyAnticipatoryEntryGridOrders(tick.eventTime, false, "long");
+        }
         this.syncLegacyExitGridMemories(memory, activeLongs, tick.price, "long");
 
         for (const lot of activeLongs) {
@@ -1578,6 +1603,19 @@ export class SimulatedExecutionEngine {
           }
         }
       }
+    }
+
+    if (signal === "hold" && anticipation) {
+      const anticipated = this.createLegacyAnticipatoryOrders({
+        memory,
+        anticipation,
+        tick,
+        longEntryRisk,
+        shortEntryRisk,
+        events,
+      });
+      orders.push(...anticipated.orders);
+      acted ||= anticipated.acted;
     }
 
     if (decision.entrySignal.signal === "buy") {
@@ -1696,7 +1734,8 @@ export class SimulatedExecutionEngine {
       return events ?? NO_EVENTS;
     }
 
-    this.state.memory.lastSignal = signal;
+    this.state.memory.lastSignal =
+      signal !== "hold" ? signal : anticipation?.side === "long" ? "buy" : "sell";
     this.state.memory.lastActionAt = tick.eventTime;
 
     if (events) {
@@ -1731,21 +1770,41 @@ export class SimulatedExecutionEngine {
     lifecycle: OrderLifecycleFields = {},
     targetEntryLeverage = this.targetLongEntryLeverage(marketPrice),
   ): TradingOrder | undefined {
+    return this.createLongEntryLimitOrder(
+      roundQuote(marketPrice * (1 - this.state.config.limitOffsetBps / 10_000)),
+      marketPrice,
+      createdAt,
+      reason,
+      desiredQuoteSize,
+      lifecycle,
+      targetEntryLeverage,
+    );
+  }
+
+  private createLongEntryLimitOrder(
+    limitPrice: number,
+    capacityMarketPrice: number,
+    createdAt: number,
+    reason: string,
+    desiredQuoteSize: number,
+    lifecycle: OrderLifecycleFields = {},
+    targetEntryLeverage = this.targetLongEntryLeverage(capacityMarketPrice),
+  ): TradingOrder | undefined {
     const config = this.state.config;
     if (!config.legacyValleyPeak.longSideEnabled) {
       return undefined;
     }
     const availableQuote = this.longEntryBuyingPowerQuote(
-      marketPrice,
+      capacityMarketPrice,
       targetEntryLeverage,
     );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
+    const price = roundQuote(limitPrice);
 
-    if (quoteSize < config.minOrderQuote) {
+    if (quoteSize < config.minOrderQuote || price <= 0) {
       return undefined;
     }
 
-    const price = roundQuote(marketPrice * (1 - config.limitOffsetBps / 10_000));
     const feeRate = config.feeBps / 10_000;
     const quantity = roundAsset(quoteSize / price);
     const estimatedQuoteCost = roundQuote(quantity * price * (1 + feeRate));
@@ -1807,18 +1866,42 @@ export class SimulatedExecutionEngine {
     lifecycle: OrderLifecycleFields = {},
     targetEntryLeverage = this.targetShortEntryLeverage(marketPrice),
   ): TradingOrder | undefined {
+    return this.createShortEntryLimitOrder(
+      roundQuote(marketPrice * (1 + this.state.config.limitOffsetBps / 10_000)),
+      marketPrice,
+      createdAt,
+      reason,
+      desiredQuoteSize,
+      lifecycle,
+      targetEntryLeverage,
+    );
+  }
+
+  private createShortEntryLimitOrder(
+    limitPrice: number,
+    capacityMarketPrice: number,
+    createdAt: number,
+    reason: string,
+    desiredQuoteSize: number,
+    lifecycle: OrderLifecycleFields = {},
+    targetEntryLeverage = this.targetShortEntryLeverage(capacityMarketPrice),
+  ): TradingOrder | undefined {
     const config = this.state.config;
     const availableQuote = this.shortEntrySellingPowerQuote(
-      marketPrice,
+      capacityMarketPrice,
       targetEntryLeverage,
     );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
+    const price = roundQuote(limitPrice);
 
-    if (!config.legacyValleyPeak.shortSideEnabled || quoteSize < config.minOrderQuote) {
+    if (
+      !config.legacyValleyPeak.shortSideEnabled ||
+      quoteSize < config.minOrderQuote ||
+      price <= 0
+    ) {
       return undefined;
     }
 
-    const price = roundQuote(marketPrice * (1 + config.limitOffsetBps / 10_000));
     const quantity = roundAsset(quoteSize / price);
 
     if (quantity <= 0) {
@@ -1971,28 +2054,49 @@ export class SimulatedExecutionEngine {
     reason: string,
     targetPositionId?: string,
   ): TradingOrder | undefined {
+    return this.createBuyCloseOrderAtPrice(
+      price,
+      quantity,
+      createdAt,
+      reason,
+      targetPositionId,
+      "stop-market",
+      "above",
+    );
+  }
+
+  private createBuyCloseOrderAtPrice(
+    price: number,
+    quantity: number,
+    createdAt: number,
+    reason: string,
+    targetPositionId: string | undefined,
+    type: OrderType,
+    trigger?: "above" | "below",
+  ): TradingOrder | undefined {
     const config = this.state.config;
     const roundedQuantity = roundAsset(quantity);
-    const quoteSize = roundedQuantity * price;
+    const roundedPrice = roundQuote(price);
+    const quoteSize = roundedQuantity * roundedPrice;
 
-    if (roundedQuantity <= 0 || quoteSize < config.minOrderQuote) {
+    if (roundedQuantity <= 0 || roundedPrice <= 0 || quoteSize < config.minOrderQuote) {
       return undefined;
     }
 
     const feeRate = config.feeBps / 10_000;
-    const estimatedQuoteCost = roundQuote(roundedQuantity * price * (1 + feeRate));
+    const estimatedQuoteCost = roundQuote(roundedQuantity * roundedPrice * (1 + feeRate));
     this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
     this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
 
     const order = this.buildOrder(
       "buy",
-      roundQuote(price),
+      roundedPrice,
       roundedQuantity,
       estimatedQuoteCost,
       createdAt,
       reason,
-      "stop-market",
-      "above",
+      type,
+      trigger,
     );
     order.positionEffect = "close";
     if (targetPositionId) {
@@ -2010,11 +2114,33 @@ export class SimulatedExecutionEngine {
     reason: string,
     targetPositionId?: string,
   ): TradingOrder | undefined {
+    return this.createSellCloseOrderAtPrice(
+      price,
+      quantity,
+      createdAt,
+      reason,
+      targetPositionId,
+      "stop-market",
+      "below",
+    );
+  }
+
+  private createSellCloseOrderAtPrice(
+    price: number,
+    quantity: number,
+    createdAt: number,
+    reason: string,
+    targetPositionId: string | undefined,
+    type: OrderType,
+    trigger?: "above" | "below",
+  ): TradingOrder | undefined {
     const roundedQuantity = roundAsset(quantity);
-    const quoteSize = roundedQuantity * price;
+    const roundedPrice = roundQuote(price);
+    const quoteSize = roundedQuantity * roundedPrice;
 
     if (
       roundedQuantity <= 0 ||
+      roundedPrice <= 0 ||
       quoteSize < this.state.config.minOrderQuote ||
       roundedQuantity > this.state.baseFree
     ) {
@@ -2026,17 +2152,17 @@ export class SimulatedExecutionEngine {
 
     const order = this.buildOrder(
       "sell",
-      roundQuote(price),
+      roundedPrice,
       roundedQuantity,
       0,
       createdAt,
       reason,
-      "stop-market",
-      "below",
+      type,
+      trigger,
     );
+    order.positionEffect = "close";
     if (targetPositionId) {
       order.targetPositionId = targetPositionId;
-      order.positionEffect = "close";
     }
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
@@ -2239,6 +2365,286 @@ export class SimulatedExecutionEngine {
     }
 
     return [];
+  }
+
+  private createLegacyAnticipatoryOrders(input: {
+    memory: LegacyValleyPeakMemory;
+    anticipation: LegacyValleyPeakAnticipation;
+    tick: PriceTick;
+    longEntryRisk: EntryRiskProfile;
+    shortEntryRisk: EntryRiskProfile;
+    events: BotEvent[] | undefined;
+  }): { orders: TradingOrder[]; acted: boolean } {
+    const orders: TradingOrder[] = [];
+    let acted = false;
+    const { memory, anticipation, tick, events } = input;
+    const legacyConfig = this.state.config.legacyValleyPeak;
+
+    if (anticipation.side === "long") {
+      if (legacyConfig.shortSideEnabled && this.activeShortQuantity() > MIN_BASE_QUANTITY) {
+        const activeShorts = this.activeLegacyShortLots(tick.price);
+        this.syncLegacyExitGridMemories(memory, activeShorts, tick.price, "short");
+
+        for (const lot of activeShorts) {
+          if (this.openLegacyExitGridOrders(lot.id, "short").length > 0) {
+            continue;
+          }
+
+          const grid = this.ensureLegacyExitGrid(memory, lot, tick.price);
+          const resetTroughPrice = this.legacyExitGridResetTroughPrice(
+            grid,
+            lot,
+            anticipation.extremaPrice,
+          );
+          if (resetTroughPrice === undefined) {
+            continue;
+          }
+
+          const cancelled = this.cancelLegacyAnticipatoryEntryGridOrders(
+            tick.eventTime,
+            events !== undefined,
+            "short",
+          );
+          events?.push(...cancelled);
+          acted ||= cancelled.length > 0;
+          grid.troughPrice = resetTroughPrice;
+          orders.push(
+            ...this.createLegacyShortExitGridOrders(
+              grid,
+              lot,
+              tick.eventTime,
+              tick.price,
+            ),
+          );
+          if (this.openOrderIndexes.size >= this.state.config.maxOpenOrders) {
+            break;
+          }
+        }
+      }
+
+      const cancelledOpposite = this.cancelLegacyAnticipatoryEntryGridOrders(
+        tick.eventTime,
+        events !== undefined,
+        "short",
+      );
+      events?.push(...cancelledOpposite);
+      acted ||= cancelledOpposite.length > 0;
+      orders.push(
+        ...this.createLegacyAnticipatoryEntryGridOrders(
+          anticipation,
+          tick.eventTime,
+          tick.price,
+          input.longEntryRisk.leverage,
+        ),
+      );
+    } else {
+      if (legacyConfig.longSideEnabled && this.activeLongQuantity() > MIN_BASE_QUANTITY) {
+        const activeLongs = this.activeLegacyLongLots(tick.price);
+        this.syncLegacyExitGridMemories(memory, activeLongs, tick.price, "long");
+
+        for (const lot of activeLongs) {
+          if (this.openLegacyExitGridOrders(lot.id, "long").length > 0) {
+            continue;
+          }
+
+          const grid = this.ensureLegacyExitGrid(memory, lot, tick.price);
+          const resetPeakPrice = this.legacyExitGridResetPeakPrice(
+            grid,
+            lot,
+            anticipation.extremaPrice,
+          );
+          if (resetPeakPrice === undefined) {
+            continue;
+          }
+
+          const cancelled = this.cancelLegacyAnticipatoryEntryGridOrders(
+            tick.eventTime,
+            events !== undefined,
+            "long",
+          );
+          events?.push(...cancelled);
+          acted ||= cancelled.length > 0;
+          grid.peakPrice = resetPeakPrice;
+          orders.push(
+            ...this.createLegacyLongExitGridOrders(
+              grid,
+              lot,
+              tick.eventTime,
+              tick.price,
+            ),
+          );
+          if (this.openOrderIndexes.size >= this.state.config.maxOpenOrders) {
+            break;
+          }
+        }
+      }
+
+      const cancelledOpposite = this.cancelLegacyAnticipatoryEntryGridOrders(
+        tick.eventTime,
+        events !== undefined,
+        "long",
+      );
+      events?.push(...cancelledOpposite);
+      acted ||= cancelledOpposite.length > 0;
+      orders.push(
+        ...this.createLegacyAnticipatoryEntryGridOrders(
+          anticipation,
+          tick.eventTime,
+          tick.price,
+          input.shortEntryRisk.leverage,
+        ),
+      );
+    }
+
+    return { orders, acted: acted || orders.length > 0 };
+  }
+
+  private createLegacyAnticipatoryEntryGridOrders(
+    anticipation: LegacyValleyPeakAnticipation,
+    createdAt: number,
+    currentPrice: number,
+    targetEntryLeverage: number,
+  ): TradingOrder[] {
+    const config = this.state.config;
+    const legacyConfig = config.legacyValleyPeak;
+    if (
+      legacyConfig.anticipatoryGridWindowSec <= 0 ||
+      this.openLegacyAnticipatoryEntryGridOrders(anticipation.side).length > 0
+    ) {
+      return [];
+    }
+
+    const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
+    if (availableSlots <= 0) {
+      return [];
+    }
+
+    const priceOffset = config.limitOffsetBps / 10_000;
+    const lowerPrice =
+      anticipation.side === "long"
+        ? roundQuote(anticipation.extremaPrice)
+        : roundQuote(currentPrice * (1 + priceOffset));
+    const upperPrice =
+      anticipation.side === "long"
+        ? roundQuote(currentPrice * Math.max(0.000001, 1 - priceOffset))
+        : roundQuote(anticipation.extremaPrice);
+    if (
+      lowerPrice <= 0 ||
+      upperPrice <= lowerPrice ||
+      !Number.isFinite(anticipation.extremaPrice)
+    ) {
+      return [];
+    }
+
+    const availableQuote =
+      anticipation.side === "long"
+        ? this.longEntryBuyingPowerQuote(currentPrice, targetEntryLeverage)
+        : this.shortEntrySellingPowerQuote(currentPrice, targetEntryLeverage);
+    const totalQuote = roundQuote(
+      Math.min(legacyConfig.maxTradeQuote, Math.max(0, availableQuote)),
+    );
+    if (totalQuote < config.minOrderQuote) {
+      return [];
+    }
+
+    const orderCount = this.legacyAnticipatoryEntryGridOrderCount({
+      lowerPrice,
+      upperPrice,
+      currentPrice,
+      totalQuote,
+      availableSlots,
+    });
+    if (orderCount <= 0) {
+      return [];
+    }
+
+    const orders: TradingOrder[] = [];
+    let remainingQuote = totalQuote;
+    const baseQuotePerOrder = roundQuote(totalQuote / orderCount);
+    const reason = `${LEGACY_ANTICIPATORY_ENTRY_GRID_REASON}; ${anticipation.side}; window ${Math.round(anticipation.windowSec)}s; extrema ${roundQuote(anticipation.extremaPrice)}`;
+
+    for (let index = 0; index < orderCount; index += 1) {
+      const price =
+        anticipation.side === "long"
+          ? this.legacyExitGridOrderPrice(index, orderCount, lowerPrice, upperPrice)
+          : this.legacyExitGridCoverOrderPrice(index, orderCount, lowerPrice, upperPrice);
+      let quoteSize = index === orderCount - 1
+        ? remainingQuote
+        : Math.min(baseQuotePerOrder, remainingQuote);
+      const remainingAfterOrder = roundQuote(remainingQuote - quoteSize);
+      if (
+        remainingAfterOrder > 0 &&
+        remainingAfterOrder < config.minOrderQuote
+      ) {
+        quoteSize = remainingQuote;
+      }
+      if (quoteSize < config.minOrderQuote) {
+        break;
+      }
+
+      const order =
+        anticipation.side === "long"
+          ? this.createLongEntryLimitOrder(
+              price,
+              currentPrice,
+              createdAt,
+              reason,
+              quoteSize,
+              {},
+              targetEntryLeverage,
+            )
+          : this.createShortEntryLimitOrder(
+              price,
+              currentPrice,
+              createdAt,
+              reason,
+              quoteSize,
+              {},
+              targetEntryLeverage,
+            );
+      if (!order) {
+        break;
+      }
+
+      orders.push(order);
+      remainingQuote = roundQuote(remainingQuote - quoteSize);
+      if (remainingQuote < config.minOrderQuote) {
+        break;
+      }
+    }
+
+    return orders;
+  }
+
+  private legacyAnticipatoryEntryGridOrderCount(input: {
+    lowerPrice: number;
+    upperPrice: number;
+    currentPrice: number;
+    totalQuote: number;
+    availableSlots: number;
+  }): number {
+    const config = this.state.config;
+    const legacyConfig = config.legacyValleyPeak;
+    const quoteLimitedCount = Math.floor(input.totalQuote / Math.max(config.minOrderQuote, 1));
+    const maxOrderCount = Math.min(
+      legacyConfig.anticipatoryGridOrderCount,
+      input.availableSlots,
+      quoteLimitedCount,
+    );
+    if (maxOrderCount <= 0) {
+      return 0;
+    }
+
+    const span = Math.max(0, input.upperPrice - input.lowerPrice);
+    const stepOrderCount =
+      span > 0 && legacyConfig.exitGridMaxStepPct > 0
+        ? Math.ceil(
+            span /
+              (Math.max(input.currentPrice, MIN_BASE_QUANTITY) *
+                (legacyConfig.exitGridMaxStepPct / 100)),
+          ) + 1
+        : maxOrderCount;
+    return Math.min(maxOrderCount, stepOrderCount);
   }
 
   private activeLegacyLongLots(price: number): LegacyLongExitGridLot[] {
@@ -3224,12 +3630,15 @@ export class SimulatedExecutionEngine {
         }
       }
 
-      const order = this.createTriggeredSellOrder(
+      const isLimitOrder = price > currentPrice;
+      const order = this.createSellCloseOrderAtPrice(
         price,
         quantity,
         createdAt,
         `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; peak ${upperPrice}`,
         lot.id,
+        isLimitOrder ? "limit" : "stop-market",
+        isLimitOrder ? undefined : "below",
       );
       if (!order) {
         break;
@@ -3310,12 +3719,15 @@ export class SimulatedExecutionEngine {
         }
       }
 
-      const order = this.createTriggeredBuyOrder(
+      const isLimitOrder = price < currentPrice;
+      const order = this.createBuyCloseOrderAtPrice(
         price,
         quantity,
         createdAt,
         `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; trough ${lowerPrice}`,
         lot.id,
+        isLimitOrder ? "limit" : "stop-market",
+        isLimitOrder ? undefined : "above",
       );
       if (!order) {
         break;
@@ -3467,6 +3879,34 @@ export class SimulatedExecutionEngine {
     return events ?? NO_EVENTS;
   }
 
+  private cancelLegacyAnticipatoryEntryGridOrders(
+    at: number,
+    collectEvents: boolean,
+    side?: PositionLotSide,
+  ): BotEvent[] {
+    const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+
+    for (const { index, order } of this.openLegacyAnticipatoryEntryGridOrders(side)) {
+      this.releaseOrderReserve(order);
+      order.status = "cancelled";
+      order.cancelledAt = at;
+      order.updatedAt = at;
+      order.reason = `${order.reason}; reset`;
+      this.openOrderIndexes.delete(index);
+
+      if (events) {
+        events.push({
+          type: "order_cancelled",
+          at,
+          message: `${order.side.toUpperCase()} anticipatory entry grid order cancelled`,
+          order: structuredClone(order),
+        });
+      }
+    }
+
+    return events ?? NO_EVENTS;
+  }
+
   private openLegacyExitGridOrders(
     lotId?: string,
     side?: PositionLotSide,
@@ -3479,6 +3919,30 @@ export class SimulatedExecutionEngine {
         order.reason.startsWith(LEGACY_EXIT_GRID_REASON) &&
         (!side || (side === "long" ? order.side === "sell" : order.side === "buy")) &&
         (!lotId || order.targetPositionId === lotId)
+      ) {
+        orders.push({ index, order });
+      }
+    }
+    return orders;
+  }
+
+  private openLegacyAnticipatoryEntryGridOrders(
+    side?: PositionLotSide,
+  ): Array<{ index: number; order: TradingOrder }> {
+    const orders: Array<{ index: number; order: TradingOrder }> = [];
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      const orderSide: PositionLotSide | undefined =
+        order?.side === "buy"
+          ? "long"
+          : order?.side === "sell" && order.positionEffect === "open"
+            ? "short"
+            : undefined;
+      if (
+        order?.status === "open" &&
+        order.positionEffect === "open" &&
+        order.reason.startsWith(LEGACY_ANTICIPATORY_ENTRY_GRID_REASON) &&
+        (!side || orderSide === side)
       ) {
         orders.push({ index, order });
       }
@@ -3687,6 +4151,7 @@ export class SimulatedExecutionEngine {
       liquidatedPositionCount: order.liquidatedPositionCount,
     };
     this.state.fills.push(fill);
+    this.recordLegacyExitGridFill(order, fill);
     this.refreshAverageEntryPrices();
     if (fill.liquidation) {
       this.liquidatedPositionCountValue += Math.max(
@@ -3701,8 +4166,7 @@ export class SimulatedExecutionEngine {
   private recordLegacyExitGridFill(order: TradingOrder, fill: TradeFill): void {
     if (
       !order.targetPositionId ||
-      !order.reason.startsWith(LEGACY_EXIT_GRID_REASON) ||
-      !order.trigger
+      !order.reason.startsWith(LEGACY_EXIT_GRID_REASON)
     ) {
       return;
     }
