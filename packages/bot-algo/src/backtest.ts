@@ -45,7 +45,7 @@ const DEFAULT_MAX_RETURNED_ORDERS = 2_000;
 const DEFAULT_MAX_RETURNED_FILLS = 2_000;
 const DEFAULT_MAX_CHART_CANDLES = 2_000;
 const DEFAULT_MAX_CHART_ANNOTATIONS = 5_000;
-const SMA_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e", "#f472b6", "#eab308"];
+const AVERAGE_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e", "#f472b6", "#eab308"];
 
 export interface BacktestChartCollector {
   sampleEvery: number;
@@ -90,15 +90,16 @@ export function createBacktestChartCollector(
   totalCandles: number,
   maxChartCandles = DEFAULT_MAX_CHART_CANDLES,
 ): BacktestChartCollector {
-  const selectedIndices = selectedSmaIndices(config);
+  const selectedIndices = selectedAverageIndices(config);
+  const averageLabel = config.legacyValleyPeak.movingAverageType.toUpperCase();
   return {
     sampleEvery: Math.max(1, Math.ceil(totalCandles / Math.max(1, maxChartCandles))),
     candles: [],
     smaSeries: selectedIndices.map((index, colorIndex) => ({
       index,
       windowSec: config.legacyValleyPeak.averagingRangesSec[index] ?? 0,
-      label: `${formatWindowLabel(config.legacyValleyPeak.averagingRangesSec[index] ?? 0)} SMA`,
-      color: SMA_COLORS[colorIndex % SMA_COLORS.length] ?? "#38bdf8",
+      label: `${formatWindowLabel(config.legacyValleyPeak.averagingRangesSec[index] ?? 0)} ${averageLabel}`,
+      color: AVERAGE_COLORS[colorIndex % AVERAGE_COLORS.length] ?? "#38bdf8",
       points: [],
     })),
     annotations: [],
@@ -242,7 +243,7 @@ function appendBacktestAnnotation(
   }
 }
 
-function selectedSmaIndices(config: Readonly<StrategyConfig>): number[] {
+function selectedAverageIndices(config: Readonly<StrategyConfig>): number[] {
   const legacy = config.legacyValleyPeak;
   const maxIndex = legacy.averagingRangesSec.length - 1;
   const indices = new Set<number>();

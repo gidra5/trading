@@ -1723,6 +1723,20 @@ function AlgorithmPanel(props: {
                   onInput={(value) => updateValleyPeak("relativeRateEnabled", value)}
                 />
                 <SelectField
+                  label="Average Type"
+                  value={config().legacyValleyPeak.movingAverageType}
+                  options={[
+                    { value: "sma", label: "SMA" },
+                    { value: "ema", label: "EMA" },
+                  ]}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "movingAverageType",
+                      value as StrategyConfig["legacyValleyPeak"]["movingAverageType"],
+                    )
+                  }
+                />
+                <SelectField
                   label="Derivative Source"
                   value={config().legacyValleyPeak.derivativeSource}
                   options={[
@@ -2259,13 +2273,19 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
 
             <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
               <div class="mb-2 flex items-center justify-between gap-3">
-                <div class="muted-label">Raw SMA Derivatives</div>
+                <div class="muted-label">
+                  Raw {state().movingAverageType.toUpperCase()} Derivatives
+                </div>
                 <div class="text-xs text-ink-300">
                   {state().saturated
                     ? "saturated"
                     : `${formatDuration(state().saturationRemainingMs)} warmup`}
                   <span class="ml-2 tabular-nums">
-                    signal {state().derivativeSource === "kama" ? "KAMA" : "SMA"} ${formatQuote(state().derivativeSourceValue, 4)}
+                    signal{" "}
+                    {state().derivativeSource === "kama"
+                      ? "KAMA"
+                      : state().movingAverageType.toUpperCase()}{" "}
+                    ${formatQuote(state().derivativeSourceValue, 4)}
                   </span>
                 </div>
               </div>
@@ -2281,7 +2301,15 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
                   </tr>
                 </thead>
                 <tbody>
-                  <For each={roleAverages()} fallback={<EmptyRow columns={6} label="No SMA data yet" />}>
+                  <For
+                    each={roleAverages()}
+                    fallback={
+                      <EmptyRow
+                        columns={6}
+                        label={`No ${state().movingAverageType.toUpperCase()} data yet`}
+                      />
+                    }
+                  >
                     {(item) => (
                       <tr>
                         <td class="td-cell">

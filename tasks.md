@@ -16,23 +16,11 @@
 - as base for extrema pick sma window in which there is enough movement on average to get over round trip cost (buy-sell fees).
 
 1. use simple `dS_m=(p_t-p_{t-m})/m` and `dS_m^2=(p_t-p_{t-m}-(p_{t-1}-p_{t-m-1}))/m` to get sma first and second derivatives
-2. anticipate the extrema for early entry. the extrema will happen at least half window size in future.
-3. use derivatives to estimate order of SMAs with `d_{m,n}=(m-n)/2*dS_m+m(m-n)/6*dS_m^2`.
-4. Measure entry error. We can see good entries post fact and compare with actual entries. We can probably get this by using shifted SMAs by half window. We may compute it incrementally during the run. Explore ways to improve entry time.
-5. Treat strategy as a derivative. Given some bot executing a strategy, track proportion of investment that it makes - what part of its leveraged equity invested where. Run another bot that monitors that proportion and can accept its own initial equity, that will be invested proportionally to the initial strategy, or even against it. This basically defines an investable derivative over which we can run another bot. Investing in that derivative proportionally invests it into the asset, and realising profit proportionally reduces the investment.
-6. Portfolio trading. We can borrow from other asset positions internally. This incurs conversion cost that should be accounted the same way fees are, but double since it is double converted.
-7.  Get assets sorted by 24h abs change, volume/market cap, and keep portfolio consisting of best 10 entries
-8.  Look for negatively correlated assets with good sharpe and mix to improve overall sharpe. Leverage the better one to keep profits?
-9.  Exit signal should be more permissive/absolute?
-  
-add a button to run the backtest from live bot start date to now.
-
-Hedge mode reconcile warning
-
-Half the confirmation windows
-equal sigmas
-for Long Range Bounds use largest suitable candle width instead of 1m granularity
-try ema instead of sma
+2. use derivatives to estimate order of SMAs with `d_{m,n}=(m-n)/2*dS_m+m(m-n)/6*dS_m^2`.
+3. Treat strategy as a derivative. Given some bot executing a strategy, track proportion of investment that it makes - what part of its leveraged equity invested where. Run another bot that monitors that proportion and can accept its own initial equity, that will be invested proportionally to the initial strategy, or even against it. This basically defines an investable derivative over which we can run another bot. Investing in that derivative proportionally invests it into the asset, and realising profit proportionally reduces the investment.
+4. Portfolio trading. We can borrow from other asset positions internally. This incurs conversion cost that should be accounted the same way fees are, but double since it is double converted.
+5.  Get assets sorted by 24h abs change, volume/market cap, and keep portfolio consisting of best 10 entries
+6.  Look for negatively correlated assets with good sharpe and mix to improve overall sharpe. Leverage the better one to keep profits?
 
 Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size. maybw makes sense for exit as well.
 
@@ -100,23 +88,11 @@ npx tsx scripts/check-sigma-borrow-matrix.ts \
   --mode both --long-borrow-depth 999 --short-borrow-depth 999
 ```
 
-use kama as a source
-
-((sigmaX*a+(1-a)*sigmaY), (sigmaX*b+(1-b)*sigmaY))
-a=sigmoid(trend, slopeA) 
-b=sigmoid(-trend, slopeB)
-sigmaX=0.05
-sigmaY=0.3
-tested 2026-07-04 as `sigmaMode=sigmoid-trend`: best observed among bounded return sweep was 12h trend, slopeA=15, slopeB=300, avg -1.6123% over the ten 3d cases. Not competitive with static 0.1/0.1; needs separate neutral/range gate so both sides can stay low in sideways churn.
-
 add "parallel" giid strategy that would place limit orders with fixed interval between prices in some range (short/mid price range) and some price distribution among them. Then assume mean reversion/adjust based on high window sma the bias. the exact mechanics are this:
 1. place grid of limit orders accordigng to price range, mean, and size distibution
 2. when price crosses long order we place a short order at the cell we left. symmentrically for short orders.
 3. long grids assume the trend is upwards and accumulate long position as grid crosses any cell and then sell it when price crosses grid cell against assume trend. the short is symmtric
 4. neutral grids assume the trend is mean reversing an create short grid above mid, and long below.
-
-the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
-
 
 the lots state should be in bot strategy layer, updated on each signal/related order executoin. on entry we create lot with specified parameters once we successfully executed order. on exit we close the lot, partially or fully depending on exit grid execution state. the resulting state is persisted. it should not need be reconciled/reconstructed from history, but saved and restored as part of live bot state.
 

@@ -23,7 +23,7 @@ The automated entry and exit-management workflow is documented in
 
 The assumed model is very simple. Treat the market price as a time series consisting of the alternation of 3 states: up, down, and flat. The core assumption is that we can't have two identical states in a row, which means optimal decisions can be made only at the transition points. 
 
-To detect these 3 states, we use a derivative of the simple moving average. Given a up/down trend thresholds and a timeframe, we compute the derivative of the SMA over the timeframe and compare against thresholds:
+To detect these 3 states, we use a derivative of the configured moving average. Given up/down trend thresholds and a timeframe, we compute the derivative of that average over the timeframe and compare against thresholds:
 1. if its withing the thresholds around 0, we consider it a sideways trend
 2. if it is above the threshold upper, we consider it an uptrend
 3. if it is below the threshold, we consider it a downtrend
@@ -141,7 +141,7 @@ fills a signal immediately. A signal creates one resting limit order:
 
 ## Rolling Average State
 
-The detector keeps rolling averages for these default windows:
+The detector keeps moving averages for these default windows:
 
 ```text
 1s, 1m, 10m, 30m, 1h, 4h, 12h
@@ -150,9 +150,18 @@ The detector keeps rolling averages for these default windows:
 For each window it stores:
 
 - raw price entries and timestamps
-- the current rolling average
+- the current configured average
 - a derivative estimate sampled inside the rolling window
 - a clamped derivative point used for turning-point detection
+
+`legacyValleyPeak.movingAverageType` selects the raw price average used by the
+price-source detector, confirmations, trend sigma sizing, market state detection, and
+backtest chart overlays:
+
+- `sma` is the baseline default and preserves the finite rolling-window average.
+- `ema` uses a continuous-time alpha `1 - exp(-dt / tau)` with `tau = window / 2`,
+  so its average sample age matches the equivalent SMA window while still reacting
+  continuously to uneven tick spacing.
 
 Derivative clamping is important. By default, the derivative uses fractional price
 change per second, so the same detector thresholds work across BTC-scale and
@@ -210,9 +219,9 @@ closer to `1` exits earlier; at `1`, hysteresis nearly collapses back to the out
 deadband threshold.
 
 The primary valley/peak signal source is selected by
-`legacyValleyPeak.derivativeSource`. The default `price` source preserves the original
-behavior: primary extrema are detected on the configured buy/sell source SMA windows,
-usually the 1m SMA. The optional `kama` source detects the primary extrema on the
+`legacyValleyPeak.derivativeSource`. The default `price` source detects primary
+extrema on the configured buy/sell raw moving-average windows, usually the 1m
+window. The optional `kama` source detects the primary extrema on the
 PineScript-style KAMA instead:
 
 ```text
@@ -224,9 +233,9 @@ ama = previousAma + alpha * (src - previousAma)
 ```
 
 Confirmation windows, exit confirmations, trend sigma sizing, market state detection,
-range diagnostics, and chart SMA series still use raw candle prices. KAMA only replaces
-the primary source whose extrema start a buy/sell signal before those raw-price
-confirmations are checked.
+range diagnostics, and chart average series still use raw candle prices with the
+configured `movingAverageType`. KAMA only replaces the primary source whose extrema
+start a buy/sell signal before those raw-price confirmations are checked.
 
 The detector shares the same average array for buy and sell memory. `buyAverages` and
 `sellAverages` are separate fields for state compatibility, but current code points both
@@ -378,7 +387,7 @@ entry buying power =
 
 On a confirmed valley, the strategy computes a desired quote notional from leveraged
 entry buying power and the 30m derivative. The Gaussian sigma is adjusted by the
-overall 1h SMA trend:
+overall 1h configured-average trend:
 
 ```text
 buy sigma =
@@ -573,7 +582,8 @@ mode.
 | `legacyValleyPeak.saturationSec` | `3600` | Rolling detector warmup before signals can trade. |
 | `legacyValleyPeak.maxTradeQuote` | `50000` | Per-signal quote/notional clip. |
 | `legacyValleyPeak.relativeRateEnabled` | `true` | Uses price-scale-invariant relative derivatives by default; disable only for old absolute-rate baseline comparisons. |
-| `legacyValleyPeak.derivativeSource` | `price` | Primary extrema source; `kama` uses KAMA extrema for the initial buy/sell signal while confirmations stay on raw-price SMAs. |
+| `legacyValleyPeak.movingAverageType` | `sma` | Raw price average for price-source extrema, confirmations, trend sigma, market state, and chart overlays; `ema` uses equivalent-memory exponential smoothing. |
+| `legacyValleyPeak.derivativeSource` | `price` | Primary extrema source; `kama` uses KAMA extrema for the initial buy/sell signal while confirmations stay on raw-price configured averages. |
 | `legacyValleyPeak.derivativeClampMode` | `deadband` | Derivative thresholding mode; `hysteresis` keeps an active sign until an inner threshold is crossed. |
 | `legacyValleyPeak.derivativeClampInnerThresholdRatio` | `0` | Hysteresis exit threshold as a fraction of the outer derivative threshold; `0` means zero-cross exit. |
 | `legacyValleyPeak.buyEntrySignalTiming` | `start` | Valley edge used for opening longs; `start` preserves the baseline deadband-entry signal. |

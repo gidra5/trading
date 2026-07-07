@@ -3,6 +3,7 @@ import type {
   Candle,
   LegacyDerivativeClampMode,
   LegacyExtremaSignalTiming,
+  LegacyMovingAverageType,
   LegacyValleyPeakCheckDebug,
   LegacyValleyPeakConfig,
   LegacyValleyPeakDebugSnapshot,
@@ -71,6 +72,7 @@ export function legacyValleyPeakDecisionReason(
 
 export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   averagingRangesSec: [1, 60, 600, 1800, 3600, 3600 * 4, 3600 * 12],
+  movingAverageType: "sma",
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
   relativeRateEnabled: true,
   derivativeSource: "price",
@@ -188,6 +190,7 @@ export function createLegacyValleyPeakConfig(
   };
 
   const rangeCount = Math.max(1, config.averagingRangesSec.length);
+  config.movingAverageType = normalizeMovingAverageType(config.movingAverageType);
   config.rateRatios = padNumbers(config.rateRatios, rangeCount, 0.5);
   config.relativeRateEnabled = config.relativeRateEnabled === true;
   config.derivativeSource = config.derivativeSource === "kama" ? "kama" : "price";
@@ -540,6 +543,7 @@ export function evaluateLegacyValleyPeak(
       config.relativeRateEnabled,
       config.derivativeClampMode,
       config.derivativeClampInnerThresholdRatio,
+      config.movingAverageType,
     );
     updateRollingCandleRange(candleRanges[index], rangeSec, input, tsSec);
   }
@@ -888,6 +892,7 @@ export function createLegacyValleyPeakDebugSnapshot(
   return {
     updatedAt: input.eventTime,
     price: input.price,
+    movingAverageType: config.movingAverageType,
     derivativeSource: config.derivativeSource,
     derivativeSourceValue: currentDerivativeSourceValue(memory, config, input.price),
     entrySignal: decision.entrySignal.signal,
@@ -1565,7 +1570,24 @@ function updateRollingAverage(
   relativeRateEnabled: boolean,
   clampMode: LegacyDerivativeClampMode,
   innerThresholdRatio: number,
+  averageType: LegacyMovingAverageType,
 ): void {
+  if (averageType === "ema") {
+    updateRollingEma(
+      memory,
+      value,
+      tsSec,
+      rangeSec,
+      derivativeRatio,
+      thresholdLow,
+      thresholdHigh,
+      relativeRateEnabled,
+      clampMode,
+      innerThresholdRatio,
+    );
+    return;
+  }
+
   let startIndex = memory.startIndex ?? 0;
   startIndex = clampInt(startIndex, 0, memory.timestamps.length);
 
@@ -1623,6 +1645,81 @@ function updateRollingAverage(
 
   recordPoint(memory, avg, derivative, rateClamped);
   compactRollingAverage(memory);
+}
+
+function updateRollingEma(
+  memory: RollingAverageMemory,
+  value: number,
+  tsSec: number,
+  rangeSec: number,
+  derivativeRatio: number,
+  thresholdLow: number,
+  thresholdHigh: number,
+  relativeRateEnabled: boolean,
+  clampMode: LegacyDerivativeClampMode,
+  innerThresholdRatio: number,
+): void {
+  let startIndex = memory.startIndex ?? 0;
+  startIndex = clampInt(startIndex, 0, memory.timestamps.length);
+
+  while (
+    startIndex < memory.timestamps.length &&
+    memory.timestamps[startIndex] + rangeSec < tsSec
+  ) {
+    startIndex += 1;
+  }
+  memory.startIndex = startIndex;
+
+  const previousAvg = memory.averages.at(-1);
+  const previousTsSec = memory.timestamps.at(-1);
+  const avg =
+    previousAvg === undefined || previousTsSec === undefined || tsSec <= previousTsSec
+      ? value
+      : previousAvg + emaAlpha(tsSec - previousTsSec, rangeSec) * (value - previousAvg);
+
+  memory.timestamps.push(tsSec);
+  memory.entries.push(value);
+  memory.averages.push(avg);
+  memory.sum = avg;
+
+  const activeCount = memory.timestamps.length - startIndex;
+  if (activeCount < 2) {
+    recordPoint(memory, avg, 0, 0);
+    compactRollingAverage(memory);
+    return;
+  }
+
+  const pointTs = Math.max(
+    memory.timestamps[startIndex],
+    tsSec - rangeSec * derivativeRatio,
+  );
+  const sampleValue = sampleAverage(memory, pointTs, startIndex);
+  const delta = tsSec - pointTs;
+  if (delta === 0 || (relativeRateEnabled && sampleValue <= 0)) {
+    recordPoint(memory, avg, 0, 0);
+    compactRollingAverage(memory);
+    return;
+  }
+
+  const derivative = relativeRateEnabled
+    ? (avg - sampleValue) / sampleValue / delta
+    : (avg - sampleValue) / delta;
+  const rateClamped = clampDerivativeRate(
+    derivative,
+    latestPoint(memory)?.rateClamped ?? 0,
+    thresholdLow,
+    thresholdHigh,
+    clampMode,
+    innerThresholdRatio,
+  );
+
+  recordPoint(memory, avg, derivative, rateClamped);
+  compactRollingAverage(memory);
+}
+
+function emaAlpha(deltaSec: number, rangeSec: number): number {
+  const tauSec = Math.max(Number.EPSILON, rangeSec / 2);
+  return clamp(1 - Math.exp(-Math.max(0, deltaSec) / tauSec), 0, 1);
 }
 
 function clampDerivativeRate(
@@ -2710,6 +2807,12 @@ function normalizeExtremaSignalTiming(
   value: LegacyExtremaSignalTiming | undefined,
 ): LegacyExtremaSignalTiming {
   return value === "end" ? "end" : "start";
+}
+
+function normalizeMovingAverageType(
+  value: LegacyMovingAverageType | undefined,
+): LegacyMovingAverageType {
+  return value === "ema" ? "ema" : "sma";
 }
 
 function padNumbers(values: number[], length: number, fallback: number): number[] {

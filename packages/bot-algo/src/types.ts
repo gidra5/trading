@@ -41,6 +41,8 @@ export type ExitGridSizeDistribution = "geometric" | "linear" | "constant";
 
 export type LegacySigmaMode = "trend" | "static" | "sigmoid-trend";
 
+export type LegacyMovingAverageType = "sma" | "ema";
+
 export type LegacyDerivativeSource = "price" | "kama";
 
 export type LegacyDerivativeClampMode = "deadband" | "hysteresis";
@@ -125,6 +127,7 @@ export interface PositionRiskConfig {
 
 export interface LegacyValleyPeakConfig {
   averagingRangesSec: number[];
+  movingAverageType: LegacyMovingAverageType;
   rateRatios: number[];
   relativeRateEnabled: boolean;
   derivativeSource: LegacyDerivativeSource;
@@ -368,6 +371,7 @@ export interface LegacyMarketStateDebug {
 export interface LegacyValleyPeakDebugSnapshot {
   updatedAt: number;
   price: number;
+  movingAverageType: LegacyMovingAverageType;
   derivativeSource: LegacyDerivativeSource;
   derivativeSourceValue: number;
   entrySignal: BotSignal;

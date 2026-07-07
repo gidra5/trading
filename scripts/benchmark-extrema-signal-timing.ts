@@ -6,6 +6,7 @@ import {
   type BacktestResult,
   type Candle,
   type LegacyDerivativeSource,
+  type LegacyMovingAverageType,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
 
@@ -23,6 +24,7 @@ interface Args {
   buySigma: number;
   sellSigma: number;
   derivativeSource: LegacyDerivativeSource;
+  movingAverageTypes: LegacyMovingAverageType[];
 }
 
 interface ResultRow {
@@ -32,6 +34,7 @@ interface ResultRow {
   interval: string;
   runLabel: string;
   derivativeSource: LegacyDerivativeSource;
+  movingAverageType: LegacyMovingAverageType;
   buySigma: number;
   sellSigma: number;
   marketReturnPct: number;
@@ -113,27 +116,37 @@ function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPa
       buySigma: configArgs.buySigma,
       sellSigma: configArgs.sellSigma,
       derivativeSource: configArgs.derivativeSource,
+      movingAverageTypes: configArgs.movingAverageTypes,
       derivativeClampMode: "deadband",
     },
   });
 
-  for (const testCase of cases) {
-    const candles = loadCandles(testCase);
-    const market = summarizeMarket(candles);
-    const started = Date.now();
-    const result = runBacktestFromCandles(candles, {
-      config: benchmarkConfig(configArgs),
-      maxReturnedOrders: 0,
-      maxReturnedFills: 0,
-      maxEquityPoints: 16,
-      maxChartCandles: 1,
-    });
-    const row = resultRow(testCase, market, result, configArgs, Date.now() - started);
-    rows.push(row);
-    appendJson(targetOutputPath, row);
-    console.error(
-      `${testCase.startDate}..${testCase.endDate}: ${formatSignedPct(row.returnPct)}, DD ${formatPct(row.maxDrawdownPct)}, trades ${row.tradeCount}`,
-    );
+  for (const movingAverageType of configArgs.movingAverageTypes) {
+    for (const testCase of cases) {
+      const candles = loadCandles(testCase);
+      const market = summarizeMarket(candles);
+      const started = Date.now();
+      const result = runBacktestFromCandles(candles, {
+        config: benchmarkConfig(configArgs, movingAverageType),
+        maxReturnedOrders: 0,
+        maxReturnedFills: 0,
+        maxEquityPoints: 16,
+        maxChartCandles: 1,
+      });
+      const row = resultRow(
+        testCase,
+        market,
+        result,
+        configArgs,
+        movingAverageType,
+        Date.now() - started,
+      );
+      rows.push(row);
+      appendJson(targetOutputPath, row);
+      console.error(
+        `${movingAverageType.toUpperCase()} ${testCase.startDate}..${testCase.endDate}: ${formatSignedPct(row.returnPct)}, DD ${formatPct(row.maxDrawdownPct)}, trades ${row.tradeCount}`,
+      );
+    }
   }
 
   appendJson(targetOutputPath, {
@@ -146,7 +159,10 @@ function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPa
   console.error(`Report written to ${path.relative(repoRoot, targetReportPath)}`);
 }
 
-function benchmarkConfig(configArgs: Args): PartialStrategyConfig {
+function benchmarkConfig(
+  configArgs: Args,
+  movingAverageType: LegacyMovingAverageType,
+): PartialStrategyConfig {
   return {
     symbol: "BTCUSDT",
     algorithm: "legacy-valley-peak",
@@ -157,6 +173,7 @@ function benchmarkConfig(configArgs: Args): PartialStrategyConfig {
     shortBorrowDepth: 999,
     internalBorrowAccounting: "inactive",
     legacyValleyPeak: {
+      movingAverageType,
       sigmaMode: "static",
       buySigma: configArgs.buySigma,
       sellSigma: configArgs.sellSigma,
@@ -171,6 +188,7 @@ function resultRow(
   market: ReturnType<typeof summarizeMarket>,
   result: BacktestResult,
   configArgs: Args,
+  movingAverageType: LegacyMovingAverageType,
   elapsedMs: number,
 ): ResultRow {
   const summary = result.summary;
@@ -181,6 +199,7 @@ function resultRow(
     interval: `${testCase.startDate}..${testCase.endDate}`,
     runLabel: configArgs.label,
     derivativeSource: configArgs.derivativeSource,
+    movingAverageType,
     buySigma: configArgs.buySigma,
     sellSigma: configArgs.sellSigma,
     marketReturnPct: round(market.returnPct, 4),
@@ -217,30 +236,61 @@ function renderReport(
   lines.push("- Market: BTCUSDT 1m spot candles, UTC day-inclusive intervals from `tasks.md`.");
   lines.push(`- Strategy: static sigma \`buySigma=${configArgs.buySigma}\`, \`sellSigma=${configArgs.sellSigma}\`, mode both, futures-margin shorts, borrow depths \`999/999\`, max leverage \`1x\`.`);
   lines.push(`- Derivative source: \`${configArgs.derivativeSource}\`; derivative clamp mode: \`deadband\`.`);
+  lines.push(`- Moving average type(s): \`${configArgs.movingAverageTypes.join("`, `")}\`. EMA uses a continuous-time alpha with \`tau = window / 2\`, matching the SMA window's average sample age.`);
   lines.push("");
   lines.push("## Summary");
   lines.push("");
-  lines.push("| Avg return | Median return | Positive | Avg DD | Max DD | Avg trades |");
-  lines.push("| ---: | ---: | ---: | ---: | ---: | ---: |");
-  lines.push(
-    [
-      `| ${formatSignedPct(mean(rows.map((row) => row.returnPct)))}`,
-      formatSignedPct(median(rows.map((row) => row.returnPct))),
-      `${rows.filter((row) => row.returnPct > 0).length}/${rows.length}`,
-      formatPct(mean(rows.map((row) => row.maxDrawdownPct))),
-      formatPct(Math.max(...rows.map((row) => row.maxDrawdownPct))),
-      `${round(mean(rows.map((row) => row.tradeCount)), 1).toLocaleString()} |`,
-    ].join(" | "),
-  );
+  lines.push("| Average | Avg return | Median return | Positive | Avg DD | Max DD | Avg trades |");
+  lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+  for (const movingAverageType of configArgs.movingAverageTypes) {
+    const typeRows = rows.filter((row) => row.movingAverageType === movingAverageType);
+    lines.push(
+      [
+        `| ${movingAverageType.toUpperCase()}`,
+        formatSignedPct(mean(typeRows.map((row) => row.returnPct))),
+        formatSignedPct(median(typeRows.map((row) => row.returnPct))),
+        `${typeRows.filter((row) => row.returnPct > 0).length}/${typeRows.length}`,
+        formatPct(mean(typeRows.map((row) => row.maxDrawdownPct))),
+        formatPct(Math.max(...typeRows.map((row) => row.maxDrawdownPct))),
+        `${round(mean(typeRows.map((row) => row.tradeCount)), 1).toLocaleString()} |`,
+      ].join(" | "),
+    );
+  }
+  if (configArgs.movingAverageTypes.includes("sma") && configArgs.movingAverageTypes.includes("ema")) {
+    lines.push("");
+    lines.push("## EMA vs SMA");
+    lines.push("");
+    lines.push("| Group | Case | Interval | Market | SMA return | EMA return | Delta | SMA DD | EMA DD | Delta DD | SMA trades | EMA trades |");
+    lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for (const comparison of compareAverageRows(rows)) {
+      lines.push(
+        [
+          `| ${comparison.sma.group}`,
+          comparison.sma.label,
+          `\`${comparison.sma.interval}\``,
+          formatSignedPct(comparison.sma.marketReturnPct),
+          formatSignedPct(comparison.sma.returnPct),
+          formatSignedPct(comparison.ema.returnPct),
+          formatSignedPct(comparison.ema.returnPct - comparison.sma.returnPct),
+          formatPct(comparison.sma.maxDrawdownPct),
+          formatPct(comparison.ema.maxDrawdownPct),
+          formatSignedPct(comparison.ema.maxDrawdownPct - comparison.sma.maxDrawdownPct),
+          comparison.sma.tradeCount.toLocaleString(),
+          `${comparison.ema.tradeCount.toLocaleString()} |`,
+        ].join(" | "),
+      );
+    }
+  }
   lines.push("");
   lines.push("## Intervals");
   lines.push("");
-  lines.push("| Group | Case | Interval | Market | Return | Max DD | Trades | Win rate | Stop |");
-  lines.push("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |");
+  lines.push("| Average | Group | Case | Interval | Market | Return | Max DD | Trades | Win rate | Stop |");
+  lines.push("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |");
   for (const row of rows) {
     lines.push(
       [
-        `| ${row.group}`,
+        `| ${row.movingAverageType.toUpperCase()}`,
+        row.group,
         row.label,
         `\`${row.interval}\``,
         formatSignedPct(row.marketReturnPct),
@@ -280,7 +330,21 @@ function parseArgs(argv: string[]): Args {
     buySigma: positiveNumber(values.get("buy-sigma") ?? "0.1", "buy-sigma"),
     sellSigma: positiveNumber(values.get("sell-sigma") ?? "0.1", "sell-sigma"),
     derivativeSource: parseDerivativeSource(values.get("derivative-source")),
+    movingAverageTypes: parseMovingAverageTypes(values.get("moving-average-type")),
   };
+}
+
+function compareAverageRows(rows: ResultRow[]): Array<{ sma: ResultRow; ema: ResultRow }> {
+  const byKey = new Map<string, Partial<Record<LegacyMovingAverageType, ResultRow>>>();
+  for (const row of rows) {
+    const key = `${row.group}|${row.label}|${row.interval}`;
+    const existing = byKey.get(key) ?? {};
+    existing[row.movingAverageType] = row;
+    byKey.set(key, existing);
+  }
+  return [...byKey.values()].flatMap((entry) =>
+    entry.sma && entry.ema ? [{ sma: entry.sma, ema: entry.ema }] : [],
+  );
 }
 
 function parseDerivativeSource(value: string | undefined): LegacyDerivativeSource {
@@ -291,6 +355,27 @@ function parseDerivativeSource(value: string | undefined): LegacyDerivativeSourc
     return "kama";
   }
   throw new Error("--derivative-source must be price or kama.");
+}
+
+function parseMovingAverageTypes(value: string | undefined): LegacyMovingAverageType[] {
+  if (value === undefined) {
+    return ["sma"];
+  }
+  if (value === "both") {
+    return ["sma", "ema"];
+  }
+
+  const parsed = value
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const types = parsed.map((part) => {
+    if (part === "sma" || part === "ema") {
+      return part;
+    }
+    throw new Error("--moving-average-type must be sma, ema, both, or a comma list of sma/ema.");
+  });
+  return [...new Set(types)];
 }
 
 function positiveNumber(value: string, label: string): number {
