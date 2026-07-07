@@ -243,12 +243,24 @@ not retain every raw trade tick. The `3m` window is modeled as 90 days.
 
 ## Valley Signal
 
-A valley is detected when the selected window's clamped derivative turns upward:
+Valley signals can use either the start or end edge of the selected window's extrema
+deadband. The baseline default is `start` for both entries and exits:
 
 ```text
 latest.rateClamped >= 0
 previous.rateClamped < 0
 ```
+
+The optional `end` edge waits until the selected window exits the extrema deadband
+upward:
+
+```text
+latest.rateClamped > 0
+previous.rateClamped <= 0
+```
+
+`legacyValleyPeak.buyEntrySignalTiming` controls long entries and
+`legacyValleyPeak.buyExitSignalTiming` controls short-cover exits.
 
 The default buy source is the 1m window:
 
@@ -275,12 +287,24 @@ legacyValleyPeak.sellExitConfirmationOffsets = [1, 2]
 
 ## Peak Signal
 
-A peak is detected when the selected window's clamped derivative turns downward:
+Peak signals mirror valley timing. The baseline default is `start` for both entries
+and exits:
 
 ```text
 latest.rateClamped <= 0
 previous.rateClamped > 0
 ```
+
+The optional `end` edge waits until the selected window exits the extrema deadband
+downward:
+
+```text
+latest.rateClamped < 0
+previous.rateClamped >= 0
+```
+
+`legacyValleyPeak.sellEntrySignalTiming` controls short entries and
+`legacyValleyPeak.sellExitSignalTiming` controls long exits.
 
 The default sell source matches the buy source:
 
@@ -295,8 +319,7 @@ legacyValleyPeak.sellConfirmationOffsets = [1, 2]
 ```
 
 That checks the 10m and 30m windows relative to the 1m source and requires each
-confirmation window to still be falling (`rateClamped < 0`). This is the
-strict-symmetric baseline used by the `0.35%` 180d anchor replay.
+confirmation window to still be falling (`rateClamped < 0`).
 
 Sell-side exits use the same default confirmation offsets as buy-side exits:
 
@@ -553,6 +576,10 @@ mode.
 | `legacyValleyPeak.derivativeSource` | `price` | Primary extrema source; `kama` uses KAMA extrema for the initial buy/sell signal while confirmations stay on raw-price SMAs. |
 | `legacyValleyPeak.derivativeClampMode` | `deadband` | Derivative thresholding mode; `hysteresis` keeps an active sign until an inner threshold is crossed. |
 | `legacyValleyPeak.derivativeClampInnerThresholdRatio` | `0` | Hysteresis exit threshold as a fraction of the outer derivative threshold; `0` means zero-cross exit. |
+| `legacyValleyPeak.buyEntrySignalTiming` | `start` | Valley edge used for opening longs; `start` preserves the baseline deadband-entry signal. |
+| `legacyValleyPeak.sellEntrySignalTiming` | `start` | Peak edge used for opening shorts; `start` preserves the baseline deadband-entry signal. |
+| `legacyValleyPeak.buyExitSignalTiming` | `start` | Valley edge used for covering shorts. |
+| `legacyValleyPeak.sellExitSignalTiming` | `start` | Peak edge used for closing longs. |
 | `legacyValleyPeak.kamaErLen` | `20` | KAMA efficiency-ratio length in observed samples. |
 | `legacyValleyPeak.kamaFastLen` | `5` | KAMA fast EMA length. |
 | `legacyValleyPeak.kamaSlowLen` | `50` | KAMA slow EMA length. |

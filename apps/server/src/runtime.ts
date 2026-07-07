@@ -20,7 +20,6 @@ import {
   type ManualTradeInput,
   type OrderBookSnapshot,
   type PartialStrategyConfig,
-  type BotCoreState,
   type PaperBotState,
   type PriceTick,
   type EquityPoint,
@@ -189,7 +188,7 @@ export class TradingRuntime {
     const exchangeDriven = this.isExchangeDrivenExecution();
     const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
     const savedState = exchangeDriven
-      ? this.restorePaperStateFromBotCoreState(await this.storage.loadLiveBotCoreState())
+      ? await this.storage.loadLiveBotState()
       : await this.storage.loadBotState();
     const exchangeStartingQuote = exchangeDriven
       ? undefined
@@ -236,7 +235,7 @@ export class TradingRuntime {
     const exchangeDriven = this.isExchangeDrivenExecution();
     const exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
     const savedState = exchangeDriven
-      ? this.restorePaperStateFromBotCoreState(await this.storage.loadLiveBotCoreState())
+      ? await this.storage.loadLiveBotState()
       : await this.storage.loadBotState();
     const exchangeStartingQuote = exchangeDriven
       ? undefined
@@ -333,11 +332,13 @@ export class TradingRuntime {
   snapshot(): RuntimeSnapshot {
     const bot = this.bot.view();
     const exchangeSnapshot = this.publicExchangeSnapshot();
+    const exchangeDriven = this.isExchangeDrivenExecution();
     const publicBot = compactPublicBotState(
-      this.isExchangeDrivenExecution()
+      exchangeDriven
         ? exchangeDrivenPublicBotState(bot, exchangeSnapshot, this.market)
         : bot,
     );
+    const positionState = exchangeDriven ? this.bot.snapshot() : publicBot;
     return {
       market: {
         id: this.market.id,
@@ -357,7 +358,7 @@ export class TradingRuntime {
         orderBook: this.orderBook,
       },
       bot: publicBot,
-      positions: analyzePositions(publicBot),
+      positions: analyzePositions(positionState),
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
       equityCurve: this.liveEquityCurve,
@@ -367,25 +368,50 @@ export class TradingRuntime {
   }
 
   async startBot(): Promise<BotEvent[]> {
-    const wasStopped = this.bot.view().status !== "running";
-    if (wasStopped) {
-      this.liveEquityCurve = [];
-      this.lastLiveEquitySampleAt = 0;
-    }
-    const events = this.bot.setStatus("running");
-    if (wasStopped) {
-      this.recordLiveEquity(Date.now(), this.bot.snapshot(), true);
-    }
-    this.recordEvents(events);
-    await this.flushState();
-    return events;
+    return this.withBotOperation(async () => {
+      const events: BotEvent[] = [];
+      if (this.isExchangeDrivenExecution()) {
+        const snapshot = await this.syncExecutionExchangeSnapshot();
+        if (snapshot) {
+          events.push(...(await this.applyExchangeSnapshot(snapshot)));
+        }
+      }
+
+      const wasStopped = this.bot.view().status !== "running";
+      if (wasStopped) {
+        this.liveEquityCurve = [];
+        this.lastLiveEquitySampleAt = 0;
+      }
+      const statusEvents = this.bot.setStatus("running");
+      events.push(...statusEvents);
+      if (wasStopped) {
+        this.recordLiveEquity(Date.now(), this.bot.snapshot(), true);
+      }
+      this.recordEvents(statusEvents);
+      await this.flushState();
+      return events;
+    });
   }
 
   async stopBot(): Promise<BotEvent[]> {
-    const events = this.bot.setStatus("stopped");
-    this.recordEvents(events);
-    await this.flushState();
-    return events;
+    return this.withBotOperation(async () => {
+      const events = this.bot.setStatus("stopped");
+      this.recordEvents(events);
+      await this.flushState();
+
+      if (this.isExchangeDrivenExecution()) {
+        try {
+          const snapshot = await this.syncExecutionExchangeSnapshot();
+          if (snapshot) {
+            events.push(...(await this.applyExchangeSnapshot(snapshot)));
+          }
+        } catch {
+          // The local stop must remain effective even if Binance sync is unavailable.
+        }
+      }
+
+      return events;
+    });
   }
 
   async resetBot(): Promise<BotEvent[]> {
@@ -860,7 +886,7 @@ export class TradingRuntime {
 
     const snapshot = this.bot.snapshot();
     const saveState = this.isExchangeDrivenExecution()
-      ? () => this.storage.saveLiveBotCoreState(botCoreStateFromPaperState(snapshot))
+      ? () => this.storage.saveLiveBotState(snapshot)
       : () => this.storage.saveBotState(snapshot);
     this.stateSaveQueue = this.stateSaveQueue.then(
       saveState,
@@ -1756,30 +1782,6 @@ export class TradingRuntime {
     };
   }
 
-  private restorePaperStateFromBotCoreState(
-    coreState: BotCoreState | undefined,
-  ): PaperBotState | undefined {
-    if (!coreState) {
-      return undefined;
-    }
-
-    const config = this.createMarketConfig(coreState);
-    const state = createInitialBotState(config);
-    state.id = coreState.id;
-    state.status = coreState.status;
-    state.symbol = this.market.symbol;
-    state.baseAsset = this.market.baseAsset;
-    state.quoteAsset = this.market.quoteAsset;
-    state.lastPrice = coreState.lastPrice;
-    state.sequence = coreState.sequence;
-    state.createdAt = coreState.createdAt;
-    state.updatedAt = coreState.updatedAt;
-    state.runStartedAt = coreState.runStartedAt;
-    state.memory = structuredClone(coreState.memory);
-    state.config = config;
-    return state;
-  }
-
   private createMarketConfig(
     savedState?: { config: StrategyConfig },
     startingQuote?: number,
@@ -1793,23 +1795,6 @@ export class TradingRuntime {
     });
     return applyMarketMaxLeverage(config, this.market.maxLeverage);
   }
-}
-
-function botCoreStateFromPaperState(state: PaperBotState): BotCoreState {
-  return {
-    id: state.id,
-    status: state.status,
-    symbol: state.symbol,
-    baseAsset: state.baseAsset,
-    quoteAsset: state.quoteAsset,
-    lastPrice: state.lastPrice,
-    sequence: state.sequence,
-    createdAt: state.createdAt,
-    updatedAt: state.updatedAt,
-    runStartedAt: state.runStartedAt,
-    memory: structuredClone(state.memory),
-    config: structuredClone(state.config),
-  };
 }
 
 function exchangeDrivenPublicBotState(
@@ -1832,27 +1817,28 @@ function exchangeDrivenPublicBotState(
   next.baseReserved = 0;
   next.avgEntryPrice = 0;
   next.avgShortEntryPrice = 0;
-  next.realizedPnl = 0;
-  next.feesPaid = 0;
-  next.winningTrades = 0;
-  next.losingTrades = 0;
-  next.orders = [];
-  next.fills = [];
+  next.realizedPnl = state.realizedPnl;
+  next.feesPaid = state.feesPaid;
+  next.winningTrades = state.winningTrades;
+  next.losingTrades = state.losingTrades;
   next.metrics = {
     ...next.metrics,
     equity: equity ?? next.metrics.equity,
-    realizedPnl: 0,
+    realizedPnl: state.realizedPnl,
     unrealizedPnl: 0,
     netPnl,
     returnPct:
       equity !== undefined && startingQuote > 0
         ? (netPnl / startingQuote) * 100
         : 0,
-    feesPaid: 0,
-    tradeCount: 0,
-    winningTrades: 0,
-    losingTrades: 0,
-    winRate: 0,
+    feesPaid: state.feesPaid,
+    tradeCount: state.fills.length,
+    winningTrades: state.winningTrades,
+    losingTrades: state.losingTrades,
+    winRate:
+      state.winningTrades + state.losingTrades > 0
+        ? (state.winningTrades / (state.winningTrades + state.losingTrades)) * 100
+        : 0,
     peakEquity: equity ?? 0,
     maxDrawdownPct: 0,
     exposurePct:

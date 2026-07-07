@@ -1573,6 +1573,10 @@ function AlgorithmPanel(props: {
       },
     });
   };
+  const signalTimingOptions = [
+    { value: "start", label: "Start" },
+    { value: "end", label: "End" },
+  ];
 
   return (
     <section class="panel">
@@ -1756,6 +1760,50 @@ function AlgorithmPanel(props: {
                     updateValleyPeak(
                       "derivativeClampInnerThresholdRatio",
                       value,
+                    )
+                  }
+                />
+                <SelectField
+                  label="Buy Entry Edge"
+                  value={config().legacyValleyPeak.buyEntrySignalTiming}
+                  options={signalTimingOptions}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "buyEntrySignalTiming",
+                      value as StrategyConfig["legacyValleyPeak"]["buyEntrySignalTiming"],
+                    )
+                  }
+                />
+                <SelectField
+                  label="Sell Entry Edge"
+                  value={config().legacyValleyPeak.sellEntrySignalTiming}
+                  options={signalTimingOptions}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "sellEntrySignalTiming",
+                      value as StrategyConfig["legacyValleyPeak"]["sellEntrySignalTiming"],
+                    )
+                  }
+                />
+                <SelectField
+                  label="Buy Exit Edge"
+                  value={config().legacyValleyPeak.buyExitSignalTiming}
+                  options={signalTimingOptions}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "buyExitSignalTiming",
+                      value as StrategyConfig["legacyValleyPeak"]["buyExitSignalTiming"],
+                    )
+                  }
+                />
+                <SelectField
+                  label="Sell Exit Edge"
+                  value={config().legacyValleyPeak.sellExitSignalTiming}
+                  options={signalTimingOptions}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "sellExitSignalTiming",
+                      value as StrategyConfig["legacyValleyPeak"]["sellExitSignalTiming"],
                     )
                   }
                 />
@@ -2556,7 +2604,7 @@ function CorrelationPanel(props: {
   onSortChange: (mode: CorrelationSortMode) => void;
   onRefresh: (refresh: boolean) => void;
 }) {
-  const [isExpanded, setIsExpanded] = createSignal(true);
+  const [isExpanded, setIsExpanded] = createSignal(false);
   const snapshot = () => props.snapshot;
   const entries = createMemo(() =>
     sortCorrelationEntries(snapshot()?.entries ?? [], props.sortMode),

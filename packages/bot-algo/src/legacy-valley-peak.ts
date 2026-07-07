@@ -2,6 +2,7 @@ import type {
   BotSignal,
   Candle,
   LegacyDerivativeClampMode,
+  LegacyExtremaSignalTiming,
   LegacyValleyPeakCheckDebug,
   LegacyValleyPeakConfig,
   LegacyValleyPeakDebugSnapshot,
@@ -87,6 +88,10 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   sellConfirmationOffsets: [1, 2],
   buyExitConfirmationOffsets: [1, 2],
   sellExitConfirmationOffsets: [1, 2],
+  buyEntrySignalTiming: "start",
+  sellEntrySignalTiming: "start",
+  buyExitSignalTiming: "start",
+  sellExitSignalTiming: "start",
   saturationSec: 3600,
   buySpendRate: 1,
   sellAmountRate: 1,
@@ -188,6 +193,18 @@ export function createLegacyValleyPeakConfig(
   config.derivativeSource = config.derivativeSource === "kama" ? "kama" : "price";
   config.derivativeClampMode =
     config.derivativeClampMode === "hysteresis" ? "hysteresis" : "deadband";
+  config.buyEntrySignalTiming = normalizeExtremaSignalTiming(
+    config.buyEntrySignalTiming,
+  );
+  config.sellEntrySignalTiming = normalizeExtremaSignalTiming(
+    config.sellEntrySignalTiming,
+  );
+  config.buyExitSignalTiming = normalizeExtremaSignalTiming(
+    config.buyExitSignalTiming,
+  );
+  config.sellExitSignalTiming = normalizeExtremaSignalTiming(
+    config.sellExitSignalTiming,
+  );
   config.derivativeClampInnerThresholdRatio = clamp(
     Number.isFinite(config.derivativeClampInnerThresholdRatio)
       ? config.derivativeClampInnerThresholdRatio
@@ -534,8 +551,20 @@ export function evaluateLegacyValleyPeak(
   const feeAdjustedBuyRate = input.price / (1 - input.feeRate);
   const feeAdjustedSellRate = input.price * (1 - input.feeRate);
 
-  const buyEntryPassed = shouldBuy(memory, config, config.buyConfirmationOffsets, input);
-  const buyExitPassed = shouldBuy(memory, config, config.buyExitConfirmationOffsets, input);
+  const buyEntryPassed = shouldBuy(
+    memory,
+    config,
+    config.buyConfirmationOffsets,
+    config.buyEntrySignalTiming,
+    input,
+  );
+  const buyExitPassed = shouldBuy(
+    memory,
+    config,
+    config.buyExitConfirmationOffsets,
+    config.buyExitSignalTiming,
+    input,
+  );
   if (buyEntryPassed || buyExitPassed) {
     const quoteSize = buyQuoteSize(memory, config, input, feeAdjustedBuyRate);
     const coverQuantity = buyCoverQuantity(memory, config, input, feeAdjustedBuyRate);
@@ -562,8 +591,20 @@ export function evaluateLegacyValleyPeak(
     }
   }
 
-  const sellEntryPassed = shouldSell(memory, config, config.sellConfirmationOffsets, input);
-  const sellExitPassed = shouldSell(memory, config, config.sellExitConfirmationOffsets, input);
+  const sellEntryPassed = shouldSell(
+    memory,
+    config,
+    config.sellConfirmationOffsets,
+    config.sellEntrySignalTiming,
+    input,
+  );
+  const sellExitPassed = shouldSell(
+    memory,
+    config,
+    config.sellExitConfirmationOffsets,
+    config.sellExitSignalTiming,
+    input,
+  );
   if (sellEntryPassed || sellExitPassed) {
     const quantity = sellQuantity(memory, config, input, feeAdjustedSellRate);
     const quoteSize = shortSellQuoteSize(memory, config, input, feeAdjustedSellRate);
@@ -884,8 +925,8 @@ export function createLegacyValleyPeakDebugSnapshot(
         ) || config.sellExitConfirmationOffsets.some(
           (offset) => index === config.sellDataIndex + offset,
         ),
-        valley: isValley(memory.buyAverages[index]),
-        peak: isPeak(memory.sellAverages[index]),
+        valley: isValley(memory.buyAverages[index], "start"),
+        peak: isPeak(memory.sellAverages[index], "start"),
       };
     }),
     candleRanges: config.averagingRangesSec.map((windowSec, index) => {
@@ -923,6 +964,7 @@ export function createLegacyValleyPeakDebugSnapshot(
       input,
       feeAdjustedBuyRate,
       config.buyConfirmationOffsets,
+      config.buyEntrySignalTiming,
     ),
     sellCheck: buildLegacyValleyPeakCheckDebug(
       "sell",
@@ -931,6 +973,7 @@ export function createLegacyValleyPeakDebugSnapshot(
       input,
       feeAdjustedSellRate,
       config.sellConfirmationOffsets,
+      config.sellEntrySignalTiming,
     ),
     buyExitCheck: buildLegacyValleyPeakCheckDebug(
       "buy",
@@ -939,6 +982,7 @@ export function createLegacyValleyPeakDebugSnapshot(
       input,
       feeAdjustedBuyRate,
       config.buyExitConfirmationOffsets,
+      config.buyExitSignalTiming,
     ),
     sellExitCheck: buildLegacyValleyPeakCheckDebug(
       "sell",
@@ -947,6 +991,7 @@ export function createLegacyValleyPeakDebugSnapshot(
       input,
       feeAdjustedSellRate,
       config.sellExitConfirmationOffsets,
+      config.sellExitSignalTiming,
     ),
   };
 }
@@ -955,10 +1000,11 @@ function shouldBuy(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   confirmationOffsets: number[],
+  timing: LegacyExtremaSignalTiming,
   input?: LegacyValleyPeakInput,
 ): boolean {
   const primary = primarySignalMemory("buy", memory, config);
-  if (!isValley(primary)) {
+  if (!isValley(primary, timing)) {
     return false;
   }
 
@@ -988,10 +1034,11 @@ function shouldSell(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
   confirmationOffsets: number[],
+  timing: LegacyExtremaSignalTiming,
   input?: LegacyValleyPeakInput,
 ): boolean {
   const primary = primarySignalMemory("sell", memory, config);
-  if (!isPeak(primary)) {
+  if (!isPeak(primary, timing)) {
     return false;
   }
 
@@ -1024,15 +1071,16 @@ function buildLegacyValleyPeakCheckDebug(
   input: LegacyValleyPeakInput,
   rate: number,
   confirmationOffsets: number[],
+  timing: LegacyExtremaSignalTiming,
 ): LegacyValleyPeakCheckDebug {
   const primaryIndex = side === "buy" ? config.buyDataIndex : config.sellDataIndex;
   const primary = primarySignalMemory(side, memory, config);
   const primaryPoint = latestPoint(primary);
   const primaryShape = !primaryPoint
     ? "missing"
-    : side === "buy" && isValley(primary)
+    : side === "buy" && isValley(primary, timing)
       ? "valley"
-      : side === "sell" && isPeak(primary)
+      : side === "sell" && isPeak(primary, timing)
         ? "peak"
         : "flat";
   const pricePrediction = predictAnticipatoryConfirmationExtremum(memory, config, input);
@@ -1078,7 +1126,7 @@ function buildLegacyValleyPeakCheckDebug(
   if (side === "buy") {
     return {
       side,
-      passed: shouldBuy(memory, config, confirmationOffsets, input),
+      passed: shouldBuy(memory, config, confirmationOffsets, timing, input),
       primaryIndex,
       primaryWindowSec: config.averagingRangesSec[primaryIndex],
       primaryRate: primaryPoint?.rate,
@@ -1095,7 +1143,7 @@ function buildLegacyValleyPeakCheckDebug(
 
   return {
     side,
-    passed: shouldSell(memory, config, confirmationOffsets, input),
+    passed: shouldSell(memory, config, confirmationOffsets, timing, input),
     primaryIndex,
     primaryWindowSec: config.averagingRangesSec[primaryIndex],
     primaryRate: primaryPoint?.rate,
@@ -2156,16 +2204,52 @@ function sampleAverage(
   return interpolate(prev, next, fraction);
 }
 
-function isValley(memory: RollingAverageMemory | undefined): boolean {
+function isValley(
+  memory: RollingAverageMemory | undefined,
+  timing: LegacyExtremaSignalTiming,
+): boolean {
+  return timing === "start" ? isValleyStart(memory) : isValleyEnd(memory);
+}
+
+function isPeak(
+  memory: RollingAverageMemory | undefined,
+  timing: LegacyExtremaSignalTiming,
+): boolean {
+  return timing === "start" ? isPeakStart(memory) : isPeakEnd(memory);
+}
+
+function isValleyStart(memory: RollingAverageMemory | undefined): boolean {
   const latest = latestPoint(memory);
   const previous = previousPoint(memory);
   return Boolean(latest && previous && latest.rateClamped >= 0 && previous.rateClamped < 0);
 }
 
-function isPeak(memory: RollingAverageMemory | undefined): boolean {
+function isValleyEnd(memory: RollingAverageMemory | undefined): boolean {
+  const latest = latestPoint(memory);
+  const previous = previousPoint(memory);
+  return Boolean(
+    latest &&
+    previous &&
+    latest.rateClamped > 0 &&
+    previous.rateClamped <= 0,
+  );
+}
+
+function isPeakStart(memory: RollingAverageMemory | undefined): boolean {
   const latest = latestPoint(memory);
   const previous = previousPoint(memory);
   return Boolean(latest && previous && latest.rateClamped <= 0 && previous.rateClamped > 0);
+}
+
+function isPeakEnd(memory: RollingAverageMemory | undefined): boolean {
+  const latest = latestPoint(memory);
+  const previous = previousPoint(memory);
+  return Boolean(
+    latest &&
+    previous &&
+    latest.rateClamped < 0 &&
+    previous.rateClamped >= 0,
+  );
 }
 
 function latestPoint(memory: RollingAverageMemory | undefined): RollingAveragePoint | undefined {
@@ -2620,6 +2704,12 @@ function normalizeRelativeRate(value: number, fallback: number): number {
   }
 
   return value;
+}
+
+function normalizeExtremaSignalTiming(
+  value: LegacyExtremaSignalTiming | undefined,
+): LegacyExtremaSignalTiming {
+  return value === "end" ? "end" : "start";
 }
 
 function padNumbers(values: number[], length: number, fallback: number): number[] {

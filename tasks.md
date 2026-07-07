@@ -36,12 +36,6 @@ try ema instead of sma
 
 Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size. maybw makes sense for exit as well.
 
-Before transitioning trend to sideways we wait until rate crosses 0. Then if it gets through either rate threshold or absolute threshold relative to point when we entered sideways trend, then we transition into directional trend. The qbs threshold is about the size of fees
-
-0.1	0.3	0/999 both sides swings from +16 on 0/0 to -20.67%
-0.3	0.3	0/0 both sides suddenly drops even more to -41.81%, the deeper borrows only make things worse up to -60.73% in 999/0 case. the 0.1 case is basically the same but scaled down.
-the best results are short-side only - 0.3 sigma with +21.02%, and 0.1 sigma with +4.31%. buy sigma and depth are irrelevant here, since longs are not created at all.
-
 sell sigma=b+a*ln(e^x+c), a some constant, x derivative of higher level sma
 buy sigma=b+a*ln(e^-x+c)
 
@@ -123,6 +117,9 @@ add "parallel" giid strategy that would place limit orders with fixed interval b
 
 the single side case need an interpretation to be cleared. because it simply controls how large the orders are based on current trend strength.
 
+
+the lots state should be in bot strategy layer, updated on each signal/related order executoin. on entry we create lot with specified parameters once we successfully executed order. on exit we close the lot, partially or fully depending on exit grid execution state. the resulting state is persisted. it should not need be reconciled/reconstructed from history, but saved and restored as part of live bot state.
+
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
   - the optimal strategy will maximize utility from peaks and valleys, while avoiding loosing too much profit on fees.
@@ -147,6 +144,8 @@ TRADING_WEB_PORT=4174 TRADING_BACKEND_URL=http://207.180.247.128:3002 pm2 restar
 PORT=3001 TRADING_DATA_DIR=/var/lib/trading/prod TRADING_MARKET_ID=usdm-futures:SOLUSDT TRADING_SHORT_MARGIN_MODEL=futures-margin TRADING_MAX_LEVERAGE=100 TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP=false TRADING_STARTING_QUOTE=50 pm2 restart trading-server-prod --update-env
 
 TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://207.180.247.128:3001 pm2 restart trading-web-prod --update-env
+
+pm2 restart trading-server trading-web trading-server-prod trading-web-prod --update-env
 
 PORT=3001 TRADING_DATA_DIR=/var/lib/trading/prod npm run start -w @trading/server
 TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://127.0.0.1:3001 npm run start -w @trading/web

@@ -45,6 +45,8 @@ export type LegacyDerivativeSource = "price" | "kama";
 
 export type LegacyDerivativeClampMode = "deadband" | "hysteresis";
 
+export type LegacyExtremaSignalTiming = "start" | "end";
+
 export type RollingPriceRangeWindow = "1y" | "3m" | "2w";
 
 export interface PriceTick {
@@ -140,6 +142,10 @@ export interface LegacyValleyPeakConfig {
   sellConfirmationOffsets: number[];
   buyExitConfirmationOffsets: number[];
   sellExitConfirmationOffsets: number[];
+  buyEntrySignalTiming: LegacyExtremaSignalTiming;
+  sellEntrySignalTiming: LegacyExtremaSignalTiming;
+  buyExitSignalTiming: LegacyExtremaSignalTiming;
+  sellExitSignalTiming: LegacyExtremaSignalTiming;
   saturationSec: number;
   buySpendRate: number;
   sellAmountRate: number;
