@@ -877,10 +877,40 @@ export interface BacktestChartAnnotation {
   targetPositionId?: string;
 }
 
+export interface BacktestReplayFrame {
+  time: number;
+  price: number;
+  metrics: BotMetrics;
+  quoteFree: number;
+  quoteReserved: number;
+  baseFree: number;
+  baseReserved: number;
+  avgEntryPrice: number;
+  avgShortEntryPrice: number;
+  openOrders: TradingOrder[];
+  openOrderCount: number;
+  truncatedOpenOrderCount?: number;
+  positions: PositionLedger;
+  longLotCount: number;
+  shortLotCount: number;
+  truncatedLongLotCount?: number;
+  truncatedShortLotCount?: number;
+  entrySignal?: BotSignal;
+  exitSignal?: BotSignal;
+  entryReason?: string;
+  exitReason?: string;
+  marketState?: LegacyMarketStateDebug;
+  lastExtremaSignal?: Exclude<BotSignal, "hold">;
+  lastExtremaSignalAt?: number;
+  lastExtremaSignalPrice?: number;
+  lastExtremaSignalReason?: string;
+}
+
 export interface BacktestCandleChart {
   candles: Candle[];
   smaSeries: BacktestChartSmaSeries[];
   annotations: BacktestChartAnnotation[];
+  frames?: BacktestReplayFrame[];
 }
 
 export interface BacktestResult {

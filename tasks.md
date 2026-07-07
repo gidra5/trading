@@ -96,6 +96,14 @@ add "parallel" giid strategy that would place limit orders with fixed interval b
 
 the lots state should be in bot strategy layer, updated on each signal/related order executoin. on entry we create lot with specified parameters once we successfully executed order. on exit we close the lot, partially or fully depending on exit grid execution state. the resulting state is persisted. it should not need be reconciled/reconstructed from history, but saved and restored as part of live bot state.
 
+also estimate peaks/valleys based on orderbook depth. identify support/resistance levels based on order concentration and predict extrema around them.
+
+add less restricted anticipation, where it can place limit orders up to predicted extrema in a grid. lets say there is also an anticipation window, when set to 0 will be equivalent to disabling it. run tests with 5min window
+
+the limit grid is an position entry grid. it exists and reseerves capital up until we can create exit grid (so when we cross break even in favorable direction). for now les use fixed size for the whole grid and only use usual logic when at the actual entry signal
+
+we may also use anticipation for exit grid. in that case we generate price grid as if we were at the extrema already, and make orders above current price as regular limit orders, while the ones below are stop-market orders.
+
 - develop strategy
   - while we can attempt to define them mechanically, the market is inherently unpredictable, so it makes sense to approach it with ml - train a model to decide buy/sell/size signals that maximize profit.
   - the optimal strategy will maximize utility from peaks and valleys, while avoiding loosing too much profit on fees.

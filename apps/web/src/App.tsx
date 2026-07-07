@@ -18,8 +18,10 @@ import {
 import type {
   BacktestCandleChart,
   BacktestChartAnnotation,
+  BacktestReplayFrame,
   BacktestExtremaOrderMassSideSummary,
   BotEvent,
+  Candle,
   LegacyEntryRiskDebug,
   LegacyMarketStateDebug,
   LegacyValleyPeakCheckDebug,
@@ -32,7 +34,7 @@ import type {
   TradeFill,
   TradingOrder,
 } from "@trading/bot-algo";
-import { CandleChart } from "./components/CandleChart";
+import { CandleChart, type CandleChartViewport } from "./components/CandleChart";
 import { EquityChart } from "./components/EquityChart";
 import {
   formatAsset,
@@ -739,6 +741,8 @@ export function App() {
           <MetricCard label="Open Orders" value={openOrders().length.toString()} />
         </section>
 
+        <LiveEquityPanel points={liveEquityCurve()} />
+
         <AlgorithmPanel
           config={configDraft()}
           marketMaxLeverage={market()?.maxLeverage}
@@ -814,21 +818,18 @@ export function App() {
           onRecordTrade={recordManualTrade}
         />
 
-        <section class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
-          <BacktestPanel
-            preset={backtestPreset()}
-            onPresetChange={setBacktestPreset}
-            settings={backtestSettings()}
-            onSettingChange={updateBacktestSetting}
-            progress={backtest()}
-            error={backtestError()}
-            liveStartAt={botRunStartedAt()}
-            onRun={() => void runBacktest()}
-            onRunFromLiveStart={() => void runBacktest(botRunStartedAt())}
-            onStop={() => void stopBacktest()}
-          />
-          <LiveEquityPanel points={liveEquityCurve()} />
-        </section>
+        <BacktestPanel
+          preset={backtestPreset()}
+          onPresetChange={setBacktestPreset}
+          settings={backtestSettings()}
+          onSettingChange={updateBacktestSetting}
+          progress={backtest()}
+          error={backtestError()}
+          liveStartAt={botRunStartedAt()}
+          onRun={() => void runBacktest()}
+          onRunFromLiveStart={() => void runBacktest(botRunStartedAt())}
+          onStop={() => void stopBacktest()}
+        />
       </div>
     </main>
   );
@@ -4443,17 +4444,334 @@ function BacktestPanel(props: {
   );
 }
 
+type BacktestReplayMetricKey =
+  | "price"
+  | "equity"
+  | "netPnl"
+  | "returnPct"
+  | "realizedPnl"
+  | "unrealizedPnl"
+  | "drawdownPct"
+  | "exposurePct"
+  | "maxEffectiveLeverage"
+  | "feesPaid"
+  | "tradeCount"
+  | "winRate"
+  | "quoteFree"
+  | "quoteReserved"
+  | "baseFree"
+  | "baseReserved"
+  | "openOrderCount"
+  | "longLotCount"
+  | "shortLotCount"
+  | "longQuantity"
+  | "shortQuantity"
+  | "netExposureQuote"
+  | "grossExposureQuote"
+  | "effectiveLeverage"
+  | "longExposureQuote"
+  | "shortExposureQuote"
+  | "pendingLongQuote"
+  | "pendingShortQuote";
+
+interface BacktestReplayMetricDefinition {
+  key: BacktestReplayMetricKey;
+  label: string;
+  group: "account" | "risk" | "balances" | "activity" | "positions";
+  color: string;
+  value: (frame: BacktestReplayFrame) => number | undefined;
+  format: (value: number | undefined) => string;
+}
+
+const backtestReplayMetrics: BacktestReplayMetricDefinition[] = [
+  {
+    key: "price",
+    label: "Price",
+    group: "account",
+    color: "#38bdf8",
+    value: (frame) => frame.price,
+    format: (value) => `$${formatQuote(value, 4)}`,
+  },
+  {
+    key: "equity",
+    label: "Equity",
+    group: "account",
+    color: "#22c55e",
+    value: (frame) => frame.metrics.equity,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "netPnl",
+    label: "Net PnL",
+    group: "account",
+    color: "#f5b84b",
+    value: (frame) => frame.metrics.netPnl,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "returnPct",
+    label: "Return",
+    group: "account",
+    color: "#a78bfa",
+    value: (frame) => frame.metrics.returnPct,
+    format: formatPercent,
+  },
+  {
+    key: "realizedPnl",
+    label: "Realized",
+    group: "account",
+    color: "#14b8a6",
+    value: (frame) => frame.metrics.realizedPnl,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "unrealizedPnl",
+    label: "Unrealized",
+    group: "account",
+    color: "#eab308",
+    value: (frame) => frame.metrics.unrealizedPnl,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "drawdownPct",
+    label: "Drawdown",
+    group: "risk",
+    color: "#f05252",
+    value: (frame) => frame.metrics.maxDrawdownPct,
+    format: formatPercent,
+  },
+  {
+    key: "exposurePct",
+    label: "Exposure",
+    group: "risk",
+    color: "#fb7185",
+    value: (frame) => frame.metrics.exposurePct,
+    format: formatPercent,
+  },
+  {
+    key: "maxEffectiveLeverage",
+    label: "Max Eff Lev",
+    group: "risk",
+    color: "#f97316",
+    value: (frame) => frame.metrics.maxEffectiveLeverage,
+    format: formatLeverage,
+  },
+  {
+    key: "feesPaid",
+    label: "Fees",
+    group: "account",
+    color: "#94a3b8",
+    value: (frame) => frame.metrics.feesPaid,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "tradeCount",
+    label: "Trades",
+    group: "activity",
+    color: "#60a5fa",
+    value: (frame) => frame.metrics.tradeCount,
+    format: (value) => formatQuote(value, 0),
+  },
+  {
+    key: "winRate",
+    label: "Win Rate",
+    group: "activity",
+    color: "#4ade80",
+    value: (frame) => frame.metrics.winRate,
+    format: formatPercent,
+  },
+  {
+    key: "quoteFree",
+    label: "Quote Free",
+    group: "balances",
+    color: "#22c55e",
+    value: (frame) => frame.quoteFree,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "quoteReserved",
+    label: "Quote Reserved",
+    group: "balances",
+    color: "#84cc16",
+    value: (frame) => frame.quoteReserved,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "baseFree",
+    label: "Base Free",
+    group: "balances",
+    color: "#2dd4bf",
+    value: (frame) => frame.baseFree,
+    format: formatAsset,
+  },
+  {
+    key: "baseReserved",
+    label: "Base Reserved",
+    group: "balances",
+    color: "#67e8f9",
+    value: (frame) => frame.baseReserved,
+    format: formatAsset,
+  },
+  {
+    key: "openOrderCount",
+    label: "Open Orders",
+    group: "activity",
+    color: "#38bdf8",
+    value: (frame) => frame.openOrderCount,
+    format: (value) => formatQuote(value, 0),
+  },
+  {
+    key: "longLotCount",
+    label: "Long Lots",
+    group: "activity",
+    color: "#22c55e",
+    value: (frame) => frame.longLotCount,
+    format: (value) => formatQuote(value, 0),
+  },
+  {
+    key: "shortLotCount",
+    label: "Short Lots",
+    group: "activity",
+    color: "#f05252",
+    value: (frame) => frame.shortLotCount,
+    format: (value) => formatQuote(value, 0),
+  },
+  {
+    key: "longQuantity",
+    label: "Long Qty",
+    group: "positions",
+    color: "#22c55e",
+    value: (frame) => frame.positions.summary.longQuantity,
+    format: formatAsset,
+  },
+  {
+    key: "shortQuantity",
+    label: "Short Qty",
+    group: "positions",
+    color: "#f05252",
+    value: (frame) => frame.positions.summary.shortQuantity,
+    format: formatAsset,
+  },
+  {
+    key: "netExposureQuote",
+    label: "Net Exposure",
+    group: "positions",
+    color: "#f5b84b",
+    value: (frame) => frame.positions.summary.netExposureQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "grossExposureQuote",
+    label: "Gross Exposure",
+    group: "positions",
+    color: "#a78bfa",
+    value: (frame) => frame.positions.summary.grossExposureQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "effectiveLeverage",
+    label: "Effective Lev",
+    group: "risk",
+    color: "#f97316",
+    value: (frame) => frame.positions.summary.effectiveLeverage,
+    format: formatLeverage,
+  },
+  {
+    key: "longExposureQuote",
+    label: "Long Exposure",
+    group: "positions",
+    color: "#16a34a",
+    value: (frame) => frame.positions.summary.longExposureQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "shortExposureQuote",
+    label: "Short Exposure",
+    group: "positions",
+    color: "#dc2626",
+    value: (frame) => frame.positions.summary.shortExposureQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "pendingLongQuote",
+    label: "Pending Long",
+    group: "positions",
+    color: "#86efac",
+    value: (frame) => frame.positions.summary.pendingLongQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+  {
+    key: "pendingShortQuote",
+    label: "Pending Short",
+    group: "positions",
+    color: "#fca5a5",
+    value: (frame) => frame.positions.summary.pendingShortQuote,
+    format: (value) => `$${formatQuote(value, 2)}`,
+  },
+];
+
+const backtestReplayMetricByKey = new Map(
+  backtestReplayMetrics.map((metric) => [metric.key, metric]),
+);
+
 function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
-  const annotations = () => props.chart.annotations.slice(-18).reverse();
+  const [selectedTime, setSelectedTime] = createSignal<number>();
+  const [chartViewport, setChartViewport] = createSignal<CandleChartViewport>();
+  const [selectedMetricKey, setSelectedMetricKey] =
+    createSignal<BacktestReplayMetricKey>("equity");
+  let chartKey = "";
+
+  createEffect(() => {
+    const first = props.chart.candles[0]?.openTime ?? 0;
+    const last = props.chart.candles.at(-1)?.closeTime ?? 0;
+    const nextKey = `${props.chart.candles.length}:${first}:${last}:${
+      props.chart.frames?.length ?? 0
+    }`;
+    if (nextKey === chartKey) {
+      return;
+    }
+
+    chartKey = nextKey;
+    setSelectedTime(props.chart.frames?.at(-1)?.time ?? (last || undefined));
+    setChartViewport(undefined);
+  });
+
+  const selectedMetric = createMemo(
+    () =>
+      backtestReplayMetricByKey.get(selectedMetricKey()) ??
+      backtestReplayMetrics[0],
+  );
+  const selectedCandle = createMemo(() =>
+    findReplayCandle(props.chart.candles, selectedTime()),
+  );
+  const selectedFrame = createMemo(() =>
+    findReplayFrame(props.chart.frames ?? [], selectedTime()),
+  );
+  const selectedAnnotations = createMemo(() => {
+    const candle = selectedCandle();
+    return candle ? replayAnnotationsForCandle(props.chart.annotations, candle) : [];
+  });
 
   return (
     <div class="mt-4 rounded-2 bg-ink-800 p-3">
       <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <div class="muted-label">Replay Candles</div>
-          <h3 class="text-base font-semibold">Annotated Replay</h3>
+          <div class="muted-label">Replay Mode</div>
+          <h3 class="text-base font-semibold">Backtest Behavior Replay</h3>
+          <div class="mt-1 text-xs text-ink-300">
+            {formatQuote(props.chart.candles.length, 0)} candles ·{" "}
+            {formatQuote(props.chart.annotations.length, 0)} events ·{" "}
+            {formatQuote(props.chart.frames?.length, 0)} state frames
+          </div>
         </div>
-        <div class="flex flex-wrap gap-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <Show when={selectedCandle()}>
+            {(candle) => (
+              <span class="rounded-2 border border-line bg-ink-900 px-2.5 py-1 text-xs tabular-nums text-ink-200">
+                {formatDateTime(candle().openTime)} · close ${formatQuote(candle().close, 4)}
+              </span>
+            )}
+          </Show>
           <For each={props.chart.smaSeries}>
             {(series) => (
               <span class="inline-flex items-center gap-1 text-xs text-ink-300">
@@ -4467,25 +4785,515 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           </For>
         </div>
       </div>
-      <div class="h-96">
+      <div class="h-110 lg:h-[560px]">
         <CandleChart
           candles={props.chart.candles}
           orders={[]}
-          lastPrice={props.chart.candles.at(-1)?.close ?? 0}
+          lastPrice={selectedFrame()?.price ?? props.chart.candles.at(-1)?.close ?? 0}
           smaSeries={props.chart.smaSeries}
           annotations={props.chart.annotations}
+          selectedTime={selectedTime()}
+          viewport={chartViewport()}
+          onSelectionChange={(selection) => setSelectedTime(selection?.time)}
+          onViewportChange={setChartViewport}
           maxCandles={0}
           interactive
           emptyLabel="No replay candles"
         />
       </div>
-      <div class="mt-3 grid grid-cols-1 gap-2 lg:grid-cols-2">
+
+      <div class="mt-3">
+        <BacktestReplayMetricPicker
+          frame={selectedFrame()}
+          selectedKey={selectedMetric().key}
+          onSelect={setSelectedMetricKey}
+        />
+      </div>
+
+      <div class="mt-3 h-48 lg:h-56">
+        <BacktestReplayMetricChart
+          candles={props.chart.candles}
+          frames={props.chart.frames ?? []}
+          metric={selectedMetric()}
+          selectedTime={selectedTime()}
+          viewport={chartViewport()}
+          onSelectionTimeChange={setSelectedTime}
+        />
+      </div>
+
+      <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)_minmax(0,1fr)]">
+        <BacktestReplayCandlePanel candle={selectedCandle()} annotations={selectedAnnotations()} />
+        <BacktestReplayStatePanel
+          frame={selectedFrame()}
+          selectedMetricKey={selectedMetric().key}
+          onMetricSelect={setSelectedMetricKey}
+        />
+        <BacktestReplayPositionPanel
+          frame={selectedFrame()}
+          selectedMetricKey={selectedMetric().key}
+          onMetricSelect={setSelectedMetricKey}
+        />
+      </div>
+
+      <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-2">
+        <BacktestReplayEventsPanel annotations={selectedAnnotations()} />
+        <BacktestReplayOrdersAndLotsPanel frame={selectedFrame()} />
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayCandlePanel(props: {
+  candle?: Candle;
+  annotations: BacktestChartAnnotation[];
+}) {
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Selected Candle</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            {formatDateTime(props.candle?.openTime)}
+          </div>
+        </div>
+        <span class="text-xs tabular-nums text-ink-300">
+          {formatQuote(props.annotations.length, 0)} events
+        </span>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <SmallMetric label="Open" value={`$${formatQuote(props.candle?.open, 4)}`} />
+        <SmallMetric label="Close" value={`$${formatQuote(props.candle?.close, 4)}`} />
+        <SmallMetric label="High" value={`$${formatQuote(props.candle?.high, 4)}`} />
+        <SmallMetric label="Low" value={`$${formatQuote(props.candle?.low, 4)}`} />
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayMetricPicker(props: {
+  frame?: BacktestReplayFrame;
+  selectedKey: BacktestReplayMetricKey;
+  onSelect: (key: BacktestReplayMetricKey) => void;
+}) {
+  const groups: Array<BacktestReplayMetricDefinition["group"]> = [
+    "account",
+    "risk",
+    "positions",
+    "balances",
+    "activity",
+  ];
+
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Metric Chart</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            {backtestReplayMetricByKey.get(props.selectedKey)?.label ?? "Metric"}
+          </div>
+        </div>
+        <span class="text-xs text-ink-300">Click a metric to plot it</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <For each={groups}>
+          {(group) => (
+            <div class="flex min-w-0 flex-wrap items-center gap-2">
+              <span class="w-18 text-xs uppercase tracking-wide text-ink-400">{group}</span>
+              <For each={backtestReplayMetrics.filter((metric) => metric.group === group)}>
+                {(metric) => (
+                  <button
+                    class="inline-flex min-h-8 items-center gap-2 rounded-2 border px-2.5 py-1 text-xs font-semibold tabular-nums transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/45"
+                    classList={{
+                      "border-accent bg-accent/14 text-ink-100": props.selectedKey === metric.key,
+                      "border-line bg-ink-800 text-ink-300 hover:border-accent/70 hover:text-ink-100":
+                        props.selectedKey !== metric.key,
+                    }}
+                    type="button"
+                    onClick={() => props.onSelect(metric.key)}
+                  >
+                    <span
+                      class="h-2 w-2 rounded-full"
+                      style={{ "background-color": metric.color }}
+                    />
+                    {metric.label}
+                    <span class="font-normal text-ink-400">
+                      {metric.format(props.frame ? metric.value(props.frame) : undefined)}
+                    </span>
+                  </button>
+                )}
+              </For>
+            </div>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayMetricButton(props: {
+  metricKey: BacktestReplayMetricKey;
+  frame?: BacktestReplayFrame;
+  selected: boolean;
+  onSelect: (key: BacktestReplayMetricKey) => void;
+}) {
+  const metric = () => backtestReplayMetricByKey.get(props.metricKey);
+  const value = () => {
+    const item = metric();
+    return item?.format(props.frame ? item.value(props.frame) : undefined) ?? "-";
+  };
+
+  return (
+    <button
+      class="rounded-2 border bg-ink-800 p-3 text-left transition hover:border-accent/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/45"
+      classList={{
+        "border-accent shadow-[inset_0_0_0_1px_rgba(56,189,248,0.32)]": props.selected,
+        "border-transparent": !props.selected,
+      }}
+      type="button"
+      onClick={() => props.onSelect(props.metricKey)}
+    >
+      <div class="flex items-center gap-2">
+        <span
+          class="h-2 w-2 rounded-full"
+          style={{ "background-color": metric()?.color ?? "#38bdf8" }}
+        />
+        <div class="muted-label">{metric()?.label ?? props.metricKey}</div>
+      </div>
+      <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">{value()}</div>
+    </button>
+  );
+}
+
+function BacktestReplayMetricChart(props: {
+  candles: Candle[];
+  frames: BacktestReplayFrame[];
+  metric: BacktestReplayMetricDefinition;
+  selectedTime?: number;
+  viewport?: CandleChartViewport;
+  onSelectionTimeChange: (time: number) => void;
+}) {
+  let canvas!: HTMLCanvasElement;
+  let observer: ResizeObserver | undefined;
+
+  const draw = () => {
+    if (!canvas) {
+      return;
+    }
+
+    const parent = canvas.parentElement;
+    const width = Math.max(320, parent?.clientWidth ?? canvas.clientWidth);
+    const height = Math.max(160, parent?.clientHeight ?? canvas.clientHeight);
+    const ratio = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(width * ratio);
+    canvas.height = Math.floor(height * ratio);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#101217";
+    ctx.fillRect(0, 0, width, height);
+
+    const range = replayMetricTimeRange(props.candles, props.viewport);
+    if (!range || props.frames.length < 2) {
+      drawReplayMetricEmpty(ctx, width, height, "No replay metric samples");
+      return;
+    }
+
+    const points = props.frames
+      .map((frame) => ({
+        time: frame.time,
+        value: props.metric.value(frame),
+      }))
+      .filter(
+        (point): point is { time: number; value: number } =>
+          point.time >= range.startTime &&
+          point.time <= range.endTime &&
+          Number.isFinite(point.value),
+      );
+
+    if (points.length < 2) {
+      drawReplayMetricEmpty(ctx, width, height, "No samples in visible range");
+      return;
+    }
+
+    const values = points.map((point) => point.value);
+    let min = Math.min(...values);
+    let max = Math.max(...values);
+    if (min === max) {
+      const pad = Math.max(Math.abs(max) * 0.01, 1);
+      min -= pad;
+      max += pad;
+    }
+
+    const padding = Math.max((max - min) * 0.08, Math.abs(max) * 0.0005, 0.000001);
+    const low = min - padding;
+    const high = max + padding;
+    const plot = replayMetricPlotBounds(width, height);
+    const xFor = (time: number) =>
+      plot.left + ((time - range.startTime) / Math.max(1, range.endTime - range.startTime)) *
+        (plot.right - plot.left);
+    const yFor = (value: number) =>
+      plot.top + ((high - value) / Math.max(0.000001, high - low)) *
+        (plot.bottom - plot.top);
+
+    drawReplayMetricGrid(ctx, width, height, plot, low, high, props.metric.format, yFor);
+    drawReplayMetricLine(ctx, points, plot, xFor, yFor, props.metric.color);
+    drawReplayMetricSelection(ctx, props.metric, points, plot, xFor, yFor, props.selectedTime);
+  };
+
+  createEffect(() => {
+    props.frames.length;
+    props.metric.key;
+    props.selectedTime;
+    props.viewport?.start;
+    props.viewport?.end;
+    props.candles.length;
+    draw();
+  });
+
+  onMount(() => {
+    observer = new ResizeObserver(draw);
+    observer.observe(canvas.parentElement ?? canvas);
+    draw();
+  });
+
+  onCleanup(() => observer?.disconnect());
+
+  const selectAtOffset = (offsetX: number) => {
+    const range = replayMetricTimeRange(props.candles, props.viewport);
+    if (!range) {
+      return;
+    }
+
+    const plot = replayMetricPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const normalized = clampNumber(
+      (offsetX - plot.left) / Math.max(1, plot.right - plot.left),
+      0,
+      1,
+    );
+    const targetTime = range.startTime + normalized * (range.endTime - range.startTime);
+    const frame = findReplayFrame(props.frames, targetTime);
+    if (frame) {
+      props.onSelectionTimeChange(frame.time);
+    }
+  };
+
+  return (
+    <canvas
+      ref={canvas}
+      class="h-full min-h-40 w-full rounded-2 outline-none focus-visible:ring-2 focus-visible:ring-accent/45"
+      tabIndex={0}
+      title="Click or move across the chart to inspect that timestamp."
+      onPointerDown={(event) => selectAtOffset(event.offsetX)}
+      onPointerMove={(event) => {
+        if (event.buttons === 1) {
+          selectAtOffset(event.offsetX);
+        }
+      }}
+    />
+  );
+}
+
+function BacktestReplayStatePanel(props: {
+  frame?: BacktestReplayFrame;
+  selectedMetricKey: BacktestReplayMetricKey;
+  onMetricSelect: (key: BacktestReplayMetricKey) => void;
+}) {
+  const frame = () => props.frame;
+
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Bot State</div>
+        <div class="mt-1 text-sm font-semibold text-ink-100">
+          {formatDateTime(frame()?.time)}
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-2 lg:grid-cols-3">
+        <BacktestReplayMetricButton
+          metricKey="equity"
+          frame={frame()}
+          selected={props.selectedMetricKey === "equity"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="returnPct"
+          frame={frame()}
+          selected={props.selectedMetricKey === "returnPct"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="exposurePct"
+          frame={frame()}
+          selected={props.selectedMetricKey === "exposurePct"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="drawdownPct"
+          frame={frame()}
+          selected={props.selectedMetricKey === "drawdownPct"}
+          onSelect={props.onMetricSelect}
+        />
+        <SmallMetric label="Entry" value={replaySignalLabel(frame()?.entrySignal)} />
+        <SmallMetric label="Exit" value={replaySignalLabel(frame()?.exitSignal)} />
+        <BacktestReplayMetricButton
+          metricKey="quoteFree"
+          frame={frame()}
+          selected={props.selectedMetricKey === "quoteFree"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="baseFree"
+          frame={frame()}
+          selected={props.selectedMetricKey === "baseFree"}
+          onSelect={props.onMetricSelect}
+        />
+        <SmallMetric label="Market" value={frame()?.marketState?.state ?? "-"} />
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayPositionPanel(props: {
+  frame?: BacktestReplayFrame;
+  selectedMetricKey: BacktestReplayMetricKey;
+  onMetricSelect: (key: BacktestReplayMetricKey) => void;
+}) {
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Positions</div>
+        <div class="mt-1 text-sm font-semibold text-ink-100">
+          {formatQuote(props.frame?.longLotCount, 0)} long lots ·{" "}
+          {formatQuote(props.frame?.shortLotCount, 0)} short lots
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-2 lg:grid-cols-3">
+        <BacktestReplayMetricButton
+          metricKey="longQuantity"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "longQuantity"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="shortQuantity"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "shortQuantity"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="netExposureQuote"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "netExposureQuote"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="grossExposureQuote"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "grossExposureQuote"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="effectiveLeverage"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "effectiveLeverage"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="openOrderCount"
+          frame={props.frame}
+          selected={props.selectedMetricKey === "openOrderCount"}
+          onSelect={props.onMetricSelect}
+        />
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayEventsPanel(props: { annotations: BacktestChartAnnotation[] }) {
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Selected Events</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            Signals, orders, fills
+          </div>
+        </div>
+        <span class="text-xs tabular-nums text-ink-300">
+          {formatQuote(props.annotations.length, 0)}
+        </span>
+      </div>
+      <div class="max-h-72 space-y-2 overflow-auto pr-1">
         <For
-          each={annotations()}
-          fallback={<div class="text-sm text-ink-300">No replay annotations</div>}
+          each={props.annotations}
+          fallback={<div class="text-sm text-ink-300">No bot events at this candle</div>}
         >
           {(annotation) => <BacktestAnnotationRow annotation={annotation} />}
         </For>
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayOrdersAndLotsPanel(props: { frame?: BacktestReplayFrame }) {
+  const lots = () => [
+    ...(props.frame?.positions.longs ?? []),
+    ...(props.frame?.positions.shorts ?? []),
+  ].sort((left, right) => right.openedAt - left.openedAt);
+
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Open Orders & Lots</div>
+        <div class="mt-1 text-sm font-semibold text-ink-100">
+          {formatQuote(props.frame?.openOrderCount, 0)} orders ·{" "}
+          {formatQuote(lots().length, 0)} shown lots
+        </div>
+      </div>
+      <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <div class="min-w-0">
+          <div class="mb-2 text-xs uppercase tracking-wide text-ink-300">Orders</div>
+          <div class="max-h-72 space-y-2 overflow-auto pr-1">
+            <For
+              each={props.frame?.openOrders ?? []}
+              fallback={<div class="text-sm text-ink-300">No open orders</div>}
+            >
+              {(order) => <BacktestReplayOrderRow order={order} />}
+            </For>
+            <Show when={props.frame?.truncatedOpenOrderCount}>
+              {(count) => (
+                <div class="text-xs text-ink-300">
+                  {formatQuote(count(), 0)} older open orders hidden
+                </div>
+              )}
+            </Show>
+          </div>
+        </div>
+        <div class="min-w-0">
+          <div class="mb-2 text-xs uppercase tracking-wide text-ink-300">Lots</div>
+          <div class="max-h-72 space-y-2 overflow-auto pr-1">
+            <For
+              each={lots()}
+              fallback={<div class="text-sm text-ink-300">No active lots</div>}
+            >
+              {(lot) => <BacktestReplayLotRow lot={lot} />}
+            </For>
+            <Show when={(props.frame?.truncatedLongLotCount ?? 0) + (props.frame?.truncatedShortLotCount ?? 0)}>
+              {(count) => (
+                <div class="text-xs text-ink-300">
+                  {formatQuote(count(), 0)} older active lots hidden
+                </div>
+              )}
+            </Show>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -4521,6 +5329,281 @@ function BacktestAnnotationRow(props: { annotation: BacktestChartAnnotation }) {
       </div>
     </div>
   );
+}
+
+function BacktestReplayOrderRow(props: { order: TradingOrder }) {
+  return (
+    <div class="rounded-2 bg-ink-800 p-2 text-sm">
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex min-w-0 items-center gap-2">
+          <Side side={props.order.side} />
+          <span class="truncate text-ink-100">{props.order.type}</span>
+        </div>
+        <span class="shrink-0 text-xs text-ink-300">{formatTime(props.order.createdAt)}</span>
+      </div>
+      <div class="mt-1 text-xs text-ink-300 tabular-nums">
+        ${formatQuote(props.order.price, 4)} · {formatAsset(props.order.quantity)} ·{" "}
+        {props.order.positionEffect ?? "auto"}
+      </div>
+    </div>
+  );
+}
+
+function BacktestReplayLotRow(props: { lot: LongPositionLot | ShortPositionLot }) {
+  const breakEven =
+    props.lot.side === "long" ? props.lot.breakEvenSellPrice : props.lot.breakEvenBuyPrice;
+  const remaining =
+    props.lot.side === "long" ? props.lot.remainingCostQuote : props.lot.remainingProceedsQuote;
+
+  return (
+    <div class="rounded-2 bg-ink-800 p-2 text-sm">
+      <div class="flex items-center justify-between gap-3">
+        <Side side={props.lot.side === "long" ? "buy" : "sell"} />
+        <span class="shrink-0 text-xs text-ink-300">{props.lot.status}</span>
+      </div>
+      <div class="mt-1 grid grid-cols-2 gap-x-3 gap-y-1 text-xs tabular-nums text-ink-300">
+        <span>qty {formatAsset(props.lot.remainingQuantity)}</span>
+        <span>avg ${formatQuote(props.lot.averagePrice, 4)}</span>
+        <span>rem ${formatQuote(remaining, 2)}</span>
+        <span>be ${formatQuote(breakEven, 4)}</span>
+        <span>lev {formatLeverage(props.lot.leverage)}</span>
+        <span>{formatTime(props.lot.openedAt)}</span>
+      </div>
+    </div>
+  );
+}
+
+function replayMetricTimeRange(
+  candles: Candle[],
+  viewport: CandleChartViewport | undefined,
+): { startTime: number; endTime: number } | undefined {
+  if (candles.length === 0) {
+    return undefined;
+  }
+
+  const start = clampNumber(Math.round(viewport?.start ?? 0), 0, candles.length - 1);
+  const end = clampNumber(
+    Math.round(viewport?.end ?? candles.length),
+    start + 1,
+    candles.length,
+  );
+  const first = candles[start];
+  const last = candles[end - 1];
+  if (!first || !last) {
+    return undefined;
+  }
+
+  return {
+    startTime: first.openTime,
+    endTime: last.closeTime,
+  };
+}
+
+function replayMetricPlotBounds(width: number, height: number): {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+} {
+  return {
+    left: 18,
+    right: width - 84,
+    top: 18,
+    bottom: height - 30,
+  };
+}
+
+function drawReplayMetricEmpty(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  label: string,
+): void {
+  ctx.fillStyle = "#aeb6c8";
+  ctx.font = "13px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, width / 2, height / 2);
+}
+
+function drawReplayMetricGrid(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  plot: { left: number; right: number; top: number; bottom: number },
+  low: number,
+  high: number,
+  format: (value: number | undefined) => string,
+  yFor: (value: number) => number,
+): void {
+  ctx.strokeStyle = "#242833";
+  ctx.lineWidth = 1;
+  ctx.font = "11px Inter, sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  for (let index = 0; index <= 3; index += 1) {
+    const value = low + ((high - low) * index) / 3;
+    const y = yFor(value);
+    ctx.beginPath();
+    ctx.moveTo(plot.left, y);
+    ctx.lineTo(plot.right, y);
+    ctx.stroke();
+    ctx.fillStyle = "#aeb6c8";
+    ctx.fillText(format(value), plot.right + 10, y);
+  }
+
+  ctx.strokeStyle = "#2b303b";
+  ctx.strokeRect(plot.left, plot.top, plot.right - plot.left, plot.bottom - plot.top);
+  ctx.fillStyle = "#101217";
+  ctx.fillRect(0, height - 24, width, 24);
+}
+
+function drawReplayMetricLine(
+  ctx: CanvasRenderingContext2D,
+  points: Array<{ time: number; value: number }>,
+  plot: { left: number; right: number; top: number; bottom: number },
+  xFor: (time: number) => number,
+  yFor: (value: number) => number,
+  color: string,
+): void {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((point, index) => {
+    const x = clampNumber(xFor(point.time), plot.left, plot.right);
+    const y = clampNumber(yFor(point.value), plot.top, plot.bottom);
+    if (index === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  });
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawReplayMetricSelection(
+  ctx: CanvasRenderingContext2D,
+  metric: BacktestReplayMetricDefinition,
+  points: Array<{ time: number; value: number }>,
+  plot: { left: number; right: number; top: number; bottom: number },
+  xFor: (time: number) => number,
+  yFor: (value: number) => number,
+  selectedTime: number | undefined,
+): void {
+  if (!selectedTime || points.length === 0) {
+    return;
+  }
+
+  let nearest = points[0];
+  let distance = Number.POSITIVE_INFINITY;
+  for (const point of points) {
+    const nextDistance = Math.abs(point.time - selectedTime);
+    if (nextDistance < distance) {
+      nearest = point;
+      distance = nextDistance;
+    }
+  }
+
+  const x = clampNumber(xFor(nearest.time), plot.left, plot.right);
+  const y = clampNumber(yFor(nearest.value), plot.top, plot.bottom);
+
+  ctx.save();
+  ctx.strokeStyle = "#d6dbea";
+  ctx.globalAlpha = 0.7;
+  ctx.setLineDash([4, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x, plot.top);
+  ctx.lineTo(x, plot.bottom);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = metric.color;
+  ctx.strokeStyle = "#090a0d";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x, y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = "#f4f6fb";
+  ctx.font = "12px Inter, sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(
+    `${metric.label}: ${metric.format(nearest.value)}`,
+    plot.left + 8,
+    plot.top + 8,
+  );
+  ctx.restore();
+}
+
+function findReplayCandle(candles: Candle[], time: number | undefined): Candle | undefined {
+  if (candles.length === 0) {
+    return undefined;
+  }
+  if (!time) {
+    return candles.at(-1);
+  }
+
+  let nearest = candles[0];
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const candle of candles) {
+    if (time >= candle.openTime && time <= candle.closeTime) {
+      return candle;
+    }
+
+    const distance = Math.min(
+      Math.abs(time - candle.openTime),
+      Math.abs(time - candle.closeTime),
+    );
+    if (distance < nearestDistance) {
+      nearest = candle;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function findReplayFrame(
+  frames: BacktestReplayFrame[],
+  time: number | undefined,
+): BacktestReplayFrame | undefined {
+  if (frames.length === 0) {
+    return undefined;
+  }
+  if (!time) {
+    return frames.at(-1);
+  }
+
+  let nearest = frames[0];
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const frame of frames) {
+    const distance = Math.abs(frame.time - time);
+    if (distance < nearestDistance) {
+      nearest = frame;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function replayAnnotationsForCandle(
+  annotations: BacktestChartAnnotation[],
+  candle: Candle,
+): BacktestChartAnnotation[] {
+  return annotations.filter(
+    (annotation) => annotation.time >= candle.openTime && annotation.time <= candle.closeTime,
+  );
+}
+
+function replaySignalLabel(signal: "buy" | "sell" | "hold" | undefined): string {
+  return signal ? signal.toUpperCase() : "-";
 }
 
 function BacktestNumberInput(props: {

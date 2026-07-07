@@ -16,15 +16,26 @@ interface CandleChartProps {
   maxCandles?: number;
   interactive?: boolean;
   emptyLabel?: string;
+  selectedTime?: number;
+  viewport?: CandleChartViewport;
+  onSelectionChange?: (selection: CandleChartSelection | undefined) => void;
+  onViewportChange?: (viewport: CandleChartViewport) => void;
 }
 
-interface ChartViewport {
+export interface CandleChartViewport {
   start: number;
   end: number;
 }
 
+export interface CandleChartSelection {
+  time: number;
+  candle: Candle;
+  annotations: BacktestChartAnnotation[];
+}
+
 const MIN_INTERACTIVE_CANDLES = 12;
 const WHEEL_ZOOM_FACTOR = 0.18;
+const MAX_BACKGROUND_ANNOTATION_MARKERS = 360;
 
 export function CandleChart(props: CandleChartProps) {
   let canvas!: HTMLCanvasElement;
@@ -34,11 +45,12 @@ export function CandleChart(props: CandleChartProps) {
     | {
         pointerId: number;
         startX: number;
-        viewport: ChartViewport;
+        viewport: CandleChartViewport;
       }
     | undefined;
-  const [viewport, setViewport] = createSignal<ChartViewport>();
+  const [viewport, setViewport] = createSignal<CandleChartViewport>();
   const [isDragging, setIsDragging] = createSignal(false);
+  const [internalSelectedTime, setInternalSelectedTime] = createSignal<number>();
 
   const draw = () => {
     if (!canvas) {
@@ -87,25 +99,24 @@ export function CandleChart(props: CandleChartProps) {
     const annotations = (props.annotations ?? []).filter(
       (annotation) => annotation.time >= startTime && annotation.time <= endTime,
     );
+    const selectedCandle = findCandleForTime(candles, selectedTime());
+    const selectedAnnotations = selectedCandle
+      ? annotationsForCandle(annotations, selectedCandle)
+      : [];
     const values = candles.flatMap((candle) => [candle.high, candle.low]);
     if (showLastPrice) {
       values.push(props.lastPrice);
     }
     values.push(...openOrders.map((order) => order.price));
     values.push(...smaSeries.flatMap((series) => series.points.map((point) => point.value)));
-    values.push(...annotations.map((annotation) => annotation.price));
+    values.push(...selectedAnnotations.map((annotation) => annotation.price));
 
     const min = Math.min(...values);
     const max = Math.max(...values);
     const padding = Math.max((max - min) * 0.08, max * 0.0005);
     const priceMin = min - padding;
     const priceMax = max + padding;
-    const plot = {
-      left: 12,
-      right: width - 74,
-      top: 16,
-      bottom: height - 28,
-    };
+    const plot = getPlotBounds(width, height);
     const plotWidth = plot.right - plot.left;
     const plotHeight = plot.bottom - plot.top;
     const priceToY = (price: number) =>
@@ -158,7 +169,11 @@ export function CandleChart(props: CandleChartProps) {
       );
     }
 
-    drawAnnotations(ctx, annotations, plot, priceToY, timeToX);
+    drawAnnotationMarkers(ctx, annotations, selectedCandle, plot, priceToY, timeToX);
+    if (selectedCandle) {
+      drawSelectedCandle(ctx, selectedCandle, plot, priceToY, timeToX);
+    }
+    drawAnnotations(ctx, selectedAnnotations, plot, priceToY, timeToX);
     drawTimeLabels(ctx, candles, plot);
   };
 
@@ -171,7 +186,10 @@ export function CandleChart(props: CandleChartProps) {
     }`;
     if (seriesKey !== lastSeriesKey) {
       lastSeriesKey = seriesKey;
-      setViewport(defaultViewport(candles.length));
+      const nextViewport = defaultViewport(candles.length);
+      setViewport(nextViewport);
+      props.onViewportChange?.(nextViewport);
+      setInternalSelectedTime(undefined);
     }
   });
 
@@ -189,6 +207,10 @@ export function CandleChart(props: CandleChartProps) {
     props.lastPrice;
     smaSeries?.length;
     annotations?.length;
+    props.selectedTime;
+    props.viewport?.start;
+    props.viewport?.end;
+    internalSelectedTime();
     viewport();
     draw();
   });
@@ -229,6 +251,7 @@ export function CandleChart(props: CandleChartProps) {
 
     event.preventDefault();
     canvas.focus();
+    updateSelectionFromPointer(event);
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -240,6 +263,9 @@ export function CandleChart(props: CandleChartProps) {
 
   const handlePointerMove = (event: PointerEvent) => {
     if (!dragState || event.pointerId !== dragState.pointerId) {
+      if (props.interactive) {
+        updateSelectionFromPointer(event);
+      }
       return;
     }
 
@@ -289,7 +315,7 @@ export function CandleChart(props: CandleChartProps) {
     }
   };
 
-  const resetViewport = () => setViewport(defaultViewport(props.candles.length));
+  const resetViewport = () => commitViewport(defaultViewport(props.candles.length));
 
   const zoomBy = (scale: number, anchor = 0.5) => {
     const total = props.candles.length;
@@ -330,20 +356,59 @@ export function CandleChart(props: CandleChartProps) {
     });
   };
 
-  const commitViewport = (next: ChartViewport) => {
-    setViewport(normalizeViewport(next, props.candles.length, MIN_INTERACTIVE_CANDLES));
+  const commitViewport = (next: CandleChartViewport) => {
+    const normalized = normalizeViewport(next, props.candles.length, MIN_INTERACTIVE_CANDLES);
+    setViewport(normalized);
+    props.onViewportChange?.(normalized);
+  };
+
+  const selectedTime = () => props.selectedTime ?? internalSelectedTime();
+
+  const updateSelectionFromPointer = (event: PointerEvent) => {
+    const selection = selectionAtOffset(event.offsetX);
+    if (!selection) {
+      return;
+    }
+    if (selection.time === selectedTime()) {
+      return;
+    }
+
+    setInternalSelectedTime(selection.time);
+    props.onSelectionChange?.(selection);
+  };
+
+  const selectionAtOffset = (offsetX: number): CandleChartSelection | undefined => {
+    const chartViewport = currentViewport();
+    const candles = props.candles.slice(chartViewport.start, chartViewport.end);
+    if (candles.length === 0) {
+      return undefined;
+    }
+
+    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const step = (plot.right - plot.left) / candles.length;
+    const index = clamp(Math.floor((offsetX - plot.left) / Math.max(1, step)), 0, candles.length - 1);
+    const candle = candles[index];
+    if (!candle) {
+      return undefined;
+    }
+
+    return {
+      time: candle.closeTime,
+      candle,
+      annotations: annotationsForCandle(props.annotations ?? [], candle),
+    };
   };
 
   const currentViewport = () =>
     props.interactive
       ? normalizeViewport(
-          viewport() ?? defaultViewport(props.candles.length),
+          props.viewport ?? viewport() ?? defaultViewport(props.candles.length),
           props.candles.length,
           MIN_INTERACTIVE_CANDLES,
         )
       : defaultViewport(props.candles.length);
 
-  const defaultViewport = (total: number): ChartViewport => {
+  const defaultViewport = (total: number): CandleChartViewport => {
     const maxCandles = props.maxCandles ?? 140;
     if (maxCandles > 0) {
       return normalizeViewport(
@@ -390,18 +455,18 @@ function getPlotBounds(width: number, height: number): {
   bottom: number;
 } {
   return {
-    left: 12,
-    right: width - 74,
-    top: 16,
-    bottom: height - 28,
+    left: 18,
+    right: width - 84,
+    top: 18,
+    bottom: height - 34,
   };
 }
 
 function normalizeViewport(
-  viewport: ChartViewport,
+  viewport: CandleChartViewport,
   total: number,
   minCandles: number,
-): ChartViewport {
+): CandleChartViewport {
   if (total <= 0) {
     return { start: 0, end: 0 };
   }
@@ -520,8 +585,120 @@ function drawLineSeries(
     ctx.font = "11px Inter, sans-serif";
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillText(series.label, plot.right - 6, clamp(priceToY(last.value), plot.top + 8, plot.bottom - 8));
+    ctx.fillText(
+      series.label,
+      plot.right - 6,
+      clamp(priceToY(last.value), plot.top + 8, plot.bottom - 8),
+    );
   }
+  ctx.restore();
+}
+
+function findCandleForTime(candles: Candle[], time: number | undefined): Candle | undefined {
+  if (!time || candles.length === 0) {
+    return undefined;
+  }
+
+  let nearest = candles[0];
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const candle of candles) {
+    if (time >= candle.openTime && time <= candle.closeTime) {
+      return candle;
+    }
+
+    const distance = Math.min(
+      Math.abs(time - candle.openTime),
+      Math.abs(time - candle.closeTime),
+    );
+    if (distance < nearestDistance) {
+      nearest = candle;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
+function annotationsForCandle(
+  annotations: BacktestChartAnnotation[],
+  candle: Candle,
+): BacktestChartAnnotation[] {
+  return annotations.filter(
+    (annotation) => annotation.time >= candle.openTime && annotation.time <= candle.closeTime,
+  );
+}
+
+function drawAnnotationMarkers(
+  ctx: CanvasRenderingContext2D,
+  annotations: BacktestChartAnnotation[],
+  selectedCandle: Candle | undefined,
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  if (annotations.length === 0) {
+    return;
+  }
+
+  const sampleEvery = Math.max(
+    1,
+    Math.ceil(annotations.length / MAX_BACKGROUND_ANNOTATION_MARKERS),
+  );
+
+  ctx.save();
+  for (let index = 0; index < annotations.length; index += sampleEvery) {
+    const annotation = annotations[index];
+    if (!annotation) {
+      continue;
+    }
+    if (
+      selectedCandle &&
+      annotation.time >= selectedCandle.openTime &&
+      annotation.time <= selectedCandle.closeTime
+    ) {
+      continue;
+    }
+
+    const x = clamp(timeToX(annotation.time), plot.left, plot.right);
+    const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
+    const isBuy = annotation.kind.startsWith("buy");
+    const isSignal = annotation.kind.endsWith("signal");
+    ctx.globalAlpha = isSignal ? 0.62 : 0.38;
+    ctx.strokeStyle = isBuy ? "#22c55e" : "#f05252";
+    ctx.lineWidth = isSignal ? 1.5 : 1;
+    ctx.beginPath();
+    ctx.moveTo(x, isBuy ? y + 7 : y - 7);
+    ctx.lineTo(x, isBuy ? y + 1 : y - 1);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawSelectedCandle(
+  ctx: CanvasRenderingContext2D,
+  candle: Candle,
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  const x = clamp(timeToX((candle.openTime + candle.closeTime) / 2), plot.left, plot.right);
+  const highY = clamp(priceToY(candle.high), plot.top, plot.bottom);
+  const lowY = clamp(priceToY(candle.low), plot.top, plot.bottom);
+
+  ctx.save();
+  ctx.strokeStyle = "#d6dbea";
+  ctx.globalAlpha = 0.74;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 5]);
+  ctx.beginPath();
+  ctx.moveTo(x, plot.top);
+  ctx.lineTo(x, plot.bottom);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.globalAlpha = 0.95;
+  ctx.strokeStyle = "#f4f6fb";
+  ctx.strokeRect(x - 6, highY - 4, 12, Math.max(8, lowY - highY + 8));
   ctx.restore();
 }
 
@@ -532,8 +709,7 @@ function drawAnnotations(
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
 ): void {
-  const visible = annotations.slice(-160);
-  for (const annotation of visible) {
+  for (const annotation of annotations) {
     const x = clamp(timeToX(annotation.time), plot.left, plot.right);
     const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
     const isBuy = annotation.kind.startsWith("buy");
@@ -572,9 +748,19 @@ function drawAnnotations(
     ctx.font = "10px Inter, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = isBuy ? "bottom" : "top";
-    ctx.fillText(annotation.kind.includes("signal") ? "SIG" : annotation.kind.includes("fill") ? "F" : "O", x, isBuy ? y - 9 : y + 9);
+    ctx.fillText(annotationShortLabel(annotation), x, isBuy ? y - 9 : y + 9);
     ctx.restore();
   }
+}
+
+function annotationShortLabel(annotation: BacktestChartAnnotation): string {
+  if (annotation.kind.includes("signal")) {
+    return "SIG";
+  }
+  if (annotation.kind.includes("fill")) {
+    return "F";
+  }
+  return "O";
 }
 
 function drawTimeLabels(
@@ -584,7 +770,6 @@ function drawTimeLabels(
 ): void {
   ctx.fillStyle = "#aeb6c8";
   ctx.font = "11px Inter, sans-serif";
-  ctx.textAlign = "center";
   ctx.textBaseline = "top";
 
   const count = Math.min(5, candles.length);
@@ -592,6 +777,7 @@ function drawTimeLabels(
     const index = Math.round((candles.length - 1) * (i / Math.max(1, count - 1)));
     const candle = candles[index];
     const x = plot.left + (plot.right - plot.left) * (i / Math.max(1, count - 1));
+    ctx.textAlign = i === 0 ? "left" : i === count - 1 ? "right" : "center";
     ctx.fillText(formatTime(candle.openTime), x, plot.bottom + 8);
   }
 }

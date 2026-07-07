@@ -387,6 +387,7 @@ async function runRandomHistoricalCandleBacktest(
       );
 
       throwIfCancelled(options.cancelSignal);
+      result.candleChart = undefined;
       results.push(result);
       completedCandles += result.summary.candlesProcessed ?? 0;
       completedFinalEquity += result.summary.finalEquity;

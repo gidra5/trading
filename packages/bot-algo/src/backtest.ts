@@ -4,7 +4,11 @@ import {
   createStrategyConfig,
   type PartialStrategyConfig,
 } from "./execution-simulator.js";
-import { defaultPositionRiskConfig, summarizeClosedPositions } from "./position-ledger.js";
+import {
+  analyzePositions,
+  defaultPositionRiskConfig,
+  summarizeClosedPositions,
+} from "./position-ledger.js";
 import { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
 import {
   createExtremaOrderMassCollector,
@@ -16,6 +20,7 @@ import type {
   BacktestSummary,
   BacktestCandleChart,
   BacktestChartAnnotation,
+  BacktestReplayFrame,
   BacktestChartSmaSeries,
   BacktestResult,
   BacktestStopReason,
@@ -23,9 +28,11 @@ import type {
   EquityPoint,
   OrderBookSnapshot,
   PaperBotState,
+  PositionLedger,
   PriceTick,
   StrategyConfig,
   StrategyMemory,
+  TradingOrder,
 } from "./types.js";
 
 export interface RunBacktestOptions {
@@ -45,6 +52,8 @@ const DEFAULT_MAX_RETURNED_ORDERS = 2_000;
 const DEFAULT_MAX_RETURNED_FILLS = 2_000;
 const DEFAULT_MAX_CHART_CANDLES = 2_000;
 const DEFAULT_MAX_CHART_ANNOTATIONS = 5_000;
+const DEFAULT_MAX_REPLAY_FRAME_ORDERS = 80;
+const DEFAULT_MAX_REPLAY_FRAME_LOTS = 80;
 const AVERAGE_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e", "#f472b6", "#eab308"];
 
 export interface BacktestChartCollector {
@@ -52,6 +61,7 @@ export interface BacktestChartCollector {
   candles: Candle[];
   smaSeries: BacktestChartSmaSeries[];
   annotations: BacktestChartAnnotation[];
+  frames: BacktestReplayFrame[];
   lastObservedOrderCount: number;
   lastObservedFillCount: number;
   lastObservedSignalAt?: number;
@@ -103,6 +113,7 @@ export function createBacktestChartCollector(
       points: [],
     })),
     annotations: [],
+    frames: [],
     lastObservedOrderCount: 0,
     lastObservedFillCount: 0,
   };
@@ -125,7 +136,9 @@ export function observeBacktestChartCandle(
   }
 
   const previous = collector.candles.at(-1);
-  if (previous?.openTime === candle.openTime && previous.interval === candle.interval) {
+  const replaceLast =
+    previous?.openTime === candle.openTime && previous.interval === candle.interval;
+  if (replaceLast) {
     collector.candles[collector.candles.length - 1] = { ...candle };
   } else {
     collector.candles.push({ ...candle });
@@ -146,6 +159,13 @@ export function observeBacktestChartCandle(
       }
     }
   }
+
+  const frame = createBacktestReplayFrame(bot, candle);
+  if (replaceLast && collector.frames.length > 0) {
+    collector.frames[collector.frames.length - 1] = frame;
+  } else {
+    collector.frames.push(frame);
+  }
 }
 
 export function finalizeBacktestCandleChart(
@@ -159,7 +179,87 @@ export function finalizeBacktestCandleChart(
     candles: collector.candles,
     smaSeries: collector.smaSeries.filter((series) => series.points.length > 0),
     annotations: collector.annotations,
+    frames: collector.frames,
   };
+}
+
+function createBacktestReplayFrame(
+  bot: SimulatedExecutionEngine,
+  candle: Candle,
+): BacktestReplayFrame {
+  const metrics = bot.markToMarket();
+  const state = bot.view();
+  const price = cleanReplayPrice(state.lastPrice) || candle.close;
+  const positions = compactReplayFramePositions(
+    analyzePositions(state as PaperBotState, { currentPrice: price }),
+  );
+  const openOrders = state.orders.filter((order) => order.status === "open");
+  const debug = state.memory.legacyValleyPeakDebug;
+
+  return {
+    time: candle.closeTime,
+    price,
+    metrics: { ...metrics },
+    quoteFree: state.quoteFree,
+    quoteReserved: state.quoteReserved,
+    baseFree: state.baseFree,
+    baseReserved: state.baseReserved,
+    avgEntryPrice: state.avgEntryPrice,
+    avgShortEntryPrice: state.avgShortEntryPrice,
+    openOrders: tail(openOrders, DEFAULT_MAX_REPLAY_FRAME_ORDERS).map(cloneTradingOrder),
+    openOrderCount: openOrders.length,
+    truncatedOpenOrderCount:
+      Math.max(0, openOrders.length - DEFAULT_MAX_REPLAY_FRAME_ORDERS) || undefined,
+    positions: positions.ledger,
+    longLotCount: positions.longLotCount,
+    shortLotCount: positions.shortLotCount,
+    truncatedLongLotCount: positions.truncatedLongLotCount,
+    truncatedShortLotCount: positions.truncatedShortLotCount,
+    entrySignal: debug?.entrySignal,
+    exitSignal: debug?.exitSignal,
+    entryReason: debug?.entryReason,
+    exitReason: debug?.exitReason,
+    marketState: debug?.marketState ? { ...debug.marketState } : undefined,
+    lastExtremaSignal: debug?.lastExtremaSignal,
+    lastExtremaSignalAt: debug?.lastExtremaSignalAt,
+    lastExtremaSignalPrice: debug?.lastExtremaSignalPrice,
+    lastExtremaSignalReason: debug?.lastExtremaSignalReason,
+  };
+}
+
+interface CompactReplayFramePositions {
+  ledger: PositionLedger;
+  longLotCount: number;
+  shortLotCount: number;
+  truncatedLongLotCount?: number;
+  truncatedShortLotCount?: number;
+}
+
+function compactReplayFramePositions(ledger: PositionLedger): CompactReplayFramePositions {
+  const activeLongs = ledger.longs.filter((lot) => lot.status !== "closed");
+  const activeShorts = ledger.shorts.filter((lot) => lot.status !== "closed");
+
+  return {
+    ledger: {
+      summary: { ...ledger.summary },
+      longs: tail(activeLongs, DEFAULT_MAX_REPLAY_FRAME_LOTS).map((lot) => ({ ...lot })),
+      shorts: tail(activeShorts, DEFAULT_MAX_REPLAY_FRAME_LOTS).map((lot) => ({ ...lot })),
+    },
+    longLotCount: activeLongs.length,
+    shortLotCount: activeShorts.length,
+    truncatedLongLotCount:
+      Math.max(0, activeLongs.length - DEFAULT_MAX_REPLAY_FRAME_LOTS) || undefined,
+    truncatedShortLotCount:
+      Math.max(0, activeShorts.length - DEFAULT_MAX_REPLAY_FRAME_LOTS) || undefined,
+  };
+}
+
+function cloneTradingOrder(order: TradingOrder): TradingOrder {
+  return { ...order };
+}
+
+function cleanReplayPrice(value: number): number {
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 function observeBacktestChartAnnotations(
