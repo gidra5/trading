@@ -1,5 +1,7 @@
-import type { TradingApi } from "./strategy.js";
-import type { Candle } from "./types.js";
+import type {
+  TradingCandle as Candle,
+  TradingApi,
+} from "./trading-api.js";
 
 const DEFAULT_EMA_WARMUP_COUNT = 256;
 const MAX_EMA_WARMUP_COUNT = 2_000;
@@ -1366,7 +1368,6 @@ async function warmupCandles(tradingApi: TradingApi, count: number): Promise<Can
   return tradingApi.getHistory({
     intervalMs: 1000,
     count,
-    endTime: Date.now(),
   });
 }
 

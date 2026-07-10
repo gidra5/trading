@@ -5,7 +5,7 @@ import {
   LinearRegressionIndicator,
   SMAIndicator,
 } from "../src/indicators.js";
-import type { TradingApi } from "../src/strategy.js";
+import type { TradingApi } from "../src/trading-api.js";
 
 const unusedApi = {} as TradingApi;
 

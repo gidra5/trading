@@ -1,31 +1,64 @@
-type TradingStrategyEntrySignal = {
-  side: TradingSide;
-  size: number;
+import type { TradingApi, TradingTick } from "./trading-api.js";
 
-  // if present - the price that is anticipated by the entry signal.
-  price: number | null;
-  // if present - skewness of the price distribution around the anticipated price.
-  confidence: number | null;
-};
-type TradingStrategyExitSignal = {
-  side: TradingSide;
+export type PositionSide = "long" | "short";
 
-  // if present - the price that is anticipated by the entry signal.
-  price: number | null;
-  // if present - skewness of the price distribution around the anticipated price.
-  // 0 - uniform, 1 - everything at the target price
-  confidence: number | null;
-};
-
-interface TradingStrategy<T> {
-  onTick: (price: number, quantity: number) => Promise<void>;
-  onOrder: (id: string, status: TradingOrderStatus) => Promise<void>;
-
-  snapshot: () => Promise<T>;
-  restore: (snapshot: T | null) => Promise<void>;
-
-  entrySignal: () => Promise<TradingStrategyEntrySignal | null>;
-  exitSignal: () => Promise<TradingStrategyExitSignal | null>;
+export interface StrategyOptions<TConfig = unknown> {
+  config: TConfig;
+  getHistory: TradingApi["getHistory"];
 }
 
-class Strategy implements TradingStrategy<unknown> {}
+export interface TradingStrategyEntrySignal {
+  side: PositionSide;
+  /** Fraction [0, 1] of the available asset/quote capacity to use. */
+  size: number;
+  leverage: number;
+  /** Null means execute at the current market price. */
+  price: number | null;
+  /** 0 is uniform grid sizing; 1 concentrates sizing at price. */
+  confidence: number | null;
+}
+
+export interface TradingStrategyExitSignal {
+  side: PositionSide;
+  /** Fraction [0, 1] of total matching-side exposure to close. */
+  size: number;
+  /** Null means execute at the current market price. */
+  price: number | null;
+  confidence: number | null;
+}
+
+export interface StrategyDiagnostics {
+  indicators: Readonly<Record<string, number | null>>;
+  gates: readonly {
+    code: string;
+    passed: boolean;
+    value?: number;
+    threshold?: number;
+  }[];
+  blockers: readonly string[];
+  lastSignal: {
+    type: "entry" | "exit";
+    side: PositionSide;
+    reason: string;
+  } | null;
+}
+
+export interface StrategySnapshot {
+  version: number;
+}
+
+export interface TradingStrategy<
+  TConfig = unknown,
+  TSnapshot extends StrategySnapshot = StrategySnapshot,
+  TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics,
+> {
+  /** The strategy fetches the history required by its indicators. */
+  warmup(): Promise<void>;
+  onTick(tick: TradingTick): Promise<void>;
+  entrySignal(): Promise<TradingStrategyEntrySignal | null>;
+  exitSignal(): Promise<TradingStrategyExitSignal | null>;
+  snapshot(): Promise<TSnapshot>;
+  restore(snapshot: TSnapshot): Promise<void>;
+  updateConfig(config: TConfig): Promise<void>;
+  getDiagnostics(): TDiagnostics;
+}

@@ -5,16 +5,10 @@ export {
   defaultStrategyConfig,
   type PartialStrategyConfig,
 } from "./execution-simulator.js";
-export {
-  PeakValleyBotCore,
-  createBotCoreMemory,
-  createBotCoreState,
-  evaluateBot,
-  type BotConfig,
-  type BotDecision,
-  type BotInput,
-  type BotMemory,
-} from "./bot.js";
+export * from "./bot.js";
+export type * from "./strategy.js";
+export type * from "./trading-api.js";
+export * from "./indicators.js";
 export {
   compactBacktestState,
   createBacktestChartCollector,

@@ -1,118 +1,136 @@
-type Candle = {
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-};
-type CreateStopLimitOrderInput = {
-  side: TradingSide;
-  size: number;
-  stopPrice: number;
-  limitPrice: number;
-};
+import type {
+  TradingApi,
+  TradingOrderEvent,
+  TradingOrderSnapshot,
+  TradingTick,
+} from "./trading-api.js";
+import type {
+  PositionSide,
+  StrategyDiagnostics,
+  StrategySnapshot,
+  TradingStrategy,
+} from "./strategy.js";
 
-type CreateStopMarketOrderInput = {
-  side: TradingSide;
-  size: number;
-  price: number;
-};
+export type GridSizeDistribution = "linear" | "geometric";
 
-type CreateLimitOrderInput = {
-  side: TradingSide;
-  size: number;
-  price: number;
-};
-
-type CreateMarketOrderInput = {
-  side: TradingSide;
-  size: number;
-};
-
-type TradingHistoryRequest = {
-  intervalMs: number;
-  count: number;
-};
-
-export interface TradingApi {
-  createStopLimitOrder(input: CreateStopLimitOrderInput): Promise<TradingOrder>;
-  createStopMarketOrder(input: CreateStopMarketOrderInput): Promise<TradingOrder>;
-  createLimitOrder(input: CreateLimitOrderInput): Promise<TradingOrder>;
-  createMarketOrder(input: CreateMarketOrderInput): Promise<TradingOrder>;
-  cancelOrder(id: string): Promise<boolean>;
-  getHistory(input: TradingHistoryRequest): Promise<Candle[]>;
-  getEquity(): Promise<EquitySnapshot>;
-  getFriction(): Promise<number>;
+export interface GridConfig {
+  orderCount: number;
+  maxPriceStep: number;
+  sizeDistribution: GridSizeDistribution;
+  /** Used by geometric distribution. */
+  sizeFraction: number;
 }
 
-export interface BotMetricsReporter<TSnapshot extends StrategySnapshot = StrategySnapshot> {
-  onOrderCreated?(order: TradingOrder): void | Promise<void>;
-  onOrderEvent?(event: ExecutionEvent): void | Promise<void>;
-  onSnapshot?(snapshot: BotRuntimeSnapshot<TSnapshot>): void | Promise<void>;
+export interface ExitGridConfig extends GridConfig {
+  reset: "previous-anchor" | "last-filled-order";
 }
 
-export interface BotOptions<TSnapshot extends StrategySnapshot = StrategySnapshot> {
-  config: TradingBotConfig;
-  reporter: BotMetricsReporter<TSnapshot>;
+export interface TradingBotConfig<TStrategyConfig = unknown> {
+  strategy: TStrategyConfig;
+  maxTargetLeverage: number;
+  minTradeQuote: number;
+  maxTradeQuote: number;
+  entryGrid: GridConfig;
+  exitGrid: ExitGridConfig;
+  positionLifetimeMs: number | null;
+  stopLossRate: number | null;
+  takeProfitRate: number | null;
+  cooldownMs: number;
+  internalBorrow: {
+    enabled: boolean;
+    /** Locks exactly the borrowed asset and quote amounts when enabled. */
+    lockLenderAmounts: boolean;
+    borrowerProfitShare: number;
+  };
 }
 
-export interface BotLotBorrow {
-  lotId: string;
-  amountBorrowed: number;
+export interface PositionBorrow {
+  positionId: string;
+  asset: number;
+  quote: number;
 }
 
-export interface BotLotGridOrder {
-  id: string;
-  size: number;
-  price: number;
+export interface PositionGridOrder {
+  order: TradingOrderSnapshot;
+  /** Unit is implied by position side and whether this is an entry or exit grid. */
   filled: number;
 }
 
-export interface BotLotGrid {
-  orders: BotLotGridOrder[];
-  priceAnchor: number;
+export interface PositionGrid {
+  orders: PositionGridOrder[];
+  creationPrice: number;
 }
 
-export interface BotLot {
+/** Created with its entry grid; asset and quote remain zero until the first fill. */
+export interface TradingPosition {
   id: string;
-  side: TradingSide;
-  quote: number;
+  side: PositionSide;
   asset: number;
-  internalBorrow: BotLotBorrow[];
-  externalBorrow: number;
-  entryGrid: BotLotGrid | null;
-  exitGrid: BotLotGrid | null;
+  quote: number;
+  internalBorrow: PositionBorrow[];
+  externalBorrow: {
+    asset: number;
+    quote: number;
+  };
+  entryGrid: PositionGrid | null;
+  exitGrid: PositionGrid | null;
+  stopLossPrice: number | null;
+  takeProfitPrice: number | null;
+  expiresAt: number | null;
 }
 
-class Bot implements TradingBot {
-  private tradingApi: TradingApi;
-  private tradingStrategy: TradingStrategy<unknown>;
-  private reporter: BotMetricsReporter;
-  private lots: BotLot[] = [];
-  private config: BotConfig;
-  private indicators = {};
+export interface BotSnapshot<
+  TStrategyConfig = unknown,
+  TStrategySnapshot extends StrategySnapshot = StrategySnapshot,
+> {
+  version: number;
+  config: TradingBotConfig<TStrategyConfig>;
+  strategy: TStrategySnapshot;
+  positions: TradingPosition[];
+}
 
-  constructor(options: BotOptions<unknown>) {
-    this.tradingApi = tradingApi;
-    this.tradingStrategy = new Strategy();
-    this.reporter = reporter;
-  }
+export interface BotMetricsSnapshot {
+  positionCount: number;
+  orderCount: number;
+  longAsset: number;
+  shortAsset: number;
+}
 
-  warmup(): void {}
+export interface BotDiagnostics<TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics> {
+  strategy: TDiagnostics;
+  positions: readonly TradingPosition[];
+  /** Derived by flattening position entry/exit grids. */
+  plannedOrders: readonly TradingOrderSnapshot[];
+  entryRisk: readonly {
+    side: PositionSide;
+    size: number;
+    leverage: number;
+    blocker: string | null;
+  }[];
+  saturated: boolean;
+}
 
-  async onTick(price: number, quantity: number): Promise<void> {
-    await this.tradingStrategy.onTick(price, quantity);
-  }
+export interface BotOptions<
+  TStrategyConfig = unknown,
+  TStrategySnapshot extends StrategySnapshot = StrategySnapshot,
+  TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics,
+> {
+  api: TradingApi;
+  strategy: TradingStrategy<TStrategyConfig, TStrategySnapshot, TDiagnostics>;
+  config: TradingBotConfig<TStrategyConfig>;
+}
 
-  async onOrder(id: string, status: TradingOrderStatus): Promise<void> {
-    await this.tradingStrategy.onOrder(id, status);
-  }
-
-  async snapshot(): Promise<T> {
-    return this.tradingStrategy.snapshot();
-  }
-
-  async restore(snapshot: T | null): Promise<void> {
-    await this.tradingStrategy.restore(snapshot);
-  }
+export interface TradingBot<
+  TStrategyConfig = unknown,
+  TStrategySnapshot extends StrategySnapshot = StrategySnapshot,
+  TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics,
+> {
+  warmup(): Promise<void>;
+  onTick(tick: TradingTick): Promise<void>;
+  onOrder(event: TradingOrderEvent): Promise<void>;
+  snapshot(): Promise<BotSnapshot<TStrategyConfig, TStrategySnapshot>>;
+  restore(snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>): Promise<void>;
+  getMetrics(): BotMetricsSnapshot;
+  getDiagnostics(): BotDiagnostics<TDiagnostics>;
+  updateConfig(config: TradingBotConfig<TStrategyConfig>): Promise<void>;
 }
