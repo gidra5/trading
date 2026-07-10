@@ -1,95 +1,118 @@
-import type {
-  BotCoreState,
-  BotStatus,
-  LegacyValleyPeakConfig,
-  LegacyValleyPeakMemory,
-  StrategyConfig,
-  StrategyMemory,
-} from "./types.js";
-import {
-  createLegacyValleyPeakMemory,
-  evaluateLegacyValleyPeak,
-  normalizeLegacyValleyPeakMemory,
-  type LegacyValleyPeakDecision,
-  type LegacyValleyPeakInput,
-} from "./legacy-valley-peak.js";
+type Candle = {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+};
+type CreateStopLimitOrderInput = {
+  side: TradingSide;
+  size: number;
+  stopPrice: number;
+  limitPrice: number;
+};
 
-export type BotConfig = LegacyValleyPeakConfig;
-export type BotMemory = LegacyValleyPeakMemory;
-export type BotInput = LegacyValleyPeakInput;
-export type BotDecision = LegacyValleyPeakDecision;
+type CreateStopMarketOrderInput = {
+  side: TradingSide;
+  size: number;
+  price: number;
+};
 
-export function evaluateBot(
-  memory: BotMemory,
-  config: BotConfig,
-  input: BotInput,
-): BotDecision {
-  return evaluateLegacyValleyPeak(memory, config, input);
+type CreateLimitOrderInput = {
+  side: TradingSide;
+  size: number;
+  price: number;
+};
+
+type CreateMarketOrderInput = {
+  side: TradingSide;
+  size: number;
+};
+
+type TradingHistoryRequest = {
+  intervalMs: number;
+  count: number;
+};
+
+export interface TradingApi {
+  createStopLimitOrder(input: CreateStopLimitOrderInput): Promise<TradingOrder>;
+  createStopMarketOrder(input: CreateStopMarketOrderInput): Promise<TradingOrder>;
+  createLimitOrder(input: CreateLimitOrderInput): Promise<TradingOrder>;
+  createMarketOrder(input: CreateMarketOrderInput): Promise<TradingOrder>;
+  cancelOrder(id: string): Promise<boolean>;
+  getHistory(input: TradingHistoryRequest): Promise<Candle[]>;
+  getEquity(): Promise<EquitySnapshot>;
+  getFriction(): Promise<number>;
 }
 
-export function createBotCoreMemory(config: StrategyConfig): StrategyMemory {
-  return {
-    prices: [],
-    lastSignal: "hold",
-    lastActionAt: 0,
-    legacyValleyPeak: createLegacyValleyPeakMemory(config.legacyValleyPeak),
-  };
+export interface BotMetricsReporter<TSnapshot extends StrategySnapshot = StrategySnapshot> {
+  onOrderCreated?(order: TradingOrder): void | Promise<void>;
+  onOrderEvent?(event: ExecutionEvent): void | Promise<void>;
+  onSnapshot?(snapshot: BotRuntimeSnapshot<TSnapshot>): void | Promise<void>;
 }
 
-export function createBotCoreState(
-  config: StrategyConfig,
-  options: {
-    id?: string;
-    status?: BotStatus;
-    now?: number;
-  } = {},
-): BotCoreState {
-  const now = options.now ?? Date.now();
-  return {
-    id: options.id ?? "bot-core",
-    status: options.status ?? "running",
-    symbol: config.symbol,
-    baseAsset: config.baseAsset,
-    quoteAsset: config.quoteAsset,
-    lastPrice: 0,
-    sequence: 0,
-    createdAt: now,
-    updatedAt: now,
-    runStartedAt: now,
-    memory: createBotCoreMemory(config),
-    config,
-  };
+export interface BotOptions<TSnapshot extends StrategySnapshot = StrategySnapshot> {
+  config: TradingBotConfig;
+  reporter: BotMetricsReporter<TSnapshot>;
 }
 
-export class PeakValleyBotCore {
-  constructor(private readonly state: BotCoreState) {}
+export interface BotLotBorrow {
+  lotId: string;
+  amountBorrowed: number;
+}
 
-  view(): Readonly<BotCoreState> {
-    return this.state;
+export interface BotLotGridOrder {
+  id: string;
+  size: number;
+  price: number;
+  filled: number;
+}
+
+export interface BotLotGrid {
+  orders: BotLotGridOrder[];
+  priceAnchor: number;
+}
+
+export interface BotLot {
+  id: string;
+  side: TradingSide;
+  quote: number;
+  asset: number;
+  internalBorrow: BotLotBorrow[];
+  externalBorrow: number;
+  entryGrid: BotLotGrid | null;
+  exitGrid: BotLotGrid | null;
+}
+
+class Bot implements TradingBot {
+  private tradingApi: TradingApi;
+  private tradingStrategy: TradingStrategy<unknown>;
+  private reporter: BotMetricsReporter;
+  private lots: BotLot[] = [];
+  private config: BotConfig;
+  private indicators = {};
+
+  constructor(options: BotOptions<unknown>) {
+    this.tradingApi = tradingApi;
+    this.tradingStrategy = new Strategy();
+    this.reporter = reporter;
   }
 
-  snapshot(): BotCoreState {
-    return structuredClone(this.state);
+  warmup(): void {}
+
+  async onTick(price: number, quantity: number): Promise<void> {
+    await this.tradingStrategy.onTick(price, quantity);
   }
 
-  memory(): LegacyValleyPeakMemory {
-    return this.ensureLegacyValleyPeakMemory();
+  async onOrder(id: string, status: TradingOrderStatus): Promise<void> {
+    await this.tradingStrategy.onOrder(id, status);
   }
 
-  evaluate(input: BotInput): BotDecision {
-    return evaluateBot(
-      this.ensureLegacyValleyPeakMemory(),
-      this.state.config.legacyValleyPeak,
-      input,
-    );
+  async snapshot(): Promise<T> {
+    return this.tradingStrategy.snapshot();
   }
 
-  private ensureLegacyValleyPeakMemory(): LegacyValleyPeakMemory {
-    const normalized = normalizeLegacyValleyPeakMemory(
-      this.state.memory.legacyValleyPeak,
-      this.state.config.legacyValleyPeak,
-    );
-    this.state.memory.legacyValleyPeak = normalized;
-    return normalized;
+  async restore(snapshot: T | null): Promise<void> {
+    await this.tradingStrategy.restore(snapshot);
   }
 }

@@ -35,7 +35,7 @@ import {
   PeakValleyBotCore,
   createBotCoreState,
   evaluateBot,
-} from "./bot.js";
+} from "./legacy-bot-core.js";
 import {
   canFillOrderAtTick,
   orderExecutionPrice,
