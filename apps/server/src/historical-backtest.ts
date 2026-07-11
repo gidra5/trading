@@ -87,6 +87,7 @@ export interface HistoricalBacktestOptions {
   randomLookbackMs?: number;
   randomMarkets?: HistoricalBacktestMarket[];
   randomPairCount?: number;
+  extremaSmaWindowMs?: number;
   cancelSignal?: AbortSignal;
 }
 
@@ -668,7 +669,10 @@ async function runBotHistoricalRangeBacktest(
   if (candles.length === 0) throw new Error("Historical backtest loaded no candles.");
 
   emit(`Replaying ${candles.length.toLocaleString()} candles`);
-  const result = await runBotBacktestFromCandles(candles, { config });
+  const result = await runBotBacktestFromCandles(candles, {
+    config,
+    extremaSmaWindowMs: options.extremaSmaWindowMs,
+  });
   Object.assign(result.summary, {
     marketId: options.marketId,
     displaySymbol: options.displaySymbol,

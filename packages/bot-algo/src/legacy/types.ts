@@ -885,6 +885,8 @@ export interface BacktestChartAnnotation {
   orderId?: string;
   fillId?: string;
   targetPositionId?: string;
+  gridId?: string;
+  gridKind?: "entry" | "exit";
 }
 
 export interface BacktestReplayFrame {
@@ -921,6 +923,7 @@ export interface BacktestCandleChart {
   smaSeries: BacktestChartSmaSeries[];
   annotations: BacktestChartAnnotation[];
   frames?: BacktestReplayFrame[];
+  trace?: BacktestTrace;
 }
 
 export interface BacktestResult {
@@ -973,3 +976,4 @@ export interface BacktestProgressSnapshot {
   error?: string;
   result?: BacktestResult;
 }
+import type { BacktestTrace } from "../backtest-trace.js";

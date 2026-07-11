@@ -17,6 +17,7 @@ import {
   type OrderBookSnapshot,
   type PartialStrategyConfig,
   type PeakValleyBotConfig,
+  type PeakValleyStrategyDiagnostics,
   type PeakValleyStrategySnapshot,
   type PriceTick,
   type StrategyConfig,
@@ -71,6 +72,7 @@ interface BacktestStartOptions {
   randomLookbackDays?: number;
   randomPairCount?: number;
   randomMarkets?: HistoricalBacktestMarket[];
+  extremaSmaWindowMinutes?: number;
 }
 
 type HistoricalPreset = Extract<
@@ -106,7 +108,7 @@ export interface RuntimeBotSnapshot {
     netPnl: number;
     returnPct: number;
   };
-  diagnostics: BotDiagnostics & { entryRisk: readonly BotEntryRiskReport[] };
+  diagnostics: BotDiagnostics<PeakValleyStrategyDiagnostics> & { entryRisk: readonly BotEntryRiskReport[] };
   equity: EquitySnapshot;
 }
 
@@ -144,7 +146,11 @@ export interface RuntimeSnapshot {
 
 export class TradingRuntime {
   private api!: RuntimeTradingApi;
-  private bot!: GridTradingBot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>;
+  private bot!: GridTradingBot<
+    PeakValleyBotConfig["strategy"],
+    PeakValleyStrategySnapshot,
+    PeakValleyStrategyDiagnostics
+  >;
   private botState!: RuntimeBotSnapshot["state"];
   private readonly entryRisk = new Map<BotEntryRiskReport["side"], BotEntryRiskReport>();
   private botConfig: PeakValleyBotConfig;
@@ -825,6 +831,9 @@ export class TradingRuntime {
         randomLookbackMs: days(options.randomLookbackDays),
         randomMarkets: options.randomMarkets,
         randomPairCount: options.randomMarkets?.length ?? options.randomPairCount,
+        extremaSmaWindowMs: options.extremaSmaWindowMinutes === undefined
+          ? undefined
+          : options.extremaSmaWindowMinutes * 60_000,
         cancelSignal: signal,
       }, (progress) => {
         this.backtest = progress;
@@ -833,7 +842,12 @@ export class TradingRuntime {
     }
     const result = options.preset === "saved-orderbook"
       ? runBacktestFromOrderBook(await this.storage.loadOrderBookSnapshots(options.limit), { config })
-      : await runBotBacktestFromCandles(await this.storage.loadCandles(options.limit), { config });
+      : await runBotBacktestFromCandles(await this.storage.loadCandles(options.limit), {
+          config,
+          extremaSmaWindowMs: options.extremaSmaWindowMinutes === undefined
+            ? undefined
+            : options.extremaSmaWindowMinutes * 60_000,
+        });
     throwIfCancelled(signal);
     return result;
   }

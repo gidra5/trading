@@ -55,6 +55,24 @@ Because legacy uses resting limit orders, OHLC replay can materially affect fill
 Results should be treated as deterministic simulator evidence, not a promise that live
 orders would have filled at the same prices.
 
+## Replay Inspector
+
+Single-window candle results include a mutation trace rather than a full bot snapshot
+for every tick. The dashboard can inspect each position's entry/exit grids, fills,
+external and internal debt, reverse lender links, and closure time. Graph markers carry
+their position and grid ids.
+
+The chart also shows strategy source/confirmation gates and a reconstructed fixed-
+notional three-state DP oracle path. Centered-SMA peaks and valleys use the configurable
+Extrema SMA window. Hover an extremum to show its quote-mass P99 time/price error box,
+the actual matched-fill extent, and the contributing orders. Random-window aggregate
+results remain summary-only because they combine unrelated markets and time ranges.
+
+Replay account/risk frames retain the metric picker, synchronized metric chart, bot
+state, exposure, balances, order counts, and position counts. Averages, signals,
+orders, fills, selected-position grids, extrema, and the oracle path can each be toggled
+independently without removing their underlying inspection data.
+
 ## Backtest Coverage
 
 Backtesting should cover several market generators and sampling surfaces because each

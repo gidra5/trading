@@ -9,6 +9,7 @@ import type {
   EquityPoint,
   OrderBookSnapshot,
   PeakValleyBotConfig,
+  PeakValleyStrategyDiagnostics,
   PeakValleyStrategySnapshot,
   TradingFill,
   TradingOrderSnapshot,
@@ -114,7 +115,7 @@ export interface RuntimeSnapshot {
       netPnl: number;
       returnPct: number;
     };
-    diagnostics: BotDiagnostics & { entryRisk: readonly BotEntryRiskReport[] };
+    diagnostics: BotDiagnostics<PeakValleyStrategyDiagnostics> & { entryRisk: readonly BotEntryRiskReport[] };
     equity: EquitySnapshot;
   };
   recentEvents: Array<{

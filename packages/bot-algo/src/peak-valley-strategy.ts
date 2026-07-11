@@ -224,8 +224,48 @@ export interface PeakValleyStrategySnapshot {
   lastSignal: StrategyDiagnostics["lastSignal"];
 }
 
+export interface PeakValleyAverageDiagnostics {
+  index: number;
+  windowSec: number;
+  value: number;
+  rawRate: number;
+  clampedRate: number;
+  previousClampedRate: number;
+  thresholdLow: number;
+  thresholdHigh: number;
+  roles: {
+    buyPrimary: boolean;
+    sellPrimary: boolean;
+    buyEntryConfirmation: boolean;
+    sellEntryConfirmation: boolean;
+    buyExitConfirmation: boolean;
+    sellExitConfirmation: boolean;
+    sizing: boolean;
+    trendSigma: boolean;
+  };
+}
+
+export interface PeakValleyStrategyDiagnostics extends StrategyDiagnostics {
+  ready: boolean;
+  warmupRemainingMs: number;
+  movingAverageType: PeakValleyAverageType;
+  derivativeSource: PeakValleyDerivativeSource;
+  latestTick: TradingTick | null;
+  averages: readonly PeakValleyAverageDiagnostics[];
+  kama: {
+    value: number;
+    rawRate: number;
+    clampedRate: number;
+    previousClampedRate: number;
+  } | null;
+  sizing: {
+    buy: { size: number; sigma: number };
+    sell: { size: number; sigma: number };
+  };
+}
+
 export class PeakValleyStrategy
-  implements TradingStrategy<PeakValleyStrategyConfig, PeakValleyStrategySnapshot>
+  implements TradingStrategy<PeakValleyStrategyConfig, PeakValleyStrategySnapshot, PeakValleyStrategyDiagnostics>
 {
   private config: PeakValleyStrategyConfig;
   private readonly historyApi: TradingApi;
@@ -236,12 +276,14 @@ export class PeakValleyStrategy
   private lastTick: TradingTick | null = null;
   private startedAt = 0;
   private ready = false;
-  private diagnostics: StrategyDiagnostics = emptyDiagnostics();
+  private diagnostics: PeakValleyStrategyDiagnostics;
 
   constructor(private readonly options: StrategyOptions<PeakValleyStrategyConfig>) {
     this.config = createPeakValleyStrategyConfig(options.config);
     this.historyApi = { getHistory: options.getHistory } as TradingApi;
     this.rebuildIndicators();
+    this.diagnostics = emptyDiagnostics(this.config);
+    this.diagnostics = this.buildDiagnostics();
   }
 
   async warmup(): Promise<void> {
@@ -279,7 +321,9 @@ export class PeakValleyStrategy
         : null;
     this.recordDecision("entry", signal, valley ? "valley" : peak ? "peak" : null, [
       gate("long.entry", valley, this.primaryRate(this.config.buyDataIndex), this.config.rateThresholdsLow[this.config.buyDataIndex]),
+      ...this.decisionGates("long.entry", "valley", this.config.buyDataIndex, this.config.buyConfirmationOffsets, this.config.buyEntrySignalTiming),
       gate("short.entry", peak, this.primaryRate(this.config.sellDataIndex), this.config.rateThresholdsLow[this.config.sellDataIndex]),
+      ...this.decisionGates("short.entry", "peak", this.config.sellDataIndex, this.config.sellConfirmationOffsets, this.config.sellEntrySignalTiming),
     ]);
     return signal;
   }
@@ -295,7 +339,9 @@ export class PeakValleyStrategy
         : null;
     this.recordDecision("exit", signal, valley ? "valley" : peak ? "peak" : null, [
       gate("short.exit", valley, this.primaryRate(this.config.buyDataIndex), this.config.rateThresholdsLow[this.config.buyDataIndex]),
+      ...this.decisionGates("short.exit", "valley", this.config.buyDataIndex, this.config.buyExitConfirmationOffsets, this.config.buyExitSignalTiming),
       gate("long.exit", peak, this.primaryRate(this.config.sellDataIndex), this.config.rateThresholdsLow[this.config.sellDataIndex]),
+      ...this.decisionGates("long.exit", "peak", this.config.sellDataIndex, this.config.sellExitConfirmationOffsets, this.config.sellExitSignalTiming),
     ]);
     return signal;
   }
@@ -341,7 +387,7 @@ export class PeakValleyStrategy
     await this.warmup();
   }
 
-  getDiagnostics(): StrategyDiagnostics {
+  getDiagnostics(): PeakValleyStrategyDiagnostics {
     return this.diagnostics;
   }
 
@@ -418,18 +464,33 @@ export class PeakValleyStrategy
     confirmationOffsets: number[],
     timing: PeakValleySignalTiming,
   ): boolean {
+    return this.decisionGates("signal", shape, primaryIndex, confirmationOffsets, timing)
+      .every((item) => item.passed);
+  }
+
+  private decisionGates(
+    code: string,
+    shape: "valley" | "peak",
+    primaryIndex: number,
+    confirmationOffsets: number[],
+    timing: PeakValleySignalTiming,
+  ): StrategyDiagnostics["gates"] {
     const primary = this.config.derivativeSource === "kama"
       ? { current: this.kamaClamped.indicator(), previous: this.kamaClamped.previous() }
       : {
           current: this.averages[primaryIndex]?.clamped.indicator() ?? 0,
           previous: this.averages[primaryIndex]?.clamped.previous() ?? 0,
         };
-    return extremum(shape, timing, primary.previous, primary.current)
-      && confirmationOffsets.every((offset) => {
+    return [
+      gate(`${code}.source.${this.config.derivativeSource}`, extremum(shape, timing, primary.previous, primary.current), primary.current, primary.previous),
+      ...confirmationOffsets.flatMap((offset) => {
         const confirmation = this.averages[primaryIndex + offset];
         const value = confirmation?.clamped.indicator();
-        return value === undefined || (shape === "valley" ? value > 0 : value < 0);
-      });
+        return value === undefined
+          ? []
+          : [gate(`${code}.confirmation.${offset}`, shape === "valley" ? value > 0 : value < 0, value, 0)];
+      }),
+    ];
   }
 
   private size(side: "buy" | "sell"): number {
@@ -456,7 +517,10 @@ export class PeakValleyStrategy
     return normalizedSigma(this.config.trendSigmaA, this.config.relativeRateEnabled) * Math.exp(clamp(exponent, -50, 50));
   }
 
-  private buildDiagnostics(): StrategyDiagnostics {
+  private buildDiagnostics(): PeakValleyStrategyDiagnostics {
+    const sizingIndex = Math.min(3, this.averages.length - 1);
+    const trendIndex = closestWindow(this.config.averagingRangesSec, this.config.trendSigmaWindowSec);
+    const warmupElapsedMs = this.lastTick ? this.lastTick.timestamp - this.startedAt : 0;
     return {
       indicators: Object.fromEntries([
         ...this.averages.flatMap((state, position) => [
@@ -470,6 +534,45 @@ export class PeakValleyStrategy
       gates: [],
       blockers: this.ready ? [] : ["warmup"],
       lastSignal: this.diagnostics.lastSignal,
+      ready: this.ready,
+      warmupRemainingMs: this.ready
+        ? 0
+        : Math.max(0, this.config.saturationSec * 1_000 - warmupElapsedMs),
+      movingAverageType: this.config.movingAverageType,
+      derivativeSource: this.config.derivativeSource,
+      latestTick: structuredClone(this.lastTick),
+      averages: this.averages.map((state, index) => ({
+        index,
+        windowSec: this.config.averagingRangesSec[index],
+        value: state.indicator.indicator(),
+        rawRate: state.rate,
+        clampedRate: state.clamped.indicator(),
+        previousClampedRate: state.clamped.previous(),
+        thresholdLow: this.config.rateThresholdsLow[index] ?? 0,
+        thresholdHigh: this.config.rateThresholdsHigh[index] ?? 0,
+        roles: {
+          buyPrimary: index === this.config.buyDataIndex,
+          sellPrimary: index === this.config.sellDataIndex,
+          buyEntryConfirmation: confirms(index, this.config.buyDataIndex, this.config.buyConfirmationOffsets),
+          sellEntryConfirmation: confirms(index, this.config.sellDataIndex, this.config.sellConfirmationOffsets),
+          buyExitConfirmation: confirms(index, this.config.buyDataIndex, this.config.buyExitConfirmationOffsets),
+          sellExitConfirmation: confirms(index, this.config.sellDataIndex, this.config.sellExitConfirmationOffsets),
+          sizing: index === sizingIndex,
+          trendSigma: this.config.sigmaMode !== "static" && index === trendIndex,
+        },
+      })),
+      kama: this.config.derivativeSource === "kama"
+        ? {
+            value: this.kama.indicator(),
+            rawRate: this.kamaRate,
+            clampedRate: this.kamaClamped.indicator(),
+            previousClampedRate: this.kamaClamped.previous(),
+          }
+        : null,
+      sizing: {
+        buy: { size: this.size("buy"), sigma: this.sigma("buy") },
+        sell: { size: this.size("sell"), sigma: this.sigma("sell") },
+      },
     };
   }
 
@@ -571,6 +674,10 @@ function offsets(values: number[]): number[] {
   return values.map((value) => Math.max(0, Math.round(value))).filter(Number.isFinite);
 }
 
+function confirms(index: number, primary: number, offsets: number[]): boolean {
+  return offsets.some((offset) => index === primary + offset);
+}
+
 function arrayIndex(value: number, count: number): number {
   return Math.max(0, Math.min(count - 1, Math.round(value)));
 }
@@ -595,6 +702,22 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-function emptyDiagnostics(): StrategyDiagnostics {
-  return { indicators: {}, gates: [], blockers: ["warmup"], lastSignal: null };
+function emptyDiagnostics(config: PeakValleyStrategyConfig): PeakValleyStrategyDiagnostics {
+  return {
+    indicators: {},
+    gates: [],
+    blockers: ["warmup"],
+    lastSignal: null,
+    ready: false,
+    warmupRemainingMs: config.saturationSec * 1_000,
+    movingAverageType: config.movingAverageType,
+    derivativeSource: config.derivativeSource,
+    latestTick: null,
+    averages: [],
+    kama: null,
+    sizing: {
+      buy: { size: 0, sigma: 0 },
+      sell: { size: 0, sigma: 0 },
+    },
+  };
 }

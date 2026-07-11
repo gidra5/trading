@@ -9,7 +9,7 @@ const DEFAULT_SMA_WINDOW_MS = 30 * 60 * 1000;
 const DEFAULT_THRESHOLD_TIME_MS = 5 * 60 * 1000;
 const DEFAULT_THRESHOLD_PRICE_DISTANCE_PCT = 0.02;
 
-type ExtremaKind = "peak" | "valley";
+export type ExtremaKind = "peak" | "valley";
 
 interface RollingClose {
   time: number;
@@ -21,7 +21,7 @@ interface CenteredSmaPoint {
   price: number;
 }
 
-interface ExtremaPoint extends CenteredSmaPoint {
+export interface ExtremaPoint extends CenteredSmaPoint {
   kind: ExtremaKind;
 }
 

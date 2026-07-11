@@ -18,17 +18,23 @@ import {
 import type {
   BacktestCandleChart,
   BacktestChartAnnotation,
+  BacktestChartSmaSeries,
+  BacktestExtremumTrace,
+  BacktestOraclePoint,
+  BacktestOrderTrace,
+  BacktestPositionStateTrace,
+  BacktestPositionTrace,
+  BacktestTrace,
+  BacktestTraceFrame,
   BacktestReplayFrame,
   BacktestExtremaOrderMassSideSummary,
   BotEvent,
   Candle,
-  LegacyEntryRiskDebug,
-  LegacyMarketStateDebug,
-  LegacyValleyPeakCheckDebug,
   LongPositionLot,
   ManualTradeInput,
-  PaperBotState,
   PeakValleyBotConfig,
+  PeakValleyAverageDiagnostics,
+  PeakValleyStrategyDiagnostics,
   PositionLedger,
   ShortPositionLot,
   EquityPoint,
@@ -41,6 +47,7 @@ import type {
 } from "@trading/bot-algo";
 import {
   CandleChart,
+  type CandleChartOverlayVisibility,
   type CandleChartPriceDisplay,
   type CandleChartViewport,
 } from "./components/CandleChart";
@@ -90,6 +97,7 @@ function websocketUrl(basePath: string, socketPath: string): string {
 }
 
 interface BacktestSettings {
+  extremaSmaWindowMinutes: number;
   historicalDays: number;
   randomSampleCount: number;
   randomWindowDays: number;
@@ -102,6 +110,7 @@ interface BacktestSettings {
 type CorrelationSortMode = "abs-desc" | "abs-asc" | "value-desc" | "value-asc";
 
 const defaultBacktestSettings: BacktestSettings = {
+  extremaSmaWindowMinutes: 30,
   historicalDays: 30,
   randomSampleCount: 40,
   randomWindowDays: 7,
@@ -355,9 +364,11 @@ export function App() {
       randomMaxWindowDays?: number;
       randomLookbackDays?: number;
       randomPairCount?: number;
+      extremaSmaWindowMinutes?: number;
     } = {
       preset,
       limit: preset === "saved-orderbook" ? 3_000 : 1_000,
+      extremaSmaWindowMinutes: settings.extremaSmaWindowMinutes,
     };
 
     if (preset === "last-x") {
@@ -2223,7 +2234,8 @@ function LiveEquityPanel(props: { points: EquityPoint[] }) {
 
 function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
   const diagnostics = () => props.bot?.diagnostics.strategy;
-  const indicators = () => Object.entries(diagnostics()?.indicators ?? {}).slice(0, 12);
+  const risk = (side: "long" | "short") =>
+    [...(props.bot?.diagnostics.entryRisk ?? [])].reverse().find((item) => item.side === side);
 
   return (
     <div class="panel">
@@ -2237,200 +2249,84 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
       <Show when={diagnostics()} fallback={<div class="text-sm text-ink-300">Waiting for strategy evaluation</div>}>
         {(state) => (
           <>
+            <div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+              <span class={state().ready ? "rounded-2 bg-gain/12 px-2 py-1 text-gain" : "rounded-2 bg-warn/12 px-2 py-1 text-warn"}>
+                {state().ready ? "ready" : `${formatDuration(state().warmupRemainingMs)} warmup`}
+              </span>
+              <span class="rounded-2 bg-ink-800 px-2 py-1 text-ink-300">
+                {state().movingAverageType.toUpperCase()} · source {state().derivativeSource.toUpperCase()}
+              </span>
+              <Show when={state().latestTick}>
+                {(tick) => <span class="text-ink-400">${formatQuote(tick().price, 4)} · {formatTime(tick().timestamp)}</span>}
+              </Show>
+            </div>
+            <StrategyMarketState diagnostics={state()} />
             <div class="grid grid-cols-2 gap-3">
-              <SmallMetric label="Last Signal" value={state().lastSignal?.type ?? "-"} />
-              <SmallMetric label="Side" value={state().lastSignal?.side ?? "-"} />
+              <SmallMetric
+                label="Last Signal"
+                value={state().lastSignal ? `${state().lastSignal?.type} ${state().lastSignal?.side}` : "-"}
+              />
+              <SmallMetric label="Reason" value={state().lastSignal?.reason ?? "-"} />
               <SmallMetric label="Blockers" value={state().blockers.join(", ") || "none"} />
               <SmallMetric
                 label="Gates"
                 value={`${state().gates.filter((gate) => gate.passed).length}/${state().gates.length}`}
               />
-            </div>
-            <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
-              <For each={indicators()} fallback={<div class="text-sm text-ink-300">No indicators yet</div>}>
-                {([name, value]) => (
-                  <div class="flex justify-between gap-3 border-t border-line py-1 text-sm first:border-0">
-                    <span class="text-ink-300">{name}</span>
-                    <span class="tabular-nums text-ink-100">{formatQuote(value ?? undefined, 8)}</span>
-                  </div>
-                )}
-              </For>
-            </div>
-          </>
-        )}
-      </Show>
-    </div>
-  );
-}
-
-function LegacyStrategyStatePanel(props: { bot?: PaperBotState }) {
-  const debug = () => props.bot?.memory.legacyValleyPeakDebug;
-  const roleAverages = () =>
-    (debug()?.averages ?? []).filter(
-      (item) =>
-        item.buyPrimary ||
-        item.sellPrimary ||
-        item.buyConfirmation ||
-        item.sellConfirmation,
-    );
-
-  return (
-    <div class="panel">
-      <div class="mb-3 flex items-center justify-between">
-        <div>
-          <div class="muted-label">Decision State</div>
-          <h2 class="text-lg font-semibold">Legacy Extrema</h2>
-        </div>
-        <Activity size={18} class="text-accent" />
-      </div>
-
-      <Show
-        when={debug()}
-        fallback={<div class="text-sm text-ink-300">Waiting for strategy evaluation</div>}
-      >
-        {(state) => (
-          <>
-            <MarketStateIndicator state={state().marketState} />
-
-            <div class="grid grid-cols-2 gap-3">
-              <SmallMetric label="Entry" value={state().entrySignal.toUpperCase()} />
-              <SmallMetric label="Exit" value={state().exitSignal.toUpperCase()} />
-              <SmallMetric
-                label="Last Extrema"
-                value={
-                  state().lastExtremaSignal
-                    ? `${state().lastExtremaSignal?.toUpperCase()} ${formatTime(
-                        state().lastExtremaSignalAt,
-                      )}`
-                    : "-"
-                }
-              />
-              <SmallMetric
-                label="Long Risk"
-                value={formatEntryRiskSummary(state().entryRisk?.long)}
-              />
-              <SmallMetric
-                label="Short Risk"
-                value={formatEntryRiskSummary(state().entryRisk?.short)}
-              />
+              <SmallMetric label="Long Risk" value={entryRiskLabel(risk("long"))} />
+              <SmallMetric label="Short Risk" value={entryRiskLabel(risk("short"))} />
+              <SmallMetric label="Buy Size / Sigma" value={`${formatPercent(state().sizing.buy.size * 100)} / ${formatQuote(state().sizing.buy.sigma, 7)}`} />
+              <SmallMetric label="Sell Size / Sigma" value={`${formatPercent(state().sizing.sell.size * 100)} / ${formatQuote(state().sizing.sell.sigma, 7)}`} />
             </div>
 
             <div class="mt-3 grid grid-cols-1 gap-2">
-              <DecisionCheck label="Entry Buy" check={state().buyCheck} />
-              <DecisionCheck label="Entry Sell" check={state().sellCheck} />
-              <DecisionCheck label="Exit Buy" check={state().buyExitCheck} />
-              <DecisionCheck label="Exit Sell" check={state().sellExitCheck} />
+              <StrategyDecisionCheck label="Entry Long" code="long.entry" diagnostics={state()} />
+              <StrategyDecisionCheck label="Entry Short" code="short.entry" diagnostics={state()} />
+              <StrategyDecisionCheck label="Exit Short" code="short.exit" diagnostics={state()} />
+              <StrategyDecisionCheck label="Exit Long" code="long.exit" diagnostics={state()} />
             </div>
 
-            <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
+            <div class="mt-3 overflow-auto rounded-2 bg-ink-800 p-3">
               <div class="mb-2 flex items-center justify-between gap-3">
-                <div class="muted-label">
-                  Raw {state().movingAverageType.toUpperCase()} Derivatives
-                </div>
-                <div class="text-xs text-ink-300">
-                  {state().saturated
-                    ? "saturated"
-                    : `${formatDuration(state().saturationRemainingMs)} warmup`}
-                  <span class="ml-2 tabular-nums">
-                    signal{" "}
-                    {state().derivativeSource === "kama"
-                      ? "KAMA"
-                      : state().movingAverageType.toUpperCase()}{" "}
-                    ${formatQuote(state().derivativeSourceValue, 4)}
-                  </span>
-                </div>
+                <div class="muted-label">Average Roles & Derivatives</div>
+                <Show when={state().kama}>
+                  {(kama) => (
+                    <span class="text-xs tabular-nums text-ink-300">
+                      KAMA ${formatQuote(kama().value, 4)} · {formatQuote(kama().rawRate, 8)} → {formatQuote(kama().clampedRate, 8)}
+                    </span>
+                  )}
+                </Show>
               </div>
-              <table class="w-full min-w-120 text-sm">
+              <table class="w-full min-w-160 text-sm">
                 <thead>
                   <tr>
                     <th class="table-head pb-2">Role</th>
                     <th class="table-head pb-2">Window</th>
-                    <th class="table-head pb-2">Avg</th>
-                    <th class="table-head pb-2">Rate</th>
-                    <th class="table-head pb-2">Clamp</th>
+                    <th class="table-head pb-2">Average</th>
+                    <th class="table-head pb-2">Raw rate</th>
+                    <th class="table-head pb-2">Previous</th>
+                    <th class="table-head pb-2">Clamped</th>
+                    <th class="table-head pb-2">Thresholds</th>
                     <th class="table-head pb-2">Shape</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <For
-                    each={roleAverages()}
-                    fallback={
-                      <EmptyRow
-                        columns={6}
-                        label={`No ${state().movingAverageType.toUpperCase()} data yet`}
-                      />
-                    }
-                  >
-                    {(item) => (
+                  <For each={state().averages}>
+                    {(average) => (
                       <tr>
-                        <td class="td-cell">
-                          <div class="flex flex-wrap gap-1">
-                            <Show when={item.buyPrimary}>
-                              <span class="rounded-2 bg-gain/12 px-2 py-1 text-xs text-gain">buy</span>
-                            </Show>
-                            <Show when={item.sellPrimary}>
-                              <span class="rounded-2 bg-loss/12 px-2 py-1 text-xs text-loss">sell</span>
-                            </Show>
-                            <Show when={item.buyConfirmation || item.sellConfirmation}>
-                              <span class="rounded-2 bg-ink-700 px-2 py-1 text-xs text-ink-200">confirm</span>
-                            </Show>
-                          </div>
-                        </td>
-                        <td class="td-cell">{formatDuration(item.windowSec * 1000)}</td>
-                        <td class="td-cell tabular-nums">${formatQuote(item.avg, 4)}</td>
-                        <td class="td-cell tabular-nums">{formatRatePerHour(item.rate)}</td>
-                        <td class="td-cell tabular-nums">{formatRatePerHour(item.rateClamped)}</td>
-                        <td class="td-cell">
-                          {item.valley ? "valley" : item.peak ? "peak" : "flat"}
-                        </td>
+                        <td class="td-cell"><AverageRoleBadges average={average} /></td>
+                        <td class="td-cell">{formatDuration(average.windowSec * 1_000)}</td>
+                        <td class="td-cell tabular-nums">${formatQuote(average.value, 4)}</td>
+                        <td class="td-cell tabular-nums">{formatQuote(average.rawRate, 9)}</td>
+                        <td class="td-cell tabular-nums">{formatQuote(average.previousClampedRate, 9)}</td>
+                        <td class="td-cell tabular-nums">{formatQuote(average.clampedRate, 9)}</td>
+                        <td class="td-cell tabular-nums">{formatQuote(average.thresholdLow, 7)} / {formatQuote(average.thresholdHigh, 7)}</td>
+                        <td class="td-cell">{averageShape(average)}</td>
                       </tr>
                     )}
                   </For>
                 </tbody>
               </table>
             </div>
-
-            <div class="mt-3 grid grid-cols-1 gap-3">
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label mb-2">Candle Move Ranges</div>
-                <div class="grid grid-cols-2 gap-2 text-xs text-ink-300">
-                  <For each={state().candleRanges.slice(-4)}>
-                    {(range) => (
-                      <div class="rounded-2 bg-ink-900 p-2">
-                        <div class="font-semibold text-ink-100">
-                          {formatDuration(range.windowSec * 1000)}
-                        </div>
-                        <div>avg {formatPercent(range.avgPct)}</div>
-                        <div>max {formatPercent(range.maxPct)}</div>
-                        <div>now {formatPercent(range.currentPct)}</div>
-                        <div class="text-ink-500">
-                          {formatRangeCoverage(range.sampleCount, range.sampleSpanMs)}
-                        </div>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </div>
-              <div class="rounded-2 bg-ink-800 p-3">
-                <div class="muted-label mb-2">Long Range Bounds</div>
-                <div class="grid grid-cols-1 gap-2 text-xs text-ink-300">
-                  <For each={state().priceRanges}>
-                    {(range) => (
-                      <div class="grid grid-cols-[48px_minmax(0,1fr)] gap-2 rounded-2 bg-ink-900 p-2">
-                        <div class="font-semibold text-ink-100">{range.window}</div>
-                        <div class="tabular-nums">
-                          ${formatQuote(range.minPrice, 2)} - ${formatQuote(range.maxPrice, 2)}
-                          <span class="ml-2 text-ink-400">{formatPercent(range.rangePct)}</span>
-                          <div class="text-ink-500">
-                            {formatRangeCoverage(range.sampleCount, range.sampleSpanMs)}
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </div>
-            </div>
           </>
         )}
       </Show>
@@ -2438,108 +2334,94 @@ function LegacyStrategyStatePanel(props: { bot?: PaperBotState }) {
   );
 }
 
-function MarketStateIndicator(props: { state: LegacyMarketStateDebug }) {
-  const label = () =>
-    props.state.state === "rising"
-      ? "Rising"
-      : props.state.state === "falling"
-        ? "Falling"
-        : "Sideways";
-
+function StrategyMarketState(props: { diagnostics: PeakValleyStrategyDiagnostics }) {
+  const average = () => props.diagnostics.averages.find((item) => item.roles.trendSigma)
+    ?? props.diagnostics.averages.at(-1);
+  const state = () => (average()?.clampedRate ?? 0) > 0
+    ? "rising"
+    : (average()?.clampedRate ?? 0) < 0
+      ? "falling"
+      : "sideways";
   return (
     <div
       class="mb-3 rounded-2 border p-3"
       classList={{
-        "border-gain/35 bg-gain/10": props.state.state === "rising",
-        "border-loss/35 bg-loss/10": props.state.state === "falling",
-        "border-line bg-ink-800": props.state.state === "sideways",
+        "border-gain/35 bg-gain/10": state() === "rising",
+        "border-loss/35 bg-loss/10": state() === "falling",
+        "border-line bg-ink-800": state() === "sideways",
       }}
     >
-      <div class="flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center justify-between gap-3">
         <div>
           <div class="muted-label">Market State</div>
-          <div
-            class="mt-1 text-lg font-semibold"
-            classList={{
-              "text-gain": props.state.state === "rising",
-              "text-loss": props.state.state === "falling",
-              "text-ink-100": props.state.state === "sideways",
-            }}
-          >
-            {label()}
-          </div>
+          <div class="mt-1 text-lg font-semibold capitalize">{state()}</div>
         </div>
-        <div class="text-right text-xs text-ink-300 tabular-nums">
-          <div>{formatDuration((props.state.windowSec ?? 0) * 1000)} window</div>
-          <div>rate {formatRatePerHour(props.state.rate)}</div>
-          <div>clamp {formatRatePerHour(props.state.rateClamped)}</div>
+        <div class="text-right text-xs tabular-nums text-ink-300">
+          <div>{formatDuration((average()?.windowSec ?? 0) * 1_000)} window</div>
+          <div>{formatQuote(average()?.rawRate, 9)} → {formatQuote(average()?.clampedRate, 9)}</div>
         </div>
       </div>
     </div>
   );
 }
 
-function DecisionCheck(props: {
-  label?: string;
-  check?: LegacyValleyPeakCheckDebug;
+function StrategyDecisionCheck(props: {
+  label: string;
+  code: string;
+  diagnostics: PeakValleyStrategyDiagnostics;
 }) {
-  const check = () => props.check;
-  const size = () => {
-    const value = check();
-    if (!value) {
-      return "-";
-    }
-    if (value.side === "buy") {
-      return `quote $${formatQuote(value.quoteSize, 2)} / cover ${formatAsset(value.coverQuantity)}`;
-    }
-    return `base ${formatAsset(value.quantity)} / short $${formatQuote(value.quoteSize, 2)}`;
-  };
-
+  const result = () => props.diagnostics.gates.find((gate) => gate.code === props.code);
+  const details = () => props.diagnostics.gates.filter((gate) => gate.code.startsWith(`${props.code}.`));
   return (
     <div class="rounded-2 bg-ink-800 p-3">
-      <div class="mb-2 flex items-center justify-between gap-3">
-        <div class="text-sm font-semibold uppercase text-ink-100">
-          {props.label ?? check()?.side ?? "check"}
-        </div>
-        <span
-          class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
-          classList={{
-            "bg-gain/12 text-gain": Boolean(check()?.passed),
-            "bg-loss/12 text-loss": !check()?.passed,
-          }}
-        >
-          {check()?.passed ? "pass" : "block"}
+      <div class="flex items-center justify-between gap-3">
+        <span class="text-sm font-semibold text-ink-100">{props.label}</span>
+        <span class={result()?.passed ? "text-sm font-semibold text-gain" : "text-sm text-ink-400"}>
+          {result()?.passed ? "active" : "blocked"}
         </span>
       </div>
-      <div class="text-xs text-ink-300">
-        primary {check()?.primaryIndex} {check()?.primaryShape} · rate{" "}
-        {formatRatePerHour(check()?.primaryRateClamped)}
-      </div>
-      <div class="mt-1 text-xs text-ink-300">
-        sigma {formatSmallNumber(check()?.effectiveSigma)} · trend{" "}
-        {formatSmallNumber(check()?.trendRate)}
-      </div>
-      <div class="mt-1 text-xs text-ink-300">{size()}</div>
-      <div class="mt-2 grid grid-cols-[repeat(auto-fit,minmax(10rem,1fr))] gap-1">
-        <For each={check()?.confirmations ?? []}>
-          {(item) => (
-            <span
-              class="min-w-0 whitespace-nowrap rounded-2 px-2 py-1 text-center text-xs tabular-nums"
-              classList={{
-                "bg-gain/12 text-gain": item.passed,
-                "bg-loss/12 text-loss": !item.passed,
-              }}
-            >
-              {item.index} {item.expected} {formatRatePerHour(item.rateClamped)}
-              <Show when={item.anticipated}>
-                <span class="ml-1 text-accent">ant</span>
-              </Show>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <For each={details()} fallback={<span class="text-xs text-ink-400">No checks yet</span>}>
+          {(gate) => (
+            <span class={gate.passed ? "rounded-2 bg-gain/12 px-2 py-1 text-xs text-gain" : "rounded-2 bg-loss/10 px-2 py-1 text-xs text-loss"}>
+              {gate.code.slice(props.code.length + 1)} · {formatQuote(gate.value, 8)} / {formatQuote(gate.threshold, 8)}
             </span>
           )}
         </For>
       </div>
     </div>
   );
+}
+
+function AverageRoleBadges(props: { average: PeakValleyAverageDiagnostics }) {
+  const roles = () => [
+    props.average.roles.buyPrimary && ["buy", "bg-gain/12 text-gain"],
+    props.average.roles.sellPrimary && ["sell", "bg-loss/12 text-loss"],
+    props.average.roles.buyEntryConfirmation && ["buy entry confirm", "bg-ink-700 text-ink-200"],
+    props.average.roles.sellEntryConfirmation && ["sell entry confirm", "bg-ink-700 text-ink-200"],
+    props.average.roles.buyExitConfirmation && ["buy exit confirm", "bg-ink-700 text-ink-200"],
+    props.average.roles.sellExitConfirmation && ["sell exit confirm", "bg-ink-700 text-ink-200"],
+    props.average.roles.sizing && ["sizing", "bg-accent/12 text-accent"],
+    props.average.roles.trendSigma && ["sigma", "bg-warn/12 text-warn"],
+  ].filter((item): item is string[] => Boolean(item));
+  return (
+    <div class="flex min-w-40 flex-wrap gap-1">
+      <For each={roles()} fallback={<span class="text-xs text-ink-400">-</span>}>
+        {(role) => <span class={`rounded-2 px-2 py-1 text-xs ${role[1]}`}>{role[0]}</span>}
+      </For>
+    </div>
+  );
+}
+
+function averageShape(average: PeakValleyAverageDiagnostics): string {
+  if (average.previousClampedRate < 0 && average.clampedRate >= 0) return "valley";
+  if (average.previousClampedRate > 0 && average.clampedRate <= 0) return "peak";
+  return average.clampedRate > 0 ? "rising" : average.clampedRate < 0 ? "falling" : "flat";
+}
+
+function entryRiskLabel(report: RuntimeSnapshot["bot"]["diagnostics"]["entryRisk"][number] | undefined): string {
+  if (!report) return "-";
+  return `${report.blocker ?? "ready"} · $${formatQuote(report.size, 2)} · ${formatLeverage(report.leverage)}`;
 }
 
 function SmallMetric(props: { label: string; value: string }) {
@@ -2549,17 +2431,6 @@ function SmallMetric(props: { label: string; value: string }) {
       <div class="mt-1 text-base font-semibold tabular-nums text-ink-100">{props.value}</div>
     </div>
   );
-}
-
-function formatRangeCoverage(
-  sampleCount: number | undefined,
-  spanMs: number | undefined,
-): string {
-  if (!sampleCount || sampleCount <= 0 || !spanMs || spanMs <= 0) {
-    return "no loaded samples";
-  }
-
-  return `${formatQuote(sampleCount, 0)} samples / ${formatDuration(spanMs)}`;
 }
 
 function formatLeverage(value: number | undefined): string {
@@ -2578,35 +2449,6 @@ function formatBps(value: number | undefined): string {
     return "-";
   }
   return `${formatQuote(value, 3)} bps`;
-}
-
-function formatRatePerHour(value: number | undefined): string {
-  if (!Number.isFinite(value)) {
-    return "-";
-  }
-  return `${formatQuote((value as number) * 100 * 3600, 5)}%/h`;
-}
-
-function formatSmallNumber(value: number | undefined): string {
-  if (!Number.isFinite(value)) {
-    return "-";
-  }
-
-  const finite = value as number;
-  if (Math.abs(finite) > 0 && Math.abs(finite) < 0.0001) {
-    return finite.toExponential(3);
-  }
-  return formatQuote(finite, 6);
-}
-
-function formatEntryRiskSummary(
-  risk: LegacyEntryRiskDebug | undefined,
-): string {
-  if (!risk) {
-    return "-";
-  }
-
-  return `${formatLeverage(risk.leverage)} ${risk.mode}`;
 }
 
 function formatOptionalQuote(value: number | undefined, quoteAsset: string): string {
@@ -4207,6 +4049,17 @@ function BacktestPanel(props: {
         </div>
       </Show>
 
+      <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:max-w-xs">
+        <BacktestNumberInput
+          label="Extrema SMA Minutes"
+          value={props.settings.extremaSmaWindowMinutes}
+          min={1}
+          max={1440}
+          disabled={isRunning()}
+          onChange={(value) => props.onSettingChange("extremaSmaWindowMinutes", value)}
+        />
+      </div>
+
       <Show when={props.preset === "random-windows"}>
         <div class="mb-4 grid grid-cols-1 gap-3 rounded-2 bg-ink-800 p-3 sm:grid-cols-2 xl:grid-cols-4">
           <BacktestNumberInput
@@ -4569,9 +4422,11 @@ interface BacktestReplayMetricDefinition {
   label: string;
   group: "account" | "risk" | "balances" | "activity" | "positions";
   color: string;
-  value: (frame: BacktestReplayFrame) => number | undefined;
+  value: (frame: BacktestMetricFrame) => number | undefined;
   format: (value: number | undefined) => string;
 }
+
+type BacktestMetricFrame = BacktestReplayFrame | BacktestTraceFrame;
 
 const backtestReplayMetrics: BacktestReplayMetricDefinition[] = [
   {
@@ -4804,8 +4659,25 @@ const backtestReplayMetricByKey = new Map(
   backtestReplayMetrics.map((metric) => [metric.key, metric]),
 );
 
+function averageSeriesKey(series: BacktestChartSmaSeries): string {
+  return `${series.index}:${series.windowSec}:${series.label}`;
+}
+
 function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
   const [selectedTime, setSelectedTime] = createSignal<number>();
+  const [selectedPositionId, setSelectedPositionId] = createSignal<string>();
+  const [selectedExtremumId, setSelectedExtremumId] = createSignal<string>();
+  const [hoveredOracle, setHoveredOracle] = createSignal<BacktestOraclePoint>();
+  const [hiddenAverageKeys, setHiddenAverageKeys] = createSignal<ReadonlySet<string>>(new Set());
+  const [overlays, setOverlays] = createSignal<CandleChartOverlayVisibility>({
+    averages: true,
+    signals: true,
+    orders: true,
+    fills: true,
+    positions: true,
+    extrema: true,
+    oracle: true,
+  });
   const [chartViewport, setChartViewport] = createSignal<CandleChartViewport>();
   const [selectedMetricKey, setSelectedMetricKey] =
     createSignal<BacktestReplayMetricKey>("equity");
@@ -4818,13 +4690,19 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
     const last = props.chart.candles.at(-1)?.closeTime ?? 0;
     const nextKey = `${props.chart.candles.length}:${first}:${last}:${
       props.chart.frames?.length ?? 0
+    }:${props.chart.trace?.positions.length ?? 0}:${props.chart.trace?.positions.at(-1)?.id ?? ""}:${
+      props.chart.smaSeries.map(averageSeriesKey).join(",")
     }`;
     if (nextKey === chartKey) {
       return;
     }
 
     chartKey = nextKey;
-    setSelectedTime(props.chart.frames?.at(-1)?.time ?? (last || undefined));
+    setSelectedTime(props.chart.trace?.frames.at(-1)?.time ?? props.chart.frames?.at(-1)?.time ?? (last || undefined));
+    setSelectedPositionId(props.chart.trace?.positions.at(-1)?.id);
+    setSelectedExtremumId(undefined);
+    setHoveredOracle(undefined);
+    setHiddenAverageKeys(() => new Set<string>());
     setChartViewport(undefined);
   });
 
@@ -4836,13 +4714,41 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
   const selectedCandle = createMemo(() =>
     findReplayCandle(props.chart.candles, selectedTime()),
   );
-  const selectedFrame = createMemo(() =>
-    findReplayFrame(props.chart.frames ?? [], selectedTime()),
-  );
+  const replayFrames = createMemo<BacktestMetricFrame[]>(() =>
+    props.chart.trace?.frames ?? props.chart.frames ?? []);
+  const selectedFrame = createMemo(() => findReplayFrame(replayFrames(), selectedTime()));
   const selectedAnnotations = createMemo(() => {
     const candle = selectedCandle();
     return candle ? replayAnnotationsForCandle(props.chart.annotations, candle) : [];
   });
+  const selectedExtremum = createMemo(() =>
+    props.chart.trace?.extrema.find((item) => item.id === selectedExtremumId()),
+  );
+  const visibleAverageSeries = createMemo(() =>
+    props.chart.smaSeries.filter((series) => !hiddenAverageKeys().has(averageSeriesKey(series))));
+  const toggleAverageSeries = (series: BacktestChartSmaSeries) => {
+    const key = averageSeriesKey(series);
+    setHiddenAverageKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const selectReplayTime = (time: number) => {
+    setSelectedTime(time);
+    const current = chartViewport();
+    const index = props.chart.candles.findIndex((candle) =>
+      time >= candle.openTime && time <= candle.closeTime);
+    if (!current || index < 0 || (index >= current.start && index < current.end)) return;
+    const visible = Math.max(1, current.end - current.start);
+    const start = clampNumber(
+      index - Math.floor(visible / 2),
+      0,
+      Math.max(0, props.chart.candles.length - visible),
+    );
+    setChartViewport({ start, end: start + visible });
+  };
 
   return (
     <div class="mt-4 rounded-2 bg-ink-800 p-3">
@@ -4853,7 +4759,7 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           <div class="mt-1 text-xs text-ink-300">
             {formatQuote(props.chart.candles.length, 0)} candles ·{" "}
             {formatQuote(props.chart.annotations.length, 0)} events ·{" "}
-            {formatQuote(props.chart.frames?.length, 0)} state frames
+            {formatQuote(props.chart.trace?.positions.length ?? props.chart.frames?.length, 0)} position traces
           </div>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -4881,6 +4787,31 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
               Line
             </button>
           </div>
+          <For each={[
+            ["averages", "Averages"],
+            ["signals", "Signals"],
+            ["orders", "Orders"],
+            ["fills", "Fills"],
+            ["positions", "Positions"],
+            ["extrema", "Extrema"],
+            ["oracle", "Oracle"],
+          ] as Array<[keyof CandleChartOverlayVisibility, string]>}>
+            {([key, label]) => (
+              <button
+                class={buttonPanelClass}
+                classList={{ "border-accent text-accent": overlays()[key] }}
+                type="button"
+                aria-pressed={overlays()[key]}
+                onClick={() => {
+                  if (key === "extrema" && overlays().extrema) setSelectedExtremumId(undefined);
+                  if (key === "oracle" && overlays().oracle) setHoveredOracle(undefined);
+                  setOverlays((current) => ({ ...current, [key]: !current[key] }));
+                }}
+              >
+                {label}
+              </button>
+            )}
+          </For>
           <Show when={selectedCandle()}>
             {(candle) => (
               <span class="rounded-2 border border-line bg-ink-900 px-2.5 py-1 text-xs tabular-nums text-ink-200">
@@ -4888,17 +4819,37 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
               </span>
             )}
           </Show>
-          <For each={props.chart.smaSeries}>
-            {(series) => (
-              <span class="inline-flex items-center gap-1 text-xs text-ink-300">
-                <span
-                  class="h-2 w-4 rounded-full"
-                  style={{ "background-color": series.color }}
-                />
-                {series.label}
-              </span>
-            )}
-          </For>
+          <Show when={overlays().averages}>
+            <div class="flex flex-wrap items-center gap-1" role="group" aria-label="Displayed moving averages">
+              <For each={props.chart.smaSeries}>
+                {(series) => (
+                  <button
+                    class="inline-flex min-h-7 items-center gap-1.5 rounded-2 border bg-ink-900 px-2 py-1 text-xs transition"
+                    classList={{
+                      "text-ink-200": !hiddenAverageKeys().has(averageSeriesKey(series)),
+                      "border-line text-ink-500": hiddenAverageKeys().has(averageSeriesKey(series)),
+                    }}
+                    style={{
+                      "border-color": hiddenAverageKeys().has(averageSeriesKey(series))
+                        ? undefined
+                        : series.color,
+                    }}
+                    type="button"
+                    aria-pressed={!hiddenAverageKeys().has(averageSeriesKey(series))}
+                    title={`Toggle ${series.label}`}
+                    onClick={() => toggleAverageSeries(series)}
+                  >
+                    <span
+                      class="h-2 w-4 rounded-full"
+                      classList={{ "opacity-25": hiddenAverageKeys().has(averageSeriesKey(series)) }}
+                      style={{ "background-color": series.color }}
+                    />
+                    {series.label}
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
         </div>
       </div>
       <div class="h-110 lg:h-[560px]">
@@ -4906,12 +4857,25 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
           candles={props.chart.candles}
           orders={[]}
           lastPrice={selectedFrame()?.price ?? props.chart.candles.at(-1)?.close ?? 0}
-          smaSeries={props.chart.smaSeries}
+          smaSeries={visibleAverageSeries()}
           annotations={props.chart.annotations}
+          trace={props.chart.trace}
+          overlays={overlays()}
+          highlightedPositionId={selectedPositionId()}
           selectedTime={selectedTime()}
           viewport={chartViewport()}
           priceDisplay={priceDisplay()}
-          onSelectionChange={(selection) => setSelectedTime(selection?.time)}
+          onSelectionChange={(selection) => {
+            setSelectedTime(selection?.time);
+            if (selection?.extremum) {
+              setSelectedPositionId(selection.extremum.orders[0]?.positionId ?? selectedPositionId());
+            } else {
+              const positionId = selection?.annotations.find((item) => item.targetPositionId)?.targetPositionId;
+              if (positionId) setSelectedPositionId(positionId);
+            }
+          }}
+          onExtremumHoverChange={(extremum) => setSelectedExtremumId(extremum?.id)}
+          onOracleHoverChange={setHoveredOracle}
           onViewportChange={setChartViewport}
           maxCandles={0}
           interactive
@@ -4920,42 +4884,62 @@ function BacktestReplayChart(props: { chart: BacktestCandleChart }) {
       </div>
 
       <div class="mt-3">
-        <BacktestReplayMetricPicker
-          frame={selectedFrame()}
-          selectedKey={selectedMetric().key}
-          onSelect={setSelectedMetricKey}
-        />
+        <BacktestReplayMetricPicker frame={selectedFrame()} selectedKey={selectedMetric().key} onSelect={setSelectedMetricKey} />
       </div>
-
       <div class="mt-3 h-48 lg:h-56">
         <BacktestReplayMetricChart
           candles={props.chart.candles}
-          frames={props.chart.frames ?? []}
+          frames={replayFrames()}
           metric={selectedMetric()}
           selectedTime={selectedTime()}
           viewport={chartViewport()}
           onSelectionTimeChange={setSelectedTime}
         />
       </div>
-
       <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)_minmax(0,1fr)]">
         <BacktestReplayCandlePanel candle={selectedCandle()} annotations={selectedAnnotations()} />
-        <BacktestReplayStatePanel
-          frame={selectedFrame()}
-          selectedMetricKey={selectedMetric().key}
-          onMetricSelect={setSelectedMetricKey}
-        />
-        <BacktestReplayPositionPanel
-          frame={selectedFrame()}
-          selectedMetricKey={selectedMetric().key}
-          onMetricSelect={setSelectedMetricKey}
-        />
+        <BacktestReplayStatePanel frame={selectedFrame()} selectedMetricKey={selectedMetric().key} onMetricSelect={setSelectedMetricKey} />
+        <BacktestReplayPositionPanel frame={selectedFrame()} selectedMetricKey={selectedMetric().key} onMetricSelect={setSelectedMetricKey} />
       </div>
 
-      <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-2">
-        <BacktestReplayEventsPanel annotations={selectedAnnotations()} />
-        <BacktestReplayOrdersAndLotsPanel frame={selectedFrame()} />
-      </div>
+      <Show when={props.chart.trace} fallback={
+        <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <BacktestReplayEventsPanel annotations={selectedAnnotations()} />
+          <BacktestReplayOrdersAndLotsPanel frame={props.chart.frames ? findReplayFrame(props.chart.frames, selectedTime()) : undefined} />
+        </div>
+      }>
+        {(trace) => (
+          <>
+            <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-2">
+              <BacktestTraceSignalPanel trace={trace()} time={selectedTime()} />
+              <BacktestTraceExtremumPanel extremum={selectedExtremum()} />
+            </div>
+            <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[minmax(240px,0.32fr)_minmax(0,0.68fr)]">
+              <BacktestTracePositionList
+                positions={trace().positions}
+                selectedId={selectedPositionId()}
+                onSelect={setSelectedPositionId}
+              />
+              <BacktestTracePositionPanel
+                trace={trace()}
+                positionId={selectedPositionId()}
+                time={selectedTime()}
+                onSelectPosition={setSelectedPositionId}
+              />
+            </div>
+            <div class="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-3">
+              <BacktestReplayEventsPanel annotations={selectedAnnotations()} />
+              <BacktestTraceOrdersPanel trace={trace()} time={selectedTime()} onSelectPosition={setSelectedPositionId} />
+              <BacktestOraclePanel
+                trace={trace()}
+                selected={hoveredOracle()}
+                time={selectedTime()}
+                onSelectTime={selectReplayTime}
+              />
+            </div>
+          </>
+        )}
+      </Show>
     </div>
   );
 }
@@ -4987,8 +4971,448 @@ function BacktestReplayCandlePanel(props: {
   );
 }
 
+function BacktestTraceSignalPanel(props: { trace: BacktestTrace; time?: number }) {
+  const signal = createMemo(() => nearestByTime(props.trace.signals, props.time));
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Strategy Activity</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            {signal() ? formatDateTime(signal()?.time) : "No active signal"}
+          </div>
+        </div>
+        <Show when={signal()}>
+          {(item) => <span class="text-xs text-accent">source {item().source}</span>}
+        </Show>
+      </div>
+      <Show when={signal()} fallback={<div class="text-sm text-ink-300">No strategy decision near this point</div>}>
+        {(item) => (
+          <>
+            <div class="mb-2 flex flex-wrap gap-2">
+              <For each={item().active} fallback={<span class="rounded-2 bg-ink-800 px-2 py-1 text-xs text-ink-300">confirmation active</span>}>
+                {(active) => (
+                  <span class="rounded-2 bg-accent/12 px-2 py-1 text-xs font-semibold text-accent">
+                    {active.side} {active.type}
+                  </span>
+                )}
+              </For>
+            </div>
+            <div class="max-h-44 space-y-1 overflow-auto pr-1 text-xs">
+              <For each={item().gates}>
+                {(gate) => (
+                  <div class="flex items-center justify-between gap-3 rounded-2 bg-ink-800 px-2 py-1.5">
+                    <span class={gate.passed ? "text-gain" : "text-ink-300"}>{gate.code}</span>
+                    <span class="tabular-nums text-ink-400">
+                      {formatQuote(gate.value, 6)} / {formatQuote(gate.threshold, 6)}
+                    </span>
+                  </div>
+                )}
+              </For>
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function BacktestTraceExtremumPanel(props: { extremum?: BacktestExtremumTrace }) {
+  const box = () => props.extremum?.errorBox;
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Hovered Real Extremum</div>
+        <div class="mt-1 text-sm font-semibold text-ink-100">
+          {props.extremum
+            ? `${props.extremum.kind} at $${formatQuote(props.extremum.price, 4)}`
+            : "Hover a peak or valley dot"}
+        </div>
+      </div>
+      <Show when={props.extremum}>
+        {(extremum) => (
+          <>
+            <div class="grid grid-cols-2 gap-2">
+              <SmallMetric label="Centered SMA" value={formatDuration(extremum().smaWindowMs)} />
+              <SmallMetric label="Matched fills" value={formatQuote(extremum().orders.length, 0)} />
+              <SmallMetric label="P99 time box" value={`±${formatDuration(extremum().p99TimeDistanceMs)}`} />
+              <SmallMetric label="P99 price box" value={`±${formatPercent(extremum().p99PriceDistancePct)}`} />
+              <SmallMetric label="Matched quote" value={`$${formatQuote(box()?.quote, 2)}`} />
+              <SmallMetric
+                label="Inside threshold"
+                value={box()?.quote ? formatPercent((box()!.withinThresholdQuote / box()!.quote) * 100) : "-"}
+              />
+            </div>
+            <div class="mt-2 max-h-28 space-y-1 overflow-auto pr-1">
+              <For each={extremum().orders}>
+                {(order) => (
+                  <div class="rounded-2 bg-ink-800 px-2 py-1.5 text-xs text-ink-300">
+                    {order.grid} {shortId(order.orderId)} · {formatDuration(Math.abs(order.timeErrorMs))} · {formatPercent(order.priceErrorPct)} · ${formatQuote(order.quote, 2)}
+                  </div>
+                )}
+              </For>
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function BacktestTracePositionList(props: {
+  positions: BacktestPositionTrace[];
+  selectedId?: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3">
+        <div class="muted-label">Concrete Positions</div>
+        <div class="mt-1 text-sm font-semibold text-ink-100">
+          {formatQuote(props.positions.length, 0)} position lifecycles
+        </div>
+      </div>
+      <div class="max-h-132 space-y-2 overflow-auto pr-1">
+        <For each={[...props.positions].sort((left, right) => right.createdAt - left.createdAt)}>
+          {(position) => (
+            <button
+              class="w-full rounded-2 border bg-ink-800 p-2 text-left transition hover:border-accent/60"
+              classList={{ "border-accent": props.selectedId === position.id, "border-transparent": props.selectedId !== position.id }}
+              type="button"
+              onClick={() => props.onSelect(position.id)}
+            >
+              <div class="flex items-center justify-between gap-2">
+                <span class={position.side === "long" ? "text-gain" : "text-loss"}>{position.side}</span>
+                <span class="text-xs text-ink-400">{formatTime(position.createdAt)}</span>
+              </div>
+              <div class="mt-1 text-xs text-ink-300">
+                {shortId(position.id)} · {formatLeverage(position.leverage)} · {position.closedAt ? "closed" : "open"}
+              </div>
+            </button>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function BacktestTracePositionPanel(props: {
+  trace: BacktestTrace;
+  positionId?: string;
+  time?: number;
+  onSelectPosition: (id: string) => void;
+}) {
+  const position = createMemo(() => props.trace.positions.find((item) => item.id === props.positionId));
+  const state = createMemo(() => positionStateAt(position(), props.time));
+  const orders = createMemo(() => props.trace.orders.filter((item) => item.positionId === props.positionId));
+  const grids = createMemo(() => props.trace.grids.filter((item) => item.positionId === props.positionId));
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <Show when={position()} fallback={<div class="text-sm text-ink-300">Select a position or one of its graph events</div>}>
+        {(item) => (
+          <>
+            <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div class="muted-label">Position Dynamics</div>
+                <div class="mt-1 text-sm font-semibold text-ink-100">
+                  {item().side} {shortId(item().id)} · {formatLeverage(item().leverage)}
+                </div>
+              </div>
+              <div class="text-right text-xs text-ink-300">
+                <div>created {formatDateTime(item().createdAt)}</div>
+                <div>opened {formatDateTime(item().openedAt ?? undefined)}</div>
+                <div>closed {formatDateTime(item().closedAt ?? undefined)}</div>
+              </div>
+            </div>
+            <div class="grid grid-cols-2 gap-2 md:grid-cols-4">
+              <SmallMetric label="Asset" value={formatAsset(state()?.asset)} />
+              <SmallMetric label="Quote" value={`$${formatQuote(state()?.quote, 2)}`} />
+              <SmallMetric label="External asset debt" value={formatAsset(state()?.externalBorrow.asset)} />
+              <SmallMetric label="External quote debt" value={`$${formatQuote(state()?.externalBorrow.quote, 2)}`} />
+            </div>
+            <div class="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <BacktestBorrowLinks
+                label="Borrowed from"
+                borrows={state()?.internalBorrow ?? []}
+                onSelect={props.onSelectPosition}
+              />
+              <BacktestBorrowLinks
+                label="Positions borrowing from it"
+                borrows={state()?.lentTo ?? []}
+                onSelect={props.onSelectPosition}
+              />
+            </div>
+            <div class="mt-3 grid grid-cols-1 gap-3 2xl:grid-cols-2">
+              <div>
+                <div class="mb-2 text-xs uppercase tracking-wide text-ink-300">How it opened and closed</div>
+                <div class="max-h-80 space-y-2 overflow-auto pr-1">
+                  <For each={orders()}>
+                    {(order) => <BacktestTraceOrderRow order={order} />}
+                  </For>
+                </div>
+              </div>
+              <div>
+                <div class="mb-2 text-xs uppercase tracking-wide text-ink-300">Amount / debt changes</div>
+                <div class="max-h-80 space-y-2 overflow-auto pr-1">
+                  <For each={item().states}>
+                    {(next, index) => <BacktestPositionStateRow state={next} previous={item().states[index() - 1]} />}
+                  </For>
+                </div>
+              </div>
+            </div>
+            <div class="mt-3 text-xs text-ink-400">
+              {grids().map((grid) => `${grid.kind}/${grid.cause} ${shortId(grid.id)} @ $${formatQuote(grid.creationPrice, 4)} (${grid.orderIds.length})`).join(" · ")}
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function BacktestTraceOrdersPanel(props: {
+  trace: BacktestTrace;
+  time?: number;
+  onSelectPosition: (id: string) => void;
+}) {
+  const orders = createMemo(() => props.trace.orders.filter((order) =>
+    (props.time === undefined || order.createdAt <= props.time)
+    && (order.endedAt === null || props.time === undefined || order.endedAt > props.time)));
+  const positions = createMemo(() => props.trace.positions.filter((position) =>
+    (props.time === undefined || position.createdAt <= props.time)
+    && (position.closedAt === null || props.time === undefined || position.closedAt > props.time)));
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Orders & Positions at Time</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            {formatQuote(orders().length, 0)} orders · {formatQuote(positions().length, 0)} positions
+          </div>
+        </div>
+        <span class="text-xs text-ink-400">{formatTime(props.time)}</span>
+      </div>
+      <div class="max-h-72 space-y-2 overflow-auto pr-1">
+        <For each={orders()} fallback={<div class="text-sm text-ink-300">No active orders</div>}>
+          {(order) => (
+            <button class="block w-full text-left" type="button" onClick={() => props.onSelectPosition(order.positionId)}>
+              <BacktestTraceOrderRow order={order} />
+            </button>
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function BacktestBorrowLinks(props: {
+  label: string;
+  borrows: Array<{ positionId: string; asset: number; quote: number }>;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div class="rounded-2 bg-ink-800 p-2">
+      <div class="mb-2 text-xs uppercase tracking-wide text-ink-300">{props.label}</div>
+      <For each={props.borrows} fallback={<div class="text-xs text-ink-400">None</div>}>
+        {(borrow) => (
+          <button class="mb-1 block w-full rounded-2 bg-ink-900 px-2 py-1.5 text-left text-xs text-accent" type="button" onClick={() => props.onSelect(borrow.positionId)}>
+            {shortId(borrow.positionId)} · {formatAsset(borrow.asset)} / ${formatQuote(borrow.quote, 2)}
+          </button>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function BacktestTraceOrderRow(props: { order: BacktestOrderTrace }) {
+  return (
+    <div class="rounded-2 bg-ink-800 p-2 text-xs">
+      <div class="flex items-center justify-between gap-3">
+        <span class={props.order.side === "buy" ? "text-gain" : "text-loss"}>
+          {props.order.grid} {props.order.side} {props.order.type}
+        </span>
+        <span class="text-ink-400">{props.order.outcome}</span>
+      </div>
+      <div class="mt-1 text-ink-300">
+        {shortId(props.order.id)} · {formatAsset(props.order.size)} @ ${formatQuote(props.order.price ?? props.order.stopPrice ?? undefined, 4)} · {formatTime(props.order.createdAt)}
+      </div>
+      <For each={props.order.fills}>
+        {(fill) => (
+          <div class="mt-1 rounded-2 bg-ink-900 px-2 py-1 text-ink-300">
+            fill {formatAsset(fill.asset)} @ ${formatQuote(fill.price, 4)} · ${formatQuote(fill.quote, 2)} · fee ${formatQuote(fill.feeQuote, 4)} · {formatTime(fill.time)}
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function BacktestPositionStateRow(props: { state: BacktestPositionStateTrace; previous?: BacktestPositionStateTrace }) {
+  const assetDelta = () => props.state.asset - (props.previous?.asset ?? 0);
+  const quoteDelta = () => props.state.quote - (props.previous?.quote ?? 0);
+  return (
+    <div class="rounded-2 bg-ink-800 p-2 text-xs text-ink-300">
+      <div class="flex items-center justify-between gap-3">
+        <span>{formatTime(props.state.time)}</span>
+        <span class="tabular-nums">Δ {formatAsset(assetDelta())} / ${formatQuote(quoteDelta(), 2)}</span>
+      </div>
+      <div class="mt-1 tabular-nums">
+        balance {formatAsset(props.state.asset)} / ${formatQuote(props.state.quote, 2)} · debt {formatAsset(props.state.externalBorrow.asset)} / ${formatQuote(props.state.externalBorrow.quote, 2)}
+      </div>
+    </div>
+  );
+}
+
+function BacktestOraclePanel(props: {
+  trace: BacktestTrace;
+  selected?: BacktestOraclePoint;
+  time?: number;
+  onSelectTime: (time: number) => void;
+}) {
+  const transitions = createMemo(() =>
+    props.trace.oracle.points.filter((point) => point.action !== "hold"));
+  const selectedIndex = createMemo(() => {
+    const values = transitions();
+    if (values.length === 0) return -1;
+    if (props.selected) {
+      const exact = values.findIndex((point) =>
+        point.time === props.selected?.time && point.state === props.selected.state);
+      if (exact >= 0) return exact;
+    }
+    return nearestOracleTransitionIndex(values, props.time);
+  });
+  const selected = createMemo(() => transitions()[selectedIndex()]);
+  const visibleTransitions = createMemo(() => {
+    const values = transitions();
+    const count = Math.min(80, values.length);
+    const start = clampNumber(
+      selectedIndex() - Math.floor(count / 2),
+      0,
+      Math.max(0, values.length - count),
+    );
+    return values.slice(start, start + count).map((point, index) => ({ point, index: start + index }));
+  });
+  const selectOffset = (offset: number) => {
+    const values = transitions();
+    const point = values[clampNumber(selectedIndex() + offset, 0, values.length - 1)];
+    if (point) props.onSelectTime(point.time);
+  };
+  return (
+    <div class="rounded-2 bg-ink-900 p-3">
+      <div class="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="muted-label">Optimal Trading Path</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">Three-state DP oracle · {props.trace.oracle.mode}</div>
+        </div>
+        <span class="text-xs text-ink-300">
+          {formatLeverage(props.trace.oracle.leverage)} · friction {formatPercent(props.trace.oracle.friction * 100)}
+        </span>
+      </div>
+      <div class="mb-2 flex flex-wrap gap-3 text-xs">
+        <span class="text-gain">▲ L long</span>
+        <span class="text-loss">▼ S short</span>
+        <span class="text-ink-300">◆ F flat / wait</span>
+        <span class="text-ink-400">{formatQuote(transitions().length, 0)} exact transitions</span>
+      </div>
+      <Show when={selected()}>
+        {(point) => (
+          <button
+            class="mb-2 block w-full rounded-2 border border-accent/35 bg-accent/8 p-2 text-left"
+            type="button"
+            onClick={() => props.onSelectTime(point().time)}
+          >
+            <div class="flex items-center justify-between gap-3 text-xs">
+              <span class={oracleStateClass(point().state)}>
+                {oracleTransitionLabel(point())} · {point().fromState} → {point().state}
+              </span>
+              <span class="text-ink-400">#{selectedIndex() + 1}</span>
+            </div>
+            <div class="mt-1 text-xs tabular-nums text-ink-200">
+              ${formatQuote(point().price, 4)} · {formatDateTime(point().time)}
+            </div>
+          </button>
+        )}
+      </Show>
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <button class={buttonPanelClass} type="button" disabled={selectedIndex() <= 0} onClick={() => selectOffset(-1)}>
+          Previous
+        </button>
+        <span class="text-center text-xs text-ink-400">
+          {formatQuote(visibleTransitions().length, 0)} around selected
+        </span>
+        <button class={buttonPanelClass} type="button" disabled={selectedIndex() >= transitions().length - 1} onClick={() => selectOffset(1)}>
+          Next
+        </button>
+      </div>
+      <div class="max-h-48 space-y-1 overflow-auto pr-1">
+        <For each={visibleTransitions()} fallback={<div class="text-sm text-ink-300">No state changes</div>}>
+          {({ point, index }) => (
+            <button
+              class="flex w-full items-center justify-between gap-3 rounded-2 bg-ink-800 px-2 py-1 text-left text-xs"
+              classList={{ "ring-1 ring-accent/55": index === selectedIndex() }}
+              type="button"
+              onClick={() => props.onSelectTime(point.time)}
+            >
+              <span class={oracleStateClass(point.state)}>
+                {index + 1}. {oracleTransitionLabel(point)} · {point.fromState} → {point.state}
+              </span>
+              <span class="text-ink-400">${formatQuote(point.price, 4)} · {formatTime(point.time)}</span>
+            </button>
+          )}
+        </For>
+      </div>
+      <div class="mt-2 text-xs text-ink-400">
+        The bottom strip is the held state; hold means remain long/short/flat. Events use synthetic open → high → low → close order.
+      </div>
+    </div>
+  );
+}
+
+function nearestOracleTransitionIndex(points: BacktestOraclePoint[], time: number | undefined): number {
+  if (points.length === 0) return -1;
+  if (time === undefined) return points.length - 1;
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((points[middle]?.time ?? Number.POSITIVE_INFINITY) < time) low = middle + 1;
+    else high = middle;
+  }
+  if (low === 0) return 0;
+  if (low >= points.length) return points.length - 1;
+  return time - points[low - 1]!.time <= points[low]!.time - time ? low - 1 : low;
+}
+
+function oracleTransitionLabel(point: BacktestOraclePoint): string {
+  if (point.state === "flat") return "GO FLAT";
+  return point.fromState === "flat"
+    ? `GO ${point.state.toUpperCase()}`
+    : `SWITCH TO ${point.state.toUpperCase()}`;
+}
+
+function oracleStateClass(state: BacktestOraclePoint["state"]): string {
+  return state === "long" ? "text-gain" : state === "short" ? "text-loss" : "text-ink-300";
+}
+
+function positionStateAt(position: BacktestPositionTrace | undefined, time: number | undefined): BacktestPositionStateTrace | undefined {
+  if (!position) return undefined;
+  if (time !== undefined && time < position.createdAt) return undefined;
+  return position.states.filter((state) => time === undefined || state.time <= time).at(-1) ?? position.states[0];
+}
+
+function nearestByTime<T extends { time: number }>(values: T[], time: number | undefined): T | undefined {
+  if (values.length === 0) return undefined;
+  if (time === undefined) return values.at(-1);
+  return values.reduce((nearest, value) =>
+    Math.abs(value.time - time) < Math.abs(nearest.time - time) ? value : nearest);
+}
+
+function shortId(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 6)}…${value.slice(-4)}` : value;
+}
+
 function BacktestReplayMetricPicker(props: {
-  frame?: BacktestReplayFrame;
+  frame?: BacktestMetricFrame;
   selectedKey: BacktestReplayMetricKey;
   onSelect: (key: BacktestReplayMetricKey) => void;
 }) {
@@ -5049,7 +5473,7 @@ function BacktestReplayMetricPicker(props: {
 
 function BacktestReplayMetricButton(props: {
   metricKey: BacktestReplayMetricKey;
-  frame?: BacktestReplayFrame;
+  frame?: BacktestMetricFrame;
   selected: boolean;
   onSelect: (key: BacktestReplayMetricKey) => void;
 }) {
@@ -5083,7 +5507,7 @@ function BacktestReplayMetricButton(props: {
 
 function BacktestReplayMetricChart(props: {
   candles: Candle[];
-  frames: BacktestReplayFrame[];
+  frames: BacktestMetricFrame[];
   metric: BacktestReplayMetricDefinition;
   selectedTime?: number;
   viewport?: CandleChartViewport;
@@ -5218,7 +5642,7 @@ function BacktestReplayMetricChart(props: {
 }
 
 function BacktestReplayStatePanel(props: {
-  frame?: BacktestReplayFrame;
+  frame?: BacktestMetricFrame;
   selectedMetricKey: BacktestReplayMetricKey;
   onMetricSelect: (key: BacktestReplayMetricKey) => void;
 }) {
@@ -5271,14 +5695,14 @@ function BacktestReplayStatePanel(props: {
           selected={props.selectedMetricKey === "baseFree"}
           onSelect={props.onMetricSelect}
         />
-        <SmallMetric label="Market" value={frame()?.marketState?.state ?? "-"} />
+        <SmallMetric label="Market" value={replayMarketState(frame())} />
       </div>
     </div>
   );
 }
 
 function BacktestReplayPositionPanel(props: {
-  frame?: BacktestReplayFrame;
+  frame?: BacktestMetricFrame;
   selectedMetricKey: BacktestReplayMetricKey;
   onMetricSelect: (key: BacktestReplayMetricKey) => void;
 }) {
@@ -5442,6 +5866,9 @@ function BacktestAnnotationRow(props: { annotation: BacktestChartAnnotation }) {
         </Show>
         <Show when={props.annotation.targetPositionId}>
           {(target) => <span> · {target()}</span>}
+        </Show>
+        <Show when={props.annotation.gridId}>
+          {(grid) => <span> · {props.annotation.gridKind} grid {shortId(grid())}</span>}
         </Show>
       </div>
     </div>
@@ -5686,14 +6113,14 @@ function findReplayCandle(candles: Candle[], time: number | undefined): Candle |
   return nearest;
 }
 
-function findReplayFrame(
-  frames: BacktestReplayFrame[],
+function findReplayFrame<T extends { time: number }>(
+  frames: T[],
   time: number | undefined,
-): BacktestReplayFrame | undefined {
+): T | undefined {
   if (frames.length === 0) {
     return undefined;
   }
-  if (!time) {
+  if (time === undefined) {
     return frames.at(-1);
   }
 
@@ -5708,6 +6135,10 @@ function findReplayFrame(
   }
 
   return nearest;
+}
+
+function replayMarketState(frame: BacktestMetricFrame | undefined): string {
+  return frame && "marketState" in frame ? frame.marketState?.state ?? "-" : "-";
 }
 
 function replayAnnotationsForCandle(

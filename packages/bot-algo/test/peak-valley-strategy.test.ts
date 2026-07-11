@@ -34,6 +34,18 @@ test("peak/valley warms indicators without emitting and signals a confirmed reve
   assert.equal(await strategy.entrySignal(), null);
   assert.equal(await strategy.exitSignal(), null);
 
+  const warmed = strategy.getDiagnostics();
+  assert.equal(warmed.ready, true);
+  assert.equal(warmed.warmupRemainingMs, 0);
+  assert.equal(warmed.movingAverageType, "sma");
+  assert.equal(warmed.derivativeSource, "price");
+  assert.equal(warmed.latestTick?.price, 2);
+  assert.equal(warmed.averages[0]?.roles.buyPrimary, true);
+  assert.equal(warmed.averages[1]?.roles.buyEntryConfirmation, true);
+  assert.equal(warmed.averages[1]?.roles.sellExitConfirmation, true);
+  assert.equal(warmed.kama, null);
+  assert.equal(warmed.sizing.buy.sigma, 1);
+
   await strategy.onTick({
     timestamp: 180_000,
     price: 4,

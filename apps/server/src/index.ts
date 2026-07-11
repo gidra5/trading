@@ -339,6 +339,7 @@ server.post("/api/backtest", async (request, reply) => {
     randomMaxWindowDays?: number;
     randomLookbackDays?: number;
     randomPairCount?: number;
+    extremaSmaWindowMinutes?: number;
   };
   const preset =
     body.preset ??
@@ -388,6 +389,10 @@ server.post("/api/backtest", async (request, reply) => {
           : clampInt(Number(body.randomLookbackDays), 1, 3650),
       randomPairCount: randomMarkets?.length ?? randomPairCount,
       randomMarkets,
+      extremaSmaWindowMinutes:
+        body.extremaSmaWindowMinutes === undefined
+          ? undefined
+          : clampInt(Number(body.extremaSmaWindowMinutes), 1, 1440),
     }, scheduleBroadcast);
     broadcastState();
     return publicSnapshot();

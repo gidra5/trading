@@ -10,6 +10,8 @@ export * from "./peak-valley-strategy.js";
 export type * from "./strategy.js";
 export type * from "./trading-api.js";
 export * from "./indicators.js";
+export type * from "./backtest-trace.js";
+export * from "./perfect-margin-oracle.js";
 export {
   compactBacktestState,
   createBacktestChartCollector,
