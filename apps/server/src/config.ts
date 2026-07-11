@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStrategyConfig, type PartialStrategyConfig } from "@trading/bot-algo";
 import { createConfiguredMarketListing, type MarketVenue } from "./binance-markets.js";
-import type { BinancePaperMode } from "./binance-paper.js";
+import type { BinanceExchangeMode } from "./binance-exchange.js";
 
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(sourceDir, "../../..");
@@ -10,7 +10,7 @@ const repoRoot = path.resolve(sourceDir, "../../..");
 const environment = normalizeEnvironment(process.env.TRADING_ENV);
 const symbol = (process.env.TRADING_SYMBOL ?? "BTCUSDT").toUpperCase();
 const interval = process.env.TRADING_INTERVAL ?? "1m";
-const binanceExchangeMode = parseBinancePaperMode(
+const binanceExchangeMode = parseBinanceExchangeMode(
   process.env.TRADING_BINANCE_EXCHANGE_MODE ??
     (parseBoolean(process.env.TRADING_BINANCE_LIVE_ENABLED, false)
       ? "live"
@@ -34,7 +34,7 @@ export const appConfig = {
   interval,
   binanceApiKey: process.env.BINANCE_API_KEY,
   binanceApiSecret: process.env.BINANCE_API_SECRET,
-  binancePaper: {
+  binanceExchange: {
     enabled:
       parseBoolean(process.env.TRADING_BINANCE_PAPER_ENABLED, false) ||
       parseBoolean(process.env.TRADING_BINANCE_LIVE_ENABLED, false) ||
@@ -128,7 +128,7 @@ function parseMarketVenue(value: string | undefined): MarketVenue | undefined {
   return undefined;
 }
 
-function parseBinancePaperMode(value: string | undefined): BinancePaperMode {
+function parseBinanceExchangeMode(value: string | undefined): BinanceExchangeMode {
   if (
     value === "live" ||
     value === "spot-live" ||
@@ -145,7 +145,7 @@ function parseBinancePaperMode(value: string | undefined): BinancePaperMode {
   return "auto";
 }
 
-function isLiveBinanceMode(value: BinancePaperMode): boolean {
+function isLiveBinanceMode(value: BinanceExchangeMode): boolean {
   return value === "live" || value.endsWith("-live");
 }
 

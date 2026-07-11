@@ -11,7 +11,7 @@ import type {
 } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
-import { BinancePaperUserDataStream } from "./binance-user-data-stream.js";
+import { BinanceExchangeUserDataStream } from "./binance-user-data-stream.js";
 import {
   BinanceMarketCatalog,
   getMarketStorageKey,
@@ -25,10 +25,10 @@ import { TradingStorage } from "./storage.js";
 import type { HistoricalBacktestMarket } from "./historical-backtest.js";
 import { CorrelationService } from "./correlation-service.js";
 import {
-  BinancePaperTrading,
-  type BinancePaperCancelOrderInput,
-  type BinancePaperPlaceOrderInput,
-} from "./binance-paper.js";
+  BinanceExchangeTrading,
+  type BinanceExchangeCancelOrderInput,
+  type BinanceExchangePlaceOrderInput,
+} from "./binance-exchange.js";
 
 const server = Fastify({
   logger: {
@@ -69,7 +69,7 @@ const marketCatalog = new BinanceMarketCatalog({
 });
 const initialMarket = await resolveInitialMarket();
 let activeMarket = initialMarket;
-const paperTrading = new BinancePaperTrading(appConfig.binancePaper);
+const exchangeTrading = new BinanceExchangeTrading(appConfig.binanceExchange);
 const runtime = new TradingRuntime(
   createStorage(initialMarket),
   initialMarket,
@@ -80,7 +80,7 @@ const runtime = new TradingRuntime(
     maxBytes: appConfig.historicalCache.maxBytes,
     minFreeBytes: appConfig.historicalCache.minFreeBytes,
   },
-  paperTrading,
+  exchangeTrading,
   {
     hardStop: appConfig.exchangeAccountGuard.hardStop,
     onWarning: (message) =>
@@ -258,7 +258,7 @@ server.put("/api/exchange/credentials", async (request, reply) => {
 
 server.post("/api/exchange/order", async (request, reply) => {
   try {
-    const body = (request.body ?? {}) as BinancePaperPlaceOrderInput;
+    const body = (request.body ?? {}) as BinanceExchangePlaceOrderInput;
     await runtime.placeExchangeOrder(normalizeExchangeOrderInput(body));
     broadcastState();
     return publicSnapshot();
@@ -270,7 +270,7 @@ server.post("/api/exchange/order", async (request, reply) => {
 
 server.delete("/api/exchange/order", async (request, reply) => {
   try {
-    const body = (request.body ?? {}) as BinancePaperCancelOrderInput;
+    const body = (request.body ?? {}) as BinanceExchangeCancelOrderInput;
     await runtime.cancelExchangeOrder(body);
     broadcastState();
     return publicSnapshot();
@@ -423,7 +423,7 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
     symbol: market.symbol,
     venue: market.venue,
     interval: appConfig.interval,
-    environment: paperTrading.streamEnvironmentFor(market),
+    environment: exchangeTrading.streamEnvironmentFor(market),
     handlers: {
       onStatus: (status) => {
         if (generation !== streamGeneration) {
@@ -468,16 +468,16 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
 function createUserDataStream(
   market: BinanceMarketListing,
   generation: number,
-): BinancePaperUserDataStream {
-  return new BinancePaperUserDataStream({
+): BinanceExchangeUserDataStream {
+  return new BinanceExchangeUserDataStream({
     market,
-    paperTrading,
+    exchangeTrading,
     handlers: {
       onStatus: (status) => {
         if (generation !== streamGeneration) {
           return;
         }
-        paperTrading.updateUserDataStreamStatus(market, status);
+        exchangeTrading.updateUserDataStreamStatus(market, status);
         scheduleBroadcast();
       },
       onUserData: async (payload) => {
@@ -499,8 +499,8 @@ function createUserDataStream(
 }
 
 function normalizeExchangeOrderInput(
-  input: BinancePaperPlaceOrderInput,
-): BinancePaperPlaceOrderInput {
+  input: BinanceExchangePlaceOrderInput,
+): BinanceExchangePlaceOrderInput {
   const side = input.side === "sell" ? "sell" : "buy";
   const type =
     input.type === "market"

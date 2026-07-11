@@ -1,7 +1,7 @@
 import WebSocket from "ws";
 import type { Candle, OrderBookSnapshot, PriceTick } from "@trading/bot-algo";
 import type { StreamVenue } from "./binance-markets.js";
-import type { BinancePaperStreamEnvironment } from "./binance-paper.js";
+import type { BinanceExchangeStreamEnvironment } from "./binance-exchange.js";
 
 export interface MarketStreamStatus {
   connected: boolean;
@@ -21,7 +21,7 @@ export interface BinanceMarketStreamOptions {
   symbol: string;
   venue: StreamVenue;
   interval: string;
-  environment?: BinancePaperStreamEnvironment;
+  environment?: BinanceExchangeStreamEnvironment;
   handlers: MarketStreamHandlers;
 }
 
@@ -40,7 +40,7 @@ export class BinanceMarketStream {
   private readonly streamSymbol: string;
   private readonly venue: StreamVenue;
   private readonly interval: string;
-  private readonly environment: BinancePaperStreamEnvironment;
+  private readonly environment: BinanceExchangeStreamEnvironment;
   private readonly handlers: MarketStreamHandlers;
 
   constructor(options: BinanceMarketStreamOptions) {

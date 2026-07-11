@@ -40,6 +40,54 @@ export interface NumericTradingIndicator<TSnapshot, TInput> extends TradingIndic
   derivative(): number;
 }
 
+export interface LookbackIndicatorSnapshot {
+  version: 1;
+  lookback: number;
+  values: number[];
+}
+
+export class LookbackIndicator
+  implements NumericTradingIndicator<LookbackIndicatorSnapshot, NumericIndicatorInput>
+{
+  private values: number[] = [];
+
+  constructor(private readonly lookback: number) {
+    assertPositiveWindow(lookback, "lookback");
+  }
+
+  async warmup(initialValue?: number): Promise<void> {
+    if (typeof initialValue === "number" && Number.isFinite(initialValue)) {
+      this.onTick({ eventTime: 0, value: initialValue });
+    }
+  }
+
+  onTick(input: NumericIndicatorInput): void {
+    if (!Number.isFinite(input.value)) return;
+    this.values.push(input.value);
+    while (this.values.length > this.lookback + 1) this.values.shift();
+  }
+
+  indicator(): number {
+    return this.values.at(-1) ?? 0;
+  }
+
+  previous(): number {
+    return this.values.at(-1 - this.lookback) ?? this.indicator();
+  }
+
+  derivative(): number {
+    return this.indicator() - this.previous();
+  }
+
+  snapshot(): LookbackIndicatorSnapshot {
+    return { version: 1, lookback: this.lookback, values: this.values.slice() };
+  }
+
+  restore(snapshot: LookbackIndicatorSnapshot | null): void {
+    this.values = snapshot?.values?.filter(isFiniteNumber).slice(-(this.lookback + 1)) ?? [];
+  }
+}
+
 export interface SMAIndicatorSnapshot {
   version: 1;
   windowSize: number;
@@ -82,6 +130,7 @@ abstract class BaseSMAIndicator<TInput extends ValueIndicatorInput>
     if (!Number.isFinite(price)) return;
     const weight = this.entryWeight(input);
 
+    const hadPrevious = this.values.length > 0;
     const prev = this.indicator();
     this.values.push(price);
     this.weights.push(weight);
@@ -94,7 +143,7 @@ abstract class BaseSMAIndicator<TInput extends ValueIndicatorInput>
       this.sum -= removedValue;
     }
     this.recalculateWeightedSums();
-    this.delta = this.values.length > 1 ? this.indicator() - prev : 0;
+    this.delta = hadPrevious ? this.indicator() - prev : 0;
   }
 
   indicator(): number {
@@ -425,8 +474,12 @@ export class KAMAIndicator implements NumericTradingIndicator<KAMAIndicatorSnaps
     slowPeriodOrAlpha: number,
     private readonly tradingApi: TradingApi,
     private readonly warmupCount = Math.max(efficiencyPeriod + 1, DEFAULT_EMA_WARMUP_COUNT),
+    private readonly power = 2,
   ) {
     assertPositiveWindow(efficiencyPeriod, "KAMA efficiency");
+    if (!Number.isFinite(power) || power <= 0) {
+      throw new Error("KAMA power must be positive.");
+    }
     this.fastAlpha = normalizeAlpha(fastPeriodOrAlpha);
     this.slowAlpha = normalizeAlpha(slowPeriodOrAlpha);
     this.alpha = this.slowAlpha;
@@ -482,7 +535,7 @@ export class KAMAIndicator implements NumericTradingIndicator<KAMAIndicatorSnaps
   private adaptiveAlpha(): number {
     const efficiencyRatio = this.efficiencyRatio.indicator();
     const smoothing = efficiencyRatio * (this.fastAlpha - this.slowAlpha) + this.slowAlpha;
-    return clampRatio(smoothing * smoothing);
+    return clampRatio(Math.pow(smoothing, this.power));
   }
 }
 

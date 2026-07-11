@@ -30,12 +30,12 @@ import {
   normalizeLegacyValleyPeakMemory,
   warmupLegacyValleyPeakPriceRanges,
   type LegacyValleyPeakAnticipation,
-} from "./legacy-valley-peak.js";
+} from "./valley-peak.js";
 import {
   PeakValleyBotCore,
   createBotCoreState,
   evaluateBot,
-} from "./legacy-bot-core.js";
+} from "./bot-core.js";
 import {
   canFillOrderAtTick,
   orderExecutionPrice,

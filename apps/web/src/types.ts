@@ -1,13 +1,27 @@
 import type {
   BacktestProgressSnapshot,
   BacktestPreset,
-  BotEvent,
+  BotDiagnostics,
+  BotEntryRiskReport,
+  BotMetricsSnapshot,
+  BotSnapshot,
   Candle,
-  OrderBookSnapshot,
   EquityPoint,
-  PaperBotState,
-  PositionLedger,
+  OrderBookSnapshot,
+  PeakValleyBotConfig,
+  PeakValleyStrategySnapshot,
+  TradingFill,
+  TradingOrderSnapshot,
 } from "@trading/bot-algo";
+
+export interface EquitySnapshot {
+  quoteAvailable: number;
+  quoteReserved: number;
+  quoteUnleveraged: number;
+  assetAvailable: number;
+  assetReserved: number;
+  assetUnleveraged: number;
+}
 
 export type MarketGroup =
   | "spot"
@@ -90,9 +104,27 @@ export interface RuntimeSnapshot {
     candles: Candle[];
     orderBook?: OrderBookSnapshot;
   };
-  bot: PaperBotState;
-  positions: PositionLedger;
-  recentEvents: BotEvent[];
+  bot: {
+    status: "running" | "stopped";
+    runStartedAt: number;
+    config: PeakValleyBotConfig;
+    state: BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>;
+    metrics: BotMetricsSnapshot & {
+      equity: number;
+      netPnl: number;
+      returnPct: number;
+    };
+    diagnostics: BotDiagnostics & { entryRisk: readonly BotEntryRiskReport[] };
+    equity: EquitySnapshot;
+  };
+  recentEvents: Array<{
+    type: "open" | "partial-fill" | "fill" | "rejected" | "status" | "reset";
+    at: number;
+    message: string;
+    order?: TradingOrderSnapshot;
+    orderId?: string;
+    fill?: TradingFill;
+  }>;
   backtest: BacktestProgressSnapshot;
   correlations: CorrelationSnapshot;
   equityCurve: EquityPoint[];
@@ -103,7 +135,7 @@ export interface RuntimeSnapshot {
     live: boolean;
     message: string;
   };
-  exchange: BinancePaperSnapshot;
+  exchange: BinanceExchangeSnapshot;
 }
 
 export type BotExecutionMode = "simulated" | "binance";
@@ -154,7 +186,7 @@ export interface CorrelationSnapshot {
   entries: CorrelationEntry[];
 }
 
-export type BinancePaperMode =
+export type BinanceExchangeMode =
   | "auto"
   | "live"
   | "spot-live"
@@ -165,7 +197,7 @@ export type BinancePaperMode =
   | "usdm-futures-testnet"
   | "coinm-futures-testnet";
 
-export interface BinancePaperBalance {
+export interface BinanceExchangeBalance {
   asset: string;
   free: number;
   locked: number;
@@ -174,7 +206,7 @@ export interface BinancePaperBalance {
   unrealizedPnl?: number;
 }
 
-export interface BinancePaperPosition {
+export interface BinanceExchangePosition {
   symbol: string;
   positionSide?: string;
   positionAmt: number;
@@ -188,7 +220,7 @@ export interface BinancePaperPosition {
   updateTime?: number;
 }
 
-export interface BinancePaperOrder {
+export interface BinanceExchangeOrder {
   symbol: string;
   orderId: string;
   clientOrderId: string;
@@ -210,7 +242,7 @@ export interface BinancePaperOrder {
   updatedAt?: number;
 }
 
-export interface BinancePaperTrade {
+export interface BinanceExchangeTrade {
   id: string;
   symbol: string;
   orderId: string;
@@ -229,7 +261,7 @@ export interface BinancePaperTrade {
   maker?: boolean;
 }
 
-export interface BinancePaperSymbolFilters {
+export interface BinanceExchangeSymbolFilters {
   symbol: string;
   pricePrecision?: number;
   quantityPrecision?: number;
@@ -246,17 +278,17 @@ export interface BinancePaperSymbolFilters {
   maxNotional?: number;
 }
 
-export interface BinancePaperCommission {
+export interface BinanceExchangeCommission {
   makerFeeBps?: number;
   takerFeeBps?: number;
 }
 
-export interface BinancePaperSnapshot {
+export interface BinanceExchangeSnapshot {
   enabled: boolean;
   configured: boolean;
   compatible: boolean;
-  mode: BinancePaperMode;
-  resolvedMode?: Exclude<BinancePaperMode, "auto" | "live">;
+  mode: BinanceExchangeMode;
+  resolvedMode?: Exclude<BinanceExchangeMode, "auto" | "live">;
   live: boolean;
   baseUrl?: string;
   streamEnvironment?: string;
@@ -270,14 +302,14 @@ export interface BinancePaperSnapshot {
   message: string;
   error?: string;
   maxLeverage?: number;
-  symbolFilters?: BinancePaperSymbolFilters;
-  commission?: BinancePaperCommission;
+  symbolFilters?: BinanceExchangeSymbolFilters;
+  commission?: BinanceExchangeCommission;
   feeBps?: number;
   estimatedSlippageBps?: number;
-  balances: BinancePaperBalance[];
-  positions: BinancePaperPosition[];
-  openOrders: BinancePaperOrder[];
-  recentOrders: BinancePaperOrder[];
-  recentTrades: BinancePaperTrade[];
-  lastOrder?: BinancePaperOrder;
+  balances: BinanceExchangeBalance[];
+  positions: BinanceExchangePosition[];
+  openOrders: BinanceExchangeOrder[];
+  recentOrders: BinanceExchangeOrder[];
+  recentTrades: BinanceExchangeTrade[];
+  lastOrder?: BinanceExchangeOrder;
 }

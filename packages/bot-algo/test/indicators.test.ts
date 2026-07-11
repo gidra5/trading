@@ -3,11 +3,27 @@ import test from "node:test";
 import {
   EMAIndicator,
   LinearRegressionIndicator,
+  LookbackIndicator,
   SMAIndicator,
 } from "../src/indicators.js";
 import type { TradingApi } from "../src/trading-api.js";
 
 const unusedApi = {} as TradingApi;
+
+test("lookback exposes the value at the configured distance", () => {
+  const indicator = new LookbackIndicator(2);
+  for (const [eventTime, value] of [1, 2, 4, 8].map((value, index) => [index, value])) {
+    indicator.onTick({ eventTime, value });
+  }
+
+  assert.equal(indicator.indicator(), 8);
+  assert.equal(indicator.previous(), 2);
+  assert.equal(indicator.derivative(), 6);
+
+  const restored = new LookbackIndicator(2);
+  restored.restore(indicator.snapshot());
+  assert.deepEqual(restored.snapshot(), indicator.snapshot());
+});
 
 test("numeric moving averages preserve zero and negative values", () => {
   const sma = new SMAIndicator(3, unusedApi);

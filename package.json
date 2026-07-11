@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "concurrently -n server,web -c green,cyan \"npm run dev -w @trading/server\" \"npm run dev -w @trading/web\"",
     "build": "npm run build -w @trading/bot-algo && npm run build -w @trading/server && npm run build -w @trading/web",
+    "test": "npm test -w @trading/bot-algo && npm test -w @trading/server",
     "typecheck": "npm run typecheck -w @trading/bot-algo && npm run typecheck -w @trading/server && npm run typecheck -w @trading/web",
     "benchmark:strategies": "tsx scripts/benchmark-strategies.ts",
     "benchmark:sigmoid-sigma": "tsx scripts/benchmark-sigmoid-sigma-fit.ts",

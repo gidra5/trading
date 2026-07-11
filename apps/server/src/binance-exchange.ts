@@ -6,7 +6,7 @@ import type {
 } from "@trading/bot-algo";
 import type { BinanceMarketListing } from "./binance-markets.js";
 
-export type BinancePaperMode =
+export type BinanceExchangeMode =
   | "auto"
   | "live"
   | "spot-live"
@@ -17,11 +17,11 @@ export type BinancePaperMode =
   | "usdm-futures-testnet"
   | "coinm-futures-testnet";
 
-export type ResolvedBinancePaperMode = Exclude<BinancePaperMode, "auto" | "live">;
+export type ResolvedBinanceExchangeMode = Exclude<BinanceExchangeMode, "auto" | "live">;
 
-export interface BinancePaperConfig {
+export interface BinanceExchangeConfig {
   enabled: boolean;
-  mode: BinancePaperMode;
+  mode: BinanceExchangeMode;
   apiKey?: string;
   apiSecret?: string;
   liveApiKey?: string;
@@ -31,7 +31,7 @@ export interface BinancePaperConfig {
   baseUrlOverride?: string;
 }
 
-export interface BinancePaperBalance {
+export interface BinanceExchangeBalance {
   asset: string;
   free: number;
   locked: number;
@@ -40,7 +40,7 @@ export interface BinancePaperBalance {
   unrealizedPnl?: number;
 }
 
-export interface BinancePaperPosition {
+export interface BinanceExchangePosition {
   symbol: string;
   positionSide?: string;
   positionAmt: number;
@@ -48,15 +48,17 @@ export interface BinancePaperPosition {
   markPrice?: number;
   unrealizedPnl?: number;
   notional?: number;
+  maxNotional?: number;
+  maxQuantity?: number;
   leverage?: number;
   marginType?: string;
   isolatedMargin?: number;
   updateTime?: number;
 }
 
-export type BinancePaperPositionMode = "one-way" | "hedge";
+export type BinanceExchangePositionMode = "one-way" | "hedge";
 
-export interface BinancePaperOrder {
+export interface BinanceExchangeOrder {
   symbol: string;
   orderId: string;
   clientOrderId: string;
@@ -78,7 +80,7 @@ export interface BinancePaperOrder {
   updatedAt?: number;
 }
 
-export interface BinancePaperTrade {
+export interface BinanceExchangeTrade {
   id: string;
   symbol: string;
   orderId: string;
@@ -97,7 +99,7 @@ export interface BinancePaperTrade {
   maker?: boolean;
 }
 
-export interface BinancePaperSymbolFilters {
+export interface BinanceExchangeSymbolFilters {
   symbol: string;
   pricePrecision?: number;
   quantityPrecision?: number;
@@ -114,20 +116,20 @@ export interface BinancePaperSymbolFilters {
   maxNotional?: number;
 }
 
-export interface BinancePaperCommission {
+export interface BinanceExchangeCommission {
   makerFeeBps?: number;
   takerFeeBps?: number;
 }
 
-export interface BinancePaperSnapshot {
+export interface BinanceExchangeSnapshot {
   enabled: boolean;
   configured: boolean;
   compatible: boolean;
-  mode: BinancePaperMode;
-  resolvedMode?: ResolvedBinancePaperMode;
+  mode: BinanceExchangeMode;
+  resolvedMode?: ResolvedBinanceExchangeMode;
   live: boolean;
   baseUrl?: string;
-  streamEnvironment?: BinancePaperStreamEnvironment;
+  streamEnvironment?: BinanceExchangeStreamEnvironment;
   autoSubmit: boolean;
   connected: boolean;
   userDataStreamConnected?: boolean;
@@ -135,36 +137,36 @@ export interface BinancePaperSnapshot {
   userDataStreamMessage?: string;
   lastSyncAt?: number;
   lastSubmitAt?: number;
-  positionMode?: BinancePaperPositionMode;
+  positionMode?: BinanceExchangePositionMode;
   message: string;
   error?: string;
   maxLeverage?: number;
-  symbolFilters?: BinancePaperSymbolFilters;
-  commission?: BinancePaperCommission;
+  symbolFilters?: BinanceExchangeSymbolFilters;
+  commission?: BinanceExchangeCommission;
   feeBps?: number;
   estimatedSlippageBps?: number;
-  balances: BinancePaperBalance[];
-  positions: BinancePaperPosition[];
-  openOrders: BinancePaperOrder[];
-  recentOrders: BinancePaperOrder[];
-  recentTrades: BinancePaperTrade[];
-  lastOrder?: BinancePaperOrder;
+  balances: BinanceExchangeBalance[];
+  positions: BinanceExchangePosition[];
+  openOrders: BinanceExchangeOrder[];
+  recentOrders: BinanceExchangeOrder[];
+  recentTrades: BinanceExchangeTrade[];
+  lastOrder?: BinanceExchangeOrder;
 }
 
-export interface BinancePaperUserDataStreamSession {
+export interface BinanceExchangeUserDataStreamSession {
   listenKey: string;
   url: string;
-  mode: ResolvedBinancePaperMode;
+  mode: ResolvedBinanceExchangeMode;
 }
 
-export interface BinancePaperUserDataStreamStatus {
+export interface BinanceExchangeUserDataStreamStatus {
   connected: boolean;
   message: string;
   lastEventAt: number;
   reconnectAttempt: number;
 }
 
-export interface BinancePaperPlaceOrderInput {
+export interface BinanceExchangePlaceOrderInput {
   symbol?: string;
   side: "buy" | "sell";
   type: "limit" | "market" | "stop-market";
@@ -177,38 +179,63 @@ export interface BinancePaperPlaceOrderInput {
   clientOrderId?: string;
 }
 
-export interface BinancePaperCancelOrderInput {
+export interface BinanceExchangeCancelOrderInput {
   symbol?: string;
   orderId?: string | number;
   clientOrderId?: string;
   algo?: boolean;
 }
 
-export class BinancePaperOrderSubmissionSkipped extends Error {
+export interface BinanceExchangePositionContext {
+  positions: BinanceExchangePosition[];
+  positionMode?: BinanceExchangePositionMode;
+}
+
+export interface BinanceExchangeOrderCapacityState extends BinanceExchangePositionContext {
+  availableBalanceQuote: number;
+  openOrders: BinanceExchangeOrder[];
+}
+
+export interface BinanceExchangeOrderUpdates {
+  openOrders: BinanceExchangeOrder[];
+  recentTrades: BinanceExchangeTrade[];
+}
+
+export interface BinanceExchangeMarketInfo {
+  filters?: BinanceExchangeSymbolFilters;
+  maxLeverage?: number;
+}
+
+export interface BinanceExchangeFriction {
+  feeBps?: number;
+  estimatedSlippageBps?: number;
+}
+
+export class BinanceExchangeOrderSubmissionSkipped extends Error {
   readonly recoverable = true;
 
   constructor(message: string) {
     super(message);
-    this.name = "BinancePaperOrderSubmissionSkipped";
+    this.name = "BinanceExchangeOrderSubmissionSkipped";
   }
 }
 
-export type BinancePaperStreamEnvironment =
+export type BinanceExchangeStreamEnvironment =
   | "live"
   | "spot-testnet"
   | "spot-demo"
   | "usdm-futures-testnet"
   | "coinm-futures-testnet";
 
-interface ResolvedPaperEnvironment {
-  mode: ResolvedBinancePaperMode;
+interface ResolvedExchangeEnvironment {
+  mode: ResolvedBinanceExchangeMode;
   product: "spot" | "usdm-futures" | "coinm-futures";
   live: boolean;
   baseUrl: string;
   restPrefix: "/api/v3" | "/fapi/v1" | "/dapi/v1";
   accountPath: string;
   balancePath?: string;
-  streamEnvironment: BinancePaperStreamEnvironment;
+  streamEnvironment: BinanceExchangeStreamEnvironment;
 }
 
 interface BinanceApiErrorPayload {
@@ -217,7 +244,7 @@ interface BinanceApiErrorPayload {
 }
 
 const EMPTY_SNAPSHOT: Pick<
-  BinancePaperSnapshot,
+  BinanceExchangeSnapshot,
   "balances" | "positions" | "openOrders" | "recentOrders" | "recentTrades" | "connected"
 > = {
   connected: false,
@@ -228,19 +255,15 @@ const EMPTY_SNAPSHOT: Pick<
   recentTrades: [],
 };
 
-export class BinancePaperTrading {
-  private snapshots = new Map<string, BinancePaperSnapshot>();
+export class BinanceExchangeTrading {
+  private snapshots = new Map<string, BinanceExchangeSnapshot>();
   private timeOffsets = new Map<string, number>();
-  private symbolFilters = new Map<string, BinancePaperSymbolFilters>();
+  private symbolFilters = new Map<string, BinanceExchangeSymbolFilters>();
   private maxLeverageBySymbol = new Map<string, number>();
-  private positionModeByMode = new Map<ResolvedBinancePaperMode, {
-    mode: BinancePaperPositionMode;
-    fetchedAt: number;
-  }>();
 
-  constructor(private readonly config: BinancePaperConfig) {}
+  constructor(private readonly config: BinanceExchangeConfig) {}
 
-  updateConfig(patch: Partial<BinancePaperConfig>): void {
+  updateConfig(patch: Partial<BinanceExchangeConfig>): void {
     Object.assign(this.config, patch);
     this.snapshots.clear();
   }
@@ -286,7 +309,7 @@ export class BinancePaperTrading {
 
   async openUserDataStream(
     market: BinanceMarketListing,
-  ): Promise<BinancePaperUserDataStreamSession> {
+  ): Promise<BinanceExchangeUserDataStreamSession> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
       throw new Error("Spot user-data streams require WebSocket API auth and are not enabled yet.");
@@ -339,8 +362,8 @@ export class BinancePaperTrading {
 
   updateUserDataStreamStatus(
     market: BinanceMarketListing,
-    status: BinancePaperUserDataStreamStatus,
-  ): BinancePaperSnapshot {
+    status: BinanceExchangeUserDataStreamStatus,
+  ): BinanceExchangeSnapshot {
     const environment = this.resolveEnvironment(market);
     const snapshot = {
       ...this.snapshot(market),
@@ -363,7 +386,7 @@ export class BinancePaperTrading {
     return futuresReconciliationFromUserDataEvent(market, payload);
   }
 
-  streamEnvironmentFor(market: BinanceMarketListing): BinancePaperStreamEnvironment {
+  streamEnvironmentFor(market: BinanceMarketListing): BinanceExchangeStreamEnvironment {
     const environment = this.resolveEnvironment(market);
     if (!environment || !this.config.enabled) {
       return "live";
@@ -371,7 +394,7 @@ export class BinancePaperTrading {
     return environment.streamEnvironment;
   }
 
-  snapshot(market: BinanceMarketListing): BinancePaperSnapshot {
+  snapshot(market: BinanceMarketListing): BinanceExchangeSnapshot {
     const environment = this.resolveEnvironment(market);
     const key = environment ? snapshotKey(environment, market.symbol) : market.id;
     const cached = this.snapshots.get(key);
@@ -426,7 +449,122 @@ export class BinancePaperTrading {
     };
   }
 
-  async sync(market: BinanceMarketListing): Promise<BinancePaperSnapshot> {
+  async fetchAccountBalances(market: BinanceMarketListing): Promise<BinanceExchangeBalance[]> {
+    const environment = this.requireReadyEnvironment(market);
+    return this.fetchBalances(environment);
+  }
+
+  async fetchPositionContext(market: BinanceMarketListing): Promise<BinanceExchangePositionContext> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") return { positions: [] };
+    const [account, positionMode] = await Promise.all([
+      this.fetchAccount(environment),
+      this.fetchPositionMode(environment),
+    ]);
+    return { positions: extractPositions(environment, account, market.symbol), positionMode };
+  }
+
+  async fetchOrderCapacityState(
+    market: BinanceMarketListing,
+    price: number,
+  ): Promise<BinanceExchangeOrderCapacityState> {
+    const environment = this.requireReadyEnvironment(market);
+    if (environment.product === "spot") {
+      throw new Error("Spot order capacity uses account balances directly.");
+    }
+    const [account, openOrders, positionMode] = await Promise.all([
+      this.fetchAccount(environment),
+      this.fetchOpenOrders(environment, market.symbol),
+      this.fetchPositionMode(environment),
+    ]);
+    const positions = extractPositions(environment, account, market.symbol, false);
+    return {
+      availableBalanceQuote: availableBalanceQuote(environment, account, market, price),
+      positions,
+      openOrders,
+      positionMode: positionMode ?? (
+        positions.some((position) => position.positionSide === "LONG" || position.positionSide === "SHORT")
+          ? "hedge"
+          : "one-way"
+      ),
+    };
+  }
+
+  async fetchOrderUpdates(market: BinanceMarketListing): Promise<BinanceExchangeOrderUpdates> {
+    const environment = this.requireReadyEnvironment(market);
+    const [openOrders, recentOrders, recentTrades] = await Promise.all([
+      this.fetchOpenOrders(environment, market.symbol),
+      this.fetchRecentOrders(environment, market.symbol),
+      this.fetchRecentTrades(environment, market),
+    ]);
+    const ordersById = new Map(recentOrders.map((order) => [order.orderId, order]));
+    return {
+      openOrders,
+      recentTrades: recentTrades.map((trade) => ({
+        ...trade,
+        clientOrderId: trade.clientOrderId || ordersById.get(trade.orderId)?.clientOrderId,
+        localOrderId: trade.localOrderId || ordersById.get(trade.orderId)?.localOrderId,
+      })),
+    };
+  }
+
+  async fetchMarketInfo(market: BinanceMarketListing): Promise<BinanceExchangeMarketInfo> {
+    const environment = this.requireReadyEnvironment(market);
+    const [filters, maxLeverage] = await Promise.all([
+      this.fetchSymbolFilters(environment, market.symbol),
+      this.fetchMaxLeverage(environment, market.symbol),
+    ]);
+    return { filters, maxLeverage };
+  }
+
+  async fetchFriction(market: BinanceMarketListing): Promise<BinanceExchangeFriction> {
+    const environment = this.requireReadyEnvironment(market);
+    const [commission, estimatedSlippageBps] = await Promise.all([
+      this.fetchCommission(environment, market.symbol),
+      this.fetchEstimatedSlippageBps(environment, market.symbol),
+    ]);
+    return { feeBps: commission?.takerFeeBps, estimatedSlippageBps };
+  }
+
+  async submitOrderDirect(
+    market: BinanceMarketListing,
+    input: BinanceExchangePlaceOrderInput,
+  ): Promise<BinanceExchangeOrder> {
+    const environment = this.requireReadyEnvironment(market);
+    const normalizedInput = await this.normalizeOrderInput(environment, market, input);
+    const payload = await this.signedRequest<Record<string, unknown>>(
+      environment,
+      "POST",
+      orderSubmissionPath(environment, normalizedInput),
+      orderParams(environment, market.symbol, normalizedInput),
+    );
+    return normalizeOrder(payload);
+  }
+
+  async cancelOrderDirect(
+    market: BinanceMarketListing,
+    input: BinanceExchangeCancelOrderInput,
+  ): Promise<BinanceExchangeOrder> {
+    const environment = this.requireReadyEnvironment(market);
+    const algo = input.algo === true && environment.product !== "spot";
+    const params: Record<string, string> = algo ? {} : {
+      symbol: (input.symbol ?? market.symbol).toUpperCase(),
+    };
+    if (input.orderId !== undefined) params[algo ? "algoId" : "orderId"] = String(input.orderId);
+    if (input.clientOrderId) params[algo ? "clientAlgoId" : "origClientOrderId"] = input.clientOrderId;
+    if (
+      (!algo && !params.orderId && !params.origClientOrderId) ||
+      (algo && !params.algoId && !params.clientAlgoId)
+    ) throw new Error("Provide orderId or clientOrderId to cancel a Binance order.");
+    return normalizeOrder(await this.signedRequest<Record<string, unknown>>(
+      environment,
+      "DELETE",
+      algo ? `${orderRestPrefix(environment)}/algoOrder` : `${orderRestPrefix(environment)}/order`,
+      params,
+    ));
+  }
+
+  async sync(market: BinanceMarketListing): Promise<BinanceExchangeSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     const [
       balances,
@@ -458,7 +596,7 @@ export class BinancePaperTrading {
       localOrderId: trade.localOrderId || ordersById.get(trade.orderId)?.localOrderId,
     }));
     const positions = extractPositions(environment, account, market.symbol);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...this.snapshot(market),
       configured: true,
       compatible: true,
@@ -484,24 +622,17 @@ export class BinancePaperTrading {
 
   async placeOrder(
     market: BinanceMarketListing,
-    input: BinancePaperPlaceOrderInput,
-  ): Promise<BinancePaperSnapshot> {
-    const environment = this.requireReadyEnvironment(market);
-    const normalizedInput = await this.normalizeOrderInput(environment, market, input);
-    const payload = await this.signedRequest<Record<string, unknown>>(
-      environment,
-      "POST",
-      orderSubmissionPath(environment, normalizedInput),
-      orderParams(environment, market.symbol, normalizedInput),
-    );
-    const lastOrder = normalizeOrder(payload);
+    input: BinanceExchangePlaceOrderInput,
+  ): Promise<BinanceExchangeSnapshot> {
+    const lastOrder = await this.submitOrderDirect(market, input);
     const synced = await this.sync(market);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...synced,
       lastSubmitAt: Date.now(),
       lastOrder,
-      message: `${normalizedInput.side.toUpperCase()} ${normalizedInput.type.toUpperCase()} order submitted to ${environment.mode}`,
+      message: `${input.side.toUpperCase()} ${input.type.toUpperCase()} order submitted to ${synced.resolvedMode ?? synced.mode}`,
     };
+    const environment = this.requireReadyEnvironment(market);
     this.snapshots.set(snapshotKey(environment, market.symbol), snapshot);
     return snapshot;
   }
@@ -510,7 +641,7 @@ export class BinancePaperTrading {
     market: BinanceMarketListing,
     order: TradingOrder,
     options: { force?: boolean } = {},
-  ): Promise<BinancePaperSnapshot | undefined> {
+  ): Promise<BinanceExchangeSnapshot | undefined> {
     if ((!options.force && !this.config.autoSubmit) || order.status !== "open") {
       return undefined;
     }
@@ -547,7 +678,7 @@ export class BinancePaperTrading {
   }
 
   private async assertReducibleFuturesPosition(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     market: BinanceMarketListing,
     order: TradingOrder,
   ): Promise<void> {
@@ -564,15 +695,15 @@ export class BinancePaperTrading {
     }
 
     const targetSide = order.side === "buy" ? "short" : "long";
-    throw new BinancePaperOrderSubmissionSkipped(
+    throw new BinanceExchangeOrderSubmissionSkipped(
       `Binance submit skipped: ${order.side.toUpperCase()} close order ${order.id} requires ${formatQuantity(order.quantity)} ${market.baseAsset}, but only ${formatQuantity(availableQuantity)} ${targetSide} ${market.baseAsset} is reducible after open close orders.`,
     );
   }
 
   private async latestSnapshotForSubmission(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     market: BinanceMarketListing,
-  ): Promise<BinancePaperSnapshot> {
+  ): Promise<BinanceExchangeSnapshot> {
     const cached = this.snapshots.get(snapshotKey(environment, market.symbol));
     if (cached?.connected) {
       return cached;
@@ -582,35 +713,12 @@ export class BinancePaperTrading {
 
   async cancelOrder(
     market: BinanceMarketListing,
-    input: BinancePaperCancelOrderInput,
-  ): Promise<BinancePaperSnapshot> {
+    input: BinanceExchangeCancelOrderInput,
+  ): Promise<BinanceExchangeSnapshot> {
     const environment = this.requireReadyEnvironment(market);
-    const algo = input.algo === true && environment.product !== "spot";
-    const params: Record<string, string> = algo ? {} : {
-      symbol: (input.symbol ?? market.symbol).toUpperCase(),
-    };
-    if (input.orderId !== undefined) {
-      params[algo ? "algoId" : "orderId"] = String(input.orderId);
-    }
-    if (input.clientOrderId) {
-      params[algo ? "clientAlgoId" : "origClientOrderId"] = input.clientOrderId;
-    }
-    if (
-      (!algo && !params.orderId && !params.origClientOrderId) ||
-      (algo && !params.algoId && !params.clientAlgoId)
-    ) {
-      throw new Error("Provide orderId or clientOrderId to cancel a Binance order.");
-    }
-
-    const payload = await this.signedRequest<Record<string, unknown>>(
-      environment,
-      "DELETE",
-      algo ? `${orderRestPrefix(environment)}/algoOrder` : `${orderRestPrefix(environment)}/order`,
-      params,
-    );
-    const lastOrder = normalizeOrder(payload);
+    const lastOrder = await this.cancelOrderDirect(market, input);
     const synced = await this.sync(market);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...synced,
       lastSubmitAt: Date.now(),
       lastOrder,
@@ -620,7 +728,7 @@ export class BinancePaperTrading {
     return snapshot;
   }
 
-  async cancelAllOpenOrders(market: BinanceMarketListing): Promise<BinancePaperSnapshot> {
+  async cancelAllOpenOrders(market: BinanceMarketListing): Promise<BinanceExchangeSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     const symbol = market.symbol;
     if (environment.product === "spot") {
@@ -647,7 +755,7 @@ export class BinancePaperTrading {
       ]);
     }
     const synced = await this.sync(market);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...synced,
       lastSubmitAt: Date.now(),
       message: `All open ${market.symbol} orders cancelled on ${environment.mode}`,
@@ -659,7 +767,7 @@ export class BinancePaperTrading {
   async closeOpenPositions(
     market: BinanceMarketListing,
     options: { includeUnprofitable?: boolean } = {},
-  ): Promise<BinancePaperSnapshot> {
+  ): Promise<BinanceExchangeSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
       throw new Error("Exchange position close is only available for futures modes.");
@@ -697,7 +805,7 @@ export class BinancePaperTrading {
     }
 
     const synced = await this.sync(market);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...synced,
       lastSubmitAt: Date.now(),
       message:
@@ -712,7 +820,7 @@ export class BinancePaperTrading {
   async changeLeverage(
     market: BinanceMarketListing,
     leverage: number,
-  ): Promise<BinancePaperSnapshot> {
+  ): Promise<BinanceExchangeSnapshot> {
     const environment = this.requireReadyEnvironment(market);
     if (environment.product === "spot") {
       throw new Error("Leverage is only available for futures modes.");
@@ -725,7 +833,7 @@ export class BinancePaperTrading {
       leverage: String(nextLeverage),
     });
     const synced = await this.sync(market);
-    const snapshot: BinancePaperSnapshot = {
+    const snapshot: BinanceExchangeSnapshot = {
       ...synced,
       lastSubmitAt: Date.now(),
       message: `${market.symbol} leverage set to ${nextLeverage}x on ${environment.mode}`,
@@ -734,7 +842,7 @@ export class BinancePaperTrading {
     return snapshot;
   }
 
-  private requireReadyEnvironment(market: BinanceMarketListing): ResolvedPaperEnvironment {
+  private requireReadyEnvironment(market: BinanceMarketListing): ResolvedExchangeEnvironment {
     if (!this.config.enabled) {
       throw new Error("Binance exchange trading is disabled.");
     }
@@ -757,7 +865,7 @@ export class BinancePaperTrading {
 
   private resolveEnvironment(
     market: BinanceMarketListing,
-  ): ResolvedPaperEnvironment | undefined {
+  ): ResolvedExchangeEnvironment | undefined {
     const mode =
       this.config.mode === "auto"
         ? defaultModeForVenue(market.venue, "sandbox")
@@ -774,7 +882,7 @@ export class BinancePaperTrading {
   }
 
   private credentialsFor(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
   ): { apiKey?: string; apiSecret?: string } {
     return environment.live
       ? {
@@ -788,8 +896,8 @@ export class BinancePaperTrading {
   }
 
   private async fetchBalances(
-    environment: ResolvedPaperEnvironment,
-  ): Promise<BinancePaperBalance[]> {
+    environment: ResolvedExchangeEnvironment,
+  ): Promise<BinanceExchangeBalance[]> {
     if (environment.balancePath) {
       const payload = await this.signedRequest<unknown[]>(
         environment,
@@ -810,7 +918,7 @@ export class BinancePaperTrading {
   }
 
   private async fetchAccount(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
   ): Promise<Record<string, unknown>> {
     if (environment.product === "spot") {
       return {};
@@ -819,9 +927,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchOpenOrders(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperOrder[]> {
+  ): Promise<BinanceExchangeOrder[]> {
     const payload = await this.signedRequest<unknown[]>(
       environment,
       "GET",
@@ -836,9 +944,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchRecentOrders(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperOrder[]> {
+  ): Promise<BinanceExchangeOrder[]> {
     try {
       const payload = await this.signedRequest<unknown[]>(
         environment,
@@ -857,9 +965,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchOpenAlgoOrders(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperOrder[]> {
+  ): Promise<BinanceExchangeOrder[]> {
     try {
       const payload = await this.signedRequest<unknown[]>(
         environment,
@@ -874,9 +982,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchRecentAlgoOrders(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperOrder[]> {
+  ): Promise<BinanceExchangeOrder[]> {
     try {
       const payload = await this.signedRequest<unknown[]>(
         environment,
@@ -891,9 +999,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchRecentTrades(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     market: BinanceMarketListing,
-  ): Promise<BinancePaperTrade[]> {
+  ): Promise<BinanceExchangeTrade[]> {
     try {
       const payload = await this.signedRequest<unknown[]>(
         environment,
@@ -908,9 +1016,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchSymbolFilters(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperSymbolFilters | undefined> {
+  ): Promise<BinanceExchangeSymbolFilters | undefined> {
     const key = `${environment.mode}:${symbol}`;
     const cached = this.symbolFilters.get(key);
     if (cached) {
@@ -933,7 +1041,7 @@ export class BinancePaperTrading {
   }
 
   private async fetchMaxLeverage(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
   ): Promise<number | undefined> {
     if (environment.product === "spot") {
@@ -962,9 +1070,9 @@ export class BinancePaperTrading {
   }
 
   private async fetchCommission(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
-  ): Promise<BinancePaperCommission | undefined> {
+  ): Promise<BinanceExchangeCommission | undefined> {
     try {
       const payload = await this.signedRequest<Record<string, unknown>>(
         environment,
@@ -979,7 +1087,7 @@ export class BinancePaperTrading {
   }
 
   private async fetchEstimatedSlippageBps(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     symbol: string,
   ): Promise<number | undefined> {
     try {
@@ -1000,11 +1108,15 @@ export class BinancePaperTrading {
   }
 
   private async normalizeOrderInput(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     market: BinanceMarketListing,
-    input: BinancePaperPlaceOrderInput,
-  ): Promise<BinancePaperPlaceOrderInput> {
-    const positionMode = await this.fetchPositionMode(environment);
+    input: BinanceExchangePlaceOrderInput,
+  ): Promise<BinanceExchangePlaceOrderInput> {
+    const positionMode = input.positionSide === "BOTH"
+      ? "one-way"
+      : input.positionSide === "LONG" || input.positionSide === "SHORT"
+        ? "hedge"
+        : await this.fetchPositionMode(environment);
     const positionInput = normalizeFuturesPositionModeInput(input, positionMode, environment);
     const filters = await this.fetchSymbolFilters(environment, market.symbol);
     if (!filters) {
@@ -1050,16 +1162,10 @@ export class BinancePaperTrading {
   }
 
   private async fetchPositionMode(
-    environment: ResolvedPaperEnvironment,
-  ): Promise<BinancePaperPositionMode | undefined> {
+    environment: ResolvedExchangeEnvironment,
+  ): Promise<BinanceExchangePositionMode | undefined> {
     if (environment.product === "spot") {
       return undefined;
-    }
-
-    const cached = this.positionModeByMode.get(environment.mode);
-    const now = Date.now();
-    if (cached && now - cached.fetchedAt < 5 * 60_000) {
-      return cached.mode;
     }
 
     try {
@@ -1068,16 +1174,14 @@ export class BinancePaperTrading {
         "GET",
         positionSideModePath(environment),
       );
-      const mode = booleanValue(payload.dualSidePosition) ? "hedge" : "one-way";
-      this.positionModeByMode.set(environment.mode, { mode, fetchedAt: now });
-      return mode;
+      return booleanValue(payload.dualSidePosition) ? "hedge" : "one-way";
     } catch {
-      return cached?.mode;
+      return undefined;
     }
   }
 
   private async signedRequest<T>(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     method: "GET" | "POST" | "DELETE",
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
@@ -1106,7 +1210,7 @@ export class BinancePaperTrading {
   }
 
   private async apiKeyRequest<T>(
-    environment: ResolvedPaperEnvironment,
+    environment: ResolvedExchangeEnvironment,
     method: "POST" | "PUT" | "DELETE",
     path: string,
     params: Record<string, string | number | boolean | undefined> = {},
@@ -1128,7 +1232,7 @@ export class BinancePaperTrading {
     });
   }
 
-  private async syncTime(environment: ResolvedPaperEnvironment): Promise<void> {
+  private async syncTime(environment: ResolvedExchangeEnvironment): Promise<void> {
     if (this.timeOffsets.has(environment.mode)) {
       return;
     }
@@ -1153,7 +1257,7 @@ export class BinancePaperTrading {
 function defaultModeForVenue(
   venue: BinanceMarketListing["venue"],
   environment: "sandbox" | "live",
-): ResolvedBinancePaperMode | undefined {
+): ResolvedBinanceExchangeMode | undefined {
   if (environment === "live") {
     if (venue === "spot") {
       return "spot-live";
@@ -1180,7 +1284,7 @@ function defaultModeForVenue(
 }
 
 function modeIsCompatibleWithVenue(
-  mode: ResolvedBinancePaperMode,
+  mode: ResolvedBinanceExchangeMode,
   venue: BinanceMarketListing["venue"],
 ): boolean {
   if (mode === "spot-testnet" || mode === "spot-demo" || mode === "spot-live") {
@@ -1196,9 +1300,9 @@ function modeIsCompatibleWithVenue(
 }
 
 function environmentForMode(
-  mode: ResolvedBinancePaperMode,
+  mode: ResolvedBinanceExchangeMode,
   baseUrlOverride: string | undefined,
-): ResolvedPaperEnvironment {
+): ResolvedExchangeEnvironment {
   if (mode === "spot-live") {
     return {
       mode,
@@ -1271,7 +1375,7 @@ function environmentForMode(
 }
 
 function orderRestPrefix(
-  environment: ResolvedPaperEnvironment,
+  environment: ResolvedExchangeEnvironment,
 ): "/api/v3" | "/fapi/v1" | "/dapi/v1" {
   if (environment.product === "spot") {
     return "/api/v3";
@@ -1279,22 +1383,22 @@ function orderRestPrefix(
   return environment.restPrefix === "/dapi/v1" ? "/dapi/v1" : "/fapi/v1";
 }
 
-function exchangeInfoPath(environment: ResolvedPaperEnvironment): string {
+function exchangeInfoPath(environment: ResolvedExchangeEnvironment): string {
   if (environment.product === "spot") {
     return "/api/v3/exchangeInfo";
   }
   return `${orderRestPrefix(environment)}/exchangeInfo`;
 }
 
-function exchangeKlinePath(environment: ResolvedPaperEnvironment): string {
+function exchangeKlinePath(environment: ResolvedExchangeEnvironment): string {
   return `${orderRestPrefix(environment)}/klines`;
 }
 
-function bookTickerPath(environment: ResolvedPaperEnvironment): string {
+function bookTickerPath(environment: ResolvedExchangeEnvironment): string {
   return `${orderRestPrefix(environment)}/ticker/bookTicker`;
 }
 
-function commissionPath(environment: ResolvedPaperEnvironment): string {
+function commissionPath(environment: ResolvedExchangeEnvironment): string {
   if (environment.product === "spot") {
     return "/api/v3/account/commission";
   }
@@ -1303,22 +1407,22 @@ function commissionPath(environment: ResolvedPaperEnvironment): string {
     : "/fapi/v1/commissionRate";
 }
 
-function leverageBracketPath(environment: ResolvedPaperEnvironment): string {
+function leverageBracketPath(environment: ResolvedExchangeEnvironment): string {
   return environment.product === "coinm-futures"
     ? "/dapi/v2/leverageBracket"
     : "/fapi/v1/leverageBracket";
 }
 
-function positionSideModePath(environment: ResolvedPaperEnvironment): string {
+function positionSideModePath(environment: ResolvedExchangeEnvironment): string {
   return `${orderRestPrefix(environment)}/positionSide/dual`;
 }
 
-function userDataStreamPath(environment: ResolvedPaperEnvironment): string {
+function userDataStreamPath(environment: ResolvedExchangeEnvironment): string {
   return `${orderRestPrefix(environment)}/listenKey`;
 }
 
 function userDataStreamWebSocketUrl(
-  environment: ResolvedPaperEnvironment,
+  environment: ResolvedExchangeEnvironment,
   listenKey: string,
 ): string {
   if (environment.product === "usdm-futures") {
@@ -1339,7 +1443,7 @@ function userDataStreamWebSocketUrl(
 function normalizePrice(
   value: number | undefined,
   side: "buy" | "sell",
-  filters: BinancePaperSymbolFilters,
+  filters: BinanceExchangeSymbolFilters,
 ): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -1360,7 +1464,7 @@ function normalizePrice(
 function normalizeStopPrice(
   value: number | undefined,
   side: "buy" | "sell",
-  filters: BinancePaperSymbolFilters,
+  filters: BinanceExchangeSymbolFilters,
 ): number | undefined {
   if (value === undefined) {
     return undefined;
@@ -1380,8 +1484,8 @@ function normalizeStopPrice(
 
 function normalizeQuantity(
   value: number,
-  type: BinancePaperPlaceOrderInput["type"],
-  filters: BinancePaperSymbolFilters,
+  type: BinanceExchangePlaceOrderInput["type"],
+  filters: BinanceExchangeSymbolFilters,
   mode: "floor" | "ceil" = "floor",
 ): number {
   const quantity = Number(value);
@@ -1399,10 +1503,10 @@ function normalizeQuantity(
 }
 
 function validateNormalizedOrder(
-  input: BinancePaperPlaceOrderInput,
+  input: BinanceExchangePlaceOrderInput,
   quantity: number,
   price: number | undefined,
-  filters: BinancePaperSymbolFilters,
+  filters: BinanceExchangeSymbolFilters,
 ): void {
   const minQuantity =
     isMarketLikeOrderType(input.type) && filters.minMarketQuantity
@@ -1457,10 +1561,10 @@ function decimalPrecision(step: number): number {
 }
 
 function normalizeFuturesPositionModeInput(
-  input: BinancePaperPlaceOrderInput,
-  positionMode: BinancePaperPositionMode | undefined,
-  environment: ResolvedPaperEnvironment,
-): BinancePaperPlaceOrderInput {
+  input: BinanceExchangePlaceOrderInput,
+  positionMode: BinanceExchangePositionMode | undefined,
+  environment: ResolvedExchangeEnvironment,
+): BinanceExchangePlaceOrderInput {
   if (environment.product === "spot") {
     return {
       ...input,
@@ -1485,7 +1589,7 @@ function normalizeFuturesPositionModeInput(
 }
 
 function inferHedgePositionSide(
-  input: BinancePaperPlaceOrderInput,
+  input: BinanceExchangePlaceOrderInput,
 ): "LONG" | "SHORT" {
   if (input.reduceOnly) {
     return input.side === "sell" ? "LONG" : "SHORT";
@@ -1507,9 +1611,9 @@ function futuresPositionSideForBotOrder(
 }
 
 function reducibleFuturesQuantityForOrder(
-  snapshot: BinancePaperSnapshot,
+  snapshot: BinanceExchangeSnapshot,
   order: TradingOrder,
-  positionMode: BinancePaperPositionMode | undefined,
+  positionMode: BinanceExchangePositionMode | undefined,
 ): number {
   const mode = positionMode ?? snapshot.positionMode ?? "one-way";
   const positionQuantity = futuresPositionQuantityForClose(snapshot, order, mode);
@@ -1518,9 +1622,9 @@ function reducibleFuturesQuantityForOrder(
 }
 
 function futuresPositionQuantityForClose(
-  snapshot: BinancePaperSnapshot,
+  snapshot: BinanceExchangeSnapshot,
   order: TradingOrder,
-  positionMode: BinancePaperPositionMode,
+  positionMode: BinanceExchangePositionMode,
 ): number {
   let quantity = 0;
   for (const position of snapshot.positions) {
@@ -1545,9 +1649,9 @@ function futuresPositionQuantityForClose(
 }
 
 function openFuturesCloseOrderQuantity(
-  snapshot: BinancePaperSnapshot,
+  snapshot: BinanceExchangeSnapshot,
   order: TradingOrder,
-  positionMode: BinancePaperPositionMode,
+  positionMode: BinanceExchangePositionMode,
 ): number {
   let quantity = 0;
   for (const openOrder of snapshot.openOrders) {
@@ -1560,9 +1664,9 @@ function openFuturesCloseOrderQuantity(
 }
 
 function isOpenFuturesCloseOrderForSide(
-  order: BinancePaperOrder,
+  order: BinanceExchangeOrder,
   side: TradingOrder["side"],
-  positionMode: BinancePaperPositionMode,
+  positionMode: BinanceExchangePositionMode,
 ): boolean {
   const orderSide = normalizeOrderSide(order.side);
   if (orderSide !== side) {
@@ -1583,7 +1687,7 @@ function normalizeOrderSide(side: string): TradingOrder["side"] {
   return side.toUpperCase() === "SELL" ? "sell" : "buy";
 }
 
-function isMarketLikeOrderType(type: BinancePaperPlaceOrderInput["type"]): boolean {
+function isMarketLikeOrderType(type: BinanceExchangePlaceOrderInput["type"]): boolean {
   return type === "market" || type === "stop-market";
 }
 
@@ -1595,8 +1699,8 @@ function formatQuantity(value: number): string {
 }
 
 function orderSubmissionPath(
-  environment: ResolvedPaperEnvironment,
-  input: BinancePaperPlaceOrderInput,
+  environment: ResolvedExchangeEnvironment,
+  input: BinanceExchangePlaceOrderInput,
 ): string {
   if (input.type === "stop-market" && environment.product !== "spot") {
     return `${orderRestPrefix(environment)}/algoOrder`;
@@ -1605,9 +1709,9 @@ function orderSubmissionPath(
 }
 
 function orderParams(
-  environment: ResolvedPaperEnvironment,
+  environment: ResolvedExchangeEnvironment,
   symbol: string,
-  input: BinancePaperPlaceOrderInput,
+  input: BinanceExchangePlaceOrderInput,
 ): Record<string, string | boolean | undefined> {
   const orderType = binanceOrderType(environment, input);
   const clientOrderId = input.clientOrderId ?? createClientOrderId();
@@ -1657,8 +1761,8 @@ function orderParams(
 }
 
 function binanceOrderType(
-  environment: ResolvedPaperEnvironment,
-  input: BinancePaperPlaceOrderInput,
+  environment: ResolvedExchangeEnvironment,
+  input: BinanceExchangePlaceOrderInput,
 ): string {
   if (input.type === "stop-market") {
     return environment.product === "spot" ? "STOP_LOSS" : "STOP_MARKET";
@@ -1691,6 +1795,9 @@ function clientOrderIdForBotOrder(orderId: string): string {
 }
 
 function localOrderIdFromClientOrderId(clientOrderId: string): string | undefined {
+  if (clientOrderId.startsWith("bot-")) {
+    return clientOrderId;
+  }
   if (!clientOrderId.startsWith("bot_")) {
     return undefined;
   }
@@ -1698,7 +1805,7 @@ function localOrderIdFromClientOrderId(clientOrderId: string): string | undefine
   return orderId || undefined;
 }
 
-function normalizeSpotBalance(raw: unknown): BinancePaperBalance {
+function normalizeSpotBalance(raw: unknown): BinanceExchangeBalance {
   const item = asRecord(raw);
   return {
     asset: stringValue(item.asset),
@@ -1707,7 +1814,7 @@ function normalizeSpotBalance(raw: unknown): BinancePaperBalance {
   };
 }
 
-function normalizeFuturesBalance(raw: unknown): BinancePaperBalance {
+function normalizeFuturesBalance(raw: unknown): BinanceExchangeBalance {
   const item = asRecord(raw);
   return {
     asset: stringValue(item.asset),
@@ -1719,7 +1826,7 @@ function normalizeFuturesBalance(raw: unknown): BinancePaperBalance {
   };
 }
 
-function isUsefulBalance(balance: BinancePaperBalance): boolean {
+function isUsefulBalance(balance: BinanceExchangeBalance): boolean {
   return (
     Boolean(balance.asset) &&
     (balance.free !== 0 || balance.locked !== 0 || balance.walletBalance !== 0)
@@ -1727,10 +1834,11 @@ function isUsefulBalance(balance: BinancePaperBalance): boolean {
 }
 
 function extractPositions(
-  environment: ResolvedPaperEnvironment,
+  environment: ResolvedExchangeEnvironment,
   account: Record<string, unknown>,
   symbol: string,
-): BinancePaperPosition[] {
+  activeOnly = true,
+): BinanceExchangePosition[] {
   if (environment.product === "spot") {
     return [];
   }
@@ -1746,23 +1854,39 @@ function extractPositions(
         markPrice: numberValue(item.markPrice),
         unrealizedPnl: numberValue(item.unrealizedProfit),
         notional: numberValue(item.notional),
+        maxNotional: optionalNumber(item.maxNotional ?? item.maxNotionalValue),
+        maxQuantity: optionalNumber(item.maxQty),
         leverage: numberValue(item.leverage),
         marginType: stringValue(item.marginType),
         isolatedMargin: numberValue(item.isolatedMargin),
         updateTime: numberValue(item.updateTime),
       };
     })
-    .filter(
-      (position) =>
-        position.symbol === symbol &&
-        (position.positionAmt !== 0 ||
-          position.notional !== 0 ||
-          position.unrealizedPnl !== 0),
-    );
+    .filter((position) => position.symbol === symbol && (!activeOnly || (
+      position.positionAmt !== 0 || position.notional !== 0 || position.unrealizedPnl !== 0
+    )));
+}
+
+function availableBalanceQuote(
+  environment: ResolvedExchangeEnvironment,
+  account: Record<string, unknown>,
+  market: BinanceMarketListing,
+  price: number,
+): number {
+  const direct = optionalNumber(account.availableBalance);
+  if (direct !== undefined) {
+    return Math.max(0, environment.product === "coinm-futures" ? direct * price : direct);
+  }
+  const asset = environment.product === "coinm-futures" ? market.baseAsset : market.quoteAsset;
+  const row = (Array.isArray(account.assets) ? account.assets : [])
+    .map(asRecord)
+    .find((item) => stringValue(item.asset) === asset);
+  const available = optionalNumber(row?.availableBalance) ?? 0;
+  return Math.max(0, environment.product === "coinm-futures" ? available * price : available);
 }
 
 function shouldClosePosition(
-  position: BinancePaperPosition,
+  position: BinanceExchangePosition,
   includeUnprofitable: boolean,
 ): boolean {
   if (position.positionAmt === 0) {
@@ -1793,7 +1917,7 @@ function normalizePositionSideForOrder(
   return undefined;
 }
 
-function normalizeOrder(raw: unknown): BinancePaperOrder {
+function normalizeOrder(raw: unknown): BinanceExchangeOrder {
   const item = asRecord(raw);
   const clientOrderId = stringValue(
     item.clientOrderId ??
@@ -1824,7 +1948,7 @@ function normalizeOrder(raw: unknown): BinancePaperOrder {
   };
 }
 
-function normalizeTrade(raw: unknown, market: BinanceMarketListing): BinancePaperTrade {
+function normalizeTrade(raw: unknown, market: BinanceMarketListing): BinanceExchangeTrade {
   const item = asRecord(raw);
   const side = tradeSide(item);
   const price = numberValue(item.price);
@@ -1862,8 +1986,8 @@ function normalizeTrade(raw: unknown, market: BinanceMarketListing): BinancePape
 
 function normalizeCommission(
   payload: Record<string, unknown>,
-  product: ResolvedPaperEnvironment["product"],
-): BinancePaperCommission {
+  product: ResolvedExchangeEnvironment["product"],
+): BinanceExchangeCommission {
   if (product === "spot") {
     const standard = asRecord(payload.standardCommission);
     const maker = optionalNumber(standard.maker ?? payload.makerCommission);
@@ -1887,7 +2011,7 @@ function rateToBps(value: number | undefined): number | undefined {
   return value > 1 ? value : value * 10_000;
 }
 
-function normalizeSymbolFilters(raw: Record<string, unknown>): BinancePaperSymbolFilters {
+function normalizeSymbolFilters(raw: Record<string, unknown>): BinanceExchangeSymbolFilters {
   const filters = Array.isArray(raw.filters) ? raw.filters.map(asRecord) : [];
   const priceFilter = filterByType(filters, "PRICE_FILTER");
   const lotSize = filterByType(filters, "LOT_SIZE");
@@ -2162,7 +2286,7 @@ async function requestJson<T>(url: URL, init: RequestInit): Promise<T> {
   return payload as T;
 }
 
-function snapshotKey(environment: ResolvedPaperEnvironment, symbol: string): string {
+function snapshotKey(environment: ResolvedExchangeEnvironment, symbol: string): string {
   return `${environment.mode}:${symbol.toUpperCase()}`;
 }
 

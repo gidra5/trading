@@ -27,12 +27,17 @@ import type {
   LegacyValleyPeakCheckDebug,
   LongPositionLot,
   ManualTradeInput,
+  PaperBotState,
+  PeakValleyBotConfig,
   PositionLedger,
   ShortPositionLot,
   EquityPoint,
   StrategyConfig,
   TradeFill,
+  TradingFill,
   TradingOrder,
+  TradingOrderSnapshot,
+  TradingPosition,
 } from "@trading/bot-algo";
 import {
   CandleChart,
@@ -53,9 +58,9 @@ import type {
   BacktestProgressSnapshot,
   BacktestSelection,
   BotExecutionMode,
-  BinancePaperMode,
-  BinancePaperOrder,
-  BinancePaperSnapshot,
+  BinanceExchangeMode,
+  BinanceExchangeOrder,
+  BinanceExchangeSnapshot,
   BinanceMarketCatalog,
   BinanceMarketListing,
   CorrelationEntry,
@@ -119,7 +124,7 @@ export function App() {
     ...defaultBacktestSettings,
   });
   const [backtestError, setBacktestError] = createSignal<string>();
-  const [configDraft, setConfigDraft] = createSignal<StrategyConfig>();
+  const [configDraft, setConfigDraft] = createSignal<PeakValleyBotConfig>();
   const [configError, setConfigError] = createSignal<string>();
   const [manualTradeError, setManualTradeError] = createSignal<string>();
   const [exchangeError, setExchangeError] = createSignal<string>();
@@ -143,26 +148,28 @@ export function App() {
   const market = createMemo(() => snapshot()?.market);
   const metrics = createMemo(() => bot()?.metrics);
   const openOrders = createMemo(() =>
-    (bot()?.orders ?? []).filter((order) => order.status === "open").slice().reverse(),
+    (bot()?.diagnostics.plannedOrders ?? [])
+      .filter((order) => order.status === "pending" || order.status === "open" || order.status === "partially-filled")
+      .slice()
+      .reverse(),
   );
-  const fills = createMemo(() => (bot()?.fills ?? []).slice(-12).reverse());
+  const fills = createMemo(() =>
+    (snapshot()?.recentEvents ?? [])
+      .filter((event): event is typeof event & { fill: TradingFill } => Boolean(event.fill))
+      .slice(0, 12),
+  );
   const events = createMemo(() => snapshot()?.recentEvents ?? []);
   const backtest = createMemo(() => snapshot()?.backtest);
   const correlations = createMemo(() => snapshot()?.correlations);
   const exchange = createMemo(() => snapshot()?.exchange);
   const hasClosablePositions = createMemo(() => {
-    const summary = snapshot()?.positions.summary;
-    return Boolean(
-      summary &&
-        (Math.abs(summary.longQuantity) > 0.00000001 ||
-          Math.abs(summary.shortQuantity) > 0.00000001),
-    );
+    return (bot()?.state.positions ?? []).some((position) => position.asset > 0.00000001);
   });
   const botRunStartedAt = createMemo(() => {
     if (bot()?.status !== "running") {
       return undefined;
     }
-    return bot()?.runStartedAt ?? bot()?.createdAt;
+    return bot()?.runStartedAt;
   });
   const botRunDurationMs = createMemo(() => {
     const startedAt = botRunStartedAt();
@@ -177,7 +184,7 @@ export function App() {
 
   createEffect(() => {
     const config = bot()?.config;
-    if (config && (!configDraft() || configDraft()?.symbol !== config.symbol)) {
+    if (config && !configDraft()) {
       setConfigDraft(structuredClone(unwrap(config)));
     }
   });
@@ -515,7 +522,7 @@ export function App() {
     applySnapshot(payload as RuntimeSnapshot);
   };
 
-  const cancelExchangeOrder = async (order: BinancePaperOrder) => {
+  const cancelExchangeOrder = async (order: BinanceExchangeOrder) => {
     setExchangeError(undefined);
     const response = await fetch(`${apiBase}/api/exchange/order`, {
       method: "DELETE",
@@ -584,7 +591,7 @@ export function App() {
   };
 
   const saveExchangeCredentials = async (input: {
-    mode: BinancePaperMode;
+    mode: BinanceExchangeMode;
     apiKey?: string;
     apiSecret?: string;
   }): Promise<boolean> => {
@@ -737,10 +744,10 @@ export function App() {
             value={formatPercent(metrics()?.returnPct)}
             tone={(metrics()?.returnPct ?? 0) >= 0 ? "gain" : "loss"}
           />
-          <MetricCard label="Quote Free" value={`$${formatQuote(bot()?.quoteFree, 2)}`} />
+          <MetricCard label="Quote Free" value={`$${formatQuote(bot()?.equity.quoteAvailable, 2)}`} />
           <MetricCard
-            label={`${bot()?.baseAsset ?? "Base"} Free`}
-            value={formatAsset(bot()?.baseFree)}
+            label={`${market()?.baseAsset ?? "Base"} Free`}
+            value={formatAsset(bot()?.equity.assetAvailable)}
           />
           <MetricCard label="Open Orders" value={openOrders().length.toString()} />
         </section>
@@ -784,7 +791,7 @@ export function App() {
             <div class="h-88 lg:h-100">
               <CandleChart
                 candles={market()?.candles ?? []}
-                orders={bot()?.orders ?? []}
+                orders={bot()?.diagnostics.plannedOrders ?? []}
                 lastPrice={market()?.lastPrice ?? 0}
               />
             </div>
@@ -813,11 +820,10 @@ export function App() {
           <EventsPanel events={events()} />
         </section>
 
-        <PositionLedgerPanel
-          ledger={snapshot()?.positions}
-          baseAsset={bot()?.baseAsset ?? "Base"}
-          quoteAsset={bot()?.quoteAsset ?? "USDT"}
-          currentPrice={market()?.lastPrice ?? bot()?.lastPrice ?? 0}
+        <TradingPositionsPanel
+          positions={bot()?.state.positions ?? []}
+          baseAsset={market()?.baseAsset ?? "Base"}
+          quoteAsset={market()?.quoteAsset ?? "USDT"}
           error={manualTradeError()}
           onRecordTrade={recordManualTrade}
         />
@@ -892,7 +898,7 @@ function ExchangeRule(props: { label: string; value: string }) {
   );
 }
 
-function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string {
+function exchangeStatusLabel(exchange: BinanceExchangeSnapshot | undefined): string {
   if (!exchange?.enabled) {
     return "Exchange off";
   }
@@ -913,13 +919,13 @@ function exchangeStatusLabel(exchange: BinancePaperSnapshot | undefined): string
 
 function ExchangePaperPanel(props: {
   market?: RuntimeSnapshot["market"];
-  snapshot?: BinancePaperSnapshot;
+  snapshot?: BinanceExchangeSnapshot;
   execution?: RuntimeSnapshot["execution"];
   botRunning: boolean;
   error?: string;
   onSetExecutionMode: (mode: BotExecutionMode) => void;
   onSaveCredentials: (input: {
-    mode: BinancePaperMode;
+    mode: BinanceExchangeMode;
     apiKey?: string;
     apiSecret?: string;
   }) => Promise<boolean>;
@@ -932,7 +938,7 @@ function ExchangePaperPanel(props: {
     stopPrice?: number;
     reduceOnly?: boolean;
   }) => void;
-  onCancelOrder: (order: BinancePaperOrder) => void;
+  onCancelOrder: (order: BinanceExchangeOrder) => void;
   onCancelAll: () => void;
   onSetLeverage: (leverage: number) => void;
 }) {
@@ -942,7 +948,7 @@ function ExchangePaperPanel(props: {
   const [price, setPrice] = createSignal(0);
   const [reduceOnly, setReduceOnly] = createSignal(false);
   const [leverage, setLeverage] = createSignal(1);
-  const [credentialMode, setCredentialMode] = createSignal<BinancePaperMode>("live");
+  const [credentialMode, setCredentialMode] = createSignal<BinanceExchangeMode>("live");
   const [credentialApiKey, setCredentialApiKey] = createSignal("");
   const [credentialApiSecret, setCredentialApiSecret] = createSignal("");
   let initializedPrice = false;
@@ -1513,22 +1519,21 @@ function venueLabel(venue: BinanceMarketListing["venue"]): string {
   return venue[0].toUpperCase() + venue.slice(1);
 }
 
-function algorithmLabel(algorithm: StrategyConfig["algorithm"] | undefined): string {
-  return algorithm === "legacy-valley-peak" ? "Legacy Valley/Peak" : "Legacy Valley/Peak";
-}
-
 function AlgorithmPanel(props: {
-  config?: StrategyConfig;
+  config?: PeakValleyBotConfig;
   marketMaxLeverage?: number;
   error?: string;
-  onChange: (config: StrategyConfig) => void;
+  onChange: (config: PeakValleyBotConfig) => void;
   onApply: () => void;
 }) {
   const marketMaxLeverage = () =>
     Number.isFinite(props.marketMaxLeverage) && (props.marketMaxLeverage as number) >= 1
       ? props.marketMaxLeverage
       : undefined;
-  const update = <K extends keyof StrategyConfig>(key: K, value: StrategyConfig[K]) => {
+  const update = <K extends keyof PeakValleyBotConfig>(
+    key: K,
+    value: PeakValleyBotConfig[K],
+  ) => {
     if (!props.config) {
       return;
     }
@@ -1538,9 +1543,9 @@ function AlgorithmPanel(props: {
       [key]: value,
     });
   };
-  const updateValleyPeak = <K extends keyof StrategyConfig["legacyValleyPeak"]>(
+  const updateValleyPeak = <K extends keyof PeakValleyBotConfig["strategy"]>(
     key: K,
-    value: StrategyConfig["legacyValleyPeak"][K],
+    value: PeakValleyBotConfig["strategy"][K],
   ) => {
     if (!props.config) {
       return;
@@ -1548,8 +1553,8 @@ function AlgorithmPanel(props: {
 
     props.onChange({
       ...props.config,
-      legacyValleyPeak: {
-        ...props.config.legacyValleyPeak,
+      strategy: {
+        ...props.config.strategy,
         [key]: value,
       },
     });
@@ -1562,21 +1567,24 @@ function AlgorithmPanel(props: {
       | "sellExitConfirmationOffsets",
     value: number[],
   ) => updateValleyPeak(key, value);
-  const updateRisk = <K extends keyof StrategyConfig["positionRisk"]>(
-    key: K,
-    value: StrategyConfig["positionRisk"][K],
+  const updateGrid = (
+    key: "entryGrid" | "exitGrid",
+    patch: Partial<PeakValleyBotConfig[typeof key]>,
   ) => {
-    if (!props.config) {
-      return;
+    if (props.config) {
+      props.onChange({
+        ...props.config,
+        [key]: { ...props.config[key], ...patch },
+      });
     }
-
-    props.onChange({
-      ...props.config,
-      positionRisk: {
-        ...props.config.positionRisk,
-        [key]: value,
-      },
-    });
+  };
+  const updateBorrow = (patch: Partial<PeakValleyBotConfig["internalBorrow"]>) => {
+    if (props.config) {
+      props.onChange({
+        ...props.config,
+        internalBorrow: { ...props.config.internalBorrow, ...patch },
+      });
+    }
   };
   const signalTimingOptions = [
     { value: "start", label: "Start" },
@@ -1589,7 +1597,7 @@ function AlgorithmPanel(props: {
         <div>
           <div class="muted-label">Algorithm</div>
           <h2 class="text-lg font-semibold">
-            {algorithmLabel(props.config?.algorithm)}
+            Peak/Valley
           </h2>
         </div>
         <button
@@ -1615,39 +1623,30 @@ function AlgorithmPanel(props: {
             <div class="rounded-2 bg-ink-800 p-3">
               <div class="muted-label">Strategy</div>
               <div class="mt-2 rounded-2 bg-ink-900 px-3 py-2 text-sm font-semibold text-ink-100">
-                Legacy Valley/Peak
+                Peak/Valley
               </div>
               <div class="mt-3 grid grid-cols-2 gap-3">
                 <NumberField
-                  label="Max Position"
-                  value={config().maxPositionQuote}
+                  label="Max Trade"
+                  value={config().maxTradeQuote}
                   min={1}
-                  placeholder="Uncapped"
-                  onInput={(value) => update("maxPositionQuote", value)}
+                  onInput={(value) => update("maxTradeQuote", value)}
                 />
                 <NumberField
                   label="Max Lev"
-                  value={config().maxLeverage}
+                  value={config().maxTargetLeverage}
                   min={1}
                   max={marketMaxLeverage()}
                   step={0.25}
                   onInput={(value) =>
-                    update("maxLeverage", clampNumber(value, 1, marketMaxLeverage() ?? 999))
+                    update("maxTargetLeverage", clampNumber(value, 1, marketMaxLeverage() ?? 999))
                   }
                 />
-                <SelectField
-                  label="Short Margin"
-                  value={config().shortMarginModel}
-                  options={[
-                    { value: "spot-borrow", label: "Spot Borrow" },
-                    { value: "futures-margin", label: "Futures Margin" },
-                  ]}
-                  onInput={(value) =>
-                    update(
-                      "shortMarginModel",
-                      value as StrategyConfig["shortMarginModel"],
-                    )
-                  }
+                <NumberField
+                  label="Min Trade"
+                  value={config().minTradeQuote}
+                  min={0}
+                  onInput={(value) => update("minTradeQuote", value)}
                 />
                 <Show when={marketMaxLeverage()}>
                   {(value) => (
@@ -1666,70 +1665,39 @@ function AlgorithmPanel(props: {
                   onInput={(value) => update("cooldownMs", value * 1000)}
                 />
                 <NumberField
-                  label="Limit bps"
-                  value={config().limitOffsetBps}
-                  min={0}
-                  step={0.5}
-                  onInput={(value) => update("limitOffsetBps", value)}
-                />
-                <NumberField
-                  label="Max Orders"
-                  value={config().maxOpenOrders}
-                  min={1}
-                  step={1}
-                  onInput={(value) => update("maxOpenOrders", Math.round(value))}
-                />
-                <NumberField
-                  label="Long Depth"
-                  value={config().longBorrowDepth}
-                  min={0}
-                  step={1}
-                  onInput={(value) => update("longBorrowDepth", Math.round(value))}
-                />
-                <NumberField
-                  label="Short Depth"
-                  value={config().shortBorrowDepth}
-                  min={0}
-                  step={1}
-                  onInput={(value) => update("shortBorrowDepth", Math.round(value))}
-                />
-                <NumberField
                   label="Profit Share"
-                  value={config().borrowerProfitShareToLender}
+                  value={config().internalBorrow.borrowerProfitShare}
                   min={0}
                   max={1}
                   step={0.05}
                   onInput={(value) =>
-                    update("borrowerProfitShareToLender", clampNumber(value, 0, 1))
+                    updateBorrow({ borrowerProfitShare: clampNumber(value, 0, 1) })
                   }
                 />
-                <NumberField
-                  label="Stale sec"
-                  value={config().staleOrderMs / 1000}
-                  min={1}
-                  step={1}
-                  onInput={(value) => update("staleOrderMs", value * 1000)}
+                <BooleanField
+                  label="Internal Borrow"
+                  checked={config().internalBorrow.enabled}
+                  onInput={(enabled) => updateBorrow({ enabled })}
                 />
-                <NumberField
-                  label="Min USDT"
-                  value={config().minOrderQuote}
-                  min={0}
-                  onInput={(value) => update("minOrderQuote", value)}
+                <BooleanField
+                  label="Lock Lenders"
+                  checked={config().internalBorrow.lockLenderAmounts}
+                  onInput={(lockLenderAmounts) => updateBorrow({ lockLenderAmounts })}
                 />
               </div>
             </div>
 
             <div class="rounded-2 bg-ink-800 p-3">
-              <div class="muted-label">Legacy Valley/Peak</div>
+              <div class="muted-label">Peak/Valley Indicators</div>
               <div class="mt-3 grid grid-cols-2 gap-3">
                 <BooleanField
                   label="Relative Rates"
-                  checked={config().legacyValleyPeak.relativeRateEnabled}
+                  checked={config().strategy.relativeRateEnabled}
                   onInput={(value) => updateValleyPeak("relativeRateEnabled", value)}
                 />
                 <SelectField
                   label="Average Type"
-                  value={config().legacyValleyPeak.movingAverageType}
+                  value={config().strategy.movingAverageType}
                   options={[
                     { value: "sma", label: "SMA" },
                     { value: "ema", label: "EMA" },
@@ -1737,13 +1705,13 @@ function AlgorithmPanel(props: {
                   onInput={(value) =>
                     updateValleyPeak(
                       "movingAverageType",
-                      value as StrategyConfig["legacyValleyPeak"]["movingAverageType"],
+                      value as PeakValleyBotConfig["strategy"]["movingAverageType"],
                     )
                   }
                 />
                 <SelectField
                   label="Derivative Source"
-                  value={config().legacyValleyPeak.derivativeSource}
+                  value={config().strategy.derivativeSource}
                   options={[
                     { value: "price", label: "Price" },
                     { value: "kama", label: "KAMA" },
@@ -1751,13 +1719,13 @@ function AlgorithmPanel(props: {
                   onInput={(value) =>
                     updateValleyPeak(
                       "derivativeSource",
-                      value as StrategyConfig["legacyValleyPeak"]["derivativeSource"],
+                      value as PeakValleyBotConfig["strategy"]["derivativeSource"],
                     )
                   }
                 />
                 <SelectField
                   label="Clamp Mode"
-                  value={config().legacyValleyPeak.derivativeClampMode}
+                  value={config().strategy.derivativeClampMode}
                   options={[
                     { value: "deadband", label: "Deadband" },
                     { value: "hysteresis", label: "Hysteresis" },
@@ -1765,13 +1733,13 @@ function AlgorithmPanel(props: {
                   onInput={(value) =>
                     updateValleyPeak(
                       "derivativeClampMode",
-                      value as StrategyConfig["legacyValleyPeak"]["derivativeClampMode"],
+                      value as PeakValleyBotConfig["strategy"]["derivativeClampMode"],
                     )
                   }
                 />
                 <NumberField
                   label="Clamp Inner"
-                  value={config().legacyValleyPeak.derivativeClampInnerThresholdRatio}
+                  value={config().strategy.derivativeClampInnerThresholdRatio}
                   min={0}
                   max={1}
                   step={0.05}
@@ -1784,75 +1752,75 @@ function AlgorithmPanel(props: {
                 />
                 <SelectField
                   label="Buy Entry Edge"
-                  value={config().legacyValleyPeak.buyEntrySignalTiming}
+                  value={config().strategy.buyEntrySignalTiming}
                   options={signalTimingOptions}
                   onInput={(value) =>
                     updateValleyPeak(
                       "buyEntrySignalTiming",
-                      value as StrategyConfig["legacyValleyPeak"]["buyEntrySignalTiming"],
+                      value as PeakValleyBotConfig["strategy"]["buyEntrySignalTiming"],
                     )
                   }
                 />
                 <SelectField
                   label="Sell Entry Edge"
-                  value={config().legacyValleyPeak.sellEntrySignalTiming}
+                  value={config().strategy.sellEntrySignalTiming}
                   options={signalTimingOptions}
                   onInput={(value) =>
                     updateValleyPeak(
                       "sellEntrySignalTiming",
-                      value as StrategyConfig["legacyValleyPeak"]["sellEntrySignalTiming"],
+                      value as PeakValleyBotConfig["strategy"]["sellEntrySignalTiming"],
                     )
                   }
                 />
                 <SelectField
                   label="Buy Exit Edge"
-                  value={config().legacyValleyPeak.buyExitSignalTiming}
+                  value={config().strategy.buyExitSignalTiming}
                   options={signalTimingOptions}
                   onInput={(value) =>
                     updateValleyPeak(
                       "buyExitSignalTiming",
-                      value as StrategyConfig["legacyValleyPeak"]["buyExitSignalTiming"],
+                      value as PeakValleyBotConfig["strategy"]["buyExitSignalTiming"],
                     )
                   }
                 />
                 <SelectField
                   label="Sell Exit Edge"
-                  value={config().legacyValleyPeak.sellExitSignalTiming}
+                  value={config().strategy.sellExitSignalTiming}
                   options={signalTimingOptions}
                   onInput={(value) =>
                     updateValleyPeak(
                       "sellExitSignalTiming",
-                      value as StrategyConfig["legacyValleyPeak"]["sellExitSignalTiming"],
+                      value as PeakValleyBotConfig["strategy"]["sellExitSignalTiming"],
                     )
                   }
                 />
                 <NumberField
                   label="Buy Rate"
-                  value={config().legacyValleyPeak.buySpendRate}
+                  value={config().strategy.buySpendRate}
                   min={0}
                   step={0.05}
                   onInput={(value) => updateValleyPeak("buySpendRate", value)}
                 />
                 <NumberField
                   label="Sell Rate"
-                  value={config().legacyValleyPeak.sellAmountRate}
+                  value={config().strategy.sellAmountRate}
                   min={0}
                   step={0.05}
                   onInput={(value) => updateValleyPeak("sellAmountRate", value)}
                 />
                 <BooleanField
                   label="Long Side"
-                  checked={config().legacyValleyPeak.longSideEnabled}
+                  checked={config().strategy.longSideEnabled}
                   onInput={(value) => updateValleyPeak("longSideEnabled", value)}
                 />
                 <BooleanField
                   label="Short Side"
-                  checked={config().legacyValleyPeak.shortSideEnabled}
+                  checked={config().strategy.shortSideEnabled}
                   onInput={(value) => updateValleyPeak("shortSideEnabled", value)}
                 />
                 <SelectField
                   label="Sigma Mode"
-                  value={config().legacyValleyPeak.sigmaMode}
+                  value={config().strategy.sigmaMode}
                   options={[
                     { value: "trend", label: "Trend" },
                     { value: "static", label: "Static" },
@@ -1861,236 +1829,224 @@ function AlgorithmPanel(props: {
                   onInput={(value) =>
                     updateValleyPeak(
                       "sigmaMode",
-                      value as StrategyConfig["legacyValleyPeak"]["sigmaMode"],
+                      value as PeakValleyBotConfig["strategy"]["sigmaMode"],
                     )
                   }
                 />
                 <NumberField
                   label="Buy Sigma"
-                  value={config().legacyValleyPeak.buySigma}
+                  value={config().strategy.buySigma}
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("buySigma", value)}
                 />
                 <NumberField
                   label="Sell Sigma"
-                  value={config().legacyValleyPeak.sellSigma}
+                  value={config().strategy.sellSigma}
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("sellSigma", value)}
                 />
                 <NumberField
                   label="Sigma A"
-                  value={config().legacyValleyPeak.trendSigmaA}
+                  value={config().strategy.trendSigmaA}
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("trendSigmaA", value)}
                 />
                 <NumberField
                   label="Sell b1"
-                  value={config().legacyValleyPeak.trendSigmaSellB1}
+                  value={config().strategy.trendSigmaSellB1}
                   min={0}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("trendSigmaSellB1", value)}
                 />
                 <NumberField
                   label="Buy b2"
-                  value={config().legacyValleyPeak.trendSigmaBuyB2}
+                  value={config().strategy.trendSigmaBuyB2}
                   min={0}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("trendSigmaBuyB2", value)}
                 />
                 <NumberField
                   label="Trend Window"
-                  value={config().legacyValleyPeak.trendSigmaWindowSec / 60}
+                  value={config().strategy.trendSigmaWindowSec / 60}
                   min={1}
                   step={1}
                   onInput={(value) => updateValleyPeak("trendSigmaWindowSec", value * 60)}
                 />
                 <NumberField
                   label="Sigmoid Low"
-                  value={config().legacyValleyPeak.sigmoidSigmaLow}
+                  value={config().strategy.sigmoidSigmaLow}
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("sigmoidSigmaLow", value)}
                 />
                 <NumberField
                   label="Sigmoid High"
-                  value={config().legacyValleyPeak.sigmoidSigmaHigh}
+                  value={config().strategy.sigmoidSigmaHigh}
                   min={0.000001}
                   step={0.01}
                   onInput={(value) => updateValleyPeak("sigmoidSigmaHigh", value)}
                 />
                 <NumberField
                   label="KAMA ER"
-                  value={config().legacyValleyPeak.kamaErLen}
+                  value={config().strategy.kamaErLen}
                   min={1}
                   step={1}
                   onInput={(value) => updateValleyPeak("kamaErLen", Math.round(value))}
                 />
                 <NumberField
                   label="KAMA Fast"
-                  value={config().legacyValleyPeak.kamaFastLen}
+                  value={config().strategy.kamaFastLen}
                   min={1}
                   step={1}
                   onInput={(value) => updateValleyPeak("kamaFastLen", Math.round(value))}
                 />
                 <NumberField
                   label="KAMA Slow"
-                  value={config().legacyValleyPeak.kamaSlowLen}
+                  value={config().strategy.kamaSlowLen}
                   min={1}
                   step={1}
                   onInput={(value) => updateValleyPeak("kamaSlowLen", Math.round(value))}
                 />
                 <NumberField
                   label="KAMA Power"
-                  value={config().legacyValleyPeak.kamaPower}
+                  value={config().strategy.kamaPower}
                   min={0.1}
                   step={0.1}
                   onInput={(value) => updateValleyPeak("kamaPower", value)}
                 />
                 <NumberField
-                  label="Signal Min"
-                  value={config().legacyValleyPeak.minTradeQuote}
-                  min={0}
-                  onInput={(value) => updateValleyPeak("minTradeQuote", value)}
-                />
-                <NumberField
-                  label="Signal Max"
-                  value={config().legacyValleyPeak.maxTradeQuote}
-                  min={1}
-                  onInput={(value) => updateValleyPeak("maxTradeQuote", value)}
-                />
-                <NumberField
                   label="Warmup min"
-                  value={config().legacyValleyPeak.saturationSec / 60}
+                  value={config().strategy.saturationSec / 60}
                   min={0}
                   onInput={(value) => updateValleyPeak("saturationSec", value * 60)}
                 />
                 <NumberListField
                   label="Buy Confirms"
-                  value={config().legacyValleyPeak.buyConfirmationOffsets}
+                  value={config().strategy.buyConfirmationOffsets}
                   onInput={(value) => updateValleyPeakOffsets("buyConfirmationOffsets", value)}
                 />
                 <NumberListField
                   label="Sell Confirms"
-                  value={config().legacyValleyPeak.sellConfirmationOffsets}
+                  value={config().strategy.sellConfirmationOffsets}
                   onInput={(value) => updateValleyPeakOffsets("sellConfirmationOffsets", value)}
                 />
                 <NumberListField
                   label="Buy Exit Confirms"
-                  value={config().legacyValleyPeak.buyExitConfirmationOffsets}
+                  value={config().strategy.buyExitConfirmationOffsets}
                   onInput={(value) =>
                     updateValleyPeakOffsets("buyExitConfirmationOffsets", value)
                   }
                 />
                 <NumberListField
                   label="Sell Exit Confirms"
-                  value={config().legacyValleyPeak.sellExitConfirmationOffsets}
+                  value={config().strategy.sellExitConfirmationOffsets}
                   onInput={(value) =>
                     updateValleyPeakOffsets("sellExitConfirmationOffsets", value)
-                  }
-                />
-                <NumberField
-                  label="Ant Misses"
-                  value={config().legacyValleyPeak.anticipatoryConfirmationMaxMisses}
-                  min={0}
-                  max={1}
-                  step={1}
-                  onInput={(value) =>
-                    updateValleyPeak(
-                      "anticipatoryConfirmationMaxMisses",
-                      Math.round(value),
-                    )
-                  }
-                />
-                <NumberField
-                  label="Ant Window"
-                  value={config().legacyValleyPeak.anticipatoryConfirmationWindowSec / 60}
-                  min={1}
-                  step={1}
-                  onInput={(value) =>
-                    updateValleyPeak("anticipatoryConfirmationWindowSec", value * 60)
-                  }
-                />
-                <NumberField
-                  label="Ant Lookahead %"
-                  value={config().legacyValleyPeak.anticipatoryConfirmationLookaheadFraction * 100}
-                  min={1}
-                  max={100}
-                  step={1}
-                  onInput={(value) =>
-                    updateValleyPeak(
-                      "anticipatoryConfirmationLookaheadFraction",
-                      value / 100,
-                    )
-                  }
-                />
-                <NumberField
-                  label="Grid Ant min"
-                  value={config().legacyValleyPeak.anticipatoryGridWindowSec / 60}
-                  min={0}
-                  step={1}
-                  onInput={(value) =>
-                    updateValleyPeak("anticipatoryGridWindowSec", value * 60)
-                  }
-                />
-                <NumberField
-                  label="Grid Ant Orders"
-                  value={config().legacyValleyPeak.anticipatoryGridOrderCount}
-                  min={1}
-                  step={1}
-                  onInput={(value) =>
-                    updateValleyPeak("anticipatoryGridOrderCount", Math.round(value))
                   }
                 />
               </div>
             </div>
 
             <div class="rounded-2 bg-ink-800 p-3">
-              <div class="muted-label">Position Risk</div>
+              <div class="muted-label">Grids & Lifecycle</div>
               <div class="mt-3 grid grid-cols-2 gap-3">
                 <NumberField
-                  label="Lower Range"
-                  value={config().positionRisk.lowerPriceExpectation}
-                  min={0}
-                  step={0.01}
-                  onInput={(value) => updateRisk("lowerPriceExpectation", value)}
+                  label="Entry Orders"
+                  value={config().entryGrid.orderCount}
+                  min={1}
+                  onInput={(orderCount) => updateGrid("entryGrid", { orderCount: Math.round(orderCount) })}
                 />
                 <NumberField
-                  label="Long Base"
-                  value={config().positionRisk.lowerBaselinePrice}
+                  label="Entry Step %"
+                  value={config().entryGrid.maxPriceStep * 100}
                   min={0}
                   step={0.01}
-                  onInput={(value) => updateRisk("lowerBaselinePrice", value)}
+                  onInput={(value) => updateGrid("entryGrid", { maxPriceStep: value / 100 })}
                 />
                 <NumberField
-                  label="Upper Range"
-                  value={config().positionRisk.upperPriceExpectation}
+                  label="Exit Orders"
+                  value={config().exitGrid.orderCount}
+                  min={1}
+                  onInput={(orderCount) => updateGrid("exitGrid", { orderCount: Math.round(orderCount) })}
+                />
+                <NumberField
+                  label="Exit Step %"
+                  value={config().exitGrid.maxPriceStep * 100}
                   min={0}
                   step={0.01}
-                  onInput={(value) => updateRisk("upperPriceExpectation", value)}
+                  onInput={(value) => updateGrid("exitGrid", { maxPriceStep: value / 100 })}
+                />
+                <SelectField
+                  label="Entry Sizes"
+                  value={config().entryGrid.sizeDistribution}
+                  options={[
+                    { value: "linear", label: "Linear" },
+                    { value: "geometric", label: "Geometric" },
+                  ]}
+                  onInput={(sizeDistribution) => updateGrid("entryGrid", {
+                    sizeDistribution: sizeDistribution as "linear" | "geometric",
+                  })}
+                />
+                <SelectField
+                  label="Exit Sizes"
+                  value={config().exitGrid.sizeDistribution}
+                  options={[
+                    { value: "linear", label: "Linear" },
+                    { value: "geometric", label: "Geometric" },
+                  ]}
+                  onInput={(sizeDistribution) => updateGrid("exitGrid", {
+                    sizeDistribution: sizeDistribution as "linear" | "geometric",
+                  })}
                 />
                 <NumberField
-                  label="Short Base"
-                  value={config().positionRisk.upperBaselinePrice}
-                  min={0}
+                  label="Entry Fraction"
+                  value={config().entryGrid.sizeFraction}
+                  min={0.01}
+                  max={1}
                   step={0.01}
-                  onInput={(value) => updateRisk("upperBaselinePrice", value)}
+                  onInput={(sizeFraction) => updateGrid("entryGrid", { sizeFraction })}
                 />
                 <NumberField
-                  label="Max Loss %"
-                  value={config().positionRisk.maxLossPct * 100}
+                  label="Exit Fraction"
+                  value={config().exitGrid.sizeFraction}
+                  min={0.01}
+                  max={1}
+                  step={0.01}
+                  onInput={(sizeFraction) => updateGrid("exitGrid", { sizeFraction })}
+                />
+                <SelectField
+                  label="Grid Reset"
+                  value={config().exitGrid.reset}
+                  options={[
+                    { value: "previous-anchor", label: "Previous Anchor" },
+                    { value: "last-filled-order", label: "Last Fill" },
+                  ]}
+                  onInput={(reset) => updateGrid("exitGrid", {
+                    reset: reset as "previous-anchor" | "last-filled-order",
+                  })}
+                />
+                <NumberField
+                  label="Lifetime min"
+                  value={(config().positionLifetimeMs ?? 0) > 0 ? (config().positionLifetimeMs ?? 0) / 60_000 : null}
+                  min={0}
+                  onInput={(value) => update("positionLifetimeMs", value > 0 ? value * 60_000 : null)}
+                />
+                <NumberField
+                  label="Stop Loss %"
+                  value={(config().stopLossRate ?? 0) > 0 ? (config().stopLossRate ?? 0) * 100 : null}
                   min={0}
                   step={0.1}
-                  onInput={(value) => updateRisk("maxLossPct", value / 100)}
+                  onInput={(value) => update("stopLossRate", value > 0 ? value / 100 : null)}
                 />
                 <NumberField
-                  label="Slip bps"
-                  value={config().positionRisk.marketSlippageBps}
+                  label="Take Profit %"
+                  value={(config().takeProfitRate ?? 0) > 0 ? (config().takeProfitRate ?? 0) * 100 : null}
                   min={0}
                   step={0.1}
-                  onInput={(value) => updateRisk("marketSlippageBps", value)}
+                  onInput={(value) => update("takeProfitRate", value > 0 ? value / 100 : null)}
                 />
               </div>
             </div>
@@ -2225,7 +2181,6 @@ function BooleanField(props: {
 
 function PerformancePanel(props: { snapshot?: RuntimeSnapshot }) {
   const metrics = () => props.snapshot?.bot.metrics;
-  const bot = () => props.snapshot?.bot;
 
   return (
     <div class="panel">
@@ -2239,16 +2194,12 @@ function PerformancePanel(props: { snapshot?: RuntimeSnapshot }) {
         <Activity size={18} class="text-accent" />
       </div>
       <div class="grid grid-cols-2 gap-3">
-        <SmallMetric label="Realized PnL" value={`$${formatQuote(metrics()?.realizedPnl, 2)}`} />
-        <SmallMetric label="Unrealized" value={`$${formatQuote(metrics()?.unrealizedPnl, 2)}`} />
-        <SmallMetric label="Win Rate" value={formatPercent(metrics()?.winRate)} />
-        <SmallMetric label="Max Drawdown" value={formatPercent(metrics()?.maxDrawdownPct)} />
-        <SmallMetric label="Fees" value={`$${formatQuote(metrics()?.feesPaid, 2)}`} />
-        <SmallMetric label="Exposure" value={formatPercent(metrics()?.exposurePct)} />
-      </div>
-      <div class="mt-3 rounded-2 bg-ink-800 p-3 text-sm text-ink-300">
-        Avg entry{" "}
-        <span class="text-ink-100 tabular-nums">${formatQuote(bot()?.avgEntryPrice, 2)}</span>
+        <SmallMetric label="Net PnL" value={`$${formatQuote(metrics()?.netPnl, 2)}`} />
+        <SmallMetric label="Return" value={formatPercent(metrics()?.returnPct)} />
+        <SmallMetric label="Positions" value={formatQuote(metrics()?.positionCount, 0)} />
+        <SmallMetric label="Orders" value={formatQuote(metrics()?.orderCount, 0)} />
+        <SmallMetric label="Long Asset" value={formatAsset(metrics()?.longAsset)} />
+        <SmallMetric label="Short Asset" value={formatAsset(metrics()?.shortAsset)} />
       </div>
     </div>
   );
@@ -2271,6 +2222,48 @@ function LiveEquityPanel(props: { points: EquityPoint[] }) {
 }
 
 function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
+  const diagnostics = () => props.bot?.diagnostics.strategy;
+  const indicators = () => Object.entries(diagnostics()?.indicators ?? {}).slice(0, 12);
+
+  return (
+    <div class="panel">
+      <div class="mb-3 flex items-center justify-between">
+        <div>
+          <div class="muted-label">Decision State</div>
+          <h2 class="text-lg font-semibold">Peak/Valley</h2>
+        </div>
+        <Activity size={18} class="text-accent" />
+      </div>
+      <Show when={diagnostics()} fallback={<div class="text-sm text-ink-300">Waiting for strategy evaluation</div>}>
+        {(state) => (
+          <>
+            <div class="grid grid-cols-2 gap-3">
+              <SmallMetric label="Last Signal" value={state().lastSignal?.type ?? "-"} />
+              <SmallMetric label="Side" value={state().lastSignal?.side ?? "-"} />
+              <SmallMetric label="Blockers" value={state().blockers.join(", ") || "none"} />
+              <SmallMetric
+                label="Gates"
+                value={`${state().gates.filter((gate) => gate.passed).length}/${state().gates.length}`}
+              />
+            </div>
+            <div class="mt-3 max-h-72 overflow-auto rounded-2 bg-ink-800 p-3">
+              <For each={indicators()} fallback={<div class="text-sm text-ink-300">No indicators yet</div>}>
+                {([name, value]) => (
+                  <div class="flex justify-between gap-3 border-t border-line py-1 text-sm first:border-0">
+                    <span class="text-ink-300">{name}</span>
+                    <span class="tabular-nums text-ink-100">{formatQuote(value ?? undefined, 8)}</span>
+                  </div>
+                )}
+              </For>
+            </div>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function LegacyStrategyStatePanel(props: { bot?: PaperBotState }) {
   const debug = () => props.bot?.memory.legacyValleyPeakDebug;
   const roleAverages = () =>
     (debug()?.averages ?? []).filter(
@@ -2905,7 +2898,7 @@ function formatCorrelation(value: number | undefined): string {
   return formatQuote(value, 3);
 }
 
-function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
+function OrdersPanel(props: { title: string; orders: readonly TradingOrderSnapshot[] }) {
   return (
     <div class="panel min-w-0 overflow-hidden">
       <div class="mb-3">
@@ -2919,8 +2912,8 @@ function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
               <th class="table-head pb-2">Side</th>
               <th class="table-head pb-2">Price</th>
               <th class="table-head pb-2">Qty</th>
-              <th class="table-head pb-2">Reason</th>
-              <th class="table-head pb-2">Created</th>
+              <th class="table-head pb-2">Type</th>
+              <th class="table-head pb-2">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -2930,10 +2923,10 @@ function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
                   <td class="td-cell">
                     <Side side={order.side} />
                   </td>
-                  <td class="td-cell">${formatQuote(order.price, 2)}</td>
-                  <td class="td-cell">{formatAsset(order.quantity)}</td>
-                  <td class="td-cell text-ink-300">{order.reason}</td>
-                  <td class="td-cell text-ink-300">{formatTime(order.createdAt)}</td>
+                  <td class="td-cell">${formatQuote(order.price ?? order.stopPrice ?? undefined, 2)}</td>
+                  <td class="td-cell">{formatAsset(order.size)}</td>
+                  <td class="td-cell text-ink-300">{order.type}</td>
+                  <td class="td-cell text-ink-300">{order.status}</td>
                 </tr>
               )}
             </For>
@@ -2944,7 +2937,9 @@ function OrdersPanel(props: { title: string; orders: TradingOrder[] }) {
   );
 }
 
-function FillsPanel(props: { fills: TradeFill[] }) {
+function FillsPanel(props: {
+  fills: Array<RuntimeSnapshot["recentEvents"][number] & { fill: TradingFill }>;
+}) {
   return (
     <div class="panel min-w-0 overflow-hidden">
       <div class="mb-3">
@@ -2955,10 +2950,10 @@ function FillsPanel(props: { fills: TradeFill[] }) {
         <table class="w-full min-w-130">
           <thead>
             <tr>
-              <th class="table-head pb-2">Side</th>
+              <th class="table-head pb-2">Order</th>
               <th class="table-head pb-2">Price</th>
               <th class="table-head pb-2">Qty</th>
-              <th class="table-head pb-2">PnL</th>
+              <th class="table-head pb-2">Quote</th>
               <th class="table-head pb-2">Filled</th>
             </tr>
           </thead>
@@ -2966,22 +2961,11 @@ function FillsPanel(props: { fills: TradeFill[] }) {
             <For each={props.fills} fallback={<EmptyRow columns={5} label="No fills yet" />}>
               {(fill) => (
                 <tr>
-                  <td class="td-cell">
-                    <Side side={fill.side} />
-                  </td>
-                  <td class="td-cell">${formatQuote(fill.price, 2)}</td>
-                  <td class="td-cell">{formatAsset(fill.quantity)}</td>
-                  <td
-                    class="td-cell"
-                    classList={{
-                      "text-gain": fill.realizedPnl > 0,
-                      "text-loss": fill.realizedPnl < 0,
-                      "text-ink-300": fill.realizedPnl === 0,
-                    }}
-                  >
-                    ${formatQuote(fill.realizedPnl, 2)}
-                  </td>
-                  <td class="td-cell text-ink-300">{formatTime(fill.filledAt)}</td>
+                  <td class="td-cell text-ink-300">{fill.orderId ?? "-"}</td>
+                  <td class="td-cell">${formatQuote(fill.fill.filledQuote / fill.fill.filledAsset, 2)}</td>
+                  <td class="td-cell">{formatAsset(fill.fill.filledAsset)}</td>
+                  <td class="td-cell">${formatQuote(fill.fill.filledQuote, 2)}</td>
+                  <td class="td-cell text-ink-300">{formatTime(fill.at)}</td>
                 </tr>
               )}
             </For>
@@ -2989,6 +2973,90 @@ function FillsPanel(props: { fills: TradeFill[] }) {
         </table>
       </div>
     </div>
+  );
+}
+
+function TradingPositionsPanel(props: {
+  positions: readonly TradingPosition[];
+  baseAsset: string;
+  quoteAsset: string;
+  error?: string;
+  onRecordTrade: (input: ManualTradeInput) => Promise<boolean>;
+}) {
+  const [quantity, setQuantity] = createSignal(0);
+  const open = (side: "buy" | "sell") => {
+    if (quantity() > 0) {
+      void props.onRecordTrade({ side, quantity: quantity(), positionEffect: "open" });
+    }
+  };
+  return (
+    <section class="panel min-w-0 overflow-hidden">
+      <div class="mb-4 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <div class="muted-label">Positions</div>
+          <h2 class="text-lg font-semibold">Position Grids</h2>
+        </div>
+        <div class="flex flex-wrap items-end gap-2">
+          <NumberField
+            label={`${props.baseAsset} quantity`}
+            value={quantity()}
+            min={0}
+            step={0.000001}
+            onInput={setQuantity}
+          />
+          <button class={buttonPrimaryClass} type="button" onClick={() => open("buy")}>Open Long</button>
+          <button class={buttonDangerClass} type="button" onClick={() => open("sell")}>Open Short</button>
+        </div>
+      </div>
+      <Show when={props.error}>
+        {(error) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{error()}</div>}
+      </Show>
+      <div class="max-w-full overflow-x-auto">
+        <table class="w-full min-w-160">
+          <thead>
+            <tr>
+              <th class="table-head pb-2">Side</th>
+              <th class="table-head pb-2">{props.baseAsset}</th>
+              <th class="table-head pb-2">{props.quoteAsset}</th>
+              <th class="table-head pb-2">Entry</th>
+              <th class="table-head pb-2">Exit</th>
+              <th class="table-head pb-2">Borrowed</th>
+              <th class="table-head pb-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.positions} fallback={<EmptyRow columns={7} label="No positions" />}>
+              {(position) => (
+                <tr>
+                  <td class="td-cell"><Side side={position.side === "long" ? "buy" : "sell"} /></td>
+                  <td class="td-cell">{formatAsset(position.asset)}</td>
+                  <td class="td-cell">${formatQuote(position.quote, 2)}</td>
+                  <td class="td-cell">{position.entryGrid?.orders.length ?? 0} orders</td>
+                  <td class="td-cell">{position.exitGrid?.orders.length ?? 0} orders</td>
+                  <td class="td-cell text-ink-300">
+                    {formatAsset(position.externalBorrow.asset)} / ${formatQuote(position.externalBorrow.quote, 2)}
+                  </td>
+                  <td class="td-cell">
+                    <button
+                      class={buttonPanelClass}
+                      type="button"
+                      onClick={() => void props.onRecordTrade({
+                        side: position.side === "long" ? "sell" : "buy",
+                        quantity: position.asset,
+                        targetPositionId: position.id,
+                        positionEffect: "close",
+                      })}
+                    >
+                      Close
+                    </button>
+                  </td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -3960,7 +4028,7 @@ function PossibleBadge(props: { possible: boolean }) {
   );
 }
 
-function EventsPanel(props: { events: BotEvent[] }) {
+function EventsPanel(props: { events: RuntimeSnapshot["recentEvents"] }) {
   return (
     <div class="panel">
       <div class="mb-3">
@@ -3978,7 +4046,7 @@ function EventsPanel(props: { events: BotEvent[] }) {
               <Show when={event.order}>
                 {(order) => (
                   <div class="mt-1 text-xs text-ink-300">
-                    {order().id} at ${formatQuote(order().price, 2)}
+                    {order().id} at ${formatQuote(order().price ?? order().stopPrice ?? undefined, 2)}
                   </div>
                 )}
               </Show>
@@ -5693,7 +5761,7 @@ function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Number.isFinite(value) ? value : min));
 }
 
-function normalizeBinanceCredentialMode(value: string | undefined): BinancePaperMode {
+function normalizeBinanceCredentialMode(value: string | undefined): BinanceExchangeMode {
   return value === "live" || value?.endsWith("-live") ? "live" : "auto";
 }
 

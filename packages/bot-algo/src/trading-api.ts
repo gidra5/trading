@@ -30,15 +30,6 @@ export interface TradingHistoryRequest {
   count: number;
 }
 
-export interface EquitySnapshot {
-  quoteAvailable: number;
-  quoteReserved: number;
-  quoteUnleveraged: number;
-  assetAvailable: number;
-  assetReserved: number;
-  assetUnleveraged: number;
-}
-
 export interface TradingQuantityRules {
   min: number | null;
   max: number | null;
@@ -52,6 +43,19 @@ export interface TradingMarketRules {
   minNotional: number | null;
   maxNotional: number | null;
   maxLeverage: number;
+}
+
+export interface TradingOrderCapacityRequest {
+  side: TradingSide;
+  price: number;
+  leverage: number;
+}
+
+export interface TradingOrderCapacity {
+  /** Maximum additional quote notional accepted by the provider. */
+  quote: number;
+  /** Leverage actually used to derive the capacity. */
+  leverage: number;
 }
 
 interface TradingOrderInput {
@@ -112,8 +116,8 @@ export interface TradingApi {
   createMarketOrder(input: CreateMarketOrderInput): Promise<TradingOrderResult>;
   cancelOrder(orderId: string): Promise<boolean>;
   getHistory(input: TradingHistoryRequest): Promise<TradingCandle[]>;
-  getEquity(): Promise<EquitySnapshot>;
   getMarketRules(): Promise<TradingMarketRules>;
+  getOrderCapacity(input: TradingOrderCapacityRequest): Promise<TradingOrderCapacity>;
   /** Expected proportional execution cost, e.g. 0.001 means 0.1%. */
   getFriction(): Promise<number>;
 }

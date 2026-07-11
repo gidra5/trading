@@ -1,21 +1,10 @@
 import {
-  SimulatedExecutionEngine,
   aggregateExtremaOrderMassSummaries,
-  calculateRiskAdjustedMetrics,
   compactBacktestState,
-  createBacktestChartCollector,
-  createExtremaOrderMassCollector,
   createInitialBotState,
   createStrategyConfig,
-  defaultPositionRiskConfig,
-  finalizeBacktestCandleChart,
-  observeExtremaOrderMassCandle,
-  observeBacktestChartCandle,
-  summarizeExtremaOrderMass,
-  summarizeClosedPositions,
   type BacktestSummary,
   type BacktestSampleSummary,
-  type BacktestStopReason,
   type BacktestPreset,
   type BacktestProgressSnapshot,
   type BacktestResult,
@@ -31,9 +20,8 @@ import {
   type HistoricalCandleCacheStats,
 } from "./historical-candle-cache.js";
 import type { StreamVenue } from "./binance-markets.js";
+import { runBotBacktestFromCandles } from "./bot-backtest.js";
 
-const WIPEOUT_EQUITY_FRACTION = 0.01;
-const WIPEOUT_CHECK_CANDLES = 100;
 const MAX_EQUITY_POINTS = 800;
 const REPLAY_PROGRESS_CANDLES = 10_000;
 const MAX_RANDOM_PRELOADED_CANDLES = 2_000_000;
@@ -128,34 +116,6 @@ interface RandomReplayWindow extends RandomBacktestWindow {
   replayEndIndex?: number;
 }
 
-interface PerfectMarginBenchmarkAccumulator {
-  startingQuote: number;
-  leverage: number;
-  oneWayFrictionRate: number;
-  previousPrice?: number;
-  flatPnl: number;
-  longPnl: number;
-  shortPnl: number;
-  flatEquity: number;
-  longEquity: number;
-  shortEquity: number;
-}
-
-const PERFECT_MARGIN_MIN_SLIPPAGE_BPS = defaultPositionRiskConfig.marketSlippageBps;
-
-type PerfectMarginBenchmark = Pick<
-  BacktestSummary,
-  | "perfectMarginLeverage"
-  | "perfectMarginFinalEquity"
-  | "perfectMarginNetPnl"
-  | "perfectMarginReturnPct"
-  | "perfectMarginCapturePct"
-  | "perfectMarginCompoundedFinalEquity"
-  | "perfectMarginCompoundedNetPnl"
-  | "perfectMarginCompoundedReturnPct"
-  | "perfectMarginCompoundedCapturePct"
->;
-
 export class BacktestCancelledError extends Error {
   constructor(message = "Backtest cancelled") {
     super(message);
@@ -222,7 +182,7 @@ export async function runHistoricalCandleBacktest(
       ? explicitStartTime
       : fallbackStartTime;
 
-  return runHistoricalRangeBacktest(
+  return runBotHistoricalRangeBacktest(
     {
       ...options,
       targetStartTime,
@@ -359,7 +319,7 @@ async function runRandomHistoricalCandleBacktest(
       const currentSample = marketIndex * sampleCount + windowIndex + 1;
       const currentWindowSample = windowIndex + 1;
       const window = replayWindows[windowIndex];
-      const result = await runHistoricalRangeBacktest(
+      const result = await runBotHistoricalRangeBacktest(
         {
           ...options,
           ...market,
@@ -641,18 +601,14 @@ async function preloadRandomWindowCandles(
   return candles;
 }
 
-async function runHistoricalRangeBacktest(
+async function runBotHistoricalRangeBacktest(
   options: HistoricalRangeBacktestOptions,
   onProgress: (progress: BacktestProgressSnapshot) => void,
 ): Promise<BacktestResult> {
   throwIfCancelled(options.cancelSignal);
   const { targetStartTime, targetEndTime } = options;
   const intervalMs = intervalToMs(options.interval);
-  const estimatedCandles = estimateRangeCandles(
-    targetStartTime,
-    targetEndTime,
-    intervalMs,
-  );
+  const estimatedCandles = estimateRangeCandles(targetStartTime, targetEndTime, intervalMs);
   const config = createStrategyConfig({
     ...options.config,
     symbol: options.symbol,
@@ -660,8 +616,6 @@ async function runHistoricalRangeBacktest(
     quoteAsset: options.quoteAsset ?? options.config.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, options.maxLeverage),
   });
-  const bot = new SimulatedExecutionEngine(createInitialBotState(config));
-  const perfectMargin = createPerfectMarginBenchmark(config);
   const cache = new HistoricalCandleCache({
     dataDir: options.cache.dataDir,
     marketKey: options.marketKey,
@@ -671,262 +625,81 @@ async function runHistoricalRangeBacktest(
     maxBytes: options.cache.maxBytes,
     minFreeBytes: options.cache.minFreeBytes,
   });
-  const equityCurve: EquityPoint[] = [];
-  const chartCollector = createBacktestChartCollector(config, estimatedCandles);
-  const extremaOrderMassCollector = createExtremaOrderMassCollector();
-  const sampleEvery = Math.max(1, Math.ceil(estimatedCandles / MAX_EQUITY_POINTS));
-  const metricsEvery = Math.max(1, Math.min(sampleEvery, WIPEOUT_CHECK_CANDLES));
-  const startedAt = Date.now();
-  const wipeoutEquity = config.startingQuote * WIPEOUT_EQUITY_FRACTION;
-
-  let processedCandles = 0;
   let cacheStats = emptyCacheStats();
-  let processedStartTime: number | undefined;
-  let processedEndTime: number | undefined;
-  let lastProcessedCandle: Candle | undefined;
-  let stopReason: BacktestStopReason = "completed";
-  let latestMetrics = bot.view().metrics;
-  let survivedMs: number | undefined;
+  const startedAt = Date.now();
+  const candles: Candle[] = [];
 
+  emit("Checking historical candle cache");
   if (!options.cacheAlreadyEnsured) {
-    emitProgress("running", "Checking historical candle cache");
-
     cacheStats = await cache.ensureRange(
       targetStartTime,
       targetEndTime,
-      (request) =>
-        fetchKlines({
-          venue: options.venue,
-          symbol: options.symbol,
-          interval: options.interval,
-          startTime: request.startTime,
-          endTime: request.endTime,
-          limit: request.limit,
-          signal: options.cancelSignal,
-        }),
+      (request) => fetchKlines({
+        venue: options.venue,
+        symbol: options.symbol,
+        interval: options.interval,
+        startTime: request.startTime,
+        endTime: request.endTime,
+        limit: request.limit,
+        signal: options.cancelSignal,
+      }),
       (stats) => {
-        throwIfCancelled(options.cancelSignal);
         cacheStats = stats;
-        emitProgress(
-          "running",
-          stats.cacheMissCandles > stats.cacheFetchedCandles
-            ? `Caching ${(
-                stats.cacheMissCandles - stats.cacheFetchedCandles
-              ).toLocaleString()} missing candles`
-            : "Historical cache ready",
-        );
+        emit("Caching historical candles");
       },
     );
-    throwIfCancelled(options.cancelSignal);
   }
-
-  const replayStartedAt = Date.now();
+  throwIfCancelled(options.cancelSignal);
 
   if (options.replayCandles) {
-    const replayStartIndex = Math.max(0, options.replayStartIndex ?? 0);
-    const replayEndIndex = Math.min(
-      options.replayCandles.length,
-      options.replayEndIndex ?? options.replayCandles.length,
-    );
-    for (let index = replayStartIndex; index < replayEndIndex; index += 1) {
-      if (!processReplayCandle(options.replayCandles[index])) {
-        break;
-      }
-      if (processedCandles > 0 && processedCandles % REPLAY_PROGRESS_CANDLES === 0) {
-        throwIfCancelled(options.cancelSignal);
-        emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
-      }
+    const start = Math.max(0, options.replayStartIndex ?? 0);
+    const end = Math.min(options.replayCandles.length, options.replayEndIndex ?? options.replayCandles.length);
+    for (let index = start; index < end; index += 1) {
+      const candle = options.replayCandles[index];
+      if (candle.openTime >= targetStartTime && candle.openTime <= targetEndTime) candles.push(candle);
     }
   } else {
-    outer: for await (const candles of cache.readRangeBatches(
-      targetStartTime,
-      targetEndTime,
-      REPLAY_PROGRESS_CANDLES,
-    )) {
-      for (const candle of candles) {
-        if (!processReplayCandle(candle)) {
-          break outer;
-        }
-      }
-
+    for await (const batch of cache.readRangeBatches(targetStartTime, targetEndTime, REPLAY_PROGRESS_CANDLES)) {
+      candles.push(...batch.filter((candle) => candle.openTime >= targetStartTime && candle.openTime <= targetEndTime));
       throwIfCancelled(options.cancelSignal);
-      emitProgress("running", `Processed ${processedCandles.toLocaleString()} candles`);
+      emit(`Loaded ${candles.length.toLocaleString()} candles`);
     }
   }
+  if (candles.length === 0) throw new Error("Historical backtest loaded no candles.");
 
-  if (lastProcessedCandle) {
-    observeBacktestChartCandle(
-      chartCollector,
-      bot,
-      lastProcessedCandle,
-      processedCandles,
-      true,
-    );
-  }
-
-  latestMetrics = bot.markToMarket();
-  const fullFinalState = bot.view();
-  const closedPositionStats = summarizeClosedPositions(fullFinalState);
-  const extremaOrderMass = summarizeExtremaOrderMass(
-    extremaOrderMassCollector,
-    fullFinalState.fills,
-  );
-  const finalState = compactBacktestState(
-    fullFinalState,
-    options.sampleCount
-      ? {
-          maxReturnedOrders: 0,
-          maxReturnedFills: 0,
-        }
-      : {},
-  );
-  if (processedEndTime && equityCurve.at(-1)?.time !== processedEndTime) {
-    equityCurve.push({
-      time: processedEndTime,
-      equity: finalState.metrics.equity,
-      price: finalState.lastPrice,
-    });
-  }
-
-  const durationMs = Date.now() - startedAt;
-  const replayDurationMs = Date.now() - replayStartedAt;
-  survivedMs =
-    processedStartTime && processedEndTime
-      ? processedEndTime - processedStartTime
-      : undefined;
-  const riskMetrics = calculateRiskAdjustedMetrics(
-    equityCurve,
-    finalState.metrics.returnPct,
-    finalState.metrics.maxDrawdownPct,
-  );
-  const result: BacktestResult = {
-    summary: {
-      symbol: options.symbol,
-      marketId: options.marketId,
-      displaySymbol: options.displaySymbol,
-      source: "candles",
-      startTime: processedStartTime ?? targetStartTime,
-      endTime: processedEndTime ?? targetStartTime,
-      targetStartTime,
-      targetEndTime,
-      eventsProcessed: processedCandles * 4,
-      candlesProcessed: processedCandles,
-      requests: cacheStats.requests,
-      cacheHitCandles: cacheStats.cacheHitCandles,
-      cacheMissCandles: cacheStats.cacheMissCandles,
-      cacheFetchedCandles: cacheStats.cacheFetchedCandles,
-      cacheSizeBytes: cacheStats.cacheSizeBytes,
-      cacheEvictedBytes: cacheStats.cacheEvictedBytes,
-      cacheEvictedFiles: cacheStats.cacheEvictedFiles,
-      stoppedEarly: stopReason !== "completed",
-      stopReason,
-      survivedMs,
-      durationMs,
-      replayDurationMs,
-      candlesPerSecond:
-        replayDurationMs > 0 ? (processedCandles / replayDurationMs) * 1000 : undefined,
-      finalEquity: finalState.metrics.equity,
-      netPnl: finalState.metrics.netPnl,
-      returnPct: finalState.metrics.returnPct,
-      ...riskMetrics,
-      maxDrawdownPct: finalState.metrics.maxDrawdownPct,
-      maxEntryLeverage: finalState.metrics.maxEntryLeverage,
-      maxEffectiveLeverage: finalState.metrics.maxEffectiveLeverage,
-      tradeCount: finalState.metrics.tradeCount,
-      winRate: finalState.metrics.winRate,
-      ...closedPositionStats,
-      ...finalizePerfectMarginBenchmark(perfectMargin, finalState.metrics.netPnl),
-      extremaOrderMass,
-    },
-    equityCurve,
-    orders: finalState.orders,
-    fills: finalState.fills,
-    finalState,
-    candleChart: finalizeBacktestCandleChart(chartCollector),
-  };
-
+  emit(`Replaying ${candles.length.toLocaleString()} candles`);
+  const result = await runBotBacktestFromCandles(candles, { config });
+  Object.assign(result.summary, {
+    marketId: options.marketId,
+    displaySymbol: options.displaySymbol,
+    targetStartTime,
+    targetEndTime,
+    requests: cacheStats.requests,
+    cacheHitCandles: cacheStats.cacheHitCandles,
+    cacheMissCandles: cacheStats.cacheMissCandles,
+    cacheFetchedCandles: cacheStats.cacheFetchedCandles,
+    cacheSizeBytes: cacheStats.cacheSizeBytes,
+    cacheEvictedBytes: cacheStats.cacheEvictedBytes,
+    cacheEvictedFiles: cacheStats.cacheEvictedFiles,
+    survivedMs: result.summary.endTime - result.summary.startTime,
+  });
+  emit("Backtest completed", result);
   return result;
 
-  function processReplayCandle(candle: Candle): boolean {
-    if (processedCandles % 100 === 0) {
-      throwIfCancelled(options.cancelSignal);
-    }
-    if (candle.openTime < targetStartTime || candle.openTime > targetEndTime) {
-      return true;
-    }
-
-    processedStartTime ??= candle.openTime;
-    processedEndTime = candle.closeTime;
-    lastProcessedCandle = candle;
-
-    const liquidated = replayCandle(bot, candle, perfectMargin);
-    processedCandles += 1;
-    observeExtremaOrderMassCandle(extremaOrderMassCollector, candle);
-    observeBacktestChartCandle(
-      chartCollector,
-      bot,
-      candle,
-      processedCandles,
-      liquidated,
-    );
-    const shouldSample = processedCandles % sampleEvery === 0;
-    const shouldCheckMetrics =
-      shouldSample ||
-      processedCandles % metricsEvery === 0 ||
-      processedCandles >= estimatedCandles;
-
-    if (shouldCheckMetrics) {
-      latestMetrics = bot.markToMarket();
-    }
-
-    if (shouldSample) {
-      equityCurve.push({
-        time: candle.closeTime,
-        equity: latestMetrics.equity,
-        price: candle.close,
-      });
-    }
-
-    if (liquidated) {
-      if (!shouldCheckMetrics) {
-        latestMetrics = bot.markToMarket();
-      }
-      stopReason = "liquidated";
-      return false;
-    }
-
-    if (
-      shouldCheckMetrics &&
-      processedCandles > 0 &&
-      latestMetrics.equity <= wipeoutEquity
-    ) {
-      stopReason = "wiped_out";
-      return false;
-    }
-
-    return true;
-  }
-
-  function emitProgress(
-    status: BacktestProgressSnapshot["status"],
-    message: string,
-  ): void {
-    const currentSurvivedMs =
-      processedStartTime && processedEndTime
-        ? processedEndTime - processedStartTime
-        : undefined;
+  function emit(message: string, result?: BacktestResult): void {
+    const processed = result?.summary.candlesProcessed ?? candles.length;
     onProgress({
       id: options.id,
       preset: options.preset,
-      status,
+      status: result ? "completed" : "running",
       source: "candles",
       startedAt,
       updatedAt: Date.now(),
       targetStartTime,
       targetEndTime,
-      processedStartTime,
-      processedEndTime,
-      processedCandles,
+      processedStartTime: candles[0]?.openTime,
+      processedEndTime: candles.at(-1)?.closeTime,
+      processedCandles: processed,
       estimatedCandles,
       requests: cacheStats.requests,
       cacheHitCandles: cacheStats.cacheHitCandles,
@@ -943,23 +716,15 @@ async function runHistoricalRangeBacktest(
       sampleLookbackMs: options.sampleLookbackMs,
       marketCount: options.randomMarkets ? options.randomMarkets.length + 1 : undefined,
       randomPairCount: options.randomPairCount,
-      percent: Math.min(100, (processedCandles / estimatedCandles) * 100),
-      equity: latestMetrics.equity,
-      returnPct: latestMetrics.returnPct,
-      stopReason: status === "completed" ? stopReason : undefined,
-      survivedMs: currentSurvivedMs,
-      candlesPerSecond: currentCandlesPerSecond(),
+      percent: result ? 100 : Math.min(95, estimatedCandles > 0 ? candles.length / estimatedCandles * 90 : 0),
+      equity: result?.summary.finalEquity ?? config.startingQuote,
+      returnPct: result?.summary.returnPct ?? 0,
+      stopReason: result?.summary.stopReason,
+      survivedMs: result ? result.summary.endTime - result.summary.startTime : undefined,
+      candlesPerSecond: result?.summary.candlesPerSecond,
       message,
+      result,
     });
-  }
-
-  function currentCandlesPerSecond(): number | undefined {
-    if (processedCandles <= 0) {
-      return undefined;
-    }
-
-    const replayDurationMs = Date.now() - replayStartedAt;
-    return replayDurationMs > 0 ? (processedCandles / replayDurationMs) * 1000 : undefined;
   }
 }
 
@@ -1544,217 +1309,6 @@ function upperBoundCandleOpenTime(candles: readonly Candle[], time: number): num
     }
   }
   return low;
-}
-
-function replayCandle(
-  bot: SimulatedExecutionEngine,
-  candle: Candle,
-  perfectMargin?: PerfectMarginBenchmarkAccumulator,
-): boolean {
-  const duration = Math.max(1, candle.closeTime - candle.openTime);
-  const highTime = candle.openTime + duration * 0.33;
-  const lowTime = candle.openTime + duration * 0.66;
-  const liquidatedBefore = bot.liquidatedPositionCount();
-
-  observePerfectMarginPrice(perfectMargin, candle.open);
-  bot.onReplayPriceTick(candle.openTime, candle.open);
-  if (bot.liquidatedPositionCount() > liquidatedBefore) {
-    return true;
-  }
-  observePerfectMarginPrice(perfectMargin, candle.high);
-  bot.onReplayPriceTick(highTime, candle.high);
-  if (bot.liquidatedPositionCount() > liquidatedBefore) {
-    return true;
-  }
-  observePerfectMarginPrice(perfectMargin, candle.low);
-  bot.onReplayPriceTick(lowTime, candle.low);
-  if (bot.liquidatedPositionCount() > liquidatedBefore) {
-    return true;
-  }
-  observePerfectMarginPrice(perfectMargin, candle.close);
-  bot.onReplayPriceTick(candle.closeTime, candle.close);
-  return bot.liquidatedPositionCount() > liquidatedBefore;
-}
-
-function createPerfectMarginBenchmark(
-  config: StrategyConfig,
-): PerfectMarginBenchmarkAccumulator {
-  const slippageBps = Math.max(
-    PERFECT_MARGIN_MIN_SLIPPAGE_BPS,
-    Math.max(0, config.positionRisk.marketSlippageBps),
-  );
-  const oneWayFrictionRate = (Math.max(0, config.feeBps) + slippageBps) / 10_000;
-  return {
-    startingQuote: config.startingQuote,
-    leverage: config.maxLeverage,
-    oneWayFrictionRate,
-    flatPnl: 0,
-    longPnl: Number.NEGATIVE_INFINITY,
-    shortPnl: Number.NEGATIVE_INFINITY,
-    flatEquity: config.startingQuote,
-    longEquity: Number.NEGATIVE_INFINITY,
-    shortEquity: Number.NEGATIVE_INFINITY,
-  };
-}
-
-function observePerfectMarginPrice(
-  benchmark: PerfectMarginBenchmarkAccumulator | undefined,
-  price: number,
-): void {
-  if (!benchmark || !Number.isFinite(price) || price <= 0) {
-    return;
-  }
-
-  const openCost = benchmark.startingQuote * benchmark.leverage * benchmark.oneWayFrictionRate;
-  if (benchmark.previousPrice === undefined) {
-    benchmark.longPnl = Math.max(benchmark.longPnl, benchmark.flatPnl - openCost);
-    benchmark.shortPnl = Math.max(benchmark.shortPnl, benchmark.flatPnl - openCost);
-    benchmark.longEquity = Math.max(
-      benchmark.longEquity,
-      transitionCompoundedEquity(
-        benchmark.flatEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-    );
-    benchmark.shortEquity = Math.max(
-      benchmark.shortEquity,
-      transitionCompoundedEquity(
-        benchmark.flatEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-    );
-    benchmark.previousPrice = price;
-    return;
-  }
-
-  if (benchmark.previousPrice && benchmark.previousPrice > 0) {
-    const relativeMove = price / benchmark.previousPrice - 1;
-    const longMovePnl = benchmark.startingQuote * benchmark.leverage * relativeMove;
-    const shortMovePnl = -longMovePnl;
-    const markedFlatPnl = benchmark.flatPnl;
-    const markedLongPnl = addFinite(benchmark.longPnl, longMovePnl);
-    const markedShortPnl = addFinite(benchmark.shortPnl, shortMovePnl);
-    const closeCost = benchmark.startingQuote * benchmark.leverage * benchmark.oneWayFrictionRate;
-    const switchCost = closeCost * 2;
-
-    benchmark.flatPnl = Math.max(
-      markedFlatPnl,
-      addFinite(markedLongPnl, -closeCost),
-      addFinite(markedShortPnl, -closeCost),
-    );
-    benchmark.longPnl = Math.max(
-      markedLongPnl,
-      addFinite(markedFlatPnl, -openCost),
-      addFinite(markedShortPnl, -switchCost),
-    );
-    benchmark.shortPnl = Math.max(
-      markedShortPnl,
-      addFinite(markedFlatPnl, -openCost),
-      addFinite(markedLongPnl, -switchCost),
-    );
-
-    const longHoldFactor = 1 + benchmark.leverage * relativeMove;
-    const shortHoldFactor = 1 - benchmark.leverage * relativeMove;
-    const markedFlatEquity = benchmark.flatEquity;
-    const markedLongEquity = multiplyFinite(benchmark.longEquity, longHoldFactor);
-    const markedShortEquity = multiplyFinite(benchmark.shortEquity, shortHoldFactor);
-
-    benchmark.flatEquity = Math.max(
-      markedFlatEquity,
-      transitionCompoundedEquity(
-        markedLongEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-      transitionCompoundedEquity(
-        markedShortEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-    );
-    benchmark.longEquity = Math.max(
-      markedLongEquity,
-      transitionCompoundedEquity(
-        markedFlatEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-      transitionCompoundedEquity(
-        markedShortEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate * 2,
-      ),
-    );
-    benchmark.shortEquity = Math.max(
-      markedShortEquity,
-      transitionCompoundedEquity(
-        markedFlatEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate,
-      ),
-      transitionCompoundedEquity(
-        markedLongEquity,
-        benchmark.leverage,
-        benchmark.oneWayFrictionRate * 2,
-      ),
-    );
-  }
-  benchmark.previousPrice = price;
-}
-
-function addFinite(value: number, delta: number): number {
-  return Number.isFinite(value) ? value + delta : Number.NEGATIVE_INFINITY;
-}
-
-function multiplyFinite(value: number, factor: number): number {
-  if (!Number.isFinite(value) || !Number.isFinite(factor) || factor <= 0) {
-    return Number.NEGATIVE_INFINITY;
-  }
-  return value * factor;
-}
-
-function transitionCompoundedEquity(
-  equity: number,
-  leverage: number,
-  oneWayFrictionRate: number,
-): number {
-  const factor = 1 - leverage * oneWayFrictionRate;
-  return multiplyFinite(equity, factor);
-}
-
-function finalizePerfectMarginBenchmark(
-  benchmark: PerfectMarginBenchmarkAccumulator,
-  actualNetPnl: number,
-): PerfectMarginBenchmark {
-  const netPnl = Math.max(benchmark.flatPnl, benchmark.longPnl, benchmark.shortPnl);
-  const finalEquity = benchmark.startingQuote + netPnl;
-  const returnPct =
-    benchmark.startingQuote > 0 ? (netPnl / benchmark.startingQuote) * 100 : 0;
-  const compoundedFinalEquity = Math.max(
-    benchmark.flatEquity,
-    benchmark.longEquity,
-    benchmark.shortEquity,
-  );
-  const compoundedNetPnl = compoundedFinalEquity - benchmark.startingQuote;
-  const compoundedReturnPct =
-    benchmark.startingQuote > 0
-      ? (compoundedNetPnl / benchmark.startingQuote) * 100
-      : 0;
-
-  return {
-    perfectMarginLeverage: benchmark.leverage,
-    perfectMarginFinalEquity: finalEquity,
-    perfectMarginNetPnl: netPnl,
-    perfectMarginReturnPct: returnPct,
-    perfectMarginCapturePct: netPnl > 0 ? (actualNetPnl / netPnl) * 100 : undefined,
-    perfectMarginCompoundedFinalEquity: compoundedFinalEquity,
-    perfectMarginCompoundedNetPnl: compoundedNetPnl,
-    perfectMarginCompoundedReturnPct: compoundedReturnPct,
-    perfectMarginCompoundedCapturePct:
-      compoundedNetPnl > 0 ? (actualNetPnl / compoundedNetPnl) * 100 : undefined,
-  };
 }
 
 function parseKline(symbol: string, interval: string, row: unknown[]): Candle {

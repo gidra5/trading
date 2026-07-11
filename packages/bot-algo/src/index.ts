@@ -4,8 +4,9 @@ export {
   createStrategyConfig,
   defaultStrategyConfig,
   type PartialStrategyConfig,
-} from "./execution-simulator.js";
+} from "./legacy/execution-simulator.js";
 export * from "./bot.js";
+export * from "./peak-valley-strategy.js";
 export type * from "./strategy.js";
 export type * from "./trading-api.js";
 export * from "./indicators.js";
@@ -18,14 +19,14 @@ export {
   runBacktestFromOrderBook,
   runBacktestFromTicks,
   type BacktestChartCollector,
-} from "./backtest.js";
+} from "./legacy/backtest.js";
 export {
   aggregateExtremaOrderMassSummaries,
   createExtremaOrderMassCollector,
   observeExtremaOrderMassCandle,
   summarizeExtremaOrderMass,
   type ExtremaOrderMassCollector,
-} from "./extrema-order-mass.js";
+} from "./legacy/extrema-order-mass.js";
 export {
   createLegacyValleyPeakConfig,
   defaultLegacyValleyPeakConfig,
@@ -38,13 +39,13 @@ export {
   legacyValleyPeakAsymmetricShortFavoringConfig,
   legacyValleyPeakReferenceConfigs,
   legacyValleyPeakStrictSymmetricConfig,
-} from "./legacy-valley-peak.js";
+} from "./legacy/valley-peak.js";
 export {
   analyzePositions,
   createPositionRiskConfig,
   defaultPositionRiskConfig,
   summarizeClosedPositions,
-} from "./position-ledger.js";
+} from "./legacy/position-ledger.js";
 export {
   FuturesMarginBalanceModel,
   LeveragedBalanceModel,
@@ -54,6 +55,6 @@ export {
   type BalanceEntrySide,
   type BalanceLiquidationInput,
   type BalanceProjection,
-} from "./leveraged-balance.js";
-export { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
-export type * from "./types.js";
+} from "./legacy/leveraged-balance.js";
+export { calculateRiskAdjustedMetrics } from "./legacy/risk-metrics.js";
+export type * from "./legacy/types.js";

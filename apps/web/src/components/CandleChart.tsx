@@ -3,13 +3,13 @@ import type {
   BacktestChartAnnotation,
   BacktestChartSmaSeries,
   Candle,
-  TradingOrder,
+  TradingOrderSnapshot,
 } from "@trading/bot-algo";
 import { formatQuote, formatTime } from "../format";
 
 interface CandleChartProps {
   candles: Candle[];
-  orders: TradingOrder[];
+  orders: readonly TradingOrderSnapshot[];
   lastPrice: number;
   smaSeries?: BacktestChartSmaSeries[];
   annotations?: BacktestChartAnnotation[];
@@ -87,7 +87,9 @@ export function CandleChart(props: CandleChartProps) {
       return;
     }
 
-    const openOrders = props.orders.filter((order) => order.status === "open");
+    const openOrders = props.orders.filter(
+      (order) => order.status === "open" && order.price !== null,
+    );
     const showLastPrice = props.lastPrice > 0 && chartViewport.end >= sourceCandles.length;
     const startTime = candles[0]?.openTime ?? 0;
     const endTime = candles.at(-1)?.closeTime ?? startTime + 1;
@@ -110,7 +112,7 @@ export function CandleChart(props: CandleChartProps) {
     if (showLastPrice) {
       values.push(props.lastPrice);
     }
-    values.push(...openOrders.map((order) => order.price));
+    values.push(...openOrders.map((order) => order.price as number));
     values.push(...smaSeries.flatMap((series) => series.points.map((point) => point.value)));
     values.push(...selectedAnnotations.map((annotation) => annotation.price));
 
@@ -173,8 +175,8 @@ export function CandleChart(props: CandleChartProps) {
       drawPriceLine(
         ctx,
         plot,
-        priceToY(order.price),
-        order.price,
+        priceToY(order.price as number),
+        order.price as number,
         order.side === "buy" ? "#22c55e" : "#f5b84b",
         order.side.toUpperCase(),
       );

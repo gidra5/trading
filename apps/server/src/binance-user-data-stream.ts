@@ -1,25 +1,25 @@
 import WebSocket from "ws";
 import type { BinanceMarketListing } from "./binance-markets.js";
 import {
-  BinancePaperTrading,
-  type BinancePaperUserDataStreamStatus,
-} from "./binance-paper.js";
+  BinanceExchangeTrading,
+  type BinanceExchangeUserDataStreamStatus,
+} from "./binance-exchange.js";
 
 const KEEPALIVE_INTERVAL_MS = 30 * 60 * 1000;
 const EVENT_SYNC_DELAY_MS = 150;
 
-export interface BinancePaperUserDataStreamHandlers {
-  onStatus: (status: BinancePaperUserDataStreamStatus) => void;
+export interface BinanceExchangeUserDataStreamHandlers {
+  onStatus: (status: BinanceExchangeUserDataStreamStatus) => void;
   onUserData: (payload: unknown) => void | Promise<void>;
 }
 
-export interface BinancePaperUserDataStreamOptions {
+export interface BinanceExchangeUserDataStreamOptions {
   market: BinanceMarketListing;
-  paperTrading: BinancePaperTrading;
-  handlers: BinancePaperUserDataStreamHandlers;
+  exchangeTrading: BinanceExchangeTrading;
+  handlers: BinanceExchangeUserDataStreamHandlers;
 }
 
-export class BinancePaperUserDataStream {
+export class BinanceExchangeUserDataStream {
   private socket?: WebSocket;
   private reconnectTimer?: NodeJS.Timeout;
   private keepAliveTimer?: NodeJS.Timeout;
@@ -29,14 +29,14 @@ export class BinancePaperUserDataStream {
   private listenKey?: string;
   private stopped = true;
 
-  constructor(private readonly options: BinancePaperUserDataStreamOptions) {}
+  constructor(private readonly options: BinanceExchangeUserDataStreamOptions) {}
 
   start(): void {
     if (!this.stopped) {
       return;
     }
     this.stopped = false;
-    if (!this.options.paperTrading.canStreamUserData(this.options.market)) {
+    if (!this.options.exchangeTrading.canStreamUserData(this.options.market)) {
       this.emitStatus(false, "Binance user-data stream unavailable for this market");
       return;
     }
@@ -51,7 +51,7 @@ export class BinancePaperUserDataStream {
     this.socket?.close();
     this.socket = undefined;
     if (listenKey) {
-      void this.options.paperTrading
+      void this.options.exchangeTrading
         .closeUserDataStream(this.options.market, listenKey)
         .catch(() => undefined);
     }
@@ -63,9 +63,9 @@ export class BinancePaperUserDataStream {
     }
 
     try {
-      const session = await this.options.paperTrading.openUserDataStream(this.options.market);
+      const session = await this.options.exchangeTrading.openUserDataStream(this.options.market);
       if (this.stopped) {
-        await this.options.paperTrading.closeUserDataStream(this.options.market, session.listenKey);
+        await this.options.exchangeTrading.closeUserDataStream(this.options.market, session.listenKey);
         return;
       }
       this.listenKey = session.listenKey;
@@ -158,7 +158,7 @@ export class BinancePaperUserDataStream {
       return;
     }
     try {
-      await this.options.paperTrading.keepAliveUserDataStream(this.options.market, listenKey);
+      await this.options.exchangeTrading.keepAliveUserDataStream(this.options.market, listenKey);
       this.emitStatus(true, "Binance user-data stream keepalive sent");
     } catch (error) {
       this.emitStatus(

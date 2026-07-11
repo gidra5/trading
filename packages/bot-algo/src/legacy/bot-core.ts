@@ -12,7 +12,7 @@ import {
   normalizeLegacyValleyPeakMemory,
   type LegacyValleyPeakDecision,
   type LegacyValleyPeakInput,
-} from "./legacy-valley-peak.js";
+} from "./valley-peak.js";
 
 export type BotConfig = LegacyValleyPeakConfig;
 export type BotMemory = LegacyValleyPeakMemory;

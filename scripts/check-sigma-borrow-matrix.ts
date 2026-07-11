@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  runBacktestFromCandles,
+  createStrategyConfig,
   type BacktestExtremaOrderMassSummary,
   type Candle,
   type InternalBorrowAccounting,
@@ -10,6 +10,7 @@ import {
   type LegacySigmaMode,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runBotBacktestFromCandles } from "../apps/server/src/bot-backtest.js";
 
 interface Args {
   sigmaMode: LegacySigmaMode;
@@ -51,10 +52,12 @@ const candles = loadCandles(args);
 const market = summarizeMarket(candles);
 const cases = selectCases(args);
 
-for (const testCase of cases) {
-  const started = Date.now();
-  const result = runBacktestFromCandles(candles, {
-    config: {
+void main();
+
+async function main(): Promise<void> {
+  for (const testCase of cases) {
+    const started = Date.now();
+    const config = createStrategyConfig({
       symbol: "BTCUSDT",
       algorithm: "legacy-valley-peak",
       startingQuote: 10_000,
@@ -64,15 +67,14 @@ for (const testCase of cases) {
       shortBorrowDepth: testCase.shortBorrowDepth,
       internalBorrowAccounting: args.internalBorrowAccounting,
       legacyValleyPeak: legacyConfig(args, testCase.mode),
-    },
-    maxReturnedOrders: 0,
-    maxReturnedFills: 0,
-    maxEquityPoints: 32,
-    maxChartCandles: 1,
-  });
-  const summary = result.summary;
-  console.log(
-    JSON.stringify({
+    });
+    const result = await runBotBacktestFromCandles(candles, {
+      config,
+      maxChartCandles: 1,
+      maxEquityPoints: 32,
+    });
+    const summary = result.summary;
+    console.log(JSON.stringify({
       sigmaMode: args.sigmaMode,
       buySigma: args.buySigma,
       sellSigma: args.sellSigma,
@@ -114,8 +116,8 @@ for (const testCase of cases) {
       extremaOrderMass: compactExtremaOrderMass(summary.extremaOrderMass),
       stopReason: summary.stopReason,
       elapsedMs: Date.now() - started,
-    }),
-  );
+    }));
+  }
 }
 
 function selectCases(args: Args): Array<{

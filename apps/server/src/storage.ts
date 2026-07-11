@@ -70,6 +70,14 @@ export class TradingStorage {
     await writeJsonAtomic(this.liveBotStatePath, state);
   }
 
+  async loadTradingState<T>(): Promise<T | undefined> {
+    return unwrapStateFile(await readJson<T | StateFile<T>>(this.tradingStatePath));
+  }
+
+  async saveTradingState(state: unknown): Promise<void> {
+    await writeJsonAtomic(this.tradingStatePath, state);
+  }
+
   async loadRuntimeSettings(): Promise<TradingRuntimeSettings | undefined> {
     return unwrapStateFile(
       await readJson<TradingRuntimeSettings | StateFile<TradingRuntimeSettings>>(
@@ -139,6 +147,13 @@ export class TradingStorage {
     return path.join(
       this.stateDir,
       `live-bot-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
+    );
+  }
+
+  private get tradingStatePath(): string {
+    return path.join(
+      this.stateDir,
+      `trading-bot-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
     );
   }
 
