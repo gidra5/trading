@@ -45,7 +45,7 @@ export type LegacyMovingAverageType = "sma" | "ema";
 
 export type LegacyDerivativeSource = "price" | "kama";
 
-export type LegacyDerivativeClampMode = "deadband" | "hysteresis";
+export type LegacyDerivativeClampMode = "deadband" | "hysteresis" | "hold";
 
 export type LegacyExtremaSignalTiming = "start" | "end";
 
@@ -137,6 +137,11 @@ export interface LegacyValleyPeakConfig {
   kamaFastLen: number;
   kamaSlowLen: number;
   kamaPower: number;
+  kamaVolumeLen: number;
+  kamaVolumeCap: number;
+  kamaVolumePower: number;
+  kamaRateThresholdLow: number;
+  kamaRateThresholdHigh: number;
   rateThresholdsLow: number[];
   rateThresholdsHigh: number[];
   buyDataIndex: number;
@@ -206,6 +211,7 @@ export interface RollingAverageMemory {
 export interface RollingKamaMemory {
   sources: number[];
   ama?: number;
+  volumeEma?: number;
 }
 
 export interface RollingCandleRangePoint {
@@ -882,6 +888,7 @@ export interface BacktestChartAnnotation {
   kind: "buy-signal" | "sell-signal" | "buy-order" | "sell-order" | "buy-fill" | "sell-fill";
   label: string;
   reason?: string;
+  signalState?: "long" | "flat" | "short";
   orderId?: string;
   fillId?: string;
   targetPositionId?: string;

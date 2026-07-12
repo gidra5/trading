@@ -12,6 +12,9 @@ export type * from "./trading-api.js";
 export * from "./indicators.js";
 export type * from "./backtest-trace.js";
 export * from "./perfect-margin-oracle.js";
+export * from "./kama-signal-evaluator.js";
+export * from "./signal-memory.js";
+export * from "./kama-rate-noise.js";
 export {
   compactBacktestState,
   createBacktestChartCollector,

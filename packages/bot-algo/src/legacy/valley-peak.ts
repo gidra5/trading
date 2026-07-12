@@ -85,23 +85,28 @@ export const legacyValleyPeakStrictSymmetricConfig: LegacyValleyPeakConfig = {
   movingAverageType: "sma",
   rateRatios: [0.5, 0.5, 0.1, 0.05, 0.01, 0.01, 0.001],
   relativeRateEnabled: true,
-  derivativeSource: "price",
+  derivativeSource: "kama",
   derivativeClampMode: "deadband",
   derivativeClampInnerThresholdRatio: 0,
-  kamaErLen: 20,
-  kamaFastLen: 5,
-  kamaSlowLen: 50,
-  kamaPower: 1,
+  kamaErLen: 14,
+  kamaFastLen: 28,
+  kamaSlowLen: 153,
+  kamaPower: 0.49045,
+  kamaVolumeLen: 130,
+  kamaVolumeCap: 2.65003,
+  kamaVolumePower: 0,
+  kamaRateThresholdLow: 67.56654 / 36_000_000,
+  kamaRateThresholdHigh: 67.56654 / 36_000_000,
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
   sellDataIndex: 1,
-  buyConfirmationOffsets: [1, 2],
-  sellConfirmationOffsets: [1, 2],
-  buyExitConfirmationOffsets: [1, 2],
-  sellExitConfirmationOffsets: [1, 2],
-  buyEntrySignalTiming: "start",
-  sellEntrySignalTiming: "start",
+  buyConfirmationOffsets: [],
+  sellConfirmationOffsets: [],
+  buyExitConfirmationOffsets: [],
+  sellExitConfirmationOffsets: [],
+  buyEntrySignalTiming: "end",
+  sellEntrySignalTiming: "end",
   buyExitSignalTiming: "start",
   sellExitSignalTiming: "start",
   saturationSec: 3600,
@@ -209,7 +214,9 @@ export function createLegacyValleyPeakConfig(
   config.relativeRateEnabled = config.relativeRateEnabled === true;
   config.derivativeSource = config.derivativeSource === "kama" ? "kama" : "price";
   config.derivativeClampMode =
-    config.derivativeClampMode === "hysteresis" ? "hysteresis" : "deadband";
+    config.derivativeClampMode === "hysteresis"
+      ? "hysteresis"
+      : config.derivativeClampMode === "hold" ? "hold" : "deadband";
   config.buyEntrySignalTiming = normalizeExtremaSignalTiming(
     config.buyEntrySignalTiming,
   );
@@ -249,6 +256,34 @@ export function createLegacyValleyPeakConfig(
     Number.isFinite(config.kamaPower)
       ? config.kamaPower
       : defaultLegacyValleyPeakConfig.kamaPower,
+  );
+  config.kamaVolumeLen = clampInt(
+    config.kamaVolumeLen,
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  config.kamaVolumeCap = Math.max(
+    1,
+    Number.isFinite(config.kamaVolumeCap)
+      ? config.kamaVolumeCap
+      : defaultLegacyValleyPeakConfig.kamaVolumeCap,
+  );
+  config.kamaVolumePower = Math.max(
+    0,
+    Number.isFinite(config.kamaVolumePower)
+      ? config.kamaVolumePower
+      : defaultLegacyValleyPeakConfig.kamaVolumePower,
+  );
+  config.kamaRateThresholdLow = config.relativeRateEnabled
+    ? normalizeRelativeRate(config.kamaRateThresholdLow, 0.0000025)
+    : Math.max(0, Number.isFinite(config.kamaRateThresholdLow) ? config.kamaRateThresholdLow : 0.25);
+  config.kamaRateThresholdHigh = Math.max(
+    config.kamaRateThresholdLow,
+    config.relativeRateEnabled
+      ? normalizeRelativeRate(config.kamaRateThresholdHigh, config.kamaRateThresholdLow)
+      : Math.max(0, Number.isFinite(config.kamaRateThresholdHigh)
+        ? config.kamaRateThresholdHigh
+        : config.kamaRateThresholdLow),
   );
   config.rateThresholdsLow = config.relativeRateEnabled
     ? normalizeRelativeRates(config.rateThresholdsLow, rangeCount, 0.0000025)
@@ -563,7 +598,7 @@ export function evaluateLegacyValleyPeak(
   for (const priceRange of priceRanges) {
     updateRollingPriceRange(priceRange, input, tsSec);
   }
-  updateSignalSource(memory, config, input.price, tsSec);
+  updateSignalSource(memory, config, input, tsSec);
   for (let index = 0; index < config.averagingRangesSec.length; index += 1) {
     const rangeSec = config.averagingRangesSec[index];
     updateRollingAverage(
@@ -1567,20 +1602,20 @@ function shortSellQuoteSize(
 function updateSignalSource(
   memory: LegacyValleyPeakMemory,
   config: LegacyValleyPeakConfig,
-  price: number,
+  input: LegacyValleyPeakInput,
   tsSec: number,
 ): void {
   if (config.derivativeSource !== "kama") {
     return;
   }
 
-  const value = updateKama(memory.kama, config, price);
+  const value = updateKama(memory.kama, config, input.price, input.sourceCandle?.volume ?? 0);
   updateSignalDerivative(
     memory.kamaBuySignal,
     value,
     tsSec,
-    config.rateThresholdsLow[config.buyDataIndex] ?? 0,
-    config.rateThresholdsHigh[config.buyDataIndex] ?? 0,
+    config.kamaRateThresholdLow,
+    config.kamaRateThresholdHigh,
     config.relativeRateEnabled,
     config.derivativeClampMode,
     config.derivativeClampInnerThresholdRatio,
@@ -1589,8 +1624,8 @@ function updateSignalSource(
     memory.kamaSellSignal,
     value,
     tsSec,
-    config.rateThresholdsLow[config.sellDataIndex] ?? 0,
-    config.rateThresholdsHigh[config.sellDataIndex] ?? 0,
+    config.kamaRateThresholdLow,
+    config.kamaRateThresholdHigh,
     config.relativeRateEnabled,
     config.derivativeClampMode,
     config.derivativeClampInnerThresholdRatio,
@@ -1644,7 +1679,7 @@ function updateSignalDerivative(
   ) {
     const delta = tsSec - previousTsSec;
     derivative = relativeRateEnabled
-      ? (value - previousValue) / previousValue / delta
+      ? (value - previousValue) / value / delta
       : (value - previousValue) / delta;
   }
 
@@ -1675,6 +1710,7 @@ function updateKama(
   memory: RollingKamaMemory,
   config: LegacyValleyPeakConfig,
   source: number,
+  volume: number,
 ): number {
   if (!isPositiveFinite(source)) {
     return memory.ama ?? source;
@@ -1695,13 +1731,29 @@ function updateKama(
     efficiencyRatio = volatility !== 0 ? change / volatility : 0;
   }
 
-  const chop = Math.pow(clamp(efficiencyRatio, 0, 1), config.kamaPower);
+  const relativeVolume = volume > 0 && (memory.volumeEma ?? 0) > 0
+    ? clamp(volume / memory.volumeEma!, 0, config.kamaVolumeCap)
+    : 1;
+  const effectiveEfficiencyRatio = clamp(
+    efficiencyRatio * Math.pow(relativeVolume, config.kamaVolumePower),
+    0,
+    1,
+  );
   const alphaFast = 2 / (config.kamaFastLen + 1);
   const alphaSlow = 2 / (config.kamaSlowLen + 1);
-  const alpha = alphaSlow + chop * (alphaFast - alphaSlow);
+  const alpha = Math.pow(
+    alphaSlow + effectiveEfficiencyRatio * (alphaFast - alphaSlow),
+    config.kamaPower,
+  );
   memory.ama = memory.ama === undefined
     ? source
     : memory.ama + alpha * (source - memory.ama);
+  if (volume > 0) {
+    const volumeAlpha = 2 / (config.kamaVolumeLen + 1);
+    memory.volumeEma = memory.volumeEma === undefined
+      ? volume
+      : memory.volumeEma + volumeAlpha * (volume - memory.volumeEma);
+  }
   compactKama(memory, erLen);
   return memory.ama;
 }
@@ -1877,6 +1929,11 @@ function clampDerivativeRate(
   mode: LegacyDerivativeClampMode,
   innerThresholdRatio: number,
 ): number {
+  if (mode === "hold") {
+    return derivative > thresholdHigh || derivative < -thresholdLow
+      ? derivative
+      : previousClamped;
+  }
   if (mode !== "hysteresis") {
     return deadbandClampDerivativeRate(derivative, thresholdLow, thresholdHigh);
   }
@@ -2632,6 +2689,7 @@ function normalizeKama(memory: RollingKamaMemory | undefined): RollingKamaMemory
   return {
     sources: (Array.isArray(memory?.sources) ? memory.sources : []).filter(isPositiveFinite),
     ama: isPositiveFinite(memory?.ama ?? 0) ? memory?.ama : undefined,
+    volumeEma: isPositiveFinite(memory?.volumeEma ?? 0) ? memory?.volumeEma : undefined,
   };
 }
 

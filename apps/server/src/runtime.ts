@@ -2,6 +2,8 @@ import {
   GridTradingBot,
   PeakValleyStrategy,
   createPeakValleyBotConfig,
+  createPeakValleyStrategyConfig,
+  rescalePeakValleyStrategyConfig,
   createStrategyConfig,
   runBacktestFromOrderBook,
   type BacktestPreset,
@@ -31,6 +33,7 @@ import { runBotBacktestFromCandles } from "./bot-backtest.js";
 import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
 import {
   BacktestCancelledError,
+  intervalToMs,
   isBacktestCancelledError,
   runHistoricalCandleBacktest,
   type HistoricalBacktestMarket,
@@ -194,7 +197,7 @@ export class TradingRuntime {
     private readonly exchangeTrading?: BinanceExchangeTrading,
     _exchangeAccountGuard?: { hardStop: boolean; onWarning?: (message: string) => void },
   ) {
-    this.botConfig = createPeakValleyBotConfig(legacyConfig);
+    this.botConfig = createPeakValleyBotConfig(legacyConfig, intervalToMs(interval));
   }
 
   async init(): Promise<void> {
@@ -215,7 +218,7 @@ export class TradingRuntime {
       quoteAsset: market.quoteAsset,
       maxLeverage: Math.min(this.legacyConfig.maxLeverage, market.maxLeverage ?? Infinity),
     });
-    this.botConfig = createPeakValleyBotConfig(this.legacyConfig);
+    this.botConfig = createPeakValleyBotConfig(this.legacyConfig, intervalToMs(this.interval));
     this.candles = [];
     this.orderBook = undefined;
     this.recentEvents = [];
@@ -234,7 +237,6 @@ export class TradingRuntime {
 
   async handleTick(tick: PriceTick): Promise<RuntimeBotEvent[]> {
     return this.withOperation(async () => {
-      const before = this.recentEvents.length;
       const next: TradingTick = {
         timestamp: tick.eventTime,
         price: tick.price,
@@ -251,23 +253,44 @@ export class TradingRuntime {
       await this.refreshState(hasFill(events));
       this.recordEquity(tick.eventTime);
       this.scheduleSave();
-      return this.recentEvents.slice(0, Math.max(0, this.recentEvents.length - before));
+      return events;
     });
   }
 
-  async handleCandle(candle: Candle): Promise<void> {
-    const previous = this.candles.at(-1);
-    if (previous?.openTime === candle.openTime) {
-      this.candles[this.candles.length - 1] = candle;
-    } else {
-      this.candles.push(candle);
-      if (this.candles.length > 500) {
-        this.candles.shift();
-      }
-    }
-    if (candle.closed) {
+  async handleCandle(candle: Candle): Promise<RuntimeBotEvent[]> {
+    return this.withOperation(async () => {
+      if (!this.rememberCandle(candle)) return [];
+      if (!candle.closed) return [];
       await this.storage.appendCandle(candle);
+      if (this.status === "running") {
+        await this.bot.onTick({
+          timestamp: candle.closeTime,
+          price: candle.close,
+          quantity: candle.volume,
+          candle: toTradingCandle(candle),
+        });
+      }
+      const events = await this.deliverOrderEvents();
+      await this.refreshState(hasFill(events));
+      this.recordEquity(candle.closeTime);
+      this.scheduleSave();
+      return events;
+    });
+  }
+
+  private rememberCandle(candle: Candle): boolean {
+    const existing = this.candles.findIndex((item) => item.openTime === candle.openTime);
+    if (existing >= 0) {
+      if (this.candles[existing]!.closed) return false;
+      this.candles[existing] = candle;
+    } else {
+      if (candle.openTime < (this.candles.at(-1)?.openTime ?? Number.NEGATIVE_INFINITY)) {
+        return false;
+      }
+      this.candles.push(candle);
+      if (this.candles.length > 500) this.candles.shift();
     }
+    return true;
   }
 
   async handleOrderBook(snapshot: OrderBookSnapshot): Promise<void> {
@@ -393,7 +416,11 @@ export class TradingRuntime {
   async updateBotConfig(patch: PartialStrategyConfig | PeakValleyBotConfig): Promise<RuntimeBotEvent[]> {
     return this.withOperation(async () => {
       if (isBotConfig(patch)) {
-        this.botConfig = normalizeBotConfig(patch, this.market.maxLeverage);
+        this.botConfig = normalizeBotConfig(
+          patch,
+          this.market.maxLeverage,
+          intervalToMs(this.interval),
+        );
         this.legacyConfig = createStrategyConfig({
           ...this.legacyConfig,
           maxLeverage: this.botConfig.maxTargetLeverage,
@@ -413,7 +440,7 @@ export class TradingRuntime {
             ...(patch.legacyValleyPeak ?? {}),
           },
         });
-        this.botConfig = createPeakValleyBotConfig(this.legacyConfig);
+        this.botConfig = createPeakValleyBotConfig(this.legacyConfig, intervalToMs(this.interval));
       }
       await this.bot.updateConfig(this.botConfig);
       await this.refreshState();
@@ -613,8 +640,12 @@ export class TradingRuntime {
     this.status = restored?.status ?? this.status;
     this.runStartedAt = restored?.runStartedAt ?? Date.now();
     this.botConfig = restored?.bot.config
-      ? normalizeBotConfig(restored.bot.config, this.market.maxLeverage)
-      : createPeakValleyBotConfig(this.legacyConfig);
+      ? normalizeBotConfig(
+          restored.bot.config,
+          this.market.maxLeverage,
+          intervalToMs(this.interval),
+        )
+      : createPeakValleyBotConfig(this.legacyConfig, intervalToMs(this.interval));
     this.api = this.executionMode === "binance" && this.exchangeTrading
       ? new BinanceTradingApi({
           market: this.market,
@@ -640,7 +671,12 @@ export class TradingRuntime {
       onEntryRisk: (report) => this.entryRisk.set(report.side, report),
     });
     if (restored?.bot) {
-      await this.bot.restore(restored.bot);
+      const sampleIntervalMs = intervalToMs(this.interval);
+      const savedIntervalMs = restored.bot.config.strategy.sampleIntervalMs ?? 60_000;
+      await this.bot.restore(
+        { ...restored.bot, config: this.botConfig },
+        { restoreStrategy: savedIntervalMs === sampleIntervalMs },
+      );
     } else {
       await this.bot.warmup();
     }
@@ -854,14 +890,22 @@ export class TradingRuntime {
 }
 
 function currentStoredState(state: StoredRuntimeState | undefined): StoredRuntimeState | undefined {
-  return state?.bot.version === 2 && state.bot.strategy?.version === 2 ? state : undefined;
+  return state?.bot.version === 2 && state.bot.strategy?.version === 3 ? state : undefined;
 }
 
-function normalizeBotConfig(config: PeakValleyBotConfig, marketMax?: number): PeakValleyBotConfig {
+function normalizeBotConfig(
+  config: PeakValleyBotConfig,
+  marketMax?: number,
+  sampleIntervalMs = config.strategy.sampleIntervalMs ?? 60_000,
+): PeakValleyBotConfig {
   const maxLeverage = Math.max(1, Math.min(config.maxTargetLeverage, marketMax ?? Infinity));
   const minTrade = Math.max(0, config.minTradeQuote);
   return {
     ...structuredClone(config),
+    strategy: rescalePeakValleyStrategyConfig(
+      createPeakValleyStrategyConfig(config.strategy),
+      sampleIntervalMs,
+    ),
     maxTargetLeverage: maxLeverage,
     minTradeQuote: minTrade,
     maxTradeQuote: Math.max(minTrade, config.maxTradeQuote),

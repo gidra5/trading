@@ -79,6 +79,7 @@ import type {
 const apiBase = "/backend";
 const wsUrl = websocketUrl(apiBase, "/ws");
 const SOCKET_SNAPSHOT_APPLY_MS = 500;
+const RELATIVE_RATE_TO_BPS_HOUR = 36_000_000;
 const buttonBaseClass =
   "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
 const buttonPrimaryClass =
@@ -711,6 +712,10 @@ export function App() {
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
+            <a class={buttonPanelClass} href="#/kama-inspector">
+              <Search size={16} />
+              KAMA Inspector
+            </a>
             <button class={buttonPrimaryClass} type="button" onClick={() => void controlBot("start")}>
               <Play size={16} />
               Start
@@ -1740,6 +1745,7 @@ function AlgorithmPanel(props: {
                   options={[
                     { value: "deadband", label: "Deadband" },
                     { value: "hysteresis", label: "Hysteresis" },
+                    { value: "hold", label: "Hold" },
                   ]}
                   onInput={(value) =>
                     updateValleyPeak(
@@ -1927,6 +1933,54 @@ function AlgorithmPanel(props: {
                   min={0.1}
                   step={0.1}
                   onInput={(value) => updateValleyPeak("kamaPower", value)}
+                />
+                <NumberField
+                  label="KAMA Volume"
+                  value={config().strategy.kamaVolumeLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaVolumeLen", Math.round(value))}
+                />
+                <NumberField
+                  label="Volume Cap"
+                  value={config().strategy.kamaVolumeCap}
+                  min={1}
+                  step={0.1}
+                  onInput={(value) => updateValleyPeak("kamaVolumeCap", value)}
+                />
+                <NumberField
+                  label="Volume Power"
+                  value={config().strategy.kamaVolumePower}
+                  min={0}
+                  step={0.1}
+                  onInput={(value) => updateValleyPeak("kamaVolumePower", value)}
+                />
+                <NumberField
+                  label="KAMA Rate Low (bps/h)"
+                  value={config().strategy.kamaRateThresholdLow * RELATIVE_RATE_TO_BPS_HOUR}
+                  min={0}
+                  step={1}
+                  onInput={(value) => updateValleyPeak(
+                    "kamaRateThresholdLow",
+                    value / RELATIVE_RATE_TO_BPS_HOUR,
+                  )}
+                />
+                <NumberField
+                  label="KAMA Rate High (bps/h)"
+                  value={config().strategy.kamaRateThresholdHigh * RELATIVE_RATE_TO_BPS_HOUR}
+                  min={0}
+                  step={1}
+                  onInput={(value) => updateValleyPeak(
+                    "kamaRateThresholdHigh",
+                    value / RELATIVE_RATE_TO_BPS_HOUR,
+                  )}
+                />
+                <NumberField
+                  label="KAMA Signal Friction (bps)"
+                  value={config().strategy.kamaSignalFriction * 10_000}
+                  min={0}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaSignalFriction", value / 10_000)}
                 />
                 <NumberField
                   label="Warmup min"
@@ -2291,7 +2345,7 @@ function StrategyStatePanel(props: { bot?: RuntimeSnapshot["bot"] }) {
                 <Show when={state().kama}>
                   {(kama) => (
                     <span class="text-xs tabular-nums text-ink-300">
-                      KAMA ${formatQuote(kama().value, 4)} · {formatQuote(kama().rawRate, 8)} → {formatQuote(kama().clampedRate, 8)}
+                      KAMA ${formatQuote(kama().value, 4)} · rate {formatQuote(kama().rawRate, 8)} → {formatQuote(kama().clampedRate, 8)} · ER {formatQuote(kama().efficiencyRatio, 3)} · RV {formatQuote(kama().relativeVolume, 2)} · α {formatQuote(kama().alpha, 4)}
                     </span>
                   )}
                 </Show>
@@ -5302,7 +5356,9 @@ function BacktestOraclePanel(props: {
       <div class="mb-3 flex items-center justify-between gap-3">
         <div>
           <div class="muted-label">Optimal Trading Path</div>
-          <div class="mt-1 text-sm font-semibold text-ink-100">Three-state DP oracle · {props.trace.oracle.mode}</div>
+          <div class="mt-1 text-sm font-semibold text-ink-100">
+            Three-state DP oracle · {props.trace.oracle.mode} · {props.trace.oracle.eventMode}
+          </div>
         </div>
         <span class="text-xs text-ink-300">
           {formatLeverage(props.trace.oracle.leverage)} · friction {formatPercent(props.trace.oracle.friction * 100)}
@@ -5362,7 +5418,9 @@ function BacktestOraclePanel(props: {
         </For>
       </div>
       <div class="mt-2 text-xs text-ink-400">
-        The bottom strip is the held state; hold means remain long/short/flat. Events use synthetic open → high → low → close order.
+        The bottom strip is the held state; hold means remain long/short/flat. {props.trace.oracle.eventMode === "ohlc"
+          ? "Events use synthetic open → high → low → close order."
+          : "Events use completed candle closes only."}
       </div>
     </div>
   );

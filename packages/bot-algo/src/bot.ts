@@ -133,7 +133,10 @@ export interface TradingBot<
   onTick(tick: TradingTick): Promise<void>;
   onOrder(event: TradingOrderEvent): Promise<void>;
   snapshot(): Promise<BotSnapshot<TStrategyConfig, TStrategySnapshot>>;
-  restore(snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>): Promise<void>;
+  restore(
+    snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>,
+    options?: { restoreStrategy?: boolean },
+  ): Promise<void>;
   getMetrics(): BotMetricsSnapshot;
   getDiagnostics(): BotDiagnostics<TDiagnostics>;
   updateConfig(config: TradingBotConfig<TStrategyConfig>): Promise<void>;
@@ -241,14 +244,21 @@ export class GridTradingBot<
     };
   }
 
-  async restore(snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>): Promise<void> {
+  async restore(
+    snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>,
+    options: { restoreStrategy?: boolean } = {},
+  ): Promise<void> {
     if (snapshot.version !== 2) {
       throw new Error(`Unsupported bot snapshot version: ${snapshot.version}`);
     }
     this.config = structuredClone(snapshot.config);
     this.positions = structuredClone(snapshot.positions);
     this.lastEntryAt = snapshot.lastEntryAt ?? 0;
-    await this.options.strategy.restore(snapshot.strategy);
+    if (options.restoreStrategy === false) {
+      await this.options.strategy.updateConfig(this.config.strategy);
+    } else {
+      await this.options.strategy.restore(snapshot.strategy);
+    }
   }
 
   getMetrics(): BotMetricsSnapshot {

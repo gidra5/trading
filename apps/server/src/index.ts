@@ -8,6 +8,8 @@ import type {
   BacktestPreset,
   ManualTradeInput,
   PartialStrategyConfig,
+  VwKamaCandleRangeRequest,
+  VwKamaInspectorRequest,
 } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
@@ -24,6 +26,7 @@ import { TradingRuntime } from "./runtime.js";
 import { TradingStorage } from "./storage.js";
 import type { HistoricalBacktestMarket } from "./historical-backtest.js";
 import { CorrelationService } from "./correlation-service.js";
+import { KamaInspector } from "./kama-inspector.js";
 import {
   BinanceExchangeTrading,
   type BinanceExchangeCancelOrderInput,
@@ -98,6 +101,8 @@ const correlationService = new CorrelationService({
     minFreeBytes: appConfig.historicalCache.minFreeBytes,
   },
 });
+const kamaInspector = new KamaInspector(appConfig.dataDir);
+server.addHook("onClose", async () => kamaInspector.close());
 
 server.get("/health", async () => ({
   ok: true,
@@ -408,6 +413,26 @@ server.post("/api/backtest/stop", async () => {
   return publicSnapshot();
 });
 
+server.get("/api/kama-inspector/windows", async () => kamaInspector.catalog());
+
+server.post("/api/kama-inspector/candles", async (request, reply) => {
+  try {
+    return await kamaInspector.candles((request.body ?? {}) as VwKamaCandleRangeRequest);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "VW-KAMA candle range failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.post("/api/kama-inspector/analyze", async (request, reply) => {
+  try {
+    return await kamaInspector.analyze((request.body ?? {}) as VwKamaInspectorRequest);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "VW-KAMA inspection failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
 server.setErrorHandler((error, _request, reply) => {
   server.log.error(error);
   reply.code(500).send({
@@ -452,8 +477,9 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
         if (generation !== streamGeneration) {
           return;
         }
-        await runtime.handleCandle(candle);
-        if (correlationService.handleCandle(candle)) {
+        const events = await runtime.handleCandle(candle);
+        const correlationChanged = correlationService.handleCandle(candle);
+        if (events.length > 0 || correlationChanged) {
           broadcastState();
         } else {
           scheduleBroadcast();

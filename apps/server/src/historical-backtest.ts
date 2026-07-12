@@ -2,7 +2,9 @@ import {
   aggregateExtremaOrderMassSummaries,
   compactBacktestState,
   createInitialBotState,
+  createPeakValleyBotConfig,
   createStrategyConfig,
+  peakValleyWarmupSamples,
   type BacktestSummary,
   type BacktestSampleSummary,
   type BacktestPreset,
@@ -96,7 +98,6 @@ interface HistoricalRangeBacktestOptions extends HistoricalBacktestOptions {
   targetEndTime: number;
   cacheAlreadyEnsured?: boolean;
   replayCandles?: readonly Candle[];
-  replayStartIndex?: number;
   replayEndIndex?: number;
   currentSample?: number;
   sampleCount?: number;
@@ -112,10 +113,7 @@ interface RandomBacktestWindow {
   windowMs: number;
 }
 
-interface RandomReplayWindow extends RandomBacktestWindow {
-  replayStartIndex?: number;
-  replayEndIndex?: number;
-}
+interface RandomReplayWindow extends RandomBacktestWindow { replayEndIndex?: number }
 
 export class BacktestCancelledError extends Error {
   constructor(message = "Backtest cancelled") {
@@ -242,6 +240,7 @@ async function runRandomHistoricalCandleBacktest(
     quoteAsset: primaryMarket.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, primaryMarket.maxLeverage),
   });
+  const warmupMs = historicalWarmupSamples(config, intervalMs) * intervalMs;
   const targetEndTime = Date.now();
   const targetStartTime = targetEndTime - sampleLookbackMs;
   const windows = buildRandomWindows({
@@ -283,6 +282,7 @@ async function runRandomHistoricalCandleBacktest(
       market,
       windows,
       intervalMs,
+      warmupMs,
       (stats) => {
         cacheStats = mergedCacheStats(completedMarketCacheStats, stats);
         emitAggregateProgress(`Checking ${market.displaySymbol} random-window cache`);
@@ -294,6 +294,7 @@ async function runRandomHistoricalCandleBacktest(
       market,
       windows,
       intervalMs,
+      warmupMs,
       (loadedCandles, estimatedCandlesToLoad) => {
         const suffix =
           estimatedCandlesToLoad > 0
@@ -307,10 +308,6 @@ async function runRandomHistoricalCandleBacktest(
     const replayWindows: RandomReplayWindow[] = preloadedCandles
       ? windows.map((window) => ({
           ...window,
-          replayStartIndex: lowerBoundCandleOpenTime(
-            preloadedCandles,
-            window.startTime,
-          ),
           replayEndIndex: upperBoundCandleOpenTime(preloadedCandles, window.endTime),
         }))
       : windows;
@@ -330,7 +327,6 @@ async function runRandomHistoricalCandleBacktest(
           targetEndTime: window.endTime,
           cacheAlreadyEnsured: true,
           replayCandles: preloadedCandles,
-          replayStartIndex: window.replayStartIndex,
           replayEndIndex: window.replayEndIndex,
           currentSample,
           sampleCount: totalSampleCount,
@@ -520,6 +516,7 @@ async function ensureRandomWindowCache(
   market: HistoricalBacktestMarket,
   windows: RandomBacktestWindow[],
   intervalMs: number,
+  warmupMs: number,
   onProgress: (stats: HistoricalCandleCacheStats) => void,
 ): Promise<HistoricalCandleCacheStats> {
   throwIfCancelled(options.cancelSignal);
@@ -533,7 +530,7 @@ async function ensureRandomWindowCache(
     minFreeBytes: options.cache.minFreeBytes,
   });
   const ranges: CandleTimeRange[] = windows.map((window) => ({
-    startTime: window.startTime,
+    startTime: window.startTime - warmupMs,
     endTime: window.endTime,
   }));
 
@@ -561,9 +558,13 @@ async function preloadRandomWindowCandles(
   market: HistoricalBacktestMarket,
   windows: RandomBacktestWindow[],
   intervalMs: number,
+  warmupMs: number,
   onProgress: (loadedCandles: number, estimatedCandles: number) => void,
 ): Promise<readonly Candle[] | undefined> {
-  const ranges = mergeCandleTimeRanges(windows, intervalMs);
+  const ranges = mergeCandleTimeRanges(windows.map((window) => ({
+    startTime: window.startTime - warmupMs,
+    endTime: window.endTime,
+  })), intervalMs);
   const estimatedCandles = sumDefined(
     ranges.map((range) => estimateRangeCandles(range.startTime, range.endTime, intervalMs)),
   );
@@ -617,6 +618,9 @@ async function runBotHistoricalRangeBacktest(
     quoteAsset: options.quoteAsset ?? options.config.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, options.maxLeverage),
   });
+  const warmupSamples = historicalWarmupSamples(config, intervalMs);
+  const firstTargetTime = alignUp(targetStartTime, intervalMs);
+  const warmupStartTime = firstTargetTime - warmupSamples * intervalMs;
   const cache = new HistoricalCandleCache({
     dataDir: options.cache.dataDir,
     marketKey: options.marketKey,
@@ -628,12 +632,13 @@ async function runBotHistoricalRangeBacktest(
   });
   let cacheStats = emptyCacheStats();
   const startedAt = Date.now();
+  const warmup: Candle[] = [];
   const candles: Candle[] = [];
 
   emit("Checking historical candle cache");
   if (!options.cacheAlreadyEnsured) {
     cacheStats = await cache.ensureRange(
-      targetStartTime,
+      warmupStartTime,
       targetEndTime,
       (request) => fetchKlines({
         venue: options.venue,
@@ -653,15 +658,15 @@ async function runBotHistoricalRangeBacktest(
   throwIfCancelled(options.cancelSignal);
 
   if (options.replayCandles) {
-    const start = Math.max(0, options.replayStartIndex ?? 0);
+    const start = lowerBoundCandleOpenTime(options.replayCandles, warmupStartTime);
     const end = Math.min(options.replayCandles.length, options.replayEndIndex ?? options.replayCandles.length);
     for (let index = start; index < end; index += 1) {
       const candle = options.replayCandles[index];
-      if (candle.openTime >= targetStartTime && candle.openTime <= targetEndTime) candles.push(candle);
+      collect(candle);
     }
   } else {
-    for await (const batch of cache.readRangeBatches(targetStartTime, targetEndTime, REPLAY_PROGRESS_CANDLES)) {
-      candles.push(...batch.filter((candle) => candle.openTime >= targetStartTime && candle.openTime <= targetEndTime));
+    for await (const batch of cache.readRangeBatches(warmupStartTime, targetEndTime, REPLAY_PROGRESS_CANDLES)) {
+      for (const candle of batch) collect(candle);
       throwIfCancelled(options.cancelSignal);
       emit(`Loaded ${candles.length.toLocaleString()} candles`);
     }
@@ -671,6 +676,7 @@ async function runBotHistoricalRangeBacktest(
   emit(`Replaying ${candles.length.toLocaleString()} candles`);
   const result = await runBotBacktestFromCandles(candles, {
     config,
+    warmup,
     extremaSmaWindowMs: options.extremaSmaWindowMs,
   });
   Object.assign(result.summary, {
@@ -689,6 +695,14 @@ async function runBotHistoricalRangeBacktest(
   });
   emit("Backtest completed", result);
   return result;
+
+  function collect(candle: Candle): void {
+    if (candle.openTime >= warmupStartTime && candle.openTime < firstTargetTime) {
+      warmup.push(candle);
+    } else if (candle.openTime >= targetStartTime && candle.openTime <= targetEndTime) {
+      candles.push(candle);
+    }
+  }
 
   function emit(message: string, result?: BacktestResult): void {
     const processed = result?.summary.candlesProcessed ?? candles.length;
@@ -1398,8 +1412,12 @@ function klineEndpointForVenue(venue: StreamVenue): string {
   return "https://eapi.binance.com/eapi/v1/klines";
 }
 
+export function historicalWarmupSamples(config: StrategyConfig, intervalMs: number): number {
+  return peakValleyWarmupSamples(createPeakValleyBotConfig(config, intervalMs).strategy);
+}
+
 export function intervalToMs(interval: string): number {
-  const match = /^(\d+)([mhdw])$/.exec(interval);
+  const match = /^(\d+)([smhdw])$/.exec(interval);
   if (!match) {
     return 60_000;
   }
@@ -1407,6 +1425,7 @@ export function intervalToMs(interval: string): number {
   const value = Number(match[1]);
   const unit = match[2];
   const multipliers: Record<string, number> = {
+    s: 1_000,
     m: 60_000,
     h: 60 * 60_000,
     d: 24 * 60 * 60_000,

@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   EMAIndicator,
+  KAMAIndicator,
   LinearRegressionIndicator,
   LookbackIndicator,
   SMAIndicator,
+  VolumeWeightedKAMAIndicator,
 } from "../src/indicators.js";
 import type { TradingApi } from "../src/trading-api.js";
 
@@ -60,4 +62,87 @@ test("linear regression retains a negative series across snapshot restore", () =
   const restored = new LinearRegressionIndicator(4, unusedApi);
   restored.restore(structuredClone(regression.snapshot()));
   assert.deepEqual(restored.indicator(), regression.indicator());
+});
+
+test("volume-weighted KAMA with zero volume power matches canonical KAMA", () => {
+  const canonical = new KAMAIndicator(3, 2, 10, unusedApi, 10, 2);
+  const weighted = new VolumeWeightedKAMAIndicator(unusedApi, {
+    efficiencyPeriod: 3,
+    fastPeriod: 2,
+    slowPeriod: 10,
+    power: 2,
+    volumePeriod: 4,
+    volumePower: 0,
+  });
+  for (const [index, price] of [100, 101, 99, 103, 102, 106].entries()) {
+    const input = { eventTime: index, price, quantity: index + 1 };
+    canonical.onTick(input);
+    weighted.onTick(input);
+    assert.ok(Math.abs(weighted.indicator() - canonical.indicator()) < 1e-12);
+  }
+});
+
+test("volume-weighted KAMA speeds up on high relative volume", () => {
+  const options = {
+    efficiencyPeriod: 2,
+    fastPeriod: 2,
+    slowPeriod: 20,
+    power: 1,
+    volumePeriod: 3,
+    volumeCap: 4,
+    volumePower: 1,
+  };
+  const base = new VolumeWeightedKAMAIndicator(unusedApi, options);
+  for (const [index, price] of [100, 101, 102].entries()) {
+    base.onTick({ eventTime: index, price, quantity: 10 });
+  }
+  const high = new VolumeWeightedKAMAIndicator(unusedApi, options);
+  const low = new VolumeWeightedKAMAIndicator(unusedApi, options);
+  high.restore(base.snapshot());
+  low.restore(base.snapshot());
+  high.onTick({ eventTime: 4, price: 104, quantity: 40 });
+  low.onTick({ eventTime: 4, price: 104, quantity: 2 });
+
+  assert.ok(high.details().alpha > low.details().alpha);
+  assert.ok(high.derivative() > low.derivative());
+});
+
+test("volume-weighted KAMA restores exactly and treats missing volume as neutral", () => {
+  const options = {
+    efficiencyPeriod: 2,
+    fastPeriod: 2,
+    slowPeriod: 10,
+    volumePeriod: 3,
+    volumePower: 1,
+  };
+  const original = new VolumeWeightedKAMAIndicator(unusedApi, options);
+  for (const [index, price] of [100, 99, 101].entries()) {
+    original.onTick({ eventTime: index, price, quantity: 10 });
+  }
+  const restored = new VolumeWeightedKAMAIndicator(unusedApi, options);
+  restored.restore(structuredClone(original.snapshot()));
+  original.onTick({ eventTime: 4, price: 103, quantity: 0 });
+  restored.onTick({ eventTime: 4, price: 103 });
+
+  assert.deepEqual(restored.snapshot(), original.snapshot());
+  assert.equal(restored.details().relativeVolume, 1);
+  assert.ok(restored.derivative() > 0);
+});
+
+test("volume-weighted KAMA restores canonical KAMA snapshots without losing price state", () => {
+  const canonical = new KAMAIndicator(2, 2, 10, unusedApi, 10, 1);
+  for (const [index, price] of [100, 99, 102].entries()) {
+    canonical.onTick({ eventTime: index, price, quantity: 10 });
+  }
+  const weighted = new VolumeWeightedKAMAIndicator(unusedApi, {
+    efficiencyPeriod: 2,
+    fastPeriod: 2,
+    slowPeriod: 10,
+    power: 1,
+    volumePeriod: 3,
+  });
+  weighted.restore(canonical.snapshot());
+
+  assert.equal(weighted.indicator(), canonical.indicator());
+  assert.equal(weighted.derivative(), canonical.derivative());
 });

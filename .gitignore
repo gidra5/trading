@@ -1,3 +1,7 @@
+data/*
+!data/benchmarks/
+data/benchmarks/*
+!data/benchmarks/vw-kama-window-presets.json
 data
 __pycache__
 .pytest_cache

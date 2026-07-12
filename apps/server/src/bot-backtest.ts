@@ -71,7 +71,7 @@ export async function runBotBacktestFromCandles(
   if (candles.length === 0) throw new Error("Backtest requires at least one candle.");
   const startedAt = Date.now();
   const config = options.config;
-  const botConfig = createPeakValleyBotConfig(config);
+  const botConfig = createPeakValleyBotConfig(config, candleIntervalMs(candles));
   const history = (options.warmup ?? []).map(tradingCandle);
   const api = new PaperTradingApi({
     startingQuote: config.startingQuote,
@@ -143,7 +143,7 @@ export async function runBotBacktestFromCandles(
       frames.push(traceFrame(candle.closeTime, candle.close, account, botSnapshot, equity));
       const diagnostics = strategy.getDiagnostics();
       for (const item of series) {
-        const value = diagnostics.indicators[`average.${item.windowSec}`];
+        const value = diagnostics.indicators[item.index < 0 ? "kama" : `average.${item.windowSec}`];
         if (Number.isFinite(value)) item.points.push({ time: candle.closeTime, value: value as number });
       }
     }
@@ -159,6 +159,7 @@ export async function runBotBacktestFromCandles(
     startingQuote: config.startingQuote,
     leverage: config.maxLeverage,
     friction: apiFriction(config),
+    eventMode: "close",
     maxPathCandles: options.maxChartCandles ?? 2_000,
   });
   const snapshots = [...orders.values()].map(({ order, trace }) => legacyOrder(order, trace.createdAt));
@@ -622,6 +623,14 @@ function tick(timestamp: number, price: number, quantity: number): TradingTick {
   return { timestamp, price, quantity, candle: null };
 }
 
+function candleIntervalMs(candles: readonly Candle[]): number {
+  const spans = candles.slice(0, 32)
+    .map((candle) => candle.closeTime - candle.openTime + 1)
+    .filter((span) => Number.isFinite(span) && span > 0)
+    .sort((left, right) => left - right);
+  return Math.max(1, Math.round(spans[Math.floor(spans.length / 2)] ?? 60_000));
+}
+
 function tradingCandle(candle: Candle) {
   return {
     openTime: candle.openTime,
@@ -635,13 +644,16 @@ function tradingCandle(candle: Candle) {
 }
 
 function averageSeries(config: PeakValleyBotConfig): BacktestChartSmaSeries[] {
-  return config.strategy.averagingRangesSec.map((windowSec, index) => ({
+  const averages = config.strategy.averagingRangesSec.map((windowSec, index) => ({
     index,
     windowSec,
     label: `${windowSec}s ${config.strategy.movingAverageType.toUpperCase()}`,
     color: ["#38bdf8", "#f5b84b", "#a78bfa", "#22c55e"][index % 4]!,
     points: [],
   }));
+  return config.strategy.derivativeSource === "kama"
+    ? [{ index: -1, windowSec: 0, label: "Volume KAMA", color: "#f472b6", points: [] }, ...averages]
+    : averages;
 }
 
 function legacyOrder(order: TradingOrderSnapshot, createdAt: number): TradingOrder {

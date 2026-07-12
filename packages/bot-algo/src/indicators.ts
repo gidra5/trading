@@ -379,6 +379,8 @@ export class EfficiencyRatioIndicator
   implements NumericTradingIndicator<EfficiencyRatioIndicatorSnapshot, ValueIndicatorInput>
 {
   private values: number[] = [];
+  private start = 0;
+  private noise = 0;
   private value = 0;
   private delta = 0;
 
@@ -405,9 +407,16 @@ export class EfficiencyRatioIndicator
     if (!Number.isFinite(value)) return;
 
     const previous = this.value;
+    const last = this.values.at(-1);
+    if (last !== undefined) this.noise += Math.abs(value - last);
     this.values.push(value);
-    while (this.values.length > this.windowSize + 1) {
-      this.values.shift();
+    if (this.values.length - this.start > this.windowSize + 1) {
+      this.noise -= Math.abs(this.values[this.start + 1]! - this.values[this.start]!);
+      this.start += 1;
+      if (this.start >= 4_096 && this.start * 2 >= this.values.length) {
+        this.values = this.values.slice(this.start);
+        this.start = 0;
+      }
     }
     this.value = this.calculate();
     this.delta = this.value - previous;
@@ -425,7 +434,7 @@ export class EfficiencyRatioIndicator
     return {
       version: 1,
       windowSize: this.windowSize,
-      values: this.values.slice(),
+      values: this.values.slice(this.start),
       value: this.value,
       delta: this.delta,
     };
@@ -433,24 +442,30 @@ export class EfficiencyRatioIndicator
 
   restore(snapshot: EfficiencyRatioIndicatorSnapshot | null): void {
     this.values = snapshot?.values?.slice(-(this.windowSize + 1)).filter(isFiniteNumber) ?? [];
+    this.start = 0;
+    this.noise = rollingNoise(this.values);
     this.value = this.calculate();
     this.delta = Number.isFinite(snapshot?.delta) ? (snapshot?.delta ?? 0) : 0;
   }
 
   private calculate(): number {
-    if (this.values.length < this.windowSize + 1) {
+    if (this.values.length - this.start < this.windowSize + 1) {
       return 0;
     }
 
-    const first = this.values[0] ?? 0;
+    const first = this.values[this.start] ?? 0;
     const last = this.values.at(-1) ?? 0;
     const signal = Math.abs(last - first);
-    let noise = 0;
-    for (let index = 1; index < this.values.length; index += 1) {
-      noise += Math.abs((this.values[index] ?? 0) - (this.values[index - 1] ?? 0));
-    }
-    return noise > 0 ? clampRatio(signal / noise) : 0;
+    return this.noise > 0 ? clampRatio(signal / this.noise) : 0;
   }
+}
+
+function rollingNoise(values: number[]): number {
+  let noise = 0;
+  for (let index = 1; index < values.length; index += 1) {
+    noise += Math.abs(values[index]! - values[index - 1]!);
+  }
+  return noise;
 }
 
 export interface KAMAIndicatorSnapshot {
@@ -536,6 +551,178 @@ export class KAMAIndicator implements NumericTradingIndicator<KAMAIndicatorSnaps
     const efficiencyRatio = this.efficiencyRatio.indicator();
     const smoothing = efficiencyRatio * (this.fastAlpha - this.slowAlpha) + this.slowAlpha;
     return clampRatio(Math.pow(smoothing, this.power));
+  }
+}
+
+export interface VolumeWeightedKAMAIndicatorConfig {
+  efficiencyPeriod: number;
+  fastPeriod: number;
+  slowPeriod: number;
+  power: number;
+  volumePeriod: number;
+  volumeCap: number;
+  volumePower: number;
+}
+
+export function volumeWeightedKamaWarmupSamples(
+  config: Pick<
+    VolumeWeightedKAMAIndicatorConfig,
+    "efficiencyPeriod" | "slowPeriod" | "volumePeriod"
+  >,
+  multiple = 1,
+): number {
+  return Math.ceil(Math.max(
+    config.efficiencyPeriod + 1,
+    config.slowPeriod,
+    config.volumePeriod,
+  ) * Math.max(1, multiple));
+}
+
+export type VolumeWeightedKAMAIndicatorOptions = Partial<VolumeWeightedKAMAIndicatorConfig> & {
+  warmupCount?: number;
+  warmupIntervalMs?: number;
+};
+
+export interface VolumeWeightedKAMAIndicatorValue {
+  kama: number;
+  efficiencyRatio: number;
+  relativeVolume: number;
+  effectiveEfficiencyRatio: number;
+  alpha: number;
+}
+
+export interface VolumeWeightedKAMAIndicatorSnapshot {
+  version: 1;
+  config: VolumeWeightedKAMAIndicatorConfig;
+  efficiencyRatio: EfficiencyRatioIndicatorSnapshot;
+  volumeEma: EMAIndicatorSnapshot;
+  kama: EMAIndicatorSnapshot;
+  value: VolumeWeightedKAMAIndicatorValue;
+  delta: number;
+}
+
+const DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG: VolumeWeightedKAMAIndicatorConfig = {
+  efficiencyPeriod: 20,
+  fastPeriod: 5,
+  slowPeriod: 50,
+  power: 1,
+  volumePeriod: 50,
+  volumeCap: 3,
+  volumePower: 1,
+};
+
+export class VolumeWeightedKAMAIndicator
+  implements NumericTradingIndicator<VolumeWeightedKAMAIndicatorSnapshot, PriceIndicatorInput>
+{
+  private readonly config: VolumeWeightedKAMAIndicatorConfig;
+  private readonly warmupCount: number;
+  private readonly warmupIntervalMs: number;
+  private readonly efficiencyRatio: EfficiencyRatioIndicator;
+  private readonly volumeEma: EMAIndicator;
+  private readonly kama: EMAIndicator;
+  private readonly fastAlpha: number;
+  private readonly slowAlpha: number;
+  private value = emptyVolumeWeightedKAMAValue();
+  private delta = 0;
+
+  constructor(
+    private readonly tradingApi: TradingApi,
+    options: VolumeWeightedKAMAIndicatorOptions = {},
+  ) {
+    this.config = normalizeVolumeWeightedKAMAConfig(options);
+    this.warmupCount = options.warmupCount ?? volumeWeightedKamaWarmupSamples(this.config);
+    this.warmupIntervalMs = Math.max(1, Math.round(options.warmupIntervalMs ?? 1_000));
+    this.fastAlpha = normalizeAlpha(this.config.fastPeriod);
+    this.slowAlpha = normalizeAlpha(this.config.slowPeriod);
+    this.efficiencyRatio = new EfficiencyRatioIndicator(this.config.efficiencyPeriod, tradingApi);
+    this.volumeEma = new EMAIndicator(this.config.volumePeriod);
+    this.kama = new EMAIndicator(this.slowAlpha);
+  }
+
+  async warmup(): Promise<void> {
+    const candles = await this.tradingApi.getHistory({
+      intervalMs: this.warmupIntervalMs,
+      count: this.warmupCount,
+    });
+    for (const candle of candles) this.onTick({ candle, eventTime: candle.closeTime });
+    assertWarmupValue(
+      this.efficiencyRatio.snapshot().values.length >= this.config.efficiencyPeriod + 1,
+      "volume-weighted KAMA efficiency ratio",
+    );
+    assertWarmupValue(this.kama.indicator() !== 0, "volume-weighted KAMA");
+  }
+
+  onTick(input: PriceIndicatorInput): void {
+    const price = indicatorPrice(input);
+    if (price <= 0) return;
+    this.efficiencyRatio.onTick(input);
+    const volume = indicatorVolume(input);
+    const volumeAverage = this.volumeEma.indicator();
+    const relativeVolume = volume > 0 && volumeAverage > 0
+      ? clamp(volume / volumeAverage, 0, this.config.volumeCap)
+      : 1;
+    const efficiencyRatio = this.efficiencyRatio.indicator();
+    // The prior volume EMA keeps the adjustment causal; volumePower=0 is canonical KAMA.
+    const effectiveEfficiencyRatio = clampRatio(
+      efficiencyRatio * Math.pow(relativeVolume, this.config.volumePower),
+    );
+    const smoothing = this.slowAlpha
+      + effectiveEfficiencyRatio * (this.fastAlpha - this.slowAlpha);
+    const alpha = clampRatio(Math.pow(smoothing, this.config.power));
+    this.kama.onTick({ eventTime: input.eventTime, value: price, alpha });
+    if (volume > 0) this.volumeEma.onTick({ eventTime: input.eventTime, value: volume });
+    this.delta = this.kama.derivative();
+    this.value = {
+      kama: this.kama.indicator(),
+      efficiencyRatio,
+      relativeVolume,
+      effectiveEfficiencyRatio,
+      alpha,
+    };
+  }
+
+  indicator(): number {
+    return this.value.kama;
+  }
+
+  derivative(): number {
+    return this.delta;
+  }
+
+  details(): VolumeWeightedKAMAIndicatorValue {
+    return { ...this.value };
+  }
+
+  snapshot(): VolumeWeightedKAMAIndicatorSnapshot {
+    return {
+      version: 1,
+      config: { ...this.config },
+      efficiencyRatio: this.efficiencyRatio.snapshot(),
+      volumeEma: this.volumeEma.snapshot(),
+      kama: this.kama.snapshot(),
+      value: this.details(),
+      delta: this.delta,
+    };
+  }
+
+  restore(snapshot: VolumeWeightedKAMAIndicatorSnapshot | KAMAIndicatorSnapshot | null): void {
+    this.efficiencyRatio.restore(snapshot?.efficiencyRatio ?? null);
+    const weighted = snapshot && "kama" in snapshot ? snapshot : null;
+    const canonical = snapshot && "ema" in snapshot ? snapshot : null;
+    this.volumeEma.restore(weighted?.volumeEma ?? null);
+    this.kama.restore(weighted?.kama ?? canonical?.ema ?? null);
+    this.value = weighted?.value
+      ? normalizeVolumeWeightedKAMAValue(weighted.value)
+      : {
+          kama: this.kama.indicator(),
+          efficiencyRatio: this.efficiencyRatio.indicator(),
+          relativeVolume: 1,
+          effectiveEfficiencyRatio: this.efficiencyRatio.indicator(),
+          alpha: isNormalizedAlpha(canonical?.alpha) ? canonical.alpha : 0,
+        };
+    this.delta = Number.isFinite(weighted?.delta)
+      ? (weighted?.delta ?? 0)
+      : (canonical?.ema.delta ?? 0);
   }
 }
 
@@ -1422,6 +1609,52 @@ async function warmupCandles(tradingApi: TradingApi, count: number): Promise<Can
     intervalMs: 1000,
     count,
   });
+}
+
+function normalizeVolumeWeightedKAMAConfig(
+  options: VolumeWeightedKAMAIndicatorOptions,
+): VolumeWeightedKAMAIndicatorConfig {
+  const config: VolumeWeightedKAMAIndicatorConfig = {
+    efficiencyPeriod: options.efficiencyPeriod ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.efficiencyPeriod,
+    fastPeriod: options.fastPeriod ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.fastPeriod,
+    slowPeriod: options.slowPeriod ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.slowPeriod,
+    power: options.power ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.power,
+    volumePeriod: options.volumePeriod ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.volumePeriod,
+    volumeCap: options.volumeCap ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.volumeCap,
+    volumePower: options.volumePower ?? DEFAULT_VOLUME_WEIGHTED_KAMA_CONFIG.volumePower,
+  };
+  assertMinimumWindow(config.efficiencyPeriod, 1, "volume-weighted KAMA efficiency ratio");
+  assertFiniteMinimum(config.fastPeriod, Number.EPSILON, "volume-weighted KAMA fast EMA");
+  assertFiniteMinimum(config.slowPeriod, Number.EPSILON, "volume-weighted KAMA slow EMA");
+  assertFiniteMinimum(config.power, 0.1, "volume-weighted KAMA power");
+  assertMinimumWindow(config.volumePeriod, 1, "volume-weighted KAMA volume EMA");
+  assertFiniteMinimum(config.volumeCap, 1, "volume-weighted KAMA relative volume cap");
+  assertFiniteMinimum(config.volumePower, 0, "volume-weighted KAMA volume power");
+  return config;
+}
+
+function emptyVolumeWeightedKAMAValue(): VolumeWeightedKAMAIndicatorValue {
+  return {
+    kama: 0,
+    efficiencyRatio: 0,
+    relativeVolume: 1,
+    effectiveEfficiencyRatio: 0,
+    alpha: 0,
+  };
+}
+
+function normalizeVolumeWeightedKAMAValue(
+  value: VolumeWeightedKAMAIndicatorValue | undefined,
+): VolumeWeightedKAMAIndicatorValue {
+  return value
+    ? {
+        kama: finiteNumber(value.kama),
+        efficiencyRatio: clampRatio(value.efficiencyRatio),
+        relativeVolume: Math.max(0, finiteNumber(value.relativeVolume)),
+        effectiveEfficiencyRatio: clampRatio(value.effectiveEfficiencyRatio),
+        alpha: isNormalizedAlpha(value.alpha) ? value.alpha : 0,
+      }
+    : emptyVolumeWeightedKAMAValue();
 }
 
 function normalizeHighVolumeChopFastAdaptiveEMAConfig(

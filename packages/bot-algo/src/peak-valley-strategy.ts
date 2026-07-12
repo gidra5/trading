@@ -1,14 +1,15 @@
 import type { TradingBotConfig } from "./bot.js";
 import {
   EMAIndicator,
-  KAMAIndicator,
   LookbackIndicator,
   SMAIndicator,
+  VolumeWeightedKAMAIndicator,
+  volumeWeightedKamaWarmupSamples,
   type EMAIndicatorSnapshot,
-  type KAMAIndicatorSnapshot,
   type LookbackIndicatorSnapshot,
   type PriceIndicatorInput,
   type SMAIndicatorSnapshot,
+  type VolumeWeightedKAMAIndicatorSnapshot,
 } from "./indicators.js";
 import type {
   PositionSide,
@@ -18,18 +19,25 @@ import type {
   TradingStrategyEntrySignal,
   TradingStrategyExitSignal,
 } from "./strategy.js";
+import { signalBeyondFriction } from "./signal-memory.js";
+import { KamaRateNoise, type KamaRateNoiseSnapshot } from "./kama-rate-noise.js";
 import type { TradingApi, TradingCandle, TradingTick } from "./trading-api.js";
 
 const SAMPLE_INTERVAL_MS = 60_000;
 const PRICE_SCALE = 100_000;
+const KAMA_WARMUP_MULTIPLE = 3;
+// Validation-selected multi-scale candidate k0021; see docs/vw-kama-oracle-signal-search.md.
+const KAMA_ORACLE_RATE_THRESHOLD = 67.56654 / 36_000_000;
 
 export type PeakValleyAverageType = "sma" | "ema";
 export type PeakValleyDerivativeSource = "price" | "kama";
-export type PeakValleyDerivativeClampMode = "deadband" | "hysteresis";
+export type PeakValleyDerivativeClampMode = "deadband" | "hysteresis" | "hold";
 export type PeakValleySignalTiming = "start" | "end";
 export type PeakValleySigmaMode = "static" | "trend" | "sigmoid-trend";
+export type PeakValleyKamaThresholdMode = "static" | "adaptive";
 
 export interface PeakValleyStrategyConfig {
+  sampleIntervalMs: number;
   averagingRangesSec: number[];
   movingAverageType: PeakValleyAverageType;
   relativeRateEnabled: boolean;
@@ -40,6 +48,15 @@ export interface PeakValleyStrategyConfig {
   kamaFastLen: number;
   kamaSlowLen: number;
   kamaPower: number;
+  kamaVolumeLen: number;
+  kamaVolumeCap: number;
+  kamaVolumePower: number;
+  kamaRateThresholdLow: number;
+  kamaRateThresholdHigh: number;
+  kamaThresholdMode: PeakValleyKamaThresholdMode;
+  kamaThresholdLookbackSec: number;
+  kamaThresholdNoiseMultiplier: number;
+  kamaSignalFriction: number;
   rateThresholdsLow: number[];
   rateThresholdsHigh: number[];
   buyDataIndex: number;
@@ -69,26 +86,36 @@ export interface PeakValleyStrategyConfig {
 }
 
 export const defaultPeakValleyStrategyConfig: PeakValleyStrategyConfig = {
+  sampleIntervalMs: SAMPLE_INTERVAL_MS,
   averagingRangesSec: [1, 60, 600, 1_800, 3_600, 14_400, 43_200],
   movingAverageType: "sma",
   relativeRateEnabled: true,
-  derivativeSource: "price",
+  derivativeSource: "kama",
   derivativeClampMode: "deadband",
   derivativeClampInnerThresholdRatio: 0,
-  kamaErLen: 20,
-  kamaFastLen: 5,
-  kamaSlowLen: 50,
-  kamaPower: 1,
+  kamaErLen: 14,
+  kamaFastLen: 28,
+  kamaSlowLen: 153,
+  kamaPower: 0.49045,
+  kamaVolumeLen: 130,
+  kamaVolumeCap: 2.65003,
+  kamaVolumePower: 0,
+  kamaRateThresholdLow: KAMA_ORACLE_RATE_THRESHOLD,
+  kamaRateThresholdHigh: KAMA_ORACLE_RATE_THRESHOLD,
+  kamaThresholdMode: "static",
+  kamaThresholdLookbackSec: 3_600,
+  kamaThresholdNoiseMultiplier: 0,
+  kamaSignalFriction: 0.00175,
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
   sellDataIndex: 1,
-  buyConfirmationOffsets: [1, 2],
-  sellConfirmationOffsets: [1, 2],
-  buyExitConfirmationOffsets: [1, 2],
-  sellExitConfirmationOffsets: [1, 2],
-  buyEntrySignalTiming: "start",
-  sellEntrySignalTiming: "start",
+  buyConfirmationOffsets: [],
+  sellConfirmationOffsets: [],
+  buyExitConfirmationOffsets: [],
+  sellExitConfirmationOffsets: [],
+  buyEntrySignalTiming: "end",
+  sellEntrySignalTiming: "end",
   buyExitSignalTiming: "start",
   sellExitSignalTiming: "start",
   saturationSec: 3_600,
@@ -118,6 +145,7 @@ export function createPeakValleyStrategyConfig(
     ]),
   ) as unknown as PeakValleyStrategyConfig;
   const count = Math.max(1, config.averagingRangesSec.length);
+  config.sampleIntervalMs = positiveInt(config.sampleIntervalMs);
   config.averagingRangesSec = pad(config.averagingRangesSec, count, 1).map(positiveInt);
   config.rateThresholdsLow = normalizeRates(config.rateThresholdsLow, count, config.relativeRateEnabled);
   config.rateThresholdsHigh = normalizeRates(config.rateThresholdsHigh, count, config.relativeRateEnabled);
@@ -127,11 +155,30 @@ export function createPeakValleyStrategyConfig(
   config.sellConfirmationOffsets = offsets(config.sellConfirmationOffsets);
   config.buyExitConfirmationOffsets = offsets(config.buyExitConfirmationOffsets);
   config.sellExitConfirmationOffsets = offsets(config.sellExitConfirmationOffsets);
+  config.derivativeClampMode = config.derivativeClampMode === "hysteresis"
+    ? "hysteresis"
+    : config.derivativeClampMode === "hold" ? "hold" : "deadband";
   config.derivativeClampInnerThresholdRatio = clamp01(config.derivativeClampInnerThresholdRatio);
   config.kamaErLen = positiveInt(config.kamaErLen);
   config.kamaFastLen = positiveInt(config.kamaFastLen);
   config.kamaSlowLen = positiveInt(config.kamaSlowLen);
   config.kamaPower = Math.max(0.1, finite(config.kamaPower, 1));
+  config.kamaVolumeLen = positiveInt(config.kamaVolumeLen);
+  config.kamaVolumeCap = Math.max(1, finite(config.kamaVolumeCap, 1));
+  config.kamaVolumePower = Math.max(0, finite(config.kamaVolumePower, 0));
+  config.kamaRateThresholdLow = normalizeRates(
+    [config.kamaRateThresholdLow],
+    1,
+    config.relativeRateEnabled,
+  )[0]!;
+  config.kamaRateThresholdHigh = Math.max(
+    config.kamaRateThresholdLow,
+    normalizeRates([config.kamaRateThresholdHigh], 1, config.relativeRateEnabled)[0]!,
+  );
+  config.kamaThresholdMode = config.kamaThresholdMode === "adaptive" ? "adaptive" : "static";
+  config.kamaThresholdLookbackSec = positive(config.kamaThresholdLookbackSec);
+  config.kamaThresholdNoiseMultiplier = Math.max(0, finite(config.kamaThresholdNoiseMultiplier, 0));
+  config.kamaSignalFriction = Math.max(0, finite(config.kamaSignalFriction, 0));
   config.saturationSec = Math.max(0, finite(config.saturationSec, 0));
   config.buySpendRate = Math.max(0, finite(config.buySpendRate, 0));
   config.sellAmountRate = Math.max(0, finite(config.sellAmountRate, 0));
@@ -142,6 +189,45 @@ export function createPeakValleyStrategyConfig(
   config.sigmoidSigmaLow = positive(config.sigmoidSigmaLow);
   config.sigmoidSigmaHigh = Math.max(config.sigmoidSigmaLow, positive(config.sigmoidSigmaHigh));
   return config;
+}
+
+export function rescalePeakValleyStrategyConfig(
+  config: PeakValleyStrategyConfig,
+  sampleIntervalMs: number,
+): PeakValleyStrategyConfig {
+  const target = positiveInt(sampleIntervalMs);
+  const scale = (samples: number) => Math.max(
+    1,
+    Math.round(samples * config.sampleIntervalMs / target),
+  );
+  return createPeakValleyStrategyConfig({
+    ...config,
+    sampleIntervalMs: target,
+    kamaErLen: scale(config.kamaErLen),
+    kamaFastLen: scale(config.kamaFastLen),
+    kamaSlowLen: scale(config.kamaSlowLen),
+    kamaVolumeLen: scale(config.kamaVolumeLen),
+  });
+}
+
+export function peakValleyWarmupSamples(config: PeakValleyStrategyConfig): number {
+  const averages = Math.max(...config.averagingRangesSec.map((window) =>
+    samplesForWindow(window, config.sampleIntervalMs)));
+  return config.derivativeSource === "kama"
+    ? Math.max(averages, peakValleyKamaWarmupSamples(config))
+    : averages;
+}
+
+export function peakValleyKamaWarmupSamples(config: PeakValleyStrategyConfig): number {
+  const kama = volumeWeightedKamaWarmupSamples({
+    efficiencyPeriod: config.kamaErLen,
+    slowPeriod: config.kamaSlowLen,
+    volumePeriod: config.kamaVolumeLen,
+  }, KAMA_WARMUP_MULTIPLE);
+  const noise = config.kamaThresholdMode === "adaptive"
+    ? samplesForWindow(config.kamaThresholdLookbackSec, config.sampleIntervalMs) * KAMA_WARMUP_MULTIPLE
+    : 0;
+  return Math.max(kama, noise);
 }
 
 interface PeakValleyExecutionConfig {
@@ -160,6 +246,8 @@ export interface PeakValleyBotConfigSource {
   minOrderQuote: number;
   maxPositionQuote: number;
   cooldownMs: number;
+  feeBps: number;
+  positionRisk: { marketSlippageBps: number };
   internalBorrowAccounting: "active" | "inactive";
   borrowerProfitShareToLender: number;
   legacyValleyPeak: Partial<PeakValleyStrategyConfig & PeakValleyExecutionConfig>;
@@ -167,9 +255,19 @@ export interface PeakValleyBotConfigSource {
 
 export type PeakValleyBotConfig = TradingBotConfig<PeakValleyStrategyConfig>;
 
-export function createPeakValleyBotConfig(config: PeakValleyBotConfigSource): PeakValleyBotConfig {
+export function createPeakValleyBotConfig(
+  config: PeakValleyBotConfigSource,
+  sampleIntervalMs = SAMPLE_INTERVAL_MS,
+): PeakValleyBotConfig {
   const source = config.legacyValleyPeak;
-  const strategy = createPeakValleyStrategyConfig(source);
+  const strategy = rescalePeakValleyStrategyConfig(
+    createPeakValleyStrategyConfig({ ...source, sampleIntervalMs: SAMPLE_INTERVAL_MS }),
+    sampleIntervalMs,
+  );
+  strategy.kamaSignalFriction = Math.max(
+    0,
+    finite(config.feeBps, 0) + finite(config.positionRisk.marketSlippageBps, 0),
+  ) / 10_000;
   const minTrade = Math.max(config.minOrderQuote, source.minTradeQuote ?? 0);
   const maxTrade = Math.max(minTrade, Math.min(config.maxPositionQuote, source.maxTradeQuote ?? Infinity));
   const distribution = source.exitGridSizeDistribution === "linear" ? "linear" : "geometric";
@@ -213,13 +311,16 @@ type AverageState = ({ type: "sma"; indicator: SMAIndicator } | { type: "ema"; i
 };
 
 export interface PeakValleyStrategySnapshot {
-  version: 2;
+  version: 3;
   averages: AverageSnapshot[];
-  kama: KAMAIndicatorSnapshot | null;
+  kama: VolumeWeightedKAMAIndicatorSnapshot | null;
   kamaRate: number;
   kamaClamped: LookbackIndicatorSnapshot;
+  kamaRateNoise?: KamaRateNoiseSnapshot;
   lastTick: TradingTick | null;
   startedAt: number;
+  sampleCount: number;
+  lastKamaSignalPrice: number | null;
   ready: boolean;
   lastSignal: StrategyDiagnostics["lastSignal"];
 }
@@ -257,6 +358,13 @@ export interface PeakValleyStrategyDiagnostics extends StrategyDiagnostics {
     rawRate: number;
     clampedRate: number;
     previousClampedRate: number;
+    efficiencyRatio: number;
+    relativeVolume: number;
+    effectiveEfficiencyRatio: number;
+    alpha: number;
+    threshold: number;
+    rateNoise: number;
+    lastSignalPrice: number | null;
   } | null;
   sizing: {
     buy: { size: number; sigma: number };
@@ -270,11 +378,14 @@ export class PeakValleyStrategy
   private config: PeakValleyStrategyConfig;
   private readonly historyApi: TradingApi;
   private averages: AverageState[] = [];
-  private kama!: KAMAIndicator;
+  private kama!: VolumeWeightedKAMAIndicator;
   private kamaRate = 0;
+  private kamaRateNoise = new KamaRateNoise(1);
   private kamaClamped = new LookbackIndicator(1);
+  private lastKamaSignalPrice: number | null = null;
   private lastTick: TradingTick | null = null;
   private startedAt = 0;
+  private sampleCount = 0;
   private ready = false;
   private diagnostics: PeakValleyStrategyDiagnostics;
 
@@ -287,24 +398,35 @@ export class PeakValleyStrategy
   }
 
   async warmup(): Promise<void> {
-    const count = Math.max(
-      ...this.config.averagingRangesSec.map(samplesForWindow),
-      this.config.kamaErLen + 1,
-      this.config.kamaSlowLen,
+    const count = this.requiredSamples();
+    const candles = continuousSuffix(
+      await this.options.getHistory({ intervalMs: this.config.sampleIntervalMs, count }),
+      this.config.sampleIntervalMs,
     );
-    const candles = await this.options.getHistory({ intervalMs: SAMPLE_INTERVAL_MS, count });
-    for (const candle of candles) this.updateIndicators(candleTick(candle));
+    const kamaStart = Math.max(0, candles.length - this.kamaRequiredSamples());
+    for (let index = 0; index < candles.length; index += 1) {
+      this.updateIndicators(candleTick(candles[index]!), index >= kamaStart);
+    }
     const span = candles.length > 1 ? (candles.at(-1)!.closeTime - candles[0].openTime) / 1_000 : 0;
-    this.ready = span >= this.config.saturationSec || candles.length >= count;
+    this.ready = this.sampleCount >= count && span >= this.config.saturationSec;
     this.retireTransition();
     this.diagnostics = this.buildDiagnostics();
   }
 
   async onTick(tick: TradingTick): Promise<void> {
     if (!Number.isFinite(tick.price) || tick.price <= 0) return;
-    if (this.lastTick && tick.candle === null && tick.timestamp - this.lastTick.timestamp < SAMPLE_INTERVAL_MS) {
+    if (tick.candle === null) {
       this.retireTransition();
       return;
+    }
+    if (this.lastTick && tick.timestamp <= this.lastTick.timestamp) return;
+    if (this.lastTick && tick.timestamp - this.lastTick.timestamp > this.config.sampleIntervalMs) {
+      await this.updateConfig(this.config);
+      if (this.lastTick?.timestamp === tick.timestamp) return;
+      if (
+        this.lastTick &&
+        tick.timestamp - this.lastTick.timestamp !== this.config.sampleIntervalMs
+      ) this.resetIndicators();
     }
     this.updateIndicators(tick);
     this.diagnostics = this.buildDiagnostics();
@@ -320,9 +442,9 @@ export class PeakValleyStrategy
         ? entry("short", this.size("sell"), this.lastTick.price)
         : null;
     this.recordDecision("entry", signal, valley ? "valley" : peak ? "peak" : null, [
-      gate("long.entry", valley, this.primaryRate(this.config.buyDataIndex), this.config.rateThresholdsLow[this.config.buyDataIndex]),
+      gate("long.entry", valley, this.primaryRate(this.config.buyDataIndex), this.primaryThreshold(this.config.buyDataIndex)),
       ...this.decisionGates("long.entry", "valley", this.config.buyDataIndex, this.config.buyConfirmationOffsets, this.config.buyEntrySignalTiming),
-      gate("short.entry", peak, this.primaryRate(this.config.sellDataIndex), this.config.rateThresholdsLow[this.config.sellDataIndex]),
+      gate("short.entry", peak, this.primaryRate(this.config.sellDataIndex), this.primaryThreshold(this.config.sellDataIndex)),
       ...this.decisionGates("short.entry", "peak", this.config.sellDataIndex, this.config.sellConfirmationOffsets, this.config.sellEntrySignalTiming),
     ]);
     return signal;
@@ -338,9 +460,9 @@ export class PeakValleyStrategy
         ? exit("long", this.size("sell"), this.lastTick.price)
         : null;
     this.recordDecision("exit", signal, valley ? "valley" : peak ? "peak" : null, [
-      gate("short.exit", valley, this.primaryRate(this.config.buyDataIndex), this.config.rateThresholdsLow[this.config.buyDataIndex]),
+      gate("short.exit", valley, this.primaryRate(this.config.buyDataIndex), this.primaryThreshold(this.config.buyDataIndex)),
       ...this.decisionGates("short.exit", "valley", this.config.buyDataIndex, this.config.buyExitConfirmationOffsets, this.config.buyExitSignalTiming),
-      gate("long.exit", peak, this.primaryRate(this.config.sellDataIndex), this.config.rateThresholdsLow[this.config.sellDataIndex]),
+      gate("long.exit", peak, this.primaryRate(this.config.sellDataIndex), this.primaryThreshold(this.config.sellDataIndex)),
       ...this.decisionGates("long.exit", "peak", this.config.sellDataIndex, this.config.sellExitConfirmationOffsets, this.config.sellExitSignalTiming),
     ]);
     return signal;
@@ -348,20 +470,23 @@ export class PeakValleyStrategy
 
   async snapshot(): Promise<PeakValleyStrategySnapshot> {
     return {
-      version: 2,
+      version: 3,
       averages: this.averages.map(snapshotAverage),
       kama: this.config.derivativeSource === "kama" ? this.kama.snapshot() : null,
       kamaRate: this.kamaRate,
       kamaClamped: this.kamaClamped.snapshot(),
+      kamaRateNoise: this.kamaRateNoise.snapshot(),
       lastTick: structuredClone(this.lastTick),
       startedAt: this.startedAt,
+      sampleCount: this.sampleCount,
+      lastKamaSignalPrice: this.lastKamaSignalPrice,
       ready: this.ready,
       lastSignal: structuredClone(this.diagnostics.lastSignal),
     };
   }
 
   async restore(snapshot: PeakValleyStrategySnapshot): Promise<void> {
-    if (snapshot.version !== 2) throw new Error(`Unsupported peak/valley snapshot version: ${snapshot.version}`);
+    if (snapshot.version !== 3) throw new Error(`Unsupported peak/valley snapshot version: ${snapshot.version}`);
     for (let position = 0; position < this.averages.length; position += 1) {
       const state = this.averages[position];
       const saved = snapshot.averages[position];
@@ -372,18 +497,18 @@ export class PeakValleyStrategy
     if (snapshot.kama) this.kama.restore(snapshot.kama);
     this.kamaRate = finite(snapshot.kamaRate, 0);
     this.kamaClamped.restore(snapshot.kamaClamped);
+    this.kamaRateNoise.restore(snapshot.kamaRateNoise);
     this.lastTick = structuredClone(snapshot.lastTick);
     this.startedAt = finite(snapshot.startedAt, this.lastTick?.timestamp ?? 0);
+    this.sampleCount = Math.max(0, Math.round(finite(snapshot.sampleCount, 0)));
+    this.lastKamaSignalPrice = nullablePositive(snapshot.lastKamaSignalPrice);
     this.ready = snapshot.ready;
     this.diagnostics = { ...this.buildDiagnostics(), lastSignal: structuredClone(snapshot.lastSignal) };
   }
 
   async updateConfig(config: PeakValleyStrategyConfig): Promise<void> {
     this.config = createPeakValleyStrategyConfig(config);
-    this.rebuildIndicators();
-    this.lastTick = null;
-    this.startedAt = 0;
-    this.ready = false;
+    this.resetIndicators();
     await this.warmup();
   }
 
@@ -393,27 +518,47 @@ export class PeakValleyStrategy
 
   private rebuildIndicators(): void {
     this.averages = this.config.averagingRangesSec.map((windowSec) => {
-      const samples = samplesForWindow(windowSec);
+      const samples = samplesForWindow(windowSec, this.config.sampleIntervalMs);
       return this.config.movingAverageType === "ema"
         ? { type: "ema", indicator: new EMAIndicator(samples), rate: 0, clamped: new LookbackIndicator(1) }
         : { type: "sma", indicator: new SMAIndicator(samples, this.historyApi), rate: 0, clamped: new LookbackIndicator(1) };
     });
-    this.kama = new KAMAIndicator(
-      this.config.kamaErLen,
-      this.config.kamaFastLen,
-      this.config.kamaSlowLen,
-      this.historyApi,
-      Math.max(this.config.kamaSlowLen, this.config.kamaErLen + 1),
-      this.config.kamaPower,
-    );
+    this.kama = new VolumeWeightedKAMAIndicator(this.historyApi, {
+      efficiencyPeriod: this.config.kamaErLen,
+      fastPeriod: this.config.kamaFastLen,
+      slowPeriod: this.config.kamaSlowLen,
+      power: this.config.kamaPower,
+      volumePeriod: this.config.kamaVolumeLen,
+      volumeCap: this.config.kamaVolumeCap,
+      volumePower: this.config.kamaVolumePower,
+      warmupCount: this.kamaRequiredSamples(),
+      warmupIntervalMs: this.config.sampleIntervalMs,
+    });
     this.kamaClamped = new LookbackIndicator(1);
+    this.kamaRateNoise = new KamaRateNoise(samplesForWindow(
+      this.config.kamaThresholdLookbackSec,
+      this.config.sampleIntervalMs,
+    ));
+    this.lastKamaSignalPrice = null;
   }
 
-  private updateIndicators(tick: TradingTick): void {
-    const seconds = Math.max(1, (tick.timestamp - (this.lastTick?.timestamp ?? tick.timestamp - SAMPLE_INTERVAL_MS)) / 1_000);
+  private resetIndicators(): void {
+    this.rebuildIndicators();
+    this.lastTick = null;
+    this.startedAt = 0;
+    this.sampleCount = 0;
+    this.ready = false;
+    this.diagnostics = emptyDiagnostics(this.config);
+  }
+
+  private updateIndicators(tick: TradingTick, updateKama = true): void {
+    const seconds = Math.max(1, (
+      tick.timestamp - (this.lastTick?.timestamp ?? tick.timestamp - this.config.sampleIntervalMs)
+    ) / 1_000);
     const input = indicatorInput(tick);
     this.startedAt ||= tick.timestamp;
     this.lastTick = tick;
+    this.sampleCount += 1;
     for (let position = 0; position < this.averages.length; position += 1) {
       const state = this.averages[position];
       state.indicator.onTick(input);
@@ -423,15 +568,35 @@ export class PeakValleyStrategy
         value: clampRate(state.rate, state.clamped.indicator(), this.config, position),
       });
     }
-    if (this.config.derivativeSource === "kama") {
+    if (this.config.derivativeSource === "kama" && updateKama) {
       this.kama.onTick(input);
       this.kamaRate = rate(this.kama.derivative(), this.kama.indicator(), seconds, this.config.relativeRateEnabled);
+      const rateNoise = this.kamaRateNoise.update(this.kamaRate);
+      const adaptiveThreshold = this.config.kamaThresholdMode === "adaptive"
+        ? rateNoise * this.config.kamaThresholdNoiseMultiplier
+        : 0;
+      const previous = this.kamaClamped.indicator();
+      const candidate = clampThreshold(
+        this.kamaRate,
+        previous,
+        this.config,
+        this.config.kamaRateThresholdLow + adaptiveThreshold,
+        this.config.kamaRateThresholdHigh + adaptiveThreshold,
+      );
+      const transition = Math.sign(candidate) !== Math.sign(previous);
+      const accepted = !transition || signalBeyondFriction(
+        tick.price,
+        this.lastKamaSignalPrice,
+        this.config.kamaSignalFriction,
+      );
       this.kamaClamped.onTick({
         eventTime: tick.timestamp,
-        value: clampRate(this.kamaRate, this.kamaClamped.indicator(), this.config, this.config.buyDataIndex),
+        value: accepted ? candidate : previous,
       });
+      if (transition && accepted) this.lastKamaSignalPrice = tick.price;
     }
-    this.ready ||= tick.timestamp - this.startedAt >= this.config.saturationSec * 1_000;
+    this.ready ||= this.sampleCount >= this.requiredSamples()
+      && tick.timestamp - this.startedAt >= this.config.saturationSec * 1_000;
   }
 
   private retireTransition(): void {
@@ -567,6 +732,13 @@ export class PeakValleyStrategy
             rawRate: this.kamaRate,
             clampedRate: this.kamaClamped.indicator(),
             previousClampedRate: this.kamaClamped.previous(),
+            efficiencyRatio: this.kama.details().efficiencyRatio,
+            relativeVolume: this.kama.details().relativeVolume,
+            effectiveEfficiencyRatio: this.kama.details().effectiveEfficiencyRatio,
+            alpha: this.kama.details().alpha,
+            threshold: this.kamaThreshold(),
+            rateNoise: this.kamaRateNoise.indicator(),
+            lastSignalPrice: this.lastKamaSignalPrice,
           }
         : null,
       sizing: {
@@ -580,6 +752,26 @@ export class PeakValleyStrategy
     return this.config.derivativeSource === "kama"
       ? this.kamaClamped.indicator()
       : this.averages[position]?.clamped.indicator() ?? 0;
+  }
+
+  private primaryThreshold(position: number): number {
+    return this.config.derivativeSource === "kama"
+      ? this.kamaThreshold()
+      : this.config.rateThresholdsLow[position] ?? 0;
+  }
+
+  private kamaThreshold(): number {
+    return this.config.kamaRateThresholdLow + (this.config.kamaThresholdMode === "adaptive"
+      ? this.kamaRateNoise.indicator() * this.config.kamaThresholdNoiseMultiplier
+      : 0);
+  }
+
+  private requiredSamples(): number {
+    return peakValleyWarmupSamples(this.config);
+  }
+
+  private kamaRequiredSamples(): number {
+    return peakValleyKamaWarmupSamples(this.config);
   }
 }
 
@@ -606,6 +798,16 @@ function candleTick(candle: TradingCandle): TradingTick {
   return { timestamp: candle.closeTime, price: candle.close, quantity: candle.volume, candle };
 }
 
+function continuousSuffix(candles: TradingCandle[], intervalMs: number): TradingCandle[] {
+  const ordered = [...new Map(candles.map((candle) => [candle.openTime, candle])).values()]
+    .sort((left, right) => left.openTime - right.openTime);
+  let start = ordered.length > 0 ? ordered.length - 1 : 0;
+  while (start > 0 && ordered[start]!.openTime - ordered[start - 1]!.openTime === intervalMs) {
+    start -= 1;
+  }
+  return ordered.slice(start);
+}
+
 function entry(side: PositionSide, size: number, price: number | null): TradingStrategyEntrySignal | null {
   return size > 0 ? { side, size, leverage: 999, price, confidence: null } : null;
 }
@@ -622,6 +824,19 @@ function extremum(shape: "valley" | "peak", timing: PeakValleySignalTiming, prev
 function clampRate(value: number, previous: number, config: PeakValleyStrategyConfig, position: number): number {
   const low = config.rateThresholdsLow[position] ?? 0;
   const high = config.rateThresholdsHigh[position] ?? low;
+  return clampThreshold(value, previous, config, low, high);
+}
+
+function clampThreshold(
+  value: number,
+  previous: number,
+  config: PeakValleyStrategyConfig,
+  low: number,
+  high: number,
+): number {
+  if (config.derivativeClampMode === "hold") {
+    return value > high || value < -low ? value : previous;
+  }
   const release = low * config.derivativeClampInnerThresholdRatio;
   if (
     config.derivativeClampMode === "hysteresis" &&
@@ -630,7 +845,7 @@ function clampRate(value: number, previous: number, config: PeakValleyStrategyCo
     Math.abs(value) >= release
   ) return value;
   const threshold = config.derivativeClampMode === "hysteresis" && previous === 0 ? high : low;
-  return Math.abs(value) >= threshold ? value : 0;
+  return Math.abs(value) > threshold ? value : 0;
 }
 
 function rate(delta: number, value: number, seconds: number, relative: boolean): number {
@@ -652,8 +867,8 @@ function gate(code: string, passed: boolean, value: number, threshold: number) {
   return { code, passed, value, threshold };
 }
 
-function samplesForWindow(seconds: number): number {
-  return Math.max(1, Math.ceil(seconds * 1_000 / SAMPLE_INTERVAL_MS));
+function samplesForWindow(seconds: number, intervalMs: number): number {
+  return Math.max(1, Math.ceil(seconds * 1_000 / intervalMs));
 }
 
 function closestWindow(windows: number[], target: number): number {
@@ -692,6 +907,10 @@ function positive(value: number): number {
 
 function finite(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) ? value as number : fallback;
+}
+
+function nullablePositive(value: number | null): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function clamp01(value: number): number {

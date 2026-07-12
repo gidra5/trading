@@ -122,6 +122,7 @@ export interface BacktestExtremumTrace {
 }
 
 export type BacktestOracleState = "flat" | "long" | "short";
+export type BacktestOracleEventMode = "ohlc" | "close";
 
 export interface BacktestOraclePoint {
   time: number;
@@ -133,6 +134,7 @@ export interface BacktestOraclePoint {
 
 export interface BacktestOraclePath {
   mode: "fixed-notional";
+  eventMode: BacktestOracleEventMode;
   leverage: number;
   friction: number;
   points: BacktestOraclePoint[];

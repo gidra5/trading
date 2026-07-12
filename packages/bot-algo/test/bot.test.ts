@@ -118,6 +118,16 @@ test("a rejected unfilled entry removes its position", async () => {
   assert.equal((await bot.snapshot()).positions.length, 0);
 });
 
+test("bot restore can preserve positions while rewarming incompatible strategy state", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeStrategy();
+  const bot = new GridTradingBot({ api, strategy, config: config() });
+  const snapshot = await bot.snapshot();
+  await bot.restore(snapshot, { restoreStrategy: false });
+  assert.equal(strategy.restores, 0);
+  assert.equal(strategy.updates, 1);
+});
+
 test("entry sizing uses provider capacity and effective leverage", async () => {
   const api = new FakeApi();
   api.capacity = { quote: 200, leverage: 2 };
@@ -300,6 +310,8 @@ class FakeApi implements TradingApi {
 class FakeStrategy implements TradingStrategy<unknown, StrategySnapshot, StrategyDiagnostics> {
   entry: TradingStrategyEntrySignal | null = null;
   exit: TradingStrategyExitSignal | null = null;
+  restores = 0;
+  updates = 0;
 
   async warmup() {}
   async onTick() {}
@@ -316,8 +328,8 @@ class FakeStrategy implements TradingStrategy<unknown, StrategySnapshot, Strateg
   async snapshot() {
     return { version: 1 };
   }
-  async restore() {}
-  async updateConfig() {}
+  async restore() { this.restores += 1; }
+  async updateConfig() { this.updates += 1; }
   getDiagnostics() {
     return { indicators: {}, gates: [], blockers: [], lastSignal: null };
   }

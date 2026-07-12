@@ -14,6 +14,8 @@
     "typecheck": "npm run typecheck -w @trading/bot-algo && npm run typecheck -w @trading/server && npm run typecheck -w @trading/web",
     "benchmark:strategies": "tsx scripts/benchmark-strategies.ts",
     "benchmark:sigmoid-sigma": "tsx scripts/benchmark-sigmoid-sigma-fit.ts",
+    "search:kama": "tsx scripts/search-volume-weighted-kama.ts",
+    "fetch:candles": "tsx scripts/fetch-binance-spot-candles.ts",
     "verify:risk": "tsx scripts/verify-bot-risk-paths.ts",
     "backtest:pathologies": "tsx scripts/collect-pathological-backtests.ts",
     "experiment:loop": "tsx scripts/experiment-agent-loop.ts",

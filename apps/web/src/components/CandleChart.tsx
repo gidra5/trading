@@ -17,7 +17,9 @@ interface CandleChartProps {
   smaSeries?: BacktestChartSmaSeries[];
   annotations?: BacktestChartAnnotation[];
   maxCandles?: number;
+  minInteractiveCandles?: number;
   interactive?: boolean;
+  timeNavigation?: boolean;
   emptyLabel?: string;
   selectedTime?: number;
   viewport?: CandleChartViewport;
@@ -25,6 +27,7 @@ interface CandleChartProps {
   trace?: BacktestTrace;
   overlays?: Partial<CandleChartOverlayVisibility>;
   highlightedPositionId?: string;
+  highlightedAnnotation?: BacktestChartAnnotation;
   onSelectionChange?: (selection: CandleChartSelection | undefined) => void;
   onExtremumHoverChange?: (extremum: BacktestExtremumTrace | undefined) => void;
   onOracleHoverChange?: (point: BacktestOraclePoint | undefined) => void;
@@ -59,6 +62,7 @@ export interface CandleChartSelection {
 const MIN_INTERACTIVE_CANDLES = 12;
 const WHEEL_ZOOM_FACTOR = 0.18;
 const MAX_BACKGROUND_ANNOTATION_MARKERS = 360;
+const CANDIDATE_SIGNAL_COLOR = "#a78bfa";
 
 export function CandleChart(props: CandleChartProps) {
   let canvas!: HTMLCanvasElement;
@@ -69,6 +73,7 @@ export function CandleChart(props: CandleChartProps) {
         pointerId: number;
         startX: number;
         viewport: CandleChartViewport;
+        timeRange?: { start: number; end: number };
       }
     | undefined;
   const [viewport, setViewport] = createSignal<CandleChartViewport>();
@@ -219,7 +224,15 @@ export function CandleChart(props: CandleChartProps) {
     }
 
     drawAnnotationMarkers(ctx, annotations, selectedCandle, plot, priceToY, timeToX);
-    drawOracleTransitions(ctx, oracle, hoveredOracle(), plot, priceToY, timeToX);
+    drawOracleTransitions(
+      ctx,
+      oracle,
+      hoveredOracle(),
+      props.highlightedAnnotation,
+      plot,
+      priceToY,
+      timeToX,
+    );
     if (overlay("positions")) {
       drawHighlightedPosition(ctx, props.trace, props.highlightedPositionId, plot, priceToY, timeToX);
     }
@@ -238,12 +251,20 @@ export function CandleChart(props: CandleChartProps) {
     const last = candles.at(-1)?.closeTime ?? 0;
     const seriesKey = `${candles.length}:${first}:${last}:${props.maxCandles ?? ""}:${
       props.interactive ? 1 : 0
-    }`;
+    }:${props.minInteractiveCandles ?? ""}`;
     if (seriesKey !== lastSeriesKey) {
       lastSeriesKey = seriesKey;
-      const nextViewport = defaultViewport(candles.length);
+      if (dragState && canvas?.hasPointerCapture(dragState.pointerId)) {
+        canvas.releasePointerCapture(dragState.pointerId);
+      }
+      dragState = undefined;
+      setIsDragging(false);
+      const controlled = props.viewport;
+      const nextViewport = controlled
+        ? normalizeViewport(controlled, candles.length, minimumInteractiveCandles())
+        : defaultViewport(candles.length);
       setViewport(nextViewport);
-      props.onViewportChange?.(nextViewport);
+      if (!controlled) props.onViewportChange?.(nextViewport);
       setInternalSelectedTime(undefined);
     }
   });
@@ -253,6 +274,7 @@ export function CandleChart(props: CandleChartProps) {
     const orders = props.orders;
     const smaSeries = props.smaSeries;
     const annotations = props.annotations;
+    const highlightedAnnotation = props.highlightedAnnotation;
     const trace = props.trace;
     const first = candles[0]?.openTime;
     const last = candles.at(-1)?.closeTime;
@@ -263,6 +285,8 @@ export function CandleChart(props: CandleChartProps) {
     props.lastPrice;
     smaSeries?.length;
     annotations?.length;
+    highlightedAnnotation?.time;
+    highlightedAnnotation?.price;
     trace?.positions.length;
     trace?.orders.length;
     trace?.signals.length;
@@ -330,6 +354,7 @@ export function CandleChart(props: CandleChartProps) {
       pointerId: event.pointerId,
       startX: event.clientX,
       viewport: currentViewport(),
+      timeRange: props.timeNavigation ? viewportTimeRange(currentViewport()) : undefined,
     };
     setIsDragging(true);
     canvas.setPointerCapture(event.pointerId);
@@ -345,6 +370,13 @@ export function CandleChart(props: CandleChartProps) {
 
     event.preventDefault();
     const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    if (props.timeNavigation && dragState.timeRange) {
+      const duration = dragState.timeRange.end - dragState.timeRange.start;
+      const shift = (event.clientX - dragState.startX)
+        / Math.max(1, plot.right - plot.left) * duration;
+      commitTimeRange(dragState.timeRange.start - shift, dragState.timeRange.end - shift);
+      return;
+    }
     const visible = dragState.viewport.end - dragState.viewport.start;
     const candleWidth = Math.max(1, (plot.right - plot.left) / Math.max(1, visible));
     const shift = Math.round((event.clientX - dragState.startX) / candleWidth);
@@ -377,12 +409,12 @@ export function CandleChart(props: CandleChartProps) {
       zoomBy(1.25);
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
-      const visible = currentViewport().end - currentViewport().start;
-      panByCandles(-Math.max(1, Math.round(visible * 0.12)));
+      const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+      panByPixels(-(plot.right - plot.left) * 0.12);
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
-      const visible = currentViewport().end - currentViewport().start;
-      panByCandles(Math.max(1, Math.round(visible * 0.12)));
+      const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+      panByPixels((plot.right - plot.left) * 0.12);
     } else if (event.key === "Home" || event.key === "0") {
       event.preventDefault();
       resetViewport();
@@ -398,8 +430,19 @@ export function CandleChart(props: CandleChartProps) {
     }
 
     const current = currentViewport();
+    if (props.timeNavigation) {
+      const range = viewportTimeRange(current);
+      const duration = range.end - range.start;
+      const anchorTime = range.start + duration * clamp(anchor, 0, 1);
+      const targetDuration = Math.max(1, Math.round(duration * scale));
+      commitTimeRange(
+        anchorTime - targetDuration * clamp(anchor, 0, 1),
+        anchorTime + targetDuration * (1 - clamp(anchor, 0, 1)),
+      );
+      return;
+    }
     const visible = current.end - current.start;
-    const minVisible = Math.min(total, MIN_INTERACTIVE_CANDLES);
+    const minVisible = Math.min(total, minimumInteractiveCandles());
     const targetVisible = clamp(Math.round(visible * scale), minVisible, total);
     if (targetVisible === visible) {
       return;
@@ -412,8 +455,14 @@ export function CandleChart(props: CandleChartProps) {
 
   const panByPixels = (deltaPixels: number) => {
     const current = currentViewport();
-    const visible = current.end - current.start;
     const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    if (props.timeNavigation) {
+      const range = viewportTimeRange(current);
+      const shift = deltaPixels / Math.max(1, plot.right - plot.left) * (range.end - range.start);
+      commitTimeRange(range.start + shift, range.end + shift);
+      return;
+    }
+    const visible = current.end - current.start;
     const candleWidth = Math.max(1, (plot.right - plot.left) / Math.max(1, visible));
     panByCandles(Math.round(deltaPixels / candleWidth));
   };
@@ -431,9 +480,20 @@ export function CandleChart(props: CandleChartProps) {
   };
 
   const commitViewport = (next: CandleChartViewport) => {
-    const normalized = normalizeViewport(next, props.candles.length, MIN_INTERACTIVE_CANDLES);
+    const normalized = normalizeViewport(next, props.candles.length, minimumInteractiveCandles());
     setViewport(normalized);
     props.onViewportChange?.(normalized);
+  };
+
+  const commitTimeRange = (start: number, end: number) => {
+    const first = props.candles[0];
+    const last = props.candles.at(-1);
+    if (!first || !last) return;
+    const lower = first.openTime;
+    const upper = last.closeTime + 1;
+    const duration = Math.min(upper - lower, Math.max(1, Math.round(end - start)));
+    const normalizedStart = clamp(Math.round(start), lower, upper - duration);
+    commitViewport(viewportForTimeRange(normalizedStart, normalizedStart + duration));
   };
 
   const selectedTime = () => props.selectedTime ?? internalSelectedTime();
@@ -500,9 +560,40 @@ export function CandleChart(props: CandleChartProps) {
       ? normalizeViewport(
           props.viewport ?? viewport() ?? defaultViewport(props.candles.length),
           props.candles.length,
-          MIN_INTERACTIVE_CANDLES,
+          minimumInteractiveCandles(),
         )
       : defaultViewport(props.candles.length);
+
+  const viewportTimeRange = (value: CandleChartViewport): { start: number; end: number } => ({
+    start: props.candles[value.start]?.openTime ?? props.candles[0]?.openTime ?? 0,
+    end: (props.candles[Math.max(value.start, value.end - 1)]?.closeTime
+      ?? props.candles.at(-1)?.closeTime
+      ?? 0) + 1,
+  });
+
+  const viewportForTimeRange = (startTime: number, endTime: number): CandleChartViewport => {
+    const candles = props.candles;
+    let low = 0;
+    let high = candles.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (candles[middle]!.closeTime < startTime) low = middle + 1;
+      else high = middle;
+    }
+    const start = low;
+    low = start;
+    high = candles.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (candles[middle]!.openTime < endTime) low = middle + 1;
+      else high = middle;
+    }
+    return normalizeViewport(
+      { start, end: Math.max(start + 1, low) },
+      candles.length,
+      minimumInteractiveCandles(),
+    );
+  };
 
   const overlay = (key: keyof CandleChartOverlayVisibility) => props.overlays?.[key] ?? true;
   const annotationVisible = (annotation: BacktestChartAnnotation) => annotation.kind.endsWith("signal")
@@ -511,20 +602,25 @@ export function CandleChart(props: CandleChartProps) {
       ? overlay("orders")
       : overlay("fills");
 
+  const minimumInteractiveCandles = () => Math.max(
+    2,
+    Math.round(props.minInteractiveCandles ?? MIN_INTERACTIVE_CANDLES),
+  );
+
   const defaultViewport = (total: number): CandleChartViewport => {
     const maxCandles = props.maxCandles ?? 140;
     if (maxCandles > 0) {
       return normalizeViewport(
         { start: total - maxCandles, end: total },
         total,
-        props.interactive ? MIN_INTERACTIVE_CANDLES : 1,
+        props.interactive ? minimumInteractiveCandles() : 1,
       );
     }
 
     return normalizeViewport(
       { start: 0, end: total },
       total,
-      props.interactive ? MIN_INTERACTIVE_CANDLES : 1,
+      props.interactive ? minimumInteractiveCandles() : 1,
     );
   };
 
@@ -804,6 +900,7 @@ function drawOracleTransitions(
   ctx: CanvasRenderingContext2D,
   points: BacktestTrace["oracle"]["points"],
   hovered: BacktestOraclePoint | undefined,
+  matched: BacktestChartAnnotation | undefined,
   plot: { left: number; right: number; top: number; bottom: number },
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
@@ -842,7 +939,8 @@ function drawOracleTransitions(
     if (x >= plot.left && x <= plot.right) {
       const y = clamp(priceToY(hovered.price), plot.top, plot.bottom);
       drawOracleMarker(ctx, hovered, x, y, true, true);
-      drawOracleTooltip(ctx, hovered, x, y, plot);
+      if (matched) drawMatchedCandidate(ctx, matched, x, y, plot, priceToY, timeToX);
+      drawOracleTooltip(ctx, hovered, matched, x, y, plot);
     }
   }
   ctx.restore();
@@ -913,15 +1011,23 @@ function drawOracleMarker(
 function drawOracleTooltip(
   ctx: CanvasRenderingContext2D,
   point: BacktestOraclePoint,
+  matched: BacktestChartAnnotation | undefined,
   markerX: number,
   markerY: number,
   plot: { left: number; right: number; top: number; bottom: number },
 ): void {
   const title = `${oracleActionLabel(point)} · ${point.fromState} → ${point.state}`;
   const detail = `$${formatQuote(point.price, 4)} · ${formatTime(point.time)}`;
+  const match = matched
+    ? `Matched candidate ${signedChartDuration(matched.time - point.time)}`
+    : "No one-to-one candidate match";
   ctx.font = "600 11px Inter, sans-serif";
-  const width = Math.max(ctx.measureText(title).width, ctx.measureText(detail).width) + 18;
-  const height = 42;
+  const width = Math.max(
+    ctx.measureText(title).width,
+    ctx.measureText(detail).width,
+    ctx.measureText(match).width,
+  ) + 18;
+  const height = 58;
   const left = clamp(markerX + 12, plot.left, plot.right - width);
   const top = clamp(markerY - height - 12, plot.top, plot.bottom - height);
   ctx.fillStyle = "rgba(9, 10, 13, 0.96)";
@@ -936,6 +1042,52 @@ function drawOracleTooltip(
   ctx.fillStyle = "#aeb6c8";
   ctx.font = "11px Inter, sans-serif";
   ctx.fillText(detail, left + 9, top + 23);
+  ctx.fillStyle = matched ? CANDIDATE_SIGNAL_COLOR : "#aeb6c8";
+  ctx.fillText(match, left + 9, top + 39);
+}
+
+function drawMatchedCandidate(
+  ctx: CanvasRenderingContext2D,
+  annotation: BacktestChartAnnotation,
+  oracleX: number,
+  oracleY: number,
+  plot: { left: number; right: number; top: number; bottom: number },
+  priceToY: (price: number) => number,
+  timeToX: (time: number) => number,
+): void {
+  const x = timeToX(annotation.time);
+  if (x < plot.left || x > plot.right) return;
+  const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
+  ctx.save();
+  ctx.strokeStyle = CANDIDATE_SIGNAL_COLOR;
+  ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(oracleX, oracleY);
+  ctx.lineTo(x, y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.arc(x, y, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#f4f6fb";
+  ctx.stroke();
+  ctx.fillStyle = "#090a0d";
+  ctx.font = "700 9px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(annotation.signalState === "long" ? "L" : annotation.signalState === "short" ? "S" : "F", x, y);
+  ctx.restore();
+}
+
+function signedChartDuration(ms: number): string {
+  const sign = ms > 0 ? "+" : ms < 0 ? "−" : "";
+  const seconds = Math.abs(ms) / 1_000;
+  if (seconds < 60) return `${sign}${formatQuote(seconds, seconds < 10 ? 1 : 0)}s`;
+  const minutes = seconds / 60;
+  if (minutes < 60) return `${sign}${formatQuote(minutes, minutes < 10 ? 1 : 0)}m`;
+  return `${sign}${formatQuote(minutes / 60, 1)}h`;
 }
 
 function oracleStateColor(state: BacktestOraclePoint["state"]): string {
@@ -1242,40 +1394,103 @@ function drawAnnotationMarkers(
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
 ): void {
-  if (annotations.length === 0) {
-    return;
-  }
-
-  const sampleEvery = Math.max(
-    1,
-    Math.ceil(annotations.length / MAX_BACKGROUND_ANNOTATION_MARKERS),
-  );
+  if (annotations.length === 0) return;
+  const signals = annotations.filter((annotation) => annotation.kind.endsWith("signal"));
+  const events = annotations.filter((annotation) => !annotation.kind.endsWith("signal"));
+  const width = Math.max(1, plot.right - plot.left);
+  const dense = signals.length > width / 7;
+  const signalEvery = dense ? Math.max(1, Math.ceil(signals.length / (width * 2))) : 1;
+  const occupied = new Set<string>();
 
   ctx.save();
-  for (let index = 0; index < annotations.length; index += sampleEvery) {
-    const annotation = annotations[index];
-    if (!annotation) {
-      continue;
-    }
+  for (let index = 0; index < signals.length; index += signalEvery) {
+    const annotation = signals[index];
+    if (!annotation) continue;
     if (
       selectedCandle &&
       annotation.time >= selectedCandle.openTime &&
       annotation.time <= selectedCandle.closeTime
-    ) {
-      continue;
-    }
+    ) continue;
 
     const x = clamp(timeToX(annotation.time), plot.left, plot.right);
     const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
     const isBuy = annotation.kind.startsWith("buy");
-    const isSignal = annotation.kind.endsWith("signal");
-    ctx.globalAlpha = isSignal ? 0.62 : 0.38;
+    if (dense) {
+      const key = `${Math.round(x)}:${annotation.signalState ?? (isBuy ? "buy" : "sell")}`;
+      if (occupied.has(key)) continue;
+      occupied.add(key);
+    }
+    drawCandidateSignalMarker(ctx, x, y, isBuy, dense, annotation.signalState);
+  }
+
+  const eventEvery = Math.max(1, Math.ceil(events.length / MAX_BACKGROUND_ANNOTATION_MARKERS));
+  for (let index = 0; index < events.length; index += eventEvery) {
+    const annotation = events[index];
+    if (!annotation) continue;
+    if (
+      selectedCandle &&
+      annotation.time >= selectedCandle.openTime &&
+      annotation.time <= selectedCandle.closeTime
+    ) continue;
+
+    const x = clamp(timeToX(annotation.time), plot.left, plot.right);
+    const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
+    const isBuy = annotation.kind.startsWith("buy");
+    ctx.globalAlpha = 0.38;
     ctx.strokeStyle = isBuy ? "#22c55e" : "#f05252";
-    ctx.lineWidth = isSignal ? 1.5 : 1;
+    ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x, isBuy ? y + 7 : y - 7);
     ctx.lineTo(x, isBuy ? y + 1 : y - 1);
     ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawCandidateSignalMarker(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  isBuy: boolean,
+  dense: boolean,
+  state?: BacktestChartAnnotation["signalState"],
+): void {
+  ctx.save();
+  ctx.globalAlpha = dense ? 0.86 : 1;
+  ctx.strokeStyle = dense ? CANDIDATE_SIGNAL_COLOR : "#090a0d";
+  ctx.lineWidth = dense ? 4 : 1.5;
+  ctx.beginPath();
+  if (dense) {
+    ctx.moveTo(x, y - 5);
+    ctx.lineTo(x, y + 5);
+  } else if (state === "flat") {
+    const radius = 6;
+    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.moveTo(x, y - radius);
+    ctx.lineTo(x + radius, y);
+    ctx.lineTo(x, y + radius);
+    ctx.lineTo(x - radius, y);
+    ctx.closePath();
+  } else {
+    const radius = 7;
+    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.moveTo(x, isBuy ? y - radius : y + radius);
+    ctx.lineTo(x - radius, isBuy ? y + radius * 0.72 : y - radius * 0.72);
+    ctx.lineTo(x + radius, isBuy ? y + radius * 0.72 : y - radius * 0.72);
+    ctx.closePath();
+  }
+  ctx.stroke();
+  if (!dense) ctx.fill();
+  if (!dense && state) {
+    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.font = "bold 10px Inter, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = state === "long" ? "bottom" : "top";
+    ctx.fillText(
+      state === "long" ? "L" : state === "short" ? "S" : "F",
+      x,
+      state === "long" ? y - 9 : y + 9,
+    );
   }
   ctx.restore();
 }
@@ -1327,14 +1542,20 @@ function drawAnnotations(
     const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
     const isBuy = annotation.kind.startsWith("buy");
     const isSignal = annotation.kind.endsWith("signal");
-    const color = isBuy ? "#22c55e" : "#f05252";
+    const color = isSignal ? CANDIDATE_SIGNAL_COLOR : isBuy ? "#22c55e" : "#f05252";
+    const markerUp = annotation.signalState === "long" || (annotation.signalState === undefined && isBuy);
 
     ctx.save();
     ctx.fillStyle = color;
     ctx.strokeStyle = "#090a0d";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    if (isBuy) {
+    if (annotation.signalState === "flat") {
+      ctx.moveTo(x, y - 7);
+      ctx.lineTo(x + 7, y);
+      ctx.lineTo(x, y + 7);
+      ctx.lineTo(x - 7, y);
+    } else if (markerUp) {
       ctx.moveTo(x, y - 8);
       ctx.lineTo(x - 5, y + 4);
       ctx.lineTo(x + 5, y + 4);
@@ -1360,15 +1581,17 @@ function drawAnnotations(
     ctx.fillStyle = color;
     ctx.font = "10px Inter, sans-serif";
     ctx.textAlign = "center";
-    ctx.textBaseline = isBuy ? "bottom" : "top";
-    ctx.fillText(annotationShortLabel(annotation), x, isBuy ? y - 9 : y + 9);
+    ctx.textBaseline = markerUp ? "bottom" : "top";
+    ctx.fillText(annotationShortLabel(annotation), x, markerUp ? y - 9 : y + 9);
     ctx.restore();
   }
 }
 
 function annotationShortLabel(annotation: BacktestChartAnnotation): string {
   if (annotation.kind.includes("signal")) {
-    return "SIG";
+    return annotation.signalState === "long" ? "L"
+      : annotation.signalState === "short" ? "S"
+        : annotation.signalState === "flat" ? "F" : "SIG";
   }
   if (annotation.kind.includes("fill")) {
     return "F";
