@@ -45,6 +45,8 @@ export interface PeakValleyStrategyConfig {
   derivativeClampMode: PeakValleyDerivativeClampMode;
   derivativeClampInnerThresholdRatio: number;
   kamaErLen: number;
+  kamaErVolumeLen: number;
+  kamaErVolumePower: number;
   kamaFastLen: number;
   kamaSlowLen: number;
   kamaPower: number;
@@ -94,6 +96,8 @@ export const defaultPeakValleyStrategyConfig: PeakValleyStrategyConfig = {
   derivativeClampMode: "deadband",
   derivativeClampInnerThresholdRatio: 0,
   kamaErLen: 14,
+  kamaErVolumeLen: 60,
+  kamaErVolumePower: 0,
   kamaFastLen: 28,
   kamaSlowLen: 153,
   kamaPower: 0.49045,
@@ -160,6 +164,8 @@ export function createPeakValleyStrategyConfig(
     : config.derivativeClampMode === "hold" ? "hold" : "deadband";
   config.derivativeClampInnerThresholdRatio = clamp01(config.derivativeClampInnerThresholdRatio);
   config.kamaErLen = positiveInt(config.kamaErLen);
+  config.kamaErVolumeLen = positiveInt(config.kamaErVolumeLen);
+  config.kamaErVolumePower = Math.max(0, finite(config.kamaErVolumePower, 0));
   config.kamaFastLen = positiveInt(config.kamaFastLen);
   config.kamaSlowLen = positiveInt(config.kamaSlowLen);
   config.kamaPower = Math.max(0.1, finite(config.kamaPower, 1));
@@ -204,6 +210,7 @@ export function rescalePeakValleyStrategyConfig(
     ...config,
     sampleIntervalMs: target,
     kamaErLen: scale(config.kamaErLen),
+    kamaErVolumeLen: scale(config.kamaErVolumeLen),
     kamaFastLen: scale(config.kamaFastLen),
     kamaSlowLen: scale(config.kamaSlowLen),
     kamaVolumeLen: scale(config.kamaVolumeLen),
@@ -221,6 +228,8 @@ export function peakValleyWarmupSamples(config: PeakValleyStrategyConfig): numbe
 export function peakValleyKamaWarmupSamples(config: PeakValleyStrategyConfig): number {
   const kama = volumeWeightedKamaWarmupSamples({
     efficiencyPeriod: config.kamaErLen,
+    efficiencyVolumePeriod: config.kamaErVolumeLen,
+    efficiencyVolumePower: config.kamaErVolumePower,
     slowPeriod: config.kamaSlowLen,
     volumePeriod: config.kamaVolumeLen,
   }, KAMA_WARMUP_MULTIPLE);
@@ -525,6 +534,8 @@ export class PeakValleyStrategy
     });
     this.kama = new VolumeWeightedKAMAIndicator(this.historyApi, {
       efficiencyPeriod: this.config.kamaErLen,
+      efficiencyVolumePeriod: this.config.kamaErVolumeLen,
+      efficiencyVolumePower: this.config.kamaErVolumePower,
       fastPeriod: this.config.kamaFastLen,
       slowPeriod: this.config.kamaSlowLen,
       power: this.config.kamaPower,

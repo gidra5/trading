@@ -5,6 +5,7 @@ import {
   KAMAIndicator,
   LinearRegressionIndicator,
   LookbackIndicator,
+  MeanReversionIndicator,
   SMAIndicator,
   VolumeWeightedKAMAIndicator,
 } from "../src/indicators.js";
@@ -50,6 +51,31 @@ test("EMA accepts signed child-indicator series", () => {
   assert.equal(ema.derivative(), -2);
 });
 
+test("mean-reversion score rises for a volatility-normalized move away from its mean", () => {
+  const indicator = new MeanReversionIndicator(20, 20, 1);
+  for (let index = 0; index < 40; index += 1) {
+    indicator.onTick({ eventTime: index, value: 100 });
+  }
+  assert.equal(indicator.indicator(), 0);
+
+  indicator.onTick({ eventTime: 40, value: 130 });
+  assert.ok(indicator.indicator() > 0.9);
+  assert.ok(indicator.details().signedDistance > 0);
+  assert.ok(indicator.details().normalizedDistance > 1);
+});
+
+test("mean-reversion indicator restores exactly", () => {
+  const original = new MeanReversionIndicator(10, 20, 1.5);
+  for (const [index, value] of [100, 101, 99, 105].entries()) {
+    original.onTick({ eventTime: index, value });
+  }
+  const restored = new MeanReversionIndicator(10, 20, 1.5);
+  restored.restore(structuredClone(original.snapshot()));
+
+  assert.deepEqual(restored.snapshot(), original.snapshot());
+  assert.deepEqual(restored.details(), original.details());
+});
+
 test("linear regression retains a negative series across snapshot restore", () => {
   const regression = new LinearRegressionIndicator(4, unusedApi);
   for (let index = 0; index < 4; index += 1) {
@@ -64,10 +90,11 @@ test("linear regression retains a negative series across snapshot restore", () =
   assert.deepEqual(restored.indicator(), regression.indicator());
 });
 
-test("volume-weighted KAMA with zero volume power matches canonical KAMA", () => {
+test("volume-weighted KAMA with both volume powers zero matches canonical KAMA", () => {
   const canonical = new KAMAIndicator(3, 2, 10, unusedApi, 10, 2);
   const weighted = new VolumeWeightedKAMAIndicator(unusedApi, {
     efficiencyPeriod: 3,
+    efficiencyVolumePower: 0,
     fastPeriod: 2,
     slowPeriod: 10,
     power: 2,
@@ -107,9 +134,33 @@ test("volume-weighted KAMA speeds up on high relative volume", () => {
   assert.ok(high.derivative() > low.derivative());
 });
 
+test("volume-weighted KAMA weights each efficiency-ratio move by relative volume", () => {
+  const indicator = new VolumeWeightedKAMAIndicator(unusedApi, {
+    efficiencyPeriod: 2,
+    efficiencyVolumePeriod: 3,
+    efficiencyVolumePower: 2,
+    fastPeriod: 2,
+    slowPeriod: 10,
+    power: 1,
+    volumePeriod: 3,
+    volumePower: 0,
+  });
+  indicator.onTick({ eventTime: 1, price: 100, quantity: 10 });
+  indicator.onTick({ eventTime: 2, price: 102, quantity: 20 });
+  indicator.onTick({ eventTime: 3, price: 101, quantity: 5 });
+
+  const up = 2 * Math.pow(20 / 15, 2);
+  const down = -1 * Math.pow(5 / 10, 2);
+  assert.ok(Math.abs(
+    indicator.details().efficiencyRatio - Math.abs(up + down) / (Math.abs(up) + Math.abs(down))
+  ) < 1e-12);
+});
+
 test("volume-weighted KAMA restores exactly and treats missing volume as neutral", () => {
   const options = {
     efficiencyPeriod: 2,
+    efficiencyVolumePeriod: 3,
+    efficiencyVolumePower: 1.5,
     fastPeriod: 2,
     slowPeriod: 10,
     volumePeriod: 3,

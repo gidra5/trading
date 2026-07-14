@@ -6,21 +6,15 @@
 - add prediction market support
 - is cache size limit per pair? It should be total cache size
 - how is random week/length backtest compute equity and return?
-- maybe run some kind of genetic algorithm to finetune the parameters. use quick 1month backtests to verify quality and guide the search.
 - maybe we can do a kind of backpropagation to improve the parameters.
 
 - estimate how much the quality of peaks and size distributions affect the performance. add a confidence score before creating positions/closing to guide the actual decisions.
 - accomodate in some way average candle size at various levels of granularity. Use this as the expected move over the window size.
 
-- avoid position drift by using the actual order results from binance - how much was actually sold and bought and use that as ground truth. Ideally in live run we should use binance account info, position info, order info, etc, as the source of truth. that should make sure that there is no drift possible.
-- as base for extrema pick sma window in which there is enough movement on average to get over round trip cost (buy-sell fees).
-
-1. use simple `dS_m=(p_t-p_{t-m})/m` and `dS_m^2=(p_t-p_{t-m}-(p_{t-1}-p_{t-m-1}))/m` to get sma first and second derivatives
-2. use derivatives to estimate order of SMAs with `d_{m,n}=(m-n)/2*dS_m+m(m-n)/6*dS_m^2`.
-3. Treat strategy as a derivative. Given some bot executing a strategy, track proportion of investment that it makes - what part of its leveraged equity invested where. Run another bot that monitors that proportion and can accept its own initial equity, that will be invested proportionally to the initial strategy, or even against it. This basically defines an investable derivative over which we can run another bot. Investing in that derivative proportionally invests it into the asset, and realising profit proportionally reduces the investment.
-4. Portfolio trading. We can borrow from other asset positions internally. This incurs conversion cost that should be accounted the same way fees are, but double since it is double converted.
-5.  Get assets sorted by 24h abs change, volume/market cap, and keep portfolio consisting of best 10 entries
-6.  Look for negatively correlated assets with good sharpe and mix to improve overall sharpe. Leverage the better one to keep profits?
+1. Treat strategy as a derivative. Given some bot executing a strategy, track proportion of investment that it makes - what part of its leveraged equity invested where. Run another bot that monitors that proportion and can accept its own initial equity, that will be invested proportionally to the initial strategy, or even against it. This basically defines an investable derivative over which we can run another bot. Investing in that derivative proportionally invests it into the asset, and realising profit proportionally reduces the investment.
+2. Portfolio trading. We can borrow from other asset positions internally. This incurs conversion cost that should be accounted the same way fees are, but double since it is double converted.
+3.  Get assets sorted by 24h abs change, volume/market cap, and keep portfolio consisting of best 10 entries
+4.  Look for negatively correlated assets with good sharpe and mix to improve overall sharpe. Leverage the better one to keep profits?
 
 Entry grid - detect incoming bottom, extrapolate to decide bottom price, setup grid. Track filled orders. On partial fill we can still allow position exits, but only over currently filled part. Once partial entry is fully exited and we still have on filled entry orders, look for trend direction, if its opposite or too weak, cancel rest. Must maximize entry size. maybw makes sense for exit as well.
 
@@ -94,8 +88,6 @@ add "parallel" giid strategy that would place limit orders with fixed interval b
 3. long grids assume the trend is upwards and accumulate long position as grid crosses any cell and then sell it when price crosses grid cell against assume trend. the short is symmtric
 4. neutral grids assume the trend is mean reversing an create short grid above mid, and long below.
 
-the lots state should be in bot strategy layer, updated on each signal/related order executoin. on entry we create lot with specified parameters once we successfully executed order. on exit we close the lot, partially or fully depending on exit grid execution state. the resulting state is persisted. it should not need be reconciled/reconstructed from history, but saved and restored as part of live bot state.
-
 also estimate peaks/valleys based on orderbook depth. identify support/resistance levels based on order concentration and predict extrema around them.
 
 - develop strategy
@@ -133,7 +125,6 @@ TRADING_WEB_PORT=4174 TRADING_BACKEND_URL=http://127.0.0.1:3002 npm run start -w
 
 npm run build -w @trading/server -w @trading/bot-algo -w @trading/web
 
-
-
+it looks like the state transition chart below the main graph is not accurate and can miss some transitions.
 
 this https://chatgpt.com/c/6a538661-de74-83ed-9f46-856d994d4031

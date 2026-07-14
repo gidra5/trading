@@ -218,8 +218,8 @@ test("legacy execution applies the shared KAMA volume configuration", () => {
 test("defaults use the validation-selected multi-scale oracle candidate", () => {
   const config = createPeakValleyStrategyConfig();
   assert.deepEqual(
-    [config.kamaErLen, config.kamaFastLen, config.kamaSlowLen, config.kamaVolumeLen],
-    [14, 28, 153, 130],
+    [config.kamaErLen, config.kamaErVolumeLen, config.kamaFastLen, config.kamaSlowLen, config.kamaVolumeLen],
+    [14, 60, 28, 153, 130],
   );
   assert.equal(config.derivativeSource, "kama");
   assert.equal(config.derivativeClampMode, "deadband");
@@ -229,6 +229,7 @@ test("defaults use the validation-selected multi-scale oracle candidate", () => 
   assert.equal(config.buyExitSignalTiming, "start");
   assert.equal(config.kamaSignalFriction, 0.00175);
   assert.equal(config.kamaVolumePower, 0);
+  assert.equal(config.kamaErVolumePower, 0);
   assert.ok(Math.abs(config.kamaRateThresholdLow * 36_000_000 - 67.56654) < 1e-9);
 });
 
@@ -257,12 +258,12 @@ test("KAMA sample counts preserve physical durations across candle scales", () =
   const oneSecond = rescalePeakValleyStrategyConfig(config, 1_000);
   const fiveMinute = rescalePeakValleyStrategyConfig(config, 300_000);
   assert.deepEqual(
-    [oneSecond.kamaErLen, oneSecond.kamaFastLen, oneSecond.kamaSlowLen, oneSecond.kamaVolumeLen],
-    [840, 1_680, 9_180, 7_800],
+    [oneSecond.kamaErLen, oneSecond.kamaErVolumeLen, oneSecond.kamaFastLen, oneSecond.kamaSlowLen, oneSecond.kamaVolumeLen],
+    [840, 3_600, 1_680, 9_180, 7_800],
   );
   assert.deepEqual(
-    [fiveMinute.kamaErLen, fiveMinute.kamaFastLen, fiveMinute.kamaSlowLen, fiveMinute.kamaVolumeLen],
-    [3, 6, 31, 26],
+    [fiveMinute.kamaErLen, fiveMinute.kamaErVolumeLen, fiveMinute.kamaFastLen, fiveMinute.kamaSlowLen, fiveMinute.kamaVolumeLen],
+    [3, 12, 6, 31, 26],
   );
   assert.equal(oneSecond.kamaRateThresholdLow, config.kamaRateThresholdLow);
   assert.equal(oneSecond.kamaSignalFriction, config.kamaSignalFriction);

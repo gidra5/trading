@@ -1914,6 +1914,20 @@ function AlgorithmPanel(props: {
                   onInput={(value) => updateValleyPeak("kamaErLen", Math.round(value))}
                 />
                 <NumberField
+                  label="ER Volume EMA"
+                  value={config().strategy.kamaErVolumeLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaErVolumeLen", Math.round(value))}
+                />
+                <NumberField
+                  label="ER Volume Power"
+                  value={config().strategy.kamaErVolumePower}
+                  min={0}
+                  step={0.1}
+                  onInput={(value) => updateValleyPeak("kamaErVolumePower", value)}
+                />
+                <NumberField
                   label="KAMA Fast"
                   value={config().strategy.kamaFastLen}
                   min={1}

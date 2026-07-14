@@ -9,6 +9,7 @@ import type {
   Candle,
   VwKamaCandleRangeResponse,
   VwKamaInspectorCatalog,
+  VwKamaIndicatorPoint,
   VwKamaInspectorRequest,
   VwKamaInspectorResponse,
   VwKamaParameters,
@@ -18,8 +19,10 @@ import type {
 import {
   CandleChart,
   type CandleChartOverlayVisibility,
+  type CandleChartStateBand,
   type CandleChartViewport,
 } from "./components/CandleChart";
+import { IndicatorChart, type IndicatorChartSeries } from "./components/IndicatorChart";
 import { formatDateTime, formatDuration, formatQuote } from "./format";
 
 const apiBase = "/backend";
@@ -30,9 +33,53 @@ const detailTriggerCandles = detailMaxCandles * 4;
 
 type OracleState = BacktestOraclePoint["state"];
 interface TimeRange { start: number; end: number }
+interface ScoreWeights { f1: number; agreement: number; cleanliness: number }
+type DiagnosticIndicatorId =
+  | "confirmationEma"
+  | "meanReversionEma"
+  | "kamaRate"
+  | "efficiencyRatio"
+  | "effectiveEfficiencyRatio"
+  | "relativeVolume"
+  | "alpha"
+  | "rsi"
+  | "dmi"
+  | "adx"
+  | "meanDistance";
+type DiagnosticVisibility = Record<DiagnosticIndicatorId, boolean>;
+
+const defaultScoreWeights: ScoreWeights = { f1: 0.2, agreement: 0.6, cleanliness: 0.2 };
+const defaultDiagnosticVisibility: DiagnosticVisibility = {
+  confirmationEma: false,
+  meanReversionEma: false,
+  kamaRate: false,
+  efficiencyRatio: false,
+  effectiveEfficiencyRatio: false,
+  relativeVolume: false,
+  alpha: false,
+  rsi: false,
+  dmi: false,
+  adx: false,
+  meanDistance: false,
+};
+const diagnosticOptions: Array<{ id: DiagnosticIndicatorId; label: string; placement: "price" | "pane" }> = [
+  { id: "confirmationEma", label: "Confirmation EMA", placement: "price" },
+  { id: "meanReversionEma", label: "Mean-reversion EMA", placement: "price" },
+  { id: "kamaRate", label: "KAMA rate", placement: "pane" },
+  { id: "efficiencyRatio", label: "Efficiency ratio", placement: "pane" },
+  { id: "effectiveEfficiencyRatio", label: "Effective ER", placement: "pane" },
+  { id: "relativeVolume", label: "Relative volume", placement: "pane" },
+  { id: "alpha", label: "KAMA alpha", placement: "pane" },
+  { id: "rsi", label: "RSI", placement: "pane" },
+  { id: "dmi", label: "DMI direction", placement: "pane" },
+  { id: "adx", label: "ADX", placement: "pane" },
+  { id: "meanDistance", label: "Mean distance", placement: "pane" },
+];
 
 const defaults: VwKamaParameters = {
   efficiencyMs: 14 * 60_000,
+  efficiencyVolumeEmaMs: 60 * 60_000,
+  efficiencyVolumePower: 0,
   fastMs: 28 * 60_000,
   slowMs: 153 * 60_000,
   power: 0.49045,
@@ -41,9 +88,36 @@ const defaults: VwKamaParameters = {
   volumePower: 0,
   deadbandBpsHour: 67.56654,
   deadbandMode: "flat",
+  hysteresisReleaseRatio: 0.25,
   thresholdMode: "static",
   thresholdLookbackMs: 60 * 60_000,
   thresholdNoiseMultiplier: 0,
+  buyMaxFraction: 1,
+  sellMaxFraction: 1,
+  buySizingSigmaBpsHour: 1e12,
+  sellSizingSigmaBpsHour: 1e12,
+  agreementMode: "sizing",
+  confirmationMix: 0,
+  confirmationMinQuality: 0,
+  confirmationAccelerationLookbackMs: 60 * 60_000,
+  confirmationDistanceLookbackMs: 60 * 60_000,
+  confirmationAccelerationWeight: 1,
+  confirmationDistanceWeight: 1,
+  confirmationEmaMs: 60 * 60_000,
+  confirmationEmaThresholdBpsHour: 0,
+  confirmationEmaWeight: 0,
+  confirmationEmaGateStrength: 0,
+  confirmationRsiMs: 14 * 60_000,
+  confirmationRsiThreshold: 0,
+  confirmationRsiWeight: 0,
+  confirmationDmiMs: 14 * 60_000,
+  confirmationDmiWeight: 0,
+  confirmationAdxThreshold: 20,
+  confirmationBias: 0,
+  meanReversionMix: 0,
+  meanReversionMeanMs: 60 * 60_000,
+  meanReversionVolatilityMs: 60 * 60_000,
+  meanReversionThreshold: 2,
 };
 
 const emptyOracle: BacktestOraclePath = {
@@ -55,16 +129,16 @@ const emptyOracle: BacktestOraclePath = {
 };
 
 const metricHelp = {
-  score: "Overall oracle-path similarity: 60% one-to-one timing-weighted F1, 30% exposure agreement, and 10% signal cleanliness. It does not measure profitability.",
+  score: "Weighted oracle-path similarity using the adjustable F1, agreement, and cleanliness weights. It does not measure profitability.",
   f1: "Harmonic mean of one-to-one timing-weighted precision and recall. It is high only when signals are both accurate and complete.",
   precision: "The timing-weighted share of candidate transitions paired with one oracle transition reaching the same target state. Extra and time-offset signals reduce it.",
   recall: "The timing-weighted share of oracle transitions covered by one candidate transition reaching the same target state. Missed and time-offset transitions reduce it.",
-  agreement: "Average candle-by-candle exposure similarity: same state 100%, flat versus directional 50%, and opposite directions 0%.",
+  agreement: "Average candle-by-candle oracle overlap. Sizing mode marks partial positions at current prices. Confidence mode gives matching direction its confidence, oracle-flat the remaining uncertainty, and opposite direction zero.",
   timingError: "Median absolute time offset across one-to-one matched transitions. Extra candidate signals and missed oracle transitions are excluded.",
   matched: "One-to-one matches divided by all oracle transitions. The remainder are missed oracle transitions.",
   extra: "Candidate transitions that could not be paired with an oracle transition. These are unnecessary signals under this comparison.",
   noise: "Extra candidate transitions divided by one-to-one matched transitions. For example, 2× means two unnecessary transitions per matched transition. Lower is better; signal cleanliness uses its bounded inverse in the score.",
-  cleanliness: "Matched transitions divided by all candidate transitions: matched / (matched + extra). Higher is better, and this contributes 10% of the overall score.",
+  cleanliness: "Matched transitions divided by all candidate transitions: matched / (matched + extra). Higher is better, and this contributes 20% of the overall score.",
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
 } as const;
@@ -80,6 +154,7 @@ export function KamaInspectorPage() {
   const [matchWindowMs, setMatchWindowMs] = createSignal(2 * 3_600_000);
   const [timingHalfLifeMs, setTimingHalfLifeMs] = createSignal(10 * 60_000);
   const [warmupMultiple, setWarmupMultiple] = createSignal(3);
+  const [scoreWeights, setScoreWeights] = createSignal({ ...defaultScoreWeights });
   const [result, setResult] = createSignal<VwKamaInspectorResponse>();
   const [comparisonResult, setComparisonResult] = createSignal<VwKamaInspectorResponse>();
   const [resultRequest, setResultRequest] = createSignal<VwKamaInspectorRequest>();
@@ -89,6 +164,7 @@ export function KamaInspectorPage() {
   const [showKama, setShowKama] = createSignal(true);
   const [showSignals, setShowSignals] = createSignal(true);
   const [showOracle, setShowOracle] = createSignal(true);
+  const [diagnosticVisibility, setDiagnosticVisibility] = createSignal({ ...defaultDiagnosticVisibility });
   const [timeViewport, setTimeViewport] = createSignal<TimeRange>();
   const [detail, setDetail] = createSignal<VwKamaCandleRangeResponse>();
   const [detailLoading, setDetailLoading] = createSignal(false);
@@ -112,17 +188,118 @@ export function KamaInspectorPage() {
   const globalPreset = createMemo(() =>
     catalog()?.presets.find((preset) => preset.scope === "global"));
   const rankedPresets = createMemo(() => (catalog()?.presets ?? [])
-    .filter((preset): preset is VwKamaPreset & { score: number } =>
-      preset.scope === "window" && Number.isFinite(preset.score))
+    .flatMap((preset) => {
+      const score = preset.score ?? preset.historicalScore;
+      return preset.scope === "window" && Number.isFinite(score)
+        ? [{ ...preset, score: score!, historical: preset.score === undefined }]
+        : [];
+    })
     .sort((left, right) => right.score - left.score));
   const bestPreset = createMemo(() => rankedPresets()[0]);
   const worstPreset = createMemo(() => rankedPresets().at(-1));
+  const scaleWindowResults = createMemo(() => rankedPresets()
+    .filter((preset) => preset.intervalMs === intervalMs()));
+  const scaleMedianScore = createMemo(() => medianValue(
+    scaleWindowResults().map((preset) => preset.score),
+  ));
+  const latestOptimization = createMemo(() => (catalog()?.presets ?? [])
+    .filter((preset) => preset.scope === "window" && preset.generatedAt)
+    .sort((left, right) => Date.parse(right.generatedAt!) - Date.parse(left.generatedAt!))[0]);
+  const normalizedScoreWeights = createMemo(() => normalizeScoreWeights(scoreWeights()));
+  const weightedScore = (metrics: VwKamaInspectorResponse["metrics"]): number => {
+    const weights = normalizedScoreWeights();
+    return metrics.f1 * weights.f1
+      + metrics.exposureAgreement * weights.agreement
+      + metrics.signalCleanliness * weights.cleanliness;
+  };
   const candles = createMemo(() => result()?.candles ?? []);
   const oracle = createMemo(() => result()?.oracle ?? emptyOracle);
   const candidatePoints = createMemo(() => result()?.candidatePath.points ?? []);
-  const kamaSeries = createMemo(() => showKama() && result()?.kamaSeries
-    ? [mergeDetailKamaSeries(result()!.kamaSeries, detail(), result())]
-    : []);
+  const candidateStatePoints = createMemo(() => {
+    const analysis = result();
+    const points = new Map((analysis?.statePoints ?? []).map((point) => [point.time, {
+      time: point.time,
+      state: point.candidate,
+      exposure: point.candidateExposure,
+    }]));
+    for (const transition of analysis?.candidateTransitions ?? []) {
+      points.set(transition.time, {
+        time: transition.time,
+        state: transition.state,
+        exposure: transition.exposure,
+      });
+    }
+    return [...points.values()].sort((left, right) => left.time - right.time);
+  });
+  const chartStateBands = createMemo<CandleChartStateBand[]>(() => [
+    { label: "Oracle", points: oracle().points },
+    { label: "Candidate", points: candidateStatePoints() },
+  ]);
+  const priceIndicatorSeries = createMemo<BacktestChartSmaSeries[]>(() => {
+    const analysis = result();
+    if (!analysis) return [];
+    const visibility = diagnosticVisibility();
+    return [
+      ...(showKama() ? [mergeDetailKamaSeries(analysis.kamaSeries, detail(), analysis)] : []),
+      ...(visibility.confirmationEma
+        ? [priceIndicatorLine(analysis.indicatorPoints, "confirmationEma", "Confirmation EMA", "#f5b84b", parameters().confirmationEmaMs ?? 0)]
+        : []),
+      ...(visibility.meanReversionEma
+        ? [priceIndicatorLine(analysis.indicatorPoints, "meanReversionEma", "Mean-reversion EMA", "#22c55e", parameters().meanReversionMeanMs ?? 0)]
+        : []),
+    ];
+  });
+  const diagnosticSeries = createMemo<IndicatorChartSeries[]>(() => {
+    const points = result()?.indicatorPoints ?? [];
+    const visible = diagnosticVisibility();
+    const values = parameters();
+    return [
+      ...(visible.kamaRate ? [diagnosticLine(points, "kamaRate", "KAMA rate", "#f472b6", {
+        symmetric: true,
+        suffix: " bps/h",
+        references: [
+          { value: values.deadbandBpsHour, color: "#f5b84b" },
+          { value: -values.deadbandBpsHour, color: "#f5b84b" },
+          { value: 0 },
+        ],
+      })] : []),
+      ...(visible.efficiencyRatio ? [diagnosticLine(points, "efficiencyRatio", "Efficiency ratio", "#38bdf8", { minimum: 0, maximum: 1, decimals: 3 })] : []),
+      ...(visible.effectiveEfficiencyRatio ? [diagnosticLine(points, "effectiveEfficiencyRatio", "Effective ER", "#a78bfa", { minimum: 0, maximum: 1, decimals: 3 })] : []),
+      ...(visible.relativeVolume ? [diagnosticLine(points, "relativeVolume", "Relative volume", "#eab308", {
+        minimum: 0,
+        maximum: Math.max(1, values.volumeCap),
+        references: [{ value: 1 }],
+        suffix: "×",
+      })] : []),
+      ...(visible.alpha ? [diagnosticLine(points, "alpha", "KAMA alpha", "#fb7185", { minimum: 0, maximum: 1, decimals: 4 })] : []),
+      ...(visible.rsi ? [diagnosticLine(points, "rsi", "RSI", "#22c55e", {
+        minimum: 0,
+        maximum: 100,
+        references: [
+          { value: 50 },
+          { value: 50 + (values.confirmationRsiThreshold ?? 0), color: "#f5b84b" },
+          { value: 50 - (values.confirmationRsiThreshold ?? 0), color: "#f5b84b" },
+        ],
+      })] : []),
+      ...(visible.dmi ? [diagnosticLine(points, "dmi", "DMI direction", "#38bdf8", { minimum: -100, maximum: 100, references: [{ value: 0 }] })] : []),
+      ...(visible.adx ? [diagnosticLine(points, "adx", "ADX", "#f5b84b", {
+        minimum: 0,
+        maximum: 100,
+        references: [{ value: values.confirmationAdxThreshold ?? 20, color: "#f5b84b" }],
+      })] : []),
+      ...(visible.meanDistance ? [diagnosticLine(points, "meanDistance", "Mean distance", "#c084fc", {
+        symmetric: true,
+        suffix: "σ",
+        references: [
+          { value: values.meanReversionThreshold ?? 2, color: "#f5b84b" },
+          { value: -(values.meanReversionThreshold ?? 2), color: "#f5b84b" },
+          { value: 0 },
+        ],
+      })] : []),
+    ];
+  });
+  const activeDiagnosticCount = createMemo(() =>
+    diagnosticOptions.filter((option) => diagnosticVisibility()[option.id]).length);
   const annotations = createMemo(() => showSignals()
     ? candidateAnnotations(result()?.candidateTransitions ?? [])
     : []);
@@ -145,7 +322,7 @@ export function KamaInspectorPage() {
     frames: [],
   }));
   const overlays = createMemo<CandleChartOverlayVisibility>(() => ({
-    averages: showKama(),
+    averages: priceIndicatorSeries().length > 0,
     signals: showSignals(),
     orders: false,
     fills: false,
@@ -401,12 +578,26 @@ export function KamaInspectorPage() {
     setParameters((current) => ({ ...current, [key]: value }));
   };
 
+  const updateScoreWeight = (key: keyof ScoreWeights, percent: number) =>
+    setScoreWeights((current) => ({ ...current, [key]: Math.max(0, percent) / 100 }));
+
+  const toggleDiagnostic = (id: DiagnosticIndicatorId) =>
+    setDiagnosticVisibility((current) => ({ ...current, [id]: !current[id] }));
+
   const applyPreset = (id: string) => {
     setRankedPair("current");
     setSelectedPresetId(id);
     const preset = catalog()?.presets.find((item) => item.id === id);
     if (preset) setParameters({ ...preset.parameters });
   };
+
+  const inspectPreset = (preset: VwKamaPreset) => batch(() => {
+    if (preset.windowId) setWindowId(preset.windowId);
+    if (preset.intervalMs) setIntervalMs(preset.intervalMs);
+    setRankedPair("current");
+    setSelectedPresetId(preset.id);
+    setParameters({ ...preset.parameters });
+  });
 
   const applyRankedPair = (value: string) => {
     const ranking = value === "best" ? "best" : value === "worst" ? "worst" : "current";
@@ -477,7 +668,115 @@ export function KamaInspectorPage() {
           {(message) => <ErrorNotice message={message()} onRetry={() => void loadCatalog()} />}
         </Show>
 
-        <section class="panel">
+        <Show when={latestOptimization()}>
+          {(preset) => {
+            const run = () => preset().optimization;
+            const incumbent = () => preset().incumbentScore;
+            const score = () => preset().score ?? preset().historicalScore;
+            return (
+              <section class="panel-tight flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div class="min-w-0">
+                  <div class="muted-label">Latest completed optimization</div>
+                  <div class="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                    <h2 class="text-lg font-semibold">{preset().label}</h2>
+                    <span class="text-xl font-semibold tabular-nums text-accent">
+                      {score() === undefined ? "—" : ratioPercent(score()!)}
+                    </span>
+                    <Show when={incumbent() !== undefined && score() !== undefined}>
+                      <span class="text-sm tabular-nums text-gain">
+                        {signedPercent(score()! - incumbent()!)} vs incumbent
+                      </span>
+                    </Show>
+                    <Show when={preset().score === undefined && preset().historicalScore !== undefined}>
+                      <span class="rounded-full border border-warn/40 px-2 py-0.5 text-xs text-warn">
+                        Historical score v{preset().scoreVersion ?? "?"}
+                      </span>
+                    </Show>
+                  </div>
+                  <div class="mt-1 text-xs text-ink-300">
+                    {preset().source ?? "Per-window optimizer result"}
+                    <Show when={run()}>
+                      {` · ${run()!.algorithm.toUpperCase()} ${formatQuote(run()!.population, 0)} × ${run()!.generations} × ${run()!.restarts} + ${run()!.refinementRounds} refinements · ${formatComputeTime(run()!.elapsedMs)}`}
+                    </Show>
+                  </div>
+                  <div class="mt-1 text-xs text-ink-400">
+                    Single-window hindsight upper bound—not a deployable or out-of-sample result. ER volume power {formatQuote(preset().parameters.efficiencyVolumePower ?? 0, 3)}; power 0 is standard ER.
+                  </div>
+                </div>
+                <button class="btn shrink-0" type="button" onClick={() => inspectPreset(preset())}>
+                  Inspect result
+                </button>
+              </section>
+            );
+          }}
+        </Show>
+
+        <Show when={scaleWindowResults().length > 0}>
+          <section class="panel">
+            <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <div class="muted-label">Per-window results</div>
+                <h2 class="text-lg font-semibold">Hindsight optima at {formatDuration(intervalMs())}</h2>
+                <div class="mt-1 text-xs text-ink-400">
+                  {scaleWindowResults().length} representative windows · each configuration was optimized on its own window and is not out-of-sample evidence.
+                  <Show when={scaleWindowResults().some((preset) => preset.historical)}>
+                    {" Rankings use historical score v2 until these presets are re-optimized under the agreement-dominant v3 objective."}
+                  </Show>
+                </div>
+              </div>
+              <div class="grid grid-cols-3 gap-2 text-sm tabular-nums">
+                <div class="rounded-2 border border-line bg-ink-800 px-3 py-2"><span class="text-ink-400">Best </span>{ratioPercent(scaleWindowResults()[0]!.score)}</div>
+                <div class="rounded-2 border border-line bg-ink-800 px-3 py-2"><span class="text-ink-400">Median </span>{ratioPercent(scaleMedianScore())}</div>
+                <div class="rounded-2 border border-line bg-ink-800 px-3 py-2"><span class="text-ink-400">Worst </span>{ratioPercent(scaleWindowResults().at(-1)!.score)}</div>
+              </div>
+            </div>
+            <div class="max-h-96 overflow-auto rounded-2 border border-line">
+              <table class="w-full min-w-180 border-collapse">
+                <thead class="sticky top-0 bg-ink-900">
+                  <tr>
+                    <th class="table-head w-14">Rank</th>
+                    <th class="table-head">Window</th>
+                    <th class="table-head w-32">Score</th>
+                    <th class="table-head w-44">Search</th>
+                    <th class="table-head w-24"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={scaleWindowResults()}>
+                    {(preset, index) => (
+                      <tr classList={{ "bg-accent/5": preset.id === latestOptimization()?.id }}>
+                        <td class="td-cell text-ink-400">{index() + 1}</td>
+                        <td class="td-cell">
+                          <div>{presetWindowName(preset, catalog())}</div>
+                          <Show when={preset.id === latestOptimization()?.id}>
+                            <div class="mt-0.5 text-xs text-accent">Latest deep rerun</div>
+                          </Show>
+                        </td>
+                        <td class="td-cell">
+                          <div class="font-medium tabular-nums">{ratioPercent(preset.score)}</div>
+                          <div class="mt-1 h-1.5 overflow-hidden rounded-full bg-ink-700">
+                            <div class="h-full rounded-full bg-accent" style={{ width: `${clamp(preset.score, 0, 1) * 100}%` }} />
+                          </div>
+                        </td>
+                        <td class="td-cell text-xs text-ink-400">
+                          <Show when={preset.optimization} fallback="Shallow per-window DE">
+                            {(run) => `${run().population} × ${run().generations} × ${run().restarts} + ${run().refinementRounds} refinements`}
+                          </Show>
+                        </td>
+                        <td class="td-cell text-right">
+                          <button class="btn px-2 py-1 text-xs" type="button" onClick={() => inspectPreset(preset)}>Inspect</button>
+                        </td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </Show>
+
+        <div class="kama-inspector-workspace">
+          <section class="panel kama-inspector-controls">
           <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <div class="muted-label">Experiment</div>
@@ -489,7 +788,7 @@ export function KamaInspectorPage() {
             </div>
           </div>
 
-          <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
             <InspectorSelect
               label="History window"
               value={windowId()}
@@ -533,12 +832,50 @@ export function KamaInspectorPage() {
               ]}
               onInput={applyPreset}
             />
+            <Show when={selectedPreset()?.source}>
+              {(source) => (
+                <div class="flex items-end text-xs text-ink-400 md:col-span-2">
+                  {source()}
+                  <Show when={selectedPreset()?.score !== undefined}>
+                    {` · stored score ${ratioPercent(selectedPreset()!.score!)}`}
+                  </Show>
+                </div>
+              )}
+            </Show>
+            <div class="rounded-2 border border-line bg-ink-800/50 p-3 md:col-span-2">
+              <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div class="text-sm font-medium">Scoring weights</div>
+                  <div class="mt-0.5 text-xs text-ink-400">
+                    Applied immediately to the displayed live score. Values are normalized to 100%; optimizer default is 20 / 60 / 20.
+                  </div>
+                </div>
+                <button class="btn px-2 py-1 text-xs" type="button" onClick={() => setScoreWeights({ ...defaultScoreWeights })}>
+                  Reset 20 / 60 / 20
+                </button>
+              </div>
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <InspectorNumber label="F1 weight (%)" value={round(scoreWeights().f1 * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("f1", value)} />
+                <InspectorNumber label="Agreement weight (%)" value={round(scoreWeights().agreement * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("agreement", value)} />
+                <InspectorNumber label="Cleanliness weight (%)" value={round(scoreWeights().cleanliness * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("cleanliness", value)} />
+              </div>
+              <div class="mt-2 text-xs tabular-nums text-ink-400">
+                Effective mix: {ratioPercent(normalizedScoreWeights().f1)} F1 · {ratioPercent(normalizedScoreWeights().agreement)} agreement · {ratioPercent(normalizedScoreWeights().cleanliness)} cleanliness
+              </div>
+            </div>
             <InspectorSelect
               label="Deadband behavior"
               value={parameters().deadbandMode}
-              options={[{ value: "hold", label: "Hold prior state" }, { value: "flat", label: "Go flat" }]}
+              options={[
+                { value: "hold", label: "Hold prior state" },
+                { value: "flat", label: "Go flat" },
+                { value: "hysteresis", label: "Hysteresis" },
+              ]}
               onInput={(value) => update("deadbandMode", value as VwKamaParameters["deadbandMode"])}
             />
+            <Show when={parameters().deadbandMode === "hysteresis"}>
+              <InspectorNumber label="Hysteresis release ratio" value={parameters().hysteresisReleaseRatio ?? 0.25} min={0} max={1} step={0.05} onInput={(value) => update("hysteresisReleaseRatio", value)} />
+            </Show>
             <InspectorSelect
               label="Threshold mode"
               value={parameters().thresholdMode ?? "static"}
@@ -548,6 +885,45 @@ export function KamaInspectorPage() {
               ]}
               onInput={(value) => update("thresholdMode", value as VwKamaParameters["thresholdMode"])}
             />
+            <InspectorSelect
+              label="Agreement strategy"
+              value={parameters().agreementMode ?? "sizing"}
+              options={[
+                { value: "sizing", label: "Price-marked sizing" },
+                { value: "confidence", label: "Signal confidence" },
+              ]}
+              onInput={(value) => update("agreementMode", value as VwKamaParameters["agreementMode"])}
+            />
+            <InspectorNumber
+              label="Mean-reversion blend"
+              value={parameters().meanReversionMix ?? 0}
+              min={0}
+              max={1}
+              step={0.05}
+              onInput={(value) => update("meanReversionMix", value)}
+            />
+            <Show when={(parameters().meanReversionMix ?? 0) > 0}>
+              <DurationInput
+                label="Mean-reversion mean"
+                value={parameters().meanReversionMeanMs ?? 60 * 60_000}
+                onInput={(value) => update("meanReversionMeanMs", value)}
+              />
+              <DurationInput
+                label="Mean-reversion volatility"
+                value={parameters().meanReversionVolatilityMs ?? 60 * 60_000}
+                onInput={(value) => update("meanReversionVolatilityMs", value)}
+              />
+              <InspectorNumber
+                label="Mean-reversion switch (σ)"
+                value={parameters().meanReversionThreshold ?? 2}
+                min={0.01}
+                step={0.05}
+                onInput={(value) => update("meanReversionThreshold", value)}
+              />
+              <div class="flex items-end text-xs text-ink-400 md:col-span-2">
+                The causal distance from the EMA is normalized by its recent volatility. At blend 1, nearby prices follow the KAMA trend while sufficiently extended prices trade against it; the ambiguous boundary reduces exposure toward flat.
+              </div>
+            </Show>
             <InspectorNumber
               label="Base threshold (bps/hour)"
               value={parameters().deadbandBpsHour}
@@ -570,12 +946,18 @@ export function KamaInspectorPage() {
               />
             </Show>
             <DurationInput label="Efficiency" value={parameters().efficiencyMs} onInput={(value) => update("efficiencyMs", value)} />
+            <DurationInput label="ER volume EMA" value={parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs} onInput={(value) => update("efficiencyVolumeEmaMs", value)} />
+            <InspectorNumber label="ER volume power" value={parameters().efficiencyVolumePower ?? 0} min={0} step={0.1} onInput={(value) => update("efficiencyVolumePower", value)} />
             <DurationInput label="Fast" value={parameters().fastMs} onInput={(value) => update("fastMs", value)} />
             <DurationInput label="Slow" value={parameters().slowMs} onInput={(value) => update("slowMs", value)} />
             <DurationInput label="Volume EMA" value={parameters().volumeMs} onInput={(value) => update("volumeMs", value)} />
             <InspectorNumber label="KAMA power" value={parameters().power} min={0.1} step={0.05} onInput={(value) => update("power", value)} />
             <InspectorNumber label="Volume cap" value={parameters().volumeCap} min={1} step={0.1} onInput={(value) => update("volumeCap", value)} />
             <InspectorNumber label="Volume power" value={parameters().volumePower} min={0} step={0.1} onInput={(value) => update("volumePower", value)} />
+            <InspectorNumber label={parameters().agreementMode === "confidence" ? "Buy max confidence" : "Buy max equity fraction"} value={parameters().buyMaxFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("buyMaxFraction", value)} />
+            <InspectorNumber label={parameters().agreementMode === "confidence" ? "Sell max confidence" : "Sell max equity fraction"} value={parameters().sellMaxFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("sellMaxFraction", value)} />
+            <InspectorNumber label="Buy sizing sigma (bps/hour)" value={parameters().buySizingSigmaBpsHour ?? 1e12} min={0.000001} step={0.1} onInput={(value) => update("buySizingSigmaBpsHour", value)} />
+            <InspectorNumber label="Sell sizing sigma (bps/hour)" value={parameters().sellSizingSigmaBpsHour ?? 1e12} min={0.000001} step={0.1} onInput={(value) => update("sellSizingSigmaBpsHour", value)} />
             <div class="flex items-end">
               <button class="btn w-full" type="button" onClick={() => {
                 const preset = globalPreset();
@@ -588,14 +970,40 @@ export function KamaInspectorPage() {
             </div>
           </div>
           <div class="mt-2 text-xs text-ink-400">
-            At {formatDuration(intervalMs())}, the periods round to {sampleCount(parameters().efficiencyMs, intervalMs())} / {sampleCount(parameters().fastMs, intervalMs())} / {sampleCount(parameters().slowMs, intervalMs())} / {sampleCount(parameters().volumeMs, intervalMs())} samples.
+            At {formatDuration(intervalMs())}, the periods round to {sampleCount(parameters().efficiencyMs, intervalMs())} / {sampleCount(parameters().fastMs, intervalMs())} / {sampleCount(parameters().slowMs, intervalMs())} / {sampleCount(parameters().volumeMs, intervalMs())} samples; the ER volume EMA is {sampleCount(parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs, intervalMs())} samples. ER move weights are (volume / volume EMA)^{parameters().efficiencyVolumePower ?? 0}; power 0 is standard ER.
             <Show when={parameters().thresholdMode === "adaptive"}>
               {` Threshold = base + ${formatQuote(parameters().thresholdNoiseMultiplier ?? 0, 3)} × EWMA of absolute KAMA-rate changes.`}
             </Show>
+            {` Signal strength = side maximum × exp(−0.5 × (KAMA rate / side sigma)²). ${parameters().agreementMode === "confidence" ? "Confidence stays fixed until the next signal." : "Partial allocations are marked from their signal price."}`}
           </div>
           <details class="mt-3 rounded-2 border border-line bg-ink-800 p-3">
+            <summary class="cursor-pointer text-sm font-semibold text-ink-200">Peak/valley confirmation</summary>
+            <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <InspectorNumber label="Confirmation mix" value={parameters().confirmationMix ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("confirmationMix", value)} />
+              <InspectorNumber label="Minimum quality" value={parameters().confirmationMinQuality ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("confirmationMinQuality", value)} />
+              <DurationInput label="Acceleration lookback" value={parameters().confirmationAccelerationLookbackMs ?? 60 * 60_000} onInput={(value) => update("confirmationAccelerationLookbackMs", value)} />
+              <DurationInput label="Distance lookback" value={parameters().confirmationDistanceLookbackMs ?? 60 * 60_000} onInput={(value) => update("confirmationDistanceLookbackMs", value)} />
+              <InspectorNumber label="Acceleration weight" value={parameters().confirmationAccelerationWeight ?? 1} min={0} step={0.1} onInput={(value) => update("confirmationAccelerationWeight", value)} />
+              <InspectorNumber label="Overextension weight" value={parameters().confirmationDistanceWeight ?? 1} min={0} step={0.1} onInput={(value) => update("confirmationDistanceWeight", value)} />
+              <DurationInput label="Slow EMA" value={parameters().confirmationEmaMs ?? 60 * 60_000} onInput={(value) => update("confirmationEmaMs", value)} />
+              <InspectorNumber label="EMA tolerance (bps/hour)" value={parameters().confirmationEmaThresholdBpsHour ?? 0} min={0} step={1} onInput={(value) => update("confirmationEmaThresholdBpsHour", value)} />
+              <InspectorNumber label="EMA trend weight" value={parameters().confirmationEmaWeight ?? 0} min={0} step={0.1} onInput={(value) => update("confirmationEmaWeight", value)} />
+              <InspectorNumber label="EMA hard-gate strength" value={parameters().confirmationEmaGateStrength ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("confirmationEmaGateStrength", value)} />
+              <DurationInput label="RSI period" value={parameters().confirmationRsiMs ?? 14 * 60_000} onInput={(value) => update("confirmationRsiMs", value)} />
+              <InspectorNumber label="RSI neutral tolerance" value={parameters().confirmationRsiThreshold ?? 0} min={0} max={50} step={1} onInput={(value) => update("confirmationRsiThreshold", value)} />
+              <InspectorNumber label="RSI trend weight" value={parameters().confirmationRsiWeight ?? 0} min={0} step={0.1} onInput={(value) => update("confirmationRsiWeight", value)} />
+              <DurationInput label="DMI / ADX period" value={parameters().confirmationDmiMs ?? 14 * 60_000} onInput={(value) => update("confirmationDmiMs", value)} />
+              <InspectorNumber label="DMI direction weight" value={parameters().confirmationDmiWeight ?? 0} min={0} step={0.1} onInput={(value) => update("confirmationDmiWeight", value)} />
+              <InspectorNumber label="ADX trend threshold" value={parameters().confirmationAdxThreshold ?? 20} min={0} max={100} step={1} onInput={(value) => update("confirmationAdxThreshold", value)} />
+              <InspectorNumber label="Quality bias" value={parameters().confirmationBias ?? 0} step={0.1} onInput={(value) => update("confirmationBias", value)} />
+            </div>
+            <div class="mt-2 text-xs text-ink-400">
+              Quality blends KAMA acceleration, price overextension, slow-EMA direction, RSI, and ADX-strength-weighted DMI direction. It scales the Gaussian strength; transitions below minimum quality are suppressed. A full EMA gate closes a countertrend position to flat and waits before entering the opposite side. Mix 0 and gate 0 disable confirmation exactly.
+            </div>
+          </details>
+          <details class="mt-3 rounded-2 border border-line bg-ink-800 p-3">
             <summary class="cursor-pointer text-sm font-semibold text-ink-200">Scoring controls</summary>
-            <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <InspectorNumber label="Oracle + signal friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
@@ -611,7 +1019,7 @@ export function KamaInspectorPage() {
           {(message) => <ErrorNotice message={message()} />}
         </Show>
 
-        <Show when={result()} fallback={<EmptyResult loading={loading()} />}>
+        <Show when={result()} fallback={<div class="kama-inspector-chart"><EmptyResult loading={loading()} /></div>}>
           {(analysis) => (
             <>
               <section class="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
@@ -619,7 +1027,7 @@ export function KamaInspectorPage() {
                   <Info aria-hidden="true" size={13} />
                   These compare VW-KAMA with the perfect-margin oracle; they do not measure trading profitability. Hover or focus an info icon for details.
                 </div>
-                <ScoreCard label="Score" value={ratioPercent(analysis().metrics.score)} description={metricHelp.score} />
+                <ScoreCard label="Score" value={ratioPercent(weightedScore(analysis().metrics))} description={metricHelp.score} />
                 <ScoreCard label="F1" value={ratioPercent(analysis().metrics.f1)} description={metricHelp.f1} />
                 <ScoreCard label="Precision" value={ratioPercent(analysis().metrics.precision)} description={metricHelp.precision} />
                 <ScoreCard label="Recall" value={ratioPercent(analysis().metrics.recall)} description={metricHelp.recall} />
@@ -647,17 +1055,17 @@ export function KamaInspectorPage() {
                       </div>
                     </div>
                     <div class="flex gap-5 text-sm tabular-nums">
-                      <div><span class="text-ink-400">Window </span>{ratioPercent(analysis().metrics.score)}</div>
-                      <div><span class="text-ink-400">Global </span>{ratioPercent(baseline().metrics.score)}</div>
-                      <div class={analysis().metrics.score >= baseline().metrics.score ? "text-gain" : "text-loss"}>
-                        {signedPercent(analysis().metrics.score - baseline().metrics.score)}
+                      <div><span class="text-ink-400">Window </span>{ratioPercent(weightedScore(analysis().metrics))}</div>
+                      <div><span class="text-ink-400">Global </span>{ratioPercent(weightedScore(baseline().metrics))}</div>
+                      <div class={weightedScore(analysis().metrics) >= weightedScore(baseline().metrics) ? "text-gain" : "text-loss"}>
+                        {signedPercent(weightedScore(analysis().metrics) - weightedScore(baseline().metrics))}
                       </div>
                     </div>
                   </section>
                 )}
               </Show>
 
-              <section class="panel">
+              <section class="panel kama-inspector-chart">
                 <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                   <div>
                     <div class="muted-label">Signal overlay</div>
@@ -674,17 +1082,52 @@ export function KamaInspectorPage() {
                     <OverlayButton label="KAMA" active={showKama()} onClick={() => setShowKama(!showKama())} />
                     <OverlayButton label="Candidate signals" active={showSignals()} onClick={() => setShowSignals(!showSignals())} />
                     <OverlayButton label="Oracle" active={showOracle()} onClick={() => setShowOracle(!showOracle())} />
+                    <details class="relative">
+                      <summary class="btn list-none cursor-pointer">
+                        Indicators{activeDiagnosticCount() > 0 ? ` (${activeDiagnosticCount()})` : ""}
+                      </summary>
+                      <div class="absolute right-0 z-30 mt-2 w-80 rounded-2 border border-line bg-ink-900 p-3 shadow-xl">
+                        <div class="mb-2 text-xs text-ink-400">
+                          EMAs overlay price. Oscillators use independently scaled, time-aligned lanes below it.
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                          <For each={diagnosticOptions}>
+                            {(option) => (
+                              <button
+                                class="btn justify-start px-2 py-1.5 text-xs"
+                                classList={{ "border-accent text-accent": diagnosticVisibility()[option.id] }}
+                                type="button"
+                                aria-pressed={diagnosticVisibility()[option.id]}
+                                title={option.placement === "price" ? "Overlay on price chart" : "Show in aligned indicator pane"}
+                                onClick={() => toggleDiagnostic(option.id)}
+                              >
+                                {option.label}
+                              </button>
+                            )}
+                          </For>
+                        </div>
+                        <button
+                          class="btn mt-2 w-full px-2 py-1 text-xs"
+                          type="button"
+                          onClick={() => setDiagnosticVisibility({ ...defaultDiagnosticVisibility })}
+                        >
+                          Clear indicator overlays
+                        </button>
+                      </div>
+                    </details>
                   </div>
                 </div>
                 <div class="mb-3 text-xs text-ink-400">
                   Purple L / F / S marks the candidate target state. Red and green L / S marks are retrospective oracle actions.
                 </div>
-                <div class="h-110 lg:h-[620px]">
+                <div class={diagnosticSeries().length > 0
+                  ? "h-80 lg:h-[calc(100vh-27rem)] lg:min-h-[300px]"
+                  : "h-110 lg:h-[calc(100vh-12rem)] lg:min-h-[420px]"}>
                   <CandleChart
                     candles={chartCandles()}
                     orders={[]}
                     lastPrice={candles().at(-1)?.close ?? 0}
-                    smaSeries={kamaSeries()}
+                    smaSeries={priceIndicatorSeries()}
                     annotations={annotations()}
                     trace={trace()}
                     overlays={overlays()}
@@ -695,14 +1138,32 @@ export function KamaInspectorPage() {
                     timeNavigation
                     viewport={chartViewport()}
                     highlightedAnnotation={matchedCandidate()}
+                    stateBands={chartStateBands()}
                     onOracleHoverChange={setHoveredOracle}
                     onViewportChange={updateViewportFromChart}
                     emptyLabel="No analyzed candles"
                   />
                 </div>
+                <Show when={diagnosticSeries().length > 0}>
+                  <div class="mt-3">
+                    <div class="mb-1 flex items-center justify-between gap-3 text-xs text-ink-400">
+                      <span>Signal diagnostics · sampled causal trace · each lane has its own scale</span>
+                      <span>Wheel to zoom · drag to pan</span>
+                    </div>
+                    <div class="h-60">
+                      <IndicatorChart
+                        series={diagnosticSeries()}
+                        start={visibleTimeRange().start}
+                        end={visibleTimeRange().end}
+                        onZoom={zoomViewport}
+                        onPan={panViewport}
+                      />
+                    </div>
+                  </div>
+                </Show>
               </section>
 
-              <section class="panel">
+              <section class="panel mx-auto w-full max-w-7xl">
                 <div class="mb-3 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
                   <div>
                     <div class="muted-label">State comparison</div>
@@ -722,29 +1183,14 @@ export function KamaInspectorPage() {
                     <button class="btn" type="button" onClick={resetViewport}>Reset view</button>
                   </div>
                 </div>
-                <StateStrip
-                  label="Oracle"
-                  points={oracle().points}
-                  start={visibleTimeRange().start}
-                  end={visibleTimeRange().end}
-                  onZoom={zoomViewport}
-                  onPan={panViewport}
-                />
-                <StateStrip
-                  label="Candidate"
-                  points={candidatePoints()}
-                  start={visibleTimeRange().start}
-                  end={visibleTimeRange().end}
-                  onZoom={zoomViewport}
-                  onPan={panViewport}
-                />
-                <div class="ml-[96px] text-xs text-ink-400">Wheel to zoom · drag to pan · synchronized with the price chart</div>
                 <div class="mt-4 overflow-auto">
                   <table class="w-full min-w-190 border-collapse">
                     <thead>
                       <tr>
                         <th class="table-head">Candidate time</th>
                         <th class="table-head">Candidate action</th>
+                        <th class="table-head">{parameters().agreementMode === "confidence" ? "Confidence" : "Equity target"}</th>
+                        <th class="table-head" title="Weighted acceleration/overextension confirmation applied to this signal.">Quality</th>
                         <th class="table-head">Matched oracle</th>
                         <th class="table-head">Oracle action</th>
                         <th class="table-head" title="Candidate time minus oracle time; positive means the candidate was later.">Time offset</th>
@@ -753,12 +1199,14 @@ export function KamaInspectorPage() {
                     </thead>
                     <tbody>
                       <For each={visibleComparisons().slice(0, 120)} fallback={
-                        <tr><td class="td-cell text-ink-300" colSpan={6}>No candidate or oracle transitions in this window.</td></tr>
+                        <tr><td class="td-cell text-ink-300" colSpan={8}>No candidate or oracle transitions in this window.</td></tr>
                       }>
                         {(row) => (
                           <tr>
                             <td class="td-cell">{formatDateTime(row.candidate?.time)}</td>
                             <td class={`td-cell ${stateText(row.candidate?.state)}`}>{row.candidate ? stateAction(row.candidate) : "missed"}</td>
+                            <td class="td-cell">{row.candidate ? ratioPercent(row.candidate.sizeFraction) : "-"}</td>
+                            <td class="td-cell" title={row.candidate ? `Acceleration ${formatQuote(row.candidate.acceleration, 3)} · overextension ${formatQuote(row.candidate.overextension, 3)} · EMA ${formatQuote(row.candidate.emaRate, 2)} bps/h · RSI ${formatQuote(row.candidate.rsi, 1)} · DMI ${formatQuote(row.candidate.dmi, 1)} · ADX ${formatQuote(row.candidate.adx, 1)}` : undefined}>{row.candidate ? ratioPercent(row.candidate.quality) : "-"}</td>
                             <td class="td-cell">{formatDateTime(row.oracle?.time)}</td>
                             <td class={`td-cell ${stateText(row.oracle?.state)}`}>{row.oracle ? stateAction(row.oracle) : "extra candidate"}</td>
                             <td class="td-cell">{row.candidate && row.oracle ? signedDuration(row.candidate.time - row.oracle.time) : "-"}</td>
@@ -773,6 +1221,7 @@ export function KamaInspectorPage() {
             </>
           )}
         </Show>
+        </div>
       </div>
     </main>
   );
@@ -804,6 +1253,7 @@ function InspectorNumber(props: {
   label: string;
   value: number;
   min?: number;
+  max?: number;
   step?: number;
   onInput: (value: number) => void;
 }) {
@@ -815,6 +1265,7 @@ function InspectorNumber(props: {
         type="number"
         value={props.value}
         min={props.min}
+        max={props.max}
         step={props.step ?? "any"}
         onInput={(event) => {
           const value = Number(event.currentTarget.value);
@@ -864,103 +1315,6 @@ function ScoreCard(props: { label: string; value: string; description: string })
   );
 }
 
-function StateStrip(props: {
-  label: string;
-  points: BacktestOraclePoint[];
-  start: number;
-  end: number;
-  onZoom: (scale: number, anchor: number) => void;
-  onPan: (fraction: number) => void;
-}) {
-  let canvas!: HTMLCanvasElement;
-  let observer: ResizeObserver | undefined;
-  let drag: { pointerId: number; x: number } | undefined;
-  const [dragging, setDragging] = createSignal(false);
-  const draw = () => {
-    if (!canvas) return;
-    const width = Math.max(1, canvas.clientWidth);
-    const height = Math.max(1, canvas.clientHeight);
-    const ratio = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(width * ratio);
-    canvas.height = Math.floor(height * ratio);
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    context.scale(ratio, ratio);
-    context.clearRect(0, 0, width, height);
-    for (const segment of stateSegments(props.points, props.start, props.end)) {
-      const left = (segment.start - props.start) / Math.max(1, props.end - props.start) * width;
-      const right = (segment.end - props.start) / Math.max(1, props.end - props.start) * width;
-      context.fillStyle = stateColor(segment.state);
-      context.fillRect(left, 0, Math.max(1, right - left), height);
-      if (right - left < 28) continue;
-      context.fillStyle = segment.state === "flat" ? "#e5e7eb" : "#071018";
-      context.font = "600 10px Inter, sans-serif";
-      context.textAlign = "center";
-      context.textBaseline = "middle";
-      context.fillText(segment.state.slice(0, 1).toUpperCase(), (left + right) / 2, height / 2);
-    }
-  };
-  onMount(() => {
-    observer = new ResizeObserver(draw);
-    observer.observe(canvas);
-    draw();
-  });
-  onCleanup(() => observer?.disconnect());
-  createEffect(() => {
-    props.points;
-    props.start;
-    props.end;
-    draw();
-  });
-  const handleWheel = (event: WheelEvent) => {
-    event.preventDefault();
-    const bounds = canvas.getBoundingClientRect();
-    if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
-      props.onPan((event.deltaX || event.deltaY) / Math.max(1, bounds.width));
-      return;
-    }
-    const anchor = clamp((event.clientX - bounds.left) / Math.max(1, bounds.width), 0, 1);
-    props.onZoom(Math.exp(Math.sign(event.deltaY) * 0.18), anchor);
-  };
-  const handlePointerDown = (event: PointerEvent) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    drag = { pointerId: event.pointerId, x: event.clientX };
-    setDragging(true);
-    canvas.setPointerCapture(event.pointerId);
-  };
-  const handlePointerMove = (event: PointerEvent) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    event.preventDefault();
-    const distance = drag.x - event.clientX;
-    drag.x = event.clientX;
-    props.onPan(distance / Math.max(1, canvas.clientWidth));
-  };
-  const handlePointerUp = (event: PointerEvent) => {
-    if (!drag || event.pointerId !== drag.pointerId) return;
-    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-    drag = undefined;
-    setDragging(false);
-  };
-  return (
-    <div class="mb-3 grid grid-cols-[84px_minmax(0,1fr)] items-center gap-3">
-      <div class="text-xs font-semibold text-ink-300">{props.label}</div>
-      <canvas
-        class="h-8 w-full rounded-2 border border-line bg-ink-800"
-        classList={{ "cursor-grab": !dragging(), "cursor-grabbing": dragging() }}
-        ref={canvas}
-        title="Wheel to zoom. Drag to pan."
-        style={{ "touch-action": "none" }}
-        onPointerCancel={handlePointerUp}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onWheel={handleWheel}
-      />
-    </div>
-  );
-}
-
 function ErrorNotice(props: { message: string; onRetry?: () => void }) {
   return (
     <div class="flex items-center justify-between gap-3 rounded-2 border border-loss/50 bg-loss/10 px-3 py-2 text-sm text-loss">
@@ -968,6 +1322,16 @@ function ErrorNotice(props: { message: string; onRetry?: () => void }) {
       <Show when={props.onRetry}><button class="btn" type="button" onClick={props.onRetry}>Retry</button></Show>
     </div>
   );
+}
+
+function normalizeScoreWeights(weights: ScoreWeights): ScoreWeights {
+  const total = weights.f1 + weights.agreement + weights.cleanliness;
+  if (!(total > 0)) return { ...defaultScoreWeights };
+  return {
+    f1: weights.f1 / total,
+    agreement: weights.agreement / total,
+    cleanliness: weights.cleanliness / total,
+  };
 }
 
 function EmptyResult(props: { loading: boolean }) {
@@ -983,10 +1347,10 @@ function candidateAnnotations(points: VwKamaTransition[]): BacktestChartAnnotati
     time: point.time,
     price: point.price,
     kind: transitionSide(point) === "buy" ? "buy-signal" : "sell-signal",
-    label: `KAMA ${point.fromState} → ${point.state}`,
+    label: `KAMA ${point.fromState} → ${point.state} · ${ratioPercent(point.sizeFraction)} · Q ${ratioPercent(point.quality)}`,
     reason: point.matchedTime === null
-      ? `Volume-weighted KAMA candidate: ${stateAction(point)} · unmatched`
-      : `Volume-weighted KAMA candidate: ${stateAction(point)} · matched oracle ${signedDuration(point.lagMs ?? 0)}`,
+      ? `Quality ${ratioPercent(point.quality)} · acceleration ${formatQuote(point.acceleration, 3)} · overextension ${formatQuote(point.overextension, 3)} · EMA ${formatQuote(point.emaRate, 2)} bps/h · RSI ${formatQuote(point.rsi, 1)} · DMI/ADX ${formatQuote(point.dmi, 1)}/${formatQuote(point.adx, 1)} · unmatched`
+      : `Quality ${ratioPercent(point.quality)} · acceleration ${formatQuote(point.acceleration, 3)} · overextension ${formatQuote(point.overextension, 3)} · EMA ${formatQuote(point.emaRate, 2)} bps/h · RSI ${formatQuote(point.rsi, 1)} · DMI/ADX ${formatQuote(point.dmi, 1)}/${formatQuote(point.adx, 1)} · matched oracle ${signedDuration(point.lagMs ?? 0)}`,
     signalState: point.state,
   }));
 }
@@ -1012,16 +1376,30 @@ function transitionSide(point: Pick<BacktestOraclePoint, "fromState" | "state">)
 }
 
 function presetOption(preset: VwKamaPreset): { value: string; label: string } {
-  const score = preset.score === undefined ? "" : ` · ${ratioPercent(preset.score)}`;
+  const value = preset.score ?? preset.historicalScore;
+  const version = preset.score === undefined && value !== undefined
+    ? ` v${preset.scoreVersion ?? "?"}`
+    : "";
+  const score = value === undefined ? "" : ` · ${ratioPercent(value)}${version}`;
   return { value: preset.id, label: `${preset.label}${score}` };
 }
 
 function rankedPresetLabel(
-  preset: VwKamaPreset & { score: number },
+  preset: VwKamaPreset & { score: number; historical: boolean },
   catalog: VwKamaInspectorCatalog | undefined,
 ): string {
   const window = catalog?.windows.find((item) => item.id === preset.windowId);
-  return `${window?.label ?? preset.windowId ?? "Unknown window"} · ${formatDuration(preset.intervalMs ?? 0)} · ${ratioPercent(preset.score)}`;
+  const version = preset.historical ? ` v${preset.scoreVersion ?? "?"}` : "";
+  return `${window?.label ?? preset.windowId ?? "Unknown window"} · ${formatDuration(preset.intervalMs ?? 0)} · ${ratioPercent(preset.score)}${version}`;
+}
+
+function presetWindowName(
+  preset: VwKamaPreset,
+  catalog: VwKamaInspectorCatalog | undefined,
+): string {
+  return catalog?.windows.find((item) => item.id === preset.windowId)?.label
+    ?? preset.windowId
+    ?? "Unknown window";
 }
 
 async function fetchAnalysis(
@@ -1039,26 +1417,17 @@ async function fetchAnalysis(
   return payload as VwKamaInspectorResponse;
 }
 
-function stateSegments(points: BacktestOraclePoint[], start: number, end: number) {
-  if (end <= start || points.length === 0) return [];
-  const ordered = points.slice().sort((left, right) => left.time - right.time);
-  let state: OracleState = ordered.filter((point) => point.time <= start).at(-1)?.state ?? "flat";
-  let cursor = start;
-  const segments: Array<{ state: OracleState; start: number; end: number; width: number }> = [];
-  for (const point of ordered) {
-    if (point.time <= start) continue;
-    if (point.time >= end) break;
-    if (point.state === state) continue;
-    segments.push({ state, start: cursor, end: point.time, width: (point.time - cursor) / (end - start) * 100 });
-    cursor = point.time;
-    state = point.state;
-  }
-  segments.push({ state, start: cursor, end, width: (end - cursor) / (end - start) * 100 });
-  return segments;
-}
-
 function ratioPercent(value: number): string {
   return `${formatQuote(value * 100, 2)}%`;
+}
+
+function medianValue(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1]! + sorted[middle]!) / 2
+    : sorted[middle]!;
 }
 
 function formatNoiseRatio(value: number | null): string {
@@ -1076,10 +1445,6 @@ function exposure(state: OracleState): number {
 function stateAction(point: Pick<BacktestOraclePoint, "fromState" | "state">): string {
   return point.state === "flat" ? "go flat" : point.fromState === "flat"
     ? `go ${point.state}` : `switch ${point.state}`;
-}
-
-function stateColor(state: OracleState): string {
-  return state === "long" ? "#22c55e" : state === "short" ? "#f05252" : "#4b5563";
 }
 
 function stateText(state: OracleState | undefined): string {
@@ -1140,6 +1505,44 @@ function candleViewport(candles: Candle[], range: TimeRange): CandleChartViewpor
     else high = middle;
   }
   return inspectorViewport({ start, end: Math.max(start + 1, low) }, candles.length);
+}
+
+type NumericIndicatorKey = Exclude<keyof VwKamaIndicatorPoint, "time">;
+
+function priceIndicatorLine(
+  points: VwKamaIndicatorPoint[],
+  key: NumericIndicatorKey,
+  label: string,
+  color: string,
+  windowMs: number,
+): BacktestChartSmaSeries {
+  return {
+    index: -1,
+    windowSec: windowMs / 1_000,
+    label,
+    color,
+    points: points
+      .map((point) => ({ time: point.time, value: point[key] }))
+      .filter((point) => Number.isFinite(point.value)),
+  };
+}
+
+function diagnosticLine(
+  points: VwKamaIndicatorPoint[],
+  key: NumericIndicatorKey,
+  label: string,
+  color: string,
+  options: Omit<IndicatorChartSeries, "id" | "label" | "color" | "points"> = {},
+): IndicatorChartSeries {
+  return {
+    id: key,
+    label,
+    color,
+    points: points
+      .map((point) => ({ time: point.time, value: point[key] }))
+      .filter((point) => Number.isFinite(point.value)),
+    ...options,
+  };
 }
 
 function mergeDetailCandles(

@@ -28,10 +28,22 @@ interface CandleChartProps {
   overlays?: Partial<CandleChartOverlayVisibility>;
   highlightedPositionId?: string;
   highlightedAnnotation?: BacktestChartAnnotation;
+  stateBands?: CandleChartStateBand[];
   onSelectionChange?: (selection: CandleChartSelection | undefined) => void;
   onExtremumHoverChange?: (extremum: BacktestExtremumTrace | undefined) => void;
   onOracleHoverChange?: (point: BacktestOraclePoint | undefined) => void;
   onViewportChange?: (viewport: CandleChartViewport) => void;
+}
+
+export interface CandleChartStateBandPoint {
+  time: number;
+  state: BacktestOraclePoint["state"];
+  exposure?: number;
+}
+
+export interface CandleChartStateBand {
+  label: string;
+  points: CandleChartStateBandPoint[];
 }
 
 export type CandleChartPriceDisplay = "candles" | "line";
@@ -63,6 +75,8 @@ const MIN_INTERACTIVE_CANDLES = 12;
 const WHEEL_ZOOM_FACTOR = 0.18;
 const MAX_BACKGROUND_ANNOTATION_MARKERS = 360;
 const CANDIDATE_SIGNAL_COLOR = "#a78bfa";
+export const CANDLE_CHART_PLOT_LEFT = 18;
+export const CANDLE_CHART_PLOT_RIGHT = 84;
 
 export function CandleChart(props: CandleChartProps) {
   let canvas!: HTMLCanvasElement;
@@ -160,7 +174,13 @@ export function CandleChart(props: CandleChartProps) {
     const padding = Math.max((max - min) * 0.08, max * 0.0005);
     const priceMin = min - padding;
     const priceMax = max + padding;
-    const plot = getPlotBounds(width, height);
+    const canvasPlot = getPlotBounds(width, height);
+    const stateBands = (props.stateBands ?? []).filter((band) => band.points.length > 0);
+    const stateBandAreaHeight = stateBands.length > 0 ? stateBands.length * 18 + 2 : 0;
+    const plot = {
+      ...canvasPlot,
+      bottom: Math.max(canvasPlot.top + 40, canvasPlot.bottom - stateBandAreaHeight),
+    };
     const plotWidth = plot.right - plot.left;
     const plotHeight = plot.bottom - plot.top;
     const priceToY = (price: number) =>
@@ -170,7 +190,7 @@ export function CandleChart(props: CandleChartProps) {
 
     drawGrid(ctx, width, height, plot, priceMin, priceMax, priceToY);
     drawSignalActivity(ctx, signals, plot, timeToX);
-    drawOracleBands(ctx, oracle, plot, timeToX);
+    if (stateBands.length === 0) drawOracleBands(ctx, oracle, plot, timeToX);
     for (const series of smaSeries) {
       drawLineSeries(ctx, series, plot, priceToY, timeToX);
     }
@@ -242,7 +262,15 @@ export function CandleChart(props: CandleChartProps) {
       drawSelectedCandle(ctx, selectedCandle, selectedTime(), plot, priceToY, timeToX);
     }
     drawAnnotations(ctx, selectedAnnotations, plot, priceToY, timeToX);
-    drawTimeLabels(ctx, candles, plot, timeToX);
+    if (stateBands.length > 0) {
+      drawStateBands(ctx, stateBands, {
+        left: canvasPlot.left,
+        right: canvasPlot.right,
+        top: plot.bottom + 2,
+        bottom: canvasPlot.bottom,
+      }, startTime, endTime);
+    }
+    drawTimeLabels(ctx, candles, canvasPlot, timeToX);
   };
 
   createEffect(() => {
@@ -287,6 +315,7 @@ export function CandleChart(props: CandleChartProps) {
     annotations?.length;
     highlightedAnnotation?.time;
     highlightedAnnotation?.price;
+    props.stateBands?.length;
     trace?.positions.length;
     trace?.orders.length;
     trace?.signals.length;
@@ -660,8 +689,8 @@ function getPlotBounds(width: number, height: number): {
   bottom: number;
 } {
   return {
-    left: 18,
-    right: width - 84,
+    left: CANDLE_CHART_PLOT_LEFT,
+    right: width - CANDLE_CHART_PLOT_RIGHT,
     top: 18,
     bottom: height - 34,
   };
@@ -894,6 +923,113 @@ function drawOracleBands(
   ctx.fillStyle = oracleStateColor(state);
   ctx.fillRect(plot.left + runStart, top, width - runStart, 7);
   ctx.restore();
+}
+
+function drawStateBands(
+  ctx: CanvasRenderingContext2D,
+  bands: CandleChartStateBand[],
+  bounds: { left: number; right: number; top: number; bottom: number },
+  startTime: number,
+  endTime: number,
+): void {
+  if (bands.length === 0 || endTime <= startTime) return;
+  const width = Math.max(1, Math.floor(bounds.right - bounds.left));
+  const rowHeight = Math.max(1, (bounds.bottom - bounds.top) / bands.length);
+  ctx.save();
+  bands.forEach((band, row) => {
+    const top = bounds.top + row * rowHeight;
+    const height = Math.max(1, rowHeight - 2);
+    ctx.fillStyle = "#090a0d";
+    ctx.fillRect(bounds.left, top, width, height);
+    const segments = stateBandSegments(band.points, startTime, endTime);
+    segments.forEach((segment, index) => {
+      const rawLeft = bounds.left + (segment.start - startTime) / (endTime - startTime) * width;
+      const rawRight = bounds.left + (segment.end - startTime) / (endTime - startTime) * width;
+      const left = Math.floor(rawLeft);
+      const right = Math.ceil(rawRight);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = stateBandColor(segment.state);
+      ctx.fillRect(left, top, Math.max(1, right - left), height);
+      if (index > 0) {
+        ctx.strokeStyle = "#090a0d";
+        ctx.globalAlpha = 0.72;
+        ctx.beginPath();
+        ctx.moveTo(left + 0.5, top);
+        ctx.lineTo(left + 0.5, top + height);
+        ctx.stroke();
+      }
+      drawStateBandRunLabel(ctx, segment.state, rawLeft, rawRight, top, height);
+    });
+    if (segments.length === 0) {
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = stateBandColor("flat");
+      ctx.fillRect(bounds.left, top, width, height);
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#aeb6c8";
+    ctx.font = "600 10px Inter, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(band.label, bounds.right + 7, top + height / 2);
+  });
+  ctx.restore();
+}
+
+function stateBandSegments(
+  points: CandleChartStateBandPoint[],
+  startTime: number,
+  endTime: number,
+): Array<{ state: BacktestOraclePoint["state"]; start: number; end: number }> {
+  if (endTime <= startTime) return [];
+  const initial = stateBandPointAtTime(points, startTime);
+  let state = initial?.state ?? "flat";
+  let cursor = startTime;
+  const segments: Array<{ state: BacktestOraclePoint["state"]; start: number; end: number }> = [];
+  for (const point of points) {
+    if (point.time <= startTime) continue;
+    if (point.time >= endTime) break;
+    if (point.state === state) continue;
+    segments.push({ state, start: cursor, end: point.time });
+    cursor = point.time;
+    state = point.state;
+  }
+  segments.push({ state, start: cursor, end: endTime });
+  return segments;
+}
+
+function drawStateBandRunLabel(
+  ctx: CanvasRenderingContext2D,
+  state: BacktestOraclePoint["state"],
+  left: number,
+  right: number,
+  top: number,
+  height: number,
+): void {
+  if (right - left < 26) return;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = state === "flat" ? "#e5e7eb" : "#071018";
+  ctx.font = "600 9px Inter, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(state === "long" ? "L" : state === "short" ? "S" : "F", (left + right) / 2, top + height / 2);
+}
+
+function stateBandPointAtTime(
+  points: CandleChartStateBandPoint[],
+  time: number,
+): CandleChartStateBandPoint | undefined {
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if ((points[middle]?.time ?? Number.POSITIVE_INFINITY) <= time) low = middle + 1;
+    else high = middle;
+  }
+  return low > 0 ? points[low - 1] : undefined;
+}
+
+function stateBandColor(state: BacktestOraclePoint["state"]): string {
+  return state === "long" ? "#22c55e" : state === "short" ? "#f05252" : "#4b5563";
 }
 
 function drawOracleTransitions(

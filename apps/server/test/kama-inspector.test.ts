@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import type { Candle, VwKamaInspectorRequest } from "@trading/bot-algo";
+import { VW_KAMA_SCORE_VERSION, type Candle, type VwKamaInspectorRequest } from "@trading/bot-algo";
 import { KamaInspectorEngine } from "../src/kama-inspector.js";
 
 const WINDOW_ID = "shape-up-low-2024-02";
@@ -100,6 +100,16 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     const analysis = await engine.analyze(analysisRequest());
     assert.equal(analysis.renderIntervalMs, 2_000);
     assert.ok(analysis.candles.length <= 2_000);
+    assert.equal(analysis.indicatorPoints.length, analysis.kamaSeries.points.length);
+    assert.deepEqual(
+      analysis.indicatorPoints.map((point) => point.time),
+      analysis.kamaSeries.points.map((point) => point.time),
+    );
+    assert.ok(analysis.indicatorPoints.every((point) =>
+      Number.isFinite(point.confirmationEma)
+      && Number.isFinite(point.rsi)
+      && Number.isFinite(point.dmi)
+      && Number.isFinite(point.adx)));
     assert.ok(analysis.candles.every((candle) =>
       candle.closeTime - candle.openTime + 1 <= analysis.renderIntervalMs
       && candle.interval === intervalLabel(candle.closeTime - candle.openTime + 1)));
@@ -117,10 +127,20 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
   }
 });
 
-test("KAMA inspector catalogs global and generated per-window presets", async () => {
+test("KAMA inspector catalogs generated global and per-window presets", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "kama-presets-"));
   try {
     await mkdir(path.join(dataDir, "benchmarks"), { recursive: true });
+    await writeFile(path.join(dataDir, "benchmarks", "vw-kama-global-presets.json"), JSON.stringify([{
+      id: "global-score-v3-volume",
+      label: "Global · score-v3 volume finalist",
+      scope: "global",
+      windowId: null,
+      parameters: analysisRequest().parameters,
+      score: 0.6,
+      scoreVersion: VW_KAMA_SCORE_VERSION,
+      source: "Validation-selected global finalist",
+    }]));
     await writeFile(path.join(dataDir, "benchmarks", "vw-kama-window-presets.json"), JSON.stringify([{
       id: "window-shape-up-low-2024-02",
       label: "generated label",
@@ -129,12 +149,41 @@ test("KAMA inspector catalogs global and generated per-window presets", async ()
       intervalMs: 1_000,
       parameters: analysisRequest().parameters,
       score: 0.5,
+      scoreVersion: VW_KAMA_SCORE_VERSION,
+      generatedAt: "2026-07-13T17:15:04.339Z",
+      incumbentScore: 0.45,
+      optimization: {
+        algorithm: "de",
+        population: 2_048,
+        generations: 64,
+        restarts: 2,
+        refinementRounds: 5,
+        elapsedMs: 1_000,
+        hindsight: true,
+      },
+    }, {
+      id: "window-shape-up-low-2024-02-old-score",
+      label: "historical label",
+      scope: "window",
+      windowId: WINDOW_ID,
+      intervalMs: 1_000,
+      parameters: analysisRequest().parameters,
+      score: 0.4,
+      scoreVersion: VW_KAMA_SCORE_VERSION - 1,
     }]));
     const catalog = new KamaInspectorEngine(dataDir).catalog();
-    assert.ok(catalog.presets.some((preset) => preset.scope === "global"));
+    assert.equal(catalog.defaults.intervalMs, 1_000);
+    const global = catalog.presets.find((preset) => preset.id === "global-score-v3-volume");
+    assert.equal(global?.score, 0.6);
+    assert.equal(global?.source, "Validation-selected global finalist");
     const local = catalog.presets.find((preset) => preset.windowId === WINDOW_ID);
     assert.equal(local?.label, "Window best found · Uptrend · low churn · 1s");
     assert.equal(local?.score, 0.5);
+    assert.equal(local?.incumbentScore, 0.45);
+    assert.equal(local?.optimization?.population, 2_048);
+    const historical = catalog.presets.find((preset) => preset.id.endsWith("old-score"));
+    assert.equal(historical?.score, undefined);
+    assert.equal(historical?.historicalScore, 0.4);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

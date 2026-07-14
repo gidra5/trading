@@ -4,11 +4,78 @@ This experiment fits completed-candle KAMA state changes to the close-only perfe
 
 The volume-weighted KAMA uses only information available at the candle close:
 
+`ER move weight_i = (volume_i / EMA(volume)_i) ^ efficiencyVolumePower`
+
+`ER = abs(sum(ER move weight_i * price change_i)) / sum(abs(ER move weight_i * price change_i))`
+
 `effective ER = clamp(ER * relativeVolume ^ volumePower, 0, 1)`
 
 `alpha = (slowAlpha + effective ER * (fastAlpha - slowAlpha)) ^ kamaPower`
 
-`volumePower = 0` is the canonical KAMA control.
+The ER volume EMA includes the current completed candle and no future observations.
+`efficiencyVolumePower = 0` recovers the standard unweighted ER exactly. Setting both
+that power and the post-ER `volumePower` to zero is the canonical KAMA control.
+
+## Fractional signal strength
+
+Accepted buy and sell signals use separate maximum strengths and Gaussian widths:
+
+`signal fraction = side maximum * exp(-0.5 * (VW-KAMA rate / side sigma) ^ 2)`
+
+The rate is the same causal, completed-candle VW-KAMA rate used for the signal. Agreement
+can interpret the resulting strength in two ways:
+
+- `sizing`: a partial position is anchored at its signal price. If
+  `r = current price / signal price`, its marked effective exposure is
+  `f*r/(1-f+f*r)` when long and `-f*r/(1+f-f*r)` when short. Explicit zero and full
+  allocations remain exactly `0` and `±1`.
+- `confidence`: strength remains fixed until the next accepted signal. It is probability
+  mass on the signaled direction, with `1-f` assigned to flat/uncertain. A matching oracle
+  direction earns `f`, oracle-flat earns `1-f`, and the opposite direction earns zero.
+
+The oracle always uses full directional exposure. Optimizer runs may search both agreement
+strategies or restrict them with `--agreement-modes`.
+
+## Causal peak/valley confirmation
+
+The evaluator and optimizer combine causal clues before accepting a directional transition:
+
+`acceleration = smoothed KAMA-rate change / EWMA(abs(KAMA-rate change))`
+
+`overextension = (price / KAMA - 1) / EWMA(abs(price / KAMA - 1))`
+
+They can also use:
+
+- an independent slow price EMA rate, with a countertrend tolerance;
+- RSI direction around 50, with a configurable neutral tolerance;
+- DMI direction (`+DI - -DI`) weighted by how far ADX is above its trend threshold.
+
+ADX supplies strength rather than direction: weak-ADX DMI contributes almost nothing,
+while strong ADX makes aligned or opposing DMI direction matter. For direction `d`
+(`+1` long, `-1` short), the raw confirmation is:
+
+`logistic(bias + acceleration term - overextension term + EMA term + RSI term + ADX-weighted DMI term)`
+
+This rewards acceleration in the proposed direction and penalizes entering after price is
+already extended in that direction. `quality = 1 - mix + mix * rawConfirmation`; quality
+scales the existing Gaussian signal fraction, and an optional minimum-quality floor
+suppresses weak transitions. `mix = 0` returns exactly `quality = 1`, preserving the
+unconfirmed signal and its warmup behavior when the independent EMA gate is also zero.
+
+The EMA gate can additionally penalize countertrend signals independently of the logistic
+mix. At full strength it is a hard gate: an opposing position closes to flat, then the
+candidate waits for EMA confirmation before opening the new side. This avoids interpreting
+“ignore a short” as “continue holding long.”
+
+The KAMA state clamp also supports hysteresis. A flat state requires the outer rate
+threshold to enter; an existing direction remains active down to
+`outer threshold * release ratio`, provided the rate still has the same sign. A sign
+reversal releases immediately unless it crosses the opposite outer threshold.
+
+All lookbacks are physical durations converted to samples at each candle scale. All inputs
+use the current or earlier completed candles; centered extrema and future prices are not
+used. This confirmation is currently an inspector/search experiment, not part of the live
+peak/valley strategy.
 
 ## Signal memory
 
@@ -31,13 +98,23 @@ Each transition can appear in only one pair. Unmatched candidate transitions red
 precision, uncovered oracle transitions reduce recall, and timing error is reported only
 for paired transitions.
 
-`case score = 0.6 * timing F1 + 0.3 * path agreement + 0.1 * signal cleanliness`
+`case score = 0.2 * timing F1 + 0.6 * path agreement + 0.2 * signal cleanliness`
 
 `noise/signal ratio = extra candidate transitions / matched candidate transitions`
 
 `signal cleanliness = matched / (matched + extra) = 1 / (1 + noise/signal ratio)`
 
-Path agreement is `1` for equal exposure, `0.5` for flat versus directional, and `0` for opposite exposure. The objective equally weights median and P10 case scores. Fit ranks candidates, validation selects one finalist per family, and only those finalists touch holdout. Defaults are chosen by validation, never holdout.
+Path agreement is the marked fraction overlapping the oracle: `clamp(candidate, 0, 1)`
+for an oracle long, `clamp(-candidate, 0, 1)` for an oracle short, and
+`1 - clamp(abs(candidate), 0, 1)` while the oracle is flat. The objective equally weights
+median and P10 case scores. Fit ranks candidates, validation selects one finalist per
+family, and only those finalists touch holdout. Defaults are chosen by validation, never
+holdout.
+
+The agreement-dominant objective is score version 3. Reports generated under score
+versions 1 or 2 are retained as historical results and are not numerically comparable;
+their configurations remain valid warm starts because every candidate is re-evaluated
+under the current objective.
 
 ## Data
 
@@ -53,11 +130,13 @@ The search loader processes one continuous segment at a time and retains only co
 
 ## Latest scale-general signal search
 
-The current `60% F1 / 30% agreement / 10% cleanliness` differential-evolution
-search used a 256-member population for eight generations across all seven scales.
+The historical score-version-2 `60% F1 / 30% agreement / 10% cleanliness` differential-evolution
+search used a 256-member population for eight generations across all seven scales and
+searched both sizing and confidence agreement strategies.
 It ranked candidates on three fit windows, selected one finalist per family on two
 later validation windows, and read the two holdout windows only for those finalists.
-Validation selected volume-aware candidate `v0182`:
+The full run completed in 32 minutes 58 seconds.
+Validation retained the full-sizing volume-aware baseline `v0182`:
 
 | parameter | value |
 |---|---:|
@@ -78,9 +157,12 @@ Validation selected volume-aware candidate `v0182`:
 | volume `v0182` | 41.39% | 31.74% | 43.61% | 62.93% | 63.83% |
 
 The modest holdout drop is real out-of-sample degradation, not a ranking leak.
+No evolved fractional-sizing or confidence candidate beat the full-sizing baseline on
+validation. Because 100% strength is identical in the two agreement strategies, their
+baseline variants tied and deterministic ID ordering retained `sizing`.
 The inspector now treats `v0182` as the global comparison preset, while the live
 strategy runtime remains unchanged. See the
-[fresh chronological search report](vw-kama-global-60-30-10-de-2026-07-12.md).
+[score-version-2 chronological search report](vw-kama-global-score-v2-de-2026-07-12.md).
 
 ### Historical 60/40 search
 
@@ -136,12 +218,43 @@ The lookback is a physical duration and is converted to samples at each candle s
 same state and snapshot logic is used by the evaluator and live strategy. Static mode is
 exactly the old behavior.
 
-The optimizer now supports differential evolution over continuous parameters and the two
-categorical modes. Each generation is first scored on a configurable subset of windows and
-scales, then the surviving population is evaluated by the full fit/validation/holdout path.
-Independent per-window searches run in a bounded process pool and emit inspector presets.
+The optimizer now uses adaptive current-to-pbest differential evolution over continuous
+parameters and categorical modes. Family, agreement mode, and every confirmation-feature
+combination have explicit islands. Each island retains a small diversity floor; the remaining
+population competes globally, with continuous cross-island migration. Successful mutations
+adapt the island's differential weight and crossover rate. Rotating fit folds reduce repeated
+screening cost, periodic full-fit generations populate a hall of fame, and shrinking local
+perturbations refine the final elites.
+
+Generation zero evaluates every warm seed plus an equally large Latin-hypercube pool, then
+selects by 70% score and 30% normalized parameter-space novelty. Nearest-selected novelty is
+updated incrementally, preserving the selection rule without cubic distance recomputation.
+Independent deterministic
+restarts are merged and selected on the full fit set, so the final candidate count remains
+bounded. Candidate/window scores are cached across generations. Candidate evaluation uses a
+persistent bounded process pool with deterministic longest-processing-time shards: KAMA,
+threshold, and confirmation warmups estimate work, then long-lookback genomes are assigned
+first to the least-loaded worker. This avoids correlating Latin-hypercube order with a core;
+bounded single-window searches also retain prepared candles and oracle paths in each worker.
+Structured convergence telemetry records best/median score,
+population diversity, unique candidates, adaptive F/CR, and the active fold for every
+generation. Results are restored to original order before selection.
+
+Search evaluation only warms and updates enabled features. Static-threshold candidates do not
+inherit adaptive-threshold lookback, and disabled acceleration, distance, EMA, RSI, and DMI
+parameters cannot change feed start or score. Full inspector traces still compute diagnostic
+series for display.
+
+The surviving population is evaluated by the full fit/validation/holdout path. Independent
+per-window searches use the same bounded pool at the window level and emit inspector presets.
 They are hindsight upper bounds for diagnosing parameter non-stationarity, not validation
 results suitable for deployment.
+
+`--seed-candidates` warm-starts generation zero from prior fit-result JSONL files and/or
+inspector preset arrays. Exact candidates are deduplicated; volume-aware seeds receive a
+canonical counterpart for a controlled family comparison. A single-window per-window run uses
+the pool for candidate shards; multi-window runs use it for independent windows, avoiding
+nested process pools.
 
 The current 256-member, eight-generation per-window run covered all 28 representative
 windows at `1m`, `5m`, and `15m`. It evaluates 512 evolving family candidates plus five
@@ -169,6 +282,7 @@ objective. Earlier search reports are retained as historical many-to-one results
 not directly comparable.
 
 - [One-to-one 60/40 refined search](vw-kama-one-to-one-60-40-refined-2026-07-12.md)
+- [Score-v2 sizing/confidence global search](vw-kama-global-score-v2-de-2026-07-12.md)
 - [Fresh global 60/30/10 differential-evolution search](vw-kama-global-60-30-10-de-2026-07-12.md)
 - [Per-window differential-evolution comparison](vw-kama-per-window-de-2026-07-12.md)
 - [Exact 1s per-window differential-evolution comparison](vw-kama-per-window-1s-de-2026-07-12.md)

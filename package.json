@@ -15,6 +15,7 @@
     "benchmark:strategies": "tsx scripts/benchmark-strategies.ts",
     "benchmark:sigmoid-sigma": "tsx scripts/benchmark-sigmoid-sigma-fit.ts",
     "search:kama": "tsx scripts/search-volume-weighted-kama.ts",
+    "audit:kama": "tsx scripts/audit-vw-kama-global.ts",
     "fetch:candles": "tsx scripts/fetch-binance-spot-candles.ts",
     "verify:risk": "tsx scripts/verify-bot-risk-paths.ts",
     "backtest:pathologies": "tsx scripts/collect-pathological-backtests.ts",
