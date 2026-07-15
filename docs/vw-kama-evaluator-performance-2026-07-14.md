@@ -11,7 +11,7 @@ The exact search evaluator now:
 - loads and aggregates candles once in the parent process;
 - evaluates dynamic candidate batches with `worker_threads` over the shared data.
 
-The `Float64` object, streaming, and shared-columnar paths produced exactly equal metrics and matched transitions in the regression suite. A separate check over 86,400 real Binance 1-second candles also produced exactly equal metrics and all 31 candidate transitions. GPU screening can therefore use these columns as its input format, but any future `f32` GPU results should be treated as approximate and finalists rescored through this exact CPU path.
+The `Float64` object, streaming, and shared-columnar paths produced exactly equal metrics and matched transitions in the regression suite. A separate check over 86,400 real Binance 1-second candles also produced exactly equal metrics and all 31 candidate transitions. The Float32 CUDA path uses the same columns with small accepted numerical drift. Automatic optimization sends batches of four or more candidates to CUDA and keeps smaller batches on CPU because of the measured throughput crossover; `--accelerator cpu` remains available for exact Float64 runs.
 
 ## Benchmark
 

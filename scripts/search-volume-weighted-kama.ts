@@ -16,6 +16,7 @@ import {
   prepareVwKamaOracle,
   VW_KAMA_SCORE_VERSION,
   vwKamaScore,
+  type VwKamaCandleColumns,
   type VwKamaCandleSeries,
   type VwKamaPreparedOracle,
   type VwKamaPreset,
@@ -24,6 +25,10 @@ import { volumeWeightedKamaWarmupSamples } from "../packages/bot-algo/src/indica
 import { perfectMarginOracle } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { PerfectMarginOracleResult } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { TradingCandle } from "../packages/bot-algo/src/trading-api.js";
+import {
+  evaluateVwKamaCudaBatch,
+  vwKamaCudaStatus,
+} from "../packages/bot-algo/src/vw-kama-cuda.js";
 
 type Family = "volume" | "canonical";
 type Stage = "fit" | "validation" | "test";
@@ -40,6 +45,8 @@ const CONFIRMATION_MASKS = [
 type ConfirmationMask = typeof CONFIRMATION_MASKS[number];
 type SearchAlgorithm = "random" | "de";
 type SearchMode = "standard" | "per-window";
+type Accelerator = "auto" | "cpu" | "cuda";
+type ScoreVersion = 2 | 3;
 
 interface Window { label: string; start: number; end: number }
 interface Range { min: number; max: number }
@@ -65,6 +72,8 @@ interface Args {
   screenWindows: number;
   screenScales: number[];
   workers: number;
+  accelerator: Accelerator;
+  scoreVersion: ScoreVersion;
   seedCandidatePaths: string[];
   presetWindowIds?: string[];
   presetOutputPath: string;
@@ -223,6 +232,10 @@ interface CaseStats {
   days: number;
   absoluteLags: number[];
   signedLags: number[];
+  lagP50Ms?: number | null;
+  lagP90Ms?: number | null;
+  lagP95Ms?: number | null;
+  lagMedianSignedMs?: number | null;
 }
 
 interface AggregateScore {
@@ -282,8 +295,13 @@ const DAY = 86_400_000;
 const HOUR = 3_600_000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const stamp = new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 17);
+// RTX 3060 measurements put the serial-CPU/CUDA crossover between two and four
+// candidates across 5k-60k-candle cases. Keep only genuinely tiny batches on CPU.
+const CUDA_AUTO_MIN_CANDIDATES = 4;
 const searchTelemetry: SearchTelemetry[] = [];
 let candidatePool: CandidatePool | null = null;
+let cudaDeviceReported = false;
+let cudaAutoFailureReported = false;
 const windowJob = process.env.VW_KAMA_WINDOW_JOB;
 const candidateWorker = !isMainThread && workerData?.kind === "vw-kama-candidate";
 
@@ -372,7 +390,7 @@ async function run(config: Args): Promise<void> {
   fs.writeFileSync(config.outputPath, "");
   appendJson(config.outputPath, {
     type: "meta",
-    scoreVersion: VW_KAMA_SCORE_VERSION,
+    scoreVersion: config.scoreVersion,
     generatedAt: new Date(startedAt).toISOString(),
     sourceDir: path.relative(repoRoot, config.sourceDir),
     sourceInterval: formatDuration(config.sourceIntervalMs),
@@ -391,6 +409,7 @@ async function run(config: Args): Promise<void> {
       telemetry: searchTelemetry,
     },
     workers: config.workers,
+    accelerator: config.accelerator,
     warmStart: {
       files: config.seedCandidatePaths.map((file) => path.relative(repoRoot, file)),
       genomes: seeds.length,
@@ -1294,8 +1313,18 @@ async function runPerWindow(
   const existing = loadPresets(config.presetOutputPath);
   const importedSeeds = loadSeedCandidates(config.seedCandidatePaths);
   const singleWindow = windows.length === 1;
+  const cuda = config.accelerator === "cpu" ? null : await vwKamaCudaStatus();
+  if (config.accelerator === "cuda" && !cuda?.available) {
+    throw new Error(`CUDA acceleration was requested but is unavailable: ${cuda?.reason}`);
+  }
+  const serialCudaWindows = !singleWindow && cuda?.available === true;
   const jobs = windows.map((window, index): WindowJob => ({
-    config: { ...config, workers: singleWindow ? config.workers : 1, seed: config.seed + index * 10_007 },
+    config: {
+      ...config,
+      workers: singleWindow || serialCudaWindows ? config.workers : 1,
+      accelerator: singleWindow || serialCudaWindows ? config.accelerator : "cpu",
+      seed: config.seed + index * 10_007,
+    },
     window,
     windowId: config.presetWindowIds?.[index] ?? window.label,
     index,
@@ -1309,9 +1338,16 @@ async function runPerWindow(
     ]),
     initialOnlySeeds: importedSeeds.length > 0,
   }));
-  const grouped = config.workers === 1 || singleWindow
-    ? await Promise.all(jobs.map(optimizeWindow))
-    : await parallelMap(jobs, Math.min(config.workers, jobs.length), runWindowWorker);
+  let grouped: Awaited<ReturnType<typeof optimizeWindow>>[];
+  if (serialCudaWindows) {
+    console.error(`Per-window CUDA: serializing ${jobs.length} optimizations through ${cuda.device}.`);
+    grouped = [];
+    for (const job of jobs) grouped.push(await optimizeWindow(job));
+  } else {
+    grouped = config.workers === 1 || singleWindow
+      ? await Promise.all(jobs.map(optimizeWindow))
+      : await parallelMap(jobs, Math.min(config.workers, jobs.length), runWindowWorker);
+  }
   const generated = grouped.flat();
   const incumbentScores = new Map<string, number>();
   for (const preset of generated) {
@@ -1327,7 +1363,7 @@ async function runPerWindow(
       [presetCandidate(incumbent)],
       bounds,
       warmupMs,
-      { ...config, scales: [preset.intervalMs] },
+      { ...config, scales: [preset.intervalMs], accelerator: "cpu" },
     );
     const score = evaluated?.cases.find((item) => item.scale === formatDuration(preset.intervalMs));
     if (score) incumbentScores.set(`${preset.windowId}:${preset.intervalMs}`, score.score);
@@ -1361,9 +1397,15 @@ async function runPerWindow(
     "# VW-KAMA per-window optimization",
     "",
     `Generated: ${new Date().toISOString()}`,
-    `Score version: ${VW_KAMA_SCORE_VERSION}`,
+    `Score version: ${config.scoreVersion}`,
     `Algorithm: ${config.algorithm}; ${config.trials} population; ${config.generations} generations × ${config.restarts} restart(s); ${config.refinementRounds} refinement round(s); ${config.scales.map(formatDuration).join(", ")}.`,
-    `Workers: ${config.workers}; ${windows.length === 1 ? "candidate-parallel single-window search" : "parallel window searches"}.`,
+    `Workers: ${config.workers}; ${windows.length === 1
+      ? cuda?.available
+        ? "single-window CUDA candidate batches"
+        : "candidate-parallel single-window CPU search"
+      : serialCudaWindows
+        ? "serial windows with CUDA candidate batches"
+        : "parallel CPU window searches"}.`,
     `Windows: ${windows.map((window, index) => `${config.presetWindowIds?.[index] ?? window.label} (${formatWindow(window)})`).join(", ")}.`,
     config.seedCandidatePaths.length > 0
       ? `Warm start: ${config.seedCandidatePaths.map((file) => `\`${path.relative(repoRoot, file)}\``).join(", ")}.`
@@ -1416,7 +1458,14 @@ async function optimizeWindow(job: WindowJob) {
     job.seeds,
     job.initialOnlySeeds ?? false,
   );
-  const evaluated = await evaluateStageParallel("fit", [window], candidates, bounds, warmupMs, config);
+  const evaluated = await evaluateStageParallel(
+    "fit",
+    [window],
+    candidates,
+    bounds,
+    warmupMs,
+    config,
+  );
   return config.scales.map((intervalMs) => {
     const scale = formatDuration(intervalMs);
     const scored = evaluated.flatMap((result) => {
@@ -1437,7 +1486,7 @@ async function optimizeWindow(job: WindowJob) {
       intervalMs,
       parameters: candidateParameters(best.result.candidate),
       score: round(best.score.score, 6),
-      scoreVersion: VW_KAMA_SCORE_VERSION,
+      scoreVersion: config.scoreVersion,
       source: `${config.algorithm.toUpperCase()} hindsight best; global baseline retained`,
     };
   });
@@ -1622,6 +1671,8 @@ async function evaluateStageParallel(
   warmupMs: number,
   config: Args,
 ): Promise<CandidateResult[]> {
+  const gpu = await evaluateStageCuda(stage, windows, candidates, bounds, warmupMs, config);
+  if (gpu) return gpu;
   const workers = Math.min(config.workers, candidates.length);
   if (workers <= 1 || candidates.length < workers * 4) {
     return evaluateStage(stage, windows, candidates, bounds, warmupMs, config);
@@ -1666,6 +1717,100 @@ async function evaluateStageParallel(
   return (await pool.runAll(jobs))
     .flat()
     .sort((left, right) => order.get(candidateIdentity(left.candidate))! - order.get(candidateIdentity(right.candidate))!);
+}
+
+async function evaluateStageCuda(
+  stage: Stage,
+  windows: Window[],
+  candidates: Candidate[],
+  bounds: { start: number; end: number },
+  warmupMs: number,
+  config: Args,
+): Promise<CandidateResult[] | null> {
+  if (config.accelerator === "cpu" || candidates.length === 0) return null;
+  if (config.accelerator === "auto" && candidates.length < CUDA_AUTO_MIN_CANDIDATES) return null;
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    if (config.accelerator === "cuda") {
+      throw new Error(`CUDA acceleration was requested but is unavailable: ${status.reason}`);
+    }
+    if (!cudaAutoFailureReported) {
+      console.error(`CUDA unavailable; using CPU workers: ${status.reason}`);
+      cudaAutoFailureReported = true;
+    }
+    return null;
+  }
+  if (!cudaDeviceReported) {
+    console.error(
+      `CUDA acceleration: ${status.device}; ${config.accelerator === "cuda"
+        ? "forced for every non-empty batch"
+        : `auto uses batches of ${CUDA_AUTO_MIN_CANDIDATES}+ candidates`}.`,
+    );
+    cudaDeviceReported = true;
+  }
+  const prepared = prepareStageWindow(stage, windows, bounds, warmupMs, config);
+  const grouped = candidates.map(() => new Map<string, CaseStats[]>());
+  const parameters = candidates.map(candidateParameters);
+  let kernelMs = 0;
+  const wallStarted = performance.now();
+  for (const testCase of prepared.cases) {
+    if (Array.isArray(testCase.candles) || !testCase.preparedOracle) {
+      if (config.accelerator === "cuda") {
+        throw new Error("CUDA evaluation requires prepared columnar candles and oracle states.");
+      }
+      return null;
+    }
+    const results = await evaluateVwKamaCudaBatch(
+      testCase.candles as VwKamaCandleColumns,
+      testCase.preparedOracle,
+      parameters,
+      {
+        intervalMs: testCase.scaleMs,
+        scoreStartIndex: testCase.scoreStart,
+        oracleFriction: config.oracleFriction,
+        matchWindowMs: config.matchWindowMs,
+        timingHalfLifeMs: config.timingHalfLifeMs,
+        warmupMultiple: config.warmupMultiple,
+      },
+    );
+    kernelMs += results[0]?.elapsedMs ?? 0;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const result = results[index]!;
+      const parts = grouped[index]!.get(testCase.id) ?? [];
+      parts.push({
+        caseId: testCase.id,
+        scale: formatDuration(testCase.scaleMs),
+        window: testCase.window.label,
+        timingCredit: result.timingCredit,
+        matchedCount: result.matchedCount,
+        signalCount: result.signalCount,
+        oracleCount: result.oracleCount,
+        stateCredit: result.stateCredit,
+        stateCount: result.stateCount,
+        days: testCase.days,
+        absoluteLags: [],
+        signedLags: [],
+        lagP50Ms: result.lagP50Ms,
+        lagP90Ms: result.lagP90Ms,
+        lagP95Ms: result.lagP95Ms,
+        lagMedianSignedMs: result.lagMedianSignedMs,
+      });
+      grouped[index]!.set(testCase.id, parts);
+    }
+  }
+  const results = candidates.map((candidate, index): CandidateResult => {
+    const cases = orderCases(
+      [...grouped[index]!.values()].map((parts) => scoreCase(parts, config.scoreVersion)),
+      windows,
+      config.scales,
+    );
+    return { candidate, stage, aggregate: aggregate(cases), cases };
+  });
+  console.error(
+    `${capitalize(stage)} CUDA: ${candidates.length} candidates × ${prepared.cases.length} segment(s) in `
+    + `${(performance.now() - wallStarted).toFixed(1)} ms (${kernelMs.toFixed(1)} ms kernels).`,
+  );
+  return results;
 }
 
 function estimatedCandidateWork(candidate: Candidate, config: Args): number {
@@ -1882,7 +2027,11 @@ function evaluatePreparedStage(
       parts.push(evaluateCase(candidate, testCase, config));
       grouped.set(testCase.id, parts);
     }
-    const cases = orderCases([...grouped.values()].map(scoreCase), windows, config.scales);
+    const cases = orderCases(
+      [...grouped.values()].map((parts) => scoreCase(parts, config.scoreVersion)),
+      windows,
+      config.scales,
+    );
     if ((index + 1) % progressEvery === 0 || index + 1 === candidates.length) {
       console.error(`${capitalize(stage)} shared: ${index + 1}/${candidates.length} candidates.`);
     }
@@ -2041,7 +2190,7 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
   };
 }
 
-function scoreCase(parts: CaseStats[]): CaseScore {
+function scoreCase(parts: CaseStats[], scoreVersion: ScoreVersion): CaseScore {
   const first = parts[0]!;
   const signalCount = sum(parts.map((part) => part.signalCount));
   const oracleCount = sum(parts.map((part) => part.oracleCount));
@@ -2057,11 +2206,23 @@ function scoreCase(parts: CaseStats[]): CaseScore {
   const days = sum(parts.map((part) => part.days));
   const absoluteLags = parts.flatMap((part) => part.absoluteLags);
   const signedLags = parts.flatMap((part) => part.signedLags);
+  const lagP50Ms = absoluteLags.length > 0
+    ? nullablePercentile(absoluteLags, 0.5)
+    : nullableMedian(parts.map((part) => part.lagP50Ms ?? null));
+  const lagP90Ms = absoluteLags.length > 0
+    ? nullablePercentile(absoluteLags, 0.9)
+    : nullableMedian(parts.map((part) => part.lagP90Ms ?? null));
+  const lagP95Ms = absoluteLags.length > 0
+    ? nullablePercentile(absoluteLags, 0.95)
+    : nullableMedian(parts.map((part) => part.lagP95Ms ?? null));
+  const lagMedianSignedMs = signedLags.length > 0
+    ? nullablePercentile(signedLags, 0.5)
+    : nullableMedian(parts.map((part) => part.lagMedianSignedMs ?? null));
   return {
     caseId: first.caseId,
     scale: first.scale,
     window: first.window,
-    score: vwKamaScore(f1, exposureAgreement, signalCleanliness),
+    score: searchScore(f1, exposureAgreement, signalCleanliness, scoreVersion),
     precision,
     recall,
     f1,
@@ -2071,11 +2232,28 @@ function scoreCase(parts: CaseStats[]): CaseScore {
     noiseSignalRatio: matchedCount > 0 ? extraSignalCount / matchedCount : extraSignalCount > 0 ? null : 0,
     signalCleanliness,
     signalsPerDay: ratio(signalCount, days),
-    lagP50Ms: nullablePercentile(absoluteLags, 0.5),
-    lagP90Ms: nullablePercentile(absoluteLags, 0.9),
-    lagP95Ms: nullablePercentile(absoluteLags, 0.95),
-    lagMedianSignedMs: nullablePercentile(signedLags, 0.5),
+    lagP50Ms,
+    lagP90Ms,
+    lagP95Ms,
+    lagMedianSignedMs,
   };
+}
+
+function searchScore(
+  f1: number,
+  exposureAgreement: number,
+  signalCleanliness: number,
+  scoreVersion: ScoreVersion,
+): number {
+  return scoreVersion === 2
+    ? 0.6 * f1 + 0.3 * exposureAgreement + 0.1 * signalCleanliness
+    : vwKamaScore(f1, exposureAgreement, signalCleanliness);
+}
+
+function scoreWeightsDescription(scoreVersion: ScoreVersion): string {
+  return scoreVersion === 2
+    ? "timing-credited transition F1 60%, sizing/confidence agreement 30%, and signal cleanliness 10%"
+    : "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
 }
 
 function aggregate(scores: CaseScore[]): AggregateScore {
@@ -2537,7 +2715,7 @@ function parseArgs(argv: string[]): Args {
     "mean-reversion-mix-range", "mean-reversion-mean-range",
     "mean-reversion-volatility-range", "mean-reversion-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
-    "screen-scales", "workers", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
+    "screen-scales", "workers", "accelerator", "score-version", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -2556,8 +2734,14 @@ function parseArgs(argv: string[]): Args {
   const reportPath = path.resolve(repoRoot, get("report", `docs/volume-weighted-kama-${stamp}.md`));
   const algorithm = get("algorithm", "de");
   const mode = get("mode", "standard");
+  const accelerator = get("accelerator", "auto");
+  const scoreVersion = integer(get("score-version", String(VW_KAMA_SCORE_VERSION)), "score-version");
   if (algorithm !== "random" && algorithm !== "de") throw new Error("--algorithm must be random or de.");
   if (mode !== "standard" && mode !== "per-window") throw new Error("--mode must be standard or per-window.");
+  if (accelerator !== "auto" && accelerator !== "cpu" && accelerator !== "cuda") {
+    throw new Error("--accelerator must be auto, cpu, or cuda.");
+  }
+  if (scoreVersion !== 2 && scoreVersion !== 3) throw new Error("--score-version must be 2 or 3.");
   const agreementModes = unique(get("agreement-modes", "sizing,confidence").split(","));
   if (agreementModes.length === 0 || agreementModes.some((value) => value !== "sizing" && value !== "confidence")) {
     throw new Error("--agreement-modes must contain sizing and/or confidence.");
@@ -2594,6 +2778,8 @@ function parseArgs(argv: string[]): Args {
     screenWindows: integer(get("screen-windows", "1"), "screen-windows"),
     screenScales: unique(get("screen-scales", "1m,15m").split(",").map(parseDuration)).sort((a, b) => a - b),
     workers: integer(get("workers", String(Math.max(1, Math.min(12, availableParallelism() - 4)))), "workers"),
+    accelerator,
+    scoreVersion,
     seedCandidatePaths: values.has("seed-candidates")
       ? values.get("seed-candidates")!.split(",").filter(Boolean).map((file) => path.resolve(repoRoot, file))
       : [],
@@ -2812,7 +2998,7 @@ function report(
     "# Volume-weighted KAMA oracle approximation search",
     "",
     `Generated: ${new Date().toISOString()}`,
-    `Score version: ${VW_KAMA_SCORE_VERSION}`,
+    `Score version: ${config.scoreVersion}`,
     `Raw results: \`${path.relative(repoRoot, config.outputPath)}\``,
     "",
     "The fit ranking never reads validation or holdout scores. The best validated volume-aware and canonical (both volume powers are zero) candidates are the only candidates evaluated on holdout.",
@@ -2830,7 +3016,7 @@ function report(
     "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A causal volatility-normalized distance-from-EMA regime blends the local trend direction into its countertrend direction as mean-reversion strength rises. A causal logistic confirmation combines KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scales or filters the signal. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
     `- Signal memory: after the first signal, a candidate state change emits only when the current close is strictly more than ${round(config.oracleFriction * 10_000, 3)} bps from the last emitted signal price; rejected changes retain the prior state. This is the same friction used by the oracle.`,
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
-    "- Case score weights timing-credited transition F1 20%, the selected sizing/confidence agreement 60%, and signal cleanliness 20%. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched. Trading returns are neither computed nor ranked.",
+    `- Case score weights ${scoreWeightsDescription(config.scoreVersion)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched. Trading returns are neither computed nor ranked.`,
     "- Candidate objective equally weights the median and P10 case score; every scale/window case has equal weight.",
     "",
     "## Holdout finalists",
@@ -2952,6 +3138,8 @@ function help(): void {
   --confirmation-masks base,acceleration,ema,rsi,dmi,all
   --differential-weight 0.75 --crossover-rate 0.8 --immigrant-rate 0.08
   --workers 12                      Candidate shards for global search; window shards in per-window mode
+  --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
+  --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version (2 or 3)
   --seed-candidates FILE,...        Put prior fit JSONL/preset candidates in generation zero
   --screen-windows 1 --screen-scales 1m,15m   Cheap early-pruning stage
   --efficiency-range 1m..2h         Duration ranges become sample counts per scale

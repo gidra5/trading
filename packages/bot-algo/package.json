@@ -20,5 +20,8 @@
   },
   "devDependencies": {
     "tsx": "^4.19.2"
+  },
+  "dependencies": {
+    "koffi": "^3.1.1"
   }
 }
