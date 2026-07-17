@@ -1,5 +1,6 @@
 export interface ExposureValueOracleOptions {
   scoreStartIndex: number;
+  horizonSteps?: number;
   friction: number;
   gridSize: number;
   temperature: number;
@@ -14,6 +15,7 @@ export interface ExposureValueOracleOptions {
 
 export interface ExposureValueOracle {
   scoreStartIndex: number;
+  horizonSteps: number;
   grid: Float64Array;
   means: Float32Array;
   secondMoments: Float32Array;
@@ -68,65 +70,104 @@ export interface ExposureValueDistillationMetrics extends ExposureValueDistillat
 }
 
 const INVALID_VALUE_TEMPERATURES = 50;
+const HOUR_MS = 3_600_000;
+
+export interface StrategyExposureTemperatureOptions {
+  intervalMs: number;
+  horizonSteps: number;
+  temperature: number;
+  scaleByVolatility?: boolean;
+}
 
 /**
  * Builds p_t(a) ∝ exp(Q_t(a) / temperature) over a fixed exposure grid.
  *
- * Q_t(a) forces exposure a for the next price move, then follows the optimal
- * friction-aware policy. Portfolio value is homogeneous, so the Bellman state
- * needs only the current marked exposure rather than absolute equity.
+ * Q_t(a) keeps target exposure a for H price moves, then follows the optimal
+ * friction-aware policy. Keeping the target fixed includes the intermediate
+ * rebalances needed to undo price drift. Portfolio value is homogeneous, so
+ * the Bellman state needs only the current marked exposure rather than equity.
  */
 export function prepareExposureValueOracle(
   prices: ArrayLike<number>,
   options: ExposureValueOracleOptions,
   shared = false,
 ): ExposureValueOracle {
-  validateOracleOptions(prices, options);
-  const minExposure = options.minExposure ?? -1;
-  const maxExposure = options.maxExposure ?? 1;
-  const grid = float64(options.gridSize, shared);
-  for (let index = 0; index < grid.length; index += 1) {
-    grid[index] = minExposure + index / (grid.length - 1) * (maxExposure - minExposure);
-  }
-  const means = float32(prices.length, shared);
-  const secondMoments = float32(prices.length, shared);
-  const modalExposures = float32(prices.length, shared);
-  const optimalExposures = float32(prices.length, shared);
-  const entropies = float32(prices.length, shared);
-  const weights = float32(prices.length, shared);
-  const opportunities = float32(prices.length, shared);
-  const probabilities = options.includeProbabilities
-    ? float32(prices.length * grid.length, shared)
-    : undefined;
+  const oracle = createExposureValueOracleStorage(prices, options, shared);
+  const {
+    grid,
+    means,
+    secondMoments,
+    modalExposures,
+    optimalExposures,
+    entropies,
+    weights,
+    opportunities,
+    probabilities,
+    execution,
+  } = oracle;
+  const horizonSteps = oracle.horizonSteps;
   const opportunityEpsilon = Math.max(0, options.opportunityEpsilon ?? 1e-6);
-  const execution: ExposureExecutionOptions = {
-    friction: Math.max(0, options.friction),
-    minExposure,
-    maxExposure,
-    quoteLendRate: options.quoteLendRate ?? 0,
-    quoteBorrowRate: options.quoteBorrowRate ?? 0,
-    assetBorrowRate: options.assetBorrowRate ?? 0,
-  };
-  let continuation = new Float64Array(grid.length);
   const forcedValues = new Float64Array(grid.length);
-  let nextContinuation = new Float64Array(grid.length);
+  const continuationRing = Array.from(
+    { length: Math.min(prices.length, horizonSteps + 1) },
+    () => new Float64Array(grid.length),
+  );
+  const rollingValues = new Float64Array(grid.length);
+  const rollingInvalidCounts = new Int32Array(grid.length);
   const policy = new Uint16Array(prices.length * grid.length);
 
   for (let time = prices.length - 1; time >= options.scoreStartIndex; time -= 1) {
     if (time === prices.length - 1) {
       forcedValues.fill(0);
     } else {
-      const price = prices[time]!;
-      const nextPrice = prices[time + 1]!;
+      const endpointTime = Math.min(prices.length - 1, time + horizonSteps);
+      const endpointContinuation = continuationRing[
+        endpointTime % continuationRing.length
+      ]!;
+      const endpointMove = endpointTime - 1;
       for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
-        forcedValues[exposureIndex] = forcedExposureValue(
-          grid[exposureIndex]!,
-          price,
-          nextPrice,
-          continuation,
-          grid,
+        const exposure = grid[exposureIndex]!;
+        let rolling = rollingValues[exposureIndex]!;
+        let invalidCount = rollingInvalidCounts[exposureIndex]!;
+        if (time + 1 < prices.length - 1) {
+          const removedFirst = holdingLogValue(exposure, time + 1, prices, execution);
+          if (Number.isFinite(removedFirst)) rolling -= removedFirst;
+          else invalidCount -= 1;
+          const addedContinuation = continuedHoldingLogValue(
+            exposure,
+            time + 1,
+            prices,
+            execution,
+          );
+          if (Number.isFinite(addedContinuation)) rolling += addedContinuation;
+          else invalidCount += 1;
+        }
+        const removedTime = time + horizonSteps;
+        if (removedTime < prices.length - 1) {
+          const removedContinuation = continuedHoldingLogValue(
+            exposure,
+            removedTime,
+            prices,
+            execution,
+          );
+          if (Number.isFinite(removedContinuation)) rolling -= removedContinuation;
+          else invalidCount -= 1;
+        }
+        const addedFirst = holdingLogValue(exposure, time, prices, execution);
+        if (Number.isFinite(addedFirst)) rolling += addedFirst;
+        else invalidCount += 1;
+        rollingValues[exposureIndex] = rolling;
+        rollingInvalidCounts[exposureIndex] = invalidCount;
+
+        const endpointOutcome = holdingOutcome(
+          exposure,
+          prices[endpointMove]!,
+          prices[endpointTime]!,
           execution,
         );
+        forcedValues[exposureIndex] = invalidCount === 0
+          ? rolling + interpolate(endpointContinuation, grid, endpointOutcome.exposure)
+          : Number.NEGATIVE_INFINITY;
       }
     }
 
@@ -139,7 +180,9 @@ export function prepareExposureValueOracle(
     opportunities[time] = statistics.opportunity;
     weights[time] = statistics.opportunity + opportunityEpsilon;
 
+    const timeContinuation = continuationRing[time % continuationRing.length]!;
     if (time === prices.length - 1) {
+      timeContinuation.fill(0);
       for (let currentIndex = 0; currentIndex < grid.length; currentIndex += 1) {
         policy[time * grid.length + currentIndex] = currentIndex;
       }
@@ -162,46 +205,81 @@ export function prepareExposureValueOracle(
           bestTargetIndex = targetIndex;
         }
       }
-      nextContinuation[currentIndex] = best;
+      timeContinuation[currentIndex] = best;
       policy[time * grid.length + currentIndex] = bestTargetIndex;
     }
-    [continuation, nextContinuation] = [nextContinuation, continuation];
   }
 
   let currentExposure = 0;
+  let target = 0;
+  let remainingHoldSteps = 0;
   for (let time = options.scoreStartIndex; time < prices.length; time += 1) {
-    const currentIndex = Math.round(clamp(
-      (currentExposure - grid[0]!) / (grid[grid.length - 1]! - grid[0]!) * (grid.length - 1),
-      0,
-      grid.length - 1,
-    ));
-    const target = grid[policy[time * grid.length + currentIndex]!]!;
+    if (remainingHoldSteps === 0) {
+      const currentIndex = Math.round(clamp(
+        (currentExposure - grid[0]!) / (grid[grid.length - 1]! - grid[0]!) * (grid.length - 1),
+        0,
+        grid.length - 1,
+      ));
+      target = grid[policy[time * grid.length + currentIndex]!]!;
+      remainingHoldSteps = Math.min(horizonSteps, prices.length - 1 - time);
+    }
     optimalExposures[time] = target;
     if (time + 1 >= prices.length) continue;
     const rebalance = rebalanceEquityFactor(currentExposure, target, execution.friction);
     currentExposure = rebalance > 0
       ? holdingOutcome(target, prices[time]!, prices[time + 1]!, execution).exposure
       : 0;
+    remainingHoldSteps -= 1;
   }
 
+  return oracle;
+}
+
+/** Allocate and validate an oracle result without running the Bellman recurrence. */
+export function createExposureValueOracleStorage(
+  prices: ArrayLike<number>,
+  options: ExposureValueOracleOptions,
+  shared = false,
+): ExposureValueOracle {
+  validateExposureValueOracleOptions(prices, options);
+  const minExposure = options.minExposure ?? -1;
+  const maxExposure = options.maxExposure ?? 1;
+  // Retain the selected H for temperature scaling and reporting. The Bellman
+  // recurrence truncates each hold at the available segment tail itself.
+  const horizonSteps = options.horizonSteps ?? 1;
+  const grid = float64(options.gridSize, shared);
+  for (let index = 0; index < grid.length; index += 1) {
+    grid[index] = minExposure + index / (grid.length - 1) * (maxExposure - minExposure);
+  }
   return {
     scoreStartIndex: options.scoreStartIndex,
+    horizonSteps,
     grid,
-    means,
-    secondMoments,
-    modalExposures,
-    optimalExposures,
-    entropies,
-    weights,
-    opportunities,
-    probabilities,
-    execution,
+    means: float32(prices.length, shared),
+    secondMoments: float32(prices.length, shared),
+    modalExposures: float32(prices.length, shared),
+    optimalExposures: float32(prices.length, shared),
+    entropies: float32(prices.length, shared),
+    weights: float32(prices.length, shared),
+    opportunities: float32(prices.length, shared),
+    ...(options.includeProbabilities
+      ? { probabilities: float32(prices.length * grid.length, shared) }
+      : {}),
+    execution: {
+      friction: Math.max(0, options.friction),
+      minExposure,
+      maxExposure,
+      quoteLendRate: options.quoteLendRate ?? 0,
+      quoteBorrowRate: options.quoteBorrowRate ?? 0,
+      assetBorrowRate: options.assetBorrowRate ?? 0,
+    },
   };
 }
 
 export function shareExposureValueOracle(oracle: ExposureValueOracle): ExposureValueOracle {
   return {
     scoreStartIndex: oracle.scoreStartIndex,
+    horizonSteps: oracle.horizonSteps,
     grid: sharedCopy(oracle.grid),
     means: sharedCopy(oracle.means),
     secondMoments: sharedCopy(oracle.secondMoments),
@@ -245,19 +323,18 @@ export function exposureValueOracleProbabilities(
 
 export function strategyExposureProbabilities(
   grid: ArrayLike<number>,
-  strategyExposure: number,
-  strategySigma: number,
+  rateBpsPerHour: number,
+  horizonMs: number,
+  temperature: number,
 ): Float64Array {
-  if (grid.length < 2 || !Number.isFinite(strategyExposure)
-    || !Number.isFinite(strategySigma) || strategySigma <= 0) {
-    throw new Error("Strategy exposure distribution requires a grid, finite exposure, and positive sigma.");
+  if (grid.length < 2) {
+    throw new Error("Strategy exposure distribution requires at least two grid points.");
   }
-  const center = clamp(strategyExposure, grid[0]!, grid[grid.length - 1]!);
-  const inverseTwoVariance = 1 / (2 * strategySigma * strategySigma);
+  const slope = strategyExposureLogSlope(rateBpsPerHour, horizonMs, temperature);
   const probabilities = new Float64Array(grid.length);
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < grid.length; index += 1) {
-    const logWeight = -((grid[index]! - center) ** 2) * inverseTwoVariance;
+    const logWeight = slope * grid[index]!;
     probabilities[index] = logWeight;
     maximum = Math.max(maximum, logWeight);
   }
@@ -271,6 +348,87 @@ export function strategyExposureProbabilities(
     probabilities[index] /= total;
   }
   return probabilities;
+}
+
+/**
+ * Converts the signed KAMA rate into the natural parameter of a truncated
+ * exponential exposure distribution: s(a) ∝ exp(slope * a).
+ */
+export function strategyExposureLogSlope(
+  rateBpsPerHour: number,
+  horizonMs: number,
+  temperature: number,
+): number {
+  if (!Number.isFinite(rateBpsPerHour) || !Number.isFinite(horizonMs) || horizonMs <= 0
+    || !Number.isFinite(temperature) || temperature <= 0) {
+    throw new Error("Strategy exposure distribution requires finite rate and positive timing temperature.");
+  }
+  const expectedLogReturn = rateBpsPerHour / 10_000 * horizonMs / HOUR_MS;
+  return expectedLogReturn / temperature;
+}
+
+/**
+ * Builds causal per-candle temperatures for an H-step value horizon. Temperature
+ * scales by sqrt(H / dt), which is sqrt(horizonSteps). Optional volatility is
+ * the unannualized population standard deviation of simple close returns over
+ * the same trailing H-step interval.
+ */
+export function strategyExposureTemperatures(
+  prices: ArrayLike<number>,
+  options: StrategyExposureTemperatureOptions,
+  shared = false,
+): Float32Array {
+  if (!Number.isFinite(options.intervalMs) || options.intervalMs <= 0
+    || !Number.isInteger(options.horizonSteps) || options.horizonSteps < 1
+    || !Number.isFinite(options.temperature) || options.temperature <= 0
+  ) {
+    throw new Error("Strategy exposure temperature configuration is invalid.");
+  }
+  const base = options.temperature * Math.sqrt(options.horizonSteps);
+  const result = float32(prices.length, shared);
+  if (!options.scaleByVolatility) {
+    result.fill(base);
+    return result;
+  }
+
+  const capacity = options.horizonSteps;
+  const returns = new Float64Array(capacity);
+  let position = 0;
+  let count = 0;
+  let sum = 0;
+  let sumSquares = 0;
+  for (let index = 0; index < prices.length; index += 1) {
+    const price = prices[index]!;
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error("Strategy exposure volatility requires positive finite prices.");
+    }
+    if (index > 0) {
+      const previous = prices[index - 1]!;
+      if (!Number.isFinite(previous) || previous <= 0) {
+        throw new Error("Strategy exposure volatility requires positive finite prices.");
+      }
+      const value = price / previous - 1;
+      if (count === capacity) {
+        const removed = returns[position]!;
+        sum -= removed;
+        sumSquares -= removed * removed;
+      } else {
+        count += 1;
+      }
+      returns[position] = value;
+      position = (position + 1) % capacity;
+      sum += value;
+      sumSquares += value * value;
+    }
+    if (count === 0) {
+      result[index] = base;
+      continue;
+    }
+    const mean = sum / count;
+    const volatility = Math.sqrt(Math.max(0, sumSquares / count - mean * mean));
+    result[index] = base * Math.max(Number.EPSILON, volatility);
+  }
+  return result;
 }
 
 export function createExposureReturnAccumulator(): ExposureReturnAccumulator {
@@ -343,28 +501,27 @@ export function observeExposureValueDistillation(
   accumulator: ExposureValueDistillationAccumulator,
   oracle: ExposureValueOracle,
   candleIndex: number,
-  strategyExposure: number,
-  strategySigma: number,
+  rateBpsPerHour: number,
+  intervalMs: number,
+  temperature: number,
 ): void {
   if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) return;
-  if (!Number.isFinite(strategyExposure) || !Number.isFinite(strategySigma) || strategySigma <= 0) {
-    throw new Error("Exposure value distillation requires finite exposure and positive strategy sigma.");
-  }
-  const center = clamp(strategyExposure, oracle.grid[0]!, oracle.grid[oracle.grid.length - 1]!);
-  const inverseTwoVariance = 1 / (2 * strategySigma * strategySigma);
+  const slope = strategyExposureLogSlope(
+    rateBpsPerHour,
+    intervalMs * oracle.horizonSteps,
+    temperature,
+  );
   let maximumLogWeight = Number.NEGATIVE_INFINITY;
   for (const exposure of oracle.grid) {
-    maximumLogWeight = Math.max(maximumLogWeight, -((exposure - center) ** 2) * inverseTwoVariance);
+    maximumLogWeight = Math.max(maximumLogWeight, slope * exposure);
   }
   let normalizer = 0;
   for (const exposure of oracle.grid) {
-    normalizer += Math.exp(-((exposure - center) ** 2) * inverseTwoVariance - maximumLogWeight);
+    normalizer += Math.exp(slope * exposure - maximumLogWeight);
   }
   const logNormalizer = maximumLogWeight + Math.log(normalizer);
   const mean = oracle.means[candleIndex]!;
-  const secondMoment = oracle.secondMoments[candleIndex]!;
-  const expectedSquaredDistance = Math.max(0, secondMoment - 2 * center * mean + center * center);
-  const crossEntropy = logNormalizer + expectedSquaredDistance * inverseTwoVariance;
+  const crossEntropy = Math.max(0, logNormalizer - slope * mean);
   const weight = oracle.weights[candleIndex]!;
   accumulator.weightedCrossEntropy += weight * crossEntropy;
   accumulator.weightedOracleEntropy += weight * oracle.entropies[candleIndex]!;
@@ -409,17 +566,28 @@ export function rebalanceEquityFactor(fromExposure: number, toExposure: number, 
   return 1 - fee * -difference / denominator;
 }
 
-function forcedExposureValue(
+function holdingLogValue(
   exposure: number,
-  price: number,
-  nextPrice: number,
-  continuation: Float64Array,
-  grid: Float64Array,
+  time: number,
+  prices: ArrayLike<number>,
   options: ExposureExecutionOptions,
 ): number {
-  const outcome = holdingOutcome(exposure, price, nextPrice, options);
+  const outcome = holdingOutcome(exposure, prices[time]!, prices[time + 1]!, options);
   if (!(outcome.equityFactor > 0)) return Number.NEGATIVE_INFINITY;
-  return Math.log(outcome.equityFactor) + interpolate(continuation, grid, outcome.exposure);
+  return Math.log(outcome.equityFactor);
+}
+
+function continuedHoldingLogValue(
+  exposure: number,
+  time: number,
+  prices: ArrayLike<number>,
+  options: ExposureExecutionOptions,
+): number {
+  const previous = holdingOutcome(exposure, prices[time - 1]!, prices[time]!, options);
+  const rebalance = rebalanceEquityFactor(previous.exposure, exposure, options.friction);
+  const outcome = holdingOutcome(exposure, prices[time]!, prices[time + 1]!, options);
+  if (!(rebalance > 0) || !(outcome.equityFactor > 0)) return Number.NEGATIVE_INFINITY;
+  return Math.log(rebalance) + Math.log(outcome.equityFactor);
 }
 
 function preferenceStatistics(
@@ -536,7 +704,10 @@ function interpolate(values: Float64Array, grid: Float64Array, exposure: number)
   return left * (1 - fraction) + right * fraction;
 }
 
-function validateOracleOptions(prices: ArrayLike<number>, options: ExposureValueOracleOptions): void {
+export function validateExposureValueOracleOptions(
+  prices: ArrayLike<number>,
+  options: ExposureValueOracleOptions,
+): void {
   if (prices.length < 2) {
     throw new Error("Exposure value oracle requires at least two positive finite prices.");
   }
@@ -553,6 +724,9 @@ function validateOracleOptions(prices: ArrayLike<number>, options: ExposureValue
   }
   if (!Number.isInteger(options.gridSize) || options.gridSize < 3 || options.gridSize > 65_535) {
     throw new Error("Exposure value oracle grid size must be an integer from three to 65,535.");
+  }
+  if (!Number.isInteger(options.horizonSteps ?? 1) || (options.horizonSteps ?? 1) < 1) {
+    throw new Error("Exposure value oracle horizon must be a positive integer number of steps.");
   }
   const minimum = options.minExposure ?? -1;
   const maximum = options.maxExposure ?? 1;

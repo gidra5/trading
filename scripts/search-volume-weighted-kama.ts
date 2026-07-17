@@ -14,25 +14,32 @@ import {
   exposureValueOracleBytes,
   prepareExposureValueOracle,
   shareExposureValueOracle,
+  strategyExposureTemperatures,
   type ExposureValueOracle,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
   prepareVwKamaOracle,
+  resolveVwKamaValueHorizonSteps,
   VW_KAMA_SCORE_VERSION,
+  vwKamaParametersFromPeakValleySignal,
   vwKamaScore,
   type VwKamaCandleColumns,
   type VwKamaCandleSeries,
   type VwKamaPreparedOracle,
   type VwKamaPreset,
+  type VwKamaValueHorizonMode,
 } from "../packages/bot-algo/src/kama-signal-evaluator.js";
+import { createPeakValleyStrategyConfig } from "../packages/bot-algo/src/peak-valley-strategy.js";
 import { volumeWeightedKamaWarmupSamples } from "../packages/bot-algo/src/indicators.js";
 import { perfectMarginOracle } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { PerfectMarginOracleResult } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { TradingCandle } from "../packages/bot-algo/src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
+  prepareExposureValueOracleCuda,
+  VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE,
   vwKamaCudaStatus,
 } from "../packages/bot-algo/src/vw-kama-cuda.js";
 
@@ -53,6 +60,7 @@ type SearchMode = "standard" | "per-window";
 type Accelerator = "auto" | "cpu" | "cuda";
 type SearchObjective = "signal" | "value-distillation";
 type ScoreVersion = typeof VW_KAMA_SCORE_VERSION;
+type ValueOracleBackend = "cpu" | "cuda";
 
 interface Window { label: string; start: number; end: number }
 interface Range { min: number; max: number }
@@ -84,8 +92,11 @@ interface Args {
   exposureGridSize: number;
   exposureMinimum: number;
   exposureMaximum: number;
+  valueHorizonMode: VwKamaValueHorizonMode;
+  valueHorizonMs: number;
   oracleTemperature: number;
-  strategySigma: number;
+  strategyTemperature: number;
+  strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
   quoteBorrowRate: number;
@@ -158,11 +169,17 @@ interface Candidate {
   volumeMs: number;
   volumeCap: number;
   volumePower: number;
+  rateMode?: "relative" | "log";
+  rateEmaMs?: number;
   deadbandBpsHour: number;
   deadbandMode: DeadbandMode;
   hysteresisReleaseRatio: number;
   thresholdLookbackMs: number;
+  thresholdNoiseResponse?: "proportional" | "inverse";
   thresholdNoiseMultiplier: number;
+  thresholdInverseMaxBpsHour?: number;
+  thresholdInverseNoiseScaleBpsHour?: number;
+  signalFrictionFraction?: number;
   buyMaxFraction: number;
   sellMaxFraction: number;
   buySizingSigmaBpsHour: number;
@@ -205,6 +222,8 @@ interface CaseData {
   oracle?: PerfectMarginOracleResult;
   preparedOracle?: VwKamaPreparedOracle;
   valueOracle?: ExposureValueOracle;
+  strategyTemperatures?: Float32Array;
+  valueHorizonMs?: number;
   days: number;
 }
 
@@ -214,6 +233,8 @@ interface PreparedStageWindow {
   segmentCount: number;
   cases: CaseData[];
   bytes: number;
+  valueOracleBackend: ValueOracleBackend;
+  valueOracleKernelMs: number;
 }
 
 interface CaseScore {
@@ -227,6 +248,7 @@ interface CaseScore {
   valueDistillationKl: number | null;
   oracleEntropy: number | null;
   meanOpportunity: number | null;
+  valueHorizonMs: number | null;
   strategyReturn: number | null;
   oracleReturn: number | null;
   strategyMaxDrawdown: number | null;
@@ -265,6 +287,7 @@ interface CaseStats {
   distillationWeight?: number;
   distillationOpportunity?: number;
   distillationSamples?: number;
+  valueHorizonMs?: number;
   strategyFinalEquity?: number;
   oracleFinalEquity?: number;
   strategyMaxDrawdown?: number;
@@ -465,8 +488,11 @@ async function run(config: Args): Promise<void> {
     valueDistillation: {
       exposureGridSize: config.exposureGridSize,
       exposureRange: [config.exposureMinimum, config.exposureMaximum],
+      horizonMode: config.valueHorizonMode,
+      horizonMs: config.valueHorizonMs,
       oracleTemperature: config.oracleTemperature,
-      strategySigma: config.strategySigma,
+      strategyTemperature: config.strategyTemperature,
+      strategyVolatilityScaling: config.strategyVolatilityScaling,
       opportunityWeight: `max(Q)-min(Q)+${config.opportunityEpsilon}`,
       quoteLendRate: config.quoteLendRate,
       quoteBorrowRate: config.quoteBorrowRate,
@@ -538,14 +564,17 @@ async function run(config: Args): Promise<void> {
       meanReversionVolatility: formatRange(config.meanReversionVolatility, formatDuration),
       meanReversionReversalThreshold: formatRange(config.meanReversionReversalThreshold),
     },
-    selection: "fit rank -> validation finalist per family -> finalists-only holdout",
+    selection: "fit rank -> validation finalist per family -> finalists plus fixed production signal baseline on holdout",
     matching: "chronological one-to-one target-state alignment maximizing timing credit",
   });
 
   const fit = await evaluateStageParallel("fit", windows.fit, candidates, bounds, maxWarmupMs, config);
   for (const result of fit) appendResult(config.outputPath, result, false);
-  const fitTop = (["volume", "canonical"] as const).flatMap((family) =>
-    rank(fit.filter((result) => result.candidate.family === family)).slice(0, config.top));
+  const fitTop = dedupeCandidateResults([
+    ...(["volume", "canonical"] as const).flatMap((family) =>
+      rank(fit.filter((result) => result.candidate.family === family)).slice(0, config.top)),
+    ...fit.filter((result) => result.candidate.id === "production-current"),
+  ]);
   const validation = await evaluateStageParallel(
     "validation",
     windows.validation,
@@ -560,10 +589,16 @@ async function run(config: Args): Promise<void> {
     if (!selected) throw new Error(`No ${family} validation finalist.`);
     return selected;
   });
+  const testCandidates = dedupeCandidates([
+    ...finalists.map((result) => result.candidate),
+    ...validation
+      .filter((result) => result.candidate.id === "production-current")
+      .map((result) => result.candidate),
+  ]);
   const test = await evaluateStageParallel(
     "test",
     windows.test,
-    finalists.map((result) => result.candidate),
+    testCandidates,
     bounds,
     maxWarmupMs,
     config,
@@ -618,8 +653,11 @@ function writeGlobalPresets(
         gridSize: config.exposureGridSize,
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
+        horizonMode: config.valueHorizonMode,
+        horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
-        strategySigma: config.strategySigma,
+        strategyTemperature: config.strategyTemperature,
+        strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
@@ -647,7 +685,7 @@ async function searchCandidates(
 ): Promise<Candidate[]> {
   seeds = dedupeSeedCandidates(seeds.flatMap((candidate) =>
     config.agreementModes.map((agreementMode) => ({ ...candidate, agreementMode }))));
-  if (config.algorithm === "random") return [...globalCandidates(config.agreementModes), ...seeds, ...generateCandidates(config)];
+  if (config.algorithm === "random") return [...globalCandidates(config.agreementModes, config.oracleFriction), ...seeds, ...generateCandidates(config)];
   const screenConfig = {
     ...config,
     scales: config.screenScales.filter((scale) => config.scales.includes(scale)),
@@ -694,7 +732,7 @@ async function searchCandidates(
   );
   const candidates = selected.map(memberCandidate);
   return [
-    ...globalCandidates(config.agreementModes),
+    ...globalCandidates(config.agreementModes, config.oracleFriction),
     ...candidates,
   ];
 }
@@ -1517,8 +1555,11 @@ async function runPerWindow(
         gridSize: config.exposureGridSize,
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
+        horizonMode: config.valueHorizonMode,
+        horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
-        strategySigma: config.strategySigma,
+        strategyTemperature: config.strategyTemperature,
+        strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
@@ -1713,6 +1754,14 @@ function dedupeSeedCandidates(candidates: Candidate[]): Candidate[] {
     .map((candidate, index) => ({ ...candidate, id: `warm-${String(index + 1).padStart(4, "0")}` }));
 }
 
+function dedupeCandidates(candidates: Candidate[]): Candidate[] {
+  return [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
+}
+
+function dedupeCandidateResults(results: CandidateResult[]): CandidateResult[] {
+  return [...new Map(results.map((result) => [result.candidate.id, result])).values()];
+}
+
 function seedPairKey(candidate: Candidate): string {
   return JSON.stringify({
     ...candidateParameters(candidate),
@@ -1829,7 +1878,7 @@ async function evaluateStageParallel(
   if (workers <= 1 || candidates.length < workers * 4) {
     return evaluateStage(stage, windows, candidates, bounds, warmupMs, config);
   }
-  const prepared = prepareStageWindow(stage, windows, bounds, warmupMs, config);
+  const prepared = await prepareStageWindow(stage, windows, bounds, warmupMs, config);
   const batchCount = Math.min(candidates.length, workers * 4);
   const shards = Array.from({ length: batchCount }, (): Candidate[] => []);
   const loads = Array.from({ length: batchCount }, () => 0);
@@ -1900,7 +1949,7 @@ async function evaluateStageCuda(
     );
     cudaDeviceReported = true;
   }
-  const prepared = prepareStageWindow(stage, windows, bounds, warmupMs, config);
+  const prepared = await prepareStageWindow(stage, windows, bounds, warmupMs, config);
   const grouped = candidates.map(() => new Map<string, CaseStats[]>());
   const parameters = candidates.map(candidateParameters);
   let kernelMs = 0;
@@ -1924,7 +1973,12 @@ async function evaluateStageCuda(
         timingHalfLifeMs: config.timingHalfLifeMs,
         warmupMultiple: config.warmupMultiple,
         valueDistillation: testCase.valueOracle
-          ? { oracle: testCase.valueOracle, strategySigma: config.strategySigma }
+          ? {
+              oracle: testCase.valueOracle,
+              strategyTemperature: config.strategyTemperature,
+              strategyVolatilityScaling: config.strategyVolatilityScaling,
+              strategyTemperatures: testCase.strategyTemperatures,
+            }
           : undefined,
       },
     );
@@ -1947,6 +2001,7 @@ async function evaluateStageCuda(
         distillationWeight: result.distillationWeight,
         distillationOpportunity: result.distillationOpportunity,
         distillationSamples: testCase.valueOracle ? result.stateCount : 0,
+        valueHorizonMs: testCase.valueHorizonMs,
         strategyFinalEquity: testCase.valueOracle ? result.strategyFinalEquity : undefined,
         oracleFinalEquity: testCase.valueOracle ? result.oracleFinalEquity : undefined,
         strategyMaxDrawdown: testCase.valueOracle ? result.strategyMaxDrawdown : undefined,
@@ -2090,15 +2145,15 @@ function closeCandidatePool(): void {
   candidatePool = null;
 }
 
-function evaluateStage(
+async function evaluateStage(
   stage: Stage,
   windows: Window[],
   candidates: Candidate[],
   bounds: { start: number; end: number },
   warmupMs: number,
   config: Args,
-): CandidateResult[] {
-  const prepared = prepareStageWindow(stage, windows, bounds, warmupMs, config);
+): Promise<CandidateResult[]> {
+  const prepared = await prepareStageWindow(stage, windows, bounds, warmupMs, config);
   return evaluatePreparedStage(stage, windows, candidates, prepared, config);
 }
 
@@ -2106,13 +2161,16 @@ const preparedStageCache = new Map<string, PreparedStageWindow>();
 const MAX_PREPARED_BYTES = 1_500_000_000;
 let preparedStageBytes = 0;
 
-function prepareStageWindow(
+async function prepareStageWindow(
   stage: Stage,
   windows: Window[],
   bounds: { start: number; end: number },
   warmupMs: number,
   config: Args,
-): PreparedStageWindow {
+  forcedValueOracleBackend?: ValueOracleBackend,
+): Promise<PreparedStageWindow> {
+  const valueOracleBackend = forcedValueOracleBackend
+    ?? await resolveValueOracleBackend(config);
   const key = JSON.stringify({
     stage,
     sourceDir: config.sourceDir,
@@ -2125,11 +2183,16 @@ function prepareStageWindow(
     exposureGridSize: config.exposureGridSize,
     exposureMinimum: config.exposureMinimum,
     exposureMaximum: config.exposureMaximum,
+    valueHorizonMode: config.valueHorizonMode,
+    valueHorizonMs: config.valueHorizonMs,
     oracleTemperature: config.oracleTemperature,
+    strategyTemperature: config.strategyTemperature,
+    strategyVolatilityScaling: config.strategyVolatilityScaling,
     opportunityEpsilon: config.opportunityEpsilon,
     quoteLendRate: config.quoteLendRate,
     quoteBorrowRate: config.quoteBorrowRate,
     assetBorrowRate: config.assetBorrowRate,
+    valueOracleBackend,
   });
   const cached = preparedStageCache.get(key);
   if (cached) {
@@ -2143,40 +2206,65 @@ function prepareStageWindow(
     segmentCount: 0,
     cases: [],
     bytes: 0,
+    valueOracleBackend,
+    valueOracleKernelMs: 0,
   };
-  for (const window of windows) {
-    const sourceStart = Math.max(bounds.start, window.start - warmupMs);
-    for (const source of loadSourceSegments(config.sourceDir, {
-      start: sourceStart,
-      end: window.end,
-    }, config.sourceIntervalMs)) {
-      prepared.sourceCount += source.length;
-      const cases = buildCases(stage, [window], config.scales, source, warmupMs, config, false);
-      if (cases.length === 0) continue;
-      prepared.segmentCount += 1;
-      for (const testCase of cases) {
-        const candles = columnarVwKamaCandles(testCase.candles as TradingCandle[], true);
-        const preparedOracle = prepareVwKamaOracle(
-          candles,
-          testCase.scoreStart,
-          testCase.oracle!,
-          true,
+  try {
+    for (const window of windows) {
+      const sourceStart = Math.max(bounds.start, window.start - warmupMs);
+      for (const source of loadSourceSegments(config.sourceDir, {
+        start: sourceStart,
+        end: window.end,
+      }, config.sourceIntervalMs)) {
+        prepared.sourceCount += source.length;
+        const built = await buildCases(
+          stage,
+          [window],
+          config.scales,
+          source,
+          warmupMs,
+          config,
+          valueOracleBackend,
+          false,
         );
-        const valueOracle = testCase.valueOracle
-          ? shareExposureValueOracle(testCase.valueOracle)
-          : undefined;
-        prepared.bytes += candleColumnBytes(candles)
-          + preparedOracle.stateCodes.byteLength
-          + (valueOracle ? exposureValueOracleBytes(valueOracle) : 0);
-        prepared.cases.push({
-          ...testCase,
-          candles,
-          oracle: undefined,
-          preparedOracle,
-          valueOracle,
-        });
+        if (built.cases.length === 0) continue;
+        prepared.segmentCount += 1;
+        prepared.valueOracleKernelMs += built.valueOracleKernelMs;
+        for (const testCase of built.cases) {
+          const candles = columnarVwKamaCandles(testCase.candles as TradingCandle[], true);
+          const preparedOracle = prepareVwKamaOracle(
+            candles,
+            testCase.scoreStart,
+            testCase.oracle!,
+            true,
+          );
+          const valueOracle = testCase.valueOracle
+            ? shareExposureValueOracle(testCase.valueOracle)
+            : undefined;
+          const strategyTemperatures = testCase.strategyTemperatures;
+          prepared.bytes += candleColumnBytes(candles)
+            + preparedOracle.stateCodes.byteLength
+            + (valueOracle ? exposureValueOracleBytes(valueOracle) : 0)
+            + (strategyTemperatures?.byteLength ?? 0);
+          prepared.cases.push({
+            ...testCase,
+            candles,
+            oracle: undefined,
+            preparedOracle,
+            valueOracle,
+            strategyTemperatures,
+          });
+        }
       }
     }
+  } catch (error) {
+    if (valueOracleBackend === "cuda" && config.accelerator === "auto") {
+      console.error(
+        `CUDA value-oracle preparation failed; retrying on CPU: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return prepareStageWindow(stage, windows, bounds, warmupMs, config, "cpu");
+    }
+    throw error;
   }
   if (prepared.cases.length === 0) {
     throw new Error(`Insufficient continuous candles for ${windows.map((item) => item.label).join(", ")}.`);
@@ -2189,12 +2277,38 @@ function prepareStageWindow(
   }
   preparedStageCache.set(key, prepared);
   preparedStageBytes += prepared.bytes;
+  const resolvedHorizons = prepared.cases.flatMap((item) => item.valueHorizonMs === undefined
+    ? []
+    : [item.valueHorizonMs]);
+  const horizonLabel = resolvedHorizons.length === 0
+    ? ""
+    : `; resolved H ${formatDuration(Math.min(...resolvedHorizons))}${Math.min(...resolvedHorizons) === Math.max(...resolvedHorizons)
+      ? ""
+      : `..${formatDuration(Math.max(...resolvedHorizons))}`}`;
   console.error(
     `${capitalize(stage)} prepared ${windows.map((item) => item.label).join(", ")}: `
     + `${prepared.sourceCount.toLocaleString()} source candles, ${prepared.segmentCount} segment(s), `
-    + `${formatBytes(prepared.bytes)} shared columns; cached for subsequent generations.`,
+    + `${formatBytes(prepared.bytes)} shared columns; value oracle ${prepared.valueOracleBackend.toUpperCase()}`
+    + `${prepared.valueOracleBackend === "cuda"
+      ? ` (${prepared.valueOracleKernelMs.toFixed(1)} ms kernels)`
+      : ""}${horizonLabel}; cached for subsequent generations.`,
   );
   return prepared;
+}
+
+async function resolveValueOracleBackend(config: Args): Promise<ValueOracleBackend> {
+  if (config.objective === "value-distillation"
+    && config.accelerator === "cuda"
+    && config.exposureGridSize > 1_024) {
+    throw new Error("CUDA value-oracle preparation supports at most 1,024 exposure grid points.");
+  }
+  if (config.objective !== "value-distillation"
+    || config.accelerator === "cpu"
+    || config.exposureGridSize > 1_024
+    || (config.accelerator === "auto"
+      && config.exposureGridSize < VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE)) return "cpu";
+  const status = await vwKamaCudaStatus();
+  return status.available ? "cuda" : "cpu";
 }
 
 function evaluatePreparedStage(
@@ -2252,67 +2366,108 @@ function orderCases(cases: CaseScore[], windows: Window[], scales: number[]): Ca
     - (order.get(right.caseId) ?? Number.MAX_SAFE_INTEGER));
 }
 
-function buildCases(
+async function buildCases(
   stage: Stage,
   windows: Window[],
   scales: number[],
   source: TradingCandle[],
   warmupMs: number,
   config: Args,
+  valueOracleBackend: ValueOracleBackend,
   required = true,
-): CaseData[] {
-  return scales.flatMap((scaleMs) => windows.flatMap((window) => {
-    const relevant = source.filter((candle) =>
-      candle.openTime >= window.start - warmupMs && candle.openTime < window.end);
-    const segments = continuousSegments(
-      aggregateCandles(relevant, config.sourceIntervalMs, scaleMs),
-      scaleMs,
-    );
-    const cases = segments.flatMap((candles, segment) => {
-      const scoreAt = Math.max(window.start, (candles[0]?.openTime ?? window.end) + warmupMs);
-      const scoreStart = candles.findIndex((candle) => candle.openTime >= scoreAt);
-      if (scoreStart < 0 || candles.length - scoreStart < 3) return [];
-      const scored = candles.slice(scoreStart).filter((candle) => candle.openTime < window.end);
-      if (scored.length < 3) return [];
-      const caseCandles = candles.slice(0, scoreStart).concat(scored);
-      const oracle = perfectMarginOracle(caseCandles, {
-        startingQuote: 1,
-        leverage: 1,
-        friction: config.oracleFriction,
-        eventMode: "close",
-        maxPathCandles: 1,
-      });
-      const valueOracle = config.objective === "value-distillation"
-        ? prepareExposureValueOracle(caseCandles.map((candle) => candle.close), {
-          scoreStartIndex: scoreStart,
-          friction: config.oracleFriction,
-          gridSize: config.exposureGridSize,
-          minExposure: config.exposureMinimum,
-          maxExposure: config.exposureMaximum,
-          temperature: config.oracleTemperature,
-          opportunityEpsilon: config.opportunityEpsilon,
-          quoteLendRate: config.quoteLendRate,
-          quoteBorrowRate: config.quoteBorrowRate,
-          assetBorrowRate: config.assetBorrowRate,
-        })
-        : undefined;
-      return [{
-        id: `${formatDuration(scaleMs)}:${window.label}`,
-        stage,
+): Promise<{ cases: CaseData[]; valueOracleKernelMs: number }> {
+  const result: CaseData[] = [];
+  let valueOracleKernelMs = 0;
+  for (const scaleMs of scales) {
+    for (const window of windows) {
+      const relevant = source.filter((candle) =>
+        candle.openTime >= window.start - warmupMs && candle.openTime < window.end);
+      const segments = continuousSegments(
+        aggregateCandles(relevant, config.sourceIntervalMs, scaleMs),
         scaleMs,
-        window,
-        candles: caseCandles,
-        scoreStart,
-        oracle,
-        valueOracle,
-        days: Math.max(scaleMs / DAY, scored.length * scaleMs / DAY),
-      }];
-    });
-    if (required && cases.length === 0) {
-      throw new Error(`Insufficient continuous candles for ${window.label} at ${formatDuration(scaleMs)}.`);
+      );
+      const cases: CaseData[] = [];
+      for (const candles of segments) {
+        const scoreAt = Math.max(window.start, (candles[0]?.openTime ?? window.end) + warmupMs);
+        const scoreStart = candles.findIndex((candle) => candle.openTime >= scoreAt);
+        if (scoreStart < 0 || candles.length - scoreStart < 3) continue;
+        const scored = candles.slice(scoreStart).filter((candle) => candle.openTime < window.end);
+        if (scored.length < 3) continue;
+        const caseCandles = candles.slice(0, scoreStart).concat(scored);
+        const oracle = perfectMarginOracle(caseCandles, {
+          startingQuote: 1,
+          leverage: 1,
+          friction: config.oracleFriction,
+          eventMode: "close",
+          maxPathCandles: 1,
+        });
+        let valueOracle: ExposureValueOracle | undefined;
+        let strategyTemperatures: Float32Array | undefined;
+        let valueHorizonMs: number | undefined;
+        if (config.objective === "value-distillation") {
+          const prices = caseCandles.map((candle) => candle.close);
+          const horizonSteps = resolveVwKamaValueHorizonSteps(
+            caseCandles,
+            scoreStart,
+            oracle.stateCodes,
+            scaleMs,
+            { horizonMode: config.valueHorizonMode, horizonMs: config.valueHorizonMs },
+          );
+          valueHorizonMs = horizonSteps * scaleMs;
+          const options = {
+            scoreStartIndex: scoreStart,
+            horizonSteps,
+            friction: config.oracleFriction,
+            gridSize: config.exposureGridSize,
+            minExposure: config.exposureMinimum,
+            maxExposure: config.exposureMaximum,
+            temperature: config.oracleTemperature,
+            opportunityEpsilon: config.opportunityEpsilon,
+            quoteLendRate: config.quoteLendRate,
+            quoteBorrowRate: config.quoteBorrowRate,
+            assetBorrowRate: config.assetBorrowRate,
+          };
+          if (valueOracleBackend === "cuda") {
+            const prepared = await prepareExposureValueOracleCuda(
+              prices,
+              options,
+            );
+            valueOracle = prepared.oracle;
+            valueOracleKernelMs += prepared.kernelMs;
+          } else {
+            valueOracle = prepareExposureValueOracle(
+              prices,
+              options,
+            );
+          }
+          strategyTemperatures = strategyExposureTemperatures(prices, {
+            intervalMs: scaleMs,
+            horizonSteps,
+            temperature: config.strategyTemperature,
+            scaleByVolatility: config.strategyVolatilityScaling,
+          }, true);
+        }
+        cases.push({
+          id: `${formatDuration(scaleMs)}:${window.label}`,
+          stage,
+          scaleMs,
+          window,
+          candles: caseCandles,
+          scoreStart,
+          oracle,
+          valueOracle,
+          strategyTemperatures,
+          valueHorizonMs,
+          days: Math.max(scaleMs / DAY, scored.length * scaleMs / DAY),
+        });
+      }
+      if (required && cases.length === 0) {
+        throw new Error(`Insufficient continuous candles for ${window.label} at ${formatDuration(scaleMs)}.`);
+      }
+      result.push(...cases);
     }
-    return cases;
-  }));
+  }
+  return { cases: result, valueOracleKernelMs };
 }
 
 function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): CaseStats {
@@ -2372,7 +2527,12 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     preparedOracle: testCase.preparedOracle,
     includeTrace: false,
     valueDistillation: testCase.valueOracle
-      ? { oracle: testCase.valueOracle, strategySigma: config.strategySigma }
+      ? {
+          oracle: testCase.valueOracle,
+          strategyTemperature: config.strategyTemperature,
+          strategyVolatilityScaling: config.strategyVolatilityScaling,
+          strategyTemperatures: testCase.strategyTemperatures,
+        }
       : undefined,
   });
   const metrics = result.metrics;
@@ -2396,6 +2556,7 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     distillationWeight: distillation?.weightSum,
     distillationOpportunity: distillation?.opportunitySum,
     distillationSamples: distillation?.sampleCount,
+    valueHorizonMs: testCase.valueHorizonMs,
     strategyFinalEquity: distillation?.returns.strategy.equity,
     oracleFinalEquity: distillation?.returns.oracle.equity,
     strategyMaxDrawdown: distillation?.returns.strategy.maxDrawdown,
@@ -2452,6 +2613,13 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
   const meanOpportunity = distillationSamples > 0
     ? sum(parts.map((part) => part.distillationOpportunity ?? 0)) / distillationSamples
     : null;
+  const horizonSamples = sum(parts.map((part) => part.valueHorizonMs === undefined
+    ? 0
+    : part.distillationSamples ?? 0));
+  const valueHorizonMs = horizonSamples > 0
+    ? sum(parts.map((part) => (part.valueHorizonMs ?? 0) * (part.distillationSamples ?? 0)))
+      / horizonSamples
+    : null;
   const strategyEquities = parts.flatMap((part) => part.strategyFinalEquity === undefined
     ? [] : [part.strategyFinalEquity]);
   const oracleEquities = parts.flatMap((part) => part.oracleFinalEquity === undefined
@@ -2475,6 +2643,7 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
     valueDistillationKl,
     oracleEntropy,
     meanOpportunity,
+    valueHorizonMs,
     strategyReturn,
     oracleReturn,
     strategyMaxDrawdown: strategyDrawdowns.length > 0 ? Math.max(...strategyDrawdowns) : null,
@@ -2546,7 +2715,11 @@ function generateCandidates(config: Args): Candidate[] {
   return candidatesFromGenomes(Array.from({ length: config.trials }, () => randomGenome(config, random)));
 }
 
-function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
+function globalCandidates(agreementModes: AgreementMode[], oracleFriction: number): Candidate[] {
+  const productionSignal = vwKamaParametersFromPeakValleySignal(
+    createPeakValleyStrategyConfig({ kamaSignalFriction: oracleFriction }),
+    oracleFriction,
+  );
   const confirmation = {
     confirmationMix: 0,
     confirmationMinQuality: 0,
@@ -2599,6 +2772,36 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
     ...fullSizing,
     ...threshold,
   };
+  const production: Candidate = {
+    ...confirmation,
+    id: "production-current",
+    family: "canonical",
+    efficiencyMs: productionSignal.efficiencyMs,
+    efficiencyVolumeEmaMs: productionSignal.efficiencyVolumeEmaMs!,
+    efficiencyVolumePower: productionSignal.efficiencyVolumePower ?? 0,
+    fastMs: productionSignal.fastMs,
+    slowMs: productionSignal.slowMs,
+    power: productionSignal.power,
+    volumeMs: productionSignal.volumeMs,
+    volumeCap: productionSignal.volumeCap,
+    volumePower: productionSignal.volumePower,
+    rateMode: productionSignal.rateMode,
+    rateEmaMs: productionSignal.rateEmaMs,
+    deadbandBpsHour: productionSignal.deadbandBpsHour,
+    deadbandMode: productionSignal.deadbandMode,
+    hysteresisReleaseRatio: productionSignal.hysteresisReleaseRatio ?? 0,
+    thresholdLookbackMs: productionSignal.thresholdLookbackMs ?? HOUR,
+    thresholdNoiseResponse: productionSignal.thresholdNoiseResponse,
+    thresholdNoiseMultiplier: productionSignal.thresholdNoiseMultiplier ?? 0,
+    thresholdInverseMaxBpsHour: productionSignal.thresholdInverseMaxBpsHour,
+    thresholdInverseNoiseScaleBpsHour: productionSignal.thresholdInverseNoiseScaleBpsHour,
+    signalFrictionFraction: productionSignal.signalFrictionFraction,
+    buyMaxFraction: productionSignal.buyMaxFraction ?? 1,
+    sellMaxFraction: productionSignal.sellMaxFraction ?? 1,
+    buySizingSigmaBpsHour: 1e12,
+    sellSizingSigmaBpsHour: 1e12,
+    agreementMode: "sizing",
+  };
   const candidates: Candidate[] = [
     {
       id: "global-clean-v0182",
@@ -2632,29 +2835,17 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
       thresholdNoiseMultiplier: 0,
       ...fullSizing,
     },
-    {
-      id: "global-runtime-k0021",
-      family: "canonical",
-      efficiencyMs: 14 * 60_000,
-      fastMs: 28 * 60_000,
-      slowMs: 153 * 60_000,
-      power: 0.49045,
-      volumeMs: 130 * 60_000,
-      volumeCap: 2.65003,
-      volumePower: 0,
-      deadbandBpsHour: 67.56654,
-      deadbandMode: "flat",
-      ...fullSizing,
-      ...threshold,
-    },
     { id: "global-refined-v0016", family: "volume", volumePower: 1.72738, ...refined },
     { id: "global-refined-k0016", family: "canonical", volumePower: 0, ...refined },
   ];
-  return agreementModes.flatMap((agreementMode) => candidates.map((candidate) => ({
-    ...candidate,
-    id: agreementMode === "sizing" ? candidate.id : `${candidate.id}-confidence`,
-    agreementMode,
-  })));
+  return [
+    production,
+    ...agreementModes.flatMap((agreementMode) => candidates.map((candidate) => ({
+      ...candidate,
+      id: agreementMode === "sizing" ? candidate.id : `${candidate.id}-confidence`,
+      agreementMode,
+    }))),
+  ];
 }
 
 function randomGenome(config: Args, random: () => number): Genome {
@@ -2746,11 +2937,17 @@ function candidateParameters(candidate: Candidate) {
     volumeMs: candidate.volumeMs,
     volumeCap: candidate.volumeCap,
     volumePower: candidate.volumePower,
+    rateMode: candidate.rateMode,
+    rateEmaMs: candidate.rateEmaMs,
     deadbandBpsHour: candidate.deadbandBpsHour,
     deadbandMode: candidate.deadbandMode,
     hysteresisReleaseRatio: candidate.hysteresisReleaseRatio,
     thresholdLookbackMs: candidate.thresholdLookbackMs,
+    thresholdNoiseResponse: candidate.thresholdNoiseResponse,
     thresholdNoiseMultiplier: candidate.thresholdNoiseMultiplier,
+    thresholdInverseMaxBpsHour: candidate.thresholdInverseMaxBpsHour,
+    thresholdInverseNoiseScaleBpsHour: candidate.thresholdInverseNoiseScaleBpsHour,
+    signalFrictionFraction: candidate.signalFrictionFraction,
     buyMaxFraction: candidate.buyMaxFraction,
     sellMaxFraction: candidate.sellMaxFraction,
     buySizingSigmaBpsHour: candidate.buySizingSigmaBpsHour,
@@ -2999,8 +3196,9 @@ function parseArgs(argv: string[]): Args {
     "mean-reversion-volatility-range", "mean-reversion-reversal-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
     "screen-scales", "workers", "accelerator", "objective", "score-version",
-    "exposure-grid-size", "exposure-min", "exposure-max", "oracle-temperature",
-    "strategy-sigma", "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
+    "exposure-grid-size", "exposure-min", "exposure-max", "value-horizon-mode", "value-horizon", "oracle-temperature",
+    "strategy-temperature", "strategy-volatility-scaling",
+    "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
     "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
   const values = new Map<string, string>();
@@ -3022,6 +3220,7 @@ function parseArgs(argv: string[]): Args {
   const mode = get("mode", "standard");
   const accelerator = get("accelerator", "auto");
   const objective = get("objective", "signal");
+  const valueHorizonMode = get("value-horizon-mode", "fixed");
   const scoreVersion = integer(get("score-version", String(VW_KAMA_SCORE_VERSION)), "score-version");
   if (algorithm !== "random" && algorithm !== "de") throw new Error("--algorithm must be random or de.");
   if (mode !== "standard" && mode !== "per-window") throw new Error("--mode must be standard or per-window.");
@@ -3030,6 +3229,9 @@ function parseArgs(argv: string[]): Args {
   }
   if (objective !== "signal" && objective !== "value-distillation") {
     throw new Error("--objective must be signal or value-distillation.");
+  }
+  if (valueHorizonMode !== "fixed" && valueHorizonMode !== "oracle-average-trade") {
+    throw new Error("--value-horizon-mode must be fixed or oracle-average-trade.");
   }
   const exposureMinimum = bounded(get("exposure-min", "-1"), "exposure-min", -100, -Number.EPSILON);
   const exposureMaximum = bounded(get("exposure-max", "1"), "exposure-max", Number.EPSILON, 100);
@@ -3076,8 +3278,14 @@ function parseArgs(argv: string[]): Args {
     exposureGridSize: integer(get("exposure-grid-size", "21"), "exposure-grid-size", 3),
     exposureMinimum,
     exposureMaximum,
+    valueHorizonMode,
+    valueHorizonMs: parseDuration(get("value-horizon", "1h")),
     oracleTemperature: positive(get("oracle-temperature", "0.01"), "oracle-temperature"),
-    strategySigma: positive(get("strategy-sigma", "0.15"), "strategy-sigma"),
+    strategyTemperature: positive(get("strategy-temperature", "0.001"), "strategy-temperature"),
+    strategyVolatilityScaling: booleanValue(
+      get("strategy-volatility-scaling", "false"),
+      "strategy-volatility-scaling",
+    ),
     opportunityEpsilon: nonNegative(get("opportunity-epsilon", "0.000001"), "opportunity-epsilon"),
     quoteLendRate: nonNegative(get("quote-lend-rate", "0"), "quote-lend-rate"),
     quoteBorrowRate: nonNegative(get("quote-borrow-rate", "0"), "quote-borrow-rate"),
@@ -3326,7 +3534,7 @@ function report(
     `Score version: ${config.scoreVersion}`,
     `Raw results: \`${path.relative(repoRoot, config.outputPath)}\``,
     "",
-    "The fit ranking never reads validation or holdout scores. The best validated volume-aware and canonical (both volume powers are zero) candidates are the only candidates evaluated on holdout.",
+    "The fit ranking never reads validation or holdout scores. Holdout evaluates only the best validated volume-aware/canonical candidates and the fixed current-production signal baseline.",
     "",
     "## Data and objective",
     "",
@@ -3338,18 +3546,18 @@ function report(
       ? `- Generation zero evaluates all ${loadSeedCandidates(config.seedCandidatePaths).length} warm genomes plus ${config.trials} Latin-hypercube genomes, then selects ${config.trials} by 70% score / 30% parameter novelty. Warm sources: ${config.seedCandidatePaths.map((file) => `\`${path.relative(repoRoot, file)}\``).join(", ")}.`
       : `- Generation zero evaluates ${config.trials} deterministic Latin-hypercube genomes and selects by 70% score / 30% parameter novelty.`,
     `- Search uses ${config.restarts} independent restart(s), adaptive current-to-pbest differential evolution, family/agreement/confirmation-mask islands with cross-island migration, rotating fit folds with a full-fit pass every ${config.fullEvaluationInterval} generations, and ${config.refinementRounds} shrinking elite-refinement round(s).`,
-    "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A second volume-aware KAMA supplies the mean-reversion baseline: it has independent ER/fast/slow periods and shares the strategy's ER-volume, KAMA-power, and post-ER volume behavior. Its causal volatility-normalized distance follows KAMA below the suppression threshold, goes flat between thresholds, and reverses KAMA at the reversal threshold. A causal logistic confirmation combines KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scales or filters the signal. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
+    "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. The rate calculation, threshold clamp, adaptive-noise threshold, and consumed-edge friction memory are shared directly with the live PeakValleyStrategy. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A second volume-aware KAMA supplies the optional mean-reversion baseline: it has independent ER/fast/slow periods and shares the strategy's ER-volume, KAMA-power, and post-ER volume behavior. Its causal volatility-normalized distance follows KAMA below the suppression threshold, goes flat between thresholds, and reverses KAMA at the reversal threshold. A causal logistic confirmation can combine KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scale or filter the signal. Those experimental layers are disabled for `production-current`. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
     `- Signal memory: after the first signal, a candidate state change emits only when the current close is strictly more than ${round(config.oracleFriction * 10_000, 3)} bps from the last emitted signal price; rejected changes retain the prior state. This is the same friction used by the oracle.`,
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-      ? `- Oracle exposures: ${config.exposureGridSize} points over [${config.exposureMinimum}, ${config.exposureMaximum}], value temperature ${config.oracleTemperature}, candidate sigma ${config.strategySigma}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+      ? `- Oracle exposures: ${config.exposureGridSize} points over [${config.exposureMinimum}, ${config.exposureMaximum}], ${config.valueHorizonMode === "fixed" ? `${formatDuration(config.valueHorizonMs)} fixed` : `average time between consecutive oracle trades (${formatDuration(config.valueHorizonMs)} fallback)`} forced-exposure horizon, value temperature ${config.oracleTemperature}; strategy truncated-exponential temperature ${config.strategyTemperature} scales with sqrt(H/dt)${config.strategyVolatilityScaling ? " and the trailing-H standard deviation of simple returns" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
       ? "- Candidate fitness is the negative of median/P90 cross-entropy, equally weighted; every scale/window case has equal weight."
       : "- Candidate objective equally weights the median and P10 case score; every scale/window case has equal weight.",
     "",
-    "## Holdout finalists",
+    "## Holdout finalists and production signal baseline",
     "",
     resultTable(test, config),
     "",
@@ -3387,9 +3595,9 @@ function report(
     "",
     ...(config.objective === "value-distillation"
       ? [
-        "| candidate | scale/window | cross-entropy | KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
+        "| candidate | scale/window | H | cross-entropy | KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableDuration(item.valueHorizonMs)} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
       ]
       : [
         "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
@@ -3490,8 +3698,11 @@ function help(): void {
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
   --objective signal                signal or value-distillation fitness
   --exposure-grid-size 21 --exposure-min -1 --exposure-max 1
+  --value-horizon-mode fixed        fixed or oracle-average-trade
+  --value-horizon 1h                Fixed H, or fallback when oracle intervals are unavailable
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
-  --strategy-sigma 0.15             Candidate exposure-distribution width
+  --strategy-temperature 0.001      Base temperature; scales by sqrt(H/dt)
+  --strategy-volatility-scaling false  Also multiply by trailing-H simple-return stddev
   --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
   --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
@@ -3590,6 +3801,11 @@ function positive(value: string, label: string): number { const parsed = Number(
 function nonNegative(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`--${label} must be non-negative.`); return parsed; }
 function bounded(value: string, label: string, minimum: number, maximum: number): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) throw new Error(`--${label} must be between ${minimum} and ${maximum}.`); return parsed; }
 function integer(value: string, label: string, minimum = 1): number { const parsed = Number(value); if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new Error(`--${label} must be an integer >= ${minimum}.`); return parsed; }
+function booleanValue(value: string, label: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`--${label} must be true or false.`);
+}
 function linearRandom(random: () => number, range: Range): number { return range.min + random() * (range.max - range.min); }
 function sparseRandom(random: () => number, range: Range, zeroChance = 0.25): number {
   return range.min === 0 && random() < zeroChance ? 0 : linearRandom(random, range);

@@ -169,6 +169,7 @@ we need to adjust the oracle evaluation:
          8. otherwise u_{t+1}=u^-_{t+1} and q_{t+1}=q^-_{t+1}
    6. The oracle defines exposure based on the future returns:
       1. a_t=L^+ if r_t>0 and a_t=-L^- if r_t<0
+      2. or more generally a_t=argmax_a(Q_t(a))
    7. Then the definition for oracle's return is simply the log return over initial and final equity:
       1. Q_t(a)=ln E_T/E_t
    8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
@@ -177,8 +178,6 @@ we need to adjust the oracle evaluation:
 3. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
    1. R_t(a) = max_A(Q_t(A)) - Q_t(a)
    2. This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
-   3. we also might want to compute regret of waiting until t'>t:
-   4. Rw_t(a, t')=R_t(a)-R_t'(a)
 4. p_t(a) is the oracle's preference for the exposure a at time t.
    1. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
 5. we compute objective as oracle value distillation over all example windows
@@ -194,6 +193,7 @@ we need to adjust the oracle evaluation:
    4.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
    5.  but this idea is for future iterations, not for now.
 
+the final time should be a fixed number of seconds
 
 1. what would be needed to move current strategy/signal to a backprop based learning engine? can we efficiently mix it with current genetic approach? In principal i think its possible, we just need to replace all discrete decisions with continuous ones based on soft function like sigmoid.
 2.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.

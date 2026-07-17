@@ -8,7 +8,11 @@ import {
   noiseSignalRatio,
   perfectMarginOracle,
   prepareExposureValueOracle,
+  prepareExposureValueOracleCuda,
+  resolveVwKamaValueHorizonSteps,
+  VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE,
   vwKamaScore,
+  vwKamaCudaStatus,
   VW_KAMA_SCORE_VERSION,
   type Candle,
   type BacktestOraclePoint,
@@ -35,6 +39,7 @@ const MAX_WARMUP_MS = 3 * DAY_MS;
 const MAX_CHART_CANDLES = 2_000;
 const MIN_RANGE_CANDLES = 100;
 const MAX_RANGE_CANDLES = 5_000;
+let cudaValueOracleFallbackReported = false;
 const SCALES = [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000]
   .map((intervalMs) => ({ label: duration(intervalMs), intervalMs }));
 const WINDOWS = [
@@ -128,8 +133,11 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     gridSize: 21,
     minExposure: -1,
     maxExposure: 1,
+    horizonMode: "fixed",
+    horizonMs: 60 * 60_000,
     oracleTemperature: 0.01,
-    strategySigma: 0.15,
+    strategyTemperature: 0.001,
+    strategyVolatilityScaling: false,
     opportunityEpsilon: 0.000001,
     quoteLendRate: 0,
     quoteBorrowRate: 0,
@@ -333,7 +341,13 @@ export class KamaInspectorEngine {
       if (scoreStart >= selected.endTime || candles.at(-1)!.openTime < scoreStart) continue;
       const scoreStartIndex = candleLowerBound(candles, scoreStart);
       const oracle = await this.oracle(cached, request, candles);
-      const valueOracle = await this.exposureOracle(cached, request, candles, scoreStartIndex);
+      const valueOracle = await this.exposureOracle(
+        cached,
+        request,
+        candles,
+        scoreStartIndex,
+        oracle.stateCodes,
+      );
       evaluated.push({
         candles,
         scoreStart,
@@ -345,7 +359,8 @@ export class KamaInspectorEngine {
           oracleResult: oracle,
           valueDistillation: {
             oracle: valueOracle,
-            strategySigma: request.valueDistillation!.strategySigma,
+            strategyTemperature: request.valueDistillation!.strategyTemperature,
+            strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
           },
         }),
       });
@@ -392,7 +407,13 @@ export class KamaInspectorEngine {
       );
       const scoreStartIndex = candleLowerBound(segment, scoreStart);
       const oracle = await this.oracle(cached, request, segment);
-      const valueOracle = await this.exposureOracle(cached, request, segment, scoreStartIndex);
+      const valueOracle = await this.exposureOracle(
+        cached,
+        request,
+        segment,
+        scoreStartIndex,
+        oracle.stateCodes,
+      );
       const evaluation = evaluateVwKamaOracle(candles, {
         ...request,
         scoreStartTime: scoreStart,
@@ -402,7 +423,8 @@ export class KamaInspectorEngine {
         oracleResult: oracle,
         valueDistillation: {
           oracle: valueOracle,
-          strategySigma: request.valueDistillation!.strategySigma,
+          strategyTemperature: request.valueDistillation!.strategyTemperature,
+          strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
         },
       });
       indicatorPoints.push(...evaluation.indicatorPoints);
@@ -484,8 +506,16 @@ export class KamaInspectorEngine {
     request: VwKamaInspectorRequest,
     candles: Candle[],
     scoreStartIndex: number,
+    oracleStateCodes: Uint8Array,
   ): Promise<ExposureValueOracle> {
     const config = request.valueDistillation!;
+    const horizonSteps = resolveVwKamaValueHorizonSteps(
+      candles,
+      scoreStartIndex,
+      oracleStateCodes,
+      request.intervalMs,
+      config,
+    );
     const key = [
       request.intervalMs,
       candles[0]!.openTime,
@@ -495,6 +525,9 @@ export class KamaInspectorEngine {
       config.gridSize,
       config.minExposure,
       config.maxExposure,
+      config.horizonMode,
+      config.horizonMs,
+      horizonSteps,
       config.oracleTemperature,
       config.opportunityEpsilon,
       config.quoteLendRate,
@@ -503,10 +536,11 @@ export class KamaInspectorEngine {
     ].join(":");
     const existing = cached.valueOracles.get(key);
     if (existing) return existing;
-    const pending = Promise.resolve().then(() => prepareExposureValueOracle(
-      candles.map((candle) => candle.close),
-      {
+    const pending = Promise.resolve().then(async () => {
+      const prices = candles.map((candle) => candle.close);
+      const options = {
         scoreStartIndex,
+        horizonSteps,
         friction: request.oracleFriction,
         gridSize: config.gridSize,
         minExposure: config.minExposure,
@@ -517,8 +551,27 @@ export class KamaInspectorEngine {
         quoteBorrowRate: config.quoteBorrowRate,
         assetBorrowRate: config.assetBorrowRate,
         includeProbabilities: true,
-      },
-    ));
+      };
+      if (config.gridSize >= VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE
+        && config.gridSize <= 1_024) {
+        const status = await vwKamaCudaStatus();
+        if (status.available) {
+          try {
+            return (await prepareExposureValueOracleCuda(prices, options)).oracle;
+          } catch (error) {
+            if (!cudaValueOracleFallbackReported) {
+              console.error(
+                `Inspector CUDA value-oracle preparation failed; using CPU: ${error instanceof Error
+                  ? error.message
+                  : String(error)}`,
+              );
+              cudaValueOracleFallbackReported = true;
+            }
+          }
+        }
+      }
+      return prepareExposureValueOracle(prices, options);
+    });
     cached.valueOracles.set(key, pending);
     while (cached.valueOracles.size > 4) {
       const oldest = cached.valueOracles.keys().next().value as string | undefined;
@@ -757,6 +810,10 @@ function combineMetrics(
     lagMedianSignedMs: percentile(lags, 0.5),
     ...(valueParts.length > 0 ? {
       valueDistillation: {
+        horizonMs: valueParts.reduce(
+          (sum, item) => sum + item.horizonMs * item.sampleCount,
+          0,
+        ) / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
         weightedCrossEntropy,
         weightedOracleEntropy,
         weightSum: distillationWeight,
@@ -930,16 +987,19 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     throw new Error("VW-KAMA thresholds and friction cannot be negative.");
   }
   const valueConfig = request.valueDistillation;
-  if (!Number.isInteger(valueConfig.gridSize) || valueConfig.gridSize < 3 || valueConfig.gridSize > 101) {
-    throw new Error("VW-KAMA value grid size must be an integer from 3 to 101.");
+  if (!Number.isInteger(valueConfig.gridSize) || valueConfig.gridSize < 3 || valueConfig.gridSize > 1_024) {
+    throw new Error("VW-KAMA value grid size must be an integer from 3 to 1,024.");
   }
   if (!Number.isFinite(valueConfig.minExposure) || valueConfig.minExposure >= 0
     || !Number.isFinite(valueConfig.maxExposure) || valueConfig.maxExposure <= 0) {
     throw new Error("VW-KAMA value exposure bounds must contain zero.");
   }
-  if (!Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
-    || !Number.isFinite(valueConfig.strategySigma) || valueConfig.strategySigma <= 0) {
-    throw new Error("VW-KAMA value temperature and strategy sigma must be positive.");
+  if (!["fixed", "oracle-average-trade"].includes(valueConfig.horizonMode)
+    || !Number.isFinite(valueConfig.horizonMs) || valueConfig.horizonMs <= 0
+    || !Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
+    || !Number.isFinite(valueConfig.strategyTemperature) || valueConfig.strategyTemperature <= 0
+    || typeof valueConfig.strategyVolatilityScaling !== "boolean") {
+    throw new Error("VW-KAMA value and strategy temperature settings are invalid.");
   }
   if ([
     valueConfig.opportunityEpsilon,

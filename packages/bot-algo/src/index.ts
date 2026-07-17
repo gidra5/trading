@@ -14,8 +14,10 @@ export type * from "./backtest-trace.js";
 export * from "./perfect-margin-oracle.js";
 export * from "./exposure-value-distillation.js";
 export * from "./kama-signal-evaluator.js";
+export * from "./vw-kama-cuda.js";
 export * from "./signal-memory.js";
 export * from "./kama-rate-noise.js";
+export * from "./peak-valley-kama-signal.js";
 export {
   compactBacktestState,
   createBacktestChartCollector,

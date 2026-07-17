@@ -7,10 +7,17 @@ import type {
   VwKamaPreparedOracle,
 } from "./kama-signal-evaluator.js";
 import type { ExposureValueOracle } from "./exposure-value-distillation.js";
+import {
+  createExposureValueOracleStorage,
+  shareExposureValueOracle,
+  strategyExposureTemperatures,
+  type ExposureValueOracleOptions,
+} from "./exposure-value-distillation.js";
 
 const PARAMETER_SIZE = 196;
 const RESULT_SIZE = 152;
 const INT_PARAMETER_COUNT = 20;
+export const VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE = 129;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
 
@@ -20,6 +27,30 @@ interface NativeCuda {
   lastError(): string;
   parameterSize(): number;
   resultSize(): number;
+  prepareValueOracle(
+    prices: Float64Array,
+    priceCount: number,
+    scoreStart: number,
+    horizonSteps: number,
+    gridSize: number,
+    minimumExposure: number,
+    maximumExposure: number,
+    temperature: number,
+    friction: number,
+    opportunityEpsilon: number,
+    quoteLendRate: number,
+    quoteBorrowRate: number,
+    assetBorrowRate: number,
+    means: Float32Array,
+    secondMoments: Float32Array,
+    modalExposures: Float32Array,
+    optimalExposures: Float32Array,
+    entropies: Float32Array,
+    weights: Float32Array,
+    opportunities: Float32Array,
+    probabilities: Float32Array | null,
+    elapsedMs: Float64Array,
+  ): number;
   evaluate(
     closeTimes: Float64Array,
     high: Float64Array,
@@ -33,9 +64,11 @@ interface NativeCuda {
     valueEntropies: Float32Array | null,
     valueWeights: Float32Array | null,
     valueOpportunities: Float32Array | null,
+    strategyTemperatures: Float32Array | null,
     candleCount: number,
     scoreStart: number,
     intervalMs: number,
+    valueHorizonSteps: number,
     oracleFriction: number,
     quoteLendRate: number,
     quoteBorrowRate: number,
@@ -45,7 +78,6 @@ interface NativeCuda {
     valueGridSize: number,
     valueGridMinimum: number,
     valueGridMaximum: number,
-    strategySigma: number,
     parameters: Buffer,
     candidateCount: number,
     output: Buffer,
@@ -61,7 +93,9 @@ export interface VwKamaCudaBatchOptions {
   warmupMultiple: number;
   valueDistillation?: {
     oracle: ExposureValueOracle;
-    strategySigma: number;
+    strategyTemperature: number;
+    strategyVolatilityScaling: boolean;
+    strategyTemperatures?: Float32Array;
   };
 }
 
@@ -94,6 +128,11 @@ export interface VwKamaCudaStatus {
   device?: string;
   reason?: string;
   libraryPath: string;
+}
+
+export interface ExposureValueOracleCudaResult {
+  oracle: ExposureValueOracle;
+  kernelMs: number;
 }
 
 let loaded: NativeCuda | null | undefined;
@@ -146,6 +185,17 @@ export async function evaluateVwKamaCudaBatch(
   )) {
     throw new Error("VW-KAMA CUDA value oracle does not cover the candle columns.");
   }
+  const strategyTemperatures = valueDistillation
+    ? valueDistillation.strategyTemperatures ?? strategyExposureTemperatures(candles.close, {
+      intervalMs: options.intervalMs,
+      horizonSteps: valueDistillation.oracle.horizonSteps,
+      temperature: valueDistillation.strategyTemperature,
+      scaleByVolatility: valueDistillation.strategyVolatilityScaling,
+    })
+    : null;
+  if (strategyTemperatures && strategyTemperatures.length < candles.length) {
+    throw new Error("VW-KAMA CUDA strategy temperatures do not cover the candle columns.");
+  }
   const native = await loadNative();
   const parameterBuffer = Buffer.alloc(candidates.length * PARAMETER_SIZE);
   for (let index = 0; index < candidates.length; index += 1) {
@@ -165,9 +215,11 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.entropies ?? null,
     valueDistillation?.oracle.weights ?? null,
     valueDistillation?.oracle.opportunities ?? null,
+    strategyTemperatures,
     candles.length,
     options.scoreStartIndex,
     options.intervalMs,
+    valueDistillation?.oracle.horizonSteps ?? 1,
     options.oracleFriction,
     valueDistillation?.oracle.execution.quoteLendRate ?? 0,
     valueDistillation?.oracle.execution.quoteBorrowRate ?? 0,
@@ -177,13 +229,57 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.grid.length ?? 0,
     valueDistillation?.oracle.grid[0] ?? 0,
     valueDistillation?.oracle.grid[valueDistillation.oracle.grid.length - 1] ?? 0,
-    valueDistillation?.strategySigma ?? 0,
     parameterBuffer,
     candidates.length,
     output,
   );
   if (status !== 0) throw new Error(`VW-KAMA CUDA evaluation failed: ${native.lastError()}`);
   return Array.from({ length: candidates.length }, (_, index) => readResult(output, index * RESULT_SIZE));
+}
+
+export async function prepareExposureValueOracleCuda(
+  prices: ArrayLike<number>,
+  options: ExposureValueOracleOptions,
+  shared = false,
+): Promise<ExposureValueOracleCudaResult> {
+  if (options.gridSize > 1_024) {
+    throw new Error("Exposure-value CUDA oracle supports at most 1,024 grid points.");
+  }
+  const native = await loadNative();
+  const source = prices instanceof Float64Array ? prices : Float64Array.from(prices);
+  const oracle = createExposureValueOracleStorage(source, options, false);
+  const elapsedMs = new Float64Array(1);
+  const status = native.prepareValueOracle(
+    source,
+    source.length,
+    options.scoreStartIndex,
+    oracle.horizonSteps,
+    options.gridSize,
+    oracle.execution.minExposure,
+    oracle.execution.maxExposure,
+    options.temperature,
+    oracle.execution.friction,
+    Math.max(0, options.opportunityEpsilon ?? 1e-6),
+    oracle.execution.quoteLendRate,
+    oracle.execution.quoteBorrowRate,
+    oracle.execution.assetBorrowRate,
+    oracle.means,
+    oracle.secondMoments,
+    oracle.modalExposures,
+    oracle.optimalExposures,
+    oracle.entropies,
+    oracle.weights,
+    oracle.opportunities,
+    oracle.probabilities ?? null,
+    elapsedMs,
+  );
+  if (status !== 0) {
+    throw new Error(`Exposure-value CUDA oracle failed: ${native.lastError()}`);
+  }
+  return {
+    oracle: shared ? shareExposureValueOracle(oracle) : oracle,
+    kernelMs: elapsedMs[0]!,
+  };
 }
 
 async function loadNative(): Promise<NativeCuda> {
@@ -205,11 +301,16 @@ async function loadNative(): Promise<NativeCuda> {
       lastError: library.func("str vw_kama_cuda_last_error()"),
       parameterSize: library.func("int vw_kama_cuda_params_size()"),
       resultSize: library.func("int vw_kama_cuda_result_size()"),
+      prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle", "int", [
+        pointer, "int", "int", "int", "int",
+        "double", "double", "double", "double", "double", "double", "double", "double",
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+      ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer, pointer, pointer, pointer,
-        "int", "int", "double", "double", "double", "double", "double", "double", "double",
-        "int", "double", "double", "double",
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        "int", "int", "double", "int", "double", "double", "double", "double", "double", "double",
+        "int", "double", "double",
         pointer, "int", pointer,
       ]),
     };

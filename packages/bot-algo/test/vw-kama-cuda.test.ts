@@ -36,6 +36,7 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
   const candidates = [baseParameters(), featureParameters()];
   const valueOracle = prepareExposureValueOracle(candles.map((candle) => candle.close), {
     scoreStartIndex,
+    horizonSteps: 30,
     friction: 0.00175,
     gridSize: 21,
     temperature: 0.01,
@@ -47,7 +48,11 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     matchWindowMs: 2 * 60 * MINUTE,
     timingHalfLifeMs: 10 * MINUTE,
     warmupMultiple: 3,
-    valueDistillation: { oracle: valueOracle, strategySigma: 0.15 },
+    valueDistillation: {
+      oracle: valueOracle,
+      strategyTemperature: 0.001,
+      strategyVolatilityScaling: true,
+    },
   };
   const gpu = await evaluateVwKamaCudaBatch(columns, prepared, candidates, common);
   assert.equal(gpu.length, candidates.length);

@@ -2,14 +2,144 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   alignVwKamaTransitions,
+  averageVwKamaOracleTradeIntervalMs,
   columnarVwKamaCandles,
+  createPeakValleyStrategyConfig,
   evaluateVwKamaOracle,
+  PeakValleyStrategy,
+  peakValleyWarmupSamples,
   perfectMarginOracle,
   prepareVwKamaOracle,
+  resolveVwKamaValueHorizonSteps,
   signalBeyondFriction,
+  vwKamaParametersFromPeakValleySignal,
   type Candle,
   type VwKamaTransition,
 } from "../src/index.js";
+
+test("VW-KAMA value horizon can follow the oracle's average inter-trade time", () => {
+  const candles = Array.from({ length: 8 }, (_, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: 100,
+    high: 100,
+    low: 100,
+    close: 100,
+    volume: 1,
+    closed: true,
+  }));
+  const stateCodes = Uint8Array.from([0, 1, 1, 2, 2, 2, 0, 0]);
+
+  assert.equal(averageVwKamaOracleTradeIntervalMs(candles, 1, stateCodes), 2_500);
+  assert.equal(resolveVwKamaValueHorizonSteps(
+    candles,
+    1,
+    stateCodes,
+    1_000,
+    { horizonMode: "oracle-average-trade", horizonMs: 5_000 },
+  ), 3);
+  assert.equal(resolveVwKamaValueHorizonSteps(
+    candles,
+    1,
+    stateCodes,
+    1_000,
+    { horizonMode: "fixed", horizonMs: 5_000 },
+  ), 5);
+});
+
+test("VW-KAMA oracle-average value horizon falls back without two oracle transitions", () => {
+  const candles = Array.from({ length: 4 }, (_, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: 100,
+    high: 100,
+    low: 100,
+    close: 100,
+    volume: 1,
+    closed: true,
+  }));
+
+  assert.equal(resolveVwKamaValueHorizonSteps(
+    candles,
+    1,
+    Uint8Array.from([0, 0, 1, 1]),
+    1_000,
+    { horizonMode: "oracle-average-trade", horizonMs: 4_000 },
+  ), 4);
+});
+
+test("VW-KAMA runner reproduces current production signal transitions", async () => {
+  const candles = Array.from({ length: 1_300 }, (_, index): Candle => {
+    const close = 100
+      + Math.sin(index / 17) * 4
+      + Math.sin(index / 71) * 2
+      + index * 0.002;
+    const previous = index === 0
+      ? close
+      : 100 + Math.sin((index - 1) / 17) * 4 + Math.sin((index - 1) / 71) * 2 + (index - 1) * 0.002;
+    return {
+      symbol: "BTCUSDT",
+      interval: "1m",
+      openTime: index * 60_000,
+      closeTime: (index + 1) * 60_000 - 1,
+      open: previous,
+      high: Math.max(previous, close) + 0.1,
+      low: Math.min(previous, close) - 0.1,
+      close,
+      volume: 5 + index % 19,
+      closed: true,
+    };
+  });
+  const scoreStart = 900;
+  const config = createPeakValleyStrategyConfig();
+  const warmup = candles.slice(0, scoreStart).slice(-peakValleyWarmupSamples(config));
+  const strategy = new PeakValleyStrategy({
+    config,
+    getHistory: async () => warmup,
+  });
+  await strategy.warmup();
+  let state = Math.sign(strategy.getDiagnostics().kama?.clampedRate ?? 0);
+  const productionTransitions: Array<{ time: number; state: string }> = [];
+  for (let index = scoreStart; index < candles.length; index += 1) {
+    const candle = candles[index]!;
+    const previous = state;
+    await strategy.onTick({
+      timestamp: candle.closeTime,
+      price: candle.close,
+      quantity: candle.volume,
+      candle,
+    });
+    const exit = await strategy.exitSignal();
+    const entry = await strategy.entrySignal();
+    if (exit && Math.sign(state) === (exit.side === "long" ? 1 : -1)) state = 0;
+    if (entry) state = entry.side === "long" ? 1 : -1;
+    if (state !== previous) {
+      productionTransitions.push({
+        time: candle.closeTime,
+        state: state > 0 ? "long" : state < 0 ? "short" : "flat",
+      });
+    }
+  }
+
+  const evaluated = evaluateVwKamaOracle(candles, {
+    intervalMs: 60_000,
+    scoreStartTime: candles[scoreStart]!.openTime,
+    parameters: vwKamaParametersFromPeakValleySignal(config, config.kamaSignalFriction),
+    oracleFriction: config.kamaSignalFriction,
+    matchWindowMs: 60_000,
+    timingHalfLifeMs: 60_000,
+    warmupMultiple: 3,
+  });
+  assert.ok(productionTransitions.length > 5);
+  assert.deepEqual(
+    evaluated.candidateTransitions.map(({ time, state }) => ({ time, state })),
+    productionTransitions,
+  );
+});
 
 function transition(
   time: number,

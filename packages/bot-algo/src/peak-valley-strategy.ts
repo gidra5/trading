@@ -19,8 +19,13 @@ import type {
   TradingStrategyEntrySignal,
   TradingStrategyExitSignal,
 } from "./strategy.js";
-import { signalBeyondFriction } from "./signal-memory.js";
 import { KamaRateNoise, type KamaRateNoiseSnapshot } from "./kama-rate-noise.js";
+import {
+  advancePeakValleyKamaSignal,
+  clampPeakValleyKamaRate,
+  peakValleyKamaRate,
+  peakValleyKamaThresholdAdjustment,
+} from "./peak-valley-kama-signal.js";
 import type { TradingApi, TradingCandle, TradingTick } from "./trading-api.js";
 
 const SAMPLE_INTERVAL_MS = 60_000;
@@ -616,7 +621,7 @@ export class PeakValleyStrategy
     }
     if (this.config.derivativeSource === "kama" && updateKama) {
       this.kama.onTick(input);
-      const rawKamaRate = selectedKamaRate(
+      const rawKamaRate = peakValleyKamaRate(
         this.kama.derivative(),
         this.kama.indicator(),
         seconds,
@@ -628,28 +633,28 @@ export class PeakValleyStrategy
       const rateNoise = this.kamaRateNoise.update(this.kamaRate);
       const adaptiveThreshold = kamaThresholdNoiseAdjustment(rateNoise, this.config);
       const previous = this.kamaClamped.indicator();
-      const candidate = clampThreshold(
+      const signal = advancePeakValleyKamaSignal(
         this.kamaRate,
-        this.kamaCandidate,
-        this.config,
-        this.config.kamaRateThresholdLow + adaptiveThreshold,
-        this.config.kamaRateThresholdHigh + adaptiveThreshold,
-      );
-      const sourceEdge = Math.sign(candidate) !== Math.sign(this.kamaCandidate);
-      this.kamaCandidate = candidate;
-      const transition = sourceEdge && Math.sign(candidate) !== Math.sign(previous);
-      const accepted = !transition || signalBeyondFriction(
         tick.price,
-        this.lastKamaSignalPrice,
-        this.config.kamaSignalFriction,
+        {
+          candidate: this.kamaCandidate,
+          accepted: previous,
+          lastSignalPrice: this.lastKamaSignalPrice,
+        },
+        {
+          mode: this.config.derivativeClampMode,
+          innerThresholdRatio: this.config.derivativeClampInnerThresholdRatio,
+          thresholdLow: this.config.kamaRateThresholdLow + adaptiveThreshold,
+          thresholdHigh: this.config.kamaRateThresholdHigh + adaptiveThreshold,
+          signalFriction: this.config.kamaSignalFriction,
+        },
       );
+      this.kamaCandidate = signal.candidate;
       this.kamaClamped.onTick({
         eventTime: tick.timestamp,
-        value: Math.sign(candidate) === Math.sign(previous) || transition && accepted
-          ? candidate
-          : previous,
+        value: signal.accepted,
       });
-      if (transition && accepted) this.lastKamaSignalPrice = tick.price;
+      this.lastKamaSignalPrice = signal.lastSignalPrice;
     }
     this.ready ||= this.sampleCount >= this.requiredSamples()
       && tick.timestamp - this.startedAt >= this.config.saturationSec * 1_000;
@@ -889,37 +894,19 @@ function clampThreshold(
   low: number,
   high: number,
 ): number {
-  if (config.derivativeClampMode === "hold") {
-    return value > high || value < -low ? value : previous;
-  }
-  const release = low * config.derivativeClampInnerThresholdRatio;
-  if (
-    config.derivativeClampMode === "hysteresis" &&
-    previous !== 0 &&
-    Math.sign(previous) === Math.sign(value) &&
-    Math.abs(value) >= release
-  ) return value;
-  const threshold = config.derivativeClampMode === "hysteresis" && previous === 0 ? high : low;
-  return Math.abs(value) > threshold ? value : 0;
+  return clampPeakValleyKamaRate(
+    value,
+    previous,
+    config.derivativeClampMode,
+    config.derivativeClampInnerThresholdRatio,
+    low,
+    high,
+  );
 }
 
 function rate(delta: number, value: number, seconds: number, relative: boolean): number {
   const absolute = delta / seconds;
   return relative && value > 0 ? absolute / value : absolute;
-}
-
-function selectedKamaRate(
-  delta: number,
-  value: number,
-  seconds: number,
-  relative: boolean,
-  mode: PeakValleyKamaRateMode,
-): number {
-  if (!relative) return delta / seconds;
-  if (value <= 0) return 0;
-  if (mode !== "log") return delta / value / seconds;
-  const previous = value - delta;
-  return previous > 0 ? Math.log(value / previous) / seconds : 0;
 }
 
 function normalizedSigma(value: number, relative: boolean): number {
@@ -977,11 +964,12 @@ function kamaThresholdNoiseEnabled(config: PeakValleyStrategyConfig): boolean {
 }
 
 function kamaThresholdNoiseAdjustment(noise: number, config: PeakValleyStrategyConfig): number {
-  if (config.kamaThresholdNoiseResponse !== "inverse") {
-    return Math.max(0, noise) * config.kamaThresholdNoiseMultiplier;
-  }
-  return config.kamaThresholdInverseMax
-    / (1 + Math.max(0, noise) / config.kamaThresholdInverseNoiseScale);
+  return peakValleyKamaThresholdAdjustment(noise, {
+    response: config.kamaThresholdNoiseResponse,
+    multiplier: config.kamaThresholdNoiseMultiplier,
+    inverseMax: config.kamaThresholdInverseMax,
+    inverseNoiseScale: config.kamaThresholdInverseNoiseScale,
+  });
 }
 
 function positive(value: number): number {

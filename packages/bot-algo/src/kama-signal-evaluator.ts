@@ -19,8 +19,14 @@ import type {
   Candle,
 } from "./legacy/types.js";
 import type { TradingApi, TradingCandle } from "./trading-api.js";
-import { signalBeyondFriction } from "./signal-memory.js";
 import { KamaRateNoise } from "./kama-rate-noise.js";
+import {
+  clampPeakValleyKamaRate,
+  peakValleyKamaRate,
+  peakValleyKamaThresholdAdjustment,
+  resolvePeakValleyKamaSignal,
+} from "./peak-valley-kama-signal.js";
+import type { PeakValleyStrategyConfig } from "./peak-valley-strategy.js";
 import {
   createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
@@ -30,6 +36,7 @@ import {
   observeExposureReturn,
   observeExposureValueDistillation,
   strategyExposureProbabilities,
+  strategyExposureTemperatures,
   type ExposureReturnMetrics,
   type ExposureValueDistillationMetrics,
   type ExposureValueOracle,
@@ -40,12 +47,13 @@ const DAY_MS = 86_400_000;
 const F1_WEIGHT = 0.2;
 const AGREEMENT_WEIGHT = 0.6;
 const CLEANLINESS_WEIGHT = 0.2;
-export const VW_KAMA_SCORE_VERSION = 4;
+export const VW_KAMA_SCORE_VERSION = 6;
 
 export type VwKamaDeadbandMode = "flat" | "hold" | "hysteresis";
 export type VwKamaAgreementMode = "sizing" | "confidence";
 export type VwKamaRateMode = "relative" | "log";
 export type VwKamaThresholdResponse = "proportional" | "inverse";
+export type VwKamaValueHorizonMode = "fixed" | "oracle-average-trade";
 
 export interface VwKamaParameters {
   efficiencyMs: number;
@@ -98,6 +106,85 @@ export interface VwKamaParameters {
   meanReversionReversalThreshold?: number;
 }
 
+/**
+ * Translate the deployable PeakValleyStrategy KAMA signal into this runner's
+ * physical-duration and bps/hour parameterization. Optional experimental
+ * confirmation and mean-reversion layers are deliberately disabled.
+ */
+export function vwKamaParametersFromPeakValleySignal(
+  config: PeakValleyStrategyConfig,
+  oracleFriction = config.kamaSignalFriction,
+): VwKamaParameters {
+  if (config.derivativeSource !== "kama") {
+    throw new Error("VW-KAMA runner requires PeakValleyStrategy derivativeSource=kama.");
+  }
+  if (!config.relativeRateEnabled) {
+    throw new Error("VW-KAMA runner requires relative PeakValleyStrategy rates.");
+  }
+  if (Math.abs(config.kamaRateThresholdHigh - config.kamaRateThresholdLow) > Number.EPSILON) {
+    throw new Error("VW-KAMA runner currently requires symmetric KAMA low/high thresholds.");
+  }
+  if (
+    config.buyConfirmationOffsets.length > 0
+    || config.sellConfirmationOffsets.length > 0
+    || config.buyExitConfirmationOffsets.length > 0
+    || config.sellExitConfirmationOffsets.length > 0
+  ) {
+    throw new Error("VW-KAMA production baseline requires empty PeakValleyStrategy confirmation offsets.");
+  }
+  if (
+    config.buyEntrySignalTiming !== "end"
+    || config.sellEntrySignalTiming !== "end"
+    || config.buyExitSignalTiming !== "start"
+    || config.sellExitSignalTiming !== "start"
+  ) {
+    throw new Error("VW-KAMA production baseline requires end entry and start exit timing.");
+  }
+  if (!config.longSideEnabled || !config.shortSideEnabled) {
+    throw new Error("VW-KAMA production baseline requires both long and short sides.");
+  }
+  const signalFrictionFraction = oracleFriction > 0
+    ? config.kamaSignalFriction / oracleFriction
+    : config.kamaSignalFriction === 0 ? 0 : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(signalFrictionFraction) || signalFrictionFraction > 1) {
+    throw new Error("PeakValleyStrategy signal friction cannot exceed the runner oracle friction.");
+  }
+  const duration = (samples: number) => samples * config.sampleIntervalMs;
+  const rateScale = 10_000 * HOUR_MS / 1_000;
+  return {
+    efficiencyMs: duration(config.kamaErLen),
+    efficiencyVolumeEmaMs: duration(config.kamaErVolumeLen),
+    efficiencyVolumePower: config.kamaErVolumePower,
+    fastMs: duration(config.kamaFastLen),
+    slowMs: duration(config.kamaSlowLen),
+    power: config.kamaPower,
+    volumeMs: duration(config.kamaVolumeLen),
+    volumeCap: config.kamaVolumeCap,
+    volumePower: config.kamaVolumePower,
+    rateMode: config.kamaRateMode,
+    rateEmaMs: duration(config.kamaRateEmaLen),
+    deadbandBpsHour: config.kamaRateThresholdLow * rateScale,
+    deadbandMode: config.derivativeClampMode === "deadband"
+      ? "flat"
+      : config.derivativeClampMode,
+    hysteresisReleaseRatio: config.derivativeClampInnerThresholdRatio,
+    thresholdLookbackMs: config.kamaThresholdLookbackSec * 1_000,
+    thresholdNoiseResponse: config.kamaThresholdNoiseResponse,
+    thresholdNoiseMultiplier: config.kamaThresholdNoiseMultiplier,
+    thresholdInverseMaxBpsHour: config.kamaThresholdInverseMax * rateScale,
+    thresholdInverseNoiseScaleBpsHour: config.kamaThresholdInverseNoiseScale * rateScale,
+    signalFrictionFraction,
+    buyMaxFraction: Math.min(1, config.buySpendRate),
+    sellMaxFraction: Math.min(1, config.sellAmountRate),
+    buySizingSigmaBpsHour: Number.MAX_VALUE,
+    sellSizingSigmaBpsHour: Number.MAX_VALUE,
+    agreementMode: "sizing",
+    confirmationMix: 0,
+    confirmationMinQuality: 0,
+    meanReversionReversalThreshold: 0,
+  };
+}
+
 export interface VwKamaInspectorWindow {
   id: string;
   label: string;
@@ -121,8 +208,11 @@ export interface VwKamaValueDistillationConfig {
   gridSize: number;
   minExposure: number;
   maxExposure: number;
+  horizonMode: VwKamaValueHorizonMode;
+  horizonMs: number;
   oracleTemperature: number;
-  strategySigma: number;
+  strategyTemperature: number;
+  strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
   quoteBorrowRate: number;
@@ -227,6 +317,7 @@ export interface VwKamaAccuracyMetrics {
 }
 
 export interface VwKamaValueDistillationMetrics extends ExposureValueDistillationMetrics {
+  horizonMs: number;
   returns: {
     oracle: ExposureReturnMetrics;
     strategy: ExposureReturnMetrics;
@@ -272,6 +363,8 @@ export interface VwKamaValueDistributionPoint {
   oracleModalExposure: number;
   oracleOptimalExposure: number;
   strategyMeanExposure: number;
+  strategyRateBpsHour: number;
+  strategyTemperature: number;
   oracleEntropy: number;
   opportunity: number;
   crossEntropy: number;
@@ -320,7 +413,9 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   includeTrace?: boolean;
   valueDistillation?: {
     oracle: ExposureValueOracle;
-    strategySigma: number;
+    strategyTemperature: number;
+    strategyVolatilityScaling: boolean;
+    strategyTemperatures?: Float32Array;
   };
 }
 
@@ -389,6 +484,41 @@ export function prepareVwKamaOracle(
     transitions: prepareVwKamaOracleTransitions(candles, scoreStartIndex, stateCodes),
     ...(includeResult ? { result } : {}),
   };
+}
+
+/** Mean elapsed time between consecutive executable oracle state changes. */
+export function averageVwKamaOracleTradeIntervalMs(
+  candles: VwKamaCandleSeries,
+  scoreStartIndex: number,
+  stateCodes: Uint8Array,
+): number | null {
+  let previousTime: number | null = null;
+  let intervalSum = 0;
+  let intervalCount = 0;
+  for (let index = Math.max(1, scoreStartIndex); index < candles.length; index += 1) {
+    if ((stateCodes[index] ?? 0) === (stateCodes[index - 1] ?? 0)) continue;
+    const time = closeTimeAt(candles, index);
+    if (previousTime !== null) {
+      intervalSum += time - previousTime;
+      intervalCount += 1;
+    }
+    previousTime = time;
+  }
+  return intervalCount > 0 ? intervalSum / intervalCount : null;
+}
+
+/** Resolves fixed H or the oracle's average inter-trade interval to candle steps. */
+export function resolveVwKamaValueHorizonSteps(
+  candles: VwKamaCandleSeries,
+  scoreStartIndex: number,
+  stateCodes: Uint8Array,
+  intervalMs: number,
+  config: Pick<VwKamaValueDistillationConfig, "horizonMode" | "horizonMs">,
+): number {
+  const average = config.horizonMode === "oracle-average-trade"
+    ? averageVwKamaOracleTradeIntervalMs(candles, scoreStartIndex, stateCodes)
+    : null;
+  return Math.max(1, Math.round((average ?? config.horizonMs) / intervalMs));
 }
 
 export type VwKamaEvaluation = Omit<
@@ -589,6 +719,20 @@ export function evaluateVwKamaOracle(
         strategy: createExposureReturnAccumulator(),
       }
     : null;
+  const strategyTemperatures = options.valueDistillation
+    ? options.valueDistillation.strategyTemperatures ?? strategyExposureTemperatures(
+      isCandleColumns(candles) ? candles.close : candles.map((item) => item.close),
+      {
+        intervalMs: options.intervalMs,
+        horizonSteps: options.valueDistillation.oracle.horizonSteps,
+        temperature: options.valueDistillation.strategyTemperature,
+        scaleByVolatility: options.valueDistillation.strategyVolatilityScaling,
+      },
+    )
+    : null;
+  if (strategyTemperatures && strategyTemperatures.length < candles.length) {
+    throw new Error("VW-KAMA strategy temperatures do not cover the candle series.");
+  }
   const signalFriction = options.oracleFriction
     * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
 
@@ -638,14 +782,13 @@ export function evaluateVwKamaOracle(
       updateMeanReversion(candle);
     }
     const kama = indicator.indicator();
-    const relativeRate = kama > 0
-      ? indicator.derivative() / kama * 10_000 * HOUR_MS / options.intervalMs
-      : 0;
-    const previousKama = kama - indicator.derivative();
-    const logRate = kama > 0 && previousKama > 0
-      ? Math.log(kama / previousKama) * 10_000 * HOUR_MS / options.intervalMs
-      : 0;
-    const rawRate = options.parameters.rateMode === "log" ? logRate : relativeRate;
+    const rawRate = peakValleyKamaRate(
+      indicator.derivative(),
+      kama,
+      options.intervalMs / 1_000,
+      true,
+      options.parameters.rateMode === "log" ? "log" : "relative",
+    ) * 10_000 * HOUR_MS / 1_000;
     rateEma.onTick({ eventTime: candle.closeTime, value: rawRate });
     const rate = rateEma.indicator();
     const noise = thresholdEnabled ? rateNoise.update(rate) : 0;
@@ -700,15 +843,21 @@ export function evaluateVwKamaOracle(
       );
     const quality = desired === 0 ? 1 : confirmation;
     const minimumQuality = clamp01(options.parameters.confirmationMinQuality ?? 0);
-    const transitionRequested = sourceEdge && desired !== current;
     const positiveQuality = desired === 0 || quality > 0;
     const sufficientQuality = quality >= minimumQuality;
-    const beyondFriction = !transitionRequested
-      || signalBeyondFriction(candle.close, lastSignalPrice, signalFriction);
-    const accepted = transitionRequested
-      && positiveQuality
-      && sufficientQuality
-      && beyondFriction;
+    const signal = resolvePeakValleyKamaSignal(
+      desired,
+      candle.close,
+      { candidate: previousTrend, accepted: current, lastSignalPrice },
+      {
+        sourceEdge,
+        signalFriction,
+        transitionAllowed: positiveQuality && sufficientQuality,
+      },
+    );
+    const transitionRequested = signal.transitionRequested;
+    const beyondFriction = signal.beyondFriction;
+    const accepted = signal.transitionAccepted;
     const signalIntent = includeTrace && sourceEdge && trend !== current
       ? stateName(trend)
       : null;
@@ -746,7 +895,7 @@ export function evaluateVwKamaOracle(
       current = desired;
       targetFraction = nextFraction;
       anchorPrice = candle.close;
-      lastSignalPrice = candle.close;
+      lastSignalPrice = signal.lastSignalPrice;
     }
     const candidateExposure = candidateAgreementValue(
       agreementMode,
@@ -767,8 +916,9 @@ export function evaluateVwKamaOracle(
           valueDistillation,
           options.valueDistillation.oracle,
           index,
-          candidateExposure,
-          options.valueDistillation.strategySigma,
+          rate,
+          options.intervalMs,
+          strategyTemperatures![index]!,
         );
         if (valueReturns && index + 1 < candles.length) {
           const price = closeAt(candles, index);
@@ -842,8 +992,10 @@ export function evaluateVwKamaOracle(
           candle.closeTime,
           index,
           candidateExposure,
+          rate,
+          options.intervalMs,
           options.valueDistillation.oracle,
-          options.valueDistillation.strategySigma,
+          strategyTemperatures![index]!,
         ));
       }
       if (points.at(-1)?.time !== candle.closeTime) points.push(statePoint(candle, current, current));
@@ -890,6 +1042,7 @@ export function evaluateVwKamaOracle(
     ...(valueDistillation && valueReturns
       ? { valueDistillation: {
           ...finalizeExposureValueDistillation(valueDistillation),
+          horizonMs: options.valueDistillation!.oracle.horizonSteps * options.intervalMs,
           returns: {
             oracle: finalizeExposureReturn(valueReturns.oracle),
             strategy: finalizeExposureReturn(valueReturns.strategy),
@@ -950,14 +1103,17 @@ function valueDistributionPoint(
   time: number,
   candleIndex: number,
   candidateExposure: number,
+  rateBpsPerHour: number,
+  intervalMs: number,
   oracle: ExposureValueOracle,
-  strategySigma: number,
+  strategyTemperature: number,
 ): VwKamaValueDistributionPoint {
   const oracleProbabilities = exposureValueOracleProbabilities(oracle, candleIndex);
   const strategyProbabilities = strategyExposureProbabilities(
     oracle.grid,
-    candidateExposure,
-    strategySigma,
+    rateBpsPerHour,
+    intervalMs * oracle.horizonSteps,
+    strategyTemperature,
   );
   let strategyMeanExposure = 0;
   let crossEntropy = 0;
@@ -977,6 +1133,8 @@ function valueDistributionPoint(
     oracleModalExposure: oracle.modalExposures[candleIndex]!,
     oracleOptimalExposure: oracle.optimalExposures[candleIndex]!,
     strategyMeanExposure,
+    strategyRateBpsHour: rateBpsPerHour,
+    strategyTemperature,
     oracleEntropy: oracle.entropies[candleIndex]!,
     opportunity: oracle.opportunities[candleIndex]!,
     crossEntropy,
@@ -1283,14 +1441,14 @@ function candidateState(
   threshold: number,
   parameters: VwKamaParameters,
 ): number {
-  if (parameters.deadbandMode === "hold") {
-    return rate > threshold ? 1 : rate < -threshold ? -1 : current;
-  }
-  if (parameters.deadbandMode === "hysteresis" && current !== 0) {
-    const release = threshold * clamp01(parameters.hysteresisReleaseRatio ?? 0.25);
-    if (Math.sign(rate) === Math.sign(current) && Math.abs(rate) >= release) return current;
-  }
-  return rate > threshold ? 1 : rate < -threshold ? -1 : 0;
+  return Math.sign(clampPeakValleyKamaRate(
+    rate,
+    current,
+    parameters.deadbandMode === "flat" ? "deadband" : parameters.deadbandMode,
+    parameters.hysteresisReleaseRatio ?? 0.25,
+    threshold,
+    threshold,
+  ));
 }
 
 function emaTrendAligned(direction: number, emaRate: number, parameters: VwKamaParameters): boolean {
@@ -1576,12 +1734,12 @@ function meanReversionParametersEnabled(parameters: VwKamaParameters): boolean {
 }
 
 function thresholdNoiseAdjustment(noise: number, parameters: VwKamaParameters): number {
-  if (parameters.thresholdNoiseResponse !== "inverse") {
-    return noise * Math.max(0, parameters.thresholdNoiseMultiplier ?? 0);
-  }
-  const maximum = Math.max(0, parameters.thresholdInverseMaxBpsHour ?? 0);
-  const scale = Math.max(Number.EPSILON, parameters.thresholdInverseNoiseScaleBpsHour ?? 1);
-  return maximum / (1 + Math.max(0, noise) / scale);
+  return peakValleyKamaThresholdAdjustment(noise, {
+    response: parameters.thresholdNoiseResponse === "inverse" ? "inverse" : "proportional",
+    multiplier: parameters.thresholdNoiseMultiplier ?? 0,
+    inverseMax: parameters.thresholdInverseMaxBpsHour ?? 0,
+    inverseNoiseScale: parameters.thresholdInverseNoiseScaleBpsHour ?? 1,
+  });
 }
 
 class DmiAdx {

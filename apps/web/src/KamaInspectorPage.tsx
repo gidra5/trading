@@ -40,8 +40,11 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   gridSize: 21,
   minExposure: -1,
   maxExposure: 1,
+  horizonMode: "fixed",
+  horizonMs: 60 * 60_000,
   oracleTemperature: 0.01,
-  strategySigma: 0.15,
+  strategyTemperature: 0.001,
+  strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
   quoteLendRate: 0,
   quoteBorrowRate: 0,
@@ -172,6 +175,7 @@ const metricHelp = {
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
   distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
+  valueHorizon: "Resolved H used by the value oracle and strategy distribution. Oracle-average mode uses the mean time between consecutive executable oracle state changes; the fixed value is used when fewer than two oracle transitions exist.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
   oracleReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the executable hindsight Bellman policy and the same friction.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
@@ -683,7 +687,7 @@ export function KamaInspectorPage() {
     if (preset) {
       setParameters({ ...preset.parameters });
       if (preset.optimization?.valueDistillation) {
-        setValueConfig({ ...preset.optimization.valueDistillation });
+        setValueConfig({ ...defaultValueDistillation, ...preset.optimization.valueDistillation });
       }
     }
   };
@@ -695,7 +699,7 @@ export function KamaInspectorPage() {
     setSelectedPresetId(preset.id);
     setParameters({ ...preset.parameters });
     if (preset.optimization?.valueDistillation) {
-      setValueConfig({ ...preset.optimization.valueDistillation });
+      setValueConfig({ ...defaultValueDistillation, ...preset.optimization.valueDistillation });
     }
   });
 
@@ -711,7 +715,7 @@ export function KamaInspectorPage() {
       setSelectedPresetId(preset.id);
       setParameters({ ...preset.parameters });
       if (preset.optimization?.valueDistillation) {
-        setValueConfig({ ...preset.optimization.valueDistillation });
+        setValueConfig({ ...defaultValueDistillation, ...preset.optimization.valueDistillation });
       }
     });
   };
@@ -1155,14 +1159,17 @@ export function KamaInspectorPage() {
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
-              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={101} step={2} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
+              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={1024} step={2} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
+              <InspectorSelect label="Value horizon source" value={valueConfig().horizonMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-average-trade", label: "Average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMode: value as VwKamaValueDistillationConfig["horizonMode"] }))} />
+              <DurationInput label={valueConfig().horizonMode === "fixed" ? "Value horizon H" : "Fallback horizon H"} value={valueConfig().horizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMs: value }))} />
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
-              <InspectorNumber label="Strategy distribution σ" value={valueConfig().strategySigma} min={0.000001} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, strategySigma: value }))} />
+              <InspectorNumber label="Base strategy temperature" value={valueConfig().strategyTemperature} min={0.000001} step={0.0001} onInput={(value) => setValueConfig((current) => ({ ...current, strategyTemperature: value }))} />
+              <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              Oracle friction shapes both retrospective paths. Value distributions use softmax(Q / temperature); the strategy curve is a truncated Gaussian over exposure. Return paths start at equity 1 and exposure 0, then use the same friction and exposure bounds.
+              Oracle friction shapes both retrospective paths. H can be fixed or resolved per continuous segment as the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. The strategy curve is a truncated exponential exp(exposure × signed H-return / temperature): rate chooses the favored side and temperature scales by √(H/dt). Optional volatility scaling multiplies it by the causal standard deviation of simple returns over the same trailing H interval. Return paths start at equity 1 and exposure 0.
             </div>
           </details>
         </section>
@@ -1200,6 +1207,7 @@ export function KamaInspectorPage() {
                     <>
                       <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
                       <ScoreCard label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
+                      <ScoreCard label="Resolved horizon H" value={formatDuration(value().horizonMs)} description={metricHelp.valueHorizon} />
                       <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
                       <ScoreCard label="Oracle return" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
                       <ScoreCard label="Strategy drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
@@ -1324,12 +1332,12 @@ export function KamaInspectorPage() {
                           <h3 class="text-sm font-semibold">Oracle and predicted exposure distributions</h3>
                         </div>
                         <div class="text-xs tabular-nums text-ink-300">
-                          {formatDateTime(point().time)} · candidate {signedExposure(point().candidateExposure)} · oracle policy {signedExposure(point().oracleOptimalExposure)} · distribution mode {signedExposure(point().oracleModalExposure)} · mean {signedExposure(point().oracleMeanExposure)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
+                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / target {signedExposure(point().oracleOptimalExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
                         </div>
                       </div>
                       <ExposureDistributionChart point={point()} />
                       <div class="mt-2 text-xs text-ink-400">
-                        Cyan is the hindsight soft value oracle; purple is the strategy Gaussian used by the loss. Click or hover the price chart to inspect another rendered candle.
+                        Cyan is the hindsight soft value oracle; purple is the signed-rate truncated exponential used by the loss. Click or hover the price chart to inspect another rendered candle.
                       </div>
                     </div>
                   )}
@@ -1425,27 +1433,62 @@ function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint 
     Number.EPSILON,
     ...props.point.values.flatMap((value) => [value.oracleProbability, value.strategyProbability]),
   );
+  const strategyMode = () => distributionMode(props.point.values, "strategyProbability");
+  const markerPosition = (exposure: number) => distributionMarkerPosition(
+    props.point.values.map((value) => value.exposure),
+    exposure,
+  );
   return (
     <div>
       <div class="mb-2 flex flex-wrap gap-4 text-xs tabular-nums text-ink-300">
-        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mean {signedExposure(props.point.oracleMeanExposure)} · mode {signedExposure(props.point.oracleModalExposure)} · executable policy {signedExposure(props.point.oracleOptimalExposure)}</span>
-        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mean {signedExposure(props.point.strategyMeanExposure)}</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mode <strong class="text-cyan-200">{signedExposure(props.point.oracleModalExposure)}</strong> · target <strong class="text-cyan-100">{signedExposure(props.point.oracleOptimalExposure)}</strong> · mean {signedExposure(props.point.oracleMeanExposure)}</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mode <strong class="text-violet-200">{signedExposure(strategyMode())}</strong> · target <strong class="text-violet-100">{signedExposure(props.point.candidateExposure)}</strong> · mean {signedExposure(props.point.strategyMeanExposure)}</span>
         <span>Oracle entropy {formatQuote(props.point.oracleEntropy, 4)}</span>
       </div>
-      <div
-        class="grid h-52 items-end gap-0.5 border-b border-line px-1 pt-2"
-        style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
-        role="img"
-        aria-label="Oracle and strategy probability by exposure"
-      >
-        <For each={props.point.values}>
-          {(value) => (
-            <div class="group relative flex h-full items-end justify-center gap-px" title={`Exposure ${signedExposure(value.exposure)} · oracle ${ratioPercent(value.oracleProbability)} · strategy ${ratioPercent(value.strategyProbability)}`}>
-              <div class="w-[44%] min-w-px rounded-t-sm bg-cyan-400/80" style={{ height: `${value.oracleProbability / maximum() * 100}%` }} />
-              <div class="w-[44%] min-w-px rounded-t-sm bg-violet-400/80" style={{ height: `${value.strategyProbability / maximum() * 100}%` }} />
-            </div>
-          )}
-        </For>
+      <div class="relative h-52 border-b border-line" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and target ${signedExposure(props.point.oracleOptimalExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
+        <div
+          class="grid h-full items-end gap-0.5 px-1 pt-2"
+          style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
+        >
+          <For each={props.point.values}>
+            {(value) => {
+              const oracleMode = () => value.exposure === props.point.oracleModalExposure;
+              const predictedMode = () => value.exposure === strategyMode();
+              return (
+                <div
+                  class="group relative flex h-full items-end justify-center gap-px"
+                  classList={{
+                    "bg-cyan-400/8": oracleMode() && !predictedMode(),
+                    "bg-violet-400/8": predictedMode() && !oracleMode(),
+                    "bg-gradient-to-r from-cyan-400/10 to-violet-400/10": oracleMode() && predictedMode(),
+                  }}
+                  title={`Exposure ${signedExposure(value.exposure)} · oracle ${ratioPercent(value.oracleProbability)}${oracleMode() ? " (mode)" : ""} · strategy ${ratioPercent(value.strategyProbability)}${predictedMode() ? " (mode)" : ""}`}
+                >
+                  <div
+                    class="w-[44%] min-w-px rounded-t-sm bg-cyan-400/80"
+                    classList={{ "outline outline-2 outline-offset-1 outline-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.8)]": oracleMode() }}
+                    style={{ height: `${value.oracleProbability / maximum() * 100}%` }}
+                  />
+                  <div
+                    class="w-[44%] min-w-px rounded-t-sm bg-violet-400/80"
+                    classList={{ "outline outline-2 outline-offset-1 outline-violet-200 shadow-[0_0_10px_rgba(167,139,250,0.8)]": predictedMode() }}
+                    style={{ height: `${value.strategyProbability / maximum() * 100}%` }}
+                  />
+                </div>
+              );
+            }}
+          </For>
+        </div>
+        <div class="pointer-events-none absolute inset-x-1 bottom-0 top-2" aria-hidden="true">
+          <div
+            class="absolute inset-y-0 -translate-x-px border-l-2 border-dashed border-cyan-100/90"
+            style={{ left: markerPosition(props.point.oracleOptimalExposure) }}
+          />
+          <div
+            class="absolute inset-y-0 translate-x-px border-l-2 border-dashed border-violet-100/90"
+            style={{ left: markerPosition(props.point.candidateExposure) }}
+          />
+        </div>
       </div>
       <div
         class="grid gap-0.5 px-1 pt-1 text-center text-[10px] tabular-nums text-ink-400"
@@ -1459,9 +1502,36 @@ function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint 
           )}
         </For>
       </div>
-      <div class="mt-0.5 text-center text-[10px] uppercase tracking-wider text-ink-500">Target exposure</div>
+      <div class="mt-0.5 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] uppercase tracking-wider text-ink-500">
+        <span>Target exposure</span>
+        <span class="text-cyan-200">outlined bar = oracle mode · dashed line = oracle target</span>
+        <span class="text-violet-200">outlined bar = strategy mode · dashed line = strategy target</span>
+      </div>
     </div>
   );
+}
+
+function distributionMode(
+  values: VwKamaValueDistributionPoint["values"],
+  probability: "oracleProbability" | "strategyProbability",
+): number {
+  if (values.length === 0) return 0;
+  return values.reduce((best, value) =>
+    value[probability] > best[probability]
+      || (value[probability] === best[probability]
+        && Math.abs(value.exposure) < Math.abs(best.exposure))
+      ? value
+      : best, values[0]!).exposure;
+}
+
+function distributionMarkerPosition(exposures: number[], target: number): string {
+  if (exposures.length <= 1) return "50%";
+  const first = exposures[0]!;
+  const last = exposures.at(-1)!;
+  const position = last === first ? 0 : (target - first) / (last - first);
+  const centered = (Math.max(0, Math.min(1, position)) * (exposures.length - 1) + 0.5)
+    / exposures.length;
+  return `${centered * 100}%`;
 }
 
 function InspectorSelect(props: {
