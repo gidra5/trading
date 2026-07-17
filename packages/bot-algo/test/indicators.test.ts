@@ -5,7 +5,6 @@ import {
   KAMAIndicator,
   LinearRegressionIndicator,
   LookbackIndicator,
-  MeanReversionIndicator,
   SMAIndicator,
   VolumeWeightedKAMAIndicator,
 } from "../src/indicators.js";
@@ -49,31 +48,6 @@ test("EMA accepts signed child-indicator series", () => {
 
   assert.equal(ema.indicator(), -4);
   assert.equal(ema.derivative(), -2);
-});
-
-test("mean-reversion score rises for a volatility-normalized move away from its mean", () => {
-  const indicator = new MeanReversionIndicator(20, 20, 1);
-  for (let index = 0; index < 40; index += 1) {
-    indicator.onTick({ eventTime: index, value: 100 });
-  }
-  assert.equal(indicator.indicator(), 0);
-
-  indicator.onTick({ eventTime: 40, value: 130 });
-  assert.ok(indicator.indicator() > 0.9);
-  assert.ok(indicator.details().signedDistance > 0);
-  assert.ok(indicator.details().normalizedDistance > 1);
-});
-
-test("mean-reversion indicator restores exactly", () => {
-  const original = new MeanReversionIndicator(10, 20, 1.5);
-  for (const [index, value] of [100, 101, 99, 105].entries()) {
-    original.onTick({ eventTime: index, value });
-  }
-  const restored = new MeanReversionIndicator(10, 20, 1.5);
-  restored.restore(structuredClone(original.snapshot()));
-
-  assert.deepEqual(restored.snapshot(), original.snapshot());
-  assert.deepEqual(restored.details(), original.details());
 });
 
 test("linear regression retains a negative series across snapshot restore", () => {
@@ -130,6 +104,8 @@ test("volume-weighted KAMA speeds up on high relative volume", () => {
   high.onTick({ eventTime: 4, price: 104, quantity: 40 });
   low.onTick({ eventTime: 4, price: 104, quantity: 2 });
 
+  assert.equal(high.volumeAverage(), 25);
+  assert.equal(low.volumeAverage(), 6);
   assert.ok(high.details().alpha > low.details().alpha);
   assert.ok(high.derivative() > low.derivative());
 });

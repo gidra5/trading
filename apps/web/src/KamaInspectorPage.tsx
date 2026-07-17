@@ -22,7 +22,11 @@ import {
   type CandleChartStateBand,
   type CandleChartViewport,
 } from "./components/CandleChart";
-import { IndicatorChart, type IndicatorChartSeries } from "./components/IndicatorChart";
+import {
+  IndicatorChart,
+  type IndicatorChartEvent,
+  type IndicatorChartSeries,
+} from "./components/IndicatorChart";
 import { formatDateTime, formatDuration, formatQuote } from "./format";
 
 const apiBase = "/backend";
@@ -36,10 +40,12 @@ interface TimeRange { start: number; end: number }
 interface ScoreWeights { f1: number; agreement: number; cleanliness: number }
 type DiagnosticIndicatorId =
   | "confirmationEma"
-  | "meanReversionEma"
+  | "meanReversionKama"
+  | "signalFriction"
   | "kamaRate"
   | "efficiencyRatio"
   | "effectiveEfficiencyRatio"
+  | "volume"
   | "relativeVolume"
   | "alpha"
   | "rsi"
@@ -51,10 +57,12 @@ type DiagnosticVisibility = Record<DiagnosticIndicatorId, boolean>;
 const defaultScoreWeights: ScoreWeights = { f1: 0.2, agreement: 0.6, cleanliness: 0.2 };
 const defaultDiagnosticVisibility: DiagnosticVisibility = {
   confirmationEma: false,
-  meanReversionEma: false,
+  meanReversionKama: false,
+  signalFriction: false,
   kamaRate: false,
   efficiencyRatio: false,
   effectiveEfficiencyRatio: false,
+  volume: false,
   relativeVolume: false,
   alpha: false,
   rsi: false,
@@ -64,10 +72,12 @@ const defaultDiagnosticVisibility: DiagnosticVisibility = {
 };
 const diagnosticOptions: Array<{ id: DiagnosticIndicatorId; label: string; placement: "price" | "pane" }> = [
   { id: "confirmationEma", label: "Confirmation EMA", placement: "price" },
-  { id: "meanReversionEma", label: "Mean-reversion EMA", placement: "price" },
-  { id: "kamaRate", label: "KAMA rate", placement: "pane" },
+  { id: "meanReversionKama", label: "Mean-reversion KAMA", placement: "price" },
+  { id: "signalFriction", label: "Signal friction bands", placement: "price" },
+  { id: "kamaRate", label: "KAMA derivative", placement: "pane" },
   { id: "efficiencyRatio", label: "Efficiency ratio", placement: "pane" },
   { id: "effectiveEfficiencyRatio", label: "Effective ER", placement: "pane" },
+  { id: "volume", label: "Volume + EMA", placement: "pane" },
   { id: "relativeVolume", label: "Relative volume", placement: "pane" },
   { id: "alpha", label: "KAMA alpha", placement: "pane" },
   { id: "rsi", label: "RSI", placement: "pane" },
@@ -86,12 +96,17 @@ const defaults: VwKamaParameters = {
   volumeMs: 130 * 60_000,
   volumeCap: 2.65003,
   volumePower: 0,
+  rateMode: "relative",
+  rateEmaMs: 60_000,
   deadbandBpsHour: 67.56654,
   deadbandMode: "flat",
   hysteresisReleaseRatio: 0.25,
-  thresholdMode: "static",
   thresholdLookbackMs: 60 * 60_000,
+  thresholdNoiseResponse: "proportional",
   thresholdNoiseMultiplier: 0,
+  thresholdInverseMaxBpsHour: 0,
+  thresholdInverseNoiseScaleBpsHour: 30,
+  signalFrictionFraction: 1,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -114,10 +129,12 @@ const defaults: VwKamaParameters = {
   confirmationDmiWeight: 0,
   confirmationAdxThreshold: 20,
   confirmationBias: 0,
-  meanReversionMix: 0,
-  meanReversionMeanMs: 60 * 60_000,
+  meanReversionEfficiencyMs: 14 * 60_000,
+  meanReversionFastMs: 28 * 60_000,
+  meanReversionSlowMs: 60 * 60_000,
   meanReversionVolatilityMs: 60 * 60_000,
-  meanReversionThreshold: 2,
+  meanReversionSuppressionThreshold: 1,
+  meanReversionReversalThreshold: 0,
 };
 
 const emptyOracle: BacktestOraclePath = {
@@ -170,6 +187,7 @@ export function KamaInspectorPage() {
   const [detailLoading, setDetailLoading] = createSignal(false);
   const [detailError, setDetailError] = createSignal<string>();
   const [hoveredOracle, setHoveredOracle] = createSignal<BacktestOraclePoint>();
+  const [cursorTime, setCursorTime] = createSignal<number>();
   let analysisTimer: number | undefined;
   let analysisController: AbortController | undefined;
   let detailTimer: number | undefined;
@@ -235,6 +253,11 @@ export function KamaInspectorPage() {
     { label: "Oracle", points: oracle().points },
     { label: "Candidate", points: candidateStatePoints() },
   ]);
+  const indicatorPoints = createMemo(() => mergeDetailIndicatorPoints(
+    result()?.indicatorPoints ?? [],
+    detail(),
+    result(),
+  ));
   const priceIndicatorSeries = createMemo<BacktestChartSmaSeries[]>(() => {
     const analysis = result();
     if (!analysis) return [];
@@ -242,29 +265,56 @@ export function KamaInspectorPage() {
     return [
       ...(showKama() ? [mergeDetailKamaSeries(analysis.kamaSeries, detail(), analysis)] : []),
       ...(visibility.confirmationEma
-        ? [priceIndicatorLine(analysis.indicatorPoints, "confirmationEma", "Confirmation EMA", "#f5b84b", parameters().confirmationEmaMs ?? 0)]
+        ? [priceIndicatorLine(indicatorPoints(), "confirmationEma", "Confirmation EMA", "#f5b84b", parameters().confirmationEmaMs ?? 0)]
         : []),
-      ...(visibility.meanReversionEma
-        ? [priceIndicatorLine(analysis.indicatorPoints, "meanReversionEma", "Mean-reversion EMA", "#22c55e", parameters().meanReversionMeanMs ?? 0)]
+      ...(visibility.meanReversionKama
+        ? [priceIndicatorLine(indicatorPoints(), "meanReversionKama", "Mean-reversion KAMA", "#22c55e", parameters().meanReversionSlowMs ?? 0)]
+        : []),
+      ...(visibility.signalFriction
+        ? signalFrictionSeries(indicatorPoints(), parameters().signalFrictionFraction ?? 1, oracleFriction())
         : []),
     ];
   });
   const diagnosticSeries = createMemo<IndicatorChartSeries[]>(() => {
-    const points = result()?.indicatorPoints ?? [];
+    const points = indicatorPoints();
     const visible = diagnosticVisibility();
     const values = parameters();
     return [
-      ...(visible.kamaRate ? [diagnosticLine(points, "kamaRate", "KAMA rate", "#f472b6", {
+      ...(visible.kamaRate ? [diagnosticLine(points, "kamaRate", `KAMA derivative · ${values.rateMode === "log" ? "log-relative" : "relative"} · ${formatDuration(values.rateEmaMs ?? intervalMs())} EMA`, "#f472b6", {
         symmetric: true,
         suffix: " bps/h",
-        references: [
-          { value: values.deadbandBpsHour, color: "#f5b84b" },
-          { value: -values.deadbandBpsHour, color: "#f5b84b" },
-          { value: 0 },
+        references: [{ value: 0 }],
+        overlays: [
+          ...(sampleCount(values.rateEmaMs ?? intervalMs(), intervalMs()) > 1 ? [{
+            label: values.rateMode === "log" ? "Raw log-relative source" : "Raw relative source",
+            color: "#38bdf8",
+            points: indicatorValues(points, "kamaRateRaw"),
+          }] : []),
+          {
+            label: "Positive live threshold",
+            color: "#f5b84b",
+            dashed: true,
+            points: indicatorValues(points, "threshold"),
+          },
+          {
+            label: "Negative live threshold",
+            color: "#f5b84b",
+            dashed: true,
+            points: indicatorValues(points, "threshold", -1),
+          },
         ],
       })] : []),
       ...(visible.efficiencyRatio ? [diagnosticLine(points, "efficiencyRatio", "Efficiency ratio", "#38bdf8", { minimum: 0, maximum: 1, decimals: 3 })] : []),
       ...(visible.effectiveEfficiencyRatio ? [diagnosticLine(points, "effectiveEfficiencyRatio", "Effective ER", "#a78bfa", { minimum: 0, maximum: 1, decimals: 3 })] : []),
+      ...(visible.volume ? [diagnosticLine(points, "volume", `Volume · ${formatDuration(values.volumeMs)} EMA`, "#a78bfa", {
+        minimum: 0,
+        decimals: 2,
+        overlays: [{
+          label: "Volume EMA",
+          color: "#38bdf8",
+          points: indicatorValues(points, "volumeAverage"),
+        }],
+      })] : []),
       ...(visible.relativeVolume ? [diagnosticLine(points, "relativeVolume", "Relative volume", "#eab308", {
         minimum: 0,
         maximum: Math.max(1, values.volumeCap),
@@ -291,13 +341,19 @@ export function KamaInspectorPage() {
         symmetric: true,
         suffix: "σ",
         references: [
-          { value: values.meanReversionThreshold ?? 2, color: "#f5b84b" },
-          { value: -(values.meanReversionThreshold ?? 2), color: "#f5b84b" },
+          ...((values.meanReversionReversalThreshold ?? 0) > 0 ? [
+            { value: values.meanReversionSuppressionThreshold ?? 1, color: "#f5b84b" },
+            { value: -(values.meanReversionSuppressionThreshold ?? 1), color: "#f5b84b" },
+            { value: values.meanReversionReversalThreshold ?? 0, color: "#fb7185" },
+            { value: -(values.meanReversionReversalThreshold ?? 0), color: "#fb7185" },
+          ] : []),
           { value: 0 },
         ],
       })] : []),
     ];
   });
+  const rejectionEvents = createMemo<IndicatorChartEvent[]>(() =>
+    diagnosticVisibility().kamaRate ? signalRejectionEvents(indicatorPoints()) : []);
   const activeDiagnosticCount = createMemo(() =>
     diagnosticOptions.filter((option) => diagnosticVisibility()[option.id]).length);
   const annotations = createMemo(() => showSignals()
@@ -864,6 +920,20 @@ export function KamaInspectorPage() {
               </div>
             </div>
             <InspectorSelect
+              label="Signal rate"
+              value={parameters().rateMode ?? "relative"}
+              options={[
+                { value: "relative", label: "Relative KAMA derivative" },
+                { value: "log", label: "Log-relative KAMA rate" },
+              ]}
+              onInput={(value) => update("rateMode", value as VwKamaParameters["rateMode"])}
+            />
+            <DurationInput
+              label="Rate EMA"
+              value={parameters().rateEmaMs ?? intervalMs()}
+              onInput={(value) => update("rateEmaMs", value)}
+            />
+            <InspectorSelect
               label="Deadband behavior"
               value={parameters().deadbandMode}
               options={[
@@ -877,15 +947,6 @@ export function KamaInspectorPage() {
               <InspectorNumber label="Hysteresis release ratio" value={parameters().hysteresisReleaseRatio ?? 0.25} min={0} max={1} step={0.05} onInput={(value) => update("hysteresisReleaseRatio", value)} />
             </Show>
             <InspectorSelect
-              label="Threshold mode"
-              value={parameters().thresholdMode ?? "static"}
-              options={[
-                { value: "static", label: "Static" },
-                { value: "adaptive", label: "Volatility-adaptive" },
-              ]}
-              onInput={(value) => update("thresholdMode", value as VwKamaParameters["thresholdMode"])}
-            />
-            <InspectorSelect
               label="Agreement strategy"
               value={parameters().agreementMode ?? "sizing"}
               options={[
@@ -894,36 +955,43 @@ export function KamaInspectorPage() {
               ]}
               onInput={(value) => update("agreementMode", value as VwKamaParameters["agreementMode"])}
             />
-            <InspectorNumber
-              label="Mean-reversion blend"
-              value={parameters().meanReversionMix ?? 0}
-              min={0}
-              max={1}
-              step={0.05}
-              onInput={(value) => update("meanReversionMix", value)}
+            <DurationInput
+              label="Mean-reversion ER"
+              value={parameters().meanReversionEfficiencyMs ?? parameters().efficiencyMs}
+              onInput={(value) => update("meanReversionEfficiencyMs", value)}
             />
-            <Show when={(parameters().meanReversionMix ?? 0) > 0}>
-              <DurationInput
-                label="Mean-reversion mean"
-                value={parameters().meanReversionMeanMs ?? 60 * 60_000}
-                onInput={(value) => update("meanReversionMeanMs", value)}
-              />
-              <DurationInput
-                label="Mean-reversion volatility"
-                value={parameters().meanReversionVolatilityMs ?? 60 * 60_000}
-                onInput={(value) => update("meanReversionVolatilityMs", value)}
-              />
-              <InspectorNumber
-                label="Mean-reversion switch (σ)"
-                value={parameters().meanReversionThreshold ?? 2}
-                min={0.01}
-                step={0.05}
-                onInput={(value) => update("meanReversionThreshold", value)}
-              />
-              <div class="flex items-end text-xs text-ink-400 md:col-span-2">
-                The causal distance from the EMA is normalized by its recent volatility. At blend 1, nearby prices follow the KAMA trend while sufficiently extended prices trade against it; the ambiguous boundary reduces exposure toward flat.
-              </div>
-            </Show>
+            <DurationInput
+              label="Mean-reversion fast"
+              value={parameters().meanReversionFastMs ?? parameters().fastMs}
+              onInput={(value) => update("meanReversionFastMs", value)}
+            />
+            <DurationInput
+              label="Mean-reversion slow"
+              value={parameters().meanReversionSlowMs ?? 60 * 60_000}
+              onInput={(value) => update("meanReversionSlowMs", value)}
+            />
+            <DurationInput
+              label="Mean-reversion volatility"
+              value={parameters().meanReversionVolatilityMs ?? 60 * 60_000}
+              onInput={(value) => update("meanReversionVolatilityMs", value)}
+            />
+            <InspectorNumber
+              label="Suppress at (σ)"
+              value={parameters().meanReversionSuppressionThreshold ?? 1}
+              min={0.01}
+              step={0.1}
+              onInput={(value) => update("meanReversionSuppressionThreshold", value)}
+            />
+            <InspectorNumber
+              label="Reverse at (σ; 0 disables)"
+              value={parameters().meanReversionReversalThreshold ?? 0}
+              min={0}
+              step={0.1}
+              onInput={(value) => update("meanReversionReversalThreshold", value)}
+            />
+            <div class="flex items-end text-xs text-ink-400 md:col-span-2">
+              The mean baseline is a second KAMA. Its ER can weight price changes by the configured ER-volume EMA/power, and it shares the main KAMA power and post-ER volume settings. On a rate-band exit, distance below suppression follows KAMA, the middle zone suppresses, and distance at or beyond reversal trades against KAMA. Reversal 0 disables it; equal thresholds make a direct switch.
+            </div>
             <InspectorNumber
               label="Base threshold (bps/hour)"
               value={parameters().deadbandBpsHour}
@@ -931,18 +999,45 @@ export function KamaInspectorPage() {
               step={1}
               onInput={(value) => update("deadbandBpsHour", value)}
             />
-            <Show when={parameters().thresholdMode === "adaptive"}>
-              <DurationInput
-                label="Noise lookback"
-                value={parameters().thresholdLookbackMs ?? 60 * 60_000}
-                onInput={(value) => update("thresholdLookbackMs", value)}
+            <DurationInput
+              label="Noise lookback"
+              value={parameters().thresholdLookbackMs ?? 60 * 60_000}
+              onInput={(value) => update("thresholdLookbackMs", value)}
+            />
+            <InspectorSelect
+              label="Noise response"
+              value={parameters().thresholdNoiseResponse ?? "proportional"}
+              options={[
+                { value: "proportional", label: "Proportional to noise" },
+                { value: "inverse", label: "Inversely proportional" },
+              ]}
+              onInput={(value) => update("thresholdNoiseResponse", value as VwKamaParameters["thresholdNoiseResponse"])}
+            />
+            <Show
+              when={parameters().thresholdNoiseResponse === "inverse"}
+              fallback={(
+                <InspectorNumber
+                  label="Noise multiplier"
+                  value={parameters().thresholdNoiseMultiplier ?? 0}
+                  min={0}
+                  step={0.1}
+                  onInput={(value) => update("thresholdNoiseMultiplier", value)}
+                />
+              )}
+            >
+              <InspectorNumber
+                label="Maximum inverse bonus (bps/hour)"
+                value={parameters().thresholdInverseMaxBpsHour ?? 0}
+                min={0}
+                step={1}
+                onInput={(value) => update("thresholdInverseMaxBpsHour", value)}
               />
               <InspectorNumber
-                label="Noise multiplier"
-                value={parameters().thresholdNoiseMultiplier ?? 0}
-                min={0}
-                step={0.1}
-                onInput={(value) => update("thresholdNoiseMultiplier", value)}
+                label="Half-decay noise scale (bps/hour)"
+                value={parameters().thresholdInverseNoiseScaleBpsHour ?? 30}
+                min={0.000001}
+                step={1}
+                onInput={(value) => update("thresholdInverseNoiseScaleBpsHour", value)}
               />
             </Show>
             <DurationInput label="Efficiency" value={parameters().efficiencyMs} onInput={(value) => update("efficiencyMs", value)} />
@@ -971,9 +1066,13 @@ export function KamaInspectorPage() {
           </div>
           <div class="mt-2 text-xs text-ink-400">
             At {formatDuration(intervalMs())}, the periods round to {sampleCount(parameters().efficiencyMs, intervalMs())} / {sampleCount(parameters().fastMs, intervalMs())} / {sampleCount(parameters().slowMs, intervalMs())} / {sampleCount(parameters().volumeMs, intervalMs())} samples; the ER volume EMA is {sampleCount(parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs, intervalMs())} samples. ER move weights are (volume / volume EMA)^{parameters().efficiencyVolumePower ?? 0}; power 0 is standard ER.
-            <Show when={parameters().thresholdMode === "adaptive"}>
-              {` Threshold = base + ${formatQuote(parameters().thresholdNoiseMultiplier ?? 0, 3)} × EWMA of absolute KAMA-rate changes.`}
+            <Show
+              when={parameters().thresholdNoiseResponse === "inverse"}
+              fallback={` Threshold = base + noise × ${formatQuote(parameters().thresholdNoiseMultiplier ?? 0, 3)}; multiplier 0 is static.`}
+            >
+              {` Threshold = base + ${formatQuote(parameters().thresholdInverseMaxBpsHour ?? 0, 3)} / (1 + noise / ${formatQuote(parameters().thresholdInverseNoiseScaleBpsHour ?? 30, 3)}); maximum bonus 0 is static.`}
             </Show>
+            {` A one-candle rate EMA is the raw selected rate.`}
             {` Signal strength = side maximum × exp(−0.5 × (KAMA rate / side sigma)²). ${parameters().agreementMode === "confidence" ? "Confidence stays fixed until the next signal." : "Partial allocations are marked from their signal price."}`}
           </div>
           <details class="mt-3 rounded-2 border border-line bg-ink-800 p-3">
@@ -1004,13 +1103,14 @@ export function KamaInspectorPage() {
           <details class="mt-3 rounded-2 border border-line bg-ink-800 p-3">
             <summary class="cursor-pointer text-sm font-semibold text-ink-200">Scoring controls</summary>
             <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <InspectorNumber label="Oracle + signal friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
+              <InspectorNumber label="Oracle friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
+              <InspectorNumber label="Candidate friction fraction" value={parameters().signalFrictionFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("signalFrictionFraction", value)} />
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              This friction shapes the oracle path and requires each candidate state change to move farther from the last emitted signal price.
+              Oracle friction shapes the retrospective path. Candidate state changes require a move from the last emitted signal price equal to oracle friction × the selected fraction; 0 disables only the candidate signal-memory gate.
             </div>
           </details>
         </section>
@@ -1073,6 +1173,7 @@ export function KamaInspectorPage() {
                     <div class="mt-1 text-xs text-ink-300">
                       {formatDateRange(timeRange().start, timeRange().end)} · {formatQuote(chartCandles().length, 0)} chart points · {formatDuration(analysis().intervalMs)} source · {chartResolution().exact ? "exact price candles" : `~${formatDuration(chartResolution().renderIntervalMs)} price buckets`}
                       <Show when={showKama()}> · {chartResolution().exact ? "exact KAMA" : "sampled KAMA"}</Show>
+                      <Show when={diagnosticSeries().length > 0}> · {chartResolution().exact ? "exact indicators" : "resolution-matched indicators"}</Show>
                       <Show when={detailLoading()}> · loading detail…</Show>
                       <Show when={analysis().elapsedMs}> · computed in {formatComputeTime(analysis().elapsedMs)}</Show>
                     </div>
@@ -1088,7 +1189,7 @@ export function KamaInspectorPage() {
                       </summary>
                       <div class="absolute right-0 z-30 mt-2 w-80 rounded-2 border border-line bg-ink-900 p-3 shadow-xl">
                         <div class="mb-2 text-xs text-ink-400">
-                          EMAs overlay price. Oscillators use independently scaled, time-aligned lanes below it.
+                          EMAs and signal-friction bands overlay price. Oscillators use independently scaled, time-aligned lanes below it.
                         </div>
                         <div class="grid grid-cols-2 gap-2">
                           <For each={diagnosticOptions}>
@@ -1137,24 +1238,29 @@ export function KamaInspectorPage() {
                     interactive
                     timeNavigation
                     viewport={chartViewport()}
+                    cursorTime={cursorTime()}
                     highlightedAnnotation={matchedCandidate()}
                     stateBands={chartStateBands()}
                     onOracleHoverChange={setHoveredOracle}
                     onViewportChange={updateViewportFromChart}
+                    onCursorTimeChange={setCursorTime}
                     emptyLabel="No analyzed candles"
                   />
                 </div>
                 <Show when={diagnosticSeries().length > 0}>
                   <div class="mt-3">
                     <div class="mb-1 flex items-center justify-between gap-3 text-xs text-ink-400">
-                      <span>Signal diagnostics · sampled causal trace · each lane has its own scale</span>
+                      <span>Signal diagnostics · causal trace · gold lines are the live ±threshold · orange marks are rejected state changes</span>
                       <span>Wheel to zoom · drag to pan</span>
                     </div>
                     <div class="h-60">
                       <IndicatorChart
                         series={diagnosticSeries()}
+                        events={rejectionEvents()}
                         start={visibleTimeRange().start}
                         end={visibleTimeRange().end}
+                        cursorTime={cursorTime()}
+                        onCursorTimeChange={setCursorTime}
                         onZoom={zoomViewport}
                         onPan={panViewport}
                       />
@@ -1507,7 +1613,19 @@ function candleViewport(candles: Candle[], range: TimeRange): CandleChartViewpor
   return inspectorViewport({ start, end: Math.max(start + 1, low) }, candles.length);
 }
 
-type NumericIndicatorKey = Exclude<keyof VwKamaIndicatorPoint, "time">;
+type NumericIndicatorKey = {
+  [K in keyof VwKamaIndicatorPoint]: VwKamaIndicatorPoint[K] extends number ? K : never
+}[keyof VwKamaIndicatorPoint];
+
+function indicatorValues(
+  points: VwKamaIndicatorPoint[],
+  key: NumericIndicatorKey,
+  multiplier = 1,
+): Array<{ time: number; value: number }> {
+  return points
+    .map((point) => ({ time: point.time, value: point[key] * multiplier }))
+    .filter((point) => Number.isFinite(point.value));
+}
 
 function priceIndicatorLine(
   points: VwKamaIndicatorPoint[],
@@ -1521,10 +1639,50 @@ function priceIndicatorLine(
     windowSec: windowMs / 1_000,
     label,
     color,
-    points: points
-      .map((point) => ({ time: point.time, value: point[key] }))
-      .filter((point) => Number.isFinite(point.value)),
+    points: indicatorValues(points, key),
   };
+}
+
+function signalFrictionSeries(
+  points: VwKamaIndicatorPoint[],
+  fraction: number,
+  oracleFriction: number,
+): BacktestChartSmaSeries[] {
+  const bps = oracleFriction * fraction * 10_000;
+  return [
+    {
+      index: -1,
+      windowSec: 0,
+      label: `Signal +${formatQuote(bps, 2)} bps`,
+      color: "#fb923c",
+      points: steppedIndicatorValues(points, "signalFrictionUpper"),
+    },
+    {
+      index: -1,
+      windowSec: 0,
+      label: `Signal −${formatQuote(bps, 2)} bps`,
+      color: "#fb923c",
+      points: steppedIndicatorValues(points, "signalFrictionLower"),
+    },
+  ];
+}
+
+function steppedIndicatorValues(
+  points: VwKamaIndicatorPoint[],
+  key: "signalFrictionLower" | "signalFrictionUpper",
+): Array<{ time: number; value: number }> {
+  const result: Array<{ time: number; value: number }> = [];
+  let previous: number | undefined;
+  for (const point of points) {
+    const value = point[key];
+    if (value === null || !Number.isFinite(value)) continue;
+    if (previous !== undefined && value !== previous) {
+      result.push({ time: point.time, value: previous });
+    }
+    result.push({ time: point.time, value });
+    previous = value;
+  }
+  return result;
 }
 
 function diagnosticLine(
@@ -1538,11 +1696,41 @@ function diagnosticLine(
     id: key,
     label,
     color,
-    points: points
-      .map((point) => ({ time: point.time, value: point[key] }))
-      .filter((point) => Number.isFinite(point.value)),
+    points: indicatorValues(points, key),
     ...options,
   };
+}
+
+function signalRejectionEvents(points: VwKamaIndicatorPoint[]): IndicatorChartEvent[] {
+  const result: IndicatorChartEvent[] = [];
+  let previous = "";
+  for (const point of points) {
+    const reasons = point.rejectionReasons ?? [];
+    if (reasons.length === 0 || !point.signalIntent) {
+      previous = "";
+      continue;
+    }
+    const key = `${point.signalIntent}:${reasons.join(",")}`;
+    if (key === previous) continue;
+    previous = key;
+    result.push({
+      time: point.time,
+      seriesId: "kamaRate",
+      color: "#fb923c",
+      label: `${point.signalIntent.toUpperCase()} rejected · ${reasons.map(rejectionReasonLabel).join(" + ")}`,
+    });
+  }
+  return result;
+}
+
+function rejectionReasonLabel(reason: VwKamaIndicatorPoint["rejectionReasons"][number]): string {
+  switch (reason) {
+    case "mean-reversion": return "mean-reversion threshold";
+    case "ema-hard-gate": return "EMA hard gate";
+    case "zero-quality": return "zero confirmation quality";
+    case "minimum-quality": return "below minimum quality";
+    case "signal-friction": return "signal friction";
+  }
 }
 
 function mergeDetailCandles(
@@ -1582,6 +1770,23 @@ function mergeDetailKamaSeries(
       ...detail.kamaSeries.points.filter((point) => point.time >= replacement.start && point.time < replacement.end),
     ].sort((left, right) => left.time - right.time),
   };
+}
+
+function mergeDetailIndicatorPoints(
+  overview: VwKamaIndicatorPoint[],
+  detail: VwKamaCandleRangeResponse | undefined,
+  analysis: VwKamaInspectorResponse | undefined,
+): VwKamaIndicatorPoint[] {
+  if (!detail?.indicatorPoints?.length || !analysis
+    || detail.windowId !== analysis.window.id
+    || detail.intervalMs !== analysis.intervalMs) return overview;
+  const replacement = detailReplacementRange(analysis.candles, detail.candles);
+  if (!replacement) return overview;
+  return [
+    ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
+    ...detail.indicatorPoints.filter((point) =>
+      point.time >= replacement.start && point.time < replacement.end),
+  ].sort((left, right) => left.time - right.time);
 }
 
 function detailReplacementRange(overview: Candle[], detail: Candle[]): TimeRange | undefined {

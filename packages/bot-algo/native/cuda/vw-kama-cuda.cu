@@ -20,17 +20,21 @@ struct VwKamaParams {
   int32_t fast_period;
   int32_t slow_period;
   int32_t volume_period;
+  int32_t rate_ema_samples;
   int32_t threshold_samples;
   int32_t acceleration_samples;
   int32_t distance_samples;
   int32_t ema_samples;
   int32_t rsi_samples;
   int32_t dmi_samples;
-  int32_t mean_reversion_samples;
+  int32_t mean_reversion_efficiency_period;
+  int32_t mean_reversion_fast_period;
+  int32_t mean_reversion_slow_period;
   int32_t mean_reversion_volatility_samples;
   int32_t deadband_mode;
-  int32_t threshold_mode;
   int32_t agreement_mode;
+  int32_t rate_mode;
+  int32_t threshold_noise_response;
 
   float power;
   float volume_cap;
@@ -39,6 +43,8 @@ struct VwKamaParams {
   float deadband_bps_hour;
   float hysteresis_release_ratio;
   float threshold_noise_multiplier;
+  float threshold_inverse_max;
+  float threshold_inverse_noise_scale;
   float buy_max_fraction;
   float sell_max_fraction;
   float buy_sizing_sigma;
@@ -55,12 +61,13 @@ struct VwKamaParams {
   float confirmation_rsi_weight;
   float confirmation_dmi_weight;
   float confirmation_adx_threshold;
-  float mean_reversion_mix;
-  float mean_reversion_threshold;
+  float mean_reversion_suppression_threshold;
+  float mean_reversion_reversal_threshold;
+  float signal_friction_fraction;
   float warmup_multiple;
 };
 
-static_assert(sizeof(VwKamaParams) == 168, "VwKamaParams ABI changed");
+static_assert(sizeof(VwKamaParams) == 196, "VwKamaParams ABI changed");
 
 struct VwKamaResult {
   double state_credit;
@@ -155,11 +162,6 @@ __device__ __forceinline__ float ema_update(float previous, float value, float a
 
 __device__ __forceinline__ float smooth(float previous, float value, float alpha) {
   return previous == 0.0f ? value : previous + alpha * (value - previous);
-}
-
-__device__ __forceinline__ float smoothstep(float minimum, float maximum, float value) {
-  const float ratio = clamp01((value - minimum) / fmaxf(2.220446e-16f, maximum - minimum));
-  return ratio * ratio * (3.0f - 2.0f * ratio);
 }
 
 __host__ __device__ __forceinline__ int state_from_code(uint8_t code) {
@@ -301,9 +303,12 @@ __global__ void evaluate_kernel(
   const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
   if (candidate >= candidate_count) return;
   const VwKamaParams p = parameters[candidate];
-  float* change_ring = changes + static_cast<size_t>(candidate) * change_stride;
+  float* change_ring = changes + static_cast<size_t>(candidate) * change_stride * 2;
+  float* mean_change_ring = change_ring + change_stride;
 
-  const bool threshold_enabled = p.threshold_mode == 1 && p.threshold_noise_multiplier > 0.0f;
+  const bool threshold_enabled = p.threshold_noise_response == 1
+    ? p.threshold_inverse_max > 0.0f
+    : p.threshold_noise_multiplier > 0.0f;
   const bool confirmation_enabled = p.confirmation_mix > 0.0f;
   const bool acceleration_enabled = confirmation_enabled && p.confirmation_acceleration_weight > 0.0f;
   const bool distance_enabled = confirmation_enabled && p.confirmation_distance_weight > 0.0f;
@@ -311,11 +316,12 @@ __global__ void evaluate_kernel(
     || p.confirmation_ema_gate_strength > 0.0f;
   const bool rsi_enabled = confirmation_enabled && p.confirmation_rsi_weight > 0.0f;
   const bool dmi_enabled = confirmation_enabled && p.confirmation_dmi_weight > 0.0f;
-  const bool mean_reversion_enabled = p.mean_reversion_mix > 0.0f;
+  const bool mean_reversion_enabled = p.mean_reversion_reversal_threshold > 0.0f;
 
   int base_warmup = max(max(p.efficiency_period + 1, p.slow_period), p.volume_period);
   if (p.efficiency_volume_power > 0.0f) base_warmup = max(base_warmup, p.efficiency_volume_period);
   int required = static_cast<int>(ceilf(static_cast<float>(base_warmup) * fmaxf(1.0f, p.warmup_multiple)));
+  required = max(required, static_cast<int>(ceilf(p.rate_ema_samples * p.warmup_multiple)));
   if (threshold_enabled) required = max(required, static_cast<int>(ceilf(p.threshold_samples * p.warmup_multiple)));
   if (acceleration_enabled) required = max(required, static_cast<int>(ceilf(p.acceleration_samples * p.warmup_multiple)));
   if (distance_enabled) required = max(required, static_cast<int>(ceilf(p.distance_samples * p.warmup_multiple)));
@@ -324,8 +330,16 @@ __global__ void evaluate_kernel(
   if (dmi_enabled) required = max(required, static_cast<int>(ceilf(p.dmi_samples * p.warmup_multiple * 2.0f)));
   if (mean_reversion_enabled) {
     required = max(required, static_cast<int>(ceilf(
-      max(p.mean_reversion_samples, p.mean_reversion_volatility_samples) * p.warmup_multiple
+      max(
+        max(p.mean_reversion_efficiency_period + 1, p.mean_reversion_slow_period),
+        max(p.volume_period, p.mean_reversion_volatility_samples)
+      ) * p.warmup_multiple
     )));
+    if (p.efficiency_volume_power > 0.0f) {
+      required = max(required, static_cast<int>(ceilf(
+        p.efficiency_volume_period * p.warmup_multiple
+      )));
+    }
   }
   const int feed_start = max(0, score_start - required);
 
@@ -333,6 +347,7 @@ __global__ void evaluate_kernel(
   const float slow_alpha = period_alpha(p.slow_period);
   const float efficiency_volume_alpha = period_alpha(p.efficiency_volume_period);
   const float volume_alpha = period_alpha(p.volume_period);
+  const float rate_ema_alpha = period_alpha(p.rate_ema_samples);
   const float threshold_alpha = 2.0f / (p.threshold_samples + 1.0f);
   const float acceleration_noise_alpha = 2.0f / (p.acceleration_samples + 1.0f);
   const float acceleration_alpha = acceleration_noise_alpha;
@@ -340,18 +355,24 @@ __global__ void evaluate_kernel(
   const float ema_alpha = period_alpha(p.ema_samples);
   const float rsi_alpha = 1.0f / p.rsi_samples;
   const float dmi_alpha = 1.0f / p.dmi_samples;
-  const float mean_alpha = period_alpha(p.mean_reversion_samples);
+  const float mean_fast_alpha = period_alpha(p.mean_reversion_fast_period);
+  const float mean_slow_alpha = period_alpha(p.mean_reversion_slow_period);
   const float mean_variance_alpha = period_alpha(p.mean_reversion_volatility_samples);
 
   int change_count = 0;
   int change_position = 0;
   float change_sum = 0.0f;
   float change_noise = 0.0f;
+  int mean_change_count = 0;
+  int mean_change_position = 0;
+  float mean_change_sum = 0.0f;
+  float mean_change_noise = 0.0f;
   float previous_price = -1.0f;
   float efficiency_volume_ema = 0.0f;
   float volume_ema = 0.0f;
   float kama = 0.0f;
   float kama_delta = 0.0f;
+  float rate_ema = 0.0f;
   float threshold_previous_rate = 0.0f;
   bool threshold_has_previous = false;
   float threshold_noise = 0.0f;
@@ -376,7 +397,7 @@ __global__ void evaluate_kernel(
   float positive_movement_ema = 0.0f;
   float negative_movement_ema = 0.0f;
   float adx = 0.0f;
-  float mean = 0.0f;
+  float mean_kama = 0.0f;
   float variance = 0.0f;
   int current = 0;
   int trend = 0;
@@ -418,10 +439,27 @@ __global__ void evaluate_kernel(
       change_count = min(change_count + 1, p.efficiency_period);
       change_sum += change;
       change_noise += fabsf(change);
+      if (mean_reversion_enabled) {
+        if (mean_change_count >= p.mean_reversion_efficiency_period) {
+          const float removed = mean_change_ring[mean_change_position];
+          mean_change_sum -= removed;
+          mean_change_noise -= fabsf(removed);
+        }
+        mean_change_ring[mean_change_position] = change;
+        mean_change_position = (mean_change_position + 1) % p.mean_reversion_efficiency_period;
+        mean_change_count = min(mean_change_count + 1, p.mean_reversion_efficiency_period);
+        mean_change_sum += change;
+        mean_change_noise += fabsf(change);
+      }
     }
     previous_price = price;
     const float efficiency_ratio = change_count >= p.efficiency_period && change_noise > 0.0f
       ? clamp01(fabsf(change_sum) / change_noise)
+      : 0.0f;
+    const float mean_efficiency_ratio = mean_reversion_enabled
+      && mean_change_count >= p.mean_reversion_efficiency_period
+      && mean_change_noise > 0.0f
+      ? clamp01(fabsf(mean_change_sum) / mean_change_noise)
       : 0.0f;
 
     const float relative_volume = candle_volume > 0.0f && volume_ema > 0.0f
@@ -433,13 +471,31 @@ __global__ void evaluate_kernel(
     const float smoothing = slow_alpha + effective_efficiency * (fast_alpha - slow_alpha);
     const float adaptive_alpha = clamp01(powf(smoothing, p.power));
     kama = ema_update(kama, price, adaptive_alpha, kama_delta);
+    if (mean_reversion_enabled) {
+      const float mean_effective_efficiency = clamp01(
+        mean_efficiency_ratio * powf(relative_volume, p.volume_power)
+      );
+      const float mean_smoothing = mean_slow_alpha
+        + mean_effective_efficiency * (mean_fast_alpha - mean_slow_alpha);
+      const float mean_adaptive_alpha = clamp01(powf(mean_smoothing, p.power));
+      float unused_delta = 0.0f;
+      mean_kama = ema_update(mean_kama, price, mean_adaptive_alpha, unused_delta);
+    }
     if (candle_volume > 0.0f) {
       float unused_delta = 0.0f;
       volume_ema = ema_update(volume_ema, candle_volume, volume_alpha, unused_delta);
     }
-    const float rate = kama > 0.0f
+    const float previous_kama = kama - kama_delta;
+    const float relative_rate = kama > 0.0f
       ? kama_delta / kama * 10000.0f * 3600000.0f / interval_ms
       : 0.0f;
+    const float log_rate = kama > 0.0f && previous_kama > 0.0f
+      ? logf(kama / previous_kama) * 10000.0f * 3600000.0f / interval_ms
+      : 0.0f;
+    const float raw_rate = p.rate_mode == 1 ? log_rate : relative_rate;
+    float unused_rate_delta = 0.0f;
+    rate_ema = ema_update(rate_ema, raw_rate, rate_ema_alpha, unused_rate_delta);
+    const float rate = rate_ema;
 
     if (threshold_enabled) {
       if (threshold_has_previous) {
@@ -537,33 +593,34 @@ __global__ void evaluate_kernel(
       dmi_has_previous = true;
     }
 
-    float reversion = 0.0f;
+    float normalized_mean_distance = 0.0f;
     if (mean_reversion_enabled) {
       float unused_delta = 0.0f;
-      mean = ema_update(mean, price, mean_alpha, unused_delta);
-      const float signed_distance = mean > 0.0f ? price / mean - 1.0f : 0.0f;
+      const float signed_distance = mean_kama > 0.0f ? price / mean_kama - 1.0f : 0.0f;
       variance = ema_update(
         variance,
         fmaxf(2.220446e-16f, signed_distance * signed_distance),
         mean_variance_alpha,
         unused_delta
       );
-      const float normalized = fabsf(signed_distance)
+      normalized_mean_distance = fabsf(signed_distance)
         / fmaxf(2.220446e-16f, sqrtf(fmaxf(0.0f, variance)));
-      reversion = smoothstep(
-        p.mean_reversion_threshold * 0.5f,
-        p.mean_reversion_threshold * 1.5f,
-        normalized
-      );
     }
 
-    const float threshold = p.deadband_bps_hour
-      + (p.threshold_mode == 1 ? threshold_noise * fmaxf(0.0f, p.threshold_noise_multiplier) : 0.0f);
+    const float threshold_adjustment = p.threshold_noise_response == 1
+      ? fmaxf(0.0f, p.threshold_inverse_max) / (
+        1.0f + fmaxf(0.0f, threshold_noise) / fmaxf(1e-12f, p.threshold_inverse_noise_scale)
+      )
+      : threshold_noise * fmaxf(0.0f, p.threshold_noise_multiplier);
+    const float threshold = p.deadband_bps_hour + threshold_adjustment;
+    const int previous_trend = trend;
     trend = candidate_state(rate, trend, threshold, p);
-    const float reversion_blend = 1.0f - 2.0f * clamp01(p.mean_reversion_mix) * reversion;
-    const int proposed = trend == 0 || fabsf(reversion_blend) <= 2.220446e-16f
-      ? 0
-      : trend * (reversion_blend > 0.0f ? 1 : -1);
+    const bool source_edge = trend != previous_trend;
+    const int proposed = !mean_reversion_enabled || trend == 0
+      ? trend
+      : normalized_mean_distance >= p.mean_reversion_reversal_threshold
+        ? -trend
+        : normalized_mean_distance >= p.mean_reversion_suppression_threshold ? 0 : trend;
     const bool aligned = proposed == 0 || ema_aligned(proposed, ema_rate, p);
     const int desired = proposed != 0
       && clamp01(p.confirmation_ema_gate_strength) == 1.0f
@@ -582,14 +639,16 @@ __global__ void evaluate_kernel(
           adx,
           p
         );
-    const float quality = desired == 0 ? 1.0f : confirmation * fabsf(reversion_blend);
+    const float quality = desired == 0 ? 1.0f : confirmation;
 
     if (
-      desired != current
+      source_edge
+      && desired != current
       && (desired == 0 || quality > 0.0f)
       && quality >= clamp01(p.confirmation_min_quality)
-      && (!has_last_signal || oracle_friction <= 0.0f
-        || fabsf(price - last_signal_price) > last_signal_price * oracle_friction)
+      && (!has_last_signal || oracle_friction <= 0.0f || p.signal_friction_fraction <= 0.0f
+        || fabsf(price - last_signal_price)
+          > last_signal_price * oracle_friction * p.signal_friction_fraction)
     ) {
       const float next_fraction = desired == 0 ? 0.0f : signal_fraction(desired, rate, p) * quality;
       if (index >= score_start) {
@@ -833,6 +892,10 @@ extern "C" int vw_kama_cuda_evaluate(
     int max_efficiency_period = 1;
     for (int index = 0; index < candidate_count; ++index) {
       max_efficiency_period = std::max(max_efficiency_period, parameters[index].efficiency_period);
+      max_efficiency_period = std::max(
+        max_efficiency_period,
+        parameters[index].mean_reversion_efficiency_period
+      );
     }
 
     DeviceBuffer<float> device_high(candle_count);
@@ -841,7 +904,9 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<float> device_volume(candle_count);
     DeviceBuffer<uint8_t> device_oracle(candle_count);
     DeviceBuffer<VwKamaParams> device_parameters(candidate_count);
-    DeviceBuffer<float> device_changes(static_cast<size_t>(candidate_count) * max_efficiency_period);
+    DeviceBuffer<float> device_changes(
+      static_cast<size_t>(candidate_count) * max_efficiency_period * 2
+    );
     DeviceBuffer<DeviceResult> device_results(candidate_count);
     cuda_check(cudaMemcpy(device_high.get(), host_high.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy high");
     cuda_check(cudaMemcpy(device_low.get(), host_low.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy low");

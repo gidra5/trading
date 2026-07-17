@@ -23,10 +23,22 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(raw.sourceCandleCount, 5);
     assert.equal(raw.candles.length, 5);
     assert.equal(raw.kamaSeries.points.length, raw.candles.length);
+    assert.equal(raw.indicatorPoints.length, raw.candles.length);
     assert.deepEqual(
       raw.kamaSeries.points.map((point) => point.time),
       raw.candles.map((candle) => candle.closeTime),
     );
+    assert.deepEqual(
+      raw.indicatorPoints.map((point) => point.time),
+      raw.candles.map((candle) => candle.closeTime),
+    );
+    assert.ok(raw.indicatorPoints.every((point) =>
+      Number.isFinite(point.threshold)
+      && Number.isFinite(point.kamaRate)
+      && Number.isFinite(point.kamaRateRaw)
+      && Number.isFinite(point.volume)
+      && Number.isFinite(point.volumeAverage)
+      && Array.isArray(point.rejectionReasons)));
     assert.ok(raw.candles.every((candle) =>
       candle.interval === "1s" && candle.closeTime - candle.openTime === 999));
 
@@ -40,6 +52,7 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(wide.sourceCandleCount, 199);
     assert.equal(wide.candles.length, 100);
     assert.equal(wide.kamaSeries.points.length, wide.candles.length);
+    assert.equal(wide.indicatorPoints.length, wide.candles.length);
     assert.deepEqual(
       wide.kamaSeries.points.map((point) => point.time),
       wide.candles.map((candle) => candle.closeTime),
@@ -107,6 +120,12 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     );
     assert.ok(analysis.indicatorPoints.every((point) =>
       Number.isFinite(point.confirmationEma)
+      && Number.isFinite(point.threshold)
+      && Number.isFinite(point.kamaRate)
+      && Number.isFinite(point.kamaRateRaw)
+      && Number.isFinite(point.volume)
+      && Number.isFinite(point.volumeAverage)
+      && Array.isArray(point.rejectionReasons)
       && Number.isFinite(point.rsi)
       && Number.isFinite(point.dmi)
       && Number.isFinite(point.adx)));

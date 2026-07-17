@@ -34,7 +34,8 @@ export type PeakValleyDerivativeSource = "price" | "kama";
 export type PeakValleyDerivativeClampMode = "deadband" | "hysteresis" | "hold";
 export type PeakValleySignalTiming = "start" | "end";
 export type PeakValleySigmaMode = "static" | "trend" | "sigmoid-trend";
-export type PeakValleyKamaThresholdMode = "static" | "adaptive";
+export type PeakValleyKamaRateMode = "relative" | "log";
+export type PeakValleyKamaThresholdNoiseResponse = "proportional" | "inverse";
 
 export interface PeakValleyStrategyConfig {
   sampleIntervalMs: number;
@@ -53,11 +54,15 @@ export interface PeakValleyStrategyConfig {
   kamaVolumeLen: number;
   kamaVolumeCap: number;
   kamaVolumePower: number;
+  kamaRateMode: PeakValleyKamaRateMode;
+  kamaRateEmaLen: number;
   kamaRateThresholdLow: number;
   kamaRateThresholdHigh: number;
-  kamaThresholdMode: PeakValleyKamaThresholdMode;
   kamaThresholdLookbackSec: number;
+  kamaThresholdNoiseResponse: PeakValleyKamaThresholdNoiseResponse;
   kamaThresholdNoiseMultiplier: number;
+  kamaThresholdInverseMax: number;
+  kamaThresholdInverseNoiseScale: number;
   kamaSignalFriction: number;
   rateThresholdsLow: number[];
   rateThresholdsHigh: number[];
@@ -104,11 +109,15 @@ export const defaultPeakValleyStrategyConfig: PeakValleyStrategyConfig = {
   kamaVolumeLen: 130,
   kamaVolumeCap: 2.65003,
   kamaVolumePower: 0,
+  kamaRateMode: "relative",
+  kamaRateEmaLen: 1,
   kamaRateThresholdLow: KAMA_ORACLE_RATE_THRESHOLD,
   kamaRateThresholdHigh: KAMA_ORACLE_RATE_THRESHOLD,
-  kamaThresholdMode: "static",
   kamaThresholdLookbackSec: 3_600,
+  kamaThresholdNoiseResponse: "proportional",
   kamaThresholdNoiseMultiplier: 0,
+  kamaThresholdInverseMax: 0,
+  kamaThresholdInverseNoiseScale: KAMA_ORACLE_RATE_THRESHOLD,
   kamaSignalFriction: 0.00175,
   rateThresholdsLow: [0.25, 0.25, 0.25, 0.25, 0.15, 0.05, 0.05],
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
@@ -172,6 +181,8 @@ export function createPeakValleyStrategyConfig(
   config.kamaVolumeLen = positiveInt(config.kamaVolumeLen);
   config.kamaVolumeCap = Math.max(1, finite(config.kamaVolumeCap, 1));
   config.kamaVolumePower = Math.max(0, finite(config.kamaVolumePower, 0));
+  config.kamaRateMode = config.kamaRateMode === "log" ? "log" : "relative";
+  config.kamaRateEmaLen = positiveInt(config.kamaRateEmaLen);
   config.kamaRateThresholdLow = normalizeRates(
     [config.kamaRateThresholdLow],
     1,
@@ -181,9 +192,21 @@ export function createPeakValleyStrategyConfig(
     config.kamaRateThresholdLow,
     normalizeRates([config.kamaRateThresholdHigh], 1, config.relativeRateEnabled)[0]!,
   );
-  config.kamaThresholdMode = config.kamaThresholdMode === "adaptive" ? "adaptive" : "static";
   config.kamaThresholdLookbackSec = positive(config.kamaThresholdLookbackSec);
+  config.kamaThresholdNoiseResponse = config.kamaThresholdNoiseResponse === "inverse"
+    ? "inverse"
+    : "proportional";
   config.kamaThresholdNoiseMultiplier = Math.max(0, finite(config.kamaThresholdNoiseMultiplier, 0));
+  config.kamaThresholdInverseMax = normalizeRates(
+    [config.kamaThresholdInverseMax],
+    1,
+    config.relativeRateEnabled,
+  )[0]!;
+  config.kamaThresholdInverseNoiseScale = positive(normalizeRates(
+    [config.kamaThresholdInverseNoiseScale],
+    1,
+    config.relativeRateEnabled,
+  )[0]!);
   config.kamaSignalFriction = Math.max(0, finite(config.kamaSignalFriction, 0));
   config.saturationSec = Math.max(0, finite(config.saturationSec, 0));
   config.buySpendRate = Math.max(0, finite(config.buySpendRate, 0));
@@ -214,6 +237,7 @@ export function rescalePeakValleyStrategyConfig(
     kamaFastLen: scale(config.kamaFastLen),
     kamaSlowLen: scale(config.kamaSlowLen),
     kamaVolumeLen: scale(config.kamaVolumeLen),
+    kamaRateEmaLen: scale(config.kamaRateEmaLen),
   });
 }
 
@@ -233,10 +257,11 @@ export function peakValleyKamaWarmupSamples(config: PeakValleyStrategyConfig): n
     slowPeriod: config.kamaSlowLen,
     volumePeriod: config.kamaVolumeLen,
   }, KAMA_WARMUP_MULTIPLE);
-  const noise = config.kamaThresholdMode === "adaptive"
+  const noise = kamaThresholdNoiseEnabled(config)
     ? samplesForWindow(config.kamaThresholdLookbackSec, config.sampleIntervalMs) * KAMA_WARMUP_MULTIPLE
     : 0;
-  return Math.max(kama, noise);
+  const rateEma = config.kamaRateEmaLen * KAMA_WARMUP_MULTIPLE;
+  return Math.max(kama, noise, rateEma);
 }
 
 interface PeakValleyExecutionConfig {
@@ -320,10 +345,12 @@ type AverageState = ({ type: "sma"; indicator: SMAIndicator } | { type: "ema"; i
 };
 
 export interface PeakValleyStrategySnapshot {
-  version: 3;
+  version: 5;
   averages: AverageSnapshot[];
   kama: VolumeWeightedKAMAIndicatorSnapshot | null;
   kamaRate: number;
+  kamaRateEma: EMAIndicatorSnapshot;
+  kamaCandidate: number;
   kamaClamped: LookbackIndicatorSnapshot;
   kamaRateNoise?: KamaRateNoiseSnapshot;
   lastTick: TradingTick | null;
@@ -389,6 +416,8 @@ export class PeakValleyStrategy
   private averages: AverageState[] = [];
   private kama!: VolumeWeightedKAMAIndicator;
   private kamaRate = 0;
+  private kamaRateEma = new EMAIndicator(1);
+  private kamaCandidate = 0;
   private kamaRateNoise = new KamaRateNoise(1);
   private kamaClamped = new LookbackIndicator(1);
   private lastKamaSignalPrice: number | null = null;
@@ -479,10 +508,12 @@ export class PeakValleyStrategy
 
   async snapshot(): Promise<PeakValleyStrategySnapshot> {
     return {
-      version: 3,
+      version: 5,
       averages: this.averages.map(snapshotAverage),
       kama: this.config.derivativeSource === "kama" ? this.kama.snapshot() : null,
       kamaRate: this.kamaRate,
+      kamaRateEma: this.kamaRateEma.snapshot(),
+      kamaCandidate: this.kamaCandidate,
       kamaClamped: this.kamaClamped.snapshot(),
       kamaRateNoise: this.kamaRateNoise.snapshot(),
       lastTick: structuredClone(this.lastTick),
@@ -495,7 +526,7 @@ export class PeakValleyStrategy
   }
 
   async restore(snapshot: PeakValleyStrategySnapshot): Promise<void> {
-    if (snapshot.version !== 3) throw new Error(`Unsupported peak/valley snapshot version: ${snapshot.version}`);
+    if (snapshot.version !== 5) throw new Error(`Unsupported peak/valley snapshot version: ${snapshot.version}`);
     for (let position = 0; position < this.averages.length; position += 1) {
       const state = this.averages[position];
       const saved = snapshot.averages[position];
@@ -505,6 +536,8 @@ export class PeakValleyStrategy
     }
     if (snapshot.kama) this.kama.restore(snapshot.kama);
     this.kamaRate = finite(snapshot.kamaRate, 0);
+    this.kamaRateEma.restore(snapshot.kamaRateEma);
+    this.kamaCandidate = finite(snapshot.kamaCandidate, 0);
     this.kamaClamped.restore(snapshot.kamaClamped);
     this.kamaRateNoise.restore(snapshot.kamaRateNoise);
     this.lastTick = structuredClone(snapshot.lastTick);
@@ -545,7 +578,9 @@ export class PeakValleyStrategy
       warmupCount: this.kamaRequiredSamples(),
       warmupIntervalMs: this.config.sampleIntervalMs,
     });
+    this.kamaRateEma = new EMAIndicator(this.config.kamaRateEmaLen);
     this.kamaClamped = new LookbackIndicator(1);
+    this.kamaCandidate = 0;
     this.kamaRateNoise = new KamaRateNoise(samplesForWindow(
       this.config.kamaThresholdLookbackSec,
       this.config.sampleIntervalMs,
@@ -581,20 +616,28 @@ export class PeakValleyStrategy
     }
     if (this.config.derivativeSource === "kama" && updateKama) {
       this.kama.onTick(input);
-      this.kamaRate = rate(this.kama.derivative(), this.kama.indicator(), seconds, this.config.relativeRateEnabled);
+      const rawKamaRate = selectedKamaRate(
+        this.kama.derivative(),
+        this.kama.indicator(),
+        seconds,
+        this.config.relativeRateEnabled,
+        this.config.kamaRateMode,
+      );
+      this.kamaRateEma.onTick({ eventTime: tick.timestamp, value: rawKamaRate });
+      this.kamaRate = this.kamaRateEma.indicator();
       const rateNoise = this.kamaRateNoise.update(this.kamaRate);
-      const adaptiveThreshold = this.config.kamaThresholdMode === "adaptive"
-        ? rateNoise * this.config.kamaThresholdNoiseMultiplier
-        : 0;
+      const adaptiveThreshold = kamaThresholdNoiseAdjustment(rateNoise, this.config);
       const previous = this.kamaClamped.indicator();
       const candidate = clampThreshold(
         this.kamaRate,
-        previous,
+        this.kamaCandidate,
         this.config,
         this.config.kamaRateThresholdLow + adaptiveThreshold,
         this.config.kamaRateThresholdHigh + adaptiveThreshold,
       );
-      const transition = Math.sign(candidate) !== Math.sign(previous);
+      const sourceEdge = Math.sign(candidate) !== Math.sign(this.kamaCandidate);
+      this.kamaCandidate = candidate;
+      const transition = sourceEdge && Math.sign(candidate) !== Math.sign(previous);
       const accepted = !transition || signalBeyondFriction(
         tick.price,
         this.lastKamaSignalPrice,
@@ -602,7 +645,9 @@ export class PeakValleyStrategy
       );
       this.kamaClamped.onTick({
         eventTime: tick.timestamp,
-        value: accepted ? candidate : previous,
+        value: Math.sign(candidate) === Math.sign(previous) || transition && accepted
+          ? candidate
+          : previous,
       });
       if (transition && accepted) this.lastKamaSignalPrice = tick.price;
     }
@@ -772,9 +817,8 @@ export class PeakValleyStrategy
   }
 
   private kamaThreshold(): number {
-    return this.config.kamaRateThresholdLow + (this.config.kamaThresholdMode === "adaptive"
-      ? this.kamaRateNoise.indicator() * this.config.kamaThresholdNoiseMultiplier
-      : 0);
+    return this.config.kamaRateThresholdLow
+      + kamaThresholdNoiseAdjustment(this.kamaRateNoise.indicator(), this.config);
   }
 
   private requiredSamples(): number {
@@ -864,6 +908,20 @@ function rate(delta: number, value: number, seconds: number, relative: boolean):
   return relative && value > 0 ? absolute / value : absolute;
 }
 
+function selectedKamaRate(
+  delta: number,
+  value: number,
+  seconds: number,
+  relative: boolean,
+  mode: PeakValleyKamaRateMode,
+): number {
+  if (!relative) return delta / seconds;
+  if (value <= 0) return 0;
+  if (mode !== "log") return delta / value / seconds;
+  const previous = value - delta;
+  return previous > 0 ? Math.log(value / previous) / seconds : 0;
+}
+
 function normalizedSigma(value: number, relative: boolean): number {
   const result = positive(value);
   return relative && result > 0.01 ? result / PRICE_SCALE : result;
@@ -910,6 +968,20 @@ function arrayIndex(value: number, count: number): number {
 
 function positiveInt(value: number): number {
   return Math.max(1, Math.round(positive(value)));
+}
+
+function kamaThresholdNoiseEnabled(config: PeakValleyStrategyConfig): boolean {
+  return config.kamaThresholdNoiseResponse === "inverse"
+    ? config.kamaThresholdInverseMax > 0
+    : config.kamaThresholdNoiseMultiplier > 0;
+}
+
+function kamaThresholdNoiseAdjustment(noise: number, config: PeakValleyStrategyConfig): number {
+  if (config.kamaThresholdNoiseResponse !== "inverse") {
+    return Math.max(0, noise) * config.kamaThresholdNoiseMultiplier;
+  }
+  return config.kamaThresholdInverseMax
+    / (1 + Math.max(0, noise) / config.kamaThresholdInverseNoiseScale);
 }
 
 function positive(value: number): number {

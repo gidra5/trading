@@ -33,7 +33,6 @@ function transition(
     rsi: 50,
     dmi: 0,
     adx: 0,
-    meanReversion: 0,
     meanDistance: 0,
     matchedTime: null,
     lagMs: null,
@@ -99,10 +98,17 @@ test("VW-KAMA evaluator produces causal transitions and bounded chart traces", (
   assert.ok(result.indicatorPoints.every((point) =>
     Number.isFinite(point.kama)
     && Number.isFinite(point.kamaRate)
+    && Number.isFinite(point.kamaRateRaw)
+    && Number.isFinite(point.threshold)
+    && Array.isArray(point.rejectionReasons)
     && point.efficiencyRatio >= 0
     && point.efficiencyRatio <= 1
     && point.effectiveEfficiencyRatio >= 0
     && point.effectiveEfficiencyRatio <= 1
+    && Number.isFinite(point.volume)
+    && Number.isFinite(point.volumeAverage)
+    && point.volume >= 0
+    && point.volumeAverage >= 0
     && point.rsi >= 0
     && point.rsi <= 100
     && point.adx >= 0
@@ -130,6 +136,143 @@ test("VW-KAMA evaluator produces causal transitions and bounded chart traces", (
       .every(Number.isFinite)
     && item.rsi >= 0 && item.rsi <= 100
     && item.adx >= 0 && item.adx <= 100));
+});
+
+test("VW-KAMA log rate is invariant to the asset price scale", () => {
+  const evaluate = (scale: number) => {
+    const candles = [100, 102, 101].map((value, index): Candle => ({
+      symbol: "BTCUSDT",
+      interval: "1s",
+      openTime: index * 1_000,
+      closeTime: index * 1_000 + 999,
+      open: value * scale,
+      high: value * scale,
+      low: value * scale,
+      close: value * scale,
+      volume: 1,
+      closed: true,
+    }));
+    return evaluateVwKamaOracle(candles, {
+      intervalMs: 1_000,
+      scoreStartTime: candles[0]!.openTime,
+      parameters: {
+        efficiencyMs: 1_000,
+        fastMs: 1_000,
+        slowMs: 1_000,
+        power: 1,
+        volumeMs: 1_000,
+        volumeCap: 1,
+        volumePower: 0,
+        rateMode: "log",
+        rateEmaMs: 2_000,
+        deadbandBpsHour: 0,
+        deadbandMode: "hold",
+      },
+      oracleFriction: 0,
+      matchWindowMs: 10_000,
+      timingHalfLifeMs: 1_000,
+      warmupMultiple: 1,
+      maxPoints: 10,
+    }).indicatorPoints;
+  };
+
+  const original = evaluate(1);
+  const rescaled = evaluate(1_000);
+  assert.equal(original.length, 3);
+  assert.ok(Math.abs(original[1]!.kamaRateRaw - Math.log(1.02) * 36_000_000) < 1e-6);
+  assert.ok(original.every((point, index) =>
+    Math.abs(point.kamaRateRaw - rescaled[index]!.kamaRateRaw) < 1e-6
+    && Math.abs(point.kamaRate - rescaled[index]!.kamaRate) < 1e-6));
+});
+
+test("VW-KAMA mean-reversion KAMA uses volume-weighted efficiency", () => {
+  const evaluate = (lastVolume: number) => {
+    const candles = [
+      { close: 100, volume: 10 },
+      { close: 102, volume: 20 },
+      { close: 101, volume: lastVolume },
+    ].map((item, index): Candle => ({
+      symbol: "BTCUSDT",
+      interval: "1s",
+      openTime: index * 1_000,
+      closeTime: index * 1_000 + 999,
+      open: item.close,
+      high: item.close,
+      low: item.close,
+      close: item.close,
+      volume: item.volume,
+      closed: true,
+    }));
+    return evaluateVwKamaOracle(candles, {
+      intervalMs: 1_000,
+      scoreStartTime: candles[0]!.openTime,
+      parameters: {
+        efficiencyMs: 2_000,
+        efficiencyVolumeEmaMs: 3_000,
+        efficiencyVolumePower: 2,
+        fastMs: 2_000,
+        slowMs: 20_000,
+        power: 1,
+        volumeMs: 3_000,
+        volumeCap: 4,
+        volumePower: 0,
+        deadbandBpsHour: 0,
+        deadbandMode: "hold",
+        meanReversionEfficiencyMs: 2_000,
+        meanReversionFastMs: 2_000,
+        meanReversionSlowMs: 20_000,
+        meanReversionVolatilityMs: 20_000,
+        meanReversionSuppressionThreshold: 1,
+        meanReversionReversalThreshold: 0,
+      },
+      oracleFriction: 0,
+      matchWindowMs: 10_000,
+      timingHalfLifeMs: 1_000,
+      warmupMultiple: 1,
+    }).indicatorPoints.at(-1)!.meanReversionKama;
+  };
+
+  assert.notEqual(evaluate(40), evaluate(5));
+});
+
+test("VW-KAMA rate EMA drives the same band-transition pipeline", () => {
+  const candles = [100, 110, 100].map((close, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: close,
+    high: close,
+    low: close,
+    close,
+    volume: 1,
+    closed: true,
+  }));
+  const evaluate = (rateEmaMs: number) => evaluateVwKamaOracle(candles, {
+    intervalMs: 1_000,
+    scoreStartTime: candles[0]!.openTime,
+    parameters: {
+      efficiencyMs: 1_000,
+      fastMs: 1_000,
+      slowMs: 1_000,
+      power: 1,
+      volumeMs: 1_000,
+      volumeCap: 1,
+      volumePower: 0,
+      rateMode: "log",
+      rateEmaMs,
+      deadbandBpsHour: 1,
+      deadbandMode: "hold",
+    },
+    oracleFriction: 0,
+    matchWindowMs: 10_000,
+    timingHalfLifeMs: 1_000,
+    warmupMultiple: 1,
+    maxPoints: 10,
+  });
+
+  assert.deepEqual(evaluate(1_000).candidateTransitions.map((item) => item.state), ["long", "short"]);
+  assert.deepEqual(evaluate(10_000).candidateTransitions.map((item) => item.state), ["long"]);
 });
 
 test("VW-KAMA streaming and shared-columnar evaluation are exactly equivalent", () => {
@@ -185,10 +328,12 @@ test("VW-KAMA streaming and shared-columnar evaluation are exactly equivalent", 
       confirmationRsiWeight: 0.2,
       confirmationDmiMs: 14_000,
       confirmationDmiWeight: 0.2,
-      meanReversionMix: 0.5,
-      meanReversionMeanMs: 60_000,
+      meanReversionSuppressionThreshold: 1,
+      meanReversionEfficiencyMs: 20_000,
+      meanReversionFastMs: 30_000,
+      meanReversionSlowMs: 60_000,
       meanReversionVolatilityMs: 60_000,
-      meanReversionThreshold: 1.5,
+      meanReversionReversalThreshold: 1.5,
     },
     oracleFriction: 0.001,
     matchWindowMs: 60_000,
@@ -242,10 +387,12 @@ test("VW-KAMA mean-reversion regime reverses a sufficiently extended local trend
       volumePower: 0,
       deadbandBpsHour: 0,
       deadbandMode: "hold",
-      meanReversionMix: 1,
-      meanReversionMeanMs: 20_000,
+      meanReversionSuppressionThreshold: 0.5,
+      meanReversionEfficiencyMs: 20_000,
+      meanReversionFastMs: 20_000,
+      meanReversionSlowMs: 20_000,
       meanReversionVolatilityMs: 20_000,
-      meanReversionThreshold: 1,
+      meanReversionReversalThreshold: 1,
     },
     oracleFriction: 0,
     matchWindowMs: 10_000,
@@ -255,8 +402,52 @@ test("VW-KAMA mean-reversion regime reverses a sufficiently extended local trend
 
   const signal = result.candidateTransitions.at(-1)!;
   assert.equal(signal.state, "short");
-  assert.ok(signal.meanReversion > 0.5);
   assert.ok(signal.meanDistance > 1);
+});
+
+test("VW-KAMA mean-reversion suppression zone consumes an extended trend edge", () => {
+  const closes = [...Array.from({ length: 40 }, () => 100), 130];
+  const candles = closes.map((close, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: index === 0 ? close : closes[index - 1]!,
+    high: Math.max(close, index === 0 ? close : closes[index - 1]!),
+    low: Math.min(close, index === 0 ? close : closes[index - 1]!),
+    close,
+    volume: 1,
+    closed: true,
+  }));
+  const result = evaluateVwKamaOracle(candles, {
+    intervalMs: 1_000,
+    scoreStartTime: candles[20]!.openTime,
+    parameters: {
+      efficiencyMs: 1_000,
+      fastMs: 1_000,
+      slowMs: 1_000,
+      power: 1,
+      volumeMs: 1_000,
+      volumeCap: 1,
+      volumePower: 0,
+      deadbandBpsHour: 0,
+      deadbandMode: "hold",
+      meanReversionSuppressionThreshold: 0.5,
+      meanReversionEfficiencyMs: 20_000,
+      meanReversionFastMs: 20_000,
+      meanReversionSlowMs: 20_000,
+      meanReversionVolatilityMs: 20_000,
+      meanReversionReversalThreshold: 100,
+    },
+    oracleFriction: 0,
+    matchWindowMs: 10_000,
+    timingHalfLifeMs: 1_000,
+    warmupMultiple: 1,
+  });
+
+  assert.equal(result.candidateTransitions.length, 0);
+  const distance = Math.abs(result.indicatorPoints.at(-1)!.meanDistance);
+  assert.ok(distance >= 0.5 && distance < 100);
 });
 
 test("adaptive VW-KAMA threshold suppresses noisy rate reversals causally", () => {
@@ -298,14 +489,29 @@ test("adaptive VW-KAMA threshold suppresses noisy rate reversals causally", () =
   };
   const fixed = evaluateVwKamaOracle(candles, {
     ...options,
-    parameters: { ...options.parameters, thresholdMode: "static" },
+    parameters: { ...options.parameters, thresholdNoiseMultiplier: 0 },
   });
   const adaptive = evaluateVwKamaOracle(candles, {
     ...options,
-    parameters: { ...options.parameters, thresholdMode: "adaptive" },
+    parameters: { ...options.parameters, thresholdNoiseMultiplier: 4 },
   });
 
   assert.ok(adaptive.metrics.signalCount < fixed.metrics.signalCount);
+  assert.ok(adaptive.indicatorPoints.some((point) => point.threshold > 0));
+
+  const inverse = evaluateVwKamaOracle(candles, {
+    ...options,
+    scoreStartTime: 0,
+    parameters: {
+      ...options.parameters,
+      thresholdNoiseResponse: "inverse",
+      thresholdNoiseMultiplier: 0,
+      thresholdInverseMaxBpsHour: 100,
+      thresholdInverseNoiseScaleBpsHour: 100,
+    },
+  });
+  assert.equal(inverse.indicatorPoints[0]!.threshold, 100);
+  assert.ok(inverse.indicatorPoints.slice(1).some((point) => point.threshold > 0 && point.threshold < 100));
 });
 
 test("inactive threshold and confirmation lookbacks do not affect search scores", () => {
@@ -334,8 +540,7 @@ test("inactive threshold and confirmation lookbacks do not affect search scores"
     volumePower: 0,
     deadbandBpsHour: 0,
     deadbandMode: "hold" as const,
-    thresholdMode: "static" as const,
-    thresholdNoiseMultiplier: 8,
+    thresholdNoiseMultiplier: 0,
     confirmationMix: 0,
     confirmationAccelerationWeight: 5,
     confirmationDistanceWeight: 5,
@@ -472,7 +677,7 @@ test("VW-KAMA hysteresis retains direction inside its outer threshold", () => {
 });
 
 test("VW-KAMA hard EMA gate closes a countertrend flip to flat", () => {
-  const closes = [100, 110, 120, 119];
+  const closes = [100, 110, 120, 119, 118];
   const candles = closes.map((close, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -510,6 +715,8 @@ test("VW-KAMA hard EMA gate closes a countertrend flip to flat", () => {
 
   assert.deepEqual(result.candidateTransitions.map((item) => item.state), ["long", "flat"]);
   assert.ok(result.candidateTransitions.at(-1)!.emaRate > 0);
+  assert.ok(result.indicatorPoints.some((point) =>
+    point.signalIntent === "short" && point.rejectionReasons.includes("ema-hard-gate")));
 });
 
 test("VW-KAMA partial sizing is marked against the current price", () => {
@@ -692,7 +899,7 @@ test("VW-KAMA alignment breaks zero-credit ties by pair count then absolute lag"
   );
 });
 
-test("VW-KAMA signal memory spaces transitions from the last accepted signal price", () => {
+test("VW-KAMA consumes a rejected band edge instead of emitting it late", () => {
   const closes = [100, 102, 101, 100.5, 100, 101, 102, 103];
   const candles = closes.map((close, index): Candle => ({
     symbol: "BTCUSDT",
@@ -731,10 +938,43 @@ test("VW-KAMA signal memory spaces transitions from the last accepted signal pri
     result.candidateTransitions.map(({ time, price, state }) => ({ time, price, state })),
     [
       { time: 1_999, price: 102, state: "long" },
-      { time: 4_999, price: 100, state: "short" },
-      { time: 6_999, price: 102, state: "long" },
     ],
   );
+
+  const withoutSignalFriction = evaluateVwKamaOracle(candles, {
+    intervalMs: 1_000,
+    scoreStartTime: candles[1]!.openTime,
+    parameters: {
+      efficiencyMs: 1_000,
+      fastMs: 1_000,
+      slowMs: 1_000,
+      power: 1,
+      volumeMs: 1_000,
+      volumeCap: 1,
+      volumePower: 0,
+      deadbandBpsHour: 0,
+      deadbandMode: "hold",
+      signalFrictionFraction: 0,
+    },
+    oracleFriction: 0.015,
+    matchWindowMs: 10_000,
+    timingHalfLifeMs: 1_000,
+    warmupMultiple: 1,
+  });
+  assert.deepEqual(
+    withoutSignalFriction.candidateTransitions.map(({ time, state }) => ({ time, state })),
+    [
+      { time: 1_999, state: "long" },
+      { time: 2_999, state: "short" },
+      { time: 5_999, state: "long" },
+    ],
+  );
+  assert.ok(result.indicatorPoints.some((point) =>
+    point.signalIntent !== null && point.rejectionReasons.includes("signal-friction")));
+  assert.equal(result.indicatorPoints[0]!.signalFrictionLower, 102 * (1 - 0.015));
+  assert.equal(result.indicatorPoints[0]!.signalFrictionUpper, 102 * (1 + 0.015));
+  assert.ok(withoutSignalFriction.indicatorPoints.every((point) =>
+    !point.rejectionReasons.includes("signal-friction")));
 });
 
 test("price signal memory requires movement strictly past friction", () => {

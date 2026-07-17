@@ -293,86 +293,6 @@ export class EMAIndicator implements NumericTradingIndicator<EMAIndicatorSnapsho
   }
 }
 
-export interface MeanReversionIndicatorSnapshot {
-  version: 1;
-  mean: EMAIndicatorSnapshot;
-  variance: EMAIndicatorSnapshot;
-  value: number;
-  signedDistance: number;
-}
-
-export interface MeanReversionIndicatorDetails {
-  mean: number;
-  volatility: number;
-  signedDistance: number;
-  normalizedDistance: number;
-}
-
-export class MeanReversionIndicator
-  implements TradingIndicator<MeanReversionIndicatorSnapshot, number, ValueIndicatorInput>
-{
-  private readonly mean: EMAIndicator;
-  private readonly variance: EMAIndicator;
-  private value = 0;
-  private signedDistance = 0;
-
-  constructor(meanPeriod: number, volatilityPeriod: number, private readonly threshold: number) {
-    assertFiniteMinimum(threshold, Number.EPSILON, "mean-reversion threshold");
-    this.mean = new EMAIndicator(meanPeriod);
-    this.variance = new EMAIndicator(volatilityPeriod);
-  }
-
-  async warmup(initialValue?: number): Promise<void> {
-    if (Number.isFinite(initialValue)) this.onTick({ eventTime: 0, value: initialValue! });
-  }
-
-  onTick(input: ValueIndicatorInput): void {
-    const price = indicatorValue(input);
-    if (!Number.isFinite(price) || price <= 0) return;
-    this.mean.onTick({ eventTime: input.eventTime, value: price });
-    const mean = this.mean.indicator();
-    this.signedDistance = mean > 0 ? price / mean - 1 : 0;
-    this.variance.onTick({
-      eventTime: input.eventTime,
-      value: Math.max(Number.EPSILON, this.signedDistance ** 2),
-    });
-    const normalized = Math.abs(this.signedDistance)
-      / Math.max(Number.EPSILON, Math.sqrt(Math.max(0, this.variance.indicator())));
-    this.value = smoothstep(this.threshold * 0.5, this.threshold * 1.5, normalized);
-  }
-
-  indicator(): number {
-    return this.value;
-  }
-
-  details(): MeanReversionIndicatorDetails {
-    const volatility = Math.sqrt(Math.max(0, this.variance.indicator()));
-    return {
-      mean: this.mean.indicator(),
-      volatility,
-      signedDistance: this.signedDistance,
-      normalizedDistance: Math.abs(this.signedDistance) / Math.max(Number.EPSILON, volatility),
-    };
-  }
-
-  snapshot(): MeanReversionIndicatorSnapshot {
-    return {
-      version: 1,
-      mean: this.mean.snapshot(),
-      variance: this.variance.snapshot(),
-      value: this.value,
-      signedDistance: this.signedDistance,
-    };
-  }
-
-  restore(snapshot: MeanReversionIndicatorSnapshot | null): void {
-    this.mean.restore(snapshot?.mean ?? null);
-    this.variance.restore(snapshot?.variance ?? null);
-    this.value = Number.isFinite(snapshot?.value) ? clampRatio(snapshot!.value) : 0;
-    this.signedDistance = Number.isFinite(snapshot?.signedDistance) ? snapshot!.signedDistance : 0;
-  }
-}
-
 export class VolumeWeightedEMAIndicator
   implements NumericTradingIndicator<VolumeWeightedEMAIndicatorSnapshot, PriceIndicatorInput>
 {
@@ -903,6 +823,10 @@ export class VolumeWeightedKAMAIndicator
 
   derivative(): number {
     return this.delta;
+  }
+
+  volumeAverage(): number {
+    return this.volumeEma.indicator();
   }
 
   details(): VolumeWeightedKAMAIndicatorValue {
@@ -2109,11 +2033,6 @@ function clampRatio(value: number): number {
     return 0;
   }
   return Math.max(0, Math.min(1, value));
-}
-
-function smoothstep(min: number, max: number, value: number): number {
-  const ratio = clampRatio((value - min) / Math.max(Number.EPSILON, max - min));
-  return ratio * ratio * (3 - 2 * ratio);
 }
 
 function clamp(value: number, min: number, max: number): number {

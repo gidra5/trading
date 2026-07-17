@@ -4,18 +4,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import {
-  VolumeWeightedKAMAIndicator,
   evaluateVwKamaOracle,
   noiseSignalRatio,
   perfectMarginOracle,
-  volumeWeightedKamaWarmupSamples,
   vwKamaScore,
   VW_KAMA_SCORE_VERSION,
   type Candle,
   type BacktestOraclePoint,
-  type BacktestChartSmaSeries,
   type PerfectMarginOracleResult,
-  type TradingApi,
   type VwKamaAccuracyMetrics,
   type VwKamaCandleRangeRequest,
   type VwKamaCandleRangeResponse,
@@ -24,6 +20,8 @@ import {
   type VwKamaInspectorRequest,
   type VwKamaInspectorResponse,
   type VwKamaInspectorWindow,
+  type VwKamaIndicatorPoint,
+  type VwKamaParameters,
   type VwKamaPreset,
   type VwKamaTransition,
 } from "@trading/bot-algo";
@@ -75,12 +73,16 @@ const BASELINE_GLOBAL_PARAMETERS = {
   volumeMs: 283_525,
   volumeCap: 5.08117,
   volumePower: 0.48543,
+  rateMode: "relative" as const,
   deadbandBpsHour: 30,
   deadbandMode: "hold" as const,
   hysteresisReleaseRatio: 0.25,
-  thresholdMode: "adaptive" as const,
   thresholdLookbackMs: 2_457_073,
+  thresholdNoiseResponse: "proportional" as const,
   thresholdNoiseMultiplier: 0,
+  thresholdInverseMaxBpsHour: 0,
+  thresholdInverseNoiseScaleBpsHour: 30,
+  signalFrictionFraction: 1,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -103,10 +105,12 @@ const BASELINE_GLOBAL_PARAMETERS = {
   confirmationDmiWeight: 0,
   confirmationAdxThreshold: 20,
   confirmationBias: 0,
-  meanReversionMix: 0,
-  meanReversionMeanMs: 60 * 60_000,
+  meanReversionEfficiencyMs: 265_846,
+  meanReversionFastMs: 1_113_418,
+  meanReversionSlowMs: 60 * 60_000,
   meanReversionVolatilityMs: 60 * 60_000,
-  meanReversionThreshold: 2,
+  meanReversionSuppressionThreshold: 1,
+  meanReversionReversalThreshold: 0,
 };
 
 const DEFAULT_REQUEST: VwKamaInspectorRequest = {
@@ -143,9 +147,8 @@ const GLOBAL_PRESETS: VwKamaPreset[] = [
       volumePower: 0,
       deadbandBpsHour: 21.21468,
       deadbandMode: "hold",
-      thresholdMode: "static",
       thresholdLookbackMs: 900_000,
-      thresholdNoiseMultiplier: 5.60731,
+      thresholdNoiseMultiplier: 0,
       buyMaxFraction: 1,
       sellMaxFraction: 1,
       buySizingSigmaBpsHour: 1e12,
@@ -168,7 +171,6 @@ const GLOBAL_PRESETS: VwKamaPreset[] = [
       volumePower: 0,
       deadbandBpsHour: 67.56654,
       deadbandMode: "flat",
-      thresholdMode: "static",
       thresholdLookbackMs: 60 * 60_000,
       thresholdNoiseMultiplier: 0,
     },
@@ -189,7 +191,6 @@ const GLOBAL_PRESETS: VwKamaPreset[] = [
       volumePower: 1.72738,
       deadbandBpsHour: 0.44351,
       deadbandMode: "hold",
-      thresholdMode: "static",
       thresholdLookbackMs: 60 * 60_000,
       thresholdNoiseMultiplier: 0,
     },
@@ -202,7 +203,6 @@ interface CachedWindow {
   source: Promise<Candle[]>;
   scales: Map<number, Promise<Candle[][]>>;
   oracles: Map<string, Promise<PerfectMarginOracleResult>>;
-  kama: Map<string, Promise<Float64Array[]>>;
 }
 
 type InspectorResult = VwKamaInspectorResponse | VwKamaCandleRangeResponse;
@@ -345,7 +345,6 @@ export class KamaInspectorEngine {
     const { request, selected } = normalizeCandleRangeRequest(input);
     const cached = this.cachedWindow(selected);
     const segments = await this.scaledSegments(cached, request.intervalMs);
-    const values = await this.kamaValues(cached, request, selected, segments);
     const rendered = renderCandleRange(
       segments,
       request.intervalMs,
@@ -353,6 +352,31 @@ export class KamaInspectorEngine {
       request.endTime,
       request.maxCandles,
     );
+    const renderedTimes = rendered.candles.map((candle) => candle.closeTime);
+    const indicatorPoints: VwKamaIndicatorPoint[] = [];
+    const warmupMs = candidateWarmupMs(request);
+    for (const [index, segment] of segments.entries()) {
+      const firstTime = segment[0]?.closeTime;
+      const lastTime = segment.at(-1)?.closeTime;
+      if (firstTime === undefined || lastTime === undefined) continue;
+      const traceTimes = renderedTimes.filter((time) => time >= firstTime && time <= lastTime);
+      if (traceTimes.length === 0) continue;
+      const endIndex = candleLowerBound(segment, traceTimes.at(-1)! + 1);
+      const candles = segment.slice(0, endIndex);
+      const scoreStart = Math.min(
+        Math.max(selected.startTime, segment[0]!.openTime + (index > 0 ? warmupMs : 0)),
+        candles.at(-1)!.openTime,
+      );
+      const oracle = await this.oracle(cached, request, segment);
+      indicatorPoints.push(...evaluateVwKamaOracle(candles, {
+        ...request,
+        scoreStartTime: scoreStart,
+        maxPoints: traceTimes.length,
+        traceTimes,
+        oracleResult: oracle,
+      }).indicatorPoints);
+    }
+    indicatorPoints.sort((left, right) => left.time - right.time);
     return {
       windowId: selected.id,
       intervalMs: request.intervalMs,
@@ -361,7 +385,14 @@ export class KamaInspectorEngine {
       endTime: request.endTime,
       sourceCandleCount: rendered.sourceCount,
       candles: rendered.candles,
-      kamaSeries: renderKamaSeries(segments, values, rendered.candles, request),
+      kamaSeries: {
+        index: -1,
+        windowSec: request.parameters.slowMs / 1_000,
+        label: "VW-KAMA",
+        color: "#f472b6",
+        points: indicatorPoints.map((point) => ({ time: point.time, value: point.kama })),
+      },
+      indicatorPoints,
     };
   }
 
@@ -373,7 +404,6 @@ export class KamaInspectorEngine {
       source,
       scales: new Map<number, Promise<Candle[][]>>(),
       oracles: new Map<string, Promise<PerfectMarginOracleResult>>(),
-      kama: new Map<string, Promise<Float64Array[]>>(),
     };
     source.catch(() => {
       if (this.cache === cached) this.cache = null;
@@ -411,43 +441,6 @@ export class KamaInspectorEngine {
       const oldest = cached.oracles.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       cached.oracles.delete(oldest);
-    }
-    return pending;
-  }
-
-  private kamaValues(
-    cached: CachedWindow,
-    request: VwKamaInspectorRequest,
-    selected: VwKamaInspectorWindow,
-    segments: Candle[][],
-  ): Promise<Float64Array[]> {
-    const parameters = request.parameters;
-    const key = JSON.stringify([
-      request.intervalMs,
-      parameters.efficiencyMs,
-      parameters.efficiencyVolumeEmaMs,
-      parameters.efficiencyVolumePower,
-      parameters.fastMs,
-      parameters.slowMs,
-      parameters.power,
-      parameters.volumeMs,
-      parameters.volumeCap,
-      parameters.volumePower,
-      request.warmupMultiple,
-    ]);
-    const existing = cached.kama.get(key);
-    if (existing) return existing;
-    const warmupMs = candidateWarmupMs(request);
-    const pending = Promise.resolve(segments.map((candles, index) => calculateKama(
-      candles,
-      request,
-      Math.max(selected.startTime, candles[0]!.openTime + (index > 0 ? warmupMs : 0)),
-    )));
-    cached.kama.set(key, pending);
-    while (cached.kama.size > 2) {
-      const oldest = cached.kama.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      cached.kama.delete(oldest);
     }
     return pending;
   }
@@ -676,6 +669,16 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   if (!["flat", "hold", "hysteresis"].includes(request.parameters.deadbandMode)) {
     throw new Error("VW-KAMA deadband mode must be flat, hold, or hysteresis.");
   }
+  if (request.parameters.rateMode !== undefined
+    && request.parameters.rateMode !== "relative"
+    && request.parameters.rateMode !== "log") {
+    throw new Error("VW-KAMA rate mode must be relative or log.");
+  }
+  if (request.parameters.thresholdNoiseResponse !== undefined
+    && request.parameters.thresholdNoiseResponse !== "proportional"
+    && request.parameters.thresholdNoiseResponse !== "inverse") {
+    throw new Error("VW-KAMA threshold noise response must be proportional or inverse.");
+  }
   if (request.parameters.agreementMode !== undefined
     && request.parameters.agreementMode !== "sizing"
     && request.parameters.agreementMode !== "confidence") {
@@ -684,9 +687,14 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   request.parameters.agreementMode ??= "sizing";
   request.parameters.efficiencyVolumeEmaMs ??= request.parameters.volumeMs;
   request.parameters.efficiencyVolumePower ??= 0;
-  request.parameters.thresholdMode = request.parameters.thresholdMode === "adaptive" ? "adaptive" : "static";
+  request.parameters.rateMode ??= "relative";
+  request.parameters.rateEmaMs ??= request.intervalMs;
   request.parameters.thresholdLookbackMs ??= 60 * 60_000;
+  request.parameters.thresholdNoiseResponse ??= "proportional";
   request.parameters.thresholdNoiseMultiplier ??= 0;
+  request.parameters.thresholdInverseMaxBpsHour ??= 0;
+  request.parameters.thresholdInverseNoiseScaleBpsHour ??= 30;
+  request.parameters.signalFrictionFraction ??= 1;
   request.parameters.buyMaxFraction ??= 1;
   request.parameters.sellMaxFraction ??= 1;
   request.parameters.buySizingSigmaBpsHour ??= 1e12;
@@ -709,10 +717,12 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   request.parameters.confirmationDmiWeight ??= 0;
   request.parameters.confirmationAdxThreshold ??= 20;
   request.parameters.confirmationBias ??= 0;
-  request.parameters.meanReversionMix ??= 0;
-  request.parameters.meanReversionMeanMs ??= 60 * 60_000;
+  request.parameters.meanReversionEfficiencyMs ??= request.parameters.efficiencyMs;
+  request.parameters.meanReversionFastMs ??= request.parameters.fastMs;
+  request.parameters.meanReversionSlowMs ??= 60 * 60_000;
   request.parameters.meanReversionVolatilityMs ??= 60 * 60_000;
-  request.parameters.meanReversionThreshold ??= 2;
+  request.parameters.meanReversionSuppressionThreshold ??= 1;
+  request.parameters.meanReversionReversalThreshold ??= 0;
   const values = [
     request.parameters.efficiencyMs,
     ...(request.parameters.efficiencyVolumePower > 0
@@ -723,7 +733,8 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     request.parameters.power,
     request.parameters.volumeMs,
     request.parameters.volumeCap,
-    ...(request.parameters.thresholdMode === "adaptive"
+    request.parameters.rateEmaMs,
+    ...(thresholdNoiseEnabled(request.parameters)
       ? [request.parameters.thresholdLookbackMs]
       : []),
     ...(request.parameters.confirmationMix > 0
@@ -742,11 +753,12 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     ...(request.parameters.confirmationDmiWeight > 0
       ? [request.parameters.confirmationDmiMs]
       : []),
-    ...(request.parameters.meanReversionMix > 0
+    ...(meanReversionEnabled(request.parameters)
       ? [
-        request.parameters.meanReversionMeanMs,
+        request.parameters.meanReversionEfficiencyMs,
+        request.parameters.meanReversionFastMs,
+        request.parameters.meanReversionSlowMs,
         request.parameters.meanReversionVolatilityMs,
-        request.parameters.meanReversionThreshold,
       ]
       : []),
     request.timingHalfLifeMs,
@@ -760,6 +772,8 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     request.parameters.efficiencyVolumePower,
     request.parameters.deadbandBpsHour,
     request.parameters.thresholdNoiseMultiplier,
+    request.parameters.thresholdInverseMaxBpsHour,
+    request.parameters.signalFrictionFraction,
     request.parameters.buyMaxFraction,
     request.parameters.sellMaxFraction,
     request.parameters.confirmationAccelerationWeight,
@@ -770,22 +784,31 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     request.parameters.confirmationRsiWeight,
     request.parameters.confirmationDmiWeight,
     request.parameters.confirmationAdxThreshold,
-    request.parameters.meanReversionMix,
+    request.parameters.meanReversionSuppressionThreshold,
+    request.parameters.meanReversionReversalThreshold,
     request.oracleFriction,
     request.matchWindowMs,
   ];
   if (nonNegative.some((value) => !Number.isFinite(value) || value < 0)) {
     throw new Error("VW-KAMA thresholds and friction cannot be negative.");
   }
+  if (request.parameters.thresholdNoiseResponse === "inverse"
+    && request.parameters.thresholdInverseMaxBpsHour > 0
+    && (!Number.isFinite(request.parameters.thresholdInverseNoiseScaleBpsHour)
+      || request.parameters.thresholdInverseNoiseScaleBpsHour <= 0)) {
+    throw new Error("VW-KAMA inverse threshold noise scale must be positive.");
+  }
   if (request.parameters.buyMaxFraction > 1 || request.parameters.sellMaxFraction > 1) {
     throw new Error("VW-KAMA sizing fractions cannot exceed one.");
+  }
+  if (request.parameters.signalFrictionFraction > 1) {
+    throw new Error("VW-KAMA signal friction fraction cannot exceed one.");
   }
   if (![
     request.parameters.confirmationMix,
     request.parameters.confirmationMinQuality,
     request.parameters.hysteresisReleaseRatio,
     request.parameters.confirmationEmaGateStrength,
-    request.parameters.meanReversionMix,
   ]
     .every((value) => Number.isFinite(value) && value >= 0 && value <= 1)) {
     throw new Error("VW-KAMA confirmation and hysteresis fractions must be between zero and one.");
@@ -796,6 +819,16 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   if (!Number.isFinite(request.parameters.confirmationBias)) {
     throw new Error("VW-KAMA confirmation bias must be finite.");
+  }
+  if (meanReversionEnabled(request.parameters)
+    && (request.parameters.meanReversionSuppressionThreshold <= 0
+      || request.parameters.meanReversionSuppressionThreshold
+        > request.parameters.meanReversionReversalThreshold)) {
+    throw new Error("VW-KAMA mean-reversion suppression threshold must be positive and at most the reversal threshold.");
+  }
+  if (meanReversionEnabled(request.parameters)
+    && request.parameters.meanReversionFastMs > request.parameters.meanReversionSlowMs) {
+    throw new Error("VW-KAMA mean-reversion fast duration cannot exceed its slow duration.");
   }
   if (![request.parameters.buySizingSigmaBpsHour, request.parameters.sellSizingSigmaBpsHour]
     .every((value) => Number.isFinite(value) && value > 0)) {
@@ -837,73 +870,6 @@ function normalizeCandleRangeRequest(input: VwKamaCandleRangeRequest): {
   };
 }
 
-function calculateKama(
-  candles: Candle[],
-  request: VwKamaInspectorRequest,
-  scoreStartTime: number,
-): Float64Array {
-  const intervalMs = request.intervalMs;
-  const parameters = request.parameters;
-  const periods = {
-    efficiencyPeriod: samples(parameters.efficiencyMs, intervalMs),
-    efficiencyVolumePeriod: samples(
-      parameters.efficiencyVolumeEmaMs ?? parameters.volumeMs,
-      intervalMs,
-    ),
-    efficiencyVolumePower: parameters.efficiencyVolumePower ?? 0,
-    fastPeriod: samples(parameters.fastMs, intervalMs),
-    slowPeriod: samples(parameters.slowMs, intervalMs),
-    volumePeriod: samples(parameters.volumeMs, intervalMs),
-  };
-  const indicator = new VolumeWeightedKAMAIndicator({} as TradingApi, {
-    ...periods,
-    power: parameters.power,
-    volumeCap: parameters.volumeCap,
-    volumePower: parameters.volumePower,
-  });
-  const values = new Float64Array(candles.length);
-  values.fill(Number.NaN);
-  const warmup = volumeWeightedKamaWarmupSamples(periods, request.warmupMultiple);
-  const scoreStart = candleLowerBound(candles, scoreStartTime);
-  const feedStart = Math.max(0, scoreStart - warmup);
-  for (let index = feedStart; index < candles.length; index += 1) {
-    const candle = candles[index]!;
-    indicator.onTick({ eventTime: candle.closeTime, candle });
-    values[index] = indicator.indicator();
-  }
-  return values;
-}
-
-function renderKamaSeries(
-  segments: Candle[][],
-  values: Float64Array[],
-  candles: Candle[],
-  request: VwKamaCandleRangeRequest,
-): BacktestChartSmaSeries {
-  const requested = new Set(candles.map((candle) => candle.closeTime));
-  const points: BacktestChartSmaSeries["points"] = [];
-  for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
-    const segment = segments[segmentIndex]!;
-    const segmentValues = values[segmentIndex]!;
-    const from = candleLowerBound(segment, request.startTime);
-    const to = candleLowerBound(segment, request.endTime);
-    for (let index = from; index < to; index += 1) {
-      const candle = segment[index]!;
-      if (requested.has(candle.closeTime) && Number.isFinite(segmentValues[index])) {
-        points.push({ time: candle.closeTime, value: segmentValues[index]! });
-      }
-    }
-  }
-  points.sort((left, right) => left.time - right.time);
-  return {
-    index: -1,
-    windowSec: request.parameters.slowMs / 1_000,
-    label: "VW-KAMA",
-    color: "#f472b6",
-    points,
-  };
-}
-
 function candidateWarmupMs(request: VwKamaInspectorRequest): number {
   const longest = Math.max(
     request.parameters.efficiencyMs,
@@ -912,7 +878,8 @@ function candidateWarmupMs(request: VwKamaInspectorRequest): number {
       : 0,
     request.parameters.slowMs,
     request.parameters.volumeMs,
-    request.parameters.thresholdMode === "adaptive"
+    request.parameters.rateEmaMs ?? request.intervalMs,
+    thresholdNoiseEnabled(request.parameters)
       ? request.parameters.thresholdLookbackMs ?? 0
       : 0,
     request.parameters.confirmationMix
@@ -931,18 +898,16 @@ function candidateWarmupMs(request: VwKamaInspectorRequest): number {
     request.parameters.confirmationMix && request.parameters.confirmationDmiWeight
       ? (request.parameters.confirmationDmiMs ?? 0) * 2
       : 0,
-    request.parameters.meanReversionMix
+    meanReversionEnabled(request.parameters)
       ? Math.max(
-        request.parameters.meanReversionMeanMs ?? 0,
+        request.parameters.meanReversionEfficiencyMs ?? request.parameters.efficiencyMs,
+        request.parameters.meanReversionFastMs ?? request.parameters.fastMs,
+        request.parameters.meanReversionSlowMs ?? request.parameters.slowMs,
         request.parameters.meanReversionVolatilityMs ?? 0,
       )
       : 0,
   );
   return Math.ceil(longest / request.intervalMs) * request.intervalMs * request.warmupMultiple;
-}
-
-function samples(durationMs: number, intervalMs: number): number {
-  return Math.max(1, Math.round(durationMs / intervalMs));
 }
 
 function aggregateCandles(candles: Candle[], sourceMs: number, targetMs: number): Candle[] {
@@ -1078,6 +1043,16 @@ function duration(ms: number): string {
   if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
   if (ms % 60_000 === 0) return `${ms / 60_000}m`;
   return `${ms / 1_000}s`;
+}
+
+function thresholdNoiseEnabled(parameters: VwKamaParameters): boolean {
+  return parameters.thresholdNoiseResponse === "inverse"
+    ? (parameters.thresholdInverseMaxBpsHour ?? 0) > 0
+    : (parameters.thresholdNoiseMultiplier ?? 0) > 0;
+}
+
+function meanReversionEnabled(parameters: VwKamaParameters): boolean {
+  return (parameters.meanReversionReversalThreshold ?? 0) > 0;
 }
 
 function utcDay(time: number): number {

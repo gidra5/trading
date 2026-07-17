@@ -584,6 +584,9 @@ function continuousSegments(candles: TradingCandle[], intervalMs: number): Tradi
 
 function candidateWarmupMs(parameters: VwKamaParameters, intervalMs: number, warmupMultiple: number): number {
   const confirmation = (parameters.confirmationMix ?? 0) > 0;
+  const thresholdEnabled = parameters.thresholdNoiseResponse === "inverse"
+    ? (parameters.thresholdInverseMaxBpsHour ?? 0) > 0
+    : (parameters.thresholdNoiseMultiplier ?? 0) > 0;
   const longest = Math.max(
     parameters.efficiencyMs,
     (parameters.efficiencyVolumePower ?? 0) > 0
@@ -591,7 +594,7 @@ function candidateWarmupMs(parameters: VwKamaParameters, intervalMs: number, war
       : 0,
     parameters.slowMs,
     parameters.volumeMs,
-    parameters.thresholdMode === "adaptive" ? parameters.thresholdLookbackMs ?? 0 : 0,
+    thresholdEnabled ? parameters.thresholdLookbackMs ?? 0 : 0,
     confirmation ? parameters.confirmationAccelerationLookbackMs ?? 0 : 0,
     confirmation ? parameters.confirmationDistanceLookbackMs ?? 0 : 0,
     (confirmation && (parameters.confirmationEmaWeight ?? 0) > 0)
@@ -600,8 +603,13 @@ function candidateWarmupMs(parameters: VwKamaParameters, intervalMs: number, war
       : 0,
     confirmation && (parameters.confirmationRsiWeight ?? 0) > 0 ? parameters.confirmationRsiMs ?? 0 : 0,
     confirmation && (parameters.confirmationDmiWeight ?? 0) > 0 ? (parameters.confirmationDmiMs ?? 0) * 2 : 0,
-    (parameters.meanReversionMix ?? 0) > 0
-      ? Math.max(parameters.meanReversionMeanMs ?? 0, parameters.meanReversionVolatilityMs ?? 0)
+    (parameters.meanReversionReversalThreshold ?? 0) > 0
+      ? Math.max(
+        parameters.meanReversionEfficiencyMs ?? parameters.efficiencyMs,
+        parameters.meanReversionFastMs ?? parameters.fastMs,
+        parameters.meanReversionSlowMs ?? parameters.slowMs,
+        parameters.meanReversionVolatilityMs ?? parameters.slowMs,
+      )
       : 0,
   );
   return Math.ceil(longest / intervalMs) * intervalMs * warmupMultiple;

@@ -1,6 +1,5 @@
 import {
   EMAIndicator,
-  MeanReversionIndicator,
   RSIIndicator,
   VolumeWeightedKAMAIndicator,
   volumeWeightedKamaWarmupSamples,
@@ -28,11 +27,12 @@ const DAY_MS = 86_400_000;
 const F1_WEIGHT = 0.2;
 const AGREEMENT_WEIGHT = 0.6;
 const CLEANLINESS_WEIGHT = 0.2;
-export const VW_KAMA_SCORE_VERSION = 3;
+export const VW_KAMA_SCORE_VERSION = 4;
 
 export type VwKamaDeadbandMode = "flat" | "hold" | "hysteresis";
-export type VwKamaThresholdMode = "static" | "adaptive";
 export type VwKamaAgreementMode = "sizing" | "confidence";
+export type VwKamaRateMode = "relative" | "log";
+export type VwKamaThresholdResponse = "proportional" | "inverse";
 
 export interface VwKamaParameters {
   efficiencyMs: number;
@@ -44,12 +44,17 @@ export interface VwKamaParameters {
   volumeMs: number;
   volumeCap: number;
   volumePower: number;
+  rateMode?: VwKamaRateMode;
+  rateEmaMs?: number;
   deadbandBpsHour: number;
   deadbandMode: VwKamaDeadbandMode;
   hysteresisReleaseRatio?: number;
-  thresholdMode?: VwKamaThresholdMode;
   thresholdLookbackMs?: number;
+  thresholdNoiseResponse?: VwKamaThresholdResponse;
   thresholdNoiseMultiplier?: number;
+  thresholdInverseMaxBpsHour?: number;
+  thresholdInverseNoiseScaleBpsHour?: number;
+  signalFrictionFraction?: number;
   buyMaxFraction?: number;
   sellMaxFraction?: number;
   buySizingSigmaBpsHour?: number;
@@ -72,10 +77,12 @@ export interface VwKamaParameters {
   confirmationDmiWeight?: number;
   confirmationAdxThreshold?: number;
   confirmationBias?: number;
-  meanReversionMix?: number;
-  meanReversionMeanMs?: number;
+  meanReversionEfficiencyMs?: number;
+  meanReversionFastMs?: number;
+  meanReversionSlowMs?: number;
   meanReversionVolatilityMs?: number;
-  meanReversionThreshold?: number;
+  meanReversionSuppressionThreshold?: number;
+  meanReversionReversalThreshold?: number;
 }
 
 export interface VwKamaInspectorWindow {
@@ -111,6 +118,7 @@ export interface VwKamaCandleRangeResponse {
   sourceCandleCount: number;
   candles: Candle[];
   kamaSeries: BacktestChartSmaSeries;
+  indicatorPoints: VwKamaIndicatorPoint[];
 }
 
 export interface VwKamaInspectorCatalog {
@@ -160,7 +168,6 @@ export interface VwKamaTransition {
   rsi: number;
   dmi: number;
   adx: number;
-  meanReversion: number;
   meanDistance: number;
   matchedTime: number | null;
   lagMs: number | null;
@@ -201,17 +208,32 @@ export interface VwKamaIndicatorPoint {
   time: number;
   kama: number;
   kamaRate: number;
+  kamaRateRaw: number;
+  threshold: number;
+  signalFrictionLower: number | null;
+  signalFrictionUpper: number | null;
   efficiencyRatio: number;
   effectiveEfficiencyRatio: number;
+  volume: number;
+  volumeAverage: number;
   relativeVolume: number;
   alpha: number;
   confirmationEma: number;
   rsi: number;
   dmi: number;
   adx: number;
-  meanReversionEma: number;
+  meanReversionKama: number;
   meanDistance: number;
+  signalIntent: BacktestOracleState | null;
+  rejectionReasons: VwKamaSignalRejectionReason[];
 }
+
+export type VwKamaSignalRejectionReason =
+  | "mean-reversion"
+  | "ema-hard-gate"
+  | "zero-quality"
+  | "minimum-quality"
+  | "signal-friction";
 
 export interface VwKamaInspectorResponse {
   window: VwKamaInspectorWindow;
@@ -237,6 +259,7 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   scoreStartTime: number;
   scoreStartIndex?: number;
   maxPoints?: number;
+  traceTimes?: readonly number[];
   oracleResult?: PerfectMarginOracleResult;
   preparedOracle?: VwKamaPreparedOracle;
   includeTrace?: boolean;
@@ -363,6 +386,7 @@ export function evaluateVwKamaOracle(
   };
   const warmup = volumeWeightedKamaWarmupSamples(periods, options.warmupMultiple);
   const thresholdSamples = samples(options.parameters.thresholdLookbackMs ?? options.intervalMs, options.intervalMs);
+  const rateEmaSamples = samples(options.parameters.rateEmaMs ?? options.intervalMs, options.intervalMs);
   const accelerationSamples = samples(
     options.parameters.confirmationAccelerationLookbackMs ?? options.intervalMs,
     options.intervalMs,
@@ -383,16 +407,30 @@ export function evaluateVwKamaOracle(
     options.parameters.confirmationDmiMs ?? options.intervalMs,
     options.intervalMs,
   );
-  const meanReversionSamples = samples(
-    options.parameters.meanReversionMeanMs ?? options.parameters.slowMs,
-    options.intervalMs,
+  const meanReversionPeriods = {
+    ...periods,
+    efficiencyPeriod: samples(
+      options.parameters.meanReversionEfficiencyMs ?? options.parameters.efficiencyMs,
+      options.intervalMs,
+    ),
+    fastPeriod: samples(
+      options.parameters.meanReversionFastMs ?? options.parameters.fastMs,
+      options.intervalMs,
+    ),
+    slowPeriod: samples(
+      options.parameters.meanReversionSlowMs ?? options.parameters.slowMs,
+      options.intervalMs,
+    ),
+  };
+  const meanReversionKamaWarmup = volumeWeightedKamaWarmupSamples(
+    meanReversionPeriods,
+    options.warmupMultiple,
   );
   const meanReversionVolatilitySamples = samples(
     options.parameters.meanReversionVolatilityMs ?? options.parameters.slowMs,
     options.intervalMs,
   );
-  const thresholdEnabled = options.parameters.thresholdMode === "adaptive"
-    && (options.parameters.thresholdNoiseMultiplier ?? 0) > 0;
+  const thresholdEnabled = thresholdNoiseEnabled(options.parameters);
   const confirmationEnabled = (options.parameters.confirmationMix ?? 0) > 0;
   const accelerationEnabled = confirmationEnabled
     && (options.parameters.confirmationAccelerationWeight ?? 1) > 0;
@@ -402,7 +440,7 @@ export function evaluateVwKamaOracle(
     || (options.parameters.confirmationEmaGateStrength ?? 0) > 0;
   const rsiEnabled = confirmationEnabled && (options.parameters.confirmationRsiWeight ?? 0) > 0;
   const dmiEnabled = confirmationEnabled && (options.parameters.confirmationDmiWeight ?? 0) > 0;
-  const meanReversionEnabled = (options.parameters.meanReversionMix ?? 0) > 0;
+  const meanReversionEnabled = (options.parameters.meanReversionReversalThreshold ?? 0) > 0;
   const computeAcceleration = includeTrace || accelerationEnabled;
   const computeDistance = includeTrace || distanceEnabled;
   const computeEma = includeTrace || emaEnabled;
@@ -410,6 +448,7 @@ export function evaluateVwKamaOracle(
   const computeDmi = includeTrace || dmiEnabled;
   const feedStart = Math.max(0, scoreStart - Math.max(
     warmup,
+    rateEmaSamples * options.warmupMultiple,
     thresholdEnabled ? thresholdSamples * options.warmupMultiple : 0,
     accelerationEnabled ? accelerationSamples * options.warmupMultiple : 0,
     distanceEnabled ? distanceSamples * options.warmupMultiple : 0,
@@ -417,7 +456,10 @@ export function evaluateVwKamaOracle(
     rsiEnabled ? rsiSamples * options.warmupMultiple : 0,
     dmiEnabled ? dmiSamples * options.warmupMultiple * 2 : 0,
     meanReversionEnabled
-      ? Math.max(meanReversionSamples, meanReversionVolatilitySamples) * options.warmupMultiple
+      ? Math.max(
+        meanReversionKamaWarmup,
+        meanReversionVolatilitySamples * options.warmupMultiple,
+      )
       : 0,
   ));
   const indicator = new VolumeWeightedKAMAIndicator({} as TradingApi, {
@@ -426,14 +468,27 @@ export function evaluateVwKamaOracle(
     volumeCap: options.parameters.volumeCap,
     volumePower: options.parameters.volumePower,
   });
+  const rateEma = new EMAIndicator(rateEmaSamples);
   const slowEma = new EMAIndicator(emaSamples);
   const rsi = new RSIIndicator(rsiSamples, {} as TradingApi);
   const dmi = new DmiAdx(dmiSamples);
-  const meanReversion = new MeanReversionIndicator(
-    meanReversionSamples,
-    meanReversionVolatilitySamples,
-    options.parameters.meanReversionThreshold ?? 2,
-  );
+  const meanReversionKama = new VolumeWeightedKAMAIndicator({} as TradingApi, {
+    ...meanReversionPeriods,
+    power: options.parameters.power,
+    volumeCap: options.parameters.volumeCap,
+    volumePower: options.parameters.volumePower,
+  });
+  const meanReversionVariance = new EMAIndicator(meanReversionVolatilitySamples);
+  let meanReversionSignedDistance = 0;
+  const updateMeanReversion = (nextCandle: TradingCandle): void => {
+    meanReversionKama.onTick({ eventTime: nextCandle.closeTime, candle: nextCandle });
+    const mean = meanReversionKama.indicator();
+    meanReversionSignedDistance = mean > 0 ? nextCandle.close / mean - 1 : 0;
+    meanReversionVariance.onTick({
+      eventTime: nextCandle.closeTime,
+      value: Math.max(Number.EPSILON, meanReversionSignedDistance ** 2),
+    });
+  };
   const candidateStates = includeTrace ? new Int8Array(candles.length) : null;
   const candidateExposures = includeTrace ? new Float64Array(candles.length) : null;
   const candidateTransitions: VwKamaTransition[] = [];
@@ -447,6 +502,7 @@ export function evaluateVwKamaOracle(
     points: [],
   };
   const maxPoints = Math.max(1, Math.round(options.maxPoints ?? 2_000));
+  const requestedTraceTimes = options.traceTimes ? new Set(options.traceTimes) : null;
   const sampleEvery = Math.max(1, Math.ceil((candles.length - scoreStart) / maxPoints));
   const agreementMode = options.parameters.agreementMode ?? "sizing";
   let current = 0;
@@ -464,6 +520,8 @@ export function evaluateVwKamaOracle(
   let smoothedRateChange = 0;
   let distanceNoise = 0;
   let stateCredit = 0;
+  const signalFriction = options.oracleFriction
+    * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
 
   if (includeTrace) {
     const emaFeedStart = Math.max(0, scoreStart - emaSamples * options.warmupMultiple);
@@ -471,7 +529,10 @@ export function evaluateVwKamaOracle(
     const dmiFeedStart = Math.max(0, scoreStart - dmiSamples * options.warmupMultiple * 2);
     const meanReversionFeedStart = Math.max(
       0,
-      scoreStart - Math.max(meanReversionSamples, meanReversionVolatilitySamples) * options.warmupMultiple,
+      scoreStart - Math.max(
+        meanReversionKamaWarmup,
+        meanReversionVolatilitySamples * options.warmupMultiple,
+      ),
     );
     const diagnosticFeedStart = Math.min(
       emaFeedStart,
@@ -493,7 +554,7 @@ export function evaluateVwKamaOracle(
       }
       if (index >= dmiFeedStart) dmi.update(diagnosticCandle);
       if (index >= meanReversionFeedStart) {
-        meanReversion.onTick({ eventTime: diagnosticCandle.closeTime, candle: diagnosticCandle });
+        updateMeanReversion(diagnosticCandle);
       }
     }
   }
@@ -505,12 +566,19 @@ export function evaluateVwKamaOracle(
     if (computeRsi) rsi.onTick({ eventTime: candle.closeTime, candle });
     const dmiValue = computeDmi ? dmi.update(candle) : { direction: 0, adx: 0 };
     if (includeTrace || meanReversionEnabled) {
-      meanReversion.onTick({ eventTime: candle.closeTime, candle });
+      updateMeanReversion(candle);
     }
     const kama = indicator.indicator();
-    const rate = kama > 0
+    const relativeRate = kama > 0
       ? indicator.derivative() / kama * 10_000 * HOUR_MS / options.intervalMs
       : 0;
+    const previousKama = kama - indicator.derivative();
+    const logRate = kama > 0 && previousKama > 0
+      ? Math.log(kama / previousKama) * 10_000 * HOUR_MS / options.intervalMs
+      : 0;
+    const rawRate = options.parameters.rateMode === "log" ? logRate : relativeRate;
+    rateEma.onTick({ eventTime: candle.closeTime, value: rawRate });
+    const rate = rateEma.indicator();
     const noise = thresholdEnabled ? rateNoise.update(rate) : 0;
     const rateChange = computeAcceleration && previousRate !== null ? rate - previousRate : 0;
     const accelerationScale = computeAcceleration ? accelerationNoise.update(rate) : 0;
@@ -529,15 +597,20 @@ export function evaluateVwKamaOracle(
       : 0;
     const rsiValue = computeRsi ? rsi.indicator() : 50;
     const threshold = options.parameters.deadbandBpsHour
-      + (options.parameters.thresholdMode === "adaptive"
-        ? noise * Math.max(0, options.parameters.thresholdNoiseMultiplier ?? 0)
-        : 0);
+      + thresholdNoiseAdjustment(noise, options.parameters);
+    const previousTrend = trend;
     trend = candidateState(rate, trend, threshold, options.parameters);
-    const reversion = meanReversionEnabled ? meanReversion.indicator() : 0;
-    const reversionBlend = 1 - 2 * clamp01(options.parameters.meanReversionMix ?? 0) * reversion;
-    const proposed = trend === 0 || Math.abs(reversionBlend) <= Number.EPSILON
-      ? 0
-      : trend * Math.sign(reversionBlend);
+    const sourceEdge = trend !== previousTrend;
+    const meanReversionVolatility = Math.sqrt(Math.max(0, meanReversionVariance.indicator()));
+    const normalizedMeanDistance = Math.abs(meanReversionSignedDistance)
+      / Math.max(Number.EPSILON, meanReversionVolatility);
+    const proposed = !meanReversionEnabled || trend === 0
+      ? trend
+      : normalizedMeanDistance >= (options.parameters.meanReversionReversalThreshold ?? 0)
+        ? -trend
+        : normalizedMeanDistance >= (options.parameters.meanReversionSuppressionThreshold ?? 0)
+          ? 0
+          : trend;
     const emaAligned = proposed === 0 || emaTrendAligned(proposed, emaRate, options.parameters);
     const desired = proposed !== 0
       && clamp01(options.parameters.confirmationEmaGateStrength ?? 0) === 1
@@ -556,7 +629,20 @@ export function evaluateVwKamaOracle(
         dmiValue.adx,
         options.parameters,
       );
-    const quality = desired === 0 ? 1 : confirmation * Math.abs(reversionBlend);
+    const quality = desired === 0 ? 1 : confirmation;
+    const minimumQuality = clamp01(options.parameters.confirmationMinQuality ?? 0);
+    const transitionRequested = sourceEdge && desired !== current;
+    const positiveQuality = desired === 0 || quality > 0;
+    const sufficientQuality = quality >= minimumQuality;
+    const beyondFriction = !transitionRequested
+      || signalBeyondFriction(candle.close, lastSignalPrice, signalFriction);
+    const accepted = transitionRequested
+      && positiveQuality
+      && sufficientQuality
+      && beyondFriction;
+    const signalIntent = includeTrace && sourceEdge && trend !== current
+      ? stateName(trend)
+      : null;
     const fromExposure = candidateAgreementValue(
       agreementMode,
       current,
@@ -564,12 +650,7 @@ export function evaluateVwKamaOracle(
       anchorPrice,
       candle.close,
     );
-    if (
-      desired !== current
-      && (desired === 0 || quality > 0)
-      && quality >= clamp01(options.parameters.confirmationMinQuality ?? 0)
-      && signalBeyondFriction(candle.close, lastSignalPrice, options.oracleFriction)
-    ) {
+    if (accepted) {
       const nextFraction = desired === 0
         ? 0
         : signalFraction(desired, rate, options.parameters) * quality;
@@ -589,9 +670,7 @@ export function evaluateVwKamaOracle(
           rsiValue,
           dmiValue.direction,
           dmiValue.adx,
-          reversion,
-          meanReversion.details().signedDistance
-            / Math.max(Number.EPSILON, meanReversion.details().volatility),
+          meanReversionSignedDistance / Math.max(Number.EPSILON, meanReversionVolatility),
         ));
         if (includeTrace) points.push(statePoint(candle, current, desired));
       }
@@ -617,25 +696,50 @@ export function evaluateVwKamaOracle(
     }
     if (candidateStates) candidateStates[index] = current;
     if (candidateExposures) candidateExposures[index] = candidateExposure;
-    if (includeTrace && index >= scoreStart && ((index - scoreStart) % sampleEvery === 0 || index === candles.length - 1)) {
+    const tracePoint = requestedTraceTimes
+      ? requestedTraceTimes.has(candle.closeTime)
+      : index >= scoreStart
+        && ((index - scoreStart) % sampleEvery === 0 || index === candles.length - 1);
+    if (includeTrace && tracePoint) {
       kamaSeries.points.push({ time: candle.closeTime, value: kama });
       const kamaDetails = indicator.details();
-      const meanReversionDetails = meanReversion.details();
+      const rejectionReasons: VwKamaSignalRejectionReason[] = [];
+      if (signalIntent) {
+        if (proposed !== trend) rejectionReasons.push("mean-reversion");
+        if (desired !== proposed) rejectionReasons.push("ema-hard-gate");
+        if (!accepted) {
+          if (transitionRequested && !positiveQuality) rejectionReasons.push("zero-quality");
+          else if (transitionRequested && !sufficientQuality) rejectionReasons.push("minimum-quality");
+          else if (transitionRequested && !beyondFriction) rejectionReasons.push("signal-friction");
+        }
+      }
       indicatorPoints.push({
         time: candle.closeTime,
         kama,
         kamaRate: rate,
+        kamaRateRaw: rawRate,
+        threshold,
+        signalFrictionLower: lastSignalPrice === null
+          ? null
+          : lastSignalPrice * (1 - signalFriction),
+        signalFrictionUpper: lastSignalPrice === null
+          ? null
+          : lastSignalPrice * (1 + signalFriction),
         efficiencyRatio: kamaDetails.efficiencyRatio,
         effectiveEfficiencyRatio: kamaDetails.effectiveEfficiencyRatio,
+        volume: candle.volume,
+        volumeAverage: indicator.volumeAverage(),
         relativeVolume: kamaDetails.relativeVolume,
         alpha: kamaDetails.alpha,
         confirmationEma: slowEma.indicator(),
         rsi: rsiValue,
         dmi: dmiValue.direction,
         adx: dmiValue.adx,
-        meanReversionEma: meanReversionDetails.mean,
-        meanDistance: meanReversionDetails.signedDistance
-          / Math.max(Number.EPSILON, meanReversionDetails.volatility),
+        meanReversionKama: meanReversionKama.indicator(),
+        meanDistance: meanReversionSignedDistance
+          / Math.max(Number.EPSILON, meanReversionVolatility),
+        signalIntent,
+        rejectionReasons,
       });
       if (points.at(-1)?.time !== candle.closeTime) points.push(statePoint(candle, current, current));
     }
@@ -708,7 +812,7 @@ export function evaluateVwKamaOracle(
       kind: item.side === "buy" ? "buy-signal" : "sell-signal",
       label: `VW-KAMA ${item.fromState} → ${item.state} · ${(item.sizeFraction * 100).toFixed(1)}%`,
       signalState: item.state,
-      reason: `Quality ${(item.quality * 100).toFixed(1)}% · mean reversion ${(item.meanReversion * 100).toFixed(1)}% at ${item.meanDistance.toFixed(2)}σ · EMA ${item.emaRate.toFixed(2)} bps/h · RSI ${item.rsi.toFixed(1)} · DMI ${item.dmi.toFixed(1)} / ADX ${item.adx.toFixed(1)} · ${item.lagMs === null ? "no one-to-one oracle match" : `oracle timing offset ${item.lagMs} ms`}`,
+      reason: `Quality ${(item.quality * 100).toFixed(1)}% · mean distance ${item.meanDistance.toFixed(2)}σ · EMA ${item.emaRate.toFixed(2)} bps/h · RSI ${item.rsi.toFixed(1)} · DMI ${item.dmi.toFixed(1)} / ADX ${item.adx.toFixed(1)} · ${item.lagMs === null ? "no one-to-one oracle match" : `oracle timing offset ${item.lagMs} ms`}`,
     })) : [],
     oracle: oracleResult
       ? { ...oracleResult.path, points: oraclePoints }
@@ -943,7 +1047,6 @@ function baseTransition(
   rsi = 50,
   dmi = 0,
   adx = 0,
-  meanReversion = 0,
   meanDistance = 0,
 ): VwKamaTransition {
   return {
@@ -962,7 +1065,6 @@ function baseTransition(
     rsi,
     dmi,
     adx,
-    meanReversion,
     meanDistance,
     matchedTime: null,
     lagMs: null,
@@ -1171,6 +1273,16 @@ function validate(options: EvaluateVwKamaOptions): void {
   if (!["flat", "hold", "hysteresis"].includes(options.parameters.deadbandMode)) {
     throw new Error("VW-KAMA deadband mode must be flat, hold, or hysteresis.");
   }
+  if (options.parameters.rateMode !== undefined
+    && options.parameters.rateMode !== "relative"
+    && options.parameters.rateMode !== "log") {
+    throw new Error("VW-KAMA rate mode must be relative or log.");
+  }
+  if (options.parameters.thresholdNoiseResponse !== undefined
+    && options.parameters.thresholdNoiseResponse !== "proportional"
+    && options.parameters.thresholdNoiseResponse !== "inverse") {
+    throw new Error("VW-KAMA threshold noise response must be proportional or inverse.");
+  }
   if (options.parameters.agreementMode !== undefined
     && options.parameters.agreementMode !== "sizing"
     && options.parameters.agreementMode !== "confidence") {
@@ -1187,6 +1299,7 @@ function validate(options: EvaluateVwKamaOptions): void {
     options.parameters.power,
     options.parameters.volumeMs,
     options.parameters.volumeCap,
+    options.parameters.rateEmaMs ?? options.intervalMs,
     options.timingHalfLifeMs,
     options.warmupMultiple,
   ];
@@ -1198,6 +1311,8 @@ function validate(options: EvaluateVwKamaOptions): void {
     options.parameters.efficiencyVolumePower ?? 0,
     options.parameters.deadbandBpsHour,
     options.parameters.thresholdNoiseMultiplier ?? 0,
+    options.parameters.thresholdInverseMaxBpsHour ?? 0,
+    options.parameters.signalFrictionFraction ?? 1,
     options.parameters.buyMaxFraction ?? 1,
     options.parameters.sellMaxFraction ?? 1,
     options.parameters.confirmationAccelerationWeight ?? 1,
@@ -1208,11 +1323,19 @@ function validate(options: EvaluateVwKamaOptions): void {
     options.parameters.confirmationRsiWeight ?? 0,
     options.parameters.confirmationDmiWeight ?? 0,
     options.parameters.confirmationAdxThreshold ?? 20,
+    options.parameters.meanReversionSuppressionThreshold ?? 0,
+    options.parameters.meanReversionReversalThreshold ?? 0,
     options.oracleFriction,
     options.matchWindowMs,
   ];
   if (nonNegative.some((value) => !Number.isFinite(value) || value < 0)) {
     throw new Error("VW-KAMA thresholds and friction cannot be negative.");
+  }
+  if (options.parameters.thresholdNoiseResponse === "inverse"
+    && (options.parameters.thresholdInverseMaxBpsHour ?? 0) > 0
+    && (!Number.isFinite(options.parameters.thresholdInverseNoiseScaleBpsHour)
+      || (options.parameters.thresholdInverseNoiseScaleBpsHour ?? 0) <= 0)) {
+    throw new Error("VW-KAMA inverse threshold noise scale must be positive.");
   }
   const sigmas = [
     options.parameters.buySizingSigmaBpsHour,
@@ -1224,12 +1347,14 @@ function validate(options: EvaluateVwKamaOptions): void {
   if ((options.parameters.buyMaxFraction ?? 1) > 1 || (options.parameters.sellMaxFraction ?? 1) > 1) {
     throw new Error("VW-KAMA sizing fractions cannot exceed one.");
   }
+  if ((options.parameters.signalFrictionFraction ?? 1) > 1) {
+    throw new Error("VW-KAMA signal friction fraction cannot exceed one.");
+  }
   const confirmationFractions = [
     options.parameters.confirmationMix ?? 0,
     options.parameters.confirmationMinQuality ?? 0,
     options.parameters.hysteresisReleaseRatio ?? 0.25,
     options.parameters.confirmationEmaGateStrength ?? 0,
-    options.parameters.meanReversionMix ?? 0,
   ];
   if (confirmationFractions.some((value) => !Number.isFinite(value) || value < 0 || value > 1)) {
     throw new Error("VW-KAMA confirmation mix and minimum quality must be between zero and one.");
@@ -1255,23 +1380,55 @@ function validate(options: EvaluateVwKamaOptions): void {
       || (options.parameters.confirmationEmaGateStrength ?? 0) > 0, options.parameters.confirmationEmaMs],
     [(options.parameters.confirmationRsiWeight ?? 0) > 0, options.parameters.confirmationRsiMs],
     [(options.parameters.confirmationDmiWeight ?? 0) > 0, options.parameters.confirmationDmiMs],
-    [(options.parameters.meanReversionMix ?? 0) > 0, options.parameters.meanReversionMeanMs],
-    [(options.parameters.meanReversionMix ?? 0) > 0, options.parameters.meanReversionVolatilityMs],
+    [meanReversionParametersEnabled(options.parameters),
+      options.parameters.meanReversionEfficiencyMs ?? options.parameters.efficiencyMs],
+    [meanReversionParametersEnabled(options.parameters),
+      options.parameters.meanReversionFastMs ?? options.parameters.fastMs],
+    [meanReversionParametersEnabled(options.parameters),
+      options.parameters.meanReversionSlowMs ?? options.parameters.slowMs],
+    [meanReversionParametersEnabled(options.parameters),
+      options.parameters.meanReversionVolatilityMs ?? options.parameters.slowMs],
   ] as const;
   if (optionalLookbacks.some(([enabled, value]) => enabled
     && (!Number.isFinite(value) || (value ?? 0) <= 0))) {
-    throw new Error("VW-KAMA EMA, RSI, and DMI confirmation lookbacks must be positive when enabled.");
+    throw new Error("VW-KAMA enabled indicator lookbacks must be positive.");
   }
-  if ((options.parameters.meanReversionMix ?? 0) > 0
-    && (!Number.isFinite(options.parameters.meanReversionThreshold)
-      || (options.parameters.meanReversionThreshold ?? 0) <= 0)) {
-    throw new Error("VW-KAMA mean-reversion threshold must be positive when enabled.");
+  if (meanReversionParametersEnabled(options.parameters)) {
+    const suppression = options.parameters.meanReversionSuppressionThreshold ?? 0;
+    const reversal = options.parameters.meanReversionReversalThreshold ?? 0;
+    const fast = options.parameters.meanReversionFastMs ?? options.parameters.fastMs;
+    const slow = options.parameters.meanReversionSlowMs ?? options.parameters.slowMs;
+    if (!Number.isFinite(suppression) || suppression <= 0 || suppression > reversal) {
+      throw new Error("VW-KAMA mean-reversion suppression threshold must be positive and at most the reversal threshold.");
+    }
+    if (fast > slow) {
+      throw new Error("VW-KAMA mean-reversion fast duration cannot exceed its slow duration.");
+    }
   }
-  if (options.parameters.thresholdMode === "adaptive"
+  if (thresholdNoiseEnabled(options.parameters)
     && (!Number.isFinite(options.parameters.thresholdLookbackMs)
       || (options.parameters.thresholdLookbackMs ?? 0) <= 0)) {
     throw new Error("VW-KAMA adaptive threshold lookback must be positive.");
   }
+}
+
+function thresholdNoiseEnabled(parameters: VwKamaParameters): boolean {
+  return parameters.thresholdNoiseResponse === "inverse"
+    ? (parameters.thresholdInverseMaxBpsHour ?? 0) > 0
+    : (parameters.thresholdNoiseMultiplier ?? 0) > 0;
+}
+
+function meanReversionParametersEnabled(parameters: VwKamaParameters): boolean {
+  return (parameters.meanReversionReversalThreshold ?? 0) > 0;
+}
+
+function thresholdNoiseAdjustment(noise: number, parameters: VwKamaParameters): number {
+  if (parameters.thresholdNoiseResponse !== "inverse") {
+    return noise * Math.max(0, parameters.thresholdNoiseMultiplier ?? 0);
+  }
+  const maximum = Math.max(0, parameters.thresholdInverseMaxBpsHour ?? 0);
+  const scale = Math.max(Number.EPSILON, parameters.thresholdInverseNoiseScaleBpsHour ?? 1);
+  return maximum / (1 + Math.max(0, noise) / scale);
 }
 
 class DmiAdx {

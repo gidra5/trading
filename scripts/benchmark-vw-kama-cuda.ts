@@ -113,7 +113,6 @@ function parameters(index: number): VwKamaParameters {
     deadbandBpsHour: 1 + index % 80,
     deadbandMode: (["flat", "hold", "hysteresis"] as const)[index % 3]!,
     hysteresisReleaseRatio: (index % 10) / 10,
-    thresholdMode: index % 2 === 0 ? "static" : "adaptive",
     thresholdLookbackMs: (30 + index % 600) * MINUTE,
     thresholdNoiseMultiplier: index % 2 === 0 ? 0 : 0.5 + index % 30 / 10,
     buyMaxFraction: 0.4 + index % 6 / 10,
@@ -138,10 +137,12 @@ function parameters(index: number): VwKamaParameters {
     confirmationDmiMs: (10 + index % 120) * MINUTE,
     confirmationDmiWeight: feature && index % 5 === 0 ? 0.6 : 0,
     confirmationAdxThreshold: 10 + index % 35,
-    meanReversionMix: index % 6 === 0 ? 0.35 : 0,
-    meanReversionMeanMs: (60 + index % 600) * MINUTE,
+    meanReversionSuppressionThreshold: index % 6 === 0 ? 1 : 0,
+    meanReversionEfficiencyMs: (30 + index % 300) * MINUTE,
+    meanReversionFastMs: (10 + index % 120) * MINUTE,
+    meanReversionSlowMs: (60 + index % 600) * MINUTE,
     meanReversionVolatilityMs: (60 + (index * 7) % 600) * MINUTE,
-    meanReversionThreshold: 0.75 + index % 30 / 10,
+    meanReversionReversalThreshold: index % 6 === 0 ? 1.25 + index % 30 / 10 : 0,
   };
 }
 

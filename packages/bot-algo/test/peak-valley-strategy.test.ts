@@ -92,7 +92,8 @@ test("peak/valley restores indicator snapshots", async () => {
   const strategy = new PeakValleyStrategy({ config, getHistory });
   await strategy.warmup();
   const snapshot = await strategy.snapshot();
-  assert.equal(snapshot.version, 3);
+  assert.equal(snapshot.version, 5);
+  assert.ok(snapshot.kamaCandidate < 0);
   assert.equal(snapshot.lastKamaSignalPrice, 99);
   const restored = new PeakValleyStrategy({ config, getHistory });
   await restored.restore(structuredClone(snapshot));
@@ -230,6 +231,10 @@ test("defaults use the validation-selected multi-scale oracle candidate", () => 
   assert.equal(config.kamaSignalFriction, 0.00175);
   assert.equal(config.kamaVolumePower, 0);
   assert.equal(config.kamaErVolumePower, 0);
+  assert.equal(config.kamaRateMode, "relative");
+  assert.equal(config.kamaRateEmaLen, 1);
+  assert.equal(config.kamaThresholdNoiseResponse, "proportional");
+  assert.equal(createPeakValleyStrategyConfig({ kamaRateEmaLen: 0 }).kamaRateEmaLen, 1);
   assert.ok(Math.abs(config.kamaRateThresholdLow * 36_000_000 - 67.56654) < 1e-9);
 });
 
@@ -254,7 +259,7 @@ test("bot config derives KAMA signal memory from execution friction", () => {
 });
 
 test("KAMA sample counts preserve physical durations across candle scales", () => {
-  const config = createPeakValleyStrategyConfig();
+  const config = createPeakValleyStrategyConfig({ kamaRateEmaLen: 60 });
   const oneSecond = rescalePeakValleyStrategyConfig(config, 1_000);
   const fiveMinute = rescalePeakValleyStrategyConfig(config, 300_000);
   assert.deepEqual(
@@ -267,6 +272,8 @@ test("KAMA sample counts preserve physical durations across candle scales", () =
   );
   assert.equal(oneSecond.kamaRateThresholdLow, config.kamaRateThresholdLow);
   assert.equal(oneSecond.kamaSignalFriction, config.kamaSignalFriction);
+  assert.equal(oneSecond.kamaRateEmaLen, 3_600);
+  assert.equal(fiveMinute.kamaRateEmaLen, 12);
 });
 
 test("KAMA warmup uses the same three-period context as the search", async () => {
@@ -354,7 +361,7 @@ test("peak/valley rewarms from the latest continuous segment after a candle gap"
   assert.equal(strategy.getDiagnostics().kama?.value, value);
 });
 
-test("KAMA signal memory suppresses reversals inside friction", async () => {
+test("KAMA signal memory consumes rejected edges instead of retrying outside the band", async () => {
   const history = [100, 100.1, 100, 100.1, 100, 100.1]
     .map((price, index) => candle(index * 1_000, price, 1_000));
   const config = createPeakValleyStrategyConfig({
@@ -392,6 +399,15 @@ test("KAMA signal memory suppresses reversals inside friction", async () => {
 
   const far = candle(7_000, 98, 1_000);
   await strategy.onTick(candleTick(far));
+  assert.ok((strategy.getDiagnostics().kama?.clampedRate ?? 0) > 0);
+  assert.equal(strategy.getDiagnostics().kama?.lastSignalPrice, 100.1);
+  assert.equal(await strategy.entrySignal(), null);
+  assert.equal(await strategy.exitSignal(), null);
+
+  const rearm = candle(8_000, 101, 1_000);
+  await strategy.onTick(candleTick(rearm));
+  const nextEdge = candle(9_000, 98, 1_000);
+  await strategy.onTick(candleTick(nextEdge));
   assert.ok((strategy.getDiagnostics().kama?.clampedRate ?? 0) < 0);
   assert.equal(strategy.getDiagnostics().kama?.lastSignalPrice, 98);
   assert.equal((await strategy.entrySignal())?.side, "short");
@@ -447,6 +463,8 @@ test("selected strategy emits the searched exposure transitions", async () => {
   const config = createPeakValleyStrategyConfig({
     averagingRangesSec: [60],
     saturationSec: 0,
+    kamaRateMode: "log",
+    kamaRateEmaLen: 5,
     sigmaMode: "static",
     buySigma: 0.01,
     sellSigma: 0.01,
@@ -460,14 +478,18 @@ test("selected strategy emits the searched exposure transitions", async () => {
   const strategy = new PeakValleyStrategy({ config, getHistory: async () => history });
   const reference = referenceVolumeKama(config);
   let state = 0;
+  let sourceState = 0;
   let lastSignalPrice: number | null = null;
   for (const item of history.slice(-peakValleyKamaWarmupSamples(config))) {
     const rate = reference(item);
     const desired = rate > config.kamaRateThresholdHigh ? 1
       : rate < -config.kamaRateThresholdLow ? -1
-      : config.derivativeClampMode === "hold" ? state : 0;
+      : config.derivativeClampMode === "hold" ? sourceState : 0;
+    const sourceEdge = desired !== sourceState;
+    sourceState = desired;
     if (
-      desired !== state
+      sourceEdge
+      && desired !== state
       && (lastSignalPrice === null
         || Math.abs(item.close - lastSignalPrice) > lastSignalPrice * config.kamaSignalFriction)
     ) {
@@ -492,8 +514,10 @@ test("selected strategy emits the searched exposure transitions", async () => {
     assert.ok(Math.abs((strategy.getDiagnostics().kama?.rawRate ?? 0) - rate) < 1e-15);
     const desired = rate > config.kamaRateThresholdHigh ? 1
       : rate < -config.kamaRateThresholdLow ? -1
-      : config.derivativeClampMode === "hold" ? state : 0;
-    const next = desired !== state
+      : config.derivativeClampMode === "hold" ? sourceState : 0;
+    const sourceEdge = desired !== sourceState;
+    sourceState = desired;
+    const next = sourceEdge && desired !== state
       && (lastSignalPrice === null
         || Math.abs(item.close - lastSignalPrice) > lastSignalPrice * config.kamaSignalFriction)
       ? desired : state;
@@ -538,6 +562,8 @@ function referenceVolumeKama(config: ReturnType<typeof createPeakValleyStrategyC
   const volumeAlpha = 2 / (config.kamaVolumeLen + 1);
   let kama = 0;
   let volumeEma = 0;
+  let rateEma = 0;
+  const rateAlpha = 2 / (config.kamaRateEmaLen + 1);
   return (item: TradingCandle): number => {
     prices.push(item.close);
     if (prices.length > config.kamaErLen + 1) prices.shift();
@@ -566,6 +592,12 @@ function referenceVolumeKama(config: ReturnType<typeof createPeakValleyStrategyC
         ? item.volume
         : volumeEma + volumeAlpha * (item.volume - volumeEma);
     }
-    return previous > 0 && kama > 0 ? (kama - previous) / kama / 60 : 0;
+    const rawRate = previous > 0 && kama > 0
+      ? config.kamaRateMode === "log"
+        ? Math.log(kama / previous) / 60
+        : (kama - previous) / kama / 60
+      : 0;
+    rateEma = rateEma === 0 ? rawRate : rateEma + rateAlpha * (rawRate - rateEma);
+    return rateEma;
   };
 }

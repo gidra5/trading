@@ -77,7 +77,6 @@ function baseParameters(): VwKamaParameters {
     deadbandBpsHour: 8,
     deadbandMode: "hysteresis",
     hysteresisReleaseRatio: 0.3,
-    thresholdMode: "adaptive",
     thresholdLookbackMs: 90 * MINUTE,
     thresholdNoiseMultiplier: 1.2,
     buyMaxFraction: 0.8,
@@ -91,6 +90,11 @@ function baseParameters(): VwKamaParameters {
 function featureParameters(): VwKamaParameters {
   return {
     ...baseParameters(),
+    rateMode: "log",
+    rateEmaMs: 30 * MINUTE,
+    thresholdNoiseResponse: "inverse",
+    thresholdInverseMaxBpsHour: 30,
+    thresholdInverseNoiseScaleBpsHour: 20,
     agreementMode: "confidence",
     confirmationMix: 0.75,
     confirmationMinQuality: 0.25,
@@ -109,10 +113,13 @@ function featureParameters(): VwKamaParameters {
     confirmationDmiMs: 30 * MINUTE,
     confirmationDmiWeight: 0.6,
     confirmationAdxThreshold: 18,
-    meanReversionMix: 0.35,
-    meanReversionMeanMs: 240 * MINUTE,
+    signalFrictionFraction: 0.35,
+    meanReversionSuppressionThreshold: 1.2,
+    meanReversionEfficiencyMs: 120 * MINUTE,
+    meanReversionFastMs: 60 * MINUTE,
+    meanReversionSlowMs: 240 * MINUTE,
     meanReversionVolatilityMs: 180 * MINUTE,
-    meanReversionThreshold: 1.8,
+    meanReversionReversalThreshold: 1.8,
   };
 }
 

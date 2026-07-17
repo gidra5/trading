@@ -33,7 +33,6 @@ import {
 type Family = "volume" | "canonical";
 type Stage = "fit" | "validation" | "test";
 type DeadbandMode = "flat" | "hold" | "hysteresis";
-type ThresholdMode = "static" | "adaptive";
 type AgreementMode = "sizing" | "confidence";
 const CONFIRMATION_MASKS = [
   "base", "acceleration", "ema", "rsi", "dmi",
@@ -46,7 +45,7 @@ type ConfirmationMask = typeof CONFIRMATION_MASKS[number];
 type SearchAlgorithm = "random" | "de";
 type SearchMode = "standard" | "per-window";
 type Accelerator = "auto" | "cpu" | "cuda";
-type ScoreVersion = 2 | 3;
+type ScoreVersion = typeof VW_KAMA_SCORE_VERSION;
 
 interface Window { label: string; start: number; end: number }
 interface Range { min: number; max: number }
@@ -103,7 +102,6 @@ interface Args {
   sellSizingSigma: Range;
   agreementModes: AgreementMode[];
   deadbandModes: DeadbandMode[];
-  thresholdModes: ThresholdMode[];
   confirmationMix: Range;
   confirmationMinQuality: Range;
   confirmationAccelerationLookback: Range;
@@ -121,10 +119,12 @@ interface Args {
   confirmationDmi: Range;
   confirmationDmiWeight: Range;
   confirmationAdxThreshold: Range;
-  meanReversionMix: Range;
-  meanReversionMean: Range;
+  meanReversionSuppressionThreshold: Range;
+  meanReversionEfficiency: Range;
+  meanReversionFast: Range;
+  meanReversionSlow: Range;
   meanReversionVolatility: Range;
-  meanReversionThreshold: Range;
+  meanReversionReversalThreshold: Range;
   outputPath: string;
   reportPath: string;
 }
@@ -144,7 +144,6 @@ interface Candidate {
   deadbandBpsHour: number;
   deadbandMode: DeadbandMode;
   hysteresisReleaseRatio: number;
-  thresholdMode: ThresholdMode;
   thresholdLookbackMs: number;
   thresholdNoiseMultiplier: number;
   buyMaxFraction: number;
@@ -169,10 +168,12 @@ interface Candidate {
   confirmationDmiMs: number;
   confirmationDmiWeight: number;
   confirmationAdxThreshold: number;
-  meanReversionMix: number;
-  meanReversionMeanMs: number;
+  meanReversionSuppressionThreshold: number;
+  meanReversionEfficiencyMs: number;
+  meanReversionFastMs: number;
+  meanReversionSlowMs: number;
   meanReversionVolatilityMs: number;
-  meanReversionThreshold: number;
+  meanReversionReversalThreshold: number;
 }
 
 type Genome = Omit<Candidate, "id" | "family" | "volumePower"> & { volumePower: number };
@@ -452,7 +453,6 @@ async function run(config: Args): Promise<void> {
       sellSizingSigma: formatRange(config.sellSizingSigma),
       agreementModes: config.agreementModes,
       deadbandModes: config.deadbandModes,
-      thresholdModes: config.thresholdModes,
       confirmationMix: formatRange(config.confirmationMix),
       confirmationMinQuality: formatRange(config.confirmationMinQuality),
       confirmationAccelerationLookback: formatRange(config.confirmationAccelerationLookback, formatDuration),
@@ -470,10 +470,12 @@ async function run(config: Args): Promise<void> {
       confirmationDmi: formatRange(config.confirmationDmi, formatDuration),
       confirmationDmiWeight: formatRange(config.confirmationDmiWeight),
       confirmationAdxThreshold: formatRange(config.confirmationAdxThreshold),
-      meanReversionMix: formatRange(config.meanReversionMix),
-      meanReversionMean: formatRange(config.meanReversionMean, formatDuration),
+      meanReversionSuppressionThreshold: formatRange(config.meanReversionSuppressionThreshold),
+      meanReversionEfficiency: formatRange(config.meanReversionEfficiency, formatDuration),
+      meanReversionFast: formatRange(config.meanReversionFast, formatDuration),
+      meanReversionSlow: formatRange(config.meanReversionSlow, formatDuration),
       meanReversionVolatility: formatRange(config.meanReversionVolatility, formatDuration),
-      meanReversionThreshold: formatRange(config.meanReversionThreshold),
+      meanReversionReversalThreshold: formatRange(config.meanReversionReversalThreshold),
     },
     selection: "fit rank -> validation finalist per family -> finalists-only holdout",
     matching: "chronological one-to-one target-state alignment maximizing timing credit",
@@ -764,7 +766,6 @@ function adaptiveTrial(
     : value);
   let genome = vectorGenome(vector, config);
   if (random() < cr) genome.deadbandMode = random() < 0.5 ? pbest.genome.deadbandMode : r1.genome.deadbandMode;
-  if (random() < cr) genome.thresholdMode = random() < 0.5 ? pbest.genome.thresholdMode : r1.genome.thresholdMode;
   genome = applyDescriptor(genome, memberDescriptor(target), config);
   return { member: { ...target, genome }, f, cr };
 }
@@ -902,10 +903,19 @@ function applyDescriptor(genome: Genome, descriptor: SearchDescriptor, config: A
     result.volumeMs = config.volume.min;
     result.volumeCap = config.volumeCap.min;
   }
-  if (result.meanReversionMix <= 0) {
-    result.meanReversionMeanMs = config.meanReversionMean.min;
+  if (result.meanReversionSuppressionThreshold <= 0
+    || result.meanReversionReversalThreshold <= 0) {
+    result.meanReversionSuppressionThreshold = 0;
+    result.meanReversionEfficiencyMs = config.meanReversionEfficiency.min;
+    result.meanReversionFastMs = config.meanReversionFast.min;
+    result.meanReversionSlowMs = config.meanReversionSlow.min;
     result.meanReversionVolatilityMs = config.meanReversionVolatility.min;
-    result.meanReversionThreshold = config.meanReversionThreshold.min;
+    result.meanReversionReversalThreshold = 0;
+  } else {
+    result.meanReversionReversalThreshold = Math.max(
+      result.meanReversionSuppressionThreshold,
+      result.meanReversionReversalThreshold,
+    );
   }
   if (descriptor.mask === "base") {
     result.confirmationMix = 0;
@@ -1198,7 +1208,6 @@ function genomeVector(genome: Genome, config: Args): number[] {
     sparseUnit(genome.volumePower, config.volumePower),
     logUnit(genome.deadbandBpsHour, config.deadbandBpsHour),
     genome.deadbandMode === "hold" ? 1 : genome.deadbandMode === "hysteresis" ? 0.5 : 0,
-    genome.thresholdMode === "adaptive" ? 1 : 0,
     logUnit(genome.thresholdLookbackMs, config.thresholdLookback),
     unit(genome.thresholdNoiseMultiplier, config.thresholdNoiseMultiplier),
     unit(genome.buyMaxFraction, config.buyMaxFraction),
@@ -1226,15 +1235,18 @@ function genomeVector(genome: Genome, config: Args): number[] {
     unit(genome.confirmationAdxThreshold, config.confirmationAdxThreshold),
     logUnit(genome.efficiencyVolumeEmaMs, config.efficiencyVolumeEma),
     sparseUnit(genome.efficiencyVolumePower, config.efficiencyVolumePower),
-    sparseUnit(genome.meanReversionMix, config.meanReversionMix),
-    logUnit(genome.meanReversionMeanMs, config.meanReversionMean),
+    sparseUnit(genome.meanReversionSuppressionThreshold, config.meanReversionSuppressionThreshold),
+    logUnit(genome.meanReversionSlowMs, config.meanReversionSlow),
     logUnit(genome.meanReversionVolatilityMs, config.meanReversionVolatility),
-    logUnit(genome.meanReversionThreshold, config.meanReversionThreshold),
+    sparseUnit(genome.meanReversionReversalThreshold, config.meanReversionReversalThreshold),
+    logUnit(genome.meanReversionEfficiencyMs, config.meanReversionEfficiency),
+    logUnit(genome.meanReversionFastMs, config.meanReversionFast),
   ];
 }
 
 function vectorGenome(vector: number[], config: Args): Genome {
   const fastMs = logRange(vector[1]!, config.fast);
+  const meanReversionFastMs = logRange(vector[41]!, config.meanReversionFast);
   return {
     efficiencyMs: logRange(vector[0]!, config.efficiency),
     fastMs,
@@ -1250,42 +1262,50 @@ function vectorGenome(vector: number[], config: Args): Genome {
         config.deadbandModes.length - 1,
         Math.floor(clamp01(vector[8]!) * config.deadbandModes.length),
       )]!,
-    thresholdMode: config.thresholdModes.length === 1
-      ? config.thresholdModes[0]!
-      : config.thresholdModes[vector[9]! >= 0.5 ? 1 : 0]!,
-    thresholdLookbackMs: logRange(vector[10]!, config.thresholdLookback),
-    thresholdNoiseMultiplier: fromUnit(vector[11]!, config.thresholdNoiseMultiplier),
-    buyMaxFraction: fromUnit(vector[12]!, config.buyMaxFraction),
-    sellMaxFraction: fromUnit(vector[13]!, config.sellMaxFraction),
-    buySizingSigmaBpsHour: logRange(vector[14]!, config.buySizingSigma),
-    sellSizingSigmaBpsHour: logRange(vector[15]!, config.sellSizingSigma),
+    thresholdLookbackMs: logRange(vector[9]!, config.thresholdLookback),
+    thresholdNoiseMultiplier: fromUnit(vector[10]!, config.thresholdNoiseMultiplier),
+    buyMaxFraction: fromUnit(vector[11]!, config.buyMaxFraction),
+    sellMaxFraction: fromUnit(vector[12]!, config.sellMaxFraction),
+    buySizingSigmaBpsHour: logRange(vector[13]!, config.buySizingSigma),
+    sellSizingSigmaBpsHour: logRange(vector[14]!, config.sellSizingSigma),
     agreementMode: config.agreementModes.length === 1
       ? config.agreementModes[0]!
-      : vector[16]! >= 0.5 ? "confidence" : "sizing",
-    confirmationMix: fromUnit(vector[17]!, config.confirmationMix),
-    confirmationMinQuality: fromUnit(vector[18]!, config.confirmationMinQuality),
-    confirmationAccelerationLookbackMs: logRange(vector[19]!, config.confirmationAccelerationLookback),
-    confirmationDistanceLookbackMs: logRange(vector[20]!, config.confirmationDistanceLookback),
-    confirmationAccelerationWeight: fromUnit(vector[21]!, config.confirmationAccelerationWeight),
-    confirmationDistanceWeight: fromUnit(vector[22]!, config.confirmationDistanceWeight),
-    confirmationBias: fromUnit(vector[23]!, config.confirmationBias),
-    hysteresisReleaseRatio: fromUnit(vector[24]!, config.hysteresisReleaseRatio),
-    confirmationEmaMs: logRange(vector[25]!, config.confirmationEma),
-    confirmationEmaThresholdBpsHour: logRange(vector[26]!, config.confirmationEmaThreshold),
-    confirmationEmaWeight: fromUnit(vector[27]!, config.confirmationEmaWeight),
-    confirmationEmaGateStrength: fromUnit(vector[28]!, config.confirmationEmaGateStrength),
-    confirmationRsiMs: logRange(vector[29]!, config.confirmationRsi),
-    confirmationRsiThreshold: fromUnit(vector[30]!, config.confirmationRsiThreshold),
-    confirmationRsiWeight: fromUnit(vector[31]!, config.confirmationRsiWeight),
-    confirmationDmiMs: logRange(vector[32]!, config.confirmationDmi),
-    confirmationDmiWeight: fromUnit(vector[33]!, config.confirmationDmiWeight),
-    confirmationAdxThreshold: fromUnit(vector[34]!, config.confirmationAdxThreshold),
-    efficiencyVolumeEmaMs: logRange(vector[35]!, config.efficiencyVolumeEma),
-    efficiencyVolumePower: sparseRange(vector[36]!, config.efficiencyVolumePower),
-    meanReversionMix: sparseRange(vector[37]!, config.meanReversionMix),
-    meanReversionMeanMs: logRange(vector[38]!, config.meanReversionMean),
-    meanReversionVolatilityMs: logRange(vector[39]!, config.meanReversionVolatility),
-    meanReversionThreshold: logRange(vector[40]!, config.meanReversionThreshold),
+      : vector[15]! >= 0.5 ? "confidence" : "sizing",
+    confirmationMix: fromUnit(vector[16]!, config.confirmationMix),
+    confirmationMinQuality: fromUnit(vector[17]!, config.confirmationMinQuality),
+    confirmationAccelerationLookbackMs: logRange(vector[18]!, config.confirmationAccelerationLookback),
+    confirmationDistanceLookbackMs: logRange(vector[19]!, config.confirmationDistanceLookback),
+    confirmationAccelerationWeight: fromUnit(vector[20]!, config.confirmationAccelerationWeight),
+    confirmationDistanceWeight: fromUnit(vector[21]!, config.confirmationDistanceWeight),
+    confirmationBias: fromUnit(vector[22]!, config.confirmationBias),
+    hysteresisReleaseRatio: fromUnit(vector[23]!, config.hysteresisReleaseRatio),
+    confirmationEmaMs: logRange(vector[24]!, config.confirmationEma),
+    confirmationEmaThresholdBpsHour: logRange(vector[25]!, config.confirmationEmaThreshold),
+    confirmationEmaWeight: fromUnit(vector[26]!, config.confirmationEmaWeight),
+    confirmationEmaGateStrength: fromUnit(vector[27]!, config.confirmationEmaGateStrength),
+    confirmationRsiMs: logRange(vector[28]!, config.confirmationRsi),
+    confirmationRsiThreshold: fromUnit(vector[29]!, config.confirmationRsiThreshold),
+    confirmationRsiWeight: fromUnit(vector[30]!, config.confirmationRsiWeight),
+    confirmationDmiMs: logRange(vector[31]!, config.confirmationDmi),
+    confirmationDmiWeight: fromUnit(vector[32]!, config.confirmationDmiWeight),
+    confirmationAdxThreshold: fromUnit(vector[33]!, config.confirmationAdxThreshold),
+    efficiencyVolumeEmaMs: logRange(vector[34]!, config.efficiencyVolumeEma),
+    efficiencyVolumePower: sparseRange(vector[35]!, config.efficiencyVolumePower),
+    meanReversionSuppressionThreshold: sparseRange(
+      vector[36]!,
+      config.meanReversionSuppressionThreshold,
+    ),
+    meanReversionSlowMs: Math.max(
+      meanReversionFastMs,
+      logRange(vector[37]!, config.meanReversionSlow),
+    ),
+    meanReversionVolatilityMs: logRange(vector[38]!, config.meanReversionVolatility),
+    meanReversionReversalThreshold: sparseRange(
+      vector[39]!,
+      config.meanReversionReversalThreshold,
+    ),
+    meanReversionEfficiencyMs: logRange(vector[40]!, config.meanReversionEfficiency),
+    meanReversionFastMs,
   };
 }
 
@@ -1436,10 +1456,10 @@ async function runPerWindow(
         + `${formatDuration(parameters.efficiencyVolumeEmaMs ?? parameters.volumeMs)} / ${round(parameters.efficiencyVolumePower ?? 0, 3)} | `
         + `${formatDuration(parameters.fastMs)} | ${formatDuration(parameters.slowMs)} | ${round(parameters.power, 3)} | `
         + `${formatDuration(parameters.volumeMs)} / ${round(parameters.volumeCap, 3)} / ${round(parameters.volumePower, 3)} | `
-        + `${round(parameters.deadbandBpsHour, 3)} bps/h + ${parameters.thresholdMode ?? "static"}/${round(parameters.thresholdNoiseMultiplier ?? 0, 3)} | `
+        + `${round(parameters.deadbandBpsHour, 3)} bps/h + noise×${round(parameters.thresholdNoiseMultiplier ?? 0, 3)} | `
         + `${parameters.deadbandMode}/${parameters.agreementMode ?? "sizing"} | `
         + `${round(parameters.confirmationMix ?? 0, 3)} / ${round(parameters.confirmationEmaGateStrength ?? 0, 3)} | `
-        + `${round(parameters.meanReversionMix ?? 0, 3)} · ${formatDuration(parameters.meanReversionMeanMs ?? HOUR)} / ${formatDuration(parameters.meanReversionVolatilityMs ?? HOUR)} @ ${round(parameters.meanReversionThreshold ?? 2, 3)}σ |`;
+        + `${formatDuration(parameters.meanReversionEfficiencyMs ?? parameters.efficiencyMs)} ER / ${formatDuration(parameters.meanReversionFastMs ?? parameters.fastMs)}–${formatDuration(parameters.meanReversionSlowMs ?? HOUR)} KAMA / ${formatDuration(parameters.meanReversionVolatilityMs ?? HOUR)} vol @ ${round(parameters.meanReversionSuppressionThreshold ?? 1, 3)}σ suppress / ${round(parameters.meanReversionReversalThreshold ?? 0, 3)}σ reverse |`;
     }),
     "",
   ].join("\n"));
@@ -1619,7 +1639,6 @@ function storedCandidate(value: Record<string, unknown>, index: number): Candida
     deadbandBpsHour: number("deadbandBpsHour", 0),
     deadbandMode: text("deadbandMode", ["flat", "hold", "hysteresis"] as const, "hold"),
     hysteresisReleaseRatio: number("hysteresisReleaseRatio", 0.25),
-    thresholdMode: text("thresholdMode", ["static", "adaptive"] as const, "static"),
     thresholdLookbackMs: duration("thresholdLookbackMs", "thresholdLookback", HOUR),
     thresholdNoiseMultiplier: number("thresholdNoiseMultiplier", 0),
     buyMaxFraction: number("buyMaxFraction", 1),
@@ -1652,14 +1671,20 @@ function storedCandidate(value: Record<string, unknown>, index: number): Candida
     confirmationDmiMs: duration("confirmationDmiMs", "confirmationDmi", 14 * 60_000),
     confirmationDmiWeight: number("confirmationDmiWeight", 0),
     confirmationAdxThreshold: number("confirmationAdxThreshold", 20),
-    meanReversionMix: number("meanReversionMix", 0),
-    meanReversionMeanMs: duration("meanReversionMeanMs", "meanReversionMean", HOUR),
+    meanReversionSuppressionThreshold: number("meanReversionSuppressionThreshold", 1),
+    meanReversionEfficiencyMs: duration(
+      "meanReversionEfficiencyMs",
+      "meanReversionEfficiency",
+      HOUR,
+    ),
+    meanReversionFastMs: duration("meanReversionFastMs", "meanReversionFast", 15 * 60_000),
+    meanReversionSlowMs: duration("meanReversionSlowMs", "meanReversionSlow", HOUR),
     meanReversionVolatilityMs: duration(
       "meanReversionVolatilityMs",
       "meanReversionVolatility",
       HOUR,
     ),
-    meanReversionThreshold: number("meanReversionThreshold", 2),
+    meanReversionReversalThreshold: number("meanReversionReversalThreshold", 0),
   };
 }
 
@@ -1815,8 +1840,7 @@ async function evaluateStageCuda(
 
 function estimatedCandidateWork(candidate: Candidate, config: Args): number {
   const multiple = config.warmupMultiple;
-  const thresholdEnabled = candidate.thresholdMode === "adaptive"
-    && candidate.thresholdNoiseMultiplier > 0;
+  const thresholdEnabled = candidate.thresholdNoiseMultiplier > 0;
   const confirmationEnabled = candidate.confirmationMix > 0;
   const accelerationEnabled = confirmationEnabled && candidate.confirmationAccelerationWeight > 0;
   const distanceEnabled = confirmationEnabled && candidate.confirmationDistanceWeight > 0;
@@ -1835,8 +1859,13 @@ function estimatedCandidateWork(candidate: Candidate, config: Args): number {
     emaEnabled ? candidate.confirmationEmaMs : 0,
     rsiEnabled ? candidate.confirmationRsiMs : 0,
     dmiEnabled ? candidate.confirmationDmiMs * 2 : 0,
-    candidate.meanReversionMix > 0
-      ? Math.max(candidate.meanReversionMeanMs, candidate.meanReversionVolatilityMs)
+    candidate.meanReversionReversalThreshold > 0
+      ? Math.max(
+        candidate.meanReversionEfficiencyMs,
+        candidate.meanReversionFastMs,
+        candidate.meanReversionSlowMs,
+        candidate.meanReversionVolatilityMs,
+      )
       : 0,
   ) * multiple;
 }
@@ -2133,7 +2162,6 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
       deadbandBpsHour: candidate.deadbandBpsHour,
       deadbandMode: candidate.deadbandMode,
       hysteresisReleaseRatio: candidate.hysteresisReleaseRatio,
-      thresholdMode: candidate.thresholdMode,
       thresholdLookbackMs: candidate.thresholdLookbackMs,
       thresholdNoiseMultiplier: candidate.thresholdNoiseMultiplier,
       buyMaxFraction: candidate.buyMaxFraction,
@@ -2158,10 +2186,12 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
       confirmationDmiMs: candidate.confirmationDmiMs,
       confirmationDmiWeight: candidate.confirmationDmiWeight,
       confirmationAdxThreshold: candidate.confirmationAdxThreshold,
-      meanReversionMix: candidate.meanReversionMix,
-      meanReversionMeanMs: candidate.meanReversionMeanMs,
+      meanReversionSuppressionThreshold: candidate.meanReversionSuppressionThreshold,
+      meanReversionEfficiencyMs: candidate.meanReversionEfficiencyMs,
+      meanReversionFastMs: candidate.meanReversionFastMs,
+      meanReversionSlowMs: candidate.meanReversionSlowMs,
       meanReversionVolatilityMs: candidate.meanReversionVolatilityMs,
-      meanReversionThreshold: candidate.meanReversionThreshold,
+      meanReversionReversalThreshold: candidate.meanReversionReversalThreshold,
     },
     oracleFriction: config.oracleFriction,
     matchWindowMs: config.matchWindowMs,
@@ -2243,17 +2273,13 @@ function searchScore(
   f1: number,
   exposureAgreement: number,
   signalCleanliness: number,
-  scoreVersion: ScoreVersion,
+  _scoreVersion: ScoreVersion,
 ): number {
-  return scoreVersion === 2
-    ? 0.6 * f1 + 0.3 * exposureAgreement + 0.1 * signalCleanliness
-    : vwKamaScore(f1, exposureAgreement, signalCleanliness);
+  return vwKamaScore(f1, exposureAgreement, signalCleanliness);
 }
 
-function scoreWeightsDescription(scoreVersion: ScoreVersion): string {
-  return scoreVersion === 2
-    ? "timing-credited transition F1 60%, sizing/confidence agreement 30%, and signal cleanliness 10%"
-    : "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
+function scoreWeightsDescription(_scoreVersion: ScoreVersion): string {
+  return "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
 }
 
 function aggregate(scores: CaseScore[]): AggregateScore {
@@ -2301,10 +2327,12 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
     confirmationDmiMs: 14 * 60_000,
     confirmationDmiWeight: 0,
     confirmationAdxThreshold: 20,
-    meanReversionMix: 0,
-    meanReversionMeanMs: HOUR,
+    meanReversionSuppressionThreshold: 1,
+    meanReversionEfficiencyMs: HOUR,
+    meanReversionFastMs: 15 * 60_000,
+    meanReversionSlowMs: HOUR,
     meanReversionVolatilityMs: HOUR,
-    meanReversionThreshold: 2,
+    meanReversionReversalThreshold: 0,
   };
   const fullSizing = {
     efficiencyVolumeEmaMs: HOUR,
@@ -2317,7 +2345,6 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
     ...confirmation,
   };
   const threshold = {
-    thresholdMode: "static" as const,
     thresholdLookbackMs: HOUR,
     thresholdNoiseMultiplier: 0,
   };
@@ -2346,7 +2373,6 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
       volumePower: 0.48543,
       deadbandBpsHour: 30,
       deadbandMode: "hold",
-      thresholdMode: "adaptive",
       thresholdLookbackMs: 2_457_073,
       thresholdNoiseMultiplier: 0,
       ...fullSizing,
@@ -2363,9 +2389,8 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
       volumePower: 0,
       deadbandBpsHour: 21.21468,
       deadbandMode: "hold",
-      thresholdMode: "static",
       thresholdLookbackMs: 900_000,
-      thresholdNoiseMultiplier: 5.60731,
+      thresholdNoiseMultiplier: 0,
       ...fullSizing,
     },
     {
@@ -2395,6 +2420,17 @@ function globalCandidates(agreementModes: AgreementMode[]): Candidate[] {
 
 function randomGenome(config: Args, random: () => number): Genome {
   const fastMs = logRandom(random, config.fast);
+  const meanReversionFastMs = logRandom(random, config.meanReversionFast);
+  const meanReversionSuppressionThreshold = sparseRandom(
+    random,
+    config.meanReversionSuppressionThreshold,
+  );
+  const meanReversionReversalThreshold = meanReversionSuppressionThreshold > 0
+    ? Math.max(
+      meanReversionSuppressionThreshold,
+      sparseRandom(random, config.meanReversionReversalThreshold),
+    )
+    : 0;
   return {
     efficiencyMs: logRandom(random, config.efficiency),
     efficiencyVolumeEmaMs: logRandom(random, config.efficiencyVolumeEma),
@@ -2408,7 +2444,6 @@ function randomGenome(config: Args, random: () => number): Genome {
     deadbandBpsHour: logRandom(random, config.deadbandBpsHour),
     deadbandMode: config.deadbandModes[Math.floor(random() * config.deadbandModes.length)]!,
     hysteresisReleaseRatio: linearRandom(random, config.hysteresisReleaseRatio),
-    thresholdMode: config.thresholdModes[Math.floor(random() * config.thresholdModes.length)]!,
     thresholdLookbackMs: logRandom(random, config.thresholdLookback),
     thresholdNoiseMultiplier: linearRandom(random, config.thresholdNoiseMultiplier),
     buyMaxFraction: linearRandom(random, config.buyMaxFraction),
@@ -2433,10 +2468,15 @@ function randomGenome(config: Args, random: () => number): Genome {
     confirmationDmiMs: logRandom(random, config.confirmationDmi),
     confirmationDmiWeight: sparseRandom(random, config.confirmationDmiWeight),
     confirmationAdxThreshold: linearRandom(random, config.confirmationAdxThreshold),
-    meanReversionMix: sparseRandom(random, config.meanReversionMix),
-    meanReversionMeanMs: logRandom(random, config.meanReversionMean),
+    meanReversionSuppressionThreshold,
+    meanReversionEfficiencyMs: logRandom(random, config.meanReversionEfficiency),
+    meanReversionFastMs,
+    meanReversionSlowMs: Math.max(
+      meanReversionFastMs,
+      logRandom(random, config.meanReversionSlow),
+    ),
     meanReversionVolatilityMs: logRandom(random, config.meanReversionVolatility),
-    meanReversionThreshold: logRandom(random, config.meanReversionThreshold),
+    meanReversionReversalThreshold,
   };
 }
 
@@ -2470,7 +2510,6 @@ function candidateParameters(candidate: Candidate) {
     deadbandBpsHour: candidate.deadbandBpsHour,
     deadbandMode: candidate.deadbandMode,
     hysteresisReleaseRatio: candidate.hysteresisReleaseRatio,
-    thresholdMode: candidate.thresholdMode,
     thresholdLookbackMs: candidate.thresholdLookbackMs,
     thresholdNoiseMultiplier: candidate.thresholdNoiseMultiplier,
     buyMaxFraction: candidate.buyMaxFraction,
@@ -2495,10 +2534,12 @@ function candidateParameters(candidate: Candidate) {
     confirmationDmiMs: candidate.confirmationDmiMs,
     confirmationDmiWeight: candidate.confirmationDmiWeight,
     confirmationAdxThreshold: candidate.confirmationAdxThreshold,
-    meanReversionMix: candidate.meanReversionMix,
-    meanReversionMeanMs: candidate.meanReversionMeanMs,
+    meanReversionSuppressionThreshold: candidate.meanReversionSuppressionThreshold,
+    meanReversionEfficiencyMs: candidate.meanReversionEfficiencyMs,
+    meanReversionFastMs: candidate.meanReversionFastMs,
+    meanReversionSlowMs: candidate.meanReversionSlowMs,
     meanReversionVolatilityMs: candidate.meanReversionVolatilityMs,
-    meanReversionThreshold: candidate.meanReversionThreshold,
+    meanReversionReversalThreshold: candidate.meanReversionReversalThreshold,
   };
 }
 
@@ -2516,7 +2557,6 @@ function presetCandidate(preset: VwKamaPreset, index = 0): Candidate {
     ...preset.parameters,
     efficiencyVolumeEmaMs: preset.parameters.efficiencyVolumeEmaMs ?? preset.parameters.volumeMs,
     efficiencyVolumePower: preset.parameters.efficiencyVolumePower ?? 0,
-    thresholdMode: preset.parameters.thresholdMode ?? "static",
     thresholdLookbackMs: preset.parameters.thresholdLookbackMs ?? HOUR,
     thresholdNoiseMultiplier: preset.parameters.thresholdNoiseMultiplier ?? 0,
     hysteresisReleaseRatio: preset.parameters.hysteresisReleaseRatio ?? 0.25,
@@ -2542,10 +2582,13 @@ function presetCandidate(preset: VwKamaPreset, index = 0): Candidate {
     confirmationDmiMs: preset.parameters.confirmationDmiMs ?? 14 * 60_000,
     confirmationDmiWeight: preset.parameters.confirmationDmiWeight ?? 0,
     confirmationAdxThreshold: preset.parameters.confirmationAdxThreshold ?? 20,
-    meanReversionMix: preset.parameters.meanReversionMix ?? 0,
-    meanReversionMeanMs: preset.parameters.meanReversionMeanMs ?? HOUR,
+    meanReversionSuppressionThreshold: preset.parameters.meanReversionSuppressionThreshold ?? 1,
+    meanReversionEfficiencyMs: preset.parameters.meanReversionEfficiencyMs
+      ?? preset.parameters.efficiencyMs,
+    meanReversionFastMs: preset.parameters.meanReversionFastMs ?? preset.parameters.fastMs,
+    meanReversionSlowMs: preset.parameters.meanReversionSlowMs ?? HOUR,
     meanReversionVolatilityMs: preset.parameters.meanReversionVolatilityMs ?? HOUR,
-    meanReversionThreshold: preset.parameters.meanReversionThreshold ?? 2,
+    meanReversionReversalThreshold: preset.parameters.meanReversionReversalThreshold ?? 0,
   };
 }
 
@@ -2702,7 +2745,7 @@ function parseArgs(argv: string[]): Args {
     "full-evaluation-interval", "refinement-rounds", "pbest-fraction", "confirmation-masks",
     "buy-max-fraction-range", "sell-max-fraction-range",
     "buy-sizing-sigma-range", "sell-sizing-sigma-range",
-    "agreement-modes", "deadband-modes", "threshold-modes",
+    "agreement-modes", "deadband-modes",
     "confirmation-mix-range", "confirmation-min-quality-range",
     "confirmation-acceleration-lookback-range", "confirmation-distance-lookback-range",
     "confirmation-acceleration-weight-range", "confirmation-distance-weight-range",
@@ -2712,8 +2755,9 @@ function parseArgs(argv: string[]): Args {
     "confirmation-ema-weight-range", "confirmation-ema-gate-strength-range",
     "confirmation-rsi-range", "confirmation-rsi-threshold-range", "confirmation-rsi-weight-range",
     "confirmation-dmi-range", "confirmation-dmi-weight-range", "confirmation-adx-threshold-range",
-    "mean-reversion-mix-range", "mean-reversion-mean-range",
-    "mean-reversion-volatility-range", "mean-reversion-threshold-range",
+    "mean-reversion-suppression-threshold-range", "mean-reversion-efficiency-range",
+    "mean-reversion-fast-range", "mean-reversion-slow-range",
+    "mean-reversion-volatility-range", "mean-reversion-reversal-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
     "screen-scales", "workers", "accelerator", "score-version", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
@@ -2741,7 +2785,9 @@ function parseArgs(argv: string[]): Args {
   if (accelerator !== "auto" && accelerator !== "cpu" && accelerator !== "cuda") {
     throw new Error("--accelerator must be auto, cpu, or cuda.");
   }
-  if (scoreVersion !== 2 && scoreVersion !== 3) throw new Error("--score-version must be 2 or 3.");
+  if (scoreVersion !== VW_KAMA_SCORE_VERSION) {
+    throw new Error(`--score-version must be ${VW_KAMA_SCORE_VERSION}.`);
+  }
   const agreementModes = unique(get("agreement-modes", "sizing,confidence").split(","));
   if (agreementModes.length === 0 || agreementModes.some((value) => value !== "sizing" && value !== "confidence")) {
     throw new Error("--agreement-modes must contain sizing and/or confidence.");
@@ -2750,11 +2796,6 @@ function parseArgs(argv: string[]): Args {
   if (deadbandModes.length === 0
     || deadbandModes.some((value) => !["flat", "hold", "hysteresis"].includes(value))) {
     throw new Error("--deadband-modes must contain flat, hold, and/or hysteresis.");
-  }
-  const thresholdModes = unique(get("threshold-modes", "static,adaptive").split(","));
-  if (thresholdModes.length === 0
-    || thresholdModes.some((value) => value !== "static" && value !== "adaptive")) {
-    throw new Error("--threshold-modes must contain static and/or adaptive.");
   }
   return {
     sourceDir,
@@ -2824,7 +2865,6 @@ function parseArgs(argv: string[]): Args {
     sellSizingSigma: numberRange(get("sell-sizing-sigma-range", "0.01..300"), "sell-sizing-sigma-range", 0.000001),
     agreementModes: agreementModes as AgreementMode[],
     deadbandModes: deadbandModes as DeadbandMode[],
-    thresholdModes: thresholdModes as ThresholdMode[],
     confirmationMix: fractionRange(get("confirmation-mix-range", "0..1"), "confirmation-mix-range"),
     confirmationMinQuality: fractionRange(get("confirmation-min-quality-range", "0..0.95"), "confirmation-min-quality-range"),
     confirmationAccelerationLookback: durationRange(get("confirmation-acceleration-lookback-range", "1m..6h"), "confirmation-acceleration-lookback-range"),
@@ -2842,16 +2882,31 @@ function parseArgs(argv: string[]): Args {
     confirmationDmi: durationRange(get("confirmation-dmi-range", "2m..6h"), "confirmation-dmi-range"),
     confirmationDmiWeight: numberRange(get("confirmation-dmi-weight-range", "0..5"), "confirmation-dmi-weight-range", 0),
     confirmationAdxThreshold: numberRange(get("confirmation-adx-threshold-range", "5..50"), "confirmation-adx-threshold-range", 0),
-    meanReversionMix: fractionRange(get("mean-reversion-mix-range", "0..1"), "mean-reversion-mix-range"),
-    meanReversionMean: durationRange(get("mean-reversion-mean-range", "1m..24h"), "mean-reversion-mean-range"),
+    meanReversionSuppressionThreshold: numberRange(
+      get("mean-reversion-suppression-threshold-range", "0..3"),
+      "mean-reversion-suppression-threshold-range",
+      0,
+    ),
+    meanReversionEfficiency: durationRange(
+      get("mean-reversion-efficiency-range", "1m..24h"),
+      "mean-reversion-efficiency-range",
+    ),
+    meanReversionFast: durationRange(
+      get("mean-reversion-fast-range", "1m..6h"),
+      "mean-reversion-fast-range",
+    ),
+    meanReversionSlow: durationRange(
+      get("mean-reversion-slow-range", "5m..24h"),
+      "mean-reversion-slow-range",
+    ),
     meanReversionVolatility: durationRange(
       get("mean-reversion-volatility-range", "1m..24h"),
       "mean-reversion-volatility-range",
     ),
-    meanReversionThreshold: numberRange(
-      get("mean-reversion-threshold-range", "0.25..5"),
-      "mean-reversion-threshold-range",
-      Number.EPSILON,
+    meanReversionReversalThreshold: numberRange(
+      get("mean-reversion-reversal-threshold-range", "0..6"),
+      "mean-reversion-reversal-threshold-range",
+      0,
     ),
     outputPath,
     reportPath,
@@ -2926,7 +2981,7 @@ function candidateWarmupSamples(candidate: Candidate, scaleMs: number, multiple:
     slowPeriod: samples(candidate.slowMs, scaleMs),
     volumePeriod: samples(candidate.volumeMs, scaleMs),
   }, multiple);
-  const threshold = candidate.thresholdMode === "adaptive"
+  const threshold = candidate.thresholdNoiseMultiplier > 0
     ? samples(candidate.thresholdLookbackMs, scaleMs) * multiple
     : 0;
   const confirmation = candidate.confirmationMix > 0
@@ -2945,9 +3000,11 @@ function candidateWarmupSamples(candidate: Candidate, scaleMs: number, multiple:
   const dmi = candidate.confirmationMix > 0 && candidate.confirmationDmiWeight > 0
     ? samples(candidate.confirmationDmiMs, scaleMs) * multiple * 2
     : 0;
-  const meanReversion = candidate.meanReversionMix > 0
+  const meanReversion = candidate.meanReversionReversalThreshold > 0
     ? Math.max(
-      samples(candidate.meanReversionMeanMs, scaleMs),
+      samples(candidate.meanReversionEfficiencyMs, scaleMs),
+      samples(candidate.meanReversionFastMs, scaleMs),
+      samples(candidate.meanReversionSlowMs, scaleMs),
       samples(candidate.meanReversionVolatilityMs, scaleMs),
     ) * multiple
     : 0;
@@ -2967,7 +3024,9 @@ function maximumWarmupMs(config: Args): number {
     config.confirmationEma.max * config.warmupMultiple,
     config.confirmationRsi.max * config.warmupMultiple,
     config.confirmationDmi.max * config.warmupMultiple * 2,
-    config.meanReversionMean.max * config.warmupMultiple,
+    config.meanReversionEfficiency.max * config.warmupMultiple,
+    config.meanReversionFast.max * config.warmupMultiple,
+    config.meanReversionSlow.max * config.warmupMultiple,
     config.meanReversionVolatility.max * config.warmupMultiple,
   );
 }
@@ -3013,7 +3072,7 @@ function report(
       ? `- Generation zero evaluates all ${loadSeedCandidates(config.seedCandidatePaths).length} warm genomes plus ${config.trials} Latin-hypercube genomes, then selects ${config.trials} by 70% score / 30% parameter novelty. Warm sources: ${config.seedCandidatePaths.map((file) => `\`${path.relative(repoRoot, file)}\``).join(", ")}.`
       : `- Generation zero evaluates ${config.trials} deterministic Latin-hypercube genomes and selects by 70% score / 30% parameter novelty.`,
     `- Search uses ${config.restarts} independent restart(s), adaptive current-to-pbest differential evolution, family/agreement/confirmation-mask islands with cross-island migration, rotating fit folds with a full-fit pass every ${config.fullEvaluationInterval} generations, and ${config.refinementRounds} shrinking elite-refinement round(s).`,
-    "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A causal volatility-normalized distance-from-EMA regime blends the local trend direction into its countertrend direction as mean-reversion strength rises. A causal logistic confirmation combines KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scales or filters the signal. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
+    "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A second volume-aware KAMA supplies the mean-reversion baseline: it has independent ER/fast/slow periods and shares the strategy's ER-volume, KAMA-power, and post-ER volume behavior. Its causal volatility-normalized distance follows KAMA below the suppression threshold, goes flat between thresholds, and reverses KAMA at the reversal threshold. A causal logistic confirmation combines KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scales or filters the signal. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
     `- Signal memory: after the first signal, a candidate state change emits only when the current close is strictly more than ${round(config.oracleFriction * 10_000, 3)} bps from the last emitted signal price; rejected changes retain the prior state. This is the same friction used by the oracle.`,
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Case score weights ${scoreWeightsDescription(config.scoreVersion)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched. Trading returns are neither computed nor ranked.`,
@@ -3033,9 +3092,9 @@ function report(
     "",
     "## Finalist parameters",
     "",
-    "| family | id | agreement | efficiency | ER volume EMA/power | fast | slow | power | volume | cap | volume power | base threshold | state mode | threshold mode | noise lookback | noise multiplier | buy max | sell max | buy sigma | sell sigma |",
-    "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
-    ...test.map(({ candidate }) => `| ${candidate.family} | ${candidate.id} | ${candidate.agreementMode} | ${formatDuration(candidate.efficiencyMs)} | ${formatDuration(candidate.efficiencyVolumeEmaMs)} / ${round(candidate.efficiencyVolumePower, 3)} | ${formatDuration(candidate.fastMs)} | ${formatDuration(candidate.slowMs)} | ${round(candidate.power, 3)} | ${formatDuration(candidate.volumeMs)} | ${round(candidate.volumeCap, 3)} | ${round(candidate.volumePower, 3)} | ${round(candidate.deadbandBpsHour, 3)} bps/hour | ${candidate.deadbandMode} | ${candidate.thresholdMode} | ${formatDuration(candidate.thresholdLookbackMs)} | ${round(candidate.thresholdNoiseMultiplier, 3)} | ${pct(candidate.buyMaxFraction)} | ${pct(candidate.sellMaxFraction)} | ${round(candidate.buySizingSigmaBpsHour, 3)} | ${round(candidate.sellSizingSigmaBpsHour, 3)} |`),
+    "| family | id | agreement | efficiency | ER volume EMA/power | fast | slow | power | volume | cap | volume power | base threshold | state mode | noise lookback | noise multiplier | buy max | sell max | buy sigma | sell sigma |",
+    "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+    ...test.map(({ candidate }) => `| ${candidate.family} | ${candidate.id} | ${candidate.agreementMode} | ${formatDuration(candidate.efficiencyMs)} | ${formatDuration(candidate.efficiencyVolumeEmaMs)} / ${round(candidate.efficiencyVolumePower, 3)} | ${formatDuration(candidate.fastMs)} | ${formatDuration(candidate.slowMs)} | ${round(candidate.power, 3)} | ${formatDuration(candidate.volumeMs)} | ${round(candidate.volumeCap, 3)} | ${round(candidate.volumePower, 3)} | ${round(candidate.deadbandBpsHour, 3)} bps/hour | ${candidate.deadbandMode} | ${formatDuration(candidate.thresholdLookbackMs)} | ${round(candidate.thresholdNoiseMultiplier, 3)} | ${pct(candidate.buyMaxFraction)} | ${pct(candidate.sellMaxFraction)} | ${round(candidate.buySizingSigmaBpsHour, 3)} | ${round(candidate.sellSizingSigmaBpsHour, 3)} |`),
     "",
     "## Finalist confirmation parameters",
     "",
@@ -3049,9 +3108,9 @@ function report(
     "",
     "## Finalist mean-reversion parameters",
     "",
-    "| candidate | blend | mean | volatility | switch threshold |",
-    "|---|---:|---:|---:|---:|",
-    ...test.map(({ candidate }) => `| ${candidate.id} | ${pct(candidate.meanReversionMix)} | ${formatDuration(candidate.meanReversionMeanMs)} | ${formatDuration(candidate.meanReversionVolatilityMs)} | ${round(candidate.meanReversionThreshold, 3)}σ |`),
+    "| candidate | ER | fast | slow | volatility | suppress at | reverse at |",
+    "|---|---:|---:|---:|---:|---:|---:|",
+    ...test.map(({ candidate }) => `| ${candidate.id} | ${formatDuration(candidate.meanReversionEfficiencyMs)} | ${formatDuration(candidate.meanReversionFastMs)} | ${formatDuration(candidate.meanReversionSlowMs)} | ${formatDuration(candidate.meanReversionVolatilityMs)} | ${round(candidate.meanReversionSuppressionThreshold, 3)}σ | ${round(candidate.meanReversionReversalThreshold, 3)}σ |`),
     "",
     "## Holdout cases",
     "",
@@ -3090,7 +3149,6 @@ function compactCandidate(candidate: Candidate): Record<string, string | number>
     deadbandBpsHour: round(candidate.deadbandBpsHour, 5),
     deadbandMode: candidate.deadbandMode,
     hysteresisReleaseRatio: round(candidate.hysteresisReleaseRatio, 5),
-    thresholdMode: candidate.thresholdMode,
     thresholdLookback: formatDuration(candidate.thresholdLookbackMs),
     thresholdNoiseMultiplier: round(candidate.thresholdNoiseMultiplier, 5),
     buyMaxFraction: round(candidate.buyMaxFraction, 5),
@@ -3115,10 +3173,12 @@ function compactCandidate(candidate: Candidate): Record<string, string | number>
     confirmationDmi: formatDuration(candidate.confirmationDmiMs),
     confirmationDmiWeight: round(candidate.confirmationDmiWeight, 5),
     confirmationAdxThreshold: round(candidate.confirmationAdxThreshold, 5),
-    meanReversionMix: round(candidate.meanReversionMix, 5),
-    meanReversionMean: formatDuration(candidate.meanReversionMeanMs),
+    meanReversionSuppressionThreshold: round(candidate.meanReversionSuppressionThreshold, 5),
+    meanReversionEfficiency: formatDuration(candidate.meanReversionEfficiencyMs),
+    meanReversionFast: formatDuration(candidate.meanReversionFastMs),
+    meanReversionSlow: formatDuration(candidate.meanReversionSlowMs),
     meanReversionVolatility: formatDuration(candidate.meanReversionVolatilityMs),
-    meanReversionThreshold: round(candidate.meanReversionThreshold, 5),
+    meanReversionReversalThreshold: round(candidate.meanReversionReversalThreshold, 5),
   };
 }
 
@@ -3139,7 +3199,7 @@ function help(): void {
   --differential-weight 0.75 --crossover-rate 0.8 --immigrant-rate 0.08
   --workers 12                      Candidate shards for global search; window shards in per-window mode
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
-  --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version (2 or 3)
+  --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
   --seed-candidates FILE,...        Put prior fit JSONL/preset candidates in generation zero
   --screen-windows 1 --screen-scales 1m,15m   Cheap early-pruning stage
   --efficiency-range 1m..2h         Duration ranges become sample counts per scale
@@ -3151,7 +3211,7 @@ function help(): void {
   --buy-max-fraction-range 0.05..1 --sell-max-fraction-range 0.05..1
   --buy-sizing-sigma-range 0.01..300 --sell-sizing-sigma-range 0.01..300
   --agreement-modes sizing,confidence
-  --deadband-modes flat,hysteresis,hold --threshold-modes static,adaptive
+  --deadband-modes flat,hysteresis,hold
   --confirmation-mix-range 0..1 --confirmation-min-quality-range 0..0.95
   --confirmation-acceleration-lookback-range 1m..6h
   --confirmation-distance-lookback-range 1m..6h
@@ -3164,9 +3224,10 @@ function help(): void {
   --confirmation-rsi-weight-range 0..5
   --confirmation-dmi-range 2m..6h --confirmation-dmi-weight-range 0..5
   --confirmation-adx-threshold-range 5..50
-  --mean-reversion-mix-range 0..1
-  --mean-reversion-mean-range 1m..24h --mean-reversion-volatility-range 1m..24h
-  --mean-reversion-threshold-range 0.25..5
+  --mean-reversion-efficiency-range 1m..24h --mean-reversion-fast-range 1m..6h
+  --mean-reversion-slow-range 5m..24h --mean-reversion-volatility-range 1m..24h
+  --mean-reversion-suppression-threshold-range 0..3
+  --mean-reversion-reversal-threshold-range 0..6
   --mode per-window --preset-window-ids ID,... --preset-output PATH
   --match-window 2h --timing-half-life 10m
   --oracle-friction 0.00175 --warmup-multiple 3 --case-warmup 72h

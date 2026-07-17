@@ -31,7 +31,7 @@ const aggregateMetrics = [
 const requiredCandidateFields = [
   "efficiency", "efficiencyVolumeEma", "efficiencyVolumePower", "fast", "slow", "power",
   "volume", "volumeCap", "volumePower", "deadbandBpsHour", "deadbandMode",
-  "hysteresisReleaseRatio", "thresholdMode", "thresholdLookback", "thresholdNoiseMultiplier",
+  "hysteresisReleaseRatio", "thresholdLookback", "thresholdNoiseMultiplier",
   "buyMaxFraction", "sellMaxFraction", "buySizingSigmaBpsHour", "sellSizingSigmaBpsHour",
   "agreementMode", "confirmationMix", "confirmationMinQuality",
   "confirmationAccelerationLookback", "confirmationDistanceLookback",
@@ -39,8 +39,9 @@ const requiredCandidateFields = [
   "confirmationEma", "confirmationEmaThresholdBpsHour", "confirmationEmaWeight",
   "confirmationEmaGateStrength", "confirmationRsi", "confirmationRsiThreshold",
   "confirmationRsiWeight", "confirmationDmi", "confirmationDmiWeight",
-  "confirmationAdxThreshold", "meanReversionMix", "meanReversionMean",
-  "meanReversionVolatility", "meanReversionThreshold",
+  "confirmationAdxThreshold", "meanReversionSuppressionThreshold", "meanReversionEfficiency",
+  "meanReversionFast", "meanReversionSlow", "meanReversionVolatility",
+  "meanReversionReversalThreshold",
 ] as const;
 
 async function main(): Promise<void> {
@@ -242,7 +243,6 @@ function storedParameters(value: Record<string, unknown>): VwKamaParameters {
     deadbandBpsHour: number("deadbandBpsHour", 0),
     deadbandMode: text(value.deadbandMode, ["flat", "hold", "hysteresis"], "hold"),
     hysteresisReleaseRatio: number("hysteresisReleaseRatio", 0.25),
-    thresholdMode: text(value.thresholdMode, ["static", "adaptive"], "static"),
     thresholdLookbackMs: duration("thresholdLookback", 3_600_000),
     thresholdNoiseMultiplier: number("thresholdNoiseMultiplier", 0),
     buyMaxFraction: number("buyMaxFraction", 1),
@@ -267,10 +267,12 @@ function storedParameters(value: Record<string, unknown>): VwKamaParameters {
     confirmationDmiMs: duration("confirmationDmi", 840_000),
     confirmationDmiWeight: number("confirmationDmiWeight", 0),
     confirmationAdxThreshold: number("confirmationAdxThreshold", 20),
-    meanReversionMix: number("meanReversionMix", 0),
-    meanReversionMeanMs: duration("meanReversionMean", 3_600_000),
+    meanReversionSuppressionThreshold: number("meanReversionSuppressionThreshold", 1),
+    meanReversionEfficiencyMs: duration("meanReversionEfficiency", 3_600_000),
+    meanReversionFastMs: duration("meanReversionFast", 900_000),
+    meanReversionSlowMs: duration("meanReversionSlow", 3_600_000),
     meanReversionVolatilityMs: duration("meanReversionVolatility", 3_600_000),
-    meanReversionThreshold: number("meanReversionThreshold", 2),
+    meanReversionReversalThreshold: number("meanReversionReversalThreshold", 0),
   };
 }
 

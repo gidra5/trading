@@ -7,9 +7,9 @@ import type {
   VwKamaPreparedOracle,
 } from "./kama-signal-evaluator.js";
 
-const PARAMETER_SIZE = 168;
+const PARAMETER_SIZE = 196;
 const RESULT_SIZE = 72;
-const INT_PARAMETER_COUNT = 16;
+const INT_PARAMETER_COUNT = 20;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
 
@@ -188,17 +188,21 @@ function writeParameters(
     samples(parameters.fastMs),
     samples(parameters.slowMs),
     samples(parameters.volumeMs),
+    samples(parameters.rateEmaMs ?? options.intervalMs),
     samples(parameters.thresholdLookbackMs ?? options.intervalMs),
     samples(parameters.confirmationAccelerationLookbackMs ?? options.intervalMs),
     samples(parameters.confirmationDistanceLookbackMs ?? options.intervalMs),
     samples(parameters.confirmationEmaMs ?? options.intervalMs),
     samples(parameters.confirmationRsiMs ?? options.intervalMs),
     samples(parameters.confirmationDmiMs ?? options.intervalMs),
-    samples(parameters.meanReversionMeanMs ?? parameters.slowMs),
+    samples(parameters.meanReversionEfficiencyMs ?? parameters.efficiencyMs),
+    samples(parameters.meanReversionFastMs ?? parameters.fastMs),
+    samples(parameters.meanReversionSlowMs ?? parameters.slowMs),
     samples(parameters.meanReversionVolatilityMs ?? parameters.slowMs),
     deadbandMode(parameters.deadbandMode),
-    parameters.thresholdMode === "adaptive" ? 1 : 0,
     parameters.agreementMode === "confidence" ? 1 : 0,
+    parameters.rateMode === "log" ? 1 : 0,
+    parameters.thresholdNoiseResponse === "inverse" ? 1 : 0,
   ];
   const floats = [
     parameters.power,
@@ -208,6 +212,8 @@ function writeParameters(
     parameters.deadbandBpsHour,
     parameters.hysteresisReleaseRatio ?? 0.25,
     parameters.thresholdNoiseMultiplier ?? 0,
+    parameters.thresholdInverseMaxBpsHour ?? 0,
+    parameters.thresholdInverseNoiseScaleBpsHour ?? 1,
     parameters.buyMaxFraction ?? 1,
     parameters.sellMaxFraction ?? 1,
     parameters.buySizingSigmaBpsHour ?? Number.MAX_VALUE,
@@ -224,11 +230,12 @@ function writeParameters(
     parameters.confirmationRsiWeight ?? 0,
     parameters.confirmationDmiWeight ?? 0,
     parameters.confirmationAdxThreshold ?? 20,
-    parameters.meanReversionMix ?? 0,
-    parameters.meanReversionThreshold ?? 2,
+    parameters.meanReversionSuppressionThreshold ?? 1,
+    parameters.meanReversionReversalThreshold ?? 0,
+    parameters.signalFrictionFraction ?? 1,
     options.warmupMultiple,
   ];
-  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 26) {
+  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 29) {
     throw new Error("VW-KAMA CUDA parameter layout is inconsistent.");
   }
   for (let index = 0; index < integers.length; index += 1) {

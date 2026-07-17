@@ -22,6 +22,7 @@ interface CandleChartProps {
   timeNavigation?: boolean;
   emptyLabel?: string;
   selectedTime?: number;
+  cursorTime?: number;
   viewport?: CandleChartViewport;
   priceDisplay?: CandleChartPriceDisplay;
   trace?: BacktestTrace;
@@ -33,6 +34,7 @@ interface CandleChartProps {
   onExtremumHoverChange?: (extremum: BacktestExtremumTrace | undefined) => void;
   onOracleHoverChange?: (point: BacktestOraclePoint | undefined) => void;
   onViewportChange?: (viewport: CandleChartViewport) => void;
+  onCursorTimeChange?: (time: number | undefined) => void;
 }
 
 export interface CandleChartStateBandPoint {
@@ -157,7 +159,7 @@ export function CandleChart(props: CandleChartProps) {
       endTime,
     );
     const hoveredExtremum = extrema.find((item) => item.id === hoveredExtremumId());
-    const selectedCandle = findCandleForTime(candles, selectedTime());
+    const selectedCandle = findCandleForTime(candles, crosshairTime());
     const selectedAnnotations = selectedCandle
       ? annotationsForCandle(annotations, selectedCandle)
       : [];
@@ -258,9 +260,6 @@ export function CandleChart(props: CandleChartProps) {
     }
     drawExtremaMarkers(ctx, extrema, hoveredExtremum, plot, priceToY, timeToX);
     if (hoveredExtremum) drawExtremumError(ctx, hoveredExtremum, plot, priceToY, timeToX);
-    if (selectedCandle) {
-      drawSelectedCandle(ctx, selectedCandle, selectedTime(), plot, priceToY, timeToX);
-    }
     drawAnnotations(ctx, selectedAnnotations, plot, priceToY, timeToX);
     if (stateBands.length > 0) {
       drawStateBands(ctx, stateBands, {
@@ -271,6 +270,17 @@ export function CandleChart(props: CandleChartProps) {
       }, startTime, endTime);
     }
     drawTimeLabels(ctx, candles, canvasPlot, timeToX);
+    if (selectedCandle) {
+      drawSelectedCandle(
+        ctx,
+        selectedCandle,
+        crosshairTime(),
+        plot,
+        priceToY,
+        timeToX,
+        canvasPlot.bottom,
+      );
+    }
   };
 
   createEffect(() => {
@@ -330,6 +340,7 @@ export function CandleChart(props: CandleChartProps) {
     props.overlays?.oracle;
     props.highlightedPositionId;
     props.selectedTime;
+    props.cursorTime;
     props.viewport?.start;
     props.viewport?.end;
     props.priceDisplay;
@@ -526,8 +537,10 @@ export function CandleChart(props: CandleChartProps) {
   };
 
   const selectedTime = () => props.selectedTime ?? internalSelectedTime();
+  const crosshairTime = () => props.cursorTime ?? selectedTime();
 
   const updateSelectionFromPointer = (event: { offsetX: number; offsetY?: number }) => {
+    props.onCursorTimeChange?.(timeAtOffset(event.offsetX));
     const selection = selectionAtOffset(event.offsetX, event.offsetY);
     if (!selection) {
       return;
@@ -542,6 +555,17 @@ export function CandleChart(props: CandleChartProps) {
     }
     setInternalSelectedTime(selection.time);
     props.onSelectionChange?.(selection);
+  };
+
+  const timeAtOffset = (offsetX: number): number | undefined => {
+    const chartViewport = currentViewport();
+    const candles = props.candles.slice(chartViewport.start, chartViewport.end);
+    if (candles.length === 0) return undefined;
+    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
+    const startTime = candles[0]!.openTime;
+    const endTime = candles.at(-1)!.closeTime;
+    const normalized = clamp((offsetX - plot.left) / Math.max(1, plot.right - plot.left), 0, 1);
+    return startTime + normalized * Math.max(1, endTime - startTime);
   };
 
   const selectionAtOffset = (offsetX: number, offsetY?: number): CandleChartSelection | undefined => {
@@ -675,6 +699,10 @@ export function CandleChart(props: CandleChartProps) {
         setHoveredOracle(undefined);
         props.onExtremumHoverChange?.(undefined);
         props.onOracleHoverChange?.(undefined);
+        if (!dragState) {
+          props.onCursorTimeChange?.(undefined);
+          if (props.onCursorTimeChange) setInternalSelectedTime(undefined);
+        }
       }}
       onPointerUp={handlePointerUp}
       onWheel={handleWheel}
@@ -1638,6 +1666,7 @@ function drawSelectedCandle(
   plot: { left: number; right: number; top: number; bottom: number },
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
+  lineBottom = plot.bottom,
 ): void {
   const markerTime = selectedTime ?? (candle.openTime + candle.closeTime) / 2;
   const x = clamp(timeToX(markerTime), plot.left, plot.right);
@@ -1656,14 +1685,28 @@ function drawSelectedCandle(
   ctx.setLineDash([4, 5]);
   ctx.beginPath();
   ctx.moveTo(x, plot.top);
-  ctx.lineTo(x, plot.bottom);
+  ctx.lineTo(x, lineBottom);
   ctx.stroke();
   ctx.setLineDash([]);
 
   ctx.globalAlpha = 0.95;
   ctx.strokeStyle = "#f4f6fb";
   ctx.strokeRect(candleX - 6, highY - 4, 12, Math.max(8, lowY - highY + 8));
+  const label = formatCursorTime(markerTime);
+  ctx.font = "11px Inter, sans-serif";
+  const labelWidth = ctx.measureText(label).width + 12;
+  const labelLeft = clamp(x - labelWidth / 2, plot.left, plot.right - labelWidth);
+  ctx.fillStyle = "#252a35";
+  ctx.fillRect(labelLeft, lineBottom - 18, labelWidth, 18);
+  ctx.fillStyle = "#eef1f8";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, labelLeft + labelWidth / 2, lineBottom - 9);
   ctx.restore();
+}
+
+function formatCursorTime(time: number): string {
+  return `${new Date(time).toISOString().replace("T", " ").slice(0, 19)} UTC`;
 }
 
 function drawAnnotations(

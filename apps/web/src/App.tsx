@@ -1712,6 +1712,20 @@ function AlgorithmPanel(props: {
                   onInput={(value) => updateValleyPeak("relativeRateEnabled", value)}
                 />
                 <SelectField
+                  label="KAMA Rate"
+                  value={config().strategy.kamaRateMode}
+                  options={[
+                    { value: "relative", label: "Relative derivative" },
+                    { value: "log", label: "Log-relative rate" },
+                  ]}
+                  onInput={(value) =>
+                    updateValleyPeak(
+                      "kamaRateMode",
+                      value as PeakValleyBotConfig["strategy"]["kamaRateMode"],
+                    )
+                  }
+                />
+                <SelectField
                   label="Average Type"
                   value={config().strategy.movingAverageType}
                   options={[
@@ -1956,6 +1970,13 @@ function AlgorithmPanel(props: {
                   onInput={(value) => updateValleyPeak("kamaVolumeLen", Math.round(value))}
                 />
                 <NumberField
+                  label="KAMA Rate EMA"
+                  value={config().strategy.kamaRateEmaLen}
+                  min={1}
+                  step={1}
+                  onInput={(value) => updateValleyPeak("kamaRateEmaLen", Math.round(value))}
+                />
+                <NumberField
                   label="Volume Cap"
                   value={config().strategy.kamaVolumeCap}
                   min={1}
@@ -1989,6 +2010,56 @@ function AlgorithmPanel(props: {
                     value / RELATIVE_RATE_TO_BPS_HOUR,
                   )}
                 />
+                <NumberField
+                  label="Threshold Noise Lookback (sec)"
+                  value={config().strategy.kamaThresholdLookbackSec}
+                  min={1}
+                  step={60}
+                  onInput={(value) => updateValleyPeak("kamaThresholdLookbackSec", value)}
+                />
+                <SelectField
+                  label="Threshold Noise Response"
+                  value={config().strategy.kamaThresholdNoiseResponse}
+                  options={[
+                    { value: "proportional", label: "Proportional" },
+                    { value: "inverse", label: "Inverse" },
+                  ]}
+                  onInput={(value) => updateValleyPeak(
+                    "kamaThresholdNoiseResponse",
+                    value as PeakValleyBotConfig["strategy"]["kamaThresholdNoiseResponse"],
+                  )}
+                />
+                <Show when={config().strategy.kamaThresholdNoiseResponse === "proportional"}>
+                  <NumberField
+                    label="Threshold Noise Multiplier"
+                    value={config().strategy.kamaThresholdNoiseMultiplier}
+                    min={0}
+                    step={0.1}
+                    onInput={(value) => updateValleyPeak("kamaThresholdNoiseMultiplier", value)}
+                  />
+                </Show>
+                <Show when={config().strategy.kamaThresholdNoiseResponse === "inverse"}>
+                  <NumberField
+                    label="Inverse Threshold Max (bps/h)"
+                    value={config().strategy.kamaThresholdInverseMax * RELATIVE_RATE_TO_BPS_HOUR}
+                    min={0}
+                    step={1}
+                    onInput={(value) => updateValleyPeak(
+                      "kamaThresholdInverseMax",
+                      value / RELATIVE_RATE_TO_BPS_HOUR,
+                    )}
+                  />
+                  <NumberField
+                    label="Inverse Noise Half-Decay (bps/h)"
+                    value={config().strategy.kamaThresholdInverseNoiseScale * RELATIVE_RATE_TO_BPS_HOUR}
+                    min={0.000001}
+                    step={1}
+                    onInput={(value) => updateValleyPeak(
+                      "kamaThresholdInverseNoiseScale",
+                      value / RELATIVE_RATE_TO_BPS_HOUR,
+                    )}
+                  />
+                </Show>
                 <NumberField
                   label="KAMA Signal Friction (bps)"
                   value={config().strategy.kamaSignalFriction * 10_000}

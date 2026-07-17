@@ -890,7 +890,7 @@ export class TradingRuntime {
 }
 
 function currentStoredState(state: StoredRuntimeState | undefined): StoredRuntimeState | undefined {
-  return state?.bot.version === 2 && state.bot.strategy?.version === 3 ? state : undefined;
+  return state?.bot.version === 2 && state.bot.strategy?.version === 5 ? state : undefined;
 }
 
 function normalizeBotConfig(
