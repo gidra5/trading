@@ -81,13 +81,19 @@ struct VwKamaResult {
   double distillation_weighted_oracle_entropy;
   double distillation_weight;
   double distillation_opportunity;
+  double strategy_final_equity;
+  double oracle_final_equity;
+  double strategy_max_drawdown;
+  double oracle_max_drawdown;
+  double strategy_turnover;
+  double oracle_turnover;
   int32_t state_count;
   int32_t signal_count;
   int32_t oracle_count;
   int32_t matched_count;
 };
 
-static_assert(sizeof(VwKamaResult) == 104, "VwKamaResult ABI changed");
+static_assert(sizeof(VwKamaResult) == 152, "VwKamaResult ABI changed");
 
 struct DeviceResult {
   float state_credit;
@@ -96,6 +102,12 @@ struct DeviceResult {
   double distillation_weighted_oracle_entropy;
   double distillation_weight;
   double distillation_opportunity;
+  double strategy_final_equity;
+  double oracle_final_equity;
+  double strategy_max_drawdown;
+  double oracle_max_drawdown;
+  double strategy_turnover;
+  double oracle_turnover;
 };
 
 struct Transition {
@@ -224,6 +236,93 @@ __device__ __forceinline__ float agreement_credit(
   return 1.0f - clamp01(fabsf(candidate));
 }
 
+__device__ __forceinline__ double rebalance_equity_factor(
+  float from_exposure,
+  float to_exposure,
+  float friction
+) {
+  const float difference = to_exposure - from_exposure;
+  if (fabsf(difference) <= 1e-12f) return 1.0;
+  if (difference > 0.0f) {
+    const double denominator = 1.0 - friction + friction * to_exposure;
+    return denominator > 0.0 ? 1.0 - friction * difference / denominator : 0.0;
+  }
+  const double denominator = 1.0 - friction * to_exposure;
+  return denominator > 0.0 ? 1.0 - friction * -difference / denominator : 0.0;
+}
+
+__device__ __forceinline__ void update_drawdown(
+  double equity,
+  double& peak,
+  double& max_drawdown
+) {
+  peak = fmax(peak, equity);
+  max_drawdown = fmax(max_drawdown, peak > 0.0 ? 1.0 - equity / peak : 1.0);
+}
+
+__device__ __forceinline__ void advance_return(
+  float requested_exposure,
+  float price,
+  float next_price,
+  float friction,
+  float minimum_exposure,
+  float maximum_exposure,
+  float quote_lend_rate,
+  float quote_borrow_rate,
+  float asset_borrow_rate,
+  double& equity,
+  float& current_exposure,
+  double& peak,
+  double& max_drawdown,
+  double& turnover
+) {
+  if (!(equity > 0.0)) return;
+  const float target = clamp_value(requested_exposure, minimum_exposure, maximum_exposure);
+  const float change = fabsf(target - current_exposure);
+  if (change > 1e-12f) {
+    const double rebalance = rebalance_equity_factor(current_exposure, target, friction);
+    if (!(rebalance > 0.0)) {
+      equity = 0.0;
+      max_drawdown = 1.0;
+      current_exposure = 0.0f;
+      return;
+    }
+    equity *= rebalance;
+    turnover += change;
+    update_drawdown(equity, peak, max_drawdown);
+  }
+  const double quote = 1.0 - target;
+  const double asset = target / price;
+  const double maintained_quote = quote >= 0.0
+    ? quote * (1.0 + quote_lend_rate)
+    : quote * (1.0 + quote_borrow_rate);
+  const double maintained_asset = asset >= 0.0 ? asset : asset * (1.0 + asset_borrow_rate);
+  const double asset_value = maintained_asset * next_price;
+  const double marked_equity = maintained_quote + asset_value;
+  const double liquidated_asset_value = asset_value >= 0.0
+    ? asset_value * (1.0 - friction)
+    : asset_value / fmax(1e-12, 1.0 - friction);
+  const double liquidation_equity = maintained_quote + liquidated_asset_value;
+  const double liquidation_exposure = liquidation_equity > 0.0
+    ? liquidated_asset_value / liquidation_equity
+    : 0.0;
+  if (!(liquidation_equity > 0.0)) {
+    equity = 0.0;
+    current_exposure = 0.0f;
+  } else if (liquidation_exposure < minimum_exposure
+    || liquidation_exposure > maximum_exposure) {
+    equity *= liquidation_equity;
+    current_exposure = 0.0f;
+  } else if (!(marked_equity > 0.0)) {
+    equity = 0.0;
+    current_exposure = 0.0f;
+  } else {
+    equity *= marked_equity;
+    current_exposure = static_cast<float>(asset_value / marked_equity);
+  }
+  update_drawdown(equity, peak, max_drawdown);
+}
+
 __device__ __forceinline__ int candidate_state(
   float rate,
   int current,
@@ -296,6 +395,7 @@ __global__ void evaluate_kernel(
   const float* volume,
   const uint8_t* oracle_codes,
   const float* value_means,
+  const float* value_optimal_exposures,
   const float* value_second_moments,
   const float* value_entropies,
   const float* value_weights,
@@ -304,6 +404,9 @@ __global__ void evaluate_kernel(
   int score_start,
   float interval_ms,
   float oracle_friction,
+  float quote_lend_rate,
+  float quote_borrow_rate,
+  float asset_borrow_rate,
   int value_grid_size,
   float value_grid_minimum,
   float value_grid_maximum,
@@ -428,9 +531,20 @@ __global__ void evaluate_kernel(
   double distillation_weighted_oracle_entropy = 0.0;
   double distillation_weight = 0.0;
   double distillation_opportunity = 0.0;
+  double strategy_equity = 1.0;
+  double oracle_equity = 1.0;
+  float strategy_exposure = 0.0f;
+  float oracle_exposure = 0.0f;
+  double strategy_peak = 1.0;
+  double oracle_peak = 1.0;
+  double strategy_max_drawdown = 0.0;
+  double oracle_max_drawdown = 0.0;
+  double strategy_turnover = 0.0;
+  double oracle_turnover = 0.0;
   const bool distillation_enabled = value_grid_size >= 3
     && strategy_sigma > 0.0f
     && value_means
+    && value_optimal_exposures
     && value_second_moments
     && value_entropies
     && value_weights
@@ -745,6 +859,40 @@ __global__ void evaluate_kernel(
         distillation_weighted_oracle_entropy += static_cast<double>(weight * value_entropies[index]);
         distillation_weight += static_cast<double>(weight);
         distillation_opportunity += static_cast<double>(value_opportunities[index]);
+        if (index + 1 < candle_count) {
+          advance_return(
+            exposure,
+            price,
+            close[index + 1],
+            oracle_friction,
+            value_grid_minimum,
+            value_grid_maximum,
+            quote_lend_rate,
+            quote_borrow_rate,
+            asset_borrow_rate,
+            strategy_equity,
+            strategy_exposure,
+            strategy_peak,
+            strategy_max_drawdown,
+            strategy_turnover
+          );
+          advance_return(
+            value_optimal_exposures[index],
+            price,
+            close[index + 1],
+            oracle_friction,
+            value_grid_minimum,
+            value_grid_maximum,
+            quote_lend_rate,
+            quote_borrow_rate,
+            asset_borrow_rate,
+            oracle_equity,
+            oracle_exposure,
+            oracle_peak,
+            oracle_max_drawdown,
+            oracle_turnover
+          );
+        }
       }
     }
   }
@@ -756,6 +904,12 @@ __global__ void evaluate_kernel(
     results[candidate].distillation_weighted_oracle_entropy = distillation_weighted_oracle_entropy;
     results[candidate].distillation_weight = distillation_weight;
     results[candidate].distillation_opportunity = distillation_opportunity;
+    results[candidate].strategy_final_equity = strategy_equity;
+    results[candidate].oracle_final_equity = oracle_equity;
+    results[candidate].strategy_max_drawdown = strategy_max_drawdown;
+    results[candidate].oracle_max_drawdown = oracle_max_drawdown;
+    results[candidate].strategy_turnover = strategy_turnover;
+    results[candidate].oracle_turnover = oracle_turnover;
   }
 }
 
@@ -922,6 +1076,7 @@ extern "C" int vw_kama_cuda_evaluate(
   const double* volume,
   const uint8_t* oracle_codes,
   const float* value_means,
+  const float* value_optimal_exposures,
   const float* value_second_moments,
   const float* value_entropies,
   const float* value_weights,
@@ -930,6 +1085,9 @@ extern "C" int vw_kama_cuda_evaluate(
   int score_start,
   double interval_ms,
   double oracle_friction,
+  double quote_lend_rate,
+  double quote_borrow_rate,
+  double asset_borrow_rate,
   double match_window_ms,
   double timing_half_life_ms,
   int value_grid_size,
@@ -947,12 +1105,14 @@ extern "C" int vw_kama_cuda_evaluate(
     if (candle_count <= 0 || candidate_count <= 0 || score_start < 0 || score_start >= candle_count) {
       throw std::runtime_error("VW-KAMA CUDA received invalid dimensions");
     }
-    if (interval_ms <= 0 || match_window_ms < 0 || timing_half_life_ms <= 0) {
+    if (interval_ms <= 0 || match_window_ms < 0 || timing_half_life_ms <= 0
+      || quote_lend_rate < 0 || quote_borrow_rate < 0 || asset_borrow_rate < 0) {
       throw std::runtime_error("VW-KAMA CUDA received invalid timing options");
     }
     const bool distillation_enabled = value_grid_size >= 3;
     if (distillation_enabled && (
       !value_means
+      || !value_optimal_exposures
       || !value_second_moments
       || !value_entropies
       || !value_weights
@@ -997,6 +1157,7 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<float> device_volume(candle_count);
     DeviceBuffer<uint8_t> device_oracle(candle_count);
     DeviceBuffer<float> device_value_means(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_optimal_exposures(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_second_moments(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_entropies(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_weights(distillation_enabled ? candle_count : 0);
@@ -1013,6 +1174,7 @@ extern "C" int vw_kama_cuda_evaluate(
     cuda_check(cudaMemcpy(device_oracle.get(), oracle_codes, candle_count, cudaMemcpyHostToDevice), "copy oracle");
     if (distillation_enabled) {
       cuda_check(cudaMemcpy(device_value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value means");
+      cuda_check(cudaMemcpy(device_value_optimal_exposures.get(), value_optimal_exposures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value optimal exposures");
       cuda_check(cudaMemcpy(device_value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value second moments");
       cuda_check(cudaMemcpy(device_value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value entropies");
       cuda_check(cudaMemcpy(device_value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value weights");
@@ -1040,6 +1202,7 @@ extern "C" int vw_kama_cuda_evaluate(
       device_volume.get(),
       device_oracle.get(),
       device_value_means.get(),
+      device_value_optimal_exposures.get(),
       device_value_second_moments.get(),
       device_value_entropies.get(),
       device_value_weights.get(),
@@ -1048,6 +1211,9 @@ extern "C" int vw_kama_cuda_evaluate(
       score_start,
       static_cast<float>(interval_ms),
       static_cast<float>(oracle_friction),
+      static_cast<float>(quote_lend_rate),
+      static_cast<float>(quote_borrow_rate),
+      static_cast<float>(asset_borrow_rate),
       value_grid_size,
       static_cast<float>(value_grid_minimum),
       static_cast<float>(value_grid_maximum),
@@ -1092,6 +1258,7 @@ extern "C" int vw_kama_cuda_evaluate(
         device_volume.get(),
         device_oracle.get(),
         device_value_means.get(),
+        device_value_optimal_exposures.get(),
         device_value_second_moments.get(),
         device_value_entropies.get(),
         device_value_weights.get(),
@@ -1100,6 +1267,9 @@ extern "C" int vw_kama_cuda_evaluate(
         score_start,
         static_cast<float>(interval_ms),
         static_cast<float>(oracle_friction),
+        static_cast<float>(quote_lend_rate),
+        static_cast<float>(quote_borrow_rate),
+        static_cast<float>(asset_borrow_rate),
         value_grid_size,
         static_cast<float>(value_grid_minimum),
         static_cast<float>(value_grid_maximum),
@@ -1175,6 +1345,12 @@ extern "C" int vw_kama_cuda_evaluate(
         host_results[candidate].distillation_weighted_oracle_entropy,
         host_results[candidate].distillation_weight,
         host_results[candidate].distillation_opportunity,
+        host_results[candidate].strategy_final_equity,
+        host_results[candidate].oracle_final_equity,
+        host_results[candidate].strategy_max_drawdown,
+        host_results[candidate].oracle_max_drawdown,
+        host_results[candidate].strategy_turnover,
+        host_results[candidate].oracle_turnover,
         candle_count - score_start,
         host_results[candidate].signal_count,
         static_cast<int32_t>(oracle_transitions.size()),

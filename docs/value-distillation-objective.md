@@ -52,10 +52,37 @@ Genetic fitness is `-CE`, so larger fitness remains better. The report displays 
 cross-entropy, KL divergence, `exp(-KL)`, mean opportunity, and the previous signal score as a
 diagnostic.
 
+The standard search also writes its validation-selected volume-aware and canonical finalists
+to `data/benchmarks/vw-kama-global-presets.json`. The KAMA inspector loads these presets and
+uses the exact oracle temperature, exposure grid, and strategy sigma stored with the run.
+
 Because `log s_t(a)` is quadratic in exposure, exact cross-entropy only needs the oracle
 distribution's mean, second moment, and entropy. These sufficient statistics keep the shared
 oracle cache to five floats per candle and avoid an exposure-grid loop for oracle probabilities
 inside each candidate evaluation. CUDA and CPU calculate the same loss.
+
+## Inspector visualization
+
+The KAMA inspector retains full oracle probabilities only for interactive analysis. Click or
+hover a rendered price-chart candle to compare grouped bars for `p_t(a)` and `s_t(a)`. The
+panel also shows both distribution means, cross-entropy, oracle entropy, and opportunity. Full
+probability rows are not retained by global-search workers, so the high-throughput search path
+continues to use the compact sufficient statistics.
+
+## Return measurements
+
+The evaluator marks two hypothetical close-to-close portfolios alongside the loss:
+
+- the strategy uses its actual price-marked exposure;
+- the hindsight oracle uses the Bellman policy conditioned on its current marked exposure,
+  maximizing `log(rebalanceFactor(current, a)) + Q_t(a)`. The unconditioned distribution mode
+  and soft mean `E_p[a]` remain visible in the chart but are not labeled as oracle return.
+
+Every continuous segment starts with equity `1` and exposure `0`. Each target rebalance uses
+the same exact fee equation as the Bellman oracle, followed by the configured quote/asset
+maintenance rates and the next close. Final equity is marked at the last close without a
+synthetic terminal liquidation. Reports include compounded return, maximum drawdown, and
+turnover; return is diagnostic and does not enter genetic fitness.
 
 ## Current scope
 

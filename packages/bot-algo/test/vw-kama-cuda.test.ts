@@ -76,6 +76,16 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
         <= Math.max(0.02, cpuDistillation.crossEntropy * 0.05),
       `candidate ${index} value-distillation loss drifted`,
     );
+    assert.ok(
+      Math.abs(Math.log(gpu[index]!.strategyFinalEquity)
+        - Math.log(cpuDistillation.returns.strategy.equity)) < 0.08,
+      `candidate ${index} strategy return drifted`,
+    );
+    assert.ok(
+      Math.abs(Math.log(gpu[index]!.oracleFinalEquity)
+        - Math.log(cpuDistillation.returns.oracle.equity)) < 0.02,
+      `candidate ${index} oracle return drifted`,
+    );
   }
 });
 

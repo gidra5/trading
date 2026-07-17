@@ -9,7 +9,7 @@ import type {
 import type { ExposureValueOracle } from "./exposure-value-distillation.js";
 
 const PARAMETER_SIZE = 196;
-const RESULT_SIZE = 104;
+const RESULT_SIZE = 152;
 const INT_PARAMETER_COUNT = 20;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
@@ -28,6 +28,7 @@ interface NativeCuda {
     volume: Float64Array,
     oracleCodes: Uint8Array,
     valueMeans: Float32Array | null,
+    valueOptimalExposures: Float32Array | null,
     valueSecondMoments: Float32Array | null,
     valueEntropies: Float32Array | null,
     valueWeights: Float32Array | null,
@@ -36,6 +37,9 @@ interface NativeCuda {
     scoreStart: number,
     intervalMs: number,
     oracleFriction: number,
+    quoteLendRate: number,
+    quoteBorrowRate: number,
+    assetBorrowRate: number,
     matchWindowMs: number,
     timingHalfLifeMs: number,
     valueGridSize: number,
@@ -73,6 +77,12 @@ export interface VwKamaCudaCaseResult {
   distillationWeightedOracleEntropy: number;
   distillationWeight: number;
   distillationOpportunity: number;
+  strategyFinalEquity: number;
+  oracleFinalEquity: number;
+  strategyMaxDrawdown: number;
+  oracleMaxDrawdown: number;
+  strategyTurnover: number;
+  oracleTurnover: number;
   stateCount: number;
   signalCount: number;
   oracleCount: number;
@@ -128,6 +138,7 @@ export async function evaluateVwKamaCudaBatch(
   const valueDistillation = options.valueDistillation;
   if (valueDistillation && (
     valueDistillation.oracle.means.length < candles.length
+    || valueDistillation.oracle.optimalExposures.length < candles.length
     || valueDistillation.oracle.secondMoments.length < candles.length
     || valueDistillation.oracle.entropies.length < candles.length
     || valueDistillation.oracle.weights.length < candles.length
@@ -149,6 +160,7 @@ export async function evaluateVwKamaCudaBatch(
     candles.volume,
     oracle.stateCodes,
     valueDistillation?.oracle.means ?? null,
+    valueDistillation?.oracle.optimalExposures ?? null,
     valueDistillation?.oracle.secondMoments ?? null,
     valueDistillation?.oracle.entropies ?? null,
     valueDistillation?.oracle.weights ?? null,
@@ -157,6 +169,9 @@ export async function evaluateVwKamaCudaBatch(
     options.scoreStartIndex,
     options.intervalMs,
     options.oracleFriction,
+    valueDistillation?.oracle.execution.quoteLendRate ?? 0,
+    valueDistillation?.oracle.execution.quoteBorrowRate ?? 0,
+    valueDistillation?.oracle.execution.assetBorrowRate ?? 0,
     options.matchWindowMs,
     options.timingHalfLifeMs,
     valueDistillation?.oracle.grid.length ?? 0,
@@ -192,8 +207,8 @@ async function loadNative(): Promise<NativeCuda> {
       resultSize: library.func("int vw_kama_cuda_result_size()"),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer, pointer, pointer,
-        "int", "int", "double", "double", "double", "double",
+        pointer, pointer, pointer, pointer, pointer, pointer,
+        "int", "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "double", "double", "double",
         pointer, "int", pointer,
       ]),
@@ -300,10 +315,16 @@ function readResult(buffer: Buffer, offset: number): VwKamaCudaCaseResult {
     distillationWeightedOracleEntropy: buffer.readDoubleLE(offset + 64),
     distillationWeight: buffer.readDoubleLE(offset + 72),
     distillationOpportunity: buffer.readDoubleLE(offset + 80),
-    stateCount: buffer.readInt32LE(offset + 88),
-    signalCount: buffer.readInt32LE(offset + 92),
-    oracleCount: buffer.readInt32LE(offset + 96),
-    matchedCount: buffer.readInt32LE(offset + 100),
+    strategyFinalEquity: buffer.readDoubleLE(offset + 88),
+    oracleFinalEquity: buffer.readDoubleLE(offset + 96),
+    strategyMaxDrawdown: buffer.readDoubleLE(offset + 104),
+    oracleMaxDrawdown: buffer.readDoubleLE(offset + 112),
+    strategyTurnover: buffer.readDoubleLE(offset + 120),
+    oracleTurnover: buffer.readDoubleLE(offset + 128),
+    stateCount: buffer.readInt32LE(offset + 136),
+    signalCount: buffer.readInt32LE(offset + 140),
+    oracleCount: buffer.readInt32LE(offset + 144),
+    matchedCount: buffer.readInt32LE(offset + 148),
   };
 }
 

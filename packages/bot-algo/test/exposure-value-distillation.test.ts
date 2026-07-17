@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
+  exposureValueOracleProbabilities,
+  finalizeExposureReturn,
   finalizeExposureValueDistillation,
+  observeExposureReturn,
   observeExposureValueDistillation,
   prepareExposureValueOracle,
   rebalanceEquityFactor,
   shareExposureValueOracle,
+  strategyExposureProbabilities,
 } from "../src/exposure-value-distillation.js";
 
 test("exposure value oracle prefers the sign of the next price move", () => {
@@ -25,6 +30,8 @@ test("exposure value oracle prefers the sign of the next price move", () => {
 
   assert.ok(up.means[0]! > 0.5);
   assert.ok(down.means[0]! < -0.5);
+  assert.equal(up.optimalExposures[0], 1);
+  assert.equal(down.optimalExposures[0], -1);
   assert.ok(up.opportunities[0]! > 0);
   assert.ok(Math.abs(up.means[1]!) < 1e-7);
 });
@@ -84,4 +91,35 @@ test("value oracle arrays can be shared across candidate workers", () => {
 
   assert.ok(shared.means.buffer instanceof SharedArrayBuffer);
   assert.ok(shared.grid.buffer instanceof SharedArrayBuffer);
+});
+
+test("retained oracle and strategy distributions are normalized", () => {
+  const oracle = prepareExposureValueOracle([100, 102], {
+    scoreStartIndex: 0,
+    friction: 0,
+    gridSize: 9,
+    temperature: 0.01,
+    includeProbabilities: true,
+  });
+  const oracleProbabilities = exposureValueOracleProbabilities(oracle, 0);
+  const strategyProbabilities = strategyExposureProbabilities(oracle.grid, 0.4, 0.15);
+  assert.ok(Math.abs(oracleProbabilities.reduce((sum, value) => sum + value, 0) - 1) < 1e-6);
+  assert.ok(Math.abs(strategyProbabilities.reduce((sum, value) => sum + value, 0) - 1) < 1e-12);
+});
+
+test("return measurement starts flat and marks the requested exposure", () => {
+  const returns = createExposureReturnAccumulator();
+  observeExposureReturn(returns, 1, 100, 110, {
+    friction: 0,
+    minExposure: -1,
+    maxExposure: 1,
+    quoteLendRate: 0,
+    quoteBorrowRate: 0,
+    assetBorrowRate: 0,
+  });
+  const metrics = finalizeExposureReturn(returns);
+  assert.ok(Math.abs(metrics.equity - 1.1) < 1e-12);
+  assert.ok(Math.abs(metrics.totalReturn - 0.1) < 1e-12);
+  assert.equal(metrics.rebalanceCount, 1);
+  assert.equal(metrics.turnover, 1);
 });

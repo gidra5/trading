@@ -15,6 +15,8 @@ import type {
   VwKamaParameters,
   VwKamaPreset,
   VwKamaTransition,
+  VwKamaValueDistillationConfig,
+  VwKamaValueDistributionPoint,
 } from "@trading/bot-algo";
 import {
   CandleChart,
@@ -34,6 +36,17 @@ const debounceMs = 150;
 const detailDebounceMs = 120;
 const detailMaxCandles = 5_000;
 const detailTriggerCandles = detailMaxCandles * 4;
+const defaultValueDistillation: VwKamaValueDistillationConfig = {
+  gridSize: 21,
+  minExposure: -1,
+  maxExposure: 1,
+  oracleTemperature: 0.01,
+  strategySigma: 0.15,
+  opportunityEpsilon: 0.000001,
+  quoteLendRate: 0,
+  quoteBorrowRate: 0,
+  assetBorrowRate: 0,
+};
 
 type OracleState = BacktestOraclePoint["state"];
 interface TimeRange { start: number; end: number }
@@ -158,6 +171,10 @@ const metricHelp = {
   cleanliness: "Matched transitions divided by all candidate transitions: matched / (matched + extra). Higher is better, and this contributes 20% of the overall score.",
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
+  distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
+  strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
+  oracleReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the executable hindsight Bellman policy and the same friction.",
+  drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
 } as const;
 
 export function KamaInspectorPage() {
@@ -171,6 +188,7 @@ export function KamaInspectorPage() {
   const [matchWindowMs, setMatchWindowMs] = createSignal(2 * 3_600_000);
   const [timingHalfLifeMs, setTimingHalfLifeMs] = createSignal(10 * 60_000);
   const [warmupMultiple, setWarmupMultiple] = createSignal(3);
+  const [valueConfig, setValueConfig] = createSignal({ ...defaultValueDistillation });
   const [scoreWeights, setScoreWeights] = createSignal({ ...defaultScoreWeights });
   const [result, setResult] = createSignal<VwKamaInspectorResponse>();
   const [comparisonResult, setComparisonResult] = createSignal<VwKamaInspectorResponse>();
@@ -188,6 +206,7 @@ export function KamaInspectorPage() {
   const [detailError, setDetailError] = createSignal<string>();
   const [hoveredOracle, setHoveredOracle] = createSignal<BacktestOraclePoint>();
   const [cursorTime, setCursorTime] = createSignal<number>();
+  const [selectedTime, setSelectedTime] = createSignal<number>();
   let analysisTimer: number | undefined;
   let analysisController: AbortController | undefined;
   let detailTimer: number | undefined;
@@ -408,6 +427,15 @@ export function KamaInspectorPage() {
     result()?.intervalMs ?? intervalMs(),
     result()?.renderIntervalMs,
   ));
+  const valueDistributions = createMemo(() => mergeDetailValueDistributions(
+    result()?.valueDistributions ?? [],
+    detail(),
+    result(),
+  ));
+  const selectedDistribution = createMemo(() => nearestValueDistribution(
+    valueDistributions(),
+    selectedTime() ?? cursorTime(),
+  ));
   const comparisons = createMemo(() => compareTransitions(
     result()?.candidateTransitions ?? [],
     result()?.oracleTransitions ?? [],
@@ -446,6 +474,7 @@ export function KamaInspectorPage() {
     const matchWindow = matchWindowMs();
     const timingHalfLife = timingHalfLifeMs();
     const warmup = warmupMultiple();
+    const distillation = valueConfig();
     const preset = selectedPreset();
     if (!id || !catalog()) return;
     if (analysisTimer !== undefined) window.clearTimeout(analysisTimer);
@@ -461,6 +490,7 @@ export function KamaInspectorPage() {
         matchWindowMs: matchWindow,
         timingHalfLifeMs: timingHalfLife,
         warmupMultiple: warmup,
+        valueDistillation: { ...distillation },
       };
       const baseline = preset?.scope === "window" ? globalPreset() : undefined;
       void analyze(request, sequence, baseline ? { ...request, parameters: { ...baseline.parameters } } : undefined);
@@ -480,6 +510,11 @@ export function KamaInspectorPage() {
       return current && current.start === next.start && current.end === next.end ? current : next;
     });
     setDetail(undefined);
+    const distributions = analysis.valueDistributions;
+    if (distributions.length > 0) {
+      setSelectedTime(distributions.reduce((best, point) =>
+        point.opportunity > best.opportunity ? point : best).time);
+    }
   });
 
   createEffect(() => {
@@ -540,6 +575,7 @@ export function KamaInspectorPage() {
       setMatchWindowMs(next.defaults.matchWindowMs);
       setTimingHalfLifeMs(next.defaults.timingHalfLifeMs);
       setWarmupMultiple(next.defaults.warmupMultiple);
+      setValueConfig({ ...defaultValueDistillation, ...next.defaults.valueDistillation });
     } catch (error) {
       setCatalogError(error instanceof Error ? error.message : "Could not load inspector windows");
     }
@@ -644,7 +680,12 @@ export function KamaInspectorPage() {
     setRankedPair("current");
     setSelectedPresetId(id);
     const preset = catalog()?.presets.find((item) => item.id === id);
-    if (preset) setParameters({ ...preset.parameters });
+    if (preset) {
+      setParameters({ ...preset.parameters });
+      if (preset.optimization?.valueDistillation) {
+        setValueConfig({ ...preset.optimization.valueDistillation });
+      }
+    }
   };
 
   const inspectPreset = (preset: VwKamaPreset) => batch(() => {
@@ -653,6 +694,9 @@ export function KamaInspectorPage() {
     setRankedPair("current");
     setSelectedPresetId(preset.id);
     setParameters({ ...preset.parameters });
+    if (preset.optimization?.valueDistillation) {
+      setValueConfig({ ...preset.optimization.valueDistillation });
+    }
   });
 
   const applyRankedPair = (value: string) => {
@@ -666,6 +710,9 @@ export function KamaInspectorPage() {
       if (preset.intervalMs) setIntervalMs(preset.intervalMs);
       setSelectedPresetId(preset.id);
       setParameters({ ...preset.parameters });
+      if (preset.optimization?.valueDistillation) {
+        setValueConfig({ ...preset.optimization.valueDistillation });
+      }
     });
   };
 
@@ -893,7 +940,7 @@ export function KamaInspectorPage() {
                 <div class="flex items-end text-xs text-ink-400 md:col-span-2">
                   {source()}
                   <Show when={selectedPreset()?.score !== undefined}>
-                    {` · stored score ${ratioPercent(selectedPreset()!.score!)}`}
+                    {` · stored ${presetScoreLabel(selectedPreset()!, selectedPreset()!.score!)}`}
                   </Show>
                 </div>
               )}
@@ -1108,9 +1155,14 @@ export function KamaInspectorPage() {
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
+              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={101} step={2} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
+              <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
+              <InspectorNumber label="Strategy distribution σ" value={valueConfig().strategySigma} min={0.000001} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, strategySigma: value }))} />
+              <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
+              <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              Oracle friction shapes the retrospective path. Candidate state changes require a move from the last emitted signal price equal to oracle friction × the selected fraction; 0 disables only the candidate signal-memory gate.
+              Oracle friction shapes both retrospective paths. Value distributions use softmax(Q / temperature); the strategy curve is a truncated Gaussian over exposure. Return paths start at equity 1 and exposure 0, then use the same friction and exposure bounds.
             </div>
           </details>
         </section>
@@ -1143,6 +1195,18 @@ export function KamaInspectorPage() {
                 <ScoreCard label="Timing error P50" value={formatDuration(analysis().metrics.lagP50Ms ?? undefined)} description={metricHelp.timingError} />
                 <ScoreCard label="Signals/day" value={formatQuote(analysis().metrics.signalsPerDay, 1)} description={metricHelp.signals} />
                 <ScoreCard label="Candles" value={formatQuote(analysis().candleCount, 0)} description={metricHelp.candles} />
+                <Show when={analysis().metrics.valueDistillation}>
+                  {(value) => (
+                    <>
+                      <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
+                      <ScoreCard label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
+                      <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
+                      <ScoreCard label="Oracle return" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
+                      <ScoreCard label="Strategy drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
+                      <ScoreCard label="Oracle drawdown" value={ratioPercent(value().returns.oracle.maxDrawdown)} description={metricHelp.drawdown} />
+                    </>
+                  )}
+                </Show>
               </section>
 
               <Show when={comparisonResult()}>
@@ -1239,14 +1303,37 @@ export function KamaInspectorPage() {
                     timeNavigation
                     viewport={chartViewport()}
                     cursorTime={cursorTime()}
+                    selectedTime={selectedTime()}
                     highlightedAnnotation={matchedCandidate()}
                     stateBands={chartStateBands()}
                     onOracleHoverChange={setHoveredOracle}
                     onViewportChange={updateViewportFromChart}
                     onCursorTimeChange={setCursorTime}
+                    onSelectionChange={(selection) => {
+                      if (selection) setSelectedTime(selection.candle.closeTime);
+                    }}
                     emptyLabel="No analyzed candles"
                   />
                 </div>
+                <Show when={selectedDistribution()}>
+                  {(point) => (
+                    <div class="mt-3 rounded-2 border border-line bg-ink-800/50 p-3">
+                      <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
+                        <div>
+                          <div class="muted-label">Selected chart point</div>
+                          <h3 class="text-sm font-semibold">Oracle and predicted exposure distributions</h3>
+                        </div>
+                        <div class="text-xs tabular-nums text-ink-300">
+                          {formatDateTime(point().time)} · candidate {signedExposure(point().candidateExposure)} · oracle policy {signedExposure(point().oracleOptimalExposure)} · distribution mode {signedExposure(point().oracleModalExposure)} · mean {signedExposure(point().oracleMeanExposure)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
+                        </div>
+                      </div>
+                      <ExposureDistributionChart point={point()} />
+                      <div class="mt-2 text-xs text-ink-400">
+                        Cyan is the hindsight soft value oracle; purple is the strategy Gaussian used by the loss. Click or hover the price chart to inspect another rendered candle.
+                      </div>
+                    </div>
+                  )}
+                </Show>
                 <Show when={diagnosticSeries().length > 0}>
                   <div class="mt-3">
                     <div class="mb-1 flex items-center justify-between gap-3 text-xs text-ink-400">
@@ -1330,6 +1417,50 @@ export function KamaInspectorPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint }) {
+  const maximum = () => Math.max(
+    Number.EPSILON,
+    ...props.point.values.flatMap((value) => [value.oracleProbability, value.strategyProbability]),
+  );
+  return (
+    <div>
+      <div class="mb-2 flex flex-wrap gap-4 text-xs tabular-nums text-ink-300">
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mean {signedExposure(props.point.oracleMeanExposure)} · mode {signedExposure(props.point.oracleModalExposure)} · executable policy {signedExposure(props.point.oracleOptimalExposure)}</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mean {signedExposure(props.point.strategyMeanExposure)}</span>
+        <span>Oracle entropy {formatQuote(props.point.oracleEntropy, 4)}</span>
+      </div>
+      <div
+        class="grid h-52 items-end gap-0.5 border-b border-line px-1 pt-2"
+        style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
+        role="img"
+        aria-label="Oracle and strategy probability by exposure"
+      >
+        <For each={props.point.values}>
+          {(value) => (
+            <div class="group relative flex h-full items-end justify-center gap-px" title={`Exposure ${signedExposure(value.exposure)} · oracle ${ratioPercent(value.oracleProbability)} · strategy ${ratioPercent(value.strategyProbability)}`}>
+              <div class="w-[44%] min-w-px rounded-t-sm bg-cyan-400/80" style={{ height: `${value.oracleProbability / maximum() * 100}%` }} />
+              <div class="w-[44%] min-w-px rounded-t-sm bg-violet-400/80" style={{ height: `${value.strategyProbability / maximum() * 100}%` }} />
+            </div>
+          )}
+        </For>
+      </div>
+      <div
+        class="grid gap-0.5 px-1 pt-1 text-center text-[10px] tabular-nums text-ink-400"
+        style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
+      >
+        <For each={props.point.values}>
+          {(value, index) => (
+            <span classList={{ invisible: index() % Math.max(1, Math.ceil(props.point.values.length / 9)) !== 0 && index() !== props.point.values.length - 1 }}>
+              {formatQuote(value.exposure, 1)}
+            </span>
+          )}
+        </For>
+      </div>
+      <div class="mt-0.5 text-center text-[10px] uppercase tracking-wider text-ink-500">Target exposure</div>
+    </div>
   );
 }
 
@@ -1486,8 +1617,14 @@ function presetOption(preset: VwKamaPreset): { value: string; label: string } {
   const version = preset.score === undefined && value !== undefined
     ? ` v${preset.scoreVersion ?? "?"}`
     : "";
-  const score = value === undefined ? "" : ` · ${ratioPercent(value)}${version}`;
+  const score = value === undefined ? "" : ` · ${presetScoreLabel(preset, value)}${version}`;
   return { value: preset.id, label: `${preset.label}${score}` };
+}
+
+function presetScoreLabel(preset: VwKamaPreset, value: number): string {
+  return preset.optimization?.objective === "value-distillation"
+    ? `CE ${formatQuote(-value, 5)}`
+    : `score ${ratioPercent(value)}`;
 }
 
 function rankedPresetLabel(
@@ -1525,6 +1662,10 @@ async function fetchAnalysis(
 
 function ratioPercent(value: number): string {
   return `${formatQuote(value * 100, 2)}%`;
+}
+
+function signedExposure(value: number): string {
+  return `${value >= 0 ? "+" : ""}${formatQuote(value, 3)}`;
 }
 
 function medianValue(values: number[]): number {
@@ -1787,6 +1928,41 @@ function mergeDetailIndicatorPoints(
     ...detail.indicatorPoints.filter((point) =>
       point.time >= replacement.start && point.time < replacement.end),
   ].sort((left, right) => left.time - right.time);
+}
+
+function mergeDetailValueDistributions(
+  overview: VwKamaValueDistributionPoint[],
+  detail: VwKamaCandleRangeResponse | undefined,
+  analysis: VwKamaInspectorResponse | undefined,
+): VwKamaValueDistributionPoint[] {
+  if (!detail?.valueDistributions?.length || !analysis
+    || detail.windowId !== analysis.window.id
+    || detail.intervalMs !== analysis.intervalMs) return overview;
+  const replacement = detailReplacementRange(analysis.candles, detail.candles);
+  if (!replacement) return overview;
+  return [
+    ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
+    ...detail.valueDistributions.filter((point) =>
+      point.time >= replacement.start && point.time < replacement.end),
+  ].sort((left, right) => left.time - right.time);
+}
+
+function nearestValueDistribution(
+  points: VwKamaValueDistributionPoint[],
+  time: number | undefined,
+): VwKamaValueDistributionPoint | undefined {
+  if (points.length === 0) return undefined;
+  if (time === undefined) return points.at(-1);
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.time < time) low = middle + 1;
+    else high = middle;
+  }
+  const right = points[Math.min(points.length - 1, low)]!;
+  const left = points[Math.max(0, low - 1)]!;
+  return Math.abs(left.time - time) <= Math.abs(right.time - time) ? left : right;
 }
 
 function detailReplacementRange(overview: Candle[], detail: Candle[]): TimeRange | undefined {

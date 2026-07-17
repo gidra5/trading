@@ -227,6 +227,12 @@ interface CaseScore {
   valueDistillationKl: number | null;
   oracleEntropy: number | null;
   meanOpportunity: number | null;
+  strategyReturn: number | null;
+  oracleReturn: number | null;
+  strategyMaxDrawdown: number | null;
+  oracleMaxDrawdown: number | null;
+  strategyTurnover: number | null;
+  oracleTurnover: number | null;
   precision: number;
   recall: number;
   f1: number;
@@ -259,6 +265,12 @@ interface CaseStats {
   distillationWeight?: number;
   distillationOpportunity?: number;
   distillationSamples?: number;
+  strategyFinalEquity?: number;
+  oracleFinalEquity?: number;
+  strategyMaxDrawdown?: number;
+  oracleMaxDrawdown?: number;
+  strategyTurnover?: number;
+  oracleTurnover?: number;
   days: number;
   absoluteLags: number[];
   signedLags: number[];
@@ -277,6 +289,10 @@ interface AggregateScore {
   valueDistillationLoss: number | null;
   valueDistillationKl: number | null;
   meanOpportunity: number | null;
+  strategyReturn: number | null;
+  oracleReturn: number | null;
+  strategyMaxDrawdown: number | null;
+  oracleMaxDrawdown: number | null;
   precision: number;
   recall: number;
   f1: number;
@@ -561,6 +577,7 @@ async function run(config: Args): Promise<void> {
       validationObjective: round(result.aggregate.objective, 6),
     })),
   });
+  writeGlobalPresets(config, finalists, startedAt);
   appendJson(config.outputPath, {
     type: "status",
     status: "completed",
@@ -570,6 +587,54 @@ async function run(config: Args): Promise<void> {
   fs.writeFileSync(config.reportPath, report(config, windows, fit, validation, test, maxWarmupMs));
   console.error(`Results: ${path.relative(repoRoot, config.outputPath)}`);
   console.error(`Report: ${path.relative(repoRoot, config.reportPath)}`);
+}
+
+function writeGlobalPresets(
+  config: Args,
+  finalists: CandidateResult[],
+  startedAt: number,
+): void {
+  const completedAt = Date.now();
+  const generated = finalists.map((result): VwKamaPreset => ({
+    id: `global-${config.objective}-${result.candidate.family}`,
+    label: `Global · ${config.objective} · ${result.candidate.family}`,
+    scope: "global",
+    windowId: null,
+    parameters: candidateParameters(result.candidate),
+    score: round(result.aggregate.objective, 6),
+    scoreVersion: config.scoreVersion,
+    source: `${config.algorithm.toUpperCase()} chronological validation finalist; holdout excluded from selection`,
+    generatedAt: new Date(completedAt).toISOString(),
+    optimization: {
+      algorithm: config.algorithm,
+      objective: config.objective,
+      population: config.trials,
+      generations: config.generations,
+      restarts: config.restarts,
+      refinementRounds: config.refinementRounds,
+      elapsedMs: completedAt - startedAt,
+      hindsight: false,
+      valueDistillation: {
+        gridSize: config.exposureGridSize,
+        minExposure: config.exposureMinimum,
+        maxExposure: config.exposureMaximum,
+        oracleTemperature: config.oracleTemperature,
+        strategySigma: config.strategySigma,
+        opportunityEpsilon: config.opportunityEpsilon,
+        quoteLendRate: config.quoteLendRate,
+        quoteBorrowRate: config.quoteBorrowRate,
+        assetBorrowRate: config.assetBorrowRate,
+      },
+    },
+  }));
+  const replaced = new Set(generated.map((preset) => preset.id));
+  const presets = [
+    ...loadPresets(config.presetOutputPath).filter((preset) => !replaced.has(preset.id)),
+    ...generated,
+  ];
+  fs.mkdirSync(path.dirname(config.presetOutputPath), { recursive: true });
+  fs.writeFileSync(config.presetOutputPath, `${JSON.stringify(presets, null, 2)}\n`);
+  console.error(`Global presets: ${path.relative(repoRoot, config.presetOutputPath)}`);
 }
 
 async function searchCandidates(
@@ -1448,6 +1513,17 @@ async function runPerWindow(
       refinementRounds: config.refinementRounds,
       elapsedMs: completedAt - startedAt,
       hindsight: true,
+      valueDistillation: {
+        gridSize: config.exposureGridSize,
+        minExposure: config.exposureMinimum,
+        maxExposure: config.exposureMaximum,
+        oracleTemperature: config.oracleTemperature,
+        strategySigma: config.strategySigma,
+        opportunityEpsilon: config.opportunityEpsilon,
+        quoteLendRate: config.quoteLendRate,
+        quoteBorrowRate: config.quoteBorrowRate,
+        assetBorrowRate: config.assetBorrowRate,
+      },
     },
   }));
   const replaced = new Set(documented.map((preset) => `${preset.windowId}:${preset.intervalMs ?? "all"}`));
@@ -1871,6 +1947,12 @@ async function evaluateStageCuda(
         distillationWeight: result.distillationWeight,
         distillationOpportunity: result.distillationOpportunity,
         distillationSamples: testCase.valueOracle ? result.stateCount : 0,
+        strategyFinalEquity: testCase.valueOracle ? result.strategyFinalEquity : undefined,
+        oracleFinalEquity: testCase.valueOracle ? result.oracleFinalEquity : undefined,
+        strategyMaxDrawdown: testCase.valueOracle ? result.strategyMaxDrawdown : undefined,
+        oracleMaxDrawdown: testCase.valueOracle ? result.oracleMaxDrawdown : undefined,
+        strategyTurnover: testCase.valueOracle ? result.strategyTurnover : undefined,
+        oracleTurnover: testCase.valueOracle ? result.oracleTurnover : undefined,
         days: testCase.days,
         absoluteLags: [],
         signedLags: [],
@@ -2314,6 +2396,12 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     distillationWeight: distillation?.weightSum,
     distillationOpportunity: distillation?.opportunitySum,
     distillationSamples: distillation?.sampleCount,
+    strategyFinalEquity: distillation?.returns.strategy.equity,
+    oracleFinalEquity: distillation?.returns.oracle.equity,
+    strategyMaxDrawdown: distillation?.returns.strategy.maxDrawdown,
+    oracleMaxDrawdown: distillation?.returns.oracle.maxDrawdown,
+    strategyTurnover: distillation?.returns.strategy.turnover,
+    oracleTurnover: distillation?.returns.oracle.turnover,
     days: testCase.days,
   };
 }
@@ -2364,6 +2452,16 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
   const meanOpportunity = distillationSamples > 0
     ? sum(parts.map((part) => part.distillationOpportunity ?? 0)) / distillationSamples
     : null;
+  const strategyEquities = parts.flatMap((part) => part.strategyFinalEquity === undefined
+    ? [] : [part.strategyFinalEquity]);
+  const oracleEquities = parts.flatMap((part) => part.oracleFinalEquity === undefined
+    ? [] : [part.oracleFinalEquity]);
+  const strategyReturn = strategyEquities.length > 0 ? compoundEquity(strategyEquities) - 1 : null;
+  const oracleReturn = oracleEquities.length > 0 ? compoundEquity(oracleEquities) - 1 : null;
+  const strategyDrawdowns = parts.flatMap((part) => part.strategyMaxDrawdown === undefined
+    ? [] : [part.strategyMaxDrawdown]);
+  const oracleDrawdowns = parts.flatMap((part) => part.oracleMaxDrawdown === undefined
+    ? [] : [part.oracleMaxDrawdown]);
   return {
     caseId: first.caseId,
     scale: first.scale,
@@ -2377,6 +2475,12 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
     valueDistillationKl,
     oracleEntropy,
     meanOpportunity,
+    strategyReturn,
+    oracleReturn,
+    strategyMaxDrawdown: strategyDrawdowns.length > 0 ? Math.max(...strategyDrawdowns) : null,
+    oracleMaxDrawdown: oracleDrawdowns.length > 0 ? Math.max(...oracleDrawdowns) : null,
+    strategyTurnover: nullableSum(parts.map((part) => part.strategyTurnover ?? null)),
+    oracleTurnover: nullableSum(parts.map((part) => part.oracleTurnover ?? null)),
     precision,
     recall,
     f1,
@@ -2421,6 +2525,10 @@ function aggregate(scores: CaseScore[]): AggregateScore {
     valueDistillationLoss: nullableMedian(scores.map((score) => score.valueDistillationLoss)),
     valueDistillationKl: nullableMedian(scores.map((score) => score.valueDistillationKl)),
     meanOpportunity: nullableMedian(scores.map((score) => score.meanOpportunity)),
+    strategyReturn: nullableMedian(scores.map((score) => score.strategyReturn)),
+    oracleReturn: nullableMedian(scores.map((score) => score.oracleReturn)),
+    strategyMaxDrawdown: nullableMedian(scores.map((score) => score.strategyMaxDrawdown)),
+    oracleMaxDrawdown: nullableMedian(scores.map((score) => score.oracleMaxDrawdown)),
     precision: median(scores.map((score) => score.precision)),
     recall: median(scores.map((score) => score.recall)),
     f1: median(scores.map((score) => score.f1)),
@@ -2980,7 +3088,12 @@ function parseArgs(argv: string[]): Args {
     presetWindowIds: values.has("preset-window-ids")
       ? values.get("preset-window-ids")!.split(",").filter(Boolean)
       : undefined,
-    presetOutputPath: path.resolve(repoRoot, get("preset-output", "data/benchmarks/vw-kama-window-presets.json")),
+    presetOutputPath: path.resolve(repoRoot, get(
+      "preset-output",
+      mode === "per-window"
+        ? "data/benchmarks/vw-kama-window-presets.json"
+        : "data/benchmarks/vw-kama-global-presets.json",
+    )),
     top: integer(get("top", "6"), "top"),
     seed: integer(get("seed", "17"), "seed", 0),
     oracleFriction: nonNegative(get("oracle-friction", "0.00175"), "oracle-friction"),
@@ -3274,9 +3387,9 @@ function report(
     "",
     ...(config.objective === "value-distillation"
       ? [
-        "| candidate | scale/window | cross-entropy | KL | exp(-KL) | opportunity | signal score | agreement | signals/day |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
-        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
+        "| candidate | scale/window | cross-entropy | KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
       ]
       : [
         "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
@@ -3291,11 +3404,11 @@ function report(
 function resultTable(results: CandidateResult[], config: Args): string {
   if (config.objective === "value-distillation") {
     return [
-      "| family | id | strategy | robust CE | median CE | P90 CE | median KL | exp(-KL) | signal score | agreement | signals/day |",
-      "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+      "| family | id | strategy | robust CE | median CE | P90 CE | median KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | signal score | agreement | signals/day |",
+      "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
       ...results.map((result) => {
         const score = result.aggregate;
-        return `| ${result.candidate.family} | ${result.candidate.id} | ${result.candidate.agreementMode} | ${round(-score.objective, 5)} | ${round(-score.median, 5)} | ${round(-score.p10, 5)} | ${formatNullableNumber(score.valueDistillationKl)} | ${formatNullablePercent(score.valueDistillationScore)} | ${pct(score.signalScore)} | ${pct(score.exposureAgreement)} | ${round(score.signalsPerDay, 2)} |`;
+        return `| ${result.candidate.family} | ${result.candidate.id} | ${result.candidate.agreementMode} | ${round(-score.objective, 5)} | ${round(-score.median, 5)} | ${round(-score.p10, 5)} | ${formatNullableNumber(score.valueDistillationKl)} | ${formatNullablePercent(score.valueDistillationScore)} | ${formatNullablePercent(score.strategyReturn)} | ${formatNullablePercent(score.oracleReturn)} | ${formatNullablePercent(score.strategyMaxDrawdown)} | ${formatNullablePercent(score.oracleMaxDrawdown)} | ${pct(score.signalScore)} | ${pct(score.exposureAgreement)} | ${round(score.signalsPerDay, 2)} |`;
       }),
     ].join("\n");
   }
@@ -3430,6 +3543,14 @@ function eventRatio(value: number, total: number, oppositeTotal: number): number
 }
 function harmonic(a: number, b: number): number { return a + b > 0 ? 2 * a * b / (a + b) : 0; }
 function sum(values: number[]): number { return values.reduce((total, value) => total + value, 0); }
+function nullableSum(values: Array<number | null>): number | null {
+  const finite = values.flatMap((value) => value === null ? [] : [value]);
+  return finite.length > 0 ? sum(finite) : null;
+}
+function compoundEquity(values: number[]): number {
+  if (values.some((value) => value <= 0)) return 0;
+  return Math.exp(sum(values.map(Math.log)));
+}
 function mean(values: number[]): number { return values.length ? sum(values) / values.length : 0; }
 function unique<T>(values: T[]): T[] { return [...new Set(values)]; }
 function median(values: number[]): number { return percentile(values, 0.5); }

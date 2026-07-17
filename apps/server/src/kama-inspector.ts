@@ -7,6 +7,7 @@ import {
   evaluateVwKamaOracle,
   noiseSignalRatio,
   perfectMarginOracle,
+  prepareExposureValueOracle,
   vwKamaScore,
   VW_KAMA_SCORE_VERSION,
   type Candle,
@@ -24,6 +25,8 @@ import {
   type VwKamaParameters,
   type VwKamaPreset,
   type VwKamaTransition,
+  type ExposureReturnMetrics,
+  type ExposureValueOracle,
 } from "@trading/bot-algo";
 
 const DAY_MS = 86_400_000;
@@ -121,6 +124,17 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
   matchWindowMs: 2 * 3_600_000,
   timingHalfLifeMs: 10 * 60_000,
   warmupMultiple: 3,
+  valueDistillation: {
+    gridSize: 21,
+    minExposure: -1,
+    maxExposure: 1,
+    oracleTemperature: 0.01,
+    strategySigma: 0.15,
+    opportunityEpsilon: 0.000001,
+    quoteLendRate: 0,
+    quoteBorrowRate: 0,
+    assetBorrowRate: 0,
+  },
 };
 
 const GLOBAL_PRESETS: VwKamaPreset[] = [
@@ -203,6 +217,7 @@ interface CachedWindow {
   source: Promise<Candle[]>;
   scales: Map<number, Promise<Candle[][]>>;
   oracles: Map<string, Promise<PerfectMarginOracleResult>>;
+  valueOracles: Map<string, Promise<ExposureValueOracle>>;
 }
 
 type InspectorResult = VwKamaInspectorResponse | VwKamaCandleRangeResponse;
@@ -316,15 +331,22 @@ export class KamaInspectorEngine {
     for (const [index, candles] of segments.entries()) {
       const scoreStart = Math.max(selected.startTime, candles[0]!.openTime + (index > 0 ? warmupMs : 0));
       if (scoreStart >= selected.endTime || candles.at(-1)!.openTime < scoreStart) continue;
+      const scoreStartIndex = candleLowerBound(candles, scoreStart);
       const oracle = await this.oracle(cached, request, candles);
+      const valueOracle = await this.exposureOracle(cached, request, candles, scoreStartIndex);
       evaluated.push({
         candles,
         scoreStart,
         result: evaluateVwKamaOracle(candles, {
           ...request,
           scoreStartTime: scoreStart,
+          scoreStartIndex,
           maxPoints: Math.max(100, Math.floor(MAX_CHART_CANDLES / segments.length)),
           oracleResult: oracle,
+          valueDistillation: {
+            oracle: valueOracle,
+            strategySigma: request.valueDistillation!.strategySigma,
+          },
         }),
       });
     }
@@ -354,6 +376,7 @@ export class KamaInspectorEngine {
     );
     const renderedTimes = rendered.candles.map((candle) => candle.closeTime);
     const indicatorPoints: VwKamaIndicatorPoint[] = [];
+    const valueDistributions: VwKamaCandleRangeResponse["valueDistributions"] = [];
     const warmupMs = candidateWarmupMs(request);
     for (const [index, segment] of segments.entries()) {
       const firstTime = segment[0]?.closeTime;
@@ -367,14 +390,23 @@ export class KamaInspectorEngine {
         Math.max(selected.startTime, segment[0]!.openTime + (index > 0 ? warmupMs : 0)),
         candles.at(-1)!.openTime,
       );
+      const scoreStartIndex = candleLowerBound(segment, scoreStart);
       const oracle = await this.oracle(cached, request, segment);
-      indicatorPoints.push(...evaluateVwKamaOracle(candles, {
+      const valueOracle = await this.exposureOracle(cached, request, segment, scoreStartIndex);
+      const evaluation = evaluateVwKamaOracle(candles, {
         ...request,
         scoreStartTime: scoreStart,
+        scoreStartIndex,
         maxPoints: traceTimes.length,
         traceTimes,
         oracleResult: oracle,
-      }).indicatorPoints);
+        valueDistillation: {
+          oracle: valueOracle,
+          strategySigma: request.valueDistillation!.strategySigma,
+        },
+      });
+      indicatorPoints.push(...evaluation.indicatorPoints);
+      valueDistributions.push(...evaluation.valueDistributions);
     }
     indicatorPoints.sort((left, right) => left.time - right.time);
     return {
@@ -393,6 +425,7 @@ export class KamaInspectorEngine {
         points: indicatorPoints.map((point) => ({ time: point.time, value: point.kama })),
       },
       indicatorPoints,
+      valueDistributions: valueDistributions.sort((left, right) => left.time - right.time),
     };
   }
 
@@ -404,6 +437,7 @@ export class KamaInspectorEngine {
       source,
       scales: new Map<number, Promise<Candle[][]>>(),
       oracles: new Map<string, Promise<PerfectMarginOracleResult>>(),
+      valueOracles: new Map<string, Promise<ExposureValueOracle>>(),
     };
     source.catch(() => {
       if (this.cache === cached) this.cache = null;
@@ -441,6 +475,55 @@ export class KamaInspectorEngine {
       const oldest = cached.oracles.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       cached.oracles.delete(oldest);
+    }
+    return pending;
+  }
+
+  private exposureOracle(
+    cached: CachedWindow,
+    request: VwKamaInspectorRequest,
+    candles: Candle[],
+    scoreStartIndex: number,
+  ): Promise<ExposureValueOracle> {
+    const config = request.valueDistillation!;
+    const key = [
+      request.intervalMs,
+      candles[0]!.openTime,
+      candles.at(-1)!.closeTime,
+      scoreStartIndex,
+      request.oracleFriction,
+      config.gridSize,
+      config.minExposure,
+      config.maxExposure,
+      config.oracleTemperature,
+      config.opportunityEpsilon,
+      config.quoteLendRate,
+      config.quoteBorrowRate,
+      config.assetBorrowRate,
+    ].join(":");
+    const existing = cached.valueOracles.get(key);
+    if (existing) return existing;
+    const pending = Promise.resolve().then(() => prepareExposureValueOracle(
+      candles.map((candle) => candle.close),
+      {
+        scoreStartIndex,
+        friction: request.oracleFriction,
+        gridSize: config.gridSize,
+        minExposure: config.minExposure,
+        maxExposure: config.maxExposure,
+        temperature: config.oracleTemperature,
+        opportunityEpsilon: config.opportunityEpsilon,
+        quoteLendRate: config.quoteLendRate,
+        quoteBorrowRate: config.quoteBorrowRate,
+        assetBorrowRate: config.assetBorrowRate,
+        includeProbabilities: true,
+      },
+    ));
+    cached.valueOracles.set(key, pending);
+    while (cached.valueOracles.size > 4) {
+      const oldest = cached.valueOracles.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      cached.valueOracles.delete(oldest);
     }
     return pending;
   }
@@ -543,6 +626,7 @@ function combineEvaluations(
     item.candles.filter((candle) => candle.openTime >= item.scoreStart));
   const statePoints = results.flatMap((item) => item.statePoints);
   const indicatorPoints = results.flatMap((item) => item.indicatorPoints);
+  const valueDistributions = results.flatMap((item) => item.valueDistributions);
   const rendered = renderCandleRange(
     continuousSegments(scored, request.intervalMs),
     request.intervalMs,
@@ -573,6 +657,7 @@ function combineEvaluations(
     candidatePath: { points: candidatePath(evaluated) },
     statePoints,
     indicatorPoints,
+    valueDistributions,
     candidateTransitions,
     oracleTransitions,
   };
@@ -638,6 +723,18 @@ function combineMetrics(
   ) / candleCount;
   const lags = candidates.flatMap((item) => item.lagMs === null ? [] : [item.lagMs]);
   const absoluteLags = lags.map(Math.abs);
+  const valueParts = results.flatMap((item) => item.metrics.valueDistillation ?? []);
+  const distillationWeight = valueParts.reduce((sum, item) => sum + item.weightSum, 0);
+  const weightedCrossEntropy = valueParts.reduce(
+    (sum, item) => sum + item.weightedCrossEntropy,
+    0,
+  );
+  const weightedOracleEntropy = valueParts.reduce(
+    (sum, item) => sum + item.weightedOracleEntropy,
+    0,
+  );
+  const crossEntropy = distillationWeight > 0 ? weightedCrossEntropy / distillationWeight : 0;
+  const oracleEntropy = distillationWeight > 0 ? weightedOracleEntropy / distillationWeight : 0;
   return {
     score: vwKamaScore(f1, exposureAgreement, signalCleanliness),
     precision,
@@ -658,6 +755,42 @@ function combineMetrics(
     lagP90Ms: percentile(absoluteLags, 0.9),
     lagP95Ms: percentile(absoluteLags, 0.95),
     lagMedianSignedMs: percentile(lags, 0.5),
+    ...(valueParts.length > 0 ? {
+      valueDistillation: {
+        weightedCrossEntropy,
+        weightedOracleEntropy,
+        weightSum: distillationWeight,
+        opportunitySum: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0),
+        sampleCount: valueParts.reduce((sum, item) => sum + item.sampleCount, 0),
+        crossEntropy,
+        oracleEntropy,
+        klDivergence: Math.max(0, crossEntropy - oracleEntropy),
+        score: Math.exp(-Math.max(0, crossEntropy - oracleEntropy)),
+        meanOpportunity: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0)
+          / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
+        returns: {
+          oracle: combineExposureReturns(valueParts.map((item) => item.returns.oracle)),
+          strategy: combineExposureReturns(valueParts.map((item) => item.returns.strategy)),
+        },
+      },
+    } : {}),
+  };
+}
+
+function combineExposureReturns(parts: ExposureReturnMetrics[]): ExposureReturnMetrics {
+  const logReturn = parts.reduce((sum, item) => sum + item.logReturn, 0);
+  const equity = Math.exp(logReturn);
+  return {
+    equity,
+    exposure: parts.at(-1)?.exposure ?? 0,
+    peakEquity: Math.max(1, ...parts.map((item) => item.peakEquity)),
+    maxDrawdown: Math.max(0, ...parts.map((item) => item.maxDrawdown)),
+    turnover: parts.reduce((sum, item) => sum + item.turnover, 0),
+    rebalanceCount: parts.reduce((sum, item) => sum + item.rebalanceCount, 0),
+    liquidationCount: parts.reduce((sum, item) => sum + item.liquidationCount, 0),
+    sampleCount: parts.reduce((sum, item) => sum + item.sampleCount, 0),
+    totalReturn: equity - 1,
+    logReturn,
   };
 }
 
@@ -666,6 +799,10 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     throw new Error(`Unsupported VW-KAMA scale: ${input.intervalMs}`);
   }
   const request = structuredClone(input);
+  request.valueDistillation = {
+    ...DEFAULT_REQUEST.valueDistillation!,
+    ...request.valueDistillation,
+  };
   if (!["flat", "hold", "hysteresis"].includes(request.parameters.deadbandMode)) {
     throw new Error("VW-KAMA deadband mode must be flat, hold, or hysteresis.");
   }
@@ -792,6 +929,27 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   if (nonNegative.some((value) => !Number.isFinite(value) || value < 0)) {
     throw new Error("VW-KAMA thresholds and friction cannot be negative.");
   }
+  const valueConfig = request.valueDistillation;
+  if (!Number.isInteger(valueConfig.gridSize) || valueConfig.gridSize < 3 || valueConfig.gridSize > 101) {
+    throw new Error("VW-KAMA value grid size must be an integer from 3 to 101.");
+  }
+  if (!Number.isFinite(valueConfig.minExposure) || valueConfig.minExposure >= 0
+    || !Number.isFinite(valueConfig.maxExposure) || valueConfig.maxExposure <= 0) {
+    throw new Error("VW-KAMA value exposure bounds must contain zero.");
+  }
+  if (!Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
+    || !Number.isFinite(valueConfig.strategySigma) || valueConfig.strategySigma <= 0) {
+    throw new Error("VW-KAMA value temperature and strategy sigma must be positive.");
+  }
+  if ([
+    valueConfig.opportunityEpsilon,
+    valueConfig.quoteLendRate,
+    valueConfig.quoteBorrowRate,
+    valueConfig.assetBorrowRate,
+  ].some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error("VW-KAMA value costs and rates must be finite and non-negative.");
+  }
+  if (request.oracleFriction >= 1) throw new Error("VW-KAMA oracle friction must be less than one.");
   if (request.parameters.thresholdNoiseResponse === "inverse"
     && request.parameters.thresholdInverseMaxBpsHour > 0
     && (!Number.isFinite(request.parameters.thresholdInverseNoiseScaleBpsHour)

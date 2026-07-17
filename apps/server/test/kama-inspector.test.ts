@@ -24,6 +24,10 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(raw.candles.length, 5);
     assert.equal(raw.kamaSeries.points.length, raw.candles.length);
     assert.equal(raw.indicatorPoints.length, raw.candles.length);
+    assert.equal(raw.valueDistributions.length, raw.candles.length);
+    assert.ok(raw.valueDistributions.every((point) =>
+      Math.abs(point.values.reduce((sum, value) => sum + value.oracleProbability, 0) - 1) < 1e-6
+      && Math.abs(point.values.reduce((sum, value) => sum + value.strategyProbability, 0) - 1) < 1e-9));
     assert.deepEqual(
       raw.kamaSeries.points.map((point) => point.time),
       raw.candles.map((candle) => candle.closeTime),
@@ -113,6 +117,10 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     const analysis = await engine.analyze(analysisRequest());
     assert.equal(analysis.renderIntervalMs, 2_000);
     assert.ok(analysis.candles.length <= 2_000);
+    assert.ok(analysis.valueDistributions.length > 0);
+    assert.ok(analysis.metrics.valueDistillation);
+    assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.strategy.totalReturn));
+    assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.oracle.totalReturn));
     assert.equal(analysis.indicatorPoints.length, analysis.kamaSeries.points.length);
     assert.deepEqual(
       analysis.indicatorPoints.map((point) => point.time),

@@ -22,9 +22,15 @@ import type { TradingApi, TradingCandle } from "./trading-api.js";
 import { signalBeyondFriction } from "./signal-memory.js";
 import { KamaRateNoise } from "./kama-rate-noise.js";
 import {
+  createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
+  exposureValueOracleProbabilities,
+  finalizeExposureReturn,
   finalizeExposureValueDistillation,
+  observeExposureReturn,
   observeExposureValueDistillation,
+  strategyExposureProbabilities,
+  type ExposureReturnMetrics,
   type ExposureValueDistillationMetrics,
   type ExposureValueOracle,
 } from "./exposure-value-distillation.js";
@@ -108,6 +114,19 @@ export interface VwKamaInspectorRequest {
   matchWindowMs: number;
   timingHalfLifeMs: number;
   warmupMultiple: number;
+  valueDistillation?: VwKamaValueDistillationConfig;
+}
+
+export interface VwKamaValueDistillationConfig {
+  gridSize: number;
+  minExposure: number;
+  maxExposure: number;
+  oracleTemperature: number;
+  strategySigma: number;
+  opportunityEpsilon: number;
+  quoteLendRate: number;
+  quoteBorrowRate: number;
+  assetBorrowRate: number;
 }
 
 export interface VwKamaCandleRangeRequest extends VwKamaInspectorRequest {
@@ -126,6 +145,7 @@ export interface VwKamaCandleRangeResponse {
   candles: Candle[];
   kamaSeries: BacktestChartSmaSeries;
   indicatorPoints: VwKamaIndicatorPoint[];
+  valueDistributions: VwKamaValueDistributionPoint[];
 }
 
 export interface VwKamaInspectorCatalog {
@@ -157,6 +177,7 @@ export interface VwKamaPreset {
     refinementRounds: number;
     elapsedMs: number;
     hindsight: boolean;
+    valueDistillation?: VwKamaValueDistillationConfig;
   };
 }
 
@@ -202,7 +223,14 @@ export interface VwKamaAccuracyMetrics {
   lagP90Ms: number | null;
   lagP95Ms: number | null;
   lagMedianSignedMs: number | null;
-  valueDistillation?: ExposureValueDistillationMetrics;
+  valueDistillation?: VwKamaValueDistillationMetrics;
+}
+
+export interface VwKamaValueDistillationMetrics extends ExposureValueDistillationMetrics {
+  returns: {
+    oracle: ExposureReturnMetrics;
+    strategy: ExposureReturnMetrics;
+  };
 }
 
 export interface VwKamaStatePoint {
@@ -237,6 +265,23 @@ export interface VwKamaIndicatorPoint {
   rejectionReasons: VwKamaSignalRejectionReason[];
 }
 
+export interface VwKamaValueDistributionPoint {
+  time: number;
+  candidateExposure: number;
+  oracleMeanExposure: number;
+  oracleModalExposure: number;
+  oracleOptimalExposure: number;
+  strategyMeanExposure: number;
+  oracleEntropy: number;
+  opportunity: number;
+  crossEntropy: number;
+  values: Array<{
+    exposure: number;
+    oracleProbability: number;
+    strategyProbability: number;
+  }>;
+}
+
 export type VwKamaSignalRejectionReason =
   | "mean-reversion"
   | "ema-hard-gate"
@@ -262,9 +307,10 @@ export interface VwKamaInspectorResponse {
   indicatorPoints: VwKamaIndicatorPoint[];
   candidateTransitions: VwKamaTransition[];
   oracleTransitions: VwKamaTransition[];
+  valueDistributions: VwKamaValueDistributionPoint[];
 }
 
-export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "windowId"> {
+export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "windowId" | "valueDistillation"> {
   scoreStartTime: number;
   scoreStartIndex?: number;
   maxPoints?: number;
@@ -507,6 +553,7 @@ export function evaluateVwKamaOracle(
   const candidateTransitions: VwKamaTransition[] = [];
   const points: BacktestOraclePoint[] = [];
   const indicatorPoints: VwKamaIndicatorPoint[] = [];
+  const valueDistributions: VwKamaValueDistributionPoint[] = [];
   const kamaSeries: BacktestChartSmaSeries = {
     index: -1,
     windowSec: options.parameters.slowMs / 1_000,
@@ -535,6 +582,12 @@ export function evaluateVwKamaOracle(
   let stateCredit = 0;
   const valueDistillation = options.valueDistillation
     ? createExposureValueDistillationAccumulator()
+    : null;
+  const valueReturns = options.valueDistillation
+    ? {
+        oracle: createExposureReturnAccumulator(),
+        strategy: createExposureReturnAccumulator(),
+      }
     : null;
   const signalFriction = options.oracleFriction
     * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
@@ -717,6 +770,24 @@ export function evaluateVwKamaOracle(
           candidateExposure,
           options.valueDistillation.strategySigma,
         );
+        if (valueReturns && index + 1 < candles.length) {
+          const price = closeAt(candles, index);
+          const nextPrice = closeAt(candles, index + 1);
+          observeExposureReturn(
+            valueReturns.strategy,
+            candidateExposure,
+            price,
+            nextPrice,
+            options.valueDistillation.oracle.execution,
+          );
+          observeExposureReturn(
+            valueReturns.oracle,
+            options.valueDistillation.oracle.optimalExposures[index]!,
+            price,
+            nextPrice,
+            options.valueDistillation.oracle.execution,
+          );
+        }
       }
     }
     if (candidateStates) candidateStates[index] = current;
@@ -766,6 +837,15 @@ export function evaluateVwKamaOracle(
         signalIntent,
         rejectionReasons,
       });
+      if (options.valueDistillation?.oracle.probabilities) {
+        valueDistributions.push(valueDistributionPoint(
+          candle.closeTime,
+          index,
+          candidateExposure,
+          options.valueDistillation.oracle,
+          options.valueDistillation.strategySigma,
+        ));
+      }
       if (points.at(-1)?.time !== candle.closeTime) points.push(statePoint(candle, current, current));
     }
   }
@@ -807,8 +887,14 @@ export function evaluateVwKamaOracle(
     lagP90Ms: percentile(absoluteLags, 0.9),
     lagP95Ms: percentile(absoluteLags, 0.95),
     lagMedianSignedMs: percentile(lags, 0.5),
-    ...(valueDistillation
-      ? { valueDistillation: finalizeExposureValueDistillation(valueDistillation) }
+    ...(valueDistillation && valueReturns
+      ? { valueDistillation: {
+          ...finalizeExposureValueDistillation(valueDistillation),
+          returns: {
+            oracle: finalizeExposureReturn(valueReturns.oracle),
+            strategy: finalizeExposureReturn(valueReturns.strategy),
+          },
+        } }
       : {}),
   };
   const scoredStartTime = closeTimeAt(candles, scoreStart);
@@ -854,8 +940,47 @@ export function evaluateVwKamaOracle(
     candidatePath: { points: includeTrace ? points.sort((left, right) => left.time - right.time) : [] },
     statePoints,
     indicatorPoints,
+    valueDistributions,
     candidateTransitions,
     oracleTransitions: oracleTransitions as VwKamaTransition[],
+  };
+}
+
+function valueDistributionPoint(
+  time: number,
+  candleIndex: number,
+  candidateExposure: number,
+  oracle: ExposureValueOracle,
+  strategySigma: number,
+): VwKamaValueDistributionPoint {
+  const oracleProbabilities = exposureValueOracleProbabilities(oracle, candleIndex);
+  const strategyProbabilities = strategyExposureProbabilities(
+    oracle.grid,
+    candidateExposure,
+    strategySigma,
+  );
+  let strategyMeanExposure = 0;
+  let crossEntropy = 0;
+  const values = Array.from(oracle.grid, (exposure, index) => {
+    const oracleProbability = oracleProbabilities[index]!;
+    const strategyProbability = strategyProbabilities[index]!;
+    strategyMeanExposure += strategyProbability * exposure;
+    if (oracleProbability > 0) {
+      crossEntropy -= oracleProbability * Math.log(Math.max(Number.MIN_VALUE, strategyProbability));
+    }
+    return { exposure, oracleProbability, strategyProbability };
+  });
+  return {
+    time,
+    candidateExposure,
+    oracleMeanExposure: oracle.means[candleIndex]!,
+    oracleModalExposure: oracle.modalExposures[candleIndex]!,
+    oracleOptimalExposure: oracle.optimalExposures[candleIndex]!,
+    strategyMeanExposure,
+    oracleEntropy: oracle.entropies[candleIndex]!,
+    opportunity: oracle.opportunities[candleIndex]!,
+    crossEntropy,
+    values,
   };
 }
 
