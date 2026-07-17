@@ -128,3 +128,74 @@ npm run build -w @trading/server -w @trading/bot-algo -w @trading/web
 it looks like the state transition chart below the main graph is not accurate and can miss some transitions.
 
 this https://chatgpt.com/c/6a538661-de74-83ed-9f46-856d994d4031
+
+get evaluation closer to this
+https://chatgpt.com/c/6a58d7b3-dd44-83eb-b172-a7aec93cf050
+https://chatgpt.com/c/6a58fb11-2eb0-83ed-8bfb-807dca191a58
+https://chatgpt.com/c/6a58fd5c-bda4-83eb-bd94-3d7c853ac950
+
+we need to adjust the oracle evaluation:
+1. for a given window and a point in it, it should generate a range of returns based on some initial exposure, lets call that Q_t(a), the window is implied. Currently it is as if we assume 0 initial exposure, but in general it can be any other value. That models "picking up" from whatever is the current state, not just from clean quote-only portfolio. that matters because moving money back incurs friction. Or rather there should simply be a procedure to do this computation for a given interval and exposure, it can even be defined recursively/iteratively. You could also interpret it as forcing the exposure a at time t and then computing oracle's perfect return afterwards. 
+   1. For that lets define a few common sequences: P_t is the price at time t, r_t=P_t/P_{t-1}-1 is the return at time t, E_t is the equity at time t
+   2. E_t can be defined as evolution of simple portfolio with the quote and asset j_t=(q_t,u_t). Then mark-to-market value is y_t=u_t*P_t and E_t=q_t+y_t is the total equity at time t.
+   3. f_t here is the friction term, generally accounting for fees, slippage, etc. at time t.
+   4. based on j_t we also define exposure to the asset as a_t=y_t/E_t
+   5. The evolution of j_t is defined as the recurrence over (q,u,a,P,f) tuple: 
+      1. Rebalancing phase
+         1. Assume we are buying the asset. 
+            1. dq is the cost and du is the received amount. that means du=(1-f)*dq/P
+            2. the equity then is E^+_t=E-f*dq
+            3. and with y^+_t=P\*u+(1-f)*dq
+            4. we get dq=(a\*E-P\*u)/(1-f+f*a)
+            5. that is true when (a\*E-P\*u)>0
+         2. Assume we are selling the asset. 
+            1. du is the cost and dq is the received amount. that means dq=P\*(1-f)\*du
+            2. the equity then is E^+_t=E-f\*P\*du
+            3. and with y^+_t=P\*(u-du)
+            4. we get du=(P\*u-a\*E)/(P*(1-f*a))
+            5. that is true when (a\*E-P\*u)<0
+      2. Maintenance phase:
+         1. define [x]=max(0,x)
+         2. q^-_{t+1}=(1+r_lend)\*[q^+_t]-(1+r_borrow)\*[-q^+_t]
+         3. u^-_{t+1}=[u^+_t]-(1+r_borrow)\*[-u^+_t]
+      3. Liquidation phase:
+         1. u_liq=(1-f_{t+1})y^-\_{t+1} if u^-_{t+1}>0 and u_liq=y^-\_{t+1}/(1-f_{t+1}) if u^-_{t+1}<0
+         2. E_liq=q^-_{t+1}+u_liq
+         3. a_eff=u_liq/E_liq
+         4. Liquidated when abs(a_eff)>L_max or E_liq<=0
+         5. alternatively, liquidated when maintenance margin ratio E_liq/abs(u_liq) is less than 1/L_max
+         6. L_max is max effective leverage.
+         7. If liquidated, u_{t+1}=0 and q_{t+1}=E_liq
+         8. otherwise u_{t+1}=u^-_{t+1} and q_{t+1}=q^-_{t+1}
+   6. The oracle defines exposure based on the future returns:
+      1. a_t=L^+ if r_t>0 and a_t=-L^- if r_t<0
+   7. Then the definition for oracle's return is simply the log return over initial and final equity:
+      1. Q_t(a)=ln E_T/E_t
+   8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
+   9. bellman equation???
+2. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
+3. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
+   1. R_t(a) = max_A(Q_t(A)) - Q_t(a)
+   2. This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
+   3. we also might want to compute regret of waiting until t'>t:
+   4. Rw_t(a, t')=R_t(a)-R_t'(a)
+4. p_t(a) is the oracle's preference for the exposure a at time t.
+   1. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
+5. we compute objective as oracle value distillation over all example windows
+   1. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
+   2. w_t=W_t/sum(W_t)
+   3. W_t=eps+R_t(a_t)/median_a(R_t(a)) 
+   4. or W_t=max_A(Q_t(a))-min_A(Q_t(a))
+6. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence. 
+7. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price. 
+   1. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing. 
+   2. it generally just outputs what is the preferred final state of the bot state (exposure and pending order), and then execution engine calculates the actual actions needed to achieve that from current state. 
+   3.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute. 
+   4.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
+   5.  but this idea is for future iterations, not for now.
+
+
+1. what would be needed to move current strategy/signal to a backprop based learning engine? can we efficiently mix it with current genetic approach? In principal i think its possible, we just need to replace all discrete decisions with continuous ones based on soft function like sigmoid.
+9. can we adapt the current strategy to the framework that was developed? that will predict action preference instead of a single action.
+10. maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
+11. train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.

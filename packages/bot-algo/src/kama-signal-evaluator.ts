@@ -21,6 +21,13 @@ import type {
 import type { TradingApi, TradingCandle } from "./trading-api.js";
 import { signalBeyondFriction } from "./signal-memory.js";
 import { KamaRateNoise } from "./kama-rate-noise.js";
+import {
+  createExposureValueDistillationAccumulator,
+  finalizeExposureValueDistillation,
+  observeExposureValueDistillation,
+  type ExposureValueDistillationMetrics,
+  type ExposureValueOracle,
+} from "./exposure-value-distillation.js";
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -143,6 +150,7 @@ export interface VwKamaPreset {
   incumbentScore?: number;
   optimization?: {
     algorithm: "random" | "de";
+    objective?: "signal" | "value-distillation";
     population: number;
     generations: number;
     restarts: number;
@@ -194,6 +202,7 @@ export interface VwKamaAccuracyMetrics {
   lagP90Ms: number | null;
   lagP95Ms: number | null;
   lagMedianSignedMs: number | null;
+  valueDistillation?: ExposureValueDistillationMetrics;
 }
 
 export interface VwKamaStatePoint {
@@ -263,6 +272,10 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   oracleResult?: PerfectMarginOracleResult;
   preparedOracle?: VwKamaPreparedOracle;
   includeTrace?: boolean;
+  valueDistillation?: {
+    oracle: ExposureValueOracle;
+    strategySigma: number;
+  };
 }
 
 export interface VwKamaCandleColumns {
@@ -520,6 +533,9 @@ export function evaluateVwKamaOracle(
   let smoothedRateChange = 0;
   let distanceNoise = 0;
   let stateCredit = 0;
+  const valueDistillation = options.valueDistillation
+    ? createExposureValueDistillationAccumulator()
+    : null;
   const signalFriction = options.oracleFriction
     * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
 
@@ -693,6 +709,15 @@ export function evaluateVwKamaOracle(
         candidateExposure,
         exposureFromCode(oracleStateCodes[index] ?? 0),
       );
+      if (valueDistillation && options.valueDistillation) {
+        observeExposureValueDistillation(
+          valueDistillation,
+          options.valueDistillation.oracle,
+          index,
+          candidateExposure,
+          options.valueDistillation.strategySigma,
+        );
+      }
     }
     if (candidateStates) candidateStates[index] = current;
     if (candidateExposures) candidateExposures[index] = candidateExposure;
@@ -782,6 +807,9 @@ export function evaluateVwKamaOracle(
     lagP90Ms: percentile(absoluteLags, 0.9),
     lagP95Ms: percentile(absoluteLags, 0.95),
     lagMedianSignedMs: percentile(lags, 0.5),
+    ...(valueDistillation
+      ? { valueDistillation: finalizeExposureValueDistillation(valueDistillation) }
+      : {}),
   };
   const scoredStartTime = closeTimeAt(candles, scoreStart);
   const oraclePoints = includeTrace ? slicePath(oracleResult!.path.points, scoredStartTime) : [];

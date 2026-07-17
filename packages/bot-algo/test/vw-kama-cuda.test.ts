@@ -7,6 +7,7 @@ import {
   type VwKamaParameters,
 } from "../src/kama-signal-evaluator.js";
 import { perfectMarginOracle } from "../src/perfect-margin-oracle.js";
+import { prepareExposureValueOracle } from "../src/exposure-value-distillation.js";
 import type { TradingCandle } from "../src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
@@ -33,6 +34,12 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
   const columns = columnarVwKamaCandles(candles);
   const prepared = prepareVwKamaOracle(columns, scoreStartIndex, oracle);
   const candidates = [baseParameters(), featureParameters()];
+  const valueOracle = prepareExposureValueOracle(candles.map((candle) => candle.close), {
+    scoreStartIndex,
+    friction: 0.00175,
+    gridSize: 21,
+    temperature: 0.01,
+  });
   const common = {
     intervalMs: MINUTE,
     scoreStartIndex,
@@ -40,6 +47,7 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     matchWindowMs: 2 * 60 * MINUTE,
     timingHalfLifeMs: 10 * MINUTE,
     warmupMultiple: 3,
+    valueDistillation: { oracle: valueOracle, strategySigma: 0.15 },
   };
   const gpu = await evaluateVwKamaCudaBatch(columns, prepared, candidates, common);
   assert.equal(gpu.length, candidates.length);
@@ -59,6 +67,14 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     assert.ok(
       transitionDrift <= Math.max(3, cpu.metrics.signalCount * 0.08),
       `candidate ${index} transition count drifted by ${transitionDrift}`,
+    );
+    const cpuDistillation = cpu.metrics.valueDistillation!;
+    const gpuCrossEntropy = gpu[index]!.distillationWeightedCrossEntropy
+      / gpu[index]!.distillationWeight;
+    assert.ok(
+      Math.abs(gpuCrossEntropy - cpuDistillation.crossEntropy)
+        <= Math.max(0.02, cpuDistillation.crossEntropy * 0.05),
+      `candidate ${index} value-distillation loss drifted`,
     );
   }
 });

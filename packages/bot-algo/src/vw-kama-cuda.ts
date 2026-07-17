@@ -6,9 +6,10 @@ import type {
   VwKamaParameters,
   VwKamaPreparedOracle,
 } from "./kama-signal-evaluator.js";
+import type { ExposureValueOracle } from "./exposure-value-distillation.js";
 
 const PARAMETER_SIZE = 196;
-const RESULT_SIZE = 72;
+const RESULT_SIZE = 104;
 const INT_PARAMETER_COUNT = 20;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
@@ -26,12 +27,21 @@ interface NativeCuda {
     close: Float64Array,
     volume: Float64Array,
     oracleCodes: Uint8Array,
+    valueMeans: Float32Array | null,
+    valueSecondMoments: Float32Array | null,
+    valueEntropies: Float32Array | null,
+    valueWeights: Float32Array | null,
+    valueOpportunities: Float32Array | null,
     candleCount: number,
     scoreStart: number,
     intervalMs: number,
     oracleFriction: number,
     matchWindowMs: number,
     timingHalfLifeMs: number,
+    valueGridSize: number,
+    valueGridMinimum: number,
+    valueGridMaximum: number,
+    strategySigma: number,
     parameters: Buffer,
     candidateCount: number,
     output: Buffer,
@@ -45,6 +55,10 @@ export interface VwKamaCudaBatchOptions {
   matchWindowMs: number;
   timingHalfLifeMs: number;
   warmupMultiple: number;
+  valueDistillation?: {
+    oracle: ExposureValueOracle;
+    strategySigma: number;
+  };
 }
 
 export interface VwKamaCudaCaseResult {
@@ -55,6 +69,10 @@ export interface VwKamaCudaCaseResult {
   lagP95Ms: number | null;
   lagMedianSignedMs: number | null;
   elapsedMs: number;
+  distillationWeightedCrossEntropy: number;
+  distillationWeightedOracleEntropy: number;
+  distillationWeight: number;
+  distillationOpportunity: number;
   stateCount: number;
   signalCount: number;
   oracleCount: number;
@@ -107,6 +125,16 @@ export async function evaluateVwKamaCudaBatch(
   if (oracle.stateCodes.length < candles.length) {
     throw new Error("VW-KAMA CUDA oracle states do not cover the candle columns.");
   }
+  const valueDistillation = options.valueDistillation;
+  if (valueDistillation && (
+    valueDistillation.oracle.means.length < candles.length
+    || valueDistillation.oracle.secondMoments.length < candles.length
+    || valueDistillation.oracle.entropies.length < candles.length
+    || valueDistillation.oracle.weights.length < candles.length
+    || valueDistillation.oracle.opportunities.length < candles.length
+  )) {
+    throw new Error("VW-KAMA CUDA value oracle does not cover the candle columns.");
+  }
   const native = await loadNative();
   const parameterBuffer = Buffer.alloc(candidates.length * PARAMETER_SIZE);
   for (let index = 0; index < candidates.length; index += 1) {
@@ -120,12 +148,21 @@ export async function evaluateVwKamaCudaBatch(
     candles.close,
     candles.volume,
     oracle.stateCodes,
+    valueDistillation?.oracle.means ?? null,
+    valueDistillation?.oracle.secondMoments ?? null,
+    valueDistillation?.oracle.entropies ?? null,
+    valueDistillation?.oracle.weights ?? null,
+    valueDistillation?.oracle.opportunities ?? null,
     candles.length,
     options.scoreStartIndex,
     options.intervalMs,
     options.oracleFriction,
     options.matchWindowMs,
     options.timingHalfLifeMs,
+    valueDistillation?.oracle.grid.length ?? 0,
+    valueDistillation?.oracle.grid[0] ?? 0,
+    valueDistillation?.oracle.grid[valueDistillation.oracle.grid.length - 1] ?? 0,
+    valueDistillation?.strategySigma ?? 0,
     parameterBuffer,
     candidates.length,
     output,
@@ -155,7 +192,9 @@ async function loadNative(): Promise<NativeCuda> {
       resultSize: library.func("int vw_kama_cuda_result_size()"),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer,
         "int", "int", "double", "double", "double", "double",
+        "int", "double", "double", "double",
         pointer, "int", pointer,
       ]),
     };
@@ -257,10 +296,14 @@ function readResult(buffer: Buffer, offset: number): VwKamaCudaCaseResult {
     lagP95Ms: nullable(buffer.readDoubleLE(offset + 32)),
     lagMedianSignedMs: nullable(buffer.readDoubleLE(offset + 40)),
     elapsedMs: buffer.readDoubleLE(offset + 48),
-    stateCount: buffer.readInt32LE(offset + 56),
-    signalCount: buffer.readInt32LE(offset + 60),
-    oracleCount: buffer.readInt32LE(offset + 64),
-    matchedCount: buffer.readInt32LE(offset + 68),
+    distillationWeightedCrossEntropy: buffer.readDoubleLE(offset + 56),
+    distillationWeightedOracleEntropy: buffer.readDoubleLE(offset + 64),
+    distillationWeight: buffer.readDoubleLE(offset + 72),
+    distillationOpportunity: buffer.readDoubleLE(offset + 80),
+    stateCount: buffer.readInt32LE(offset + 88),
+    signalCount: buffer.readInt32LE(offset + 92),
+    oracleCount: buffer.readInt32LE(offset + 96),
+    matchedCount: buffer.readInt32LE(offset + 100),
   };
 }
 

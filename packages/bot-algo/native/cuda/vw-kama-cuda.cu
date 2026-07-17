@@ -77,17 +77,25 @@ struct VwKamaResult {
   double lag_p95_ms;
   double lag_median_signed_ms;
   double elapsed_ms;
+  double distillation_weighted_cross_entropy;
+  double distillation_weighted_oracle_entropy;
+  double distillation_weight;
+  double distillation_opportunity;
   int32_t state_count;
   int32_t signal_count;
   int32_t oracle_count;
   int32_t matched_count;
 };
 
-static_assert(sizeof(VwKamaResult) == 72, "VwKamaResult ABI changed");
+static_assert(sizeof(VwKamaResult) == 104, "VwKamaResult ABI changed");
 
 struct DeviceResult {
   float state_credit;
   int32_t signal_count;
+  double distillation_weighted_cross_entropy;
+  double distillation_weighted_oracle_entropy;
+  double distillation_weight;
+  double distillation_opportunity;
 };
 
 struct Transition {
@@ -287,10 +295,19 @@ __global__ void evaluate_kernel(
   const float* close,
   const float* volume,
   const uint8_t* oracle_codes,
+  const float* value_means,
+  const float* value_second_moments,
+  const float* value_entropies,
+  const float* value_weights,
+  const float* value_opportunities,
   int candle_count,
   int score_start,
   float interval_ms,
   float oracle_friction,
+  int value_grid_size,
+  float value_grid_minimum,
+  float value_grid_maximum,
+  float strategy_sigma,
   const VwKamaParams* parameters,
   int candidate_count,
   float* changes,
@@ -407,6 +424,17 @@ __global__ void evaluate_kernel(
   bool has_last_signal = false;
   float state_credit = 0.0f;
   int signal_count = 0;
+  double distillation_weighted_cross_entropy = 0.0;
+  double distillation_weighted_oracle_entropy = 0.0;
+  double distillation_weight = 0.0;
+  double distillation_opportunity = 0.0;
+  const bool distillation_enabled = value_grid_size >= 3
+    && strategy_sigma > 0.0f
+    && value_means
+    && value_second_moments
+    && value_entropies
+    && value_weights
+    && value_opportunities;
 
   for (int index = feed_start; index < candle_count; ++index) {
     const float price = close[index];
@@ -679,12 +707,55 @@ __global__ void evaluate_kernel(
         exposure,
         state_from_code(oracle_codes[index])
       );
+      if (distillation_enabled) {
+        const float center = clamp_value(exposure, value_grid_minimum, value_grid_maximum);
+        const float inverse_two_variance = 1.0f / (2.0f * strategy_sigma * strategy_sigma);
+        float maximum_log_weight = -3.402823466e38F;
+        for (int grid_index = 0; grid_index < value_grid_size; ++grid_index) {
+          const float grid_exposure = value_grid_minimum
+            + static_cast<float>(grid_index) / static_cast<float>(value_grid_size - 1)
+              * (value_grid_maximum - value_grid_minimum);
+          const float difference = grid_exposure - center;
+          maximum_log_weight = fmaxf(
+            maximum_log_weight,
+            -difference * difference * inverse_two_variance
+          );
+        }
+        float normalizer = 0.0f;
+        for (int grid_index = 0; grid_index < value_grid_size; ++grid_index) {
+          const float grid_exposure = value_grid_minimum
+            + static_cast<float>(grid_index) / static_cast<float>(value_grid_size - 1)
+              * (value_grid_maximum - value_grid_minimum);
+          const float difference = grid_exposure - center;
+          normalizer += expf(
+            -difference * difference * inverse_two_variance - maximum_log_weight
+          );
+        }
+        const float log_normalizer = maximum_log_weight + logf(normalizer);
+        const float expected_squared_distance = fmaxf(
+          0.0f,
+          value_second_moments[index]
+            - 2.0f * center * value_means[index]
+            + center * center
+        );
+        const float cross_entropy = log_normalizer
+          + expected_squared_distance * inverse_two_variance;
+        const float weight = value_weights[index];
+        distillation_weighted_cross_entropy += static_cast<double>(weight * cross_entropy);
+        distillation_weighted_oracle_entropy += static_cast<double>(weight * value_entropies[index]);
+        distillation_weight += static_cast<double>(weight);
+        distillation_opportunity += static_cast<double>(value_opportunities[index]);
+      }
     }
   }
 
   if (!write_transitions) {
     results[candidate].state_credit = state_credit;
     results[candidate].signal_count = signal_count;
+    results[candidate].distillation_weighted_cross_entropy = distillation_weighted_cross_entropy;
+    results[candidate].distillation_weighted_oracle_entropy = distillation_weighted_oracle_entropy;
+    results[candidate].distillation_weight = distillation_weight;
+    results[candidate].distillation_opportunity = distillation_opportunity;
   }
 }
 
@@ -850,12 +921,21 @@ extern "C" int vw_kama_cuda_evaluate(
   const double* close,
   const double* volume,
   const uint8_t* oracle_codes,
+  const float* value_means,
+  const float* value_second_moments,
+  const float* value_entropies,
+  const float* value_weights,
+  const float* value_opportunities,
   int candle_count,
   int score_start,
   double interval_ms,
   double oracle_friction,
   double match_window_ms,
   double timing_half_life_ms,
+  int value_grid_size,
+  double value_grid_minimum,
+  double value_grid_maximum,
+  double strategy_sigma,
   const void* parameter_data,
   int candidate_count,
   void* output_data
@@ -869,6 +949,19 @@ extern "C" int vw_kama_cuda_evaluate(
     }
     if (interval_ms <= 0 || match_window_ms < 0 || timing_half_life_ms <= 0) {
       throw std::runtime_error("VW-KAMA CUDA received invalid timing options");
+    }
+    const bool distillation_enabled = value_grid_size >= 3;
+    if (distillation_enabled && (
+      !value_means
+      || !value_second_moments
+      || !value_entropies
+      || !value_weights
+      || !value_opportunities
+      || value_grid_minimum >= 0
+      || value_grid_maximum <= 0
+      || strategy_sigma <= 0
+    )) {
+      throw std::runtime_error("VW-KAMA CUDA received invalid value-distillation inputs");
     }
     const auto* parameters = static_cast<const VwKamaParams*>(parameter_data);
     auto* output = static_cast<VwKamaResult*>(output_data);
@@ -903,6 +996,11 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<float> device_close(candle_count);
     DeviceBuffer<float> device_volume(candle_count);
     DeviceBuffer<uint8_t> device_oracle(candle_count);
+    DeviceBuffer<float> device_value_means(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_second_moments(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_entropies(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_weights(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_opportunities(distillation_enabled ? candle_count : 0);
     DeviceBuffer<VwKamaParams> device_parameters(candidate_count);
     DeviceBuffer<float> device_changes(
       static_cast<size_t>(candidate_count) * max_efficiency_period * 2
@@ -913,6 +1011,13 @@ extern "C" int vw_kama_cuda_evaluate(
     cuda_check(cudaMemcpy(device_close.get(), host_close.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy close");
     cuda_check(cudaMemcpy(device_volume.get(), host_volume.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy volume");
     cuda_check(cudaMemcpy(device_oracle.get(), oracle_codes, candle_count, cudaMemcpyHostToDevice), "copy oracle");
+    if (distillation_enabled) {
+      cuda_check(cudaMemcpy(device_value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value means");
+      cuda_check(cudaMemcpy(device_value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value second moments");
+      cuda_check(cudaMemcpy(device_value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value entropies");
+      cuda_check(cudaMemcpy(device_value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value weights");
+      cuda_check(cudaMemcpy(device_value_opportunities.get(), value_opportunities, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value opportunities");
+    }
     cuda_check(cudaMemcpy(
       device_parameters.get(),
       parameters,
@@ -934,10 +1039,19 @@ extern "C" int vw_kama_cuda_evaluate(
       device_close.get(),
       device_volume.get(),
       device_oracle.get(),
+      device_value_means.get(),
+      device_value_second_moments.get(),
+      device_value_entropies.get(),
+      device_value_weights.get(),
+      device_value_opportunities.get(),
       candle_count,
       score_start,
       static_cast<float>(interval_ms),
       static_cast<float>(oracle_friction),
+      value_grid_size,
+      static_cast<float>(value_grid_minimum),
+      static_cast<float>(value_grid_maximum),
+      static_cast<float>(strategy_sigma),
       device_parameters.get(),
       candidate_count,
       device_changes.get(),
@@ -977,10 +1091,19 @@ extern "C" int vw_kama_cuda_evaluate(
         device_close.get(),
         device_volume.get(),
         device_oracle.get(),
+        device_value_means.get(),
+        device_value_second_moments.get(),
+        device_value_entropies.get(),
+        device_value_weights.get(),
+        device_value_opportunities.get(),
         candle_count,
         score_start,
         static_cast<float>(interval_ms),
         static_cast<float>(oracle_friction),
+        value_grid_size,
+        static_cast<float>(value_grid_minimum),
+        static_cast<float>(value_grid_maximum),
+        static_cast<float>(strategy_sigma),
         device_parameters.get(),
         candidate_count,
         device_changes.get(),
@@ -1048,6 +1171,10 @@ extern "C" int vw_kama_cuda_evaluate(
         percentile(absolute_lags, 0.95),
         percentile(alignment.signed_lags, 0.5),
         static_cast<double>(elapsed_ms),
+        host_results[candidate].distillation_weighted_cross_entropy,
+        host_results[candidate].distillation_weighted_oracle_entropy,
+        host_results[candidate].distillation_weight,
+        host_results[candidate].distillation_opportunity,
         candle_count - score_start,
         host_results[candidate].signal_count,
         static_cast<int32_t>(oracle_transitions.size()),

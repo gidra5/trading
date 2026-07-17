@@ -3,13 +3,19 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { fork } from "node:child_process";
-import { availableParallelism } from "node:os";
+import { availableParallelism, cpus } from "node:os";
 import {
   isMainThread,
   parentPort,
   Worker,
   workerData,
 } from "node:worker_threads";
+import {
+  exposureValueOracleBytes,
+  prepareExposureValueOracle,
+  shareExposureValueOracle,
+  type ExposureValueOracle,
+} from "../packages/bot-algo/src/exposure-value-distillation.js";
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
@@ -45,6 +51,7 @@ type ConfirmationMask = typeof CONFIRMATION_MASKS[number];
 type SearchAlgorithm = "random" | "de";
 type SearchMode = "standard" | "per-window";
 type Accelerator = "auto" | "cpu" | "cuda";
+type SearchObjective = "signal" | "value-distillation";
 type ScoreVersion = typeof VW_KAMA_SCORE_VERSION;
 
 interface Window { label: string; start: number; end: number }
@@ -72,7 +79,17 @@ interface Args {
   screenScales: number[];
   workers: number;
   accelerator: Accelerator;
+  objective: SearchObjective;
   scoreVersion: ScoreVersion;
+  exposureGridSize: number;
+  exposureMinimum: number;
+  exposureMaximum: number;
+  oracleTemperature: number;
+  strategySigma: number;
+  opportunityEpsilon: number;
+  quoteLendRate: number;
+  quoteBorrowRate: number;
+  assetBorrowRate: number;
   seedCandidatePaths: string[];
   presetWindowIds?: string[];
   presetOutputPath: string;
@@ -187,6 +204,7 @@ interface CaseData {
   scoreStart: number;
   oracle?: PerfectMarginOracleResult;
   preparedOracle?: VwKamaPreparedOracle;
+  valueOracle?: ExposureValueOracle;
   days: number;
 }
 
@@ -203,6 +221,12 @@ interface CaseScore {
   scale: string;
   window: string;
   score: number;
+  signalScore: number;
+  valueDistillationScore: number | null;
+  valueDistillationLoss: number | null;
+  valueDistillationKl: number | null;
+  oracleEntropy: number | null;
+  meanOpportunity: number | null;
   precision: number;
   recall: number;
   f1: number;
@@ -230,6 +254,11 @@ interface CaseStats {
   oracleCount: number;
   stateCredit: number;
   stateCount: number;
+  distillationWeightedCrossEntropy?: number;
+  distillationWeightedOracleEntropy?: number;
+  distillationWeight?: number;
+  distillationOpportunity?: number;
+  distillationSamples?: number;
   days: number;
   absoluteLags: number[];
   signedLags: number[];
@@ -243,6 +272,11 @@ interface AggregateScore {
   objective: number;
   median: number;
   p10: number;
+  signalScore: number;
+  valueDistillationScore: number | null;
+  valueDistillationLoss: number | null;
+  valueDistillationKl: number | null;
+  meanOpportunity: number | null;
   precision: number;
   recall: number;
   f1: number;
@@ -411,6 +445,17 @@ async function run(config: Args): Promise<void> {
     },
     workers: config.workers,
     accelerator: config.accelerator,
+    objective: config.objective,
+    valueDistillation: {
+      exposureGridSize: config.exposureGridSize,
+      exposureRange: [config.exposureMinimum, config.exposureMaximum],
+      oracleTemperature: config.oracleTemperature,
+      strategySigma: config.strategySigma,
+      opportunityWeight: `max(Q)-min(Q)+${config.opportunityEpsilon}`,
+      quoteLendRate: config.quoteLendRate,
+      quoteBorrowRate: config.quoteBorrowRate,
+      assetBorrowRate: config.assetBorrowRate,
+    },
     warmStart: {
       files: config.seedCandidatePaths.map((file) => path.relative(repoRoot, file)),
       genomes: seeds.length,
@@ -723,7 +768,8 @@ async function evolvePopulation(
     });
     console.error(
       `DE restart ${restart + 1}/${config.restarts} generation ${generation + 1}/${config.generations}: `
-      + `best ${(Math.max(...values) * 100).toFixed(2)}%, median ${(median(values) * 100).toFixed(2)}%, `
+      + `best ${formatSearchFitness(Math.max(...values), config.objective)}, `
+      + `median ${formatSearchFitness(median(values), config.objective)}, `
       + `unique ${population.length}, diversity ${diversity.toFixed(3)}, `
       + `F ${meanF.toFixed(3)}, CR ${meanCr.toFixed(3)}, `
       + `${useFull ? "full fit" : `fold ${generation % Math.max(1, windows.length) + 1}`}.`,
@@ -805,7 +851,7 @@ function latinMembers(
   let remainder = count % descriptors.length;
   return descriptors.flatMap((descriptor) => {
     const size = base + (remainder-- > 0 ? 1 : 0);
-    return latinVectors(size, 41, random).map((vector) => ({
+    return latinVectors(size, 42, random).map((vector) => ({
       family: descriptor.family,
       mask: descriptor.mask,
       genome: applyDescriptor(vectorGenome(vector, config), descriptor, config),
@@ -1395,6 +1441,7 @@ async function runPerWindow(
     incumbentScore: incumbentScores.get(`${preset.windowId}:${preset.intervalMs}`),
     optimization: {
       algorithm: config.algorithm,
+      objective: config.objective,
       population: config.trials,
       generations: config.generations,
       restarts: config.restarts,
@@ -1437,13 +1484,17 @@ async function runPerWindow(
     "",
     "Existing presets are re-scored with the current evaluator before replacement; `incumbent` is therefore directly comparable even when evaluator semantics changed.",
     "",
-    "| window | scale | score | incumbent | delta | preset |",
+    `| window | scale | ${config.objective === "value-distillation" ? "cross-entropy" : "score"} | incumbent | improvement | preset |`,
     "|---|---:|---:|---:|---:|---|",
     ...documented.map((preset) => {
       const incumbent = incumbentScores.get(`${preset.windowId}:${preset.intervalMs}`);
-      return `| ${preset.windowId} | ${formatDuration(preset.intervalMs)} | ${pct(preset.score)} | `
-        + `${incumbent === undefined ? "—" : pct(incumbent)} | `
-        + `${incumbent === undefined ? "—" : signedPct(preset.score - incumbent)} | ${preset.id} |`;
+      return `| ${preset.windowId} | ${formatDuration(preset.intervalMs)} | ${formatSearchFitness(preset.score, config.objective)} | `
+        + `${incumbent === undefined ? "—" : formatSearchFitness(incumbent, config.objective)} | `
+        + `${incumbent === undefined
+          ? "—"
+          : config.objective === "value-distillation"
+            ? round(preset.score - incumbent, 5)
+            : signedPct(preset.score - incumbent)} | ${preset.id} |`;
     }),
     "",
     "## Selected parameters",
@@ -1507,7 +1558,7 @@ async function optimizeWindow(job: WindowJob) {
       parameters: candidateParameters(best.result.candidate),
       score: round(best.score.score, 6),
       scoreVersion: config.scoreVersion,
-      source: `${config.algorithm.toUpperCase()} hindsight best; global baseline retained`,
+      source: `${config.algorithm.toUpperCase()} ${config.objective} hindsight best; global baseline retained`,
     };
   });
 }
@@ -1796,6 +1847,9 @@ async function evaluateStageCuda(
         matchWindowMs: config.matchWindowMs,
         timingHalfLifeMs: config.timingHalfLifeMs,
         warmupMultiple: config.warmupMultiple,
+        valueDistillation: testCase.valueOracle
+          ? { oracle: testCase.valueOracle, strategySigma: config.strategySigma }
+          : undefined,
       },
     );
     kernelMs += results[0]?.elapsedMs ?? 0;
@@ -1812,6 +1866,11 @@ async function evaluateStageCuda(
         oracleCount: result.oracleCount,
         stateCredit: result.stateCredit,
         stateCount: result.stateCount,
+        distillationWeightedCrossEntropy: result.distillationWeightedCrossEntropy,
+        distillationWeightedOracleEntropy: result.distillationWeightedOracleEntropy,
+        distillationWeight: result.distillationWeight,
+        distillationOpportunity: result.distillationOpportunity,
+        distillationSamples: testCase.valueOracle ? result.stateCount : 0,
         days: testCase.days,
         absoluteLags: [],
         signedLags: [],
@@ -1825,7 +1884,7 @@ async function evaluateStageCuda(
   }
   const results = candidates.map((candidate, index): CandidateResult => {
     const cases = orderCases(
-      [...grouped[index]!.values()].map((parts) => scoreCase(parts, config.scoreVersion)),
+      [...grouped[index]!.values()].map((parts) => scoreCase(parts, config)),
       windows,
       config.scales,
     );
@@ -1980,6 +2039,15 @@ function prepareStageWindow(
     windows,
     warmupMs,
     oracleFriction: config.oracleFriction,
+    objective: config.objective,
+    exposureGridSize: config.exposureGridSize,
+    exposureMinimum: config.exposureMinimum,
+    exposureMaximum: config.exposureMaximum,
+    oracleTemperature: config.oracleTemperature,
+    opportunityEpsilon: config.opportunityEpsilon,
+    quoteLendRate: config.quoteLendRate,
+    quoteBorrowRate: config.quoteBorrowRate,
+    assetBorrowRate: config.assetBorrowRate,
   });
   const cached = preparedStageCache.get(key);
   if (cached) {
@@ -2012,12 +2080,18 @@ function prepareStageWindow(
           testCase.oracle!,
           true,
         );
-        prepared.bytes += candleColumnBytes(candles) + preparedOracle.stateCodes.byteLength;
+        const valueOracle = testCase.valueOracle
+          ? shareExposureValueOracle(testCase.valueOracle)
+          : undefined;
+        prepared.bytes += candleColumnBytes(candles)
+          + preparedOracle.stateCodes.byteLength
+          + (valueOracle ? exposureValueOracleBytes(valueOracle) : 0);
         prepared.cases.push({
           ...testCase,
           candles,
           oracle: undefined,
           preparedOracle,
+          valueOracle,
         });
       }
     }
@@ -2057,7 +2131,7 @@ function evaluatePreparedStage(
       grouped.set(testCase.id, parts);
     }
     const cases = orderCases(
-      [...grouped.values()].map((parts) => scoreCase(parts, config.scoreVersion)),
+      [...grouped.values()].map((parts) => scoreCase(parts, config)),
       windows,
       config.scales,
     );
@@ -2126,6 +2200,20 @@ function buildCases(
         eventMode: "close",
         maxPathCandles: 1,
       });
+      const valueOracle = config.objective === "value-distillation"
+        ? prepareExposureValueOracle(caseCandles.map((candle) => candle.close), {
+          scoreStartIndex: scoreStart,
+          friction: config.oracleFriction,
+          gridSize: config.exposureGridSize,
+          minExposure: config.exposureMinimum,
+          maxExposure: config.exposureMaximum,
+          temperature: config.oracleTemperature,
+          opportunityEpsilon: config.opportunityEpsilon,
+          quoteLendRate: config.quoteLendRate,
+          quoteBorrowRate: config.quoteBorrowRate,
+          assetBorrowRate: config.assetBorrowRate,
+        })
+        : undefined;
       return [{
         id: `${formatDuration(scaleMs)}:${window.label}`,
         stage,
@@ -2134,6 +2222,7 @@ function buildCases(
         candles: caseCandles,
         scoreStart,
         oracle,
+        valueOracle,
         days: Math.max(scaleMs / DAY, scored.length * scaleMs / DAY),
       }];
     });
@@ -2200,8 +2289,12 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     oracleResult: testCase.oracle,
     preparedOracle: testCase.preparedOracle,
     includeTrace: false,
+    valueDistillation: testCase.valueOracle
+      ? { oracle: testCase.valueOracle, strategySigma: config.strategySigma }
+      : undefined,
   });
   const metrics = result.metrics;
+  const distillation = metrics.valueDistillation;
   return {
     caseId: testCase.id,
     scale: formatDuration(testCase.scaleMs),
@@ -2216,11 +2309,16 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
       item.lagMs === null ? [] : [item.lagMs]),
     stateCredit: metrics.exposureAgreement * result.candleCount,
     stateCount: result.candleCount,
+    distillationWeightedCrossEntropy: distillation?.weightedCrossEntropy,
+    distillationWeightedOracleEntropy: distillation?.weightedOracleEntropy,
+    distillationWeight: distillation?.weightSum,
+    distillationOpportunity: distillation?.opportunitySum,
+    distillationSamples: distillation?.sampleCount,
     days: testCase.days,
   };
 }
 
-function scoreCase(parts: CaseStats[], scoreVersion: ScoreVersion): CaseScore {
+function scoreCase(parts: CaseStats[], config: Args): CaseScore {
   const first = parts[0]!;
   const signalCount = sum(parts.map((part) => part.signalCount));
   const oracleCount = sum(parts.map((part) => part.oracleCount));
@@ -2248,11 +2346,37 @@ function scoreCase(parts: CaseStats[], scoreVersion: ScoreVersion): CaseScore {
   const lagMedianSignedMs = signedLags.length > 0
     ? nullablePercentile(signedLags, 0.5)
     : nullableMedian(parts.map((part) => part.lagMedianSignedMs ?? null));
+  const signalScore = searchScore(f1, exposureAgreement, signalCleanliness, config.scoreVersion);
+  const distillationWeight = sum(parts.map((part) => part.distillationWeight ?? 0));
+  const valueDistillationLoss = distillationWeight > 0
+    ? sum(parts.map((part) => part.distillationWeightedCrossEntropy ?? 0)) / distillationWeight
+    : null;
+  const oracleEntropy = distillationWeight > 0
+    ? sum(parts.map((part) => part.distillationWeightedOracleEntropy ?? 0)) / distillationWeight
+    : null;
+  const valueDistillationKl = valueDistillationLoss !== null && oracleEntropy !== null
+    ? Math.max(0, valueDistillationLoss - oracleEntropy)
+    : null;
+  const valueDistillationScore = valueDistillationKl === null
+    ? null
+    : Math.exp(-valueDistillationKl);
+  const distillationSamples = sum(parts.map((part) => part.distillationSamples ?? 0));
+  const meanOpportunity = distillationSamples > 0
+    ? sum(parts.map((part) => part.distillationOpportunity ?? 0)) / distillationSamples
+    : null;
   return {
     caseId: first.caseId,
     scale: first.scale,
     window: first.window,
-    score: searchScore(f1, exposureAgreement, signalCleanliness, scoreVersion),
+    score: config.objective === "value-distillation"
+      ? valueDistillationLoss === null ? Number.NEGATIVE_INFINITY : -valueDistillationLoss
+      : signalScore,
+    signalScore,
+    valueDistillationScore,
+    valueDistillationLoss,
+    valueDistillationKl,
+    oracleEntropy,
+    meanOpportunity,
     precision,
     recall,
     f1,
@@ -2278,8 +2402,10 @@ function searchScore(
   return vwKamaScore(f1, exposureAgreement, signalCleanliness);
 }
 
-function scoreWeightsDescription(_scoreVersion: ScoreVersion): string {
-  return "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
+function scoreWeightsDescription(config: Args): string {
+  return config.objective === "value-distillation"
+    ? "negative weighted cross-entropy -CE(p_oracle, s_candidate); p is derived from friction-aware future value and weighted by max(Q)-min(Q)"
+    : "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
 }
 
 function aggregate(scores: CaseScore[]): AggregateScore {
@@ -2290,6 +2416,11 @@ function aggregate(scores: CaseScore[]): AggregateScore {
     objective: (medianScore + p10) / 2,
     median: medianScore,
     p10,
+    signalScore: median(scores.map((score) => score.signalScore)),
+    valueDistillationScore: nullableMedian(scores.map((score) => score.valueDistillationScore)),
+    valueDistillationLoss: nullableMedian(scores.map((score) => score.valueDistillationLoss)),
+    valueDistillationKl: nullableMedian(scores.map((score) => score.valueDistillationKl)),
+    meanOpportunity: nullableMedian(scores.map((score) => score.meanOpportunity)),
     precision: median(scores.map((score) => score.precision)),
     recall: median(scores.map((score) => score.recall)),
     f1: median(scores.map((score) => score.f1)),
@@ -2759,7 +2890,10 @@ function parseArgs(argv: string[]): Args {
     "mean-reversion-fast-range", "mean-reversion-slow-range",
     "mean-reversion-volatility-range", "mean-reversion-reversal-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
-    "screen-scales", "workers", "accelerator", "score-version", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
+    "screen-scales", "workers", "accelerator", "objective", "score-version",
+    "exposure-grid-size", "exposure-min", "exposure-max", "oracle-temperature",
+    "strategy-sigma", "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
+    "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -2779,12 +2913,18 @@ function parseArgs(argv: string[]): Args {
   const algorithm = get("algorithm", "de");
   const mode = get("mode", "standard");
   const accelerator = get("accelerator", "auto");
+  const objective = get("objective", "signal");
   const scoreVersion = integer(get("score-version", String(VW_KAMA_SCORE_VERSION)), "score-version");
   if (algorithm !== "random" && algorithm !== "de") throw new Error("--algorithm must be random or de.");
   if (mode !== "standard" && mode !== "per-window") throw new Error("--mode must be standard or per-window.");
   if (accelerator !== "auto" && accelerator !== "cpu" && accelerator !== "cuda") {
     throw new Error("--accelerator must be auto, cpu, or cuda.");
   }
+  if (objective !== "signal" && objective !== "value-distillation") {
+    throw new Error("--objective must be signal or value-distillation.");
+  }
+  const exposureMinimum = bounded(get("exposure-min", "-1"), "exposure-min", -100, -Number.EPSILON);
+  const exposureMaximum = bounded(get("exposure-max", "1"), "exposure-max", Number.EPSILON, 100);
   if (scoreVersion !== VW_KAMA_SCORE_VERSION) {
     throw new Error(`--score-version must be ${VW_KAMA_SCORE_VERSION}.`);
   }
@@ -2818,9 +2958,22 @@ function parseArgs(argv: string[]): Args {
     immigrantRate: bounded(get("immigrant-rate", "0.08"), "immigrant-rate", 0, 1),
     screenWindows: integer(get("screen-windows", "1"), "screen-windows"),
     screenScales: unique(get("screen-scales", "1m,15m").split(",").map(parseDuration)).sort((a, b) => a - b),
-    workers: integer(get("workers", String(Math.max(1, Math.min(12, availableParallelism() - 4)))), "workers"),
+    workers: integer(get("workers", String(Math.max(
+      1,
+      Math.min(12, (typeof availableParallelism === "function" ? availableParallelism() : cpus().length) - 4),
+    ))), "workers"),
     accelerator,
+    objective: objective as SearchObjective,
     scoreVersion,
+    exposureGridSize: integer(get("exposure-grid-size", "21"), "exposure-grid-size", 3),
+    exposureMinimum,
+    exposureMaximum,
+    oracleTemperature: positive(get("oracle-temperature", "0.01"), "oracle-temperature"),
+    strategySigma: positive(get("strategy-sigma", "0.15"), "strategy-sigma"),
+    opportunityEpsilon: nonNegative(get("opportunity-epsilon", "0.000001"), "opportunity-epsilon"),
+    quoteLendRate: nonNegative(get("quote-lend-rate", "0"), "quote-lend-rate"),
+    quoteBorrowRate: nonNegative(get("quote-borrow-rate", "0"), "quote-borrow-rate"),
+    assetBorrowRate: nonNegative(get("asset-borrow-rate", "0"), "asset-borrow-rate"),
     seedCandidatePaths: values.has("seed-candidates")
       ? values.get("seed-candidates")!.split(",").filter(Boolean).map((file) => path.resolve(repoRoot, file))
       : [],
@@ -3075,20 +3228,25 @@ function report(
     "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A second volume-aware KAMA supplies the mean-reversion baseline: it has independent ER/fast/slow periods and shares the strategy's ER-volume, KAMA-power, and post-ER volume behavior. Its causal volatility-normalized distance follows KAMA below the suppression threshold, goes flat between thresholds, and reverses KAMA at the reversal threshold. A causal logistic confirmation combines KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scales or filters the signal. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
     `- Signal memory: after the first signal, a candidate state change emits only when the current close is strictly more than ${round(config.oracleFriction * 10_000, 3)} bps from the last emitted signal price; rejected changes retain the prior state. This is the same friction used by the oracle.`,
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
-    `- Case score weights ${scoreWeightsDescription(config.scoreVersion)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched. Trading returns are neither computed nor ranked.`,
-    "- Candidate objective equally weights the median and P10 case score; every scale/window case has equal weight.",
+    `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
+    config.objective === "value-distillation"
+      ? `- Oracle exposures: ${config.exposureGridSize} points over [${config.exposureMinimum}, ${config.exposureMaximum}], value temperature ${config.oracleTemperature}, candidate sigma ${config.strategySigma}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+      : "- The signal score remains available as a diagnostic beside the selected objective.",
+    config.objective === "value-distillation"
+      ? "- Candidate fitness is the negative of median/P90 cross-entropy, equally weighted; every scale/window case has equal weight."
+      : "- Candidate objective equally weights the median and P10 case score; every scale/window case has equal weight.",
     "",
     "## Holdout finalists",
     "",
-    resultTable(test),
+    resultTable(test, config),
     "",
     "## Validation finalists",
     "",
-    resultTable(rank(validation)),
+    resultTable(rank(validation), config),
     "",
     "## Best fit candidates",
     "",
-    resultTable(rank(fit).slice(0, 12)),
+    resultTable(rank(fit).slice(0, 12), config),
     "",
     "## Finalist parameters",
     "",
@@ -3114,15 +3272,33 @@ function report(
     "",
     "## Holdout cases",
     "",
-    "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
-    "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-    ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${pct(item.score)} | ${pct(item.precision)} | ${pct(item.recall)} | ${pct(item.f1)} | ${pct(item.exposureAgreement)} | ${pct(item.signalCleanliness)} | ${formatNullableRatio(item.noiseSignalRatio)} | ${round(item.signalsPerDay, 2)} | ${formatNullableDuration(item.lagP50Ms)} | ${formatNullableDuration(item.lagP90Ms)} |`)),
+    ...(config.objective === "value-distillation"
+      ? [
+        "| candidate | scale/window | cross-entropy | KL | exp(-KL) | opportunity | signal score | agreement | signals/day |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
+      ]
+      : [
+        "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${pct(item.score)} | ${pct(item.precision)} | ${pct(item.recall)} | ${pct(item.f1)} | ${pct(item.exposureAgreement)} | ${pct(item.signalCleanliness)} | ${formatNullableRatio(item.noiseSignalRatio)} | ${round(item.signalsPerDay, 2)} | ${formatNullableDuration(item.lagP50Ms)} | ${formatNullableDuration(item.lagP90Ms)} |`)),
+      ]),
     "",
   ];
   return lines.join("\n");
 }
 
-function resultTable(results: CandidateResult[]): string {
+function resultTable(results: CandidateResult[], config: Args): string {
+  if (config.objective === "value-distillation") {
+    return [
+      "| family | id | strategy | robust CE | median CE | P90 CE | median KL | exp(-KL) | signal score | agreement | signals/day |",
+      "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+      ...results.map((result) => {
+        const score = result.aggregate;
+        return `| ${result.candidate.family} | ${result.candidate.id} | ${result.candidate.agreementMode} | ${round(-score.objective, 5)} | ${round(-score.median, 5)} | ${round(-score.p10, 5)} | ${formatNullableNumber(score.valueDistillationKl)} | ${formatNullablePercent(score.valueDistillationScore)} | ${pct(score.signalScore)} | ${pct(score.exposureAgreement)} | ${round(score.signalsPerDay, 2)} |`;
+      }),
+    ].join("\n");
+  }
   return [
     "| family | id | strategy | objective | median | P10 | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 |",
     "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -3199,6 +3375,12 @@ function help(): void {
   --differential-weight 0.75 --crossover-rate 0.8 --immigrant-rate 0.08
   --workers 12                      Candidate shards for global search; window shards in per-window mode
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
+  --objective signal                signal or value-distillation fitness
+  --exposure-grid-size 21 --exposure-min -1 --exposure-max 1
+  --oracle-temperature 0.01         Soft oracle value temperature in log-return units
+  --strategy-sigma 0.15             Candidate exposure-distribution width
+  --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
+  --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
   --seed-candidates FILE,...        Put prior fit JSONL/preset candidates in generation zero
   --screen-windows 1 --screen-scales 1m,15m   Cheap early-pruning stage
@@ -3269,6 +3451,13 @@ function capitalize(value: string): string { return value[0]!.toUpperCase() + va
 function formatWindow(window: Window): string { return `${new Date(window.start).toISOString().slice(0, 10)}..${new Date(window.end - 1).toISOString().slice(0, 10)}`; }
 function formatNullableDuration(value: number | null): string { return value === null ? "-" : formatDuration(value); }
 function formatNullableRatio(value: number | null): string { return value === null ? "∞" : round(value, 3).toString(); }
+function formatNullableNumber(value: number | null, digits = 5): string {
+  return value === null ? "-" : round(value, digits).toString();
+}
+function formatNullablePercent(value: number | null): string { return value === null ? "-" : pct(value); }
+function formatSearchFitness(value: number, objective: SearchObjective): string {
+  return objective === "value-distillation" ? `CE ${(-value).toFixed(5)}` : `${(value * 100).toFixed(2)}%`;
+}
 function formatDuration(ms: number): string {
   for (const [suffix, size] of [["w", 7 * DAY], ["d", DAY], ["h", HOUR], ["m", 60_000], ["s", 1_000]] as const) {
     if (ms >= size && ms % size === 0) return `${ms / size}${suffix}`;
