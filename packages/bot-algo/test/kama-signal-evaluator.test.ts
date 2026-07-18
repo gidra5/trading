@@ -306,6 +306,9 @@ test("VW-KAMA b2 volatility window is independent from the one-step value horizo
       volumePower: 0,
       deadbandBpsHour: 0,
       deadbandMode: "hold",
+      strategyTemperature: 0.001,
+      strategyQuadraticScale: quadraticScale,
+      strategyQuadraticVolatilityMs: 3_000,
     },
     oracleFriction: 0,
     matchWindowMs: 10_000,
@@ -314,9 +317,6 @@ test("VW-KAMA b2 volatility window is independent from the one-step value horizo
     maxPoints: 10,
     valueDistillation: {
       oracle: valueOracle,
-      strategyTemperature: 0.001,
-      strategyQuadraticScale: quadraticScale,
-      strategyQuadraticVolatilityMs: 3_000,
       strategyVolatilityScaling: false,
     },
   });

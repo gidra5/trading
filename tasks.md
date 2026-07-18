@@ -193,8 +193,5 @@ we need to adjust the oracle evaluation:
    4.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
    5.  but this idea is for future iterations, not for now.
 
-the final time should be a fixed number of seconds
-
-1. what would be needed to move current strategy/signal to a backprop based learning engine? can we efficiently mix it with current genetic approach? In principal i think its possible, we just need to replace all discrete decisions with continuous ones based on soft function like sigmoid.
-2.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
-3.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
+8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
+9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.

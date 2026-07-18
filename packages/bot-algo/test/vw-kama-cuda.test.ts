@@ -34,7 +34,12 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
   });
   const columns = columnarVwKamaCandles(candles);
   const prepared = prepareVwKamaOracle(columns, scoreStartIndex, oracle);
-  const candidates = [baseParameters(), featureParameters()];
+  const candidates = [baseParameters(), featureParameters()].map((parameters, index) => ({
+    ...parameters,
+    strategyTemperature: index === 0 ? 0.001 : 0.003,
+    strategyQuadraticScale: index === 0 ? 200_000 : 2_000,
+    strategyQuadraticVolatilityMs: index === 0 ? 120 * MINUTE : 30 * MINUTE,
+  }));
   const valueOracle = prepareExposureValueOracle(candles.map((candle) => candle.close), {
     scoreStartIndex,
     horizonSteps: 30,
@@ -51,9 +56,6 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     warmupMultiple: 3,
     valueDistillation: {
       oracle: valueOracle,
-      strategyTemperature: 0.001,
-      strategyQuadraticScale: 200_000,
-      strategyQuadraticVolatilityMs: 120 * MINUTE,
       strategyVolatilityScaling: true,
     },
   };

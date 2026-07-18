@@ -11,13 +11,12 @@ import {
   createExposureValueOracleStorage,
   shareExposureValueOracle,
   strategyExposureTemperatures,
-  strategyExposureVolatilities,
   type ExposureValueOracleOptions,
 } from "./exposure-value-distillation.js";
 
-const PARAMETER_SIZE = 196;
+const PARAMETER_SIZE = 208;
 const RESULT_SIZE = 152;
-const INT_PARAMETER_COUNT = 20;
+const INT_PARAMETER_COUNT = 21;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
 
@@ -142,12 +141,8 @@ export interface VwKamaCudaBatchOptions {
   fitnessOnly?: boolean;
   valueDistillation?: {
     oracle: ExposureValueOracle;
-    strategyTemperature: number;
-    strategyQuadraticScale: number;
-    strategyQuadraticVolatilityMs: number;
     strategyVolatilityScaling: boolean;
     strategyTemperatures?: Float32Array;
-    strategyQuadraticVolatilities?: Float32Array;
   };
 }
 
@@ -254,24 +249,18 @@ export async function evaluateVwKamaCudaBatch(
     throw new Error("VW-KAMA CUDA value oracle does not cover the candle columns.");
   }
   const strategyQuadraticVolatilities = valueDistillation
-    ? valueDistillation.strategyQuadraticVolatilities ?? strategyExposureVolatilities(
-      candles.close,
-      Math.max(1, Math.round(
-        valueDistillation.strategyQuadraticVolatilityMs / options.intervalMs,
-      )),
-    )
+    ? new Float32Array(candles.length)
     : null;
   const strategyTemperatures = valueDistillation
     ? valueDistillation.strategyTemperatures ?? strategyExposureTemperatures(candles.close, {
       intervalMs: options.intervalMs,
       horizonSteps: valueDistillation.oracle.horizonSteps,
-      temperature: valueDistillation.strategyTemperature,
+      temperature: 1,
       scaleByVolatility: valueDistillation.strategyVolatilityScaling,
     })
     : null;
   if ((strategyTemperatures && strategyTemperatures.length < candles.length)
-    || (strategyQuadraticVolatilities
-      && strategyQuadraticVolatilities.length < candles.length)) {
+    || (strategyQuadraticVolatilities && strategyQuadraticVolatilities.length < candles.length)) {
     throw new Error("VW-KAMA CUDA strategy calibration does not cover the candle columns.");
   }
   const native = await loadNative();
@@ -288,7 +277,7 @@ export async function evaluateVwKamaCudaBatch(
       options,
       includeHighLow,
       valueDistillation.strategyTemperatures,
-      valueDistillation.strategyQuadraticVolatilities,
+      undefined,
     );
     const testCase = getOrCreateFitnessCase(
       native,
@@ -342,7 +331,7 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.grid[0] ?? 0,
     valueDistillation?.oracle.grid[valueDistillation.oracle.grid.length - 1] ?? 0,
     valueDistillation?.oracle.execution.maxEffectiveExposure ?? 250,
-    valueDistillation?.strategyQuadraticScale ?? 0,
+    0,
     parameterBuffer,
     candidates.length,
     options.fitnessOnly ? 1 : 0,
@@ -368,19 +357,13 @@ export async function evaluateVwKamaCudaFitnessCases(
     const request = cases[caseIndex]!;
     const { candles, options } = request;
     const distillation = options.valueDistillation;
-    const quadraticVolatilities = distillation.strategyQuadraticVolatilities
-      ?? strategyExposureVolatilities(
-        candles.close,
-        Math.max(1, Math.round(
-          distillation.strategyQuadraticVolatilityMs / options.intervalMs,
-        )),
-      );
+    const quadraticVolatilities = new Float32Array(candles.length);
     const temperatures = distillation.strategyTemperatures ?? strategyExposureTemperatures(
       candles.close,
       {
         intervalMs: options.intervalMs,
         horizonSteps: distillation.oracle.horizonSteps,
-        temperature: distillation.strategyTemperature,
+        temperature: 1,
         scaleByVolatility: distillation.strategyVolatilityScaling,
       },
     );
@@ -399,7 +382,7 @@ export async function evaluateVwKamaCudaFitnessCases(
       options,
       includeHighLow,
       distillation.strategyTemperatures,
-      distillation.strategyQuadraticVolatilities,
+      undefined,
     );
     if (scheduledKeys.has(key)) {
       throw new Error("VW-KAMA CUDA fitness cases must be distinct within one scheduled batch.");
@@ -605,7 +588,7 @@ function getOrCreateFitnessCase(
     oracle.grid[0]!,
     oracle.grid[oracle.grid.length - 1]!,
     oracle.execution.maxEffectiveExposure,
-    options.valueDistillation?.strategyQuadraticScale ?? 0,
+    0,
     includeHighLow ? 1 : 0,
     residentBytes,
   );
@@ -665,9 +648,6 @@ function fitnessCaseKey(
     options.intervalMs,
     oracle.horizonSteps,
     includeHighLow ? 1 : 0,
-    options.valueDistillation?.strategyTemperature,
-    options.valueDistillation?.strategyQuadraticScale,
-    options.valueDistillation?.strategyQuadraticVolatilityMs,
     options.valueDistillation?.strategyVolatilityScaling ? 1 : 0,
   ].join(":");
 }
@@ -716,6 +696,7 @@ function writeParameters(
     parameters.agreementMode === "confidence" ? 1 : 0,
     parameters.rateMode === "log" ? 1 : 0,
     parameters.thresholdNoiseResponse === "inverse" ? 1 : 0,
+    samples(parameters.strategyQuadraticVolatilityMs ?? 60 * 60_000),
   ];
   const floats = [
     parameters.power,
@@ -746,9 +727,11 @@ function writeParameters(
     parameters.meanReversionSuppressionThreshold ?? 1,
     parameters.meanReversionReversalThreshold ?? 0,
     parameters.signalFrictionFraction ?? 1,
+    parameters.strategyTemperature ?? 0.001,
+    parameters.strategyQuadraticScale ?? 0,
     options.warmupMultiple,
   ];
-  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 29) {
+  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 31) {
     throw new Error("VW-KAMA CUDA parameter layout is inconsistent.");
   }
   for (let index = 0; index < integers.length; index += 1) {

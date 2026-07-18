@@ -44,9 +44,6 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   horizonMode: "fixed",
   horizonMs: 1_000,
   oracleTemperature: 0.01,
-  strategyTemperature: 0.001,
-  strategyQuadraticScale: 0,
-  strategyQuadraticVolatilityMs: 60 * 60_000,
   strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
   quoteLendRate: 0,
@@ -126,6 +123,9 @@ const defaults: VwKamaParameters = {
   thresholdInverseMaxBpsHour: 0,
   thresholdInverseNoiseScaleBpsHour: 30,
   signalFrictionFraction: 1,
+  strategyTemperature: 0.001,
+  strategyQuadraticScale: 0,
+  strategyQuadraticVolatilityMs: 60 * 60_000,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -224,9 +224,8 @@ export function KamaInspectorPage() {
 
   const selectedWindow = createMemo(() =>
     catalog()?.windows.find((window) => window.id === windowId()));
-  const presets = createMemo(() => (catalog()?.presets ?? []).filter((preset) =>
-    preset.scope === "global"
-      || preset.windowId === windowId() && (preset.intervalMs == null || preset.intervalMs === intervalMs())));
+  const availableScales = createMemo(() => (catalog()?.scales ?? []).filter((scale) =>
+    scale.intervalMs >= (selectedWindow()?.sourceIntervalMs ?? 1_000)));
   const selectedPreset = createMemo(() =>
     catalog()?.presets.find((preset) => preset.id === selectedPresetId()));
   const globalPreset = createMemo(() =>
@@ -684,15 +683,13 @@ export function KamaInspectorPage() {
     setDiagnosticVisibility((current) => ({ ...current, [id]: !current[id] }));
 
   const applyPreset = (id: string) => {
-    setRankedPair("current");
-    setSelectedPresetId(id);
     const preset = catalog()?.presets.find((item) => item.id === id);
-    if (preset) {
-      setParameters({ ...preset.parameters });
-      if (preset.optimization?.valueDistillation) {
-        setValueConfig({ ...defaultValueDistillation, ...preset.optimization.valueDistillation });
-      }
+    if (!preset) {
+      setRankedPair("current");
+      setSelectedPresetId("custom");
+      return;
     }
+    inspectPreset(preset);
   };
 
   const inspectPreset = (preset: VwKamaPreset) => batch(() => {
@@ -907,14 +904,20 @@ export function KamaInspectorPage() {
                 label: `${window.label} · ${formatDateRange(window.startTime, window.endTime)}`,
               }))}
               onInput={(value) => {
-                setRankedPair("current");
-                setWindowId(value);
+                const nextWindow = catalog()?.windows.find((window) => window.id === value);
+                batch(() => {
+                  setRankedPair("current");
+                  setWindowId(value);
+                  if (nextWindow && intervalMs() < nextWindow.sourceIntervalMs) {
+                    setIntervalMs(nextWindow.sourceIntervalMs);
+                  }
+                });
               }}
             />
             <InspectorSelect
               label="Candle scale"
               value={String(intervalMs())}
-              options={(catalog()?.scales ?? []).map((scale) => ({
+              options={availableScales().map((scale) => ({
                 value: String(scale.intervalMs),
                 label: scale.label,
               }))}
@@ -933,12 +936,12 @@ export function KamaInspectorPage() {
               ]}
               onInput={applyRankedPair}
             />
-            <InspectorSelect
-              label="Parameter preset"
+            <InspectorSearchSelect
+              label={`Parameter preset · ${(catalog()?.presets.length ?? 0) + 1} configs`}
               value={selectedPresetId()}
               options={[
-                { value: "custom", label: "Custom" },
-                ...presets().map(presetOption),
+                { value: "custom", label: "Custom parameters", keywords: "manual editable" },
+                ...(catalog()?.presets ?? []).map(presetOption),
               ]}
               onInput={applyPreset}
             />
@@ -1094,6 +1097,10 @@ export function KamaInspectorPage() {
                 onInput={(value) => update("thresholdInverseNoiseScaleBpsHour", value)}
               />
             </Show>
+            <InspectorNumber label="Candidate friction fraction" value={parameters().signalFrictionFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("signalFrictionFraction", value)} />
+            <InspectorNumber label="Base strategy temperature" value={parameters().strategyTemperature ?? 0.001} min={0.000001} step={0.0001} onInput={(value) => update("strategyTemperature", value)} />
+            <InspectorNumber label="Strategy quadratic scale b₂′" value={parameters().strategyQuadraticScale ?? 0} min={0} step={1} onInput={(value) => update("strategyQuadraticScale", value)} />
+            <DurationInput label="Quadratic volatility window" value={parameters().strategyQuadraticVolatilityMs ?? 60 * 60_000} onInput={(value) => update("strategyQuadraticVolatilityMs", value)} />
             <DurationInput label="Efficiency" value={parameters().efficiencyMs} onInput={(value) => update("efficiencyMs", value)} />
             <DurationInput label="ER volume EMA" value={parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs} onInput={(value) => update("efficiencyVolumeEmaMs", value)} />
             <InspectorNumber label="ER volume power" value={parameters().efficiencyVolumePower ?? 0} min={0} step={0.1} onInput={(value) => update("efficiencyVolumePower", value)} />
@@ -1158,7 +1165,6 @@ export function KamaInspectorPage() {
             <summary class="cursor-pointer text-sm font-semibold text-ink-200">Scoring controls</summary>
             <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <InspectorNumber label="Oracle friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
-              <InspectorNumber label="Candidate friction fraction" value={parameters().signalFrictionFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("signalFrictionFraction", value)} />
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
@@ -1166,9 +1172,6 @@ export function KamaInspectorPage() {
               <InspectorSelect label="Value horizon source" value={valueConfig().horizonMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMode: value as VwKamaValueDistillationConfig["horizonMode"] }))} />
               <DurationInput label={valueConfig().horizonMode === "fixed" ? "Value horizon H" : "Fallback horizon H"} value={valueConfig().horizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMs: value }))} />
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
-              <InspectorNumber label="Base strategy temperature" value={valueConfig().strategyTemperature} min={0.000001} step={0.0001} onInput={(value) => setValueConfig((current) => ({ ...current, strategyTemperature: value }))} />
-              <InspectorNumber label="Strategy quadratic scale b₂′" value={valueConfig().strategyQuadraticScale} min={0} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, strategyQuadraticScale: value }))} />
-              <DurationInput label="Quadratic volatility window" value={valueConfig().strategyQuadraticVolatilityMs} onInput={(value) => setValueConfig((current) => ({ ...current, strategyQuadraticVolatilityMs: value }))} />
               <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H log-return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
@@ -1562,6 +1565,113 @@ function InspectorSelect(props: {
   );
 }
 
+interface SearchableOption {
+  value: string;
+  label: string;
+  keywords?: string;
+}
+
+function InspectorSearchSelect(props: {
+  label: string;
+  value: string;
+  options: SearchableOption[];
+  onInput: (value: string) => void;
+}) {
+  const inputId = createUniqueId();
+  const listId = createUniqueId();
+  const [query, setQuery] = createSignal("");
+  const [expanded, setExpanded] = createSignal(false);
+  const [activeIndex, setActiveIndex] = createSignal(0);
+  let input: HTMLInputElement | undefined;
+  const selected = createMemo(() => props.options.find((option) => option.value === props.value));
+  const matches = createMemo(() => {
+    const terms = query().trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return props.options;
+    return props.options.filter((option) => {
+      const haystack = `${option.label} ${option.value} ${option.keywords ?? ""}`.toLocaleLowerCase();
+      return terms.every((term) => haystack.includes(term));
+    });
+  });
+  const visibleMatches = createMemo(() => matches().slice(0, 80));
+  const choose = (option: SearchableOption) => {
+    props.onInput(option.value);
+    setExpanded(false);
+    setQuery("");
+  };
+  const open = () => {
+    setQuery("");
+    setActiveIndex(0);
+    setExpanded(true);
+  };
+
+  return (
+    <div class="relative block">
+      <label for={inputId} class="mb-1 block text-xs font-medium text-ink-300">{props.label}</label>
+      <input
+        id={inputId}
+        ref={input}
+        class="min-h-10 w-full rounded-2 border border-line bg-ink-800 px-3 text-sm text-ink-100"
+        type="search"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls={listId}
+        aria-expanded={expanded()}
+        autocomplete="off"
+        placeholder="Search by name, window, scale, ID, or objective"
+        value={expanded() ? query() : selected()?.label ?? "Custom parameters"}
+        onFocus={open}
+        onInput={(event) => {
+          setQuery(event.currentTarget.value);
+          setActiveIndex(0);
+          setExpanded(true);
+        }}
+        onBlur={() => setExpanded(false)}
+        onKeyDown={(event) => {
+          const options = visibleMatches();
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setActiveIndex((index) => Math.max(0, Math.min(index + 1, options.length - 1)));
+          } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            setActiveIndex((index) => Math.max(index - 1, 0));
+          } else if (event.key === "Enter" && options[activeIndex()]) {
+            event.preventDefault();
+            choose(options[activeIndex()]!);
+          } else if (event.key === "Escape") {
+            setExpanded(false);
+            setQuery("");
+            input?.blur();
+          }
+        }}
+      />
+      <Show when={expanded()}>
+        <div id={listId} role="listbox" class="absolute left-0 right-0 z-40 mt-1 max-h-80 overflow-auto rounded-2 border border-line bg-ink-900 p-1 shadow-xl">
+          <For each={visibleMatches()} fallback={<div class="px-3 py-2 text-sm text-ink-400">No matching configs</div>}>
+            {(option, index) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={option.value === props.value}
+                class="block w-full rounded-2 px-3 py-2 text-left text-sm text-ink-200 hover:bg-ink-700"
+                classList={{ "bg-ink-700": index() === activeIndex(), "text-accent": option.value === props.value }}
+                onMouseEnter={() => setActiveIndex(index())}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => choose(option)}
+              >
+                <div class="truncate">{option.label}</div>
+                <div class="mt-0.5 truncate text-xs text-ink-400">{option.value}</div>
+              </button>
+            )}
+          </For>
+          <Show when={matches().length > visibleMatches().length}>
+            <div class="px-3 py-2 text-xs text-ink-400">Refine the search to see the remaining {matches().length - visibleMatches().length} configs.</div>
+          </Show>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function InspectorNumber(props: {
   label: string;
   value: number;
@@ -1688,13 +1798,23 @@ function transitionSide(point: Pick<BacktestOraclePoint, "fromState" | "state">)
   return exposure(point.state) > exposure(point.fromState) ? "buy" : "sell";
 }
 
-function presetOption(preset: VwKamaPreset): { value: string; label: string } {
+function presetOption(preset: VwKamaPreset): SearchableOption {
   const value = preset.score ?? preset.historicalScore;
   const version = preset.score === undefined && value !== undefined
     ? ` v${preset.scoreVersion ?? "?"}`
     : "";
   const score = value === undefined ? "" : ` · ${presetScoreLabel(preset, value)}${version}`;
-  return { value: preset.id, label: `${preset.label}${score}` };
+  return {
+    value: preset.id,
+    label: `${preset.label}${score}`,
+    keywords: [
+      preset.scope,
+      preset.source,
+      preset.optimization?.objective,
+      preset.optimization?.algorithm,
+      preset.generatedAt,
+    ].filter(Boolean).join(" "),
+  };
 }
 
 function presetScoreLabel(preset: VwKamaPreset, value: number): string {

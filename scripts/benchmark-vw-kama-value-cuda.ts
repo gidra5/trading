@@ -63,7 +63,12 @@ async function run(): Promise<void> {
     maxPathCandles: 1,
   });
   const preparedSignalOracle = prepareVwKamaOracle(columns, scoreStartIndex, signalOracle);
-  const candidates = Array.from({ length: candidateCount }, (_, index) => parameters(index));
+  const candidates = Array.from({ length: candidateCount }, (_, index) => ({
+    ...parameters(index),
+    strategyTemperature: 0.001,
+    strategyQuadraticScale,
+    strategyQuadraticVolatilityMs: 60 * MINUTE,
+  }));
   const common = {
     intervalMs: MINUTE,
     scoreStartIndex,
@@ -73,9 +78,6 @@ async function run(): Promise<void> {
     warmupMultiple: 3,
     valueDistillation: {
       oracle: cpuOracle,
-      strategyTemperature: 0.001,
-      strategyQuadraticScale,
-      strategyQuadraticVolatilityMs: 60 * MINUTE,
       strategyVolatilityScaling: false,
     },
   };

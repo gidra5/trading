@@ -78,6 +78,9 @@ export interface VwKamaParameters {
   thresholdInverseMaxBpsHour?: number;
   thresholdInverseNoiseScaleBpsHour?: number;
   signalFrictionFraction?: number;
+  strategyTemperature?: number;
+  strategyQuadraticScale?: number;
+  strategyQuadraticVolatilityMs?: number;
   buyMaxFraction?: number;
   sellMaxFraction?: number;
   buySizingSigmaBpsHour?: number;
@@ -176,6 +179,9 @@ export function vwKamaParametersFromPeakValleySignal(
     thresholdInverseMaxBpsHour: config.kamaThresholdInverseMax * rateScale,
     thresholdInverseNoiseScaleBpsHour: config.kamaThresholdInverseNoiseScale * rateScale,
     signalFrictionFraction,
+    strategyTemperature: 0.001,
+    strategyQuadraticScale: 0,
+    strategyQuadraticVolatilityMs: HOUR_MS,
     buyMaxFraction: Math.min(1, config.buySpendRate),
     sellMaxFraction: Math.min(1, config.sellAmountRate),
     buySizingSigmaBpsHour: Number.MAX_VALUE,
@@ -193,6 +199,7 @@ export interface VwKamaInspectorWindow {
   group: string;
   startTime: number;
   endTime: number;
+  sourceIntervalMs: number;
 }
 
 export interface VwKamaInspectorRequest {
@@ -214,9 +221,6 @@ export interface VwKamaValueDistillationConfig {
   horizonMode: VwKamaValueHorizonMode;
   horizonMs: number;
   oracleTemperature: number;
-  strategyTemperature: number;
-  strategyQuadraticScale: number;
-  strategyQuadraticVolatilityMs: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
@@ -421,9 +425,6 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   includeTrace?: boolean;
   valueDistillation?: {
     oracle: ExposureValueOracle;
-    strategyTemperature: number;
-    strategyQuadraticScale: number;
-    strategyQuadraticVolatilityMs: number;
     strategyVolatilityScaling: boolean;
     strategyTemperatures?: Float32Array;
     strategyQuadraticVolatilities?: Float32Array;
@@ -738,7 +739,7 @@ export function evaluateVwKamaOracle(
     ? options.valueDistillation.strategyQuadraticVolatilities ?? strategyExposureVolatilities(
       valuePrices!,
       Math.max(1, Math.round(
-        options.valueDistillation.strategyQuadraticVolatilityMs / options.intervalMs,
+        (options.parameters.strategyQuadraticVolatilityMs ?? HOUR_MS) / options.intervalMs,
       )),
     )
     : null;
@@ -748,7 +749,7 @@ export function evaluateVwKamaOracle(
       {
         intervalMs: options.intervalMs,
         horizonSteps: options.valueDistillation.oracle.horizonSteps,
-        temperature: options.valueDistillation.strategyTemperature,
+        temperature: 1,
         scaleByVolatility: options.valueDistillation.strategyVolatilityScaling,
       },
     )
@@ -937,8 +938,10 @@ export function evaluateVwKamaOracle(
         exposureFromCode(oracleStateCodes[index] ?? 0),
       );
       if (valueDistillation && options.valueDistillation) {
+        const strategyTemperature = (options.parameters.strategyTemperature ?? 0.001)
+          * strategyTemperatures![index]!;
         const quadraticCoefficient = strategyExposureQuadraticCoefficient(
-          options.valueDistillation.strategyQuadraticScale,
+          options.parameters.strategyQuadraticScale ?? 0,
           strategyQuadraticVolatilities![index]!,
         );
         observeExposureValueDistillation(
@@ -947,7 +950,7 @@ export function evaluateVwKamaOracle(
           index,
           rate,
           options.intervalMs,
-          strategyTemperatures![index]!,
+          strategyTemperature,
           quadraticCoefficient,
         );
         if (valueReturns && index + 1 < candles.length) {
@@ -1025,8 +1028,8 @@ export function evaluateVwKamaOracle(
           rate,
           options.intervalMs,
           options.valueDistillation.oracle,
-          strategyTemperatures![index]!,
-          options.valueDistillation.strategyQuadraticScale,
+          (options.parameters.strategyTemperature ?? 0.001) * strategyTemperatures![index]!,
+          options.parameters.strategyQuadraticScale ?? 0,
           strategyQuadraticVolatilities![index]!,
         ));
       }
@@ -1653,6 +1656,8 @@ function validate(options: EvaluateVwKamaOptions): void {
     options.parameters.volumeMs,
     options.parameters.volumeCap,
     options.parameters.rateEmaMs ?? options.intervalMs,
+    options.parameters.strategyTemperature ?? 0.001,
+    options.parameters.strategyQuadraticVolatilityMs ?? HOUR_MS,
     options.timingHalfLifeMs,
     options.warmupMultiple,
   ];
@@ -1666,6 +1671,7 @@ function validate(options: EvaluateVwKamaOptions): void {
     options.parameters.thresholdNoiseMultiplier ?? 0,
     options.parameters.thresholdInverseMaxBpsHour ?? 0,
     options.parameters.signalFrictionFraction ?? 1,
+    options.parameters.strategyQuadraticScale ?? 0,
     options.parameters.buyMaxFraction ?? 1,
     options.parameters.sellMaxFraction ?? 1,
     options.parameters.confirmationAccelerationWeight ?? 1,

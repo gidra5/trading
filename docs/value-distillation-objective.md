@@ -12,9 +12,11 @@ npm run search:kama -- \
   --value-horizon-mode fixed \
   --value-horizon 1s \
   --oracle-temperature 0.01 \
-  --strategy-temperature 0.001 \
-  --strategy-quadratic-scale 0 \
-  --strategy-quadratic-volatility-window 1h \
+  --strategy-temperature-range 0.000001..0.1 \
+  --strategy-quadratic-scale-range 0..1000000 \
+  --strategy-quadratic-volatility-window-range 1m..24h \
+  --threshold-noise-responses proportional,inverse \
+  --signal-friction-fraction-range 0..1 \
   --strategy-volatility-scaling true
 ```
 
@@ -99,7 +101,10 @@ larger volatility concentrates probability more strongly around its interior mod
 or zero measured volatility gives `b2=0` and recovers the original truncated exponential with
 its exact constant-time partition. The effective temperature is:
 
-The quadratic volatility window defaults to `1h`. At each candle scale it is rounded to the
+Strategy temperature, quadratic scale, quadratic volatility window, threshold-noise response,
+and candidate friction fraction are signal parameters searched independently for every candidate
+and stored directly in each selected preset. The quadratic volatility window search defaults to
+`1m..24h`. At each candle scale it is rounded to the
 nearest positive candle count. If it resolves to one return, its population standard deviation
 is zero and the quadratic term is inactive at that scale.
 

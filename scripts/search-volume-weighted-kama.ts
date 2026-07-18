@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { fork } from "node:child_process";
 import { availableParallelism, cpus } from "node:os";
+import { gunzipSync } from "node:zlib";
 import {
   isMainThread,
   parentPort,
@@ -15,7 +16,6 @@ import {
   prepareExposureValueOracle,
   shareExposureValueOracle,
   strategyExposureTemperatures,
-  strategyExposureVolatilities,
   type ExposureValueOracle,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
 import {
@@ -98,9 +98,6 @@ interface Args {
   valueHorizonMode: VwKamaValueHorizonMode;
   valueHorizonMs: number;
   oracleTemperature: number;
-  strategyTemperature: number;
-  strategyQuadraticScale: number;
-  strategyQuadraticVolatilityMs: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
@@ -128,7 +125,14 @@ interface Args {
   deadbandBpsHour: Range;
   hysteresisReleaseRatio: Range;
   thresholdLookback: Range;
+  thresholdNoiseResponses: Array<"proportional" | "inverse">;
   thresholdNoiseMultiplier: Range;
+  thresholdInverseMax: Range;
+  thresholdInverseNoiseScale: Range;
+  signalFrictionFraction: Range;
+  strategyTemperature: Range;
+  strategyQuadraticScale: Range;
+  strategyQuadraticVolatility: Range;
   buyMaxFraction: Range;
   sellMaxFraction: Range;
   buySizingSigma: Range;
@@ -180,11 +184,14 @@ interface Candidate {
   deadbandMode: DeadbandMode;
   hysteresisReleaseRatio: number;
   thresholdLookbackMs: number;
-  thresholdNoiseResponse?: "proportional" | "inverse";
+  thresholdNoiseResponse: "proportional" | "inverse";
   thresholdNoiseMultiplier: number;
-  thresholdInverseMaxBpsHour?: number;
-  thresholdInverseNoiseScaleBpsHour?: number;
-  signalFrictionFraction?: number;
+  thresholdInverseMaxBpsHour: number;
+  thresholdInverseNoiseScaleBpsHour: number;
+  signalFrictionFraction: number;
+  strategyTemperature: number;
+  strategyQuadraticScale: number;
+  strategyQuadraticVolatilityMs: number;
   buyMaxFraction: number;
   sellMaxFraction: number;
   buySizingSigmaBpsHour: number;
@@ -228,7 +235,6 @@ interface CaseData {
   preparedOracle?: VwKamaPreparedOracle;
   valueOracle?: ExposureValueOracle;
   strategyTemperatures?: Float32Array;
-  strategyQuadraticVolatilities?: Float32Array;
   valueHorizonMs?: number;
   days: number;
 }
@@ -498,9 +504,6 @@ async function run(config: Args): Promise<void> {
       horizonMode: config.valueHorizonMode,
       horizonMs: config.valueHorizonMs,
       oracleTemperature: config.oracleTemperature,
-      strategyTemperature: config.strategyTemperature,
-      strategyQuadraticScale: config.strategyQuadraticScale,
-      strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
       strategyVolatilityScaling: config.strategyVolatilityScaling,
       opportunityWeight: `max(Q)-min(Q)+${config.opportunityEpsilon}`,
       quoteLendRate: config.quoteLendRate,
@@ -526,8 +529,9 @@ async function run(config: Args): Promise<void> {
       caseWarmup: formatDuration(maxWarmupMs),
     },
     signalMemory: {
-      friction: config.oracleFriction,
-      rule: "absolute close-to-last-signal return must be greater than friction",
+      oracleFriction: config.oracleFriction,
+      candidateFractionRange: formatRange(config.signalFrictionFraction),
+      rule: "absolute close-to-last-signal return must exceed oracle friction times the candidate fraction",
     },
     ranges: {
       efficiency: formatRange(config.efficiency, formatDuration),
@@ -542,7 +546,14 @@ async function run(config: Args): Promise<void> {
       deadbandBpsHour: formatRange(config.deadbandBpsHour),
       hysteresisReleaseRatio: formatRange(config.hysteresisReleaseRatio),
       thresholdLookback: formatRange(config.thresholdLookback, formatDuration),
+      thresholdNoiseResponses: config.thresholdNoiseResponses,
       thresholdNoiseMultiplier: formatRange(config.thresholdNoiseMultiplier),
+      thresholdInverseMax: formatRange(config.thresholdInverseMax),
+      thresholdInverseNoiseScale: formatRange(config.thresholdInverseNoiseScale),
+      signalFrictionFraction: formatRange(config.signalFrictionFraction),
+      strategyTemperature: formatRange(config.strategyTemperature),
+      strategyQuadraticScale: formatRange(config.strategyQuadraticScale),
+      strategyQuadraticVolatility: formatRange(config.strategyQuadraticVolatility, formatDuration),
       buyMaxFraction: formatRange(config.buyMaxFraction),
       sellMaxFraction: formatRange(config.sellMaxFraction),
       buySizingSigma: formatRange(config.buySizingSigma),
@@ -666,9 +677,6 @@ function writeGlobalPresets(
         horizonMode: config.valueHorizonMode,
         horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
-        strategyTemperature: config.strategyTemperature,
-        strategyQuadraticScale: config.strategyQuadraticScale,
-        strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
@@ -966,7 +974,7 @@ function latinMembers(
   let remainder = count % descriptors.length;
   return descriptors.flatMap((descriptor) => {
     const size = base + (remainder-- > 0 ? 1 : 0);
-    return latinVectors(size, 42, random).map((vector) => ({
+    return latinVectors(size, 49, random).map((vector) => ({
       family: descriptor.family,
       mask: descriptor.mask,
       genome: applyDescriptor(vectorGenome(vector, config), descriptor, config),
@@ -1403,6 +1411,13 @@ function genomeVector(genome: Genome, config: Args): number[] {
     sparseUnit(genome.meanReversionReversalThreshold, config.meanReversionReversalThreshold),
     logUnit(genome.meanReversionEfficiencyMs, config.meanReversionEfficiency),
     logUnit(genome.meanReversionFastMs, config.meanReversionFast),
+    logUnit(genome.strategyTemperature, config.strategyTemperature),
+    sparseUnit(genome.strategyQuadraticScale, config.strategyQuadraticScale),
+    logUnit(genome.strategyQuadraticVolatilityMs, config.strategyQuadraticVolatility),
+    genome.thresholdNoiseResponse === "inverse" ? 1 : 0,
+    unit(genome.signalFrictionFraction, config.signalFrictionFraction),
+    logUnit(genome.thresholdInverseMaxBpsHour, config.thresholdInverseMax),
+    logUnit(genome.thresholdInverseNoiseScaleBpsHour, config.thresholdInverseNoiseScale),
   ];
 }
 
@@ -1468,6 +1483,15 @@ function vectorGenome(vector: number[], config: Args): Genome {
     ),
     meanReversionEfficiencyMs: logRange(vector[40]!, config.meanReversionEfficiency),
     meanReversionFastMs,
+    strategyTemperature: logRange(vector[42]!, config.strategyTemperature),
+    strategyQuadraticScale: sparseRange(vector[43]!, config.strategyQuadraticScale),
+    strategyQuadraticVolatilityMs: logRange(vector[44]!, config.strategyQuadraticVolatility),
+    thresholdNoiseResponse: config.thresholdNoiseResponses.length === 1
+      ? config.thresholdNoiseResponses[0]!
+      : vector[45]! >= 0.5 ? "inverse" : "proportional",
+    signalFrictionFraction: fromUnit(vector[46]!, config.signalFrictionFraction),
+    thresholdInverseMaxBpsHour: logRange(vector[47]!, config.thresholdInverseMax),
+    thresholdInverseNoiseScaleBpsHour: logRange(vector[48]!, config.thresholdInverseNoiseScale),
   };
 }
 
@@ -1572,9 +1596,6 @@ async function runPerWindow(
         horizonMode: config.valueHorizonMode,
         horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
-        strategyTemperature: config.strategyTemperature,
-        strategyQuadraticScale: config.strategyQuadraticScale,
-        strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
@@ -1645,6 +1666,12 @@ async function runPerWindow(
         + `${round(parameters.confirmationMix ?? 0, 3)} / ${round(parameters.confirmationEmaGateStrength ?? 0, 3)} | `
         + `${formatDuration(parameters.meanReversionEfficiencyMs ?? parameters.efficiencyMs)} ER / ${formatDuration(parameters.meanReversionFastMs ?? parameters.fastMs)}–${formatDuration(parameters.meanReversionSlowMs ?? HOUR)} KAMA / ${formatDuration(parameters.meanReversionVolatilityMs ?? HOUR)} vol @ ${round(parameters.meanReversionSuppressionThreshold ?? 1, 3)}σ suppress / ${round(parameters.meanReversionReversalThreshold ?? 0, 3)}σ reverse |`;
     }),
+    "",
+    "## Selected distribution and friction parameters",
+    "",
+    "| preset | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window |",
+    "|---|---|---:|---:|---:|---:|",
+    ...documented.map(({ id, parameters }) => `| ${id} | ${parameters.thresholdNoiseResponse ?? "proportional"} | ${round(parameters.signalFrictionFraction ?? 1, 5)} | ${round(parameters.strategyTemperature ?? 0.001, 9)} | ${round(parameters.strategyQuadraticScale ?? 0, 5)} | ${formatDuration(parameters.strategyQuadraticVolatilityMs ?? HOUR)} |`),
     "",
   ].join("\n"));
   console.error(`Presets: ${path.relative(repoRoot, config.presetOutputPath)}`);
@@ -1833,6 +1860,21 @@ function storedCandidate(value: Record<string, unknown>, index: number): Candida
     hysteresisReleaseRatio: number("hysteresisReleaseRatio", 0.25),
     thresholdLookbackMs: duration("thresholdLookbackMs", "thresholdLookback", HOUR),
     thresholdNoiseMultiplier: number("thresholdNoiseMultiplier", 0),
+    thresholdInverseMaxBpsHour: number("thresholdInverseMaxBpsHour", 0),
+    thresholdInverseNoiseScaleBpsHour: number("thresholdInverseNoiseScaleBpsHour", 30),
+    thresholdNoiseResponse: text(
+      "thresholdNoiseResponse",
+      ["proportional", "inverse"] as const,
+      "proportional",
+    ),
+    signalFrictionFraction: number("signalFrictionFraction", 1),
+    strategyTemperature: number("strategyTemperature", 0.001),
+    strategyQuadraticScale: number("strategyQuadraticScale", 0),
+    strategyQuadraticVolatilityMs: duration(
+      "strategyQuadraticVolatilityMs",
+      "strategyQuadraticVolatility",
+      HOUR,
+    ),
     buyMaxFraction: number("buyMaxFraction", 1),
     sellMaxFraction: number("sellMaxFraction", 1),
     buySizingSigmaBpsHour: number("buySizingSigmaBpsHour", 1e12),
@@ -2009,12 +2051,8 @@ async function evaluateStageCuda(
             fitnessOnly: true,
             valueDistillation: {
               oracle: testCase.valueOracle,
-              strategyTemperature: config.strategyTemperature,
-              strategyQuadraticScale: config.strategyQuadraticScale,
-              strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
               strategyVolatilityScaling: config.strategyVolatilityScaling,
               strategyTemperatures: testCase.strategyTemperatures,
-              strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
             },
           },
         };
@@ -2040,12 +2078,8 @@ async function evaluateStageCuda(
         valueDistillation: testCase.valueOracle
           ? {
               oracle: testCase.valueOracle,
-              strategyTemperature: config.strategyTemperature,
-              strategyQuadraticScale: config.strategyQuadraticScale,
-              strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
               strategyVolatilityScaling: config.strategyVolatilityScaling,
               strategyTemperatures: testCase.strategyTemperatures,
-              strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
             }
           : undefined,
       },
@@ -2260,9 +2294,6 @@ async function prepareStageWindow(
     valueHorizonMode: config.valueHorizonMode,
     valueHorizonMs: config.valueHorizonMs,
     oracleTemperature: config.oracleTemperature,
-    strategyTemperature: config.strategyTemperature,
-    strategyQuadraticScale: config.strategyQuadraticScale,
-    strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
     strategyVolatilityScaling: config.strategyVolatilityScaling,
     opportunityEpsilon: config.opportunityEpsilon,
     quoteLendRate: config.quoteLendRate,
@@ -2318,12 +2349,10 @@ async function prepareStageWindow(
             ? shareExposureValueOracle(testCase.valueOracle)
             : undefined;
           const strategyTemperatures = testCase.strategyTemperatures;
-          const strategyQuadraticVolatilities = testCase.strategyQuadraticVolatilities;
           prepared.bytes += candleColumnBytes(candles)
             + preparedOracle.stateCodes.byteLength
             + (valueOracle ? exposureValueOracleBytes(valueOracle) : 0)
-            + (strategyTemperatures?.byteLength ?? 0)
-            + (strategyQuadraticVolatilities?.byteLength ?? 0);
+            + (strategyTemperatures?.byteLength ?? 0);
           prepared.cases.push({
             ...testCase,
             candles,
@@ -2331,7 +2360,6 @@ async function prepareStageWindow(
             preparedOracle,
             valueOracle,
             strategyTemperatures,
-            strategyQuadraticVolatilities,
           });
         }
       }
@@ -2494,7 +2522,6 @@ async function buildCases(
         });
         let valueOracle: ExposureValueOracle | undefined;
         let strategyTemperatures: Float32Array | undefined;
-        let strategyQuadraticVolatilities: Float32Array | undefined;
         let valueHorizonMs: number | undefined;
         if (config.objective === "value-distillation") {
           const prices = caseCandles.map((candle) => candle.close);
@@ -2533,15 +2560,10 @@ async function buildCases(
               options,
             );
           }
-          strategyQuadraticVolatilities = strategyExposureVolatilities(
-            prices,
-            Math.max(1, Math.round(config.strategyQuadraticVolatilityMs / scaleMs)),
-            true,
-          );
           strategyTemperatures = strategyExposureTemperatures(prices, {
             intervalMs: scaleMs,
             horizonSteps,
-            temperature: config.strategyTemperature,
+            temperature: 1,
             scaleByVolatility: config.strategyVolatilityScaling,
           }, true);
         }
@@ -2555,7 +2577,6 @@ async function buildCases(
           oracle,
           valueOracle,
           strategyTemperatures,
-          strategyQuadraticVolatilities,
           valueHorizonMs,
           days: Math.max(scaleMs / DAY, scored.length * scaleMs / DAY),
         });
@@ -2574,50 +2595,7 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     intervalMs: testCase.scaleMs,
     scoreStartTime: testCase.window.start,
     scoreStartIndex: testCase.scoreStart,
-    parameters: {
-      efficiencyMs: candidate.efficiencyMs,
-      efficiencyVolumeEmaMs: candidate.efficiencyVolumeEmaMs,
-      efficiencyVolumePower: candidate.efficiencyVolumePower,
-      fastMs: candidate.fastMs,
-      slowMs: candidate.slowMs,
-      power: candidate.power,
-      volumeMs: candidate.volumeMs,
-      volumeCap: candidate.volumeCap,
-      volumePower: candidate.volumePower,
-      deadbandBpsHour: candidate.deadbandBpsHour,
-      deadbandMode: candidate.deadbandMode,
-      hysteresisReleaseRatio: candidate.hysteresisReleaseRatio,
-      thresholdLookbackMs: candidate.thresholdLookbackMs,
-      thresholdNoiseMultiplier: candidate.thresholdNoiseMultiplier,
-      buyMaxFraction: candidate.buyMaxFraction,
-      sellMaxFraction: candidate.sellMaxFraction,
-      buySizingSigmaBpsHour: candidate.buySizingSigmaBpsHour,
-      sellSizingSigmaBpsHour: candidate.sellSizingSigmaBpsHour,
-      agreementMode: candidate.agreementMode,
-      confirmationMix: candidate.confirmationMix,
-      confirmationMinQuality: candidate.confirmationMinQuality,
-      confirmationAccelerationLookbackMs: candidate.confirmationAccelerationLookbackMs,
-      confirmationDistanceLookbackMs: candidate.confirmationDistanceLookbackMs,
-      confirmationAccelerationWeight: candidate.confirmationAccelerationWeight,
-      confirmationDistanceWeight: candidate.confirmationDistanceWeight,
-      confirmationBias: candidate.confirmationBias,
-      confirmationEmaMs: candidate.confirmationEmaMs,
-      confirmationEmaThresholdBpsHour: candidate.confirmationEmaThresholdBpsHour,
-      confirmationEmaWeight: candidate.confirmationEmaWeight,
-      confirmationEmaGateStrength: candidate.confirmationEmaGateStrength,
-      confirmationRsiMs: candidate.confirmationRsiMs,
-      confirmationRsiThreshold: candidate.confirmationRsiThreshold,
-      confirmationRsiWeight: candidate.confirmationRsiWeight,
-      confirmationDmiMs: candidate.confirmationDmiMs,
-      confirmationDmiWeight: candidate.confirmationDmiWeight,
-      confirmationAdxThreshold: candidate.confirmationAdxThreshold,
-      meanReversionSuppressionThreshold: candidate.meanReversionSuppressionThreshold,
-      meanReversionEfficiencyMs: candidate.meanReversionEfficiencyMs,
-      meanReversionFastMs: candidate.meanReversionFastMs,
-      meanReversionSlowMs: candidate.meanReversionSlowMs,
-      meanReversionVolatilityMs: candidate.meanReversionVolatilityMs,
-      meanReversionReversalThreshold: candidate.meanReversionReversalThreshold,
-    },
+    parameters: candidateParameters(candidate),
     oracleFriction: config.oracleFriction,
     matchWindowMs: config.matchWindowMs,
     timingHalfLifeMs: config.timingHalfLifeMs,
@@ -2628,12 +2606,8 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     valueDistillation: testCase.valueOracle
       ? {
           oracle: testCase.valueOracle,
-          strategyTemperature: config.strategyTemperature,
-          strategyQuadraticScale: config.strategyQuadraticScale,
-          strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
           strategyVolatilityScaling: config.strategyVolatilityScaling,
           strategyTemperatures: testCase.strategyTemperatures,
-          strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
         }
       : undefined,
   });
@@ -2856,11 +2830,18 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
     buySizingSigmaBpsHour: 1e12,
     sellSizingSigmaBpsHour: 1e12,
     agreementMode: "sizing" as const,
+    signalFrictionFraction: 1,
+    strategyTemperature: 0.001,
+    strategyQuadraticScale: 0,
+    strategyQuadraticVolatilityMs: HOUR,
     ...confirmation,
   };
   const threshold = {
     thresholdLookbackMs: HOUR,
+    thresholdNoiseResponse: "proportional" as const,
     thresholdNoiseMultiplier: 0,
+    thresholdInverseMaxBpsHour: 0,
+    thresholdInverseNoiseScaleBpsHour: 30,
   };
   const refined = {
     efficiencyMs: 1_856_036,
@@ -2893,11 +2874,14 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
     deadbandMode: productionSignal.deadbandMode,
     hysteresisReleaseRatio: productionSignal.hysteresisReleaseRatio ?? 0,
     thresholdLookbackMs: productionSignal.thresholdLookbackMs ?? HOUR,
-    thresholdNoiseResponse: productionSignal.thresholdNoiseResponse,
+    thresholdNoiseResponse: productionSignal.thresholdNoiseResponse ?? "proportional",
     thresholdNoiseMultiplier: productionSignal.thresholdNoiseMultiplier ?? 0,
-    thresholdInverseMaxBpsHour: productionSignal.thresholdInverseMaxBpsHour,
-    thresholdInverseNoiseScaleBpsHour: productionSignal.thresholdInverseNoiseScaleBpsHour,
-    signalFrictionFraction: productionSignal.signalFrictionFraction,
+    thresholdInverseMaxBpsHour: productionSignal.thresholdInverseMaxBpsHour ?? 0,
+    thresholdInverseNoiseScaleBpsHour: productionSignal.thresholdInverseNoiseScaleBpsHour ?? 30,
+    signalFrictionFraction: productionSignal.signalFrictionFraction ?? 1,
+    strategyTemperature: productionSignal.strategyTemperature ?? 0.001,
+    strategyQuadraticScale: productionSignal.strategyQuadraticScale ?? 0,
+    strategyQuadraticVolatilityMs: productionSignal.strategyQuadraticVolatilityMs ?? HOUR,
     buyMaxFraction: productionSignal.buyMaxFraction ?? 1,
     sellMaxFraction: productionSignal.sellMaxFraction ?? 1,
     buySizingSigmaBpsHour: 1e12,
@@ -2918,7 +2902,10 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
       deadbandBpsHour: 30,
       deadbandMode: "hold",
       thresholdLookbackMs: 2_457_073,
+      thresholdNoiseResponse: "proportional",
       thresholdNoiseMultiplier: 0,
+      thresholdInverseMaxBpsHour: 0,
+      thresholdInverseNoiseScaleBpsHour: 30,
       ...fullSizing,
     },
     {
@@ -2934,7 +2921,10 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
       deadbandBpsHour: 21.21468,
       deadbandMode: "hold",
       thresholdLookbackMs: 900_000,
+      thresholdNoiseResponse: "proportional",
       thresholdNoiseMultiplier: 0,
+      thresholdInverseMaxBpsHour: 0,
+      thresholdInverseNoiseScaleBpsHour: 30,
       ...fullSizing,
     },
     { id: "global-refined-v0016", family: "volume", volumePower: 1.72738, ...refined },
@@ -2977,7 +2967,15 @@ function randomGenome(config: Args, random: () => number): Genome {
     deadbandMode: config.deadbandModes[Math.floor(random() * config.deadbandModes.length)]!,
     hysteresisReleaseRatio: linearRandom(random, config.hysteresisReleaseRatio),
     thresholdLookbackMs: logRandom(random, config.thresholdLookback),
+    thresholdNoiseResponse:
+      config.thresholdNoiseResponses[Math.floor(random() * config.thresholdNoiseResponses.length)]!,
     thresholdNoiseMultiplier: linearRandom(random, config.thresholdNoiseMultiplier),
+    thresholdInverseMaxBpsHour: logRandom(random, config.thresholdInverseMax),
+    thresholdInverseNoiseScaleBpsHour: logRandom(random, config.thresholdInverseNoiseScale),
+    signalFrictionFraction: linearRandom(random, config.signalFrictionFraction),
+    strategyTemperature: logRandom(random, config.strategyTemperature),
+    strategyQuadraticScale: sparseRandom(random, config.strategyQuadraticScale),
+    strategyQuadraticVolatilityMs: logRandom(random, config.strategyQuadraticVolatility),
     buyMaxFraction: linearRandom(random, config.buyMaxFraction),
     sellMaxFraction: linearRandom(random, config.sellMaxFraction),
     buySizingSigmaBpsHour: logRandom(random, config.buySizingSigma),
@@ -3050,6 +3048,9 @@ function candidateParameters(candidate: Candidate) {
     thresholdInverseMaxBpsHour: candidate.thresholdInverseMaxBpsHour,
     thresholdInverseNoiseScaleBpsHour: candidate.thresholdInverseNoiseScaleBpsHour,
     signalFrictionFraction: candidate.signalFrictionFraction,
+    strategyTemperature: candidate.strategyTemperature,
+    strategyQuadraticScale: candidate.strategyQuadraticScale,
+    strategyQuadraticVolatilityMs: candidate.strategyQuadraticVolatilityMs,
     buyMaxFraction: candidate.buyMaxFraction,
     sellMaxFraction: candidate.sellMaxFraction,
     buySizingSigmaBpsHour: candidate.buySizingSigmaBpsHour,
@@ -3097,6 +3098,13 @@ function presetCandidate(preset: VwKamaPreset, index = 0): Candidate {
     efficiencyVolumePower: preset.parameters.efficiencyVolumePower ?? 0,
     thresholdLookbackMs: preset.parameters.thresholdLookbackMs ?? HOUR,
     thresholdNoiseMultiplier: preset.parameters.thresholdNoiseMultiplier ?? 0,
+    thresholdNoiseResponse: preset.parameters.thresholdNoiseResponse ?? "proportional",
+    thresholdInverseMaxBpsHour: preset.parameters.thresholdInverseMaxBpsHour ?? 0,
+    thresholdInverseNoiseScaleBpsHour: preset.parameters.thresholdInverseNoiseScaleBpsHour ?? 30,
+    signalFrictionFraction: preset.parameters.signalFrictionFraction ?? 1,
+    strategyTemperature: preset.parameters.strategyTemperature ?? 0.001,
+    strategyQuadraticScale: preset.parameters.strategyQuadraticScale ?? 0,
+    strategyQuadraticVolatilityMs: preset.parameters.strategyQuadraticVolatilityMs ?? HOUR,
     hysteresisReleaseRatio: preset.parameters.hysteresisReleaseRatio ?? 0.25,
     buyMaxFraction: preset.parameters.buyMaxFraction ?? 1,
     sellMaxFraction: preset.parameters.sellMaxFraction ?? 1,
@@ -3197,9 +3205,14 @@ function* loadSourceSegments(
   let found = false;
   for (let time = utcDay(range.start); time < range.end; time += DAY) {
     const date = new Date(time).toISOString().slice(0, 10);
-    const file = path.join(sourceDir, `${date}.jsonl`);
+    const plainFile = path.join(sourceDir, `${date}.jsonl`);
+    const compressedFile = `${plainFile}.gz`;
+    const file = fs.existsSync(plainFile) ? plainFile : compressedFile;
     if (!fs.existsSync(file)) continue;
-    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const content = file.endsWith(".gz")
+      ? gunzipSync(fs.readFileSync(file)).toString("utf8")
+      : fs.readFileSync(file, "utf8");
+    for (const line of content.split("\n")) {
       if (!line.trim()) continue;
       const parsed = JSON.parse(line) as TradingCandle & { interval?: string; closed?: boolean };
       if (!validCandle(parsed) || parsed.closed === false) continue;
@@ -3237,10 +3250,10 @@ function* loadSourceSegments(
 }
 
 function sourceBounds(sourceDir: string): { start: number; end: number } {
-  const dates = fs.readdirSync(sourceDir)
-    .map((file) => /^(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(file)?.[1])
+  const dates = [...new Set(fs.readdirSync(sourceDir)
+    .map((file) => /^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.gz)?$/.exec(file)?.[1])
     .filter((date): date is string => Boolean(date))
-    .sort();
+  )].sort();
   if (dates.length === 0) throw new Error(`No daily JSONL shards in ${sourceDir}.`);
   const start = Date.parse(`${dates[0]}T00:00:00Z`);
   const shardEnd = Date.parse(`${dates.at(-1)}T00:00:00Z`) + DAY;
@@ -3279,7 +3292,9 @@ function parseArgs(argv: string[]): Args {
     "efficiency-volume-ema-range", "efficiency-volume-power-range",
     "slow-range", "volume-range", "power-range", "volume-cap-range",
     "volume-power-range", "deadband-bps-hour-range", "threshold-lookback-range",
-    "threshold-noise-multiplier-range", "algorithm", "mode", "generations", "restarts",
+    "threshold-noise-responses", "threshold-noise-multiplier-range",
+    "threshold-inverse-max-range", "threshold-inverse-noise-scale-range",
+    "signal-friction-fraction-range", "algorithm", "mode", "generations", "restarts",
     "full-evaluation-interval", "refinement-rounds", "pbest-fraction", "confirmation-masks",
     "buy-max-fraction-range", "sell-max-fraction-range",
     "buy-sizing-sigma-range", "sell-sizing-sigma-range",
@@ -3300,7 +3315,8 @@ function parseArgs(argv: string[]): Args {
     "screen-scales", "workers", "accelerator", "objective", "score-version",
     "exposure-grid-size", "exposure-min", "exposure-max", "max-effective-exposure",
     "value-horizon-mode", "value-horizon", "oracle-temperature",
-    "strategy-temperature", "strategy-quadratic-scale", "strategy-quadratic-volatility-window",
+    "strategy-temperature-range", "strategy-quadratic-scale-range",
+    "strategy-quadratic-volatility-window-range",
     "strategy-volatility-scaling",
     "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
     "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
@@ -3357,6 +3373,13 @@ function parseArgs(argv: string[]): Args {
     || deadbandModes.some((value) => !["flat", "hold", "hysteresis"].includes(value))) {
     throw new Error("--deadband-modes must contain flat, hold, and/or hysteresis.");
   }
+  const thresholdNoiseResponses = unique(
+    get("threshold-noise-responses", "proportional,inverse").split(","),
+  );
+  if (thresholdNoiseResponses.length === 0
+    || thresholdNoiseResponses.some((value) => value !== "proportional" && value !== "inverse")) {
+    throw new Error("--threshold-noise-responses must contain proportional and/or inverse.");
+  }
   return {
     sourceDir,
     sourceIntervalMs: parseDuration(get("source-interval", "1m")),
@@ -3392,14 +3415,6 @@ function parseArgs(argv: string[]): Args {
     valueHorizonMode,
     valueHorizonMs: parseDuration(get("value-horizon", "1s")),
     oracleTemperature: positive(get("oracle-temperature", "0.01"), "oracle-temperature"),
-    strategyTemperature: positive(get("strategy-temperature", "0.001"), "strategy-temperature"),
-    strategyQuadraticScale: nonNegative(
-      get("strategy-quadratic-scale", "0"),
-      "strategy-quadratic-scale",
-    ),
-    strategyQuadraticVolatilityMs: parseDuration(
-      get("strategy-quadratic-volatility-window", "1h"),
-    ),
     strategyVolatilityScaling: booleanValue(
       get("strategy-volatility-scaling", "false"),
       "strategy-volatility-scaling",
@@ -3446,10 +3461,39 @@ function parseArgs(argv: string[]): Args {
     deadbandBpsHour: numberRange(get("deadband-bps-hour-range", "0.05..2000"), "deadband-bps-hour-range", 0),
     hysteresisReleaseRatio: fractionRange(get("hysteresis-release-ratio-range", "0..1"), "hysteresis-release-ratio-range"),
     thresholdLookback: durationRange(get("threshold-lookback-range", "5m..24h"), "threshold-lookback-range"),
+    thresholdNoiseResponses: thresholdNoiseResponses as Array<"proportional" | "inverse">,
     thresholdNoiseMultiplier: numberRange(
       get("threshold-noise-multiplier-range", "0..8"),
       "threshold-noise-multiplier-range",
       0,
+    ),
+    thresholdInverseMax: numberRange(
+      get("threshold-inverse-max-range", "0.05..2000"),
+      "threshold-inverse-max-range",
+      0,
+    ),
+    thresholdInverseNoiseScale: numberRange(
+      get("threshold-inverse-noise-scale-range", "0.05..2000"),
+      "threshold-inverse-noise-scale-range",
+      Number.MIN_VALUE,
+    ),
+    signalFrictionFraction: fractionRange(
+      get("signal-friction-fraction-range", "0..1"),
+      "signal-friction-fraction-range",
+    ),
+    strategyTemperature: numberRange(
+      get("strategy-temperature-range", "0.000001..0.1"),
+      "strategy-temperature-range",
+      Number.MIN_VALUE,
+    ),
+    strategyQuadraticScale: numberRange(
+      get("strategy-quadratic-scale-range", "0..1000000"),
+      "strategy-quadratic-scale-range",
+      0,
+    ),
+    strategyQuadraticVolatility: durationRange(
+      get("strategy-quadratic-volatility-window-range", "1m..24h"),
+      "strategy-quadratic-volatility-window-range",
     ),
     buyMaxFraction: fractionRange(get("buy-max-fraction-range", "0.05..1"), "buy-max-fraction-range"),
     sellMaxFraction: fractionRange(get("sell-max-fraction-range", "0.05..1"), "sell-max-fraction-range"),
@@ -3620,6 +3664,7 @@ function maximumWarmupMs(config: Args): number {
     config.meanReversionFast.max * config.warmupMultiple,
     config.meanReversionSlow.max * config.warmupMultiple,
     config.meanReversionVolatility.max * config.warmupMultiple,
+    config.strategyQuadraticVolatility.max,
   );
 }
 
@@ -3665,11 +3710,11 @@ function report(
       : `- Generation zero evaluates ${config.trials} deterministic Latin-hypercube genomes and selects by 70% score / 30% parameter novelty.`,
     `- Search uses ${config.restarts} independent restart(s), adaptive current-to-pbest differential evolution, family/agreement/confirmation-mask islands with cross-island migration, rotating fit folds with a full-fit pass every ${config.fullEvaluationInterval} generations, and ${config.refinementRounds} shrinking elite-refinement round(s).`,
     "- Signal: completed-candle volume-weighted KAMA derivative rate with flat, hold, or hysteresis state handling. The rate calculation, threshold clamp, adaptive-noise threshold, and consumed-edge friction memory are shared directly with the live PeakValleyStrategy. ER optionally weights every price move by `(volume / causal volume EMA)^ER volume power`; zero recovers standard ER. A second volume-aware KAMA supplies the optional mean-reversion baseline: it has independent ER/fast/slow periods and shares the strategy's ER-volume, KAMA-power, and post-ER volume behavior. Its causal volatility-normalized distance follows KAMA below the suppression threshold, goes flat between thresholds, and reverses KAMA at the reversal threshold. A causal logistic confirmation can combine KAMA acceleration, price overextension, independent slow-EMA trend, RSI, and ADX-strength-weighted DMI direction, then scale or filter the signal. Those experimental layers are disabled for `production-current`. Sizing mode price-marks the fraction, while confidence mode holds it as uncertainty until the next signal.",
-    `- Signal memory: after the first signal, a candidate state change emits only when the current close is strictly more than ${round(config.oracleFriction * 10_000, 3)} bps from the last emitted signal price; rejected changes retain the prior state. This is the same friction used by the oracle.`,
+    `- Signal memory: after the first signal, a candidate state change emits only when the current close moves strictly past oracle friction × its searched candidate fraction (${formatRange(config.signalFrictionFraction)}); rejected changes retain the prior state. Oracle friction is ${round(config.oracleFriction * 10_000, 3)} bps.`,
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}, ${config.valueHorizonMode === "fixed" ? `${formatDuration(config.valueHorizonMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHorizonMs)} fallback)`} forced-exposure horizon, value temperature ${config.oracleTemperature}; strategy exp(b1*a - ${config.strategyQuadraticScale}*v^2*a^2), where v is causal log-return volatility over ${formatDuration(config.strategyQuadraticVolatilityMs)}; temperature ${config.strategyTemperature} scales with sqrt(H/dt)${config.strategyVolatilityScaling ? " and trailing-H volatility" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}, ${config.valueHorizonMode === "fixed" ? `${formatDuration(config.valueHorizonMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHorizonMs)} fallback)`} forced-exposure horizon, value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, and quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
       ? "- Candidate fitness is the negative of median/P90 cross-entropy, equally weighted; every scale/window case has equal weight."
@@ -3692,6 +3737,12 @@ function report(
     "| family | id | agreement | efficiency | ER volume EMA/power | fast | slow | power | volume | cap | volume power | base threshold | state mode | noise lookback | noise multiplier | buy max | sell max | buy sigma | sell sigma |",
     "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|",
     ...test.map(({ candidate }) => `| ${candidate.family} | ${candidate.id} | ${candidate.agreementMode} | ${formatDuration(candidate.efficiencyMs)} | ${formatDuration(candidate.efficiencyVolumeEmaMs)} / ${round(candidate.efficiencyVolumePower, 3)} | ${formatDuration(candidate.fastMs)} | ${formatDuration(candidate.slowMs)} | ${round(candidate.power, 3)} | ${formatDuration(candidate.volumeMs)} | ${round(candidate.volumeCap, 3)} | ${round(candidate.volumePower, 3)} | ${round(candidate.deadbandBpsHour, 3)} bps/hour | ${candidate.deadbandMode} | ${formatDuration(candidate.thresholdLookbackMs)} | ${round(candidate.thresholdNoiseMultiplier, 3)} | ${pct(candidate.buyMaxFraction)} | ${pct(candidate.sellMaxFraction)} | ${round(candidate.buySizingSigmaBpsHour, 3)} | ${round(candidate.sellSizingSigmaBpsHour, 3)} |`),
+    "",
+    "## Finalist distribution and friction parameters",
+    "",
+    "| candidate | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window |",
+    "|---|---|---:|---:|---:|---:|",
+    ...test.map(({ candidate }) => `| ${candidate.id} | ${candidate.thresholdNoiseResponse} | ${round(candidate.signalFrictionFraction, 5)} | ${round(candidate.strategyTemperature, 9)} | ${round(candidate.strategyQuadraticScale, 5)} | ${formatDuration(candidate.strategyQuadraticVolatilityMs)} |`),
     "",
     "## Finalist confirmation parameters",
     "",
@@ -3765,7 +3816,14 @@ function compactCandidate(candidate: Candidate): Record<string, string | number>
     deadbandMode: candidate.deadbandMode,
     hysteresisReleaseRatio: round(candidate.hysteresisReleaseRatio, 5),
     thresholdLookback: formatDuration(candidate.thresholdLookbackMs),
+    thresholdNoiseResponse: candidate.thresholdNoiseResponse,
     thresholdNoiseMultiplier: round(candidate.thresholdNoiseMultiplier, 5),
+    thresholdInverseMaxBpsHour: round(candidate.thresholdInverseMaxBpsHour, 5),
+    thresholdInverseNoiseScaleBpsHour: round(candidate.thresholdInverseNoiseScaleBpsHour, 5),
+    signalFrictionFraction: round(candidate.signalFrictionFraction, 5),
+    strategyTemperature: round(candidate.strategyTemperature, 9),
+    strategyQuadraticScale: round(candidate.strategyQuadraticScale, 5),
+    strategyQuadraticVolatility: formatDuration(candidate.strategyQuadraticVolatilityMs),
     buyMaxFraction: round(candidate.buyMaxFraction, 5),
     sellMaxFraction: round(candidate.sellMaxFraction, 5),
     buySizingSigmaBpsHour: round(candidate.buySizingSigmaBpsHour, 5),
@@ -3819,10 +3877,10 @@ function help(): void {
   --value-horizon-mode fixed        fixed or oracle-half-average-trade
   --value-horizon 1s                Fixed H (one candle by default), or adaptive fallback
   --max-effective-exposure 250      Liquidate only after drift exceeds this absolute exposure
-  --strategy-quadratic-scale 0  Nonnegative b2' in b2=-b2'*v^2
-  --strategy-quadratic-volatility-window 1h  Separate trailing window used for b2 volatility
+  --strategy-quadratic-scale-range 0..1000000  Candidate b2' in b2=-b2'*v^2
+  --strategy-quadratic-volatility-window-range 1m..24h
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
-  --strategy-temperature 0.001      Base temperature; scales by sqrt(H/dt)
+  --strategy-temperature-range 0.000001..0.1  Candidate base temperature
   --strategy-volatility-scaling false  Also multiply temperature by trailing-H log-return stddev
   --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
   --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
@@ -3834,7 +3892,9 @@ function help(): void {
   --fast-range 1s..30m --slow-range 5m..24h --volume-range 1m..12h
   --power-range 0.3..5 --volume-cap-range 1..10 --volume-power-range 0..3
   --deadband-bps-hour-range 0.05..2000
-  --threshold-lookback-range 5m..24h --threshold-noise-multiplier-range 0..8
+  --threshold-lookback-range 5m..24h --threshold-noise-responses proportional,inverse
+  --threshold-noise-multiplier-range 0..8 --signal-friction-fraction-range 0..1
+  --threshold-inverse-max-range 0.05..2000 --threshold-inverse-noise-scale-range 0.05..2000
   --buy-max-fraction-range 0.05..1 --sell-max-fraction-range 0.05..1
   --buy-sizing-sigma-range 0.01..300 --sell-sizing-sigma-range 0.01..300
   --agreement-modes sizing,confidence

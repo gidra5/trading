@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import { gunzipSync } from "node:zlib";
 import {
   evaluateVwKamaOracle,
   noiseSignalRatio,
@@ -42,6 +43,11 @@ let cudaValueOracleFallbackReported = false;
 const SCALES = [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000]
   .map((intervalMs) => ({ label: duration(intervalMs), intervalMs }));
 const WINDOWS = [
+  window("fit-full", "Optimizer fit · full", "Optimizer fit", "2025-03-19", "2025-11-13"),
+  window("fit-1", "Optimizer fit 1", "Optimizer fit", "2025-03-19", "2025-05-17"),
+  window("fit-2", "Optimizer fit 2", "Optimizer fit", "2025-05-18", "2025-07-16"),
+  window("fit-3", "Optimizer fit 3", "Optimizer fit", "2025-07-17", "2025-09-14"),
+  window("fit-4", "Optimizer fit 4", "Optimizer fit", "2025-09-15", "2025-11-13"),
   window("sideways-churn-2022-07", "Sideways · highest OHLC churn", "Sideways / choppy", "2022-07-28", "2022-08-03"),
   window("sideways-churn-2022-05", "Sideways · highest close churn", "Sideways / choppy", "2022-05-14", "2022-05-20"),
   window("sideways-churn-2021-12", "Sideways · very choppy (Dec 2021)", "Sideways / choppy", "2021-12-14", "2021-12-20"),
@@ -90,6 +96,9 @@ const BASELINE_GLOBAL_PARAMETERS = {
   thresholdInverseMaxBpsHour: 0,
   thresholdInverseNoiseScaleBpsHour: 30,
   signalFrictionFraction: 1,
+  strategyTemperature: 0.001,
+  strategyQuadraticScale: 0,
+  strategyQuadraticVolatilityMs: 60 * 60_000,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -136,9 +145,6 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     horizonMode: "fixed",
     horizonMs: 1_000,
     oracleTemperature: 0.01,
-    strategyTemperature: 0.001,
-    strategyQuadraticScale: 0,
-    strategyQuadraticVolatilityMs: 60 * 60_000,
     strategyVolatilityScaling: false,
     opportunityEpsilon: 0.000001,
     quoteLendRate: 0,
@@ -224,6 +230,7 @@ const GLOBAL_PRESETS: VwKamaPreset[] = [
 
 interface CachedWindow {
   id: string;
+  sourceIntervalMs: number;
   source: Promise<Candle[]>;
   scales: Map<number, Promise<Candle[][]>>;
   oracles: Map<string, Promise<PerfectMarginOracleResult>>;
@@ -333,6 +340,7 @@ export class KamaInspectorEngine {
     const request = normalizeRequest(input);
     const selected = WINDOWS.find((item) => item.id === request.windowId);
     if (!selected) throw new Error(`Unknown VW-KAMA window: ${request.windowId}`);
+    validateWindowScale(selected, request.intervalMs);
     const cached = this.cachedWindow(selected);
     const segments = await this.scaledSegments(cached, request.intervalMs);
     const warmupMs = candidateWarmupMs(request);
@@ -361,10 +369,6 @@ export class KamaInspectorEngine {
           oracleResult: oracle,
           valueDistillation: {
             oracle: valueOracle,
-            strategyTemperature: request.valueDistillation!.strategyTemperature,
-            strategyQuadraticScale: request.valueDistillation!.strategyQuadraticScale,
-            strategyQuadraticVolatilityMs:
-              request.valueDistillation!.strategyQuadraticVolatilityMs,
             strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
           },
         }),
@@ -428,10 +432,6 @@ export class KamaInspectorEngine {
         oracleResult: oracle,
         valueDistillation: {
           oracle: valueOracle,
-          strategyTemperature: request.valueDistillation!.strategyTemperature,
-          strategyQuadraticScale: request.valueDistillation!.strategyQuadraticScale,
-          strategyQuadraticVolatilityMs:
-            request.valueDistillation!.strategyQuadraticVolatilityMs,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
         },
       });
@@ -464,6 +464,7 @@ export class KamaInspectorEngine {
     const source = this.loadSource(selected);
     const cached = {
       id: selected.id,
+      sourceIntervalMs: selected.sourceIntervalMs,
       source,
       scales: new Map<number, Promise<Candle[][]>>(),
       oracles: new Map<string, Promise<PerfectMarginOracleResult>>(),
@@ -480,7 +481,7 @@ export class KamaInspectorEngine {
     const existing = cached.scales.get(intervalMs);
     if (existing) return existing;
     const pending = cached.source.then((candles) =>
-      continuousSegments(aggregateCandles(candles, 1_000, intervalMs), intervalMs));
+      continuousSegments(aggregateCandles(candles, cached.sourceIntervalMs, intervalMs), intervalMs));
     cached.scales.set(intervalMs, pending);
     return pending;
   }
@@ -593,16 +594,17 @@ export class KamaInspectorEngine {
 
   private async loadSource(selected: VwKamaInspectorWindow): Promise<Candle[]> {
     const start = selected.startTime - MAX_WARMUP_MS;
-    const root = path.join(this.dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
+    const sourceLabel = duration(selected.sourceIntervalMs);
+    const root = path.join(this.dataDir, "historical", "spot-btcusdt", "btcusdt", sourceLabel);
     const candles: Candle[] = [];
     for (let day = utcDay(start); day < selected.endTime; day += DAY_MS) {
       const date = new Date(day).toISOString().slice(0, 10);
       let content: string;
       try {
-        content = await fs.readFile(path.join(root, `${date}.jsonl`), "utf8");
+        content = await readDailyShard(root, date);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new Error(`Missing BTCUSDT 1s shard ${date}; representative fetch is not complete.`);
+          throw new Error(`Missing BTCUSDT ${sourceLabel} shard ${date}; representative fetch is not complete.`);
         }
         throw error;
       }
@@ -899,6 +901,9 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   request.parameters.thresholdInverseMaxBpsHour ??= 0;
   request.parameters.thresholdInverseNoiseScaleBpsHour ??= 30;
   request.parameters.signalFrictionFraction ??= 1;
+  request.parameters.strategyTemperature ??= 0.001;
+  request.parameters.strategyQuadraticScale ??= 0;
+  request.parameters.strategyQuadraticVolatilityMs ??= 60 * 60_000;
   request.parameters.buyMaxFraction ??= 1;
   request.parameters.sellMaxFraction ??= 1;
   request.parameters.buySizingSigmaBpsHour ??= 1e12;
@@ -978,6 +983,7 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     request.parameters.thresholdNoiseMultiplier,
     request.parameters.thresholdInverseMaxBpsHour,
     request.parameters.signalFrictionFraction,
+    request.parameters.strategyQuadraticScale,
     request.parameters.buyMaxFraction,
     request.parameters.sellMaxFraction,
     request.parameters.confirmationAccelerationWeight,
@@ -1014,11 +1020,6 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   if (!["fixed", "oracle-half-average-trade"].includes(valueConfig.horizonMode)
     || !Number.isFinite(valueConfig.horizonMs) || valueConfig.horizonMs <= 0
     || !Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
-    || !Number.isFinite(valueConfig.strategyTemperature) || valueConfig.strategyTemperature <= 0
-    || !Number.isFinite(valueConfig.strategyQuadraticScale)
-    || valueConfig.strategyQuadraticScale < 0
-    || !Number.isFinite(valueConfig.strategyQuadraticVolatilityMs)
-    || valueConfig.strategyQuadraticVolatilityMs <= 0
     || typeof valueConfig.strategyVolatilityScaling !== "boolean") {
     throw new Error("VW-KAMA value and strategy calibration settings are invalid.");
   }
@@ -1042,6 +1043,12 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   if (request.parameters.signalFrictionFraction > 1) {
     throw new Error("VW-KAMA signal friction fraction cannot exceed one.");
+  }
+  if (!Number.isFinite(request.parameters.strategyTemperature)
+    || request.parameters.strategyTemperature <= 0
+    || !Number.isFinite(request.parameters.strategyQuadraticVolatilityMs)
+    || request.parameters.strategyQuadraticVolatilityMs <= 0) {
+    throw new Error("VW-KAMA strategy distribution temperature and volatility window must be positive.");
   }
   if (![
     request.parameters.confirmationMix,
@@ -1086,6 +1093,7 @@ function normalizeCandleRangeRequest(input: VwKamaCandleRangeRequest): {
   const analysis = normalizeRequest(input);
   const selected = WINDOWS.find((item) => item.id === analysis.windowId);
   if (!selected) throw new Error(`Unknown VW-KAMA window: ${input.windowId}`);
+  validateWindowScale(selected, analysis.intervalMs);
   const requestedStart = Number(input.startTime);
   const requestedEnd = Number(input.endTime);
   if (!Number.isFinite(requestedStart) || !Number.isFinite(requestedEnd)) {
@@ -1146,7 +1154,9 @@ function candidateWarmupMs(request: VwKamaInspectorRequest): number {
       )
       : 0,
   );
-  return Math.ceil(longest / request.intervalMs) * request.intervalMs * request.warmupMultiple;
+  return Math.max(1, Math.round(longest / request.intervalMs))
+    * request.intervalMs
+    * request.warmupMultiple;
 }
 
 function aggregateCandles(candles: Candle[], sourceMs: number, targetMs: number): Candle[] {
@@ -1268,14 +1278,40 @@ function candleLowerBound(candles: Candle[], time: number): number {
   return low;
 }
 
-function window(id: string, label: string, group: string, start: string, end: string): VwKamaInspectorWindow {
+function window(
+  id: string,
+  label: string,
+  group: string,
+  start: string,
+  end: string,
+  sourceIntervalMs = 1_000,
+): VwKamaInspectorWindow {
   return {
     id,
     label,
     group,
     startTime: Date.parse(`${start}T00:00:00.000Z`),
     endTime: Date.parse(`${end}T00:00:00.000Z`) + DAY_MS,
+    sourceIntervalMs,
   };
+}
+
+function validateWindowScale(window: VwKamaInspectorWindow, intervalMs: number): void {
+  if (intervalMs < window.sourceIntervalMs) {
+    throw new Error(
+      `${window.label} starts at ${duration(window.sourceIntervalMs)} candles; ${duration(intervalMs)} is unavailable.`,
+    );
+  }
+}
+
+async function readDailyShard(root: string, date: string): Promise<string> {
+  try {
+    return await fs.readFile(path.join(root, `${date}.jsonl`), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const compressed = await fs.readFile(path.join(root, `${date}.jsonl.gz`));
+  return gunzipSync(compressed).toString("utf8");
 }
 
 function duration(ms: number): string {

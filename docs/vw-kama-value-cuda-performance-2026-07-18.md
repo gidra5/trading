@@ -18,9 +18,11 @@ fee equations, `H`-step holding semantics, or deterministic lower-exposure tie b
   turnover are deferred to diagnostic evaluation.
 - Candidate-independent work: weighted oracle entropy, opportunity totals, weight totals, and the
   oracle return path are computed once per case rather than once per candidate.
-- Residency and transfers: case columns, value means/second moments/weights, and strategy temperatures are
-  converted to aligned Float32 structure-of-arrays and uploaded once. Generations transfer only
-  parameter and result buffers. The device LRU budget is controlled by
+- Residency and transfers: case columns, value means/second moments/weights, and unit
+  strategy-temperature scales are converted to aligned Float32 structure-of-arrays and uploaded
+  once. Candidate temperature, quadratic scale, and quadratic-volatility window travel in the
+  packed parameter row; each CUDA lane maintains its own causal rolling volatility moments.
+  Generations transfer only parameter and result buffers. The device LRU budget is controlled by
   `VW_KAMA_CUDA_CASE_CACHE_BYTES` and defaults to 1.5 GB.
 - Layout: recurrent change storage uses packed per-candidate offsets, eliminating the previous
   `candidateCount × maximumPeriod × 2` allocation. CPU policy rows are stored only for the scored

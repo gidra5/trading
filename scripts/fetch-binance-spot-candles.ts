@@ -3,8 +3,12 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import { createReadStream, createWriteStream } from "node:fs";
+import https from "node:https";
 import path from "node:path";
 import readline from "node:readline";
+import { PassThrough } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGunzip, createGzip } from "node:zlib";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const args = process.argv.slice(2);
@@ -16,6 +20,7 @@ if (args.includes("--help")) {
   --days 30 --end YYYY-MM-DD       Rolling UTC day range; end is inclusive
   --ranges START..END,...          Sparse UTC date ranges; ends are inclusive
   --warmup-days 0                  Prepend this many days to every range
+  --compression none|gzip         Store daily shards as JSONL or JSONL.GZ
   --quiet                          Only print the final total
   --data-dir data`);
   process.exit(0);
@@ -26,6 +31,7 @@ const value = (name: string): string | undefined => {
 };
 const symbol = (value("--symbol") ?? "BTCUSDT").toUpperCase();
 const interval = value("--interval") ?? "1s";
+const compression = value("--compression") ?? "none";
 const quiet = args.includes("--quiet");
 const days = Number(value("--days") ?? 30);
 const warmupDays = Number(value("--warmup-days") ?? 0);
@@ -50,6 +56,9 @@ if (!Number.isInteger(warmupDays) || warmupDays < 0) {
   throw new Error("--warmup-days must be a non-negative integer");
 }
 if (DAY_MS % intervalMs !== 0) throw new Error(`${interval} does not divide a UTC day`);
+if (compression !== "none" && compression !== "gzip") {
+  throw new Error("--compression must be none or gzip");
+}
 
 main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
@@ -62,7 +71,7 @@ async function main(): Promise<void> {
   let total = 0;
   for (const { start, end } of ranges) for (let day = start; day <= end; day += DAY_MS) {
     const date = new Date(day).toISOString().slice(0, 10);
-    const target = path.join(outputDir, `${date}.jsonl`);
+    const target = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? ".gz" : ""}`);
     const expected = DAY_MS / intervalMs;
     const cached = await validatedCount(target, day, expected);
     if (cached > 0) {
@@ -130,17 +139,17 @@ async function main(): Promise<void> {
       let gaps = 0;
       let previousTime = day - intervalMs;
       const ordered = [...candles.values()].sort((a, b) => a.openTime - b.openTime);
-      const output = createWriteStream(temporary, { encoding: "utf8" });
-      const outputError = new Promise<never>((_, reject) => output.once("error", reject));
+      const output = compression === "gzip" ? createGzip({ level: 6 }) : new PassThrough();
+      const outputDone = pipeline(output, createWriteStream(temporary));
       for (const candle of ordered) {
         gaps += (candle.openTime - previousTime) / intervalMs - 1;
         if (!output.write(`${JSON.stringify(candle)}\n`)) {
-          await Promise.race([once(output, "drain"), outputError]);
+          await once(output, "drain");
         }
         previousTime = candle.openTime;
       }
       output.end();
-      await Promise.race([once(output, "finish"), outputError]);
+      await outputDone;
       gaps += (day + DAY_MS - intervalMs - previousTime) / intervalMs;
       const count = ordered.length;
       if (count === 0 || count + gaps !== expected) throw new Error(`${date}: invalid archive coverage`);
@@ -201,7 +210,10 @@ function milliseconds(input: string): number {
 
 async function validatedCount(file: string, day: number, expected: number): Promise<number> {
   try {
-    const lines = readline.createInterface({ input: createReadStream(file), crlfDelay: Infinity });
+    await fs.access(file);
+    const source = createReadStream(file);
+    const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
     let count = 0;
     let previousTime = day - intervalMs;
     let firstTime = -1;
@@ -223,9 +235,8 @@ async function validatedCount(file: string, day: number, expected: number): Prom
 }
 
 async function verifyChecksum(url: string, file: string): Promise<void> {
-  const response = await fetch(`${url}.CHECKSUM`, { signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error(`${url}.CHECKSUM: HTTP ${response.status}`);
-  const expected = (await response.text()).trim().split(/\s+/, 1)[0]?.toLowerCase();
+  const expected = (await requestBuffer(`${url}.CHECKSUM`, 20_000))
+    .toString("utf8").trim().split(/\s+/, 1)[0]?.toLowerCase();
   const actual = createHash("sha256").update(await fs.readFile(file)).digest("hex");
   if (!expected || expected !== actual) throw new Error(`${path.basename(file)}: checksum mismatch`);
 }
@@ -234,9 +245,7 @@ async function download(url: string, file: string): Promise<void> {
   let failure: unknown;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-      if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-      await fs.writeFile(file, Buffer.from(await response.arrayBuffer()));
+      await fs.writeFile(file, await requestBuffer(url, 60_000));
       return;
     } catch (error) {
       failure = error;
@@ -244,6 +253,35 @@ async function download(url: string, file: string): Promise<void> {
     }
   }
   throw failure;
+}
+
+function requestBuffer(url: string, timeoutMs: number, redirects = 5): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { headers: { "user-agent": "trading-history-fetcher/1.0" } }, (response) => {
+      const status = response.statusCode ?? 0;
+      if (status >= 300 && status < 400 && response.headers.location) {
+        response.resume();
+        if (redirects <= 0) {
+          reject(new Error(`${url}: too many redirects`));
+          return;
+        }
+        requestBuffer(new URL(response.headers.location, url).toString(), timeoutMs, redirects - 1)
+          .then(resolve, reject);
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        reject(new Error(`${url}: HTTP ${status}`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.once("end", () => resolve(Buffer.concat(chunks)));
+      response.once("error", reject);
+    });
+    request.setTimeout(timeoutMs, () => request.destroy(new Error(`${url}: timed out`)));
+    request.once("error", reject);
+  });
 }
 
 function formatRange(range: { start: number; end: number }): string {

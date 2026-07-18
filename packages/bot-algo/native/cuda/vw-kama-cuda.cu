@@ -37,6 +37,7 @@ struct VwKamaParams {
   int32_t agreement_mode;
   int32_t rate_mode;
   int32_t threshold_noise_response;
+  int32_t strategy_quadratic_volatility_samples;
 
   float power;
   float volume_cap;
@@ -66,10 +67,12 @@ struct VwKamaParams {
   float mean_reversion_suppression_threshold;
   float mean_reversion_reversal_threshold;
   float signal_friction_fraction;
+  float strategy_temperature;
+  float strategy_quadratic_scale;
   float warmup_multiple;
 };
 
-static_assert(sizeof(VwKamaParams) == 196, "VwKamaParams ABI changed");
+static_assert(sizeof(VwKamaParams) == 208, "VwKamaParams ABI changed");
 
 struct VwKamaResult {
   double state_credit;
@@ -1254,10 +1257,40 @@ __global__ void evaluate_kernel(
     && strategy_quadratic_volatilities
     && value_means
     && value_weights;
+  const int quadratic_capacity = max(1, p.strategy_quadratic_volatility_samples);
+  int quadratic_count = 0;
+  double quadratic_sum = 0.0;
+  double quadratic_sum_squares = 0.0;
+  if (distillation_enabled) {
+    const int first_return = max(1, feed_start - quadratic_capacity + 1);
+    for (int return_index = first_return; return_index <= feed_start; ++return_index) {
+      const double log_return = log(
+        static_cast<double>(close[return_index]) / close[return_index - 1]
+      );
+      quadratic_sum += log_return;
+      quadratic_sum_squares += log_return * log_return;
+      ++quadratic_count;
+    }
+  }
 
   for (int index = feed_start; index < candle_count; ++index) {
     const float price = close[index];
     const float candle_volume = volume[index];
+    if (distillation_enabled && index > feed_start) {
+      if (quadratic_count == quadratic_capacity) {
+        const int removed_index = index - quadratic_capacity;
+        const double removed = log(
+          static_cast<double>(close[removed_index]) / close[removed_index - 1]
+        );
+        quadratic_sum -= removed;
+        quadratic_sum_squares -= removed * removed;
+      } else {
+        ++quadratic_count;
+      }
+      const double added = log(static_cast<double>(price) / close[index - 1]);
+      quadratic_sum += added;
+      quadratic_sum_squares += added * added;
+    }
 
     float efficiency_relative_volume = 1.0f;
     if (p.efficiency_volume_power > 0.0f && candle_volume > 0.0f) {
@@ -1531,12 +1564,21 @@ __global__ void evaluate_kernel(
       if (distillation_enabled) {
         const float expected_log_return = rate / 10000.0f
           * interval_ms * value_horizon_steps / 3600000.0f;
-        const float slope = expected_log_return / fmaxf(1e-20f, strategy_temperatures[index]);
-        const float volatility = strategy_quadratic_volatilities[index];
+        const float effective_temperature = p.strategy_temperature * strategy_temperatures[index];
+        const float slope = expected_log_return / fmaxf(1e-20f, effective_temperature);
+        const double quadratic_mean = quadratic_count > 0
+          ? quadratic_sum / quadratic_count
+          : 0.0;
+        const float volatility = quadratic_count > 0
+          ? static_cast<float>(sqrt(fmax(
+              0.0,
+              quadratic_sum_squares / quadratic_count - quadratic_mean * quadratic_mean
+            )))
+          : 0.0f;
         const float strategy_quadratic_coefficient =
-          strategy_quadratic_scale == 0.0f || volatility == 0.0f
+          p.strategy_quadratic_scale == 0.0f || volatility == 0.0f
             ? 0.0f
-            : -strategy_quadratic_scale * volatility * volatility;
+            : -p.strategy_quadratic_scale * volatility * volatility;
         const float log_normalizer = quadratic_exponential_log_normalizer(
           value_grid_size,
           value_grid_minimum,

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 import { VW_KAMA_SCORE_VERSION, type Candle, type VwKamaInspectorRequest } from "@trading/bot-algo";
 import { KamaInspectorEngine } from "../src/kama-inspector.js";
 
@@ -198,9 +199,35 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
       parameters: analysisRequest().parameters,
       score: 0.4,
       scoreVersion: VW_KAMA_SCORE_VERSION - 1,
+    }, {
+      id: "window-fit-1-1m",
+      label: "optimizer fit label",
+      scope: "window",
+      windowId: "fit-1",
+      intervalMs: 60_000,
+      parameters: analysisRequest().parameters,
+      score: -5.01,
+      scoreVersion: VW_KAMA_SCORE_VERSION,
+      optimization: {
+        algorithm: "de",
+        objective: "value-distillation",
+        population: 384,
+        generations: 12,
+        restarts: 2,
+        refinementRounds: 3,
+        elapsedMs: 1_000,
+        hindsight: true,
+      },
     }]));
-    const catalog = new KamaInspectorEngine(dataDir).catalog();
+    const engine = new KamaInspectorEngine(dataDir);
+    const catalog = engine.catalog();
     assert.equal(catalog.defaults.intervalMs, 1_000);
+    assert.equal(catalog.windows.find((window) => window.id === "fit-1")?.label, "Optimizer fit 1");
+    const fullFit = catalog.windows.find((window) => window.id === "fit-full");
+    assert.equal(fullFit?.label, "Optimizer fit · full");
+    assert.equal(fullFit?.startTime, Date.parse("2025-03-19T00:00:00.000Z"));
+    assert.equal(fullFit?.endTime, Date.parse("2025-11-14T00:00:00.000Z"));
+    assert.equal(fullFit?.sourceIntervalMs, 1_000);
     const global = catalog.presets.find((preset) => preset.id === "global-score-v3-volume");
     assert.equal(global?.score, 0.6);
     assert.equal(global?.source, "Validation-selected global finalist");
@@ -212,6 +239,22 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
     const historical = catalog.presets.find((preset) => preset.id.endsWith("old-score"));
     assert.equal(historical?.score, undefined);
     assert.equal(historical?.historicalScore, 0.4);
+    const fit = catalog.presets.find((preset) => preset.id === "window-fit-1-1m");
+    assert.equal(fit?.label, "Window best found · Optimizer fit 1 · 1m");
+    assert.equal(fit?.optimization?.objective, "value-distillation");
+    await assert.rejects(
+      engine.analyze({
+        ...analysisRequest(),
+        windowId: "fit-1",
+        intervalMs: 60_000,
+        parameters: {
+          ...analysisRequest().parameters,
+          slowMs: 86_400_000.00000006,
+        },
+        warmupMultiple: 3,
+      }),
+      /Missing BTCUSDT 1s shard/,
+    );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -227,10 +270,12 @@ async function fixture(): Promise<string> {
   for (let index = 0; index < 2_400; index += 1) {
     if (index !== 120) byDate.get("2024-02-24")!.push(candle(index));
   }
-  await Promise.all(dates.map((date) => writeFile(
-    path.join(root, `${date}.jsonl`),
-    byDate.get(date)!.map((value) => JSON.stringify(value)).join("\n"),
-  )));
+  await Promise.all(dates.map((date, index) => {
+    const content = byDate.get(date)!.map((value) => JSON.stringify(value)).join("\n");
+    return index === 0
+      ? writeFile(path.join(root, `${date}.jsonl.gz`), gzipSync(content))
+      : writeFile(path.join(root, `${date}.jsonl`), content);
+  }));
   return dataDir;
 }
 
