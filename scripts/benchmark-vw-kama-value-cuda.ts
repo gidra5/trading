@@ -5,7 +5,10 @@ import {
   prepareVwKamaOracle,
   type VwKamaParameters,
 } from "../packages/bot-algo/src/kama-signal-evaluator.js";
-import { prepareExposureValueOracle } from "../packages/bot-algo/src/exposure-value-distillation.js";
+import {
+  DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+  prepareExposureValueOracle,
+} from "../packages/bot-algo/src/exposure-value-distillation.js";
 import { perfectMarginOracle } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { TradingCandle } from "../packages/bot-algo/src/trading-api.js";
 import {
@@ -39,6 +42,22 @@ async function run(): Promise<void> {
     process.argv[8] ?? "0",
     "strategy quadratic scale",
   );
+  const lossMode = process.argv[9] ?? "disabled";
+  if (!["disabled", "approximate", "precise"].includes(lossMode)) {
+    throw new Error("Loss mode must be disabled, approximate, or precise.");
+  }
+  const mutualInformationBins = positiveInteger(process.argv[10] ?? "15", "MI bins");
+  if (mutualInformationBins < 2 || mutualInformationBins > Math.min(32, gridSize)) {
+    throw new Error("MI bins must be from 2 through min(32, grid size).");
+  }
+  const lossConfig = {
+    ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+    entropyGapLambda: lossMode === "disabled" ? 0 : 1,
+    stateMutualInformationLambda: lossMode === "disabled" ? 0 : 1,
+    oracleMutualInformationLambda: lossMode === "disabled" ? 0 : 1,
+    oracleMutualInformationMode: lossMode === "precise" ? "precise" as const : "approximate" as const,
+    mutualInformationBins,
+  };
   const scoreStartIndex = Math.max(1_000, Math.floor(candleCount * 0.25));
   if (scoreStartIndex >= candleCount) throw new Error("Benchmark requires more than 1,000 candles.");
   const status = await vwKamaCudaStatus();
@@ -55,6 +74,7 @@ async function run(): Promise<void> {
     gridSize,
     temperature: 0.001,
     opportunityEpsilon: 1e-6,
+    includeProbabilities: lossMode === "precise",
   };
   let started = performance.now();
   const cpuOracle = prepareExposureValueOracle(prices, oracleOptions);
@@ -87,6 +107,7 @@ async function run(): Promise<void> {
     valueDistillation: {
       oracle: cpuOracle,
       strategyVolatilityScaling: false,
+      lossConfig,
     },
   };
   await evaluateVwKamaCudaBatch(columns, preparedSignalOracle, candidates.slice(0, 1), {
@@ -156,6 +177,8 @@ async function run(): Promise<void> {
       caseCount,
       scoreStartIndex,
       strategyQuadraticScale,
+      lossMode,
+      mutualInformationBins,
     },
     oracle: {
       cpuWallMs: cpuOracleMs,

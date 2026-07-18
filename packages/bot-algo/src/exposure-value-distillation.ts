@@ -60,6 +60,8 @@ export interface ExposureReturnMetrics extends ExposureReturnAccumulator {
 export interface ExposureValueDistillationAccumulator {
   weightedCrossEntropy: number;
   weightedOracleEntropy: number;
+  weightedStrategyEntropy: number;
+  weightedEntropyGap: number;
   weightSum: number;
   opportunitySum: number;
   sampleCount: number;
@@ -68,10 +70,62 @@ export interface ExposureValueDistillationAccumulator {
 export interface ExposureValueDistillationMetrics extends ExposureValueDistillationAccumulator {
   crossEntropy: number;
   oracleEntropy: number;
+  strategyEntropy: number;
+  entropyGap: number;
+  stateMutualInformation: number;
+  oracleMutualInformation: number;
+  oracleMutualInformationMode: ExposureValueOracleMutualInformationMode;
+  mixedLoss: number;
+  mixedScore: number;
   klDivergence: number;
   score: number;
   meanOpportunity: number;
 }
+
+export type ExposureValueOracleMutualInformationMode = "approximate" | "precise";
+
+export interface ExposureValueDistillationLossConfig {
+  entropyGapLambda: number;
+  stateMutualInformationLambda: number;
+  oracleMutualInformationLambda: number;
+  oracleMutualInformationMode: ExposureValueOracleMutualInformationMode;
+  mutualInformationBins: number;
+}
+
+export const DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS: Readonly<ExposureValueDistillationLossConfig> = {
+  entropyGapLambda: 0,
+  stateMutualInformationLambda: 0,
+  oracleMutualInformationLambda: 0,
+  oracleMutualInformationMode: "approximate",
+  mutualInformationBins: 15,
+};
+
+interface ExposureValueDistillationState {
+  config: ExposureValueDistillationLossConfig;
+  gridSize: number;
+  weightedStrategyMean: number;
+  weightedStrategySecondMoment: number;
+  weightedStrategyVariance: number;
+  weightedOracleMean: number;
+  weightedOracleSecondMoment: number;
+  weightedOracleStrategyMeanProduct: number;
+  preciseJoint: Float64Array | null;
+  preciseOracleBins: Float64Array | null;
+  preciseStrategyBins: Float64Array | null;
+}
+
+interface QuadraticExponentialStatistics {
+  logNormalizer: number;
+  mean: number;
+  secondMoment: number;
+  entropy: number;
+  probabilities?: Float64Array;
+}
+
+const distillationStates = new WeakMap<
+  ExposureValueDistillationAccumulator,
+  ExposureValueDistillationState
+>();
 
 const INVALID_VALUE_TEMPERATURES = 50;
 const HOUR_MS = 3_600_000;
@@ -745,6 +799,59 @@ export function quadraticExponentialLogNormalizer(
   return maximum + Math.log(total);
 }
 
+function quadraticExponentialStatistics(
+  gridSize: number,
+  minimumExposure: number,
+  maximumExposure: number,
+  linearCoefficient: number,
+  quadraticCoefficient: number,
+  includeProbabilities: boolean,
+): QuadraticExponentialStatistics {
+  const logNormalizer = quadraticExponentialLogNormalizer(
+    gridSize,
+    minimumExposure,
+    maximumExposure,
+    linearCoefficient,
+    quadraticCoefficient,
+  );
+  const spacing = (maximumExposure - minimumExposure) / (gridSize - 1);
+  const probabilities = includeProbabilities ? new Float64Array(gridSize) : undefined;
+  let mean = 0;
+  let secondMoment = 0;
+  let probabilitySum = 0;
+  for (let index = 0; index < gridSize; index += 1) {
+    const exposure = minimumExposure + index * spacing;
+    const probability = Math.exp(
+      linearCoefficient * exposure
+      + quadraticCoefficient * exposure * exposure
+      - logNormalizer,
+    );
+    if (probabilities) probabilities[index] = probability;
+    probabilitySum += probability;
+    mean += probability * exposure;
+    secondMoment += probability * exposure * exposure;
+  }
+  // The analytic normalizer and the explicit moment sum can differ by a few ulps.
+  // Renormalizing the moments keeps entropy and MI invariant to that drift.
+  mean /= probabilitySum;
+  secondMoment /= probabilitySum;
+  if (probabilities) {
+    for (let index = 0; index < probabilities.length; index += 1) {
+      probabilities[index] /= probabilitySum;
+    }
+  }
+  return {
+    logNormalizer,
+    mean,
+    secondMoment,
+    entropy: Math.max(
+      0,
+      logNormalizer - linearCoefficient * mean - quadraticCoefficient * secondMoment,
+    ),
+    ...(probabilities ? { probabilities } : {}),
+  };
+}
+
 /**
  * Builds causal, unannualized volatility over the trailing H price moves as the
  * population standard deviation of log close returns.
@@ -908,14 +1015,58 @@ export function finalizeExposureReturn(
   };
 }
 
-export function createExposureValueDistillationAccumulator(): ExposureValueDistillationAccumulator {
-  return {
+export function normalizeExposureValueDistillationLossConfig(
+  config: Partial<ExposureValueDistillationLossConfig> = {},
+  gridSize = Number.MAX_SAFE_INTEGER,
+): ExposureValueDistillationLossConfig {
+  const normalized = {
+    ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+    ...config,
+  };
+  if (![normalized.entropyGapLambda, normalized.stateMutualInformationLambda,
+    normalized.oracleMutualInformationLambda].every((value) => Number.isFinite(value) && value >= 0)) {
+    throw new Error("Value-distillation loss weights must be finite and non-negative.");
+  }
+  if (normalized.oracleMutualInformationMode !== "approximate"
+    && normalized.oracleMutualInformationMode !== "precise") {
+    throw new Error("Oracle mutual information mode must be approximate or precise.");
+  }
+  if (!Number.isInteger(normalized.mutualInformationBins)
+    || normalized.mutualInformationBins < 2
+    || normalized.mutualInformationBins > 32) {
+    throw new Error("Mutual-information bins must be an integer from 2 through 32.");
+  }
+  normalized.mutualInformationBins = Math.min(normalized.mutualInformationBins, gridSize);
+  return normalized;
+}
+
+export function createExposureValueDistillationAccumulator(
+  lossConfig: Partial<ExposureValueDistillationLossConfig> = {},
+  gridSize = Number.MAX_SAFE_INTEGER,
+): ExposureValueDistillationAccumulator {
+  const accumulator: ExposureValueDistillationAccumulator = {
     weightedCrossEntropy: 0,
     weightedOracleEntropy: 0,
+    weightedStrategyEntropy: 0,
+    weightedEntropyGap: 0,
     weightSum: 0,
     opportunitySum: 0,
     sampleCount: 0,
   };
+  distillationStates.set(accumulator, {
+    config: normalizeExposureValueDistillationLossConfig(lossConfig, gridSize),
+    gridSize,
+    weightedStrategyMean: 0,
+    weightedStrategySecondMoment: 0,
+    weightedStrategyVariance: 0,
+    weightedOracleMean: 0,
+    weightedOracleSecondMoment: 0,
+    weightedOracleStrategyMeanProduct: 0,
+    preciseJoint: null,
+    preciseOracleBins: null,
+    preciseStrategyBins: null,
+  });
+  return accumulator;
 }
 
 export function observeExposureValueDistillation(
@@ -928,12 +1079,33 @@ export function observeExposureValueDistillation(
   quadraticCoefficient = 0,
 ): void {
   if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) return;
+  const state = distillationStates.get(accumulator);
+  if (!state) throw new Error("Value-distillation accumulator was not initialized.");
+  if (state.gridSize === Number.MAX_SAFE_INTEGER) state.gridSize = oracle.grid.length;
+  if (state.gridSize !== oracle.grid.length) {
+    throw new Error("Value-distillation accumulator grid does not match its oracle.");
+  }
   const slope = strategyExposureLogSlope(
     rateBpsPerHour,
     intervalMs * oracle.holdingPeriodSteps,
     temperature,
   );
-  const logNormalizer = quadraticExponentialLogNormalizer(
+  const lossEnabled = state.config.entropyGapLambda > 0
+    || state.config.stateMutualInformationLambda > 0
+    || state.config.oracleMutualInformationLambda > 0;
+  const preciseEnabled = state.config.oracleMutualInformationLambda > 0
+    && state.config.oracleMutualInformationMode === "precise";
+  const statistics = lossEnabled
+    ? quadraticExponentialStatistics(
+        oracle.grid.length,
+        oracle.grid[0]!,
+        oracle.grid[oracle.grid.length - 1]!,
+        slope,
+        quadraticCoefficient,
+        preciseEnabled,
+      )
+    : null;
+  const logNormalizer = statistics?.logNormalizer ?? quadraticExponentialLogNormalizer(
     oracle.grid.length,
     oracle.grid[0]!,
     oracle.grid[oracle.grid.length - 1]!,
@@ -949,6 +1121,49 @@ export function observeExposureValueDistillation(
   const weight = oracle.weights[candleIndex]!;
   accumulator.weightedCrossEntropy += weight * crossEntropy;
   accumulator.weightedOracleEntropy += weight * oracle.entropies[candleIndex]!;
+  if (statistics) {
+    const logGridSize = Math.log(oracle.grid.length);
+    const oracleEntropy = oracle.entropies[candleIndex]!;
+    const normalizedExcessEntropy = Math.max(0, statistics.entropy - oracleEntropy) / logGridSize;
+    accumulator.weightedStrategyEntropy += weight * statistics.entropy;
+    accumulator.weightedEntropyGap += weight * normalizedExcessEntropy * normalizedExcessEntropy;
+    state.weightedStrategyMean += weight * statistics.mean;
+    state.weightedStrategySecondMoment += weight * statistics.secondMoment;
+    state.weightedStrategyVariance += weight * Math.max(
+      0,
+      statistics.secondMoment - statistics.mean * statistics.mean,
+    );
+    state.weightedOracleMean += weight * mean;
+    state.weightedOracleSecondMoment += weight * secondMoment;
+    state.weightedOracleStrategyMeanProduct += weight * mean * statistics.mean;
+    if (preciseEnabled) {
+      const oracleProbabilities = oracle.probabilities;
+      if (!oracleProbabilities || !statistics.probabilities) {
+        throw new Error("Precise oracle mutual information requires retained oracle probabilities.");
+      }
+      const bins = state.config.mutualInformationBins;
+      state.preciseJoint ??= new Float64Array(bins * bins);
+      state.preciseOracleBins ??= new Float64Array(bins);
+      state.preciseStrategyBins ??= new Float64Array(bins);
+      const oracleBins = state.preciseOracleBins;
+      const strategyBins = state.preciseStrategyBins;
+      oracleBins.fill(0);
+      strategyBins.fill(0);
+      const probabilityOffset = candleIndex * oracle.grid.length;
+      for (let index = 0; index < oracle.grid.length; index += 1) {
+        const bin = Math.min(bins - 1, Math.floor(index * bins / oracle.grid.length));
+        oracleBins[bin] += oracleProbabilities[probabilityOffset + index]!;
+        strategyBins[bin] += statistics.probabilities[index]!;
+      }
+      for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
+        for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
+          state.preciseJoint[oracleBin * bins + strategyBin] += weight
+            * oracleBins[oracleBin]!
+            * strategyBins[strategyBin]!;
+        }
+      }
+    }
+  }
   accumulator.weightSum += weight;
   accumulator.opportunitySum += oracle.opportunities[candleIndex]!;
   accumulator.sampleCount += 1;
@@ -957,6 +1172,8 @@ export function observeExposureValueDistillation(
 export function finalizeExposureValueDistillation(
   accumulator: ExposureValueDistillationAccumulator,
 ): ExposureValueDistillationMetrics {
+  const state = distillationStates.get(accumulator);
+  if (!state) throw new Error("Value-distillation accumulator was not initialized.");
   const crossEntropy = accumulator.weightSum > 0
     ? accumulator.weightedCrossEntropy / accumulator.weightSum
     : 0;
@@ -964,16 +1181,122 @@ export function finalizeExposureValueDistillation(
     ? accumulator.weightedOracleEntropy / accumulator.weightSum
     : 0;
   const klDivergence = Math.max(0, crossEntropy - oracleEntropy);
+  const strategyEntropy = accumulator.weightSum > 0
+    ? accumulator.weightedStrategyEntropy / accumulator.weightSum
+    : 0;
+  const entropyGap = accumulator.weightSum > 0
+    ? accumulator.weightedEntropyGap / accumulator.weightSum
+    : 0;
+  const stateMutualInformation = gaussianStateMutualInformation(state, accumulator.weightSum);
+  const oracleMutualInformation = state.config.oracleMutualInformationMode === "precise"
+    ? categoricalMutualInformation(state.preciseJoint, state.config.mutualInformationBins)
+    : gaussianOracleMutualInformation(state, accumulator.weightSum);
+  const mixedLoss = crossEntropy
+    + state.config.entropyGapLambda * entropyGap
+    - state.config.stateMutualInformationLambda * stateMutualInformation
+    - state.config.oracleMutualInformationLambda * oracleMutualInformation;
+  const mixedKlDivergence = Math.max(0, mixedLoss - oracleEntropy);
   return {
     ...accumulator,
     crossEntropy,
     oracleEntropy,
+    strategyEntropy,
+    entropyGap,
+    stateMutualInformation,
+    oracleMutualInformation,
+    oracleMutualInformationMode: state.config.oracleMutualInformationMode,
+    mixedLoss,
+    mixedScore: Math.exp(-mixedKlDivergence),
     klDivergence,
     score: Math.exp(-klDivergence),
     meanOpportunity: accumulator.sampleCount > 0
       ? accumulator.opportunitySum / accumulator.sampleCount
       : 0,
   };
+}
+
+function gaussianStateMutualInformation(
+  state: ExposureValueDistillationState,
+  weightSum: number,
+): number {
+  if (weightSum <= 0 || state.config.stateMutualInformationLambda === 0) return 0;
+  const mean = state.weightedStrategyMean / weightSum;
+  const totalVariance = Math.max(0, state.weightedStrategySecondMoment / weightSum - mean * mean);
+  const conditionalVariance = Math.max(0, state.weightedStrategyVariance / weightSum);
+  return normalizedGaussianVarianceInformation(totalVariance, conditionalVariance, state.gridSize);
+}
+
+function gaussianOracleMutualInformation(
+  state: ExposureValueDistillationState,
+  weightSum: number,
+): number {
+  if (weightSum <= 0 || state.config.oracleMutualInformationLambda === 0) return 0;
+  const oracleMean = state.weightedOracleMean / weightSum;
+  const strategyMean = state.weightedStrategyMean / weightSum;
+  const oracleVariance = Math.max(
+    0,
+    state.weightedOracleSecondMoment / weightSum - oracleMean * oracleMean,
+  );
+  const strategyVariance = Math.max(
+    0,
+    state.weightedStrategySecondMoment / weightSum - strategyMean * strategyMean,
+  );
+  if (oracleVariance <= Number.EPSILON || strategyVariance <= Number.EPSILON) return 0;
+  const covariance = state.weightedOracleStrategyMeanProduct / weightSum
+    - oracleMean * strategyMean;
+  const correlationSquared = clamp(
+    covariance * covariance / (oracleVariance * strategyVariance),
+    0,
+    1 - 1e-12,
+  );
+  return clamp(-0.5 * Math.log1p(-correlationSquared) / Math.log(state.gridSize), 0, 1);
+}
+
+function normalizedGaussianVarianceInformation(
+  totalVariance: number,
+  conditionalVariance: number,
+  gridSize: number,
+): number {
+  if (totalVariance <= Number.EPSILON) return 0;
+  if (conditionalVariance <= Number.EPSILON) return 1;
+  return clamp(0.5 * Math.log(totalVariance / conditionalVariance) / Math.log(gridSize), 0, 1);
+}
+
+function categoricalMutualInformation(joint: Float64Array | null, bins: number): number {
+  if (!joint) return 0;
+  let total = 0;
+  for (const value of joint) total += value;
+  if (total <= 0) return 0;
+  const oracleMarginal = new Float64Array(bins);
+  const strategyMarginal = new Float64Array(bins);
+  for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
+    for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
+      const probability = joint[oracleBin * bins + strategyBin]! / total;
+      oracleMarginal[oracleBin] += probability;
+      strategyMarginal[strategyBin] += probability;
+    }
+  }
+  let mutualInformation = 0;
+  let oracleEntropy = 0;
+  let strategyEntropy = 0;
+  for (let bin = 0; bin < bins; bin += 1) {
+    const oracleProbability = oracleMarginal[bin]!;
+    const strategyProbability = strategyMarginal[bin]!;
+    if (oracleProbability > 0) oracleEntropy -= oracleProbability * Math.log(oracleProbability);
+    if (strategyProbability > 0) strategyEntropy -= strategyProbability * Math.log(strategyProbability);
+  }
+  if (oracleEntropy <= Number.EPSILON || strategyEntropy <= Number.EPSILON) return 0;
+  for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
+    for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
+      const probability = joint[oracleBin * bins + strategyBin]! / total;
+      if (probability > 0) {
+        mutualInformation += probability * Math.log(
+          probability / (oracleMarginal[oracleBin]! * strategyMarginal[strategyBin]!),
+        );
+      }
+    }
+  }
+  return clamp(mutualInformation / Math.sqrt(oracleEntropy * strategyEntropy), 0, 1);
 }
 
 export function rebalanceEquityFactor(fromExposure: number, toExposure: number, friction: number): number {

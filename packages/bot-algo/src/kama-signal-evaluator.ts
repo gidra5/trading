@@ -40,6 +40,7 @@ import {
   strategyExposureTemperatures,
   strategyExposureVolatilities,
   type ExposureReturnMetrics,
+  type ExposureValueDistillationLossConfig,
   type ExposureValueDistillationMetrics,
   type ExposureValueOracle,
 } from "./exposure-value-distillation.js";
@@ -214,7 +215,7 @@ export interface VwKamaInspectorRequest {
   valueDistillation?: VwKamaValueDistillationConfig;
 }
 
-export interface VwKamaValueDistillationConfig {
+export interface VwKamaValueDistillationConfig extends ExposureValueDistillationLossConfig {
   gridSize: number;
   minExposure: number;
   maxExposure: number;
@@ -430,6 +431,7 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   valueDistillation?: {
     oracle: ExposureValueOracle;
     strategyVolatilityScaling: boolean;
+    lossConfig: ExposureValueDistillationLossConfig;
     strategyTemperatures?: Float32Array;
     strategyQuadraticVolatilities?: Float32Array;
   };
@@ -728,7 +730,10 @@ export function evaluateVwKamaOracle(
   let distanceNoise = 0;
   let stateCredit = 0;
   const valueDistillation = options.valueDistillation
-    ? createExposureValueDistillationAccumulator()
+    ? createExposureValueDistillationAccumulator(
+        options.valueDistillation.lossConfig,
+        options.valueDistillation.oracle.grid.length,
+      )
     : null;
   const valueReturns = options.valueDistillation
     ? {

@@ -9,13 +9,15 @@ import type {
 import type { ExposureValueOracle } from "./exposure-value-distillation.js";
 import {
   createExposureValueOracleStorage,
+  normalizeExposureValueDistillationLossConfig,
   shareExposureValueOracle,
   strategyExposureTemperatures,
+  type ExposureValueDistillationLossConfig,
   type ExposureValueOracleOptions,
 } from "./exposure-value-distillation.js";
 
 const PARAMETER_SIZE = 208;
-const RESULT_SIZE = 152;
+const RESULT_SIZE = 192;
 const INT_PARAMETER_COUNT = 21;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
@@ -35,9 +37,11 @@ interface NativeCuda {
     volume: Float64Array,
     valueMeans: Float32Array,
     valueSecondMoments: Float32Array,
+    valueEntropies: Float32Array,
     valueWeights: Float32Array,
     strategyTemperatures: Float32Array,
     strategyQuadraticVolatilities: Float32Array,
+    oracleBinProbabilities: Float32Array | null,
     candleCount: number,
     scoreStart: number,
     intervalMs: number,
@@ -51,6 +55,11 @@ interface NativeCuda {
     valueGridMaximum: number,
     maximumEffectiveExposure: number,
     strategyQuadraticScale: number,
+    entropyGapLambda: number,
+    stateMutualInformationLambda: number,
+    oracleMutualInformationLambda: number,
+    oracleMutualInformationMode: number,
+    mutualInformationBins: number,
     includeHighLow: number,
     residentBytes: Float64Array,
   ): CudaHandle;
@@ -108,6 +117,7 @@ interface NativeCuda {
     valueEntropies: Float32Array | null,
     valueWeights: Float32Array | null,
     valueOpportunities: Float32Array | null,
+    oracleBinProbabilities: Float32Array | null,
     strategyTemperatures: Float32Array | null,
     strategyQuadraticVolatilities: Float32Array | null,
     candleCount: number,
@@ -125,6 +135,11 @@ interface NativeCuda {
     valueGridMaximum: number,
     maximumEffectiveExposure: number,
     strategyQuadraticScale: number,
+    entropyGapLambda: number,
+    stateMutualInformationLambda: number,
+    oracleMutualInformationLambda: number,
+    oracleMutualInformationMode: number,
+    mutualInformationBins: number,
     parameters: Buffer,
     candidateCount: number,
     fitnessOnly: number,
@@ -143,6 +158,7 @@ export interface VwKamaCudaBatchOptions {
   valueDistillation?: {
     oracle: ExposureValueOracle;
     strategyVolatilityScaling: boolean;
+    lossConfig: ExposureValueDistillationLossConfig;
     strategyTemperatures?: Float32Array;
   };
 }
@@ -159,6 +175,11 @@ export interface VwKamaCudaCaseResult {
   distillationWeightedOracleEntropy: number;
   distillationWeight: number;
   distillationOpportunity: number;
+  distillationWeightedStrategyEntropy: number;
+  distillationWeightedEntropyGap: number;
+  distillationStateMutualInformation: number;
+  distillationOracleMutualInformation: number;
+  distillationMixedLoss: number;
   strategyFinalEquity: number;
   oracleFinalEquity: number;
   strategyMaxDrawdown: number;
@@ -194,12 +215,14 @@ let loaded: NativeCuda | null | undefined;
 let loadFailure: string | undefined;
 let nextObjectId = 1;
 const objectIds = new WeakMap<object, number>();
+const oracleBinCaches = new WeakMap<ExposureValueOracle, Map<number, Float32Array>>();
 const fitnessCaseCache = new Map<string, CachedFitnessCase>();
 let fitnessCaseCacheBytes = 0;
 
 interface CachedFitnessCase {
   handle: CudaHandle;
   deviceBytes: number;
+  preciseScratchBytes: number;
 }
 
 export async function vwKamaCudaStatus(): Promise<VwKamaCudaStatus> {
@@ -239,6 +262,16 @@ export async function evaluateVwKamaCudaBatch(
     throw new Error("VW-KAMA CUDA oracle states do not cover the candle columns.");
   }
   const valueDistillation = options.valueDistillation;
+  const loss = normalizeExposureValueDistillationLossConfig(
+    valueDistillation?.lossConfig,
+    valueDistillation?.oracle.grid.length,
+  );
+  const lossEnabled = loss.entropyGapLambda > 0
+    || loss.stateMutualInformationLambda > 0
+    || loss.oracleMutualInformationLambda > 0;
+  const oracleBinProbabilities = valueDistillation && preciseOracleMutualInformationEnabled(loss)
+    ? binnedOracleProbabilities(valueDistillation.oracle, loss.mutualInformationBins)
+    : null;
   if (valueDistillation && (
     valueDistillation.oracle.means.length < candles.length
     || valueDistillation.oracle.optimalExposures.length < candles.length
@@ -290,6 +323,20 @@ export async function evaluateVwKamaCudaBatch(
       options,
       includeHighLow,
     );
+    const preciseScratchBytes = preciseOracleMutualInformationEnabled(loss)
+      ? candidates.length * (candles.length - options.scoreStartIndex) * 3
+          * Float32Array.BYTES_PER_ELEMENT
+        + candidates.length * loss.mutualInformationBins * loss.mutualInformationBins
+          * Float64Array.BYTES_PER_ELEMENT
+      : 0;
+    const additionalScratchBytes = Math.max(0, preciseScratchBytes - testCase.preciseScratchBytes);
+    if (testCase.deviceBytes + additionalScratchBytes > fitnessCaseBudgetBytes()) {
+      throw new Error(
+        `Precise oracle MI needs about ${formatByteCount(testCase.deviceBytes + additionalScratchBytes)} `
+        + `for this case; increase VW_KAMA_CUDA_CASE_CACHE_BYTES or use approximate mode.`,
+      );
+    }
+    admitFitnessCaseBytes(native, additionalScratchBytes, cacheKey);
     const status = native.evaluateFitnessCase(
       testCase.handle,
       parameterBuffer,
@@ -297,6 +344,7 @@ export async function evaluateVwKamaCudaBatch(
       output,
     );
     if (status !== 0) throw new Error(`VW-KAMA resident CUDA evaluation failed: ${native.lastError()}`);
+    testCase.preciseScratchBytes = Math.max(testCase.preciseScratchBytes, preciseScratchBytes);
     refreshFitnessCaseBytes(native, cacheKey, testCase);
     return Array.from(
       { length: candidates.length },
@@ -313,9 +361,10 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.means ?? null,
     valueDistillation?.oracle.secondMoments ?? null,
     options.fitnessOnly ? null : valueDistillation?.oracle.optimalExposures ?? null,
-    options.fitnessOnly ? null : valueDistillation?.oracle.entropies ?? null,
+    lossEnabled || !options.fitnessOnly ? valueDistillation?.oracle.entropies ?? null : null,
     valueDistillation?.oracle.weights ?? null,
     options.fitnessOnly ? null : valueDistillation?.oracle.opportunities ?? null,
+    oracleBinProbabilities,
     strategyTemperatures,
     strategyQuadraticVolatilities,
     candles.length,
@@ -333,6 +382,11 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.grid[valueDistillation.oracle.grid.length - 1] ?? 0,
     valueDistillation?.oracle.execution.maxEffectiveExposure ?? 250,
     0,
+    loss.entropyGapLambda,
+    loss.stateMutualInformationLambda,
+    loss.oracleMutualInformationLambda,
+    loss.oracleMutualInformationMode === "precise" ? 1 : 0,
+    loss.mutualInformationBins,
     parameterBuffer,
     candidates.length,
     options.fitnessOnly ? 1 : 0,
@@ -347,6 +401,23 @@ export async function evaluateVwKamaCudaFitnessCases(
   candidates: readonly VwKamaParameters[],
 ): Promise<VwKamaCudaCaseResult[][]> {
   if (cases.length === 0 || candidates.length === 0) return cases.map(() => []);
+  if (cases.some(({ options }) => preciseOracleMutualInformationEnabled(
+    normalizeExposureValueDistillationLossConfig(
+      options.valueDistillation.lossConfig,
+      options.valueDistillation.oracle.grid.length,
+    ),
+  ))) {
+    const sequential: VwKamaCudaCaseResult[][] = [];
+    for (const { candles, options } of cases) {
+      sequential.push(await evaluateVwKamaCudaBatch(
+        candles,
+        { stateCodes: new Uint8Array(candles.length), transitions: [] },
+        candidates,
+        { ...options, fitnessOnly: true },
+      ));
+    }
+    return sequential;
+  }
   const native = await loadNative();
   const handles = new BigUint64Array(cases.length);
   const caseKeys: string[] = [];
@@ -500,9 +571,11 @@ async function loadNative(): Promise<NativeCuda> {
       parameterSize: library.func("int vw_kama_cuda_params_size()"),
       resultSize: library.func("int vw_kama_cuda_result_size()"),
       createFitnessCase: library.func("vw_kama_cuda_create_fitness_case", "uint64_t", [
-        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer,
         "int", "int", "double", "int", "double", "double", "double", "double",
-        "int", "double", "double", "double", "double", "int", pointer,
+        "int", "double", "double", "double", "double", "double", "double", "double",
+        "int", "int", "int", pointer,
       ]),
       evaluateFitnessCase: library.func(
         "int vw_kama_cuda_evaluate_fitness_case(uint64_t, void*, int, void*)",
@@ -521,9 +594,10 @@ async function loadNative(): Promise<NativeCuda> {
       ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         "int", "int", "double", "int", "double", "double", "double", "double", "double", "double",
-        "int", "double", "double", "double", "double",
+        "int", "double", "double", "double", "double", "double", "double", "double",
+        "int", "int",
         pointer, "int", "int", pointer,
       ]),
     };
@@ -565,8 +639,22 @@ function getOrCreateFitnessCase(
     fitnessCaseCache.set(key, cached);
     return cached;
   }
-  const estimatedBytes = candles.length * (includeHighLow ? 9 : 7) * Float32Array.BYTES_PER_ELEMENT;
-  admitFitnessCaseBytes(native, estimatedBytes);
+  const loss = normalizeExposureValueDistillationLossConfig(
+    options.valueDistillation?.lossConfig,
+    oracle.grid.length,
+  );
+  const oracleBinProbabilities = preciseOracleMutualInformationEnabled(loss)
+    ? binnedOracleProbabilities(oracle, loss.mutualInformationBins)
+    : null;
+  const lossEnabled = loss.entropyGapLambda > 0
+    || loss.stateMutualInformationLambda > 0
+    || loss.oracleMutualInformationLambda > 0;
+  const baseResidentColumns = (includeHighLow ? 9 : 7) + (lossEnabled ? 1 : 0);
+  const preciseResidentColumns = oracleBinProbabilities ? loss.mutualInformationBins : 0;
+  const estimatedResidentBytes = candles.length
+    * (baseResidentColumns + preciseResidentColumns)
+    * Float32Array.BYTES_PER_ELEMENT;
+  admitFitnessCaseBytes(native, estimatedResidentBytes);
   const residentBytes = new Float64Array(1);
   const handle = native.createFitnessCase(
     includeHighLow ? candles.high : null,
@@ -575,9 +663,11 @@ function getOrCreateFitnessCase(
     candles.volume,
     oracle.means,
     oracle.secondMoments,
+    oracle.entropies,
     oracle.weights,
     strategyTemperatures,
     strategyQuadraticVolatilities,
+    oracleBinProbabilities,
     candles.length,
     options.scoreStartIndex,
     options.intervalMs,
@@ -591,11 +681,16 @@ function getOrCreateFitnessCase(
     oracle.grid[oracle.grid.length - 1]!,
     oracle.execution.maxEffectiveExposure,
     0,
+    loss.entropyGapLambda,
+    loss.stateMutualInformationLambda,
+    loss.oracleMutualInformationLambda,
+    loss.oracleMutualInformationMode === "precise" ? 1 : 0,
+    loss.mutualInformationBins,
     includeHighLow ? 1 : 0,
     residentBytes,
   );
   if (Number(handle) === 0) throw new Error(`Failed to create resident CUDA fitness case: ${native.lastError()}`);
-  const result = { handle, deviceBytes: residentBytes[0]! };
+  const result = { handle, deviceBytes: residentBytes[0]!, preciseScratchBytes: 0 };
   fitnessCaseCache.set(key, result);
   fitnessCaseCacheBytes += result.deviceBytes;
   return result;
@@ -631,6 +726,10 @@ function fitnessCaseBudgetBytes(): number {
   return Number.isFinite(configured) && configured > 0 ? configured : 1_500_000_000;
 }
 
+function formatByteCount(bytes: number): string {
+  return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
+}
+
 function fitnessCaseKey(
   candles: VwKamaCandleColumns,
   oracle: ExposureValueOracle,
@@ -651,7 +750,42 @@ function fitnessCaseKey(
     oracle.holdingPeriodSteps,
     includeHighLow ? 1 : 0,
     options.valueDistillation?.strategyVolatilityScaling ? 1 : 0,
+    options.valueDistillation?.lossConfig.entropyGapLambda ?? 0,
+    options.valueDistillation?.lossConfig.stateMutualInformationLambda ?? 0,
+    options.valueDistillation?.lossConfig.oracleMutualInformationLambda ?? 0,
+    options.valueDistillation?.lossConfig.oracleMutualInformationMode ?? "approximate",
+    options.valueDistillation?.lossConfig.mutualInformationBins ?? 15,
   ].join(":");
+}
+
+function preciseOracleMutualInformationEnabled(config: ExposureValueDistillationLossConfig): boolean {
+  return config.oracleMutualInformationLambda > 0
+    && config.oracleMutualInformationMode === "precise";
+}
+
+function binnedOracleProbabilities(oracle: ExposureValueOracle, bins: number): Float32Array {
+  if (!oracle.probabilities) {
+    throw new Error("Precise CUDA oracle mutual information requires retained oracle probabilities.");
+  }
+  let cache = oracleBinCaches.get(oracle);
+  if (!cache) {
+    cache = new Map();
+    oracleBinCaches.set(oracle, cache);
+  }
+  const cached = cache.get(bins);
+  if (cached) return cached;
+  const result = new Float32Array(oracle.means.length * bins);
+  const gridSize = oracle.grid.length;
+  for (let candle = 0; candle < oracle.means.length; candle += 1) {
+    const sourceOffset = candle * gridSize;
+    const targetOffset = candle * bins;
+    for (let gridIndex = 0; gridIndex < gridSize; gridIndex += 1) {
+      const bin = Math.min(bins - 1, Math.floor(gridIndex * bins / gridSize));
+      result[targetOffset + bin] += oracle.probabilities[sourceOffset + gridIndex]!;
+    }
+  }
+  cache.set(bins, result);
+  return result;
 }
 
 function objectId(value: object): number {
@@ -769,6 +903,11 @@ function readResult(buffer: Buffer, offset: number): VwKamaCudaCaseResult {
     signalCount: buffer.readInt32LE(offset + 140),
     oracleCount: buffer.readInt32LE(offset + 144),
     matchedCount: buffer.readInt32LE(offset + 148),
+    distillationWeightedStrategyEntropy: buffer.readDoubleLE(offset + 152),
+    distillationWeightedEntropyGap: buffer.readDoubleLE(offset + 160),
+    distillationStateMutualInformation: buffer.readDoubleLE(offset + 168),
+    distillationOracleMutualInformation: buffer.readDoubleLE(offset + 176),
+    distillationMixedLoss: buffer.readDoubleLE(offset + 184),
   };
 }
 

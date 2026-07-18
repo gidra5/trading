@@ -7,7 +7,10 @@ import {
   type VwKamaParameters,
 } from "../src/kama-signal-evaluator.js";
 import { perfectMarginOracle } from "../src/perfect-margin-oracle.js";
-import { prepareExposureValueOracle } from "../src/exposure-value-distillation.js";
+import {
+  DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+  prepareExposureValueOracle,
+} from "../src/exposure-value-distillation.js";
 import type { TradingCandle } from "../src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
@@ -47,6 +50,7 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     friction: 0.00175,
     gridSize: 21,
     temperature: 0.01,
+    includeProbabilities: true,
   });
   const common = {
     intervalMs: MINUTE,
@@ -58,6 +62,12 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     valueDistillation: {
       oracle: valueOracle,
       strategyVolatilityScaling: true,
+      lossConfig: {
+        ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+        entropyGapLambda: 0.2,
+        stateMutualInformationLambda: 0.1,
+        oracleMutualInformationLambda: 0.3,
+      },
     },
   };
   const gpu = await evaluateVwKamaCudaBatch(columns, prepared, candidates, common);
@@ -82,6 +92,10 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     assert.ok(Math.abs(
       fitnessOnly[index]!.distillationWeight - gpu[index]!.distillationWeight,
     ) < 1e-9);
+    assert.ok(Math.abs(
+      fitnessOnly[index]!.distillationWeightedOracleEntropy
+        - gpu[index]!.distillationWeightedOracleEntropy,
+    ) < 1e-6);
     const cpu = evaluateVwKamaOracle(columns, {
       ...common,
       scoreStartTime: candles[scoreStartIndex]!.openTime,
@@ -106,6 +120,17 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
         <= Math.max(0.02, cpuDistillation.crossEntropy * 0.05),
       `candidate ${index} value-distillation loss drifted`,
     );
+    assert.ok(Math.abs(
+      gpu[index]!.distillationWeightedEntropyGap / gpu[index]!.distillationWeight
+        - cpuDistillation.entropyGap,
+    ) < 0.02);
+    assert.ok(Math.abs(
+      gpu[index]!.distillationStateMutualInformation - cpuDistillation.stateMutualInformation,
+    ) < 0.02);
+    assert.ok(Math.abs(
+      gpu[index]!.distillationOracleMutualInformation - cpuDistillation.oracleMutualInformation,
+    ) < 0.02);
+    assert.ok(Math.abs(gpu[index]!.distillationMixedLoss - cpuDistillation.mixedLoss) < 0.03);
     assert.ok(
       Math.abs(Math.log(gpu[index]!.strategyFinalEquity)
         - Math.log(cpuDistillation.returns.strategy.equity)) < 0.08,
@@ -117,6 +142,44 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
       `candidate ${index} oracle return drifted`,
     );
   }
+
+  const preciseOptions = {
+    ...common,
+    fitnessOnly: true,
+    valueDistillation: {
+      ...common.valueDistillation,
+      lossConfig: {
+        ...common.valueDistillation.lossConfig,
+        oracleMutualInformationMode: "precise" as const,
+        mutualInformationBins: 7,
+      },
+    },
+  };
+  const [preciseGpu] = await evaluateVwKamaCudaBatch(
+    columns,
+    prepared,
+    candidates.slice(0, 1),
+    preciseOptions,
+  );
+  const [preciseScheduled] = await evaluateVwKamaCudaFitnessCases([{
+    candles: columns,
+    options: preciseOptions,
+  }], candidates.slice(0, 1));
+  const preciseCpu = evaluateVwKamaOracle(columns, {
+    ...preciseOptions,
+    scoreStartTime: candles[scoreStartIndex]!.openTime,
+    parameters: candidates[0]!,
+    preparedOracle: prepared,
+    includeTrace: false,
+  }).metrics.valueDistillation!;
+  assert.ok(Math.abs(
+    preciseGpu!.distillationOracleMutualInformation - preciseCpu.oracleMutualInformation,
+  ) < 0.03);
+  assert.equal(
+    preciseScheduled![0]!.distillationOracleMutualInformation,
+    preciseGpu!.distillationOracleMutualInformation,
+  );
+  assert.ok(Math.abs(preciseGpu!.distillationMixedLoss - preciseCpu.mixedLoss) < 0.04);
 });
 
 function baseParameters(): VwKamaParameters {

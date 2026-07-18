@@ -4,6 +4,7 @@ import {
   alignVwKamaTransitions,
   averageVwKamaOracleTradeIntervalMs,
   columnarVwKamaCandles,
+  DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
   createPeakValleyStrategyConfig,
   evaluateVwKamaOracle,
   PeakValleyStrategy,
@@ -318,6 +319,7 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
     valueDistillation: {
       oracle: valueOracle,
       strategyVolatilityScaling: false,
+      lossConfig: { ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS },
     },
   });
   const point = result.valueDistributions.at(-1)!;

@@ -51,6 +51,11 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   quoteLendRate: 0,
   quoteBorrowRate: 0,
   assetBorrowRate: 0,
+  entropyGapLambda: 0,
+  stateMutualInformationLambda: 0,
+  oracleMutualInformationLambda: 0,
+  oracleMutualInformationMode: "approximate",
+  mutualInformationBins: 15,
 };
 
 type OracleState = BacktestOraclePoint["state"];
@@ -180,6 +185,10 @@ const metricHelp = {
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
   distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
+  mixedLoss: "Optimizer objective: cross-entropy plus the weighted excess-entropy penalty, minus weighted state and oracle mutual information. Lower is better.",
+  entropyGap: "Opportunity-weighted squared excess of strategy entropy over oracle entropy, normalized by the grid's maximum entropy.",
+  stateMutualInformation: "Normalized Gaussian variance-decomposition estimate of how much the strategy exposure distribution changes across market states. Higher is more state-responsive.",
+  oracleMutualInformation: "Normalized dependence between soft oracle and strategy exposure distributions. Approximate mode uses distribution moments; precise mode computes categorical MI over the configured exposure bins.",
   valueHoldingPeriod: "Resolved H for which each candidate exposure is forced. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
   valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
@@ -1171,19 +1180,40 @@ export function KamaInspectorPage() {
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
-              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={1024} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
+              <InspectorNumber
+                label="Value grid points"
+                value={valueConfig().gridSize}
+                min={3}
+                max={1024}
+                step={1}
+                onInput={(value) => setValueConfig((current) => {
+                  const gridSize = Math.round(value);
+                  return {
+                    ...current,
+                    gridSize,
+                    mutualInformationBins: Math.min(current.mutualInformationBins, gridSize, 32),
+                  };
+                })}
+              />
               <InspectorSelect label="Holding-period source" value={valueConfig().holdingPeriodMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMode: value as VwKamaValueDistillationConfig["holdingPeriodMode"] }))} />
               <DurationInput label={valueConfig().holdingPeriodMode === "fixed" ? "Holding period H" : "Fallback holding period H"} value={valueConfig().holdingPeriodMs} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMs: value, valueHorizonMs: Math.max(current.valueHorizonMs, value) }))} />
               <DurationInput label="Value horizon T−t" value={valueConfig().valueHorizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMs: Math.max(value, current.holdingPeriodMs) }))} />
               <InspectorSelect label="Horizon at window end" value={valueConfig().horizonEndMode} options={[{ value: "truncate", label: "Truncate at window end" }, { value: "extend", label: "Use future candles" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonEndMode: value as VwKamaValueDistillationConfig["horizonEndMode"] }))} />
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
+              <InspectorNumber label="Excess-entropy λ" value={valueConfig().entropyGapLambda} min={0} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, entropyGapLambda: value }))} />
+              <InspectorNumber label="State MI λ" value={valueConfig().stateMutualInformationLambda} min={0} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, stateMutualInformationLambda: value }))} />
+              <InspectorNumber label="Oracle MI λ" value={valueConfig().oracleMutualInformationLambda} min={0} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, oracleMutualInformationLambda: value }))} />
+              <InspectorSelect label="Oracle MI estimator" value={valueConfig().oracleMutualInformationMode} options={[{ value: "approximate", label: "Approximate · Gaussian moments" }, { value: "precise", label: "Precise · soft categorical bins" }]} onInput={(value) => setValueConfig((current) => ({ ...current, oracleMutualInformationMode: value as VwKamaValueDistillationConfig["oracleMutualInformationMode"] }))} />
+              <Show when={valueConfig().oracleMutualInformationMode === "precise"}>
+                <InspectorNumber label="Mutual-information bins" value={valueConfig().mutualInformationBins} min={2} max={Math.min(32, valueConfig().gridSize)} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, mutualInformationBins: Math.round(value) }))} />
+              </Show>
               <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H log-return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
               <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              Oracle friction shapes both retrospective paths. H defaults to one candle and can be fixed or resolved per continuous segment as half the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. Trades target only the configured exposure grid, while price and fee drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Return paths start at equity 1 and exposure 0.
+              Oracle friction shapes both retrospective paths. H defaults to one candle and can be fixed or resolved per continuous segment as half the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. Trades target only the configured exposure grid, while price and fee drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Loss terms with λ=0 are skipped. Precise oracle MI retains the soft oracle distribution and uses an additional binned GPU pass; approximate mode uses fused moment accumulators. Return paths start at equity 1 and exposure 0.
             </div>
           </details>
         </section>
@@ -1220,7 +1250,12 @@ export function KamaInspectorPage() {
                   {(value) => (
                     <>
                       <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
+                      <ScoreCard label="Mixed loss" value={formatQuote(value().mixedLoss, 5)} description={metricHelp.mixedLoss} />
+                      <ScoreCard label="Entropy gap" value={formatQuote(value().entropyGap, 5)} description={metricHelp.entropyGap} />
+                      <ScoreCard label="State MI" value={ratioPercent(value().stateMutualInformation)} description={metricHelp.stateMutualInformation} />
+                      <ScoreCard label={`Oracle MI · ${value().oracleMutualInformationMode}`} value={ratioPercent(value().oracleMutualInformation)} description={metricHelp.oracleMutualInformation} />
                       <ScoreCard label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
+                      <ScoreCard label="Mixed exp(−KL)" value={ratioPercent(value().mixedScore)} description={metricHelp.mixedLoss} />
                       <ScoreCard label="Resolved holding H" value={formatDuration(value().holdingPeriodMs)} description={metricHelp.valueHoldingPeriod} />
                       <ScoreCard label="Value horizon T−t" value={formatDuration(value().valueHorizonMs)} description={metricHelp.valueHorizon} />
                       <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />

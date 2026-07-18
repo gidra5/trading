@@ -265,6 +265,51 @@ test("distillation loss rewards a signed-rate exponential biased toward the orac
   assert.ok(alignedMetrics.score > opposedMetrics.score);
 });
 
+test("distillation loss mix exposes entropy and both mutual-information estimators", () => {
+  const prices = [100, 110, 90, 115, 85, 120];
+  const oracle = prepareExposureValueOracle(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 1,
+    friction: 0,
+    gridSize: 21,
+    temperature: 0.002,
+    includeProbabilities: true,
+  });
+  const config = {
+    entropyGapLambda: 0.3,
+    stateMutualInformationLambda: 0.2,
+    oracleMutualInformationLambda: 0.4,
+    oracleMutualInformationMode: "precise" as const,
+    mutualInformationBins: 7,
+  };
+  const accumulator = createExposureValueDistillationAccumulator(config, oracle.grid.length);
+  for (let index = 0; index < prices.length - 1; index += 1) {
+    const rate = prices[index + 1]! > prices[index]! ? 100 : -100;
+    observeExposureValueDistillation(accumulator, oracle, index, rate, 3_600_000, 0.01);
+  }
+  const metrics = finalizeExposureValueDistillation(accumulator);
+
+  assert.ok(metrics.entropyGap >= 0);
+  assert.ok(metrics.stateMutualInformation > 0 && metrics.stateMutualInformation <= 1);
+  assert.ok(metrics.oracleMutualInformation > 0 && metrics.oracleMutualInformation <= 1);
+  assert.equal(metrics.oracleMutualInformationMode, "precise");
+  assert.ok(Math.abs(metrics.mixedLoss - (
+    metrics.crossEntropy
+    + config.entropyGapLambda * metrics.entropyGap
+    - config.stateMutualInformationLambda * metrics.stateMutualInformation
+    - config.oracleMutualInformationLambda * metrics.oracleMutualInformation
+  )) < 1e-12);
+
+  const disabled = createExposureValueDistillationAccumulator({}, oracle.grid.length);
+  observeExposureValueDistillation(disabled, oracle, 0, 100, 3_600_000, 0.01);
+  const disabledMetrics = finalizeExposureValueDistillation(disabled);
+  assert.equal(disabledMetrics.mixedLoss, disabledMetrics.crossEntropy);
+  assert.equal(disabledMetrics.entropyGap, 0);
+  assert.equal(disabledMetrics.stateMutualInformation, 0);
+  assert.equal(disabledMetrics.oracleMutualInformation, 0);
+});
+
 test("truncated exponential partition matches explicit log-sum-exp", () => {
   for (const gridSize of [3, 21, 101, 1_024]) {
     for (const slope of [0, 1e-12, -1e-12, 0.7, -4.2, 1_000, -1_000]) {

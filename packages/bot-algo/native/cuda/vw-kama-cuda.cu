@@ -96,9 +96,14 @@ struct VwKamaResult {
   int32_t signal_count;
   int32_t oracle_count;
   int32_t matched_count;
+  double distillation_weighted_strategy_entropy;
+  double distillation_weighted_entropy_gap;
+  double distillation_state_mutual_information;
+  double distillation_oracle_mutual_information;
+  double distillation_mixed_loss;
 };
 
-static_assert(sizeof(VwKamaResult) == 152, "VwKamaResult ABI changed");
+static_assert(sizeof(VwKamaResult) == 192, "VwKamaResult ABI changed");
 
 struct DeviceResult {
   float state_credit;
@@ -107,6 +112,11 @@ struct DeviceResult {
   double distillation_weighted_oracle_entropy;
   double distillation_weight;
   double distillation_opportunity;
+  double distillation_weighted_strategy_entropy;
+  double distillation_weighted_entropy_gap;
+  double distillation_state_mutual_information;
+  double distillation_oracle_mutual_information;
+  double distillation_mixed_loss;
   double strategy_final_equity;
   double oracle_final_equity;
   double strategy_max_drawdown;
@@ -182,8 +192,14 @@ struct CudaFitnessCase {
   float value_grid_maximum = 0.0f;
   float maximum_effective_exposure = 250.0f;
   float strategy_quadratic_scale = 0.0f;
+  float entropy_gap_lambda = 0.0f;
+  float state_mutual_information_lambda = 0.0f;
+  float oracle_mutual_information_lambda = 0.0f;
+  int oracle_mutual_information_mode = 0;
+  int mutual_information_bins = 15;
   bool has_high_low = false;
   double distillation_weight = 0.0;
+  double distillation_weighted_oracle_entropy = 0.0;
   size_t resident_bytes = 0;
   DeviceBuffer<float> high;
   DeviceBuffer<float> low;
@@ -191,13 +207,17 @@ struct CudaFitnessCase {
   DeviceBuffer<float> volume;
   DeviceBuffer<float> value_means;
   DeviceBuffer<float> value_second_moments;
+  DeviceBuffer<float> value_entropies;
   DeviceBuffer<float> value_weights;
+  DeviceBuffer<float> oracle_bin_probabilities;
   DeviceBuffer<float> strategy_temperatures;
   DeviceBuffer<float> strategy_quadratic_volatilities;
   DeviceBuffer<VwKamaParams> parameters;
   DeviceBuffer<uint64_t> change_offsets;
   DeviceBuffer<float> changes;
   DeviceBuffer<DeviceResult> results;
+  DeviceBuffer<float> precise_features;
+  DeviceBuffer<double> precise_joint;
 };
 
 void cuda_check(cudaError_t error, const char* operation) {
@@ -589,6 +609,171 @@ __device__ __forceinline__ float quadratic_exponential_log_normalizer(
     );
   }
   return maximum + logf(total);
+}
+
+struct QuadraticExponentialStatistics {
+  float log_normalizer;
+  float mean;
+  float second_moment;
+  float entropy;
+};
+
+__device__ __forceinline__ QuadraticExponentialStatistics quadratic_exponential_statistics(
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float linear_coefficient,
+  float quadratic_coefficient
+) {
+  const float spacing = (maximum_exposure - minimum_exposure) / (grid_size - 1);
+  if (quadratic_coefficient == 0.0f) {
+    const float log_normalizer = truncated_exponential_log_normalizer(
+      grid_size,
+      minimum_exposure,
+      maximum_exposure,
+      linear_coefficient
+    );
+    if (linear_coefficient == 0.0f) {
+      const double mean = 0.5 * (minimum_exposure + maximum_exposure);
+      const double index_variance = (
+        static_cast<double>(grid_size) * grid_size - 1.0
+      ) / 12.0;
+      const double variance = spacing * spacing * index_variance;
+      return {
+        log_normalizer,
+        static_cast<float>(mean),
+        static_cast<float>(mean * mean + variance),
+        log_normalizer,
+      };
+    }
+    const double step = fabs(static_cast<double>(linear_coefficient) * spacing);
+    if (step >= 1.0e-4) {
+      const double ratio = exp(-step);
+      const double tail = exp(-step * grid_size);
+      const double one_minus_ratio = 1.0 - ratio;
+      const double one_minus_tail = 1.0 - tail;
+      const double mean_distance = ratio / one_minus_ratio
+        - grid_size * tail / one_minus_tail;
+      const double variance_distance = ratio / (one_minus_ratio * one_minus_ratio)
+        - static_cast<double>(grid_size) * grid_size * tail
+          / (one_minus_tail * one_minus_tail);
+      const double mean = linear_coefficient > 0.0f
+        ? maximum_exposure - spacing * mean_distance
+        : minimum_exposure + spacing * mean_distance;
+      const double variance = fmax(0.0, spacing * spacing * variance_distance);
+      const double second_moment = mean * mean + variance;
+      return {
+        log_normalizer,
+        static_cast<float>(mean),
+        static_cast<float>(second_moment),
+        fmaxf(0.0f, log_normalizer - linear_coefficient * static_cast<float>(mean)),
+      };
+    }
+  }
+
+  const float minimum_log_weight = linear_coefficient * minimum_exposure
+    + quadratic_coefficient * minimum_exposure * minimum_exposure;
+  const float maximum_log_weight = linear_coefficient * maximum_exposure
+    + quadratic_coefficient * maximum_exposure * maximum_exposure;
+  float maximum = fmaxf(minimum_log_weight, maximum_log_weight);
+  int peak_index = minimum_log_weight >= maximum_log_weight ? 0 : grid_size - 1;
+  int start_index = 0;
+  int active_count = grid_size;
+  if (quadratic_coefficient < 0.0f) {
+    const float vertex_position = clamp_value(
+      (-linear_coefficient / (2.0f * quadratic_coefficient) - minimum_exposure) / spacing,
+      0.0f,
+      static_cast<float>(grid_size - 1)
+    );
+    const int lower = static_cast<int>(floorf(vertex_position));
+    const int upper = min(grid_size - 1, lower + 1);
+    const float lower_exposure = minimum_exposure + lower * spacing;
+    const float upper_exposure = minimum_exposure + upper * spacing;
+    const float lower_log_weight = linear_coefficient * lower_exposure
+      + quadratic_coefficient * lower_exposure * lower_exposure;
+    const float upper_log_weight = linear_coefficient * upper_exposure
+      + quadratic_coefficient * upper_exposure * upper_exposure;
+    if (lower_log_weight > maximum) {
+      maximum = lower_log_weight;
+      peak_index = lower;
+    }
+    if (upper_log_weight > maximum) {
+      maximum = upper_log_weight;
+      peak_index = upper;
+    }
+    const float index_curvature = -quadratic_coefficient * spacing * spacing;
+    const int radius = min(
+      grid_size,
+      static_cast<int>(ceilf(0.5f + sqrtf(0.25f + 25.0f / index_curvature)))
+    );
+    active_count = min(grid_size, 2 * radius + 1);
+    start_index = max(0, min(peak_index - radius, grid_size - active_count));
+  }
+  const float start_exposure = minimum_exposure + start_index * spacing;
+  const float second_difference = 2.0f * quadratic_coefficient * spacing * spacing;
+  double total = 0.0;
+  double weighted_mean = 0.0;
+  double weighted_second_moment = 0.0;
+  float relative_log_weight = linear_coefficient * start_exposure
+    + quadratic_coefficient * start_exposure * start_exposure - maximum;
+  float delta = linear_coefficient * spacing
+    + quadratic_coefficient * (2.0f * start_exposure * spacing + spacing * spacing);
+  for (int offset = 0; offset < active_count; ++offset) {
+    const double weight = exp(static_cast<double>(relative_log_weight));
+    const double exposure = start_exposure + offset * spacing;
+    total += weight;
+    weighted_mean += weight * exposure;
+    weighted_second_moment += weight * exposure * exposure;
+    relative_log_weight += delta;
+    delta += second_difference;
+  }
+  const float log_normalizer = maximum + logf(static_cast<float>(total));
+  const double mean = weighted_mean / total;
+  const double second_moment = weighted_second_moment / total;
+  return {
+    log_normalizer,
+    static_cast<float>(mean),
+    static_cast<float>(second_moment),
+    fmaxf(0.0f, log_normalizer
+      - linear_coefficient * static_cast<float>(mean)
+      - quadratic_coefficient * static_cast<float>(second_moment)),
+  };
+}
+
+__device__ __forceinline__ double normalized_gaussian_variance_information(
+  double total_variance,
+  double conditional_variance,
+  int grid_size
+) {
+  if (total_variance <= 2.220446049250313e-16) return 0.0;
+  if (conditional_variance <= 2.220446049250313e-16) return 1.0;
+  return fmax(0.0, fmin(
+    1.0,
+    0.5 * log(total_variance / conditional_variance) / log(static_cast<double>(grid_size))
+  ));
+}
+
+__device__ __forceinline__ double normalized_gaussian_correlation_information(
+  double oracle_mean,
+  double oracle_second_moment,
+  double strategy_mean,
+  double strategy_second_moment,
+  double cross_mean,
+  int grid_size
+) {
+  const double oracle_variance = fmax(0.0, oracle_second_moment - oracle_mean * oracle_mean);
+  const double strategy_variance = fmax(0.0, strategy_second_moment - strategy_mean * strategy_mean);
+  if (oracle_variance <= 2.220446049250313e-16
+    || strategy_variance <= 2.220446049250313e-16) return 0.0;
+  const double covariance = cross_mean - oracle_mean * strategy_mean;
+  const double correlation_squared = fmax(0.0, fmin(
+    1.0 - 1.0e-12,
+    covariance * covariance / (oracle_variance * strategy_variance)
+  ));
+  return fmax(0.0, fmin(
+    1.0,
+    -0.5 * log1p(-correlation_squared) / log(static_cast<double>(grid_size))
+  ));
 }
 
 __global__ void prepare_value_oracle_steps_kernel(
@@ -1119,6 +1304,7 @@ __global__ void evaluate_kernel(
   const uint8_t* oracle_codes,
   const float* value_means,
   const float* value_second_moments,
+  const float* value_entropies,
   const float* value_optimal_exposures,
   const float* value_weights,
   const float* strategy_temperatures,
@@ -1136,6 +1322,10 @@ __global__ void evaluate_kernel(
   float value_grid_maximum,
   float maximum_effective_exposure,
   float strategy_quadratic_scale,
+  float entropy_gap_lambda,
+  float state_mutual_information_lambda,
+  float oracle_mutual_information_lambda,
+  int oracle_mutual_information_mode,
   const VwKamaParams* parameters,
   int candidate_count,
   float* changes,
@@ -1144,6 +1334,7 @@ __global__ void evaluate_kernel(
   const int32_t* transition_offsets,
   uint32_t* transitions,
   int transition_capacity,
+  float* precise_features,
   bool fitness_only,
   bool write_transitions
 ) {
@@ -1255,6 +1446,15 @@ __global__ void evaluate_kernel(
   float state_credit = 0.0f;
   int signal_count = 0;
   double distillation_weighted_cross_entropy = 0.0;
+  double distillation_weight = 0.0;
+  double distillation_weighted_strategy_entropy = 0.0;
+  double distillation_weighted_entropy_gap = 0.0;
+  double weighted_strategy_mean = 0.0;
+  double weighted_strategy_second_moment = 0.0;
+  double weighted_strategy_variance = 0.0;
+  double weighted_oracle_mean = 0.0;
+  double weighted_oracle_second_moment = 0.0;
+  double weighted_oracle_strategy_mean_product = 0.0;
   double strategy_equity = 1.0;
   double oracle_equity = 1.0;
   float strategy_exposure = 0.0f;
@@ -1270,6 +1470,11 @@ __global__ void evaluate_kernel(
     && strategy_quadratic_volatilities
     && value_means
     && value_weights;
+  const bool loss_enabled = distillation_enabled && (
+    entropy_gap_lambda > 0.0f
+    || state_mutual_information_lambda > 0.0f
+    || oracle_mutual_information_lambda > 0.0f
+  );
   const int quadratic_capacity = max(1, p.strategy_quadratic_volatility_samples);
   int quadratic_count = 0;
   double quadratic_sum = 0.0;
@@ -1592,13 +1797,27 @@ __global__ void evaluate_kernel(
           p.strategy_quadratic_scale == 0.0f || volatility == 0.0f
             ? 0.0f
             : -p.strategy_quadratic_scale * volatility * volatility;
-        const float log_normalizer = quadratic_exponential_log_normalizer(
-          value_grid_size,
-          value_grid_minimum,
-          value_grid_maximum,
-          slope,
-          strategy_quadratic_coefficient
-        );
+        const QuadraticExponentialStatistics statistics = loss_enabled
+          ? quadratic_exponential_statistics(
+              value_grid_size,
+              value_grid_minimum,
+              value_grid_maximum,
+              slope,
+              strategy_quadratic_coefficient
+            )
+          : QuadraticExponentialStatistics {
+              quadratic_exponential_log_normalizer(
+                value_grid_size,
+                value_grid_minimum,
+                value_grid_maximum,
+                slope,
+                strategy_quadratic_coefficient
+              ),
+              0.0f,
+              0.0f,
+              0.0f,
+            };
+        const float log_normalizer = statistics.log_normalizer;
         const float cross_entropy = fmaxf(
           0.0f,
           log_normalizer - slope * value_means[index]
@@ -1606,6 +1825,38 @@ __global__ void evaluate_kernel(
         );
         const float weight = value_weights[index];
         distillation_weighted_cross_entropy += static_cast<double>(weight * cross_entropy);
+        distillation_weight += weight;
+        if (loss_enabled) {
+          const float oracle_entropy = value_entropies[index];
+          const double normalized_excess_entropy = fmax(
+            0.0,
+            static_cast<double>(statistics.entropy - oracle_entropy)
+              / log(static_cast<double>(value_grid_size))
+          );
+          distillation_weighted_strategy_entropy += weight * statistics.entropy;
+          distillation_weighted_entropy_gap += weight
+            * normalized_excess_entropy * normalized_excess_entropy;
+          weighted_strategy_mean += weight * statistics.mean;
+          weighted_strategy_second_moment += weight * statistics.second_moment;
+          weighted_strategy_variance += weight * fmax(
+            0.0,
+            static_cast<double>(statistics.second_moment)
+              - static_cast<double>(statistics.mean) * statistics.mean
+          );
+          weighted_oracle_mean += weight * value_means[index];
+          weighted_oracle_second_moment += weight * value_second_moments[index];
+          weighted_oracle_strategy_mean_product += weight
+            * value_means[index] * statistics.mean;
+          if (precise_features && oracle_mutual_information_mode == 1) {
+            const size_t feature = (
+              static_cast<size_t>(candidate) * (candle_count - score_start)
+              + index - score_start
+            ) * 3;
+            precise_features[feature] = slope;
+            precise_features[feature + 1] = strategy_quadratic_coefficient;
+            precise_features[feature + 2] = log_normalizer;
+          }
+        }
         if (!fitness_only && index + 1 < candle_count) {
           advance_return(
             exposure,
@@ -1649,12 +1900,45 @@ __global__ void evaluate_kernel(
   }
 
   if (!write_transitions) {
+    const double inverse_weight = distillation_weight > 0.0 ? 1.0 / distillation_weight : 0.0;
+    const double strategy_mean = weighted_strategy_mean * inverse_weight;
+    const double strategy_second_moment = weighted_strategy_second_moment * inverse_weight;
+    const double state_mutual_information = state_mutual_information_lambda > 0.0f
+      ? normalized_gaussian_variance_information(
+          fmax(0.0, strategy_second_moment - strategy_mean * strategy_mean),
+          weighted_strategy_variance * inverse_weight,
+          value_grid_size
+        )
+      : 0.0;
+    const double oracle_mutual_information = oracle_mutual_information_lambda > 0.0f
+      && oracle_mutual_information_mode == 0
+      ? normalized_gaussian_correlation_information(
+          weighted_oracle_mean * inverse_weight,
+          weighted_oracle_second_moment * inverse_weight,
+          strategy_mean,
+          strategy_second_moment,
+          weighted_oracle_strategy_mean_product * inverse_weight,
+          value_grid_size
+        )
+      : 0.0;
+    const double mixed_loss = distillation_weight > 0.0
+      ? distillation_weighted_cross_entropy * inverse_weight
+        + entropy_gap_lambda * distillation_weighted_entropy_gap * inverse_weight
+        - state_mutual_information_lambda * state_mutual_information
+        - oracle_mutual_information_lambda * oracle_mutual_information
+      : 0.0;
     results[candidate].state_credit = state_credit;
     results[candidate].signal_count = signal_count;
     results[candidate].distillation_weighted_cross_entropy = distillation_weighted_cross_entropy;
     results[candidate].distillation_weighted_oracle_entropy = 0.0;
-    results[candidate].distillation_weight = 0.0;
+    results[candidate].distillation_weight = distillation_weight;
     results[candidate].distillation_opportunity = 0.0;
+    results[candidate].distillation_weighted_strategy_entropy =
+      distillation_weighted_strategy_entropy;
+    results[candidate].distillation_weighted_entropy_gap = distillation_weighted_entropy_gap;
+    results[candidate].distillation_state_mutual_information = state_mutual_information;
+    results[candidate].distillation_oracle_mutual_information = oracle_mutual_information;
+    results[candidate].distillation_mixed_loss = mixed_loss;
     results[candidate].strategy_final_equity = strategy_equity;
     results[candidate].oracle_final_equity = oracle_equity;
     results[candidate].strategy_max_drawdown = strategy_max_drawdown;
@@ -1662,6 +1946,183 @@ __global__ void evaluate_kernel(
     results[candidate].strategy_turnover = strategy_turnover;
     results[candidate].oracle_turnover = oracle_turnover;
   }
+}
+
+constexpr int MAX_MUTUAL_INFORMATION_BINS = 32;
+
+__global__ void precise_oracle_mutual_information_joint_kernel(
+  const float* oracle_bin_probabilities,
+  const float* value_weights,
+  const float* precise_features,
+  int candle_count,
+  int score_start,
+  int candidate_count,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  int bins,
+  double* precise_joint
+) {
+  const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+  const int candidate = lane / bins;
+  const int strategy_bin = lane % bins;
+  if (candidate >= candidate_count) return;
+  double joint[MAX_MUTUAL_INFORMATION_BINS] = {};
+  const int scored_count = candle_count - score_start;
+  const int grid_start = (strategy_bin * grid_size + bins - 1) / bins;
+  const int grid_end = ((strategy_bin + 1) * grid_size + bins - 1) / bins;
+  const float spacing = (maximum_exposure - minimum_exposure) / (grid_size - 1);
+  for (int scored_index = 0; scored_index < scored_count; ++scored_index) {
+    const size_t feature = (
+      static_cast<size_t>(candidate) * scored_count + scored_index
+    ) * 3;
+    const float linear_coefficient = precise_features[feature];
+    const float quadratic_coefficient = precise_features[feature + 1];
+    const float log_normalizer = precise_features[feature + 2];
+    double strategy_probability = 0.0;
+    for (int grid_index = grid_start; grid_index < grid_end; ++grid_index) {
+      const float exposure = minimum_exposure + grid_index * spacing;
+      strategy_probability += exp(
+        static_cast<double>(linear_coefficient) * exposure
+        + static_cast<double>(quadratic_coefficient) * exposure * exposure
+        - log_normalizer
+      );
+    }
+    const int candle_index = score_start + scored_index;
+    const double weighted_strategy_probability = value_weights[candle_index]
+      * strategy_probability;
+    const size_t oracle_offset = static_cast<size_t>(candle_index) * bins;
+    for (int oracle_bin = 0; oracle_bin < bins; ++oracle_bin) {
+      joint[oracle_bin] += weighted_strategy_probability
+        * oracle_bin_probabilities[oracle_offset + oracle_bin];
+    }
+  }
+  const size_t candidate_offset = static_cast<size_t>(candidate) * bins * bins;
+  for (int oracle_bin = 0; oracle_bin < bins; ++oracle_bin) {
+    precise_joint[candidate_offset + oracle_bin * bins + strategy_bin] = joint[oracle_bin];
+  }
+}
+
+__global__ void finalize_precise_oracle_mutual_information_kernel(
+  int candidate_count,
+  int bins,
+  float entropy_gap_lambda,
+  float state_mutual_information_lambda,
+  float oracle_mutual_information_lambda,
+  const double* precise_joint,
+  DeviceResult* results
+) {
+  const int candidate = blockIdx.x * blockDim.x + threadIdx.x;
+  if (candidate >= candidate_count) return;
+  double oracle_marginal[MAX_MUTUAL_INFORMATION_BINS] = {};
+  double strategy_marginal[MAX_MUTUAL_INFORMATION_BINS] = {};
+  const size_t offset = static_cast<size_t>(candidate) * bins * bins;
+  double total = 0.0;
+  for (int oracle_bin = 0; oracle_bin < bins; ++oracle_bin) {
+    for (int strategy_bin = 0; strategy_bin < bins; ++strategy_bin) {
+      const double value = precise_joint[offset + oracle_bin * bins + strategy_bin];
+      total += value;
+      oracle_marginal[oracle_bin] += value;
+      strategy_marginal[strategy_bin] += value;
+    }
+  }
+  double mutual_information = 0.0;
+  double oracle_entropy = 0.0;
+  double strategy_entropy = 0.0;
+  if (total > 0.0) {
+    for (int bin = 0; bin < bins; ++bin) {
+      oracle_marginal[bin] /= total;
+      strategy_marginal[bin] /= total;
+      if (oracle_marginal[bin] > 0.0) {
+        oracle_entropy -= oracle_marginal[bin] * log(oracle_marginal[bin]);
+      }
+      if (strategy_marginal[bin] > 0.0) {
+        strategy_entropy -= strategy_marginal[bin] * log(strategy_marginal[bin]);
+      }
+    }
+    for (int oracle_bin = 0; oracle_bin < bins; ++oracle_bin) {
+      for (int strategy_bin = 0; strategy_bin < bins; ++strategy_bin) {
+        const double probability = precise_joint[
+          offset + oracle_bin * bins + strategy_bin
+        ] / total;
+        if (probability > 0.0) {
+          mutual_information += probability * log(
+            probability / (oracle_marginal[oracle_bin] * strategy_marginal[strategy_bin])
+          );
+        }
+      }
+    }
+  }
+  const double normalized = oracle_entropy > 2.220446049250313e-16
+      && strategy_entropy > 2.220446049250313e-16
+    ? fmax(0.0, fmin(1.0, mutual_information / sqrt(oracle_entropy * strategy_entropy)))
+    : 0.0;
+  DeviceResult& result = results[candidate];
+  result.distillation_oracle_mutual_information = normalized;
+  const double inverse_weight = result.distillation_weight > 0.0
+    ? 1.0 / result.distillation_weight
+    : 0.0;
+  result.distillation_mixed_loss = result.distillation_weighted_cross_entropy * inverse_weight
+    + entropy_gap_lambda * result.distillation_weighted_entropy_gap * inverse_weight
+    - state_mutual_information_lambda * result.distillation_state_mutual_information
+    - oracle_mutual_information_lambda * normalized;
+}
+
+void prepare_precise_fitness_storage(CudaFitnessCase* test_case, int candidate_count) {
+  if (test_case->oracle_mutual_information_lambda <= 0.0f
+    || test_case->oracle_mutual_information_mode != 1) return;
+  const size_t scored_count = test_case->candle_count - test_case->score_start;
+  test_case->precise_features.allocate(
+    static_cast<size_t>(candidate_count) * scored_count * 3
+  );
+  test_case->precise_joint.allocate(
+    static_cast<size_t>(candidate_count)
+      * test_case->mutual_information_bins * test_case->mutual_information_bins
+  );
+}
+
+void launch_precise_fitness_kernels(
+  CudaFitnessCase* test_case,
+  int candidate_count,
+  cudaStream_t stream = nullptr
+) {
+  if (test_case->oracle_mutual_information_lambda <= 0.0f
+    || test_case->oracle_mutual_information_mode != 1) return;
+  const int joint_threads = 128;
+  const int joint_lanes = candidate_count * test_case->mutual_information_bins;
+  precise_oracle_mutual_information_joint_kernel<<<
+    (joint_lanes + joint_threads - 1) / joint_threads,
+    joint_threads,
+    0,
+    stream
+  >>>(
+    test_case->oracle_bin_probabilities.get(),
+    test_case->value_weights.get(),
+    test_case->precise_features.get(),
+    test_case->candle_count,
+    test_case->score_start,
+    candidate_count,
+    test_case->value_grid_size,
+    test_case->value_grid_minimum,
+    test_case->value_grid_maximum,
+    test_case->mutual_information_bins,
+    test_case->precise_joint.get()
+  );
+  const int finalize_threads = 128;
+  finalize_precise_oracle_mutual_information_kernel<<<
+    (candidate_count + finalize_threads - 1) / finalize_threads,
+    finalize_threads,
+    0,
+    stream
+  >>>(
+    candidate_count,
+    test_case->mutual_information_bins,
+    test_case->entropy_gap_lambda,
+    test_case->state_mutual_information_lambda,
+    test_case->oracle_mutual_information_lambda,
+    test_case->precise_joint.get(),
+    test_case->results.get()
+  );
 }
 
 int compare_alignment(const AlignmentScore& left, const AlignmentScore& right) {
@@ -2132,9 +2593,11 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   const double* volume,
   const float* value_means,
   const float* value_second_moments,
+  const float* value_entropies,
   const float* value_weights,
   const float* strategy_temperatures,
   const float* strategy_quadratic_volatilities,
+  const float* oracle_bin_probabilities,
   int candle_count,
   int score_start,
   double interval_ms,
@@ -2148,11 +2611,16 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   double value_grid_maximum,
   double maximum_effective_exposure,
   double strategy_quadratic_scale,
+  double entropy_gap_lambda,
+  double state_mutual_information_lambda,
+  double oracle_mutual_information_lambda,
+  int oracle_mutual_information_mode,
+  int mutual_information_bins,
   int include_high_low,
   double* resident_bytes
 ) {
   try {
-    if (!close || !volume || !value_means || !value_second_moments
+    if (!close || !volume || !value_means || !value_second_moments || !value_entropies
       || !value_weights || !strategy_temperatures || !strategy_quadratic_volatilities
       || !resident_bytes || (include_high_low && (!high || !low))) {
       throw std::runtime_error("CUDA fitness case received a null input pointer");
@@ -2162,6 +2630,14 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
       || value_grid_minimum >= 0.0 || value_grid_maximum <= 0.0
       || maximum_effective_exposure < fmax(fabs(value_grid_minimum), fabs(value_grid_maximum))
       || !std::isfinite(strategy_quadratic_scale) || strategy_quadratic_scale < 0.0
+      || !std::isfinite(entropy_gap_lambda) || entropy_gap_lambda < 0.0
+      || !std::isfinite(state_mutual_information_lambda) || state_mutual_information_lambda < 0.0
+      || !std::isfinite(oracle_mutual_information_lambda) || oracle_mutual_information_lambda < 0.0
+      || (oracle_mutual_information_mode != 0 && oracle_mutual_information_mode != 1)
+      || mutual_information_bins < 2
+      || mutual_information_bins > std::min(MAX_MUTUAL_INFORMATION_BINS, value_grid_size)
+      || (oracle_mutual_information_lambda > 0.0 && oracle_mutual_information_mode == 1
+        && !oracle_bin_probabilities)
       || oracle_friction < 0.0 || quote_lend_rate < 0.0
       || quote_borrow_rate < 0.0 || asset_borrow_rate < 0.0) {
       throw std::runtime_error("CUDA fitness case received invalid dimensions or options");
@@ -2181,6 +2657,11 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
     result->value_grid_maximum = static_cast<float>(value_grid_maximum);
     result->maximum_effective_exposure = static_cast<float>(maximum_effective_exposure);
     result->strategy_quadratic_scale = static_cast<float>(strategy_quadratic_scale);
+    result->entropy_gap_lambda = static_cast<float>(entropy_gap_lambda);
+    result->state_mutual_information_lambda = static_cast<float>(state_mutual_information_lambda);
+    result->oracle_mutual_information_lambda = static_cast<float>(oracle_mutual_information_lambda);
+    result->oracle_mutual_information_mode = oracle_mutual_information_mode;
+    result->mutual_information_bins = mutual_information_bins;
     result->has_high_low = include_high_low != 0;
 
     std::vector<float> host_close(candle_count);
@@ -2194,16 +2675,29 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
         host_high[index] = static_cast<float>(high[index]);
         host_low[index] = static_cast<float>(low[index]);
       }
-      if (index >= score_start) result->distillation_weight += value_weights[index];
+      if (index >= score_start) {
+        result->distillation_weight += value_weights[index];
+        result->distillation_weighted_oracle_entropy += value_weights[index]
+          * value_entropies[index];
+      }
     }
 
     result->close.allocate(candle_count);
     result->volume.allocate(candle_count);
     result->value_means.allocate(candle_count);
+    const bool loss_enabled = entropy_gap_lambda > 0.0
+      || state_mutual_information_lambda > 0.0
+      || oracle_mutual_information_lambda > 0.0;
     result->value_second_moments.allocate(candle_count);
+    result->value_entropies.allocate(loss_enabled ? candle_count : 0);
     result->value_weights.allocate(candle_count);
     result->strategy_temperatures.allocate(candle_count);
     result->strategy_quadratic_volatilities.allocate(candle_count);
+    const bool precise_enabled = oracle_mutual_information_lambda > 0.0
+      && oracle_mutual_information_mode == 1;
+    result->oracle_bin_probabilities.allocate(
+      precise_enabled ? static_cast<size_t>(candle_count) * mutual_information_bins : 0
+    );
     if (include_high_low) {
       result->high.allocate(candle_count);
       result->low.allocate(candle_count);
@@ -2214,11 +2708,25 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
     cuda_check(cudaMemcpy(result->volume.get(), host_volume.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident volume");
     cuda_check(cudaMemcpy(result->value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value means");
     cuda_check(cudaMemcpy(result->value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value second moments");
+    if (loss_enabled) {
+      cuda_check(cudaMemcpy(result->value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value entropies");
+    }
     cuda_check(cudaMemcpy(result->value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value weights");
     cuda_check(cudaMemcpy(result->strategy_temperatures.get(), strategy_temperatures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident strategy temperatures");
     cuda_check(cudaMemcpy(result->strategy_quadratic_volatilities.get(), strategy_quadratic_volatilities, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident strategy quadratic volatilities");
+    if (precise_enabled) {
+      cuda_check(cudaMemcpy(
+        result->oracle_bin_probabilities.get(),
+        oracle_bin_probabilities,
+        static_cast<size_t>(candle_count) * mutual_information_bins * sizeof(float),
+        cudaMemcpyHostToDevice
+      ), "upload resident oracle MI bins");
+    }
     result->resident_bytes = static_cast<size_t>(candle_count)
-      * (include_high_low ? 9 : 7) * sizeof(float);
+      * ((include_high_low ? 9 : 7) + (loss_enabled ? 1 : 0)) * sizeof(float)
+      + (precise_enabled
+        ? static_cast<size_t>(candle_count) * mutual_information_bins * sizeof(float)
+        : 0);
     *resident_bytes = static_cast<double>(result->resident_bytes);
     last_error.clear();
     return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(result.release()));
@@ -2258,6 +2766,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
     test_case->change_offsets.allocate(candidate_count + 1);
     test_case->changes.allocate(host_change_offsets.back());
     test_case->results.allocate(candidate_count);
+    prepare_precise_fitness_storage(test_case, candidate_count);
     cuda_check(cudaMemcpy(
       test_case->parameters.get(),
       parameters,
@@ -2286,6 +2795,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
       nullptr,
       test_case->value_means.get(),
       test_case->value_second_moments.get(),
+      test_case->value_entropies.get(),
       nullptr,
       test_case->value_weights.get(),
       test_case->strategy_temperatures.get(),
@@ -2303,6 +2813,10 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
       test_case->value_grid_maximum,
       test_case->maximum_effective_exposure,
       test_case->strategy_quadratic_scale,
+      test_case->entropy_gap_lambda,
+      test_case->state_mutual_information_lambda,
+      test_case->oracle_mutual_information_lambda,
+      test_case->oracle_mutual_information_mode,
       test_case->parameters.get(),
       candidate_count,
       test_case->changes.get(),
@@ -2311,10 +2825,13 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
       nullptr,
       nullptr,
       0,
+      test_case->precise_features.get(),
       true,
       false
     );
     cuda_check(cudaGetLastError(), "launch resident VW-KAMA fitness kernel");
+    launch_precise_fitness_kernels(test_case, candidate_count);
+    cuda_check(cudaGetLastError(), "launch resident precise oracle MI kernels");
     cuda_check(cudaEventRecord(stop_event), "record resident fitness stop event");
     cuda_check(cudaEventSynchronize(stop_event), "synchronize resident fitness kernel");
     float elapsed_ms = 0.0f;
@@ -2339,8 +2856,8 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
         std::numeric_limits<double>::quiet_NaN(),
         static_cast<double>(elapsed_ms),
         host_results[candidate].distillation_weighted_cross_entropy,
-        0.0,
-        test_case->distillation_weight,
+        test_case->distillation_weighted_oracle_entropy,
+        host_results[candidate].distillation_weight,
         0.0,
         1.0,
         1.0,
@@ -2352,6 +2869,11 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
         0,
         0,
         0,
+        host_results[candidate].distillation_weighted_strategy_entropy,
+        host_results[candidate].distillation_weighted_entropy_gap,
+        host_results[candidate].distillation_state_mutual_information,
+        host_results[candidate].distillation_oracle_mutual_information,
+        host_results[candidate].distillation_mixed_loss,
       };
     }
     last_error.clear();
@@ -2408,6 +2930,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
       test_case->change_offsets.allocate(candidate_count + 1);
       test_case->changes.allocate(offsets.back());
       test_case->results.allocate(candidate_count);
+      prepare_precise_fitness_storage(test_case, candidate_count);
       cuda_check(cudaMemcpy(
         test_case->parameters.get(),
         parameters,
@@ -2438,6 +2961,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
         nullptr,
         test_case->value_means.get(),
         test_case->value_second_moments.get(),
+        test_case->value_entropies.get(),
         nullptr,
         test_case->value_weights.get(),
         test_case->strategy_temperatures.get(),
@@ -2455,6 +2979,10 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
         test_case->value_grid_maximum,
         test_case->maximum_effective_exposure,
         test_case->strategy_quadratic_scale,
+        test_case->entropy_gap_lambda,
+        test_case->state_mutual_information_lambda,
+        test_case->oracle_mutual_information_lambda,
+        test_case->oracle_mutual_information_mode,
         test_case->parameters.get(),
         candidate_count,
         test_case->changes.get(),
@@ -2463,10 +2991,13 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
         nullptr,
         nullptr,
         0,
+        test_case->precise_features.get(),
         true,
         false
       );
       cuda_check(cudaGetLastError(), "launch scheduled resident VW-KAMA fitness kernel");
+      launch_precise_fitness_kernels(test_case, candidate_count, streams[case_index]);
+      cuda_check(cudaGetLastError(), "launch scheduled precise oracle MI kernels");
       cuda_check(cudaEventRecord(stops[case_index], streams[case_index]), "record scheduled fitness stop");
     }
 
@@ -2496,8 +3027,8 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
           std::numeric_limits<double>::quiet_NaN(),
           static_cast<double>(elapsed_ms),
           host_results[candidate].distillation_weighted_cross_entropy,
-          0.0,
-          test_case->distillation_weight,
+          test_case->distillation_weighted_oracle_entropy,
+          host_results[candidate].distillation_weight,
           0.0,
           1.0,
           1.0,
@@ -2509,6 +3040,11 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
           0,
           0,
           0,
+          host_results[candidate].distillation_weighted_strategy_entropy,
+          host_results[candidate].distillation_weighted_entropy_gap,
+          host_results[candidate].distillation_state_mutual_information,
+          host_results[candidate].distillation_oracle_mutual_information,
+          host_results[candidate].distillation_mixed_loss,
         };
       }
       cudaEventDestroy(starts[case_index]);
@@ -2530,7 +3066,9 @@ extern "C" double vw_kama_cuda_fitness_case_device_bytes(uint64_t handle) {
     + test_case->parameters.capacity() * sizeof(VwKamaParams)
     + test_case->change_offsets.capacity() * sizeof(uint64_t)
     + test_case->changes.capacity() * sizeof(float)
-    + test_case->results.capacity() * sizeof(DeviceResult));
+    + test_case->results.capacity() * sizeof(DeviceResult)
+    + test_case->precise_features.capacity() * sizeof(float)
+    + test_case->precise_joint.capacity() * sizeof(double));
 }
 
 extern "C" int vw_kama_cuda_destroy_fitness_case(uint64_t handle) {
@@ -2562,6 +3100,7 @@ extern "C" int vw_kama_cuda_evaluate(
   const float* value_entropies,
   const float* value_weights,
   const float* value_opportunities,
+  const float* oracle_bin_probabilities,
   const float* strategy_temperatures,
   const float* strategy_quadratic_volatilities,
   int candle_count,
@@ -2579,6 +3118,11 @@ extern "C" int vw_kama_cuda_evaluate(
   double value_grid_maximum,
   double maximum_effective_exposure,
   double strategy_quadratic_scale,
+  double entropy_gap_lambda,
+  double state_mutual_information_lambda,
+  double oracle_mutual_information_lambda,
+  int oracle_mutual_information_mode,
+  int mutual_information_bins,
   const void* parameter_data,
   int candidate_count,
   int fitness_only,
@@ -2597,17 +3141,30 @@ extern "C" int vw_kama_cuda_evaluate(
       throw std::runtime_error("VW-KAMA CUDA received invalid timing options");
     }
     const bool distillation_enabled = value_grid_size >= 3;
+    const bool loss_enabled = entropy_gap_lambda > 0.0
+      || state_mutual_information_lambda > 0.0
+      || oracle_mutual_information_lambda > 0.0;
+    const bool precise_enabled = oracle_mutual_information_lambda > 0.0
+      && oracle_mutual_information_mode == 1;
     if (distillation_enabled && (
       !value_means
       || !value_second_moments
       || !value_weights
       || !strategy_temperatures
       || !strategy_quadratic_volatilities
+      || (loss_enabled && !value_entropies)
+      || (precise_enabled && !oracle_bin_probabilities)
       || (!fitness_only && (!value_optimal_exposures || !value_entropies || !value_opportunities))
       || value_grid_minimum >= 0
       || value_grid_maximum <= 0
       || maximum_effective_exposure < fmax(fabs(value_grid_minimum), fabs(value_grid_maximum))
       || !std::isfinite(strategy_quadratic_scale) || strategy_quadratic_scale < 0.0
+      || !std::isfinite(entropy_gap_lambda) || entropy_gap_lambda < 0.0
+      || !std::isfinite(state_mutual_information_lambda) || state_mutual_information_lambda < 0.0
+      || !std::isfinite(oracle_mutual_information_lambda) || oracle_mutual_information_lambda < 0.0
+      || (oracle_mutual_information_mode != 0 && oracle_mutual_information_mode != 1)
+      || mutual_information_bins < 2
+      || mutual_information_bins > std::min(MAX_MUTUAL_INFORMATION_BINS, value_grid_size)
     )) {
       throw std::runtime_error("VW-KAMA CUDA received invalid value-distillation inputs");
     }
@@ -2654,16 +3211,32 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<uint8_t> device_oracle(fitness_only ? 0 : candle_count);
     DeviceBuffer<float> device_value_means(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_second_moments(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_entropies(
+      distillation_enabled && loss_enabled ? candle_count : 0
+    );
     DeviceBuffer<float> device_value_optimal_exposures(
       distillation_enabled && !fitness_only ? candle_count : 0
     );
     DeviceBuffer<float> device_value_weights(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_strategy_temperatures(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_strategy_quadratic_volatilities(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_oracle_bin_probabilities(
+      precise_enabled ? static_cast<size_t>(candle_count) * mutual_information_bins : 0
+    );
     DeviceBuffer<VwKamaParams> device_parameters(candidate_count);
     DeviceBuffer<uint64_t> device_change_offsets(candidate_count + 1);
     DeviceBuffer<float> device_changes(host_change_offsets.back());
     DeviceBuffer<DeviceResult> device_results(candidate_count);
+    DeviceBuffer<float> device_precise_features(
+      precise_enabled
+        ? static_cast<size_t>(candidate_count) * (candle_count - score_start) * 3
+        : 0
+    );
+    DeviceBuffer<double> device_precise_joint(
+      precise_enabled
+        ? static_cast<size_t>(candidate_count) * mutual_information_bins * mutual_information_bins
+        : 0
+    );
     if (any_dmi_enabled) {
       cuda_check(cudaMemcpy(device_high.get(), host_high.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy high");
       cuda_check(cudaMemcpy(device_low.get(), host_low.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy low");
@@ -2679,9 +3252,20 @@ extern "C" int vw_kama_cuda_evaluate(
     if (distillation_enabled) {
       cuda_check(cudaMemcpy(device_value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value means");
       cuda_check(cudaMemcpy(device_value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value second moments");
+      if (loss_enabled) {
+        cuda_check(cudaMemcpy(device_value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value entropies");
+      }
       cuda_check(cudaMemcpy(device_value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value weights");
       cuda_check(cudaMemcpy(device_strategy_temperatures.get(), strategy_temperatures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy strategy temperatures");
       cuda_check(cudaMemcpy(device_strategy_quadratic_volatilities.get(), strategy_quadratic_volatilities, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy strategy quadratic volatilities");
+      if (precise_enabled) {
+        cuda_check(cudaMemcpy(
+          device_oracle_bin_probabilities.get(),
+          oracle_bin_probabilities,
+          static_cast<size_t>(candle_count) * mutual_information_bins * sizeof(float),
+          cudaMemcpyHostToDevice
+        ), "copy oracle MI bins");
+      }
       if (!fitness_only) {
         cuda_check(cudaMemcpy(device_value_optimal_exposures.get(), value_optimal_exposures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value optimal exposures");
       }
@@ -2745,6 +3329,7 @@ extern "C" int vw_kama_cuda_evaluate(
       device_oracle.get(),
       device_value_means.get(),
       device_value_second_moments.get(),
+      device_value_entropies.get(),
       device_value_optimal_exposures.get(),
       device_value_weights.get(),
       device_strategy_temperatures.get(),
@@ -2762,6 +3347,10 @@ extern "C" int vw_kama_cuda_evaluate(
       static_cast<float>(value_grid_maximum),
       static_cast<float>(maximum_effective_exposure),
       static_cast<float>(strategy_quadratic_scale),
+      static_cast<float>(entropy_gap_lambda),
+      static_cast<float>(state_mutual_information_lambda),
+      static_cast<float>(oracle_mutual_information_lambda),
+      oracle_mutual_information_mode,
       device_parameters.get(),
       candidate_count,
       device_changes.get(),
@@ -2770,10 +3359,46 @@ extern "C" int vw_kama_cuda_evaluate(
       device_transition_offsets.get(),
       device_transitions.get(),
       capture_capacity,
+      device_precise_features.get(),
       fitness_only != 0,
       false
     );
     cuda_check(cudaGetLastError(), "launch VW-KAMA score kernel");
+
+    if (precise_enabled) {
+      const int joint_threads = 128;
+      const int joint_lanes = candidate_count * mutual_information_bins;
+      precise_oracle_mutual_information_joint_kernel<<<
+        (joint_lanes + joint_threads - 1) / joint_threads,
+        joint_threads
+      >>>(
+        device_oracle_bin_probabilities.get(),
+        device_value_weights.get(),
+        device_precise_features.get(),
+        candle_count,
+        score_start,
+        candidate_count,
+        value_grid_size,
+        static_cast<float>(value_grid_minimum),
+        static_cast<float>(value_grid_maximum),
+        mutual_information_bins,
+        device_precise_joint.get()
+      );
+      const int finalize_threads = 128;
+      finalize_precise_oracle_mutual_information_kernel<<<
+        (candidate_count + finalize_threads - 1) / finalize_threads,
+        finalize_threads
+      >>>(
+        candidate_count,
+        mutual_information_bins,
+        static_cast<float>(entropy_gap_lambda),
+        static_cast<float>(state_mutual_information_lambda),
+        static_cast<float>(oracle_mutual_information_lambda),
+        device_precise_joint.get(),
+        device_results.get()
+      );
+      cuda_check(cudaGetLastError(), "launch precise oracle MI kernels");
+    }
 
     std::vector<DeviceResult> host_results(candidate_count);
     cuda_check(cudaMemcpy(
@@ -2801,7 +3426,7 @@ extern "C" int vw_kama_cuda_evaluate(
           static_cast<double>(elapsed_ms),
           host_results[candidate].distillation_weighted_cross_entropy,
           0.0,
-          distillation_weight,
+          host_results[candidate].distillation_weight,
           0.0,
           1.0,
           1.0,
@@ -2813,6 +3438,11 @@ extern "C" int vw_kama_cuda_evaluate(
           0,
           0,
           0,
+          host_results[candidate].distillation_weighted_strategy_entropy,
+          host_results[candidate].distillation_weighted_entropy_gap,
+          host_results[candidate].distillation_state_mutual_information,
+          host_results[candidate].distillation_oracle_mutual_information,
+          host_results[candidate].distillation_mixed_loss,
         };
       }
       last_error.clear();
@@ -2854,6 +3484,7 @@ extern "C" int vw_kama_cuda_evaluate(
         device_oracle.get(),
         device_value_means.get(),
         device_value_second_moments.get(),
+        device_value_entropies.get(),
         device_value_optimal_exposures.get(),
         device_value_weights.get(),
         device_strategy_temperatures.get(),
@@ -2871,6 +3502,10 @@ extern "C" int vw_kama_cuda_evaluate(
         static_cast<float>(value_grid_maximum),
         static_cast<float>(maximum_effective_exposure),
         static_cast<float>(strategy_quadratic_scale),
+        static_cast<float>(entropy_gap_lambda),
+        static_cast<float>(state_mutual_information_lambda),
+        static_cast<float>(oracle_mutual_information_lambda),
+        oracle_mutual_information_mode,
         device_parameters.get(),
         candidate_count,
         device_changes.get(),
@@ -2879,6 +3514,7 @@ extern "C" int vw_kama_cuda_evaluate(
         device_transition_offsets.get(),
         device_transitions.get(),
         candle_count - score_start,
+        nullptr,
         false,
         true
       );
@@ -2961,6 +3597,11 @@ extern "C" int vw_kama_cuda_evaluate(
         host_results[candidate].signal_count,
         static_cast<int32_t>(oracle_transitions.size()),
         alignment.matched_count,
+        host_results[candidate].distillation_weighted_strategy_entropy,
+        host_results[candidate].distillation_weighted_entropy_gap,
+        host_results[candidate].distillation_state_mutual_information,
+        host_results[candidate].distillation_oracle_mutual_information,
+        host_results[candidate].distillation_mixed_loss,
       };
     }
     last_error.clear();

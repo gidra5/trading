@@ -188,6 +188,11 @@ we need to adjust the oracle evaluation:
    2. w_t=W_t/sum(W_t)
    3. W_t=eps+R_t(a_t)/median_a(R_t(a)) 
    4. or W_t=max_A(Q_t(a))-min_A(Q_t(a))
+   5. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
+      1. entropyGap is the opportunity-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
+      2. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
+      3. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
+      4. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
 6. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence. 
 7. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price. 
    1. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing. 

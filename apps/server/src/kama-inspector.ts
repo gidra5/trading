@@ -10,6 +10,7 @@ import {
   perfectMarginOracle,
   prepareExposureValueOracle,
   prepareExposureValueOracleCuda,
+  normalizeExposureValueDistillationLossConfig,
   resolveVwKamaHoldingPeriodSteps,
   truncateExposureValueOracle,
   vwKamaScore,
@@ -153,6 +154,11 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
+    entropyGapLambda: 0,
+    stateMutualInformationLambda: 0,
+    oracleMutualInformationLambda: 0,
+    oracleMutualInformationMode: "approximate",
+    mutualInformationBins: 15,
   },
 };
 
@@ -381,6 +387,7 @@ export class KamaInspectorEngine {
           valueDistillation: {
             oracle: valueOracle,
             strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
+            lossConfig: request.valueDistillation!,
           },
         }),
       });
@@ -448,6 +455,7 @@ export class KamaInspectorEngine {
         valueDistillation: {
           oracle: valueOracle,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
+          lossConfig: request.valueDistillation!,
         },
       });
       indicatorPoints.push(...evaluation.indicatorPoints);
@@ -835,8 +843,30 @@ function combineMetrics(
     (sum, item) => sum + item.weightedOracleEntropy,
     0,
   );
+  const weightedStrategyEntropy = valueParts.reduce(
+    (sum, item) => sum + item.weightedStrategyEntropy,
+    0,
+  );
+  const weightedEntropyGap = valueParts.reduce(
+    (sum, item) => sum + item.weightedEntropyGap,
+    0,
+  );
   const crossEntropy = distillationWeight > 0 ? weightedCrossEntropy / distillationWeight : 0;
   const oracleEntropy = distillationWeight > 0 ? weightedOracleEntropy / distillationWeight : 0;
+  const strategyEntropy = distillationWeight > 0 ? weightedStrategyEntropy / distillationWeight : 0;
+  const entropyGap = distillationWeight > 0 ? weightedEntropyGap / distillationWeight : 0;
+  const stateMutualInformation = distillationWeight > 0 ? valueParts.reduce(
+    (sum, item) => sum + item.stateMutualInformation * item.weightSum,
+    0,
+  ) / distillationWeight : 0;
+  const oracleMutualInformation = distillationWeight > 0 ? valueParts.reduce(
+    (sum, item) => sum + item.oracleMutualInformation * item.weightSum,
+    0,
+  ) / distillationWeight : 0;
+  const mixedLoss = distillationWeight > 0 ? valueParts.reduce(
+    (sum, item) => sum + item.mixedLoss * item.weightSum,
+    0,
+  ) / distillationWeight : 0;
   return {
     score: vwKamaScore(f1, exposureAgreement, signalCleanliness),
     precision,
@@ -869,11 +899,20 @@ function combineMetrics(
         ) / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
         weightedCrossEntropy,
         weightedOracleEntropy,
+        weightedStrategyEntropy,
+        weightedEntropyGap,
         weightSum: distillationWeight,
         opportunitySum: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0),
         sampleCount: valueParts.reduce((sum, item) => sum + item.sampleCount, 0),
         crossEntropy,
         oracleEntropy,
+        strategyEntropy,
+        entropyGap,
+        stateMutualInformation,
+        oracleMutualInformation,
+        oracleMutualInformationMode: valueParts[0]!.oracleMutualInformationMode,
+        mixedLoss,
+        mixedScore: Math.exp(-Math.max(0, mixedLoss - oracleEntropy)),
         klDivergence: Math.max(0, crossEntropy - oracleEntropy),
         score: Math.exp(-Math.max(0, crossEntropy - oracleEntropy)),
         meanOpportunity: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0)
@@ -913,6 +952,13 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     ...DEFAULT_REQUEST.valueDistillation!,
     ...request.valueDistillation,
   };
+  Object.assign(
+    request.valueDistillation,
+    normalizeExposureValueDistillationLossConfig(
+      request.valueDistillation,
+      request.valueDistillation.gridSize,
+    ),
+  );
   if (!["flat", "hold", "hysteresis"].includes(request.parameters.deadbandMode)) {
     throw new Error("VW-KAMA deadband mode must be flat, hold, or hysteresis.");
   }

@@ -18,6 +18,8 @@ import {
   strategyExposureTemperatures,
   truncateExposureValueOracle,
   type ExposureValueOracle,
+  type ExposureValueOracleMutualInformationMode,
+  type ExposureValueDistillationLossConfig,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
 import {
   columnarVwKamaCandles,
@@ -107,6 +109,11 @@ interface Args {
   quoteLendRate: number;
   quoteBorrowRate: number;
   assetBorrowRate: number;
+  entropyGapLambda: number;
+  stateMutualInformationLambda: number;
+  oracleMutualInformationLambda: number;
+  oracleMutualInformationMode: ExposureValueOracleMutualInformationMode;
+  mutualInformationBins: number;
   seedCandidatePaths: string[];
   presetWindowIds?: string[];
   presetOutputPath: string;
@@ -263,6 +270,9 @@ interface CaseScore {
   valueDistillationScore: number | null;
   valueDistillationLoss: number | null;
   valueDistillationKl: number | null;
+  entropyGap: number | null;
+  stateMutualInformation: number | null;
+  oracleMutualInformation: number | null;
   oracleEntropy: number | null;
   meanOpportunity: number | null;
   holdingPeriodMs: number | null;
@@ -302,6 +312,11 @@ interface CaseStats {
   stateCount: number;
   distillationWeightedCrossEntropy?: number;
   distillationWeightedOracleEntropy?: number;
+  distillationWeightedStrategyEntropy?: number;
+  distillationWeightedEntropyGap?: number;
+  distillationStateMutualInformation?: number;
+  distillationOracleMutualInformation?: number;
+  distillationMixedLoss?: number;
   distillationWeight?: number;
   distillationOpportunity?: number;
   distillationSamples?: number;
@@ -330,6 +345,9 @@ interface AggregateScore {
   valueDistillationScore: number | null;
   valueDistillationLoss: number | null;
   valueDistillationKl: number | null;
+  entropyGap: number | null;
+  stateMutualInformation: number | null;
+  oracleMutualInformation: number | null;
   meanOpportunity: number | null;
   strategyReturn: number | null;
   oracleReturn: number | null;
@@ -518,6 +536,11 @@ async function run(config: Args): Promise<void> {
       quoteLendRate: config.quoteLendRate,
       quoteBorrowRate: config.quoteBorrowRate,
       assetBorrowRate: config.assetBorrowRate,
+      entropyGapLambda: config.entropyGapLambda,
+      stateMutualInformationLambda: config.stateMutualInformationLambda,
+      oracleMutualInformationLambda: config.oracleMutualInformationLambda,
+      oracleMutualInformationMode: config.oracleMutualInformationMode,
+      mutualInformationBins: config.mutualInformationBins,
     },
     warmStart: {
       files: config.seedCandidatePaths.map((file) => path.relative(repoRoot, file)),
@@ -693,6 +716,11 @@ function writeGlobalPresets(
         quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
         assetBorrowRate: config.assetBorrowRate,
+        entropyGapLambda: config.entropyGapLambda,
+        stateMutualInformationLambda: config.stateMutualInformationLambda,
+        oracleMutualInformationLambda: config.oracleMutualInformationLambda,
+        oracleMutualInformationMode: config.oracleMutualInformationMode,
+        mutualInformationBins: config.mutualInformationBins,
       },
     },
   }));
@@ -1614,6 +1642,11 @@ async function runPerWindow(
         quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
         assetBorrowRate: config.assetBorrowRate,
+        entropyGapLambda: config.entropyGapLambda,
+        stateMutualInformationLambda: config.stateMutualInformationLambda,
+        oracleMutualInformationLambda: config.oracleMutualInformationLambda,
+        oracleMutualInformationMode: config.oracleMutualInformationMode,
+        mutualInformationBins: config.mutualInformationBins,
       },
     },
   }));
@@ -2065,6 +2098,7 @@ async function evaluateStageCuda(
             valueDistillation: {
               oracle: testCase.valueOracle,
               strategyVolatilityScaling: config.strategyVolatilityScaling,
+              lossConfig: valueDistillationLossConfig(config),
               strategyTemperatures: testCase.strategyTemperatures,
             },
           },
@@ -2092,6 +2126,7 @@ async function evaluateStageCuda(
           ? {
               oracle: testCase.valueOracle,
               strategyVolatilityScaling: config.strategyVolatilityScaling,
+              lossConfig: valueDistillationLossConfig(config),
               strategyTemperatures: testCase.strategyTemperatures,
             }
           : undefined,
@@ -2113,6 +2148,11 @@ async function evaluateStageCuda(
         stateCount: result.stateCount,
         distillationWeightedCrossEntropy: result.distillationWeightedCrossEntropy,
         distillationWeightedOracleEntropy: result.distillationWeightedOracleEntropy,
+        distillationWeightedStrategyEntropy: result.distillationWeightedStrategyEntropy,
+        distillationWeightedEntropyGap: result.distillationWeightedEntropyGap,
+        distillationStateMutualInformation: result.distillationStateMutualInformation,
+        distillationOracleMutualInformation: result.distillationOracleMutualInformation,
+        distillationMixedLoss: result.distillationMixedLoss,
         distillationWeight: result.distillationWeight,
         distillationOpportunity: result.distillationOpportunity,
         distillationSamples: testCase.valueOracle ? result.stateCount : 0,
@@ -2315,6 +2355,11 @@ async function prepareStageWindow(
     quoteLendRate: config.quoteLendRate,
     quoteBorrowRate: config.quoteBorrowRate,
     assetBorrowRate: config.assetBorrowRate,
+    entropyGapLambda: config.entropyGapLambda,
+    stateMutualInformationLambda: config.stateMutualInformationLambda,
+    oracleMutualInformationLambda: config.oracleMutualInformationLambda,
+    oracleMutualInformationMode: config.oracleMutualInformationMode,
+    mutualInformationBins: config.mutualInformationBins,
     valueOracleBackend,
   });
   const cached = preparedStageCache.get(key);
@@ -2597,6 +2642,8 @@ async function buildCases(
             quoteLendRate: config.quoteLendRate,
             quoteBorrowRate: config.quoteBorrowRate,
             assetBorrowRate: config.assetBorrowRate,
+            includeProbabilities: config.oracleMutualInformationLambda > 0
+              && config.oracleMutualInformationMode === "precise",
           };
           if (valueOracleBackend === "cuda") {
             const prepared = await prepareExposureValueOracleCuda(
@@ -2660,6 +2707,7 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
       ? {
           oracle: testCase.valueOracle,
           strategyVolatilityScaling: config.strategyVolatilityScaling,
+          lossConfig: valueDistillationLossConfig(config),
           strategyTemperatures: testCase.strategyTemperatures,
         }
       : undefined,
@@ -2682,6 +2730,11 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     stateCount: result.candleCount,
     distillationWeightedCrossEntropy: distillation?.weightedCrossEntropy,
     distillationWeightedOracleEntropy: distillation?.weightedOracleEntropy,
+    distillationWeightedStrategyEntropy: distillation?.weightedStrategyEntropy,
+    distillationWeightedEntropyGap: distillation?.weightedEntropyGap,
+    distillationStateMutualInformation: distillation?.stateMutualInformation,
+    distillationOracleMutualInformation: distillation?.oracleMutualInformation,
+    distillationMixedLoss: distillation?.mixedLoss,
     distillationWeight: distillation?.weightSum,
     distillationOpportunity: distillation?.opportunitySum,
     distillationSamples: distillation?.sampleCount,
@@ -2694,6 +2747,16 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     strategyTurnover: distillation?.returns.strategy.turnover,
     oracleTurnover: distillation?.returns.oracle.turnover,
     days: testCase.days,
+  };
+}
+
+function valueDistillationLossConfig(config: Args): ExposureValueDistillationLossConfig {
+  return {
+    entropyGapLambda: config.entropyGapLambda,
+    stateMutualInformationLambda: config.stateMutualInformationLambda,
+    oracleMutualInformationLambda: config.oracleMutualInformationLambda,
+    oracleMutualInformationMode: config.oracleMutualInformationMode,
+    mutualInformationBins: config.mutualInformationBins,
   };
 }
 
@@ -2728,7 +2791,20 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
   const signalScore = searchScore(f1, exposureAgreement, signalCleanliness, config.scoreVersion);
   const distillationWeight = sum(parts.map((part) => part.distillationWeight ?? 0));
   const valueDistillationLoss = distillationWeight > 0
-    ? sum(parts.map((part) => part.distillationWeightedCrossEntropy ?? 0)) / distillationWeight
+    ? sum(parts.map((part) => (part.distillationMixedLoss
+      ?? (part.distillationWeightedCrossEntropy ?? 0) / Math.max(1e-20, part.distillationWeight ?? 0))
+      * (part.distillationWeight ?? 0))) / distillationWeight
+    : null;
+  const entropyGap = distillationWeight > 0
+    ? sum(parts.map((part) => part.distillationWeightedEntropyGap ?? 0)) / distillationWeight
+    : null;
+  const stateMutualInformation = distillationWeight > 0
+    ? sum(parts.map((part) => (part.distillationStateMutualInformation ?? 0)
+      * (part.distillationWeight ?? 0))) / distillationWeight
+    : null;
+  const oracleMutualInformation = distillationWeight > 0
+    ? sum(parts.map((part) => (part.distillationOracleMutualInformation ?? 0)
+      * (part.distillationWeight ?? 0))) / distillationWeight
     : null;
   const oracleEntropy = distillationWeight > 0
     ? sum(parts.map((part) => part.distillationWeightedOracleEntropy ?? 0)) / distillationWeight
@@ -2775,6 +2851,9 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
     valueDistillationScore,
     valueDistillationLoss,
     valueDistillationKl,
+    entropyGap,
+    stateMutualInformation,
+    oracleMutualInformation,
     oracleEntropy,
     meanOpportunity,
     holdingPeriodMs,
@@ -2812,7 +2891,7 @@ function searchScore(
 
 function scoreWeightsDescription(config: Args): string {
   return config.objective === "value-distillation"
-    ? "negative weighted cross-entropy -CE(p_oracle, s_candidate); p is derived from friction-aware future value and weighted by max(Q)-min(Q)"
+    ? `negative mixed loss −[CE + ${config.entropyGapLambda}·entropy-gap − ${config.stateMutualInformationLambda}·state-MI − ${config.oracleMutualInformationLambda}·oracle-MI (${config.oracleMutualInformationMode})]; examples are weighted by max(Q)-min(Q)`
     : "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
 }
 
@@ -2828,6 +2907,9 @@ function aggregate(scores: CaseScore[]): AggregateScore {
     valueDistillationScore: nullableMedian(scores.map((score) => score.valueDistillationScore)),
     valueDistillationLoss: nullableMedian(scores.map((score) => score.valueDistillationLoss)),
     valueDistillationKl: nullableMedian(scores.map((score) => score.valueDistillationKl)),
+    entropyGap: nullableMedian(scores.map((score) => score.entropyGap)),
+    stateMutualInformation: nullableMedian(scores.map((score) => score.stateMutualInformation)),
+    oracleMutualInformation: nullableMedian(scores.map((score) => score.oracleMutualInformation)),
     meanOpportunity: nullableMedian(scores.map((score) => score.meanOpportunity)),
     strategyReturn: nullableMedian(scores.map((score) => score.strategyReturn)),
     oracleReturn: nullableMedian(scores.map((score) => score.oracleReturn)),
@@ -3378,6 +3460,8 @@ function parseArgs(argv: string[]): Args {
     "strategy-temperature-range", "strategy-quadratic-scale-range",
     "strategy-quadratic-volatility-window-range",
     "strategy-volatility-scaling",
+    "entropy-gap-lambda", "state-mi-lambda", "oracle-mi-lambda",
+    "oracle-mi-mode", "mi-bins",
     "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
     "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
@@ -3404,6 +3488,7 @@ function parseArgs(argv: string[]): Args {
   const valueHoldingPeriodMs = parseDuration(get("value-holding-period", "1s"));
   const valueHorizonMs = parseDuration(get("value-horizon", "1s"));
   const valueHorizonEndMode = get("value-horizon-end-mode", "truncate");
+  const oracleMutualInformationMode = get("oracle-mi-mode", "approximate");
   const scoreVersion = integer(get("score-version", String(VW_KAMA_SCORE_VERSION)), "score-version");
   if (algorithm !== "random" && algorithm !== "de") throw new Error("--algorithm must be random or de.");
   if (mode !== "standard" && mode !== "per-window") throw new Error("--mode must be standard or per-window.");
@@ -3422,6 +3507,14 @@ function parseArgs(argv: string[]): Args {
   }
   if (valueHorizonEndMode !== "truncate" && valueHorizonEndMode !== "extend") {
     throw new Error("--value-horizon-end-mode must be truncate or extend.");
+  }
+  if (oracleMutualInformationMode !== "approximate" && oracleMutualInformationMode !== "precise") {
+    throw new Error("--oracle-mi-mode must be approximate or precise.");
+  }
+  const exposureGridSize = integer(get("exposure-grid-size", "150"), "exposure-grid-size", 3);
+  const mutualInformationBins = integer(get("mi-bins", "15"), "mi-bins", 2);
+  if (mutualInformationBins > Math.min(32, exposureGridSize)) {
+    throw new Error("--mi-bins cannot exceed min(32, --exposure-grid-size).");
   }
   const exposureMinimum = bounded(get("exposure-min", "-100"), "exposure-min", -100, -Number.EPSILON);
   const exposureMaximum = bounded(get("exposure-max", "100"), "exposure-max", Number.EPSILON, 100);
@@ -3478,7 +3571,7 @@ function parseArgs(argv: string[]): Args {
     accelerator,
     objective: objective as SearchObjective,
     scoreVersion,
-    exposureGridSize: integer(get("exposure-grid-size", "150"), "exposure-grid-size", 3),
+    exposureGridSize,
     exposureMinimum,
     exposureMaximum,
     maxEffectiveExposure,
@@ -3491,6 +3584,11 @@ function parseArgs(argv: string[]): Args {
       get("strategy-volatility-scaling", "false"),
       "strategy-volatility-scaling",
     ),
+    entropyGapLambda: nonNegative(get("entropy-gap-lambda", "0"), "entropy-gap-lambda"),
+    stateMutualInformationLambda: nonNegative(get("state-mi-lambda", "0"), "state-mi-lambda"),
+    oracleMutualInformationLambda: nonNegative(get("oracle-mi-lambda", "0"), "oracle-mi-lambda"),
+    oracleMutualInformationMode: oracleMutualInformationMode as ExposureValueOracleMutualInformationMode,
+    mutualInformationBins,
     opportunityEpsilon: nonNegative(get("opportunity-epsilon", "0.000001"), "opportunity-epsilon"),
     quoteLendRate: nonNegative(get("quote-lend-rate", "0"), "quote-lend-rate"),
     quoteBorrowRate: nonNegative(get("quote-borrow-rate", "0"), "quote-borrow-rate"),
@@ -3786,10 +3884,10 @@ function report(
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} holding period H and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, and quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} holding period H and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, and quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; loss mix λH=${config.entropyGapLambda}, λS=${config.stateMutualInformationLambda}, λO=${config.oracleMutualInformationLambda}, oracle MI ${config.oracleMutualInformationMode}${config.oracleMutualInformationMode === "precise" ? ` at ${config.mutualInformationBins} bins` : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
-      ? "- Candidate fitness is the negative of median/P90 cross-entropy, equally weighted; every scale/window case has equal weight."
+      ? "- Candidate fitness is the negative of the equally weighted median and P90 mixed loss; every scale/window case has equal weight."
       : "- Candidate objective equally weights the median and P10 case score; every scale/window case has equal weight.",
     "",
     "## Holdout finalists and production signal baseline",
@@ -3836,9 +3934,9 @@ function report(
     "",
     ...(config.objective === "value-distillation"
       ? [
-        "| candidate | scale/window | H | T−t | cross-entropy | KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableDuration(item.holdingPeriodMs)} | ${formatNullableDuration(item.valueHorizonMs)} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
+        "| candidate | scale/window | H | T−t | mixed loss | entropy gap | state MI | oracle MI | mixed KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableDuration(item.holdingPeriodMs)} | ${formatNullableDuration(item.valueHorizonMs)} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.entropyGap)} | ${formatNullableNumber(item.stateMutualInformation)} | ${formatNullableNumber(item.oracleMutualInformation)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
       ]
       : [
         "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
@@ -3853,11 +3951,11 @@ function report(
 function resultTable(results: CandidateResult[], config: Args): string {
   if (config.objective === "value-distillation") {
     return [
-      "| family | id | strategy | robust CE | median CE | P90 CE | median KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | signal score | agreement | signals/day |",
-      "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+      "| family | id | strategy | robust loss | median loss | P90 loss | entropy gap | state MI | oracle MI | median KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | signal score | agreement | signals/day |",
+      "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
       ...results.map((result) => {
         const score = result.aggregate;
-        return `| ${result.candidate.family} | ${result.candidate.id} | ${result.candidate.agreementMode} | ${round(-score.objective, 5)} | ${round(-score.median, 5)} | ${round(-score.p10, 5)} | ${formatNullableNumber(score.valueDistillationKl)} | ${formatNullablePercent(score.valueDistillationScore)} | ${formatNullablePercent(score.strategyReturn)} | ${formatNullablePercent(score.oracleReturn)} | ${formatNullablePercent(score.strategyMaxDrawdown)} | ${formatNullablePercent(score.oracleMaxDrawdown)} | ${pct(score.signalScore)} | ${pct(score.exposureAgreement)} | ${round(score.signalsPerDay, 2)} |`;
+        return `| ${result.candidate.family} | ${result.candidate.id} | ${result.candidate.agreementMode} | ${round(-score.objective, 5)} | ${round(-score.median, 5)} | ${round(-score.p10, 5)} | ${formatNullableNumber(score.entropyGap)} | ${formatNullableNumber(score.stateMutualInformation)} | ${formatNullableNumber(score.oracleMutualInformation)} | ${formatNullableNumber(score.valueDistillationKl)} | ${formatNullablePercent(score.valueDistillationScore)} | ${formatNullablePercent(score.strategyReturn)} | ${formatNullablePercent(score.oracleReturn)} | ${formatNullablePercent(score.strategyMaxDrawdown)} | ${formatNullablePercent(score.oracleMaxDrawdown)} | ${pct(score.signalScore)} | ${pct(score.exposureAgreement)} | ${round(score.signalsPerDay, 2)} |`;
       }),
     ].join("\n");
   }
@@ -3956,6 +4054,11 @@ function help(): void {
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
   --strategy-temperature-range 0.000001..0.1  Candidate base temperature
   --strategy-volatility-scaling false  Also multiply temperature by trailing-H log-return stddev
+  --entropy-gap-lambda 0           Penalize squared normalized strategy entropy above oracle entropy
+  --state-mi-lambda 0              Reward normalized state/strategy Gaussian information
+  --oracle-mi-lambda 0             Reward normalized oracle/strategy information
+  --oracle-mi-mode approximate     approximate Gaussian moments or precise soft categorical bins
+  --mi-bins 15                     Precise-MI exposure bins (2..min(32, grid size))
   --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
   --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
