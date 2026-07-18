@@ -10,7 +10,6 @@ import {
   prepareExposureValueOracle,
   prepareExposureValueOracleCuda,
   resolveVwKamaValueHorizonSteps,
-  VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE,
   vwKamaScore,
   vwKamaCudaStatus,
   VW_KAMA_SCORE_VERSION,
@@ -130,13 +129,16 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
   timingHalfLifeMs: 10 * 60_000,
   warmupMultiple: 3,
   valueDistillation: {
-    gridSize: 21,
-    minExposure: -1,
-    maxExposure: 1,
+    gridSize: 150,
+    minExposure: -100,
+    maxExposure: 100,
+    maxEffectiveExposure: 250,
     horizonMode: "fixed",
-    horizonMs: 60 * 60_000,
+    horizonMs: 1_000,
     oracleTemperature: 0.01,
     strategyTemperature: 0.001,
+    strategyQuadraticScale: 0,
+    strategyQuadraticVolatilityMs: 60 * 60_000,
     strategyVolatilityScaling: false,
     opportunityEpsilon: 0.000001,
     quoteLendRate: 0,
@@ -360,6 +362,9 @@ export class KamaInspectorEngine {
           valueDistillation: {
             oracle: valueOracle,
             strategyTemperature: request.valueDistillation!.strategyTemperature,
+            strategyQuadraticScale: request.valueDistillation!.strategyQuadraticScale,
+            strategyQuadraticVolatilityMs:
+              request.valueDistillation!.strategyQuadraticVolatilityMs,
             strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
           },
         }),
@@ -424,6 +429,9 @@ export class KamaInspectorEngine {
         valueDistillation: {
           oracle: valueOracle,
           strategyTemperature: request.valueDistillation!.strategyTemperature,
+          strategyQuadraticScale: request.valueDistillation!.strategyQuadraticScale,
+          strategyQuadraticVolatilityMs:
+            request.valueDistillation!.strategyQuadraticVolatilityMs,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
         },
       });
@@ -525,6 +533,7 @@ export class KamaInspectorEngine {
       config.gridSize,
       config.minExposure,
       config.maxExposure,
+      config.maxEffectiveExposure,
       config.horizonMode,
       config.horizonMs,
       horizonSteps,
@@ -545,6 +554,7 @@ export class KamaInspectorEngine {
         gridSize: config.gridSize,
         minExposure: config.minExposure,
         maxExposure: config.maxExposure,
+        maxEffectiveExposure: config.maxEffectiveExposure,
         temperature: config.oracleTemperature,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
@@ -552,8 +562,8 @@ export class KamaInspectorEngine {
         assetBorrowRate: config.assetBorrowRate,
         includeProbabilities: true,
       };
-      if (config.gridSize >= VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE
-        && config.gridSize <= 1_024) {
+      const oracleCells = (candles.length - scoreStartIndex) * config.gridSize;
+      if (oracleCells >= 10_000_000 && horizonSteps >= 8 && config.gridSize <= 1_024) {
         const status = await vwKamaCudaStatus();
         if (status.available) {
           try {
@@ -994,12 +1004,23 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     || !Number.isFinite(valueConfig.maxExposure) || valueConfig.maxExposure <= 0) {
     throw new Error("VW-KAMA value exposure bounds must contain zero.");
   }
-  if (!["fixed", "oracle-average-trade"].includes(valueConfig.horizonMode)
+  if (!Number.isFinite(valueConfig.maxEffectiveExposure)
+    || valueConfig.maxEffectiveExposure < Math.max(
+      Math.abs(valueConfig.minExposure),
+      Math.abs(valueConfig.maxExposure),
+    )) {
+    throw new Error("VW-KAMA effective exposure must cover the tradable exposure range.");
+  }
+  if (!["fixed", "oracle-half-average-trade"].includes(valueConfig.horizonMode)
     || !Number.isFinite(valueConfig.horizonMs) || valueConfig.horizonMs <= 0
     || !Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
     || !Number.isFinite(valueConfig.strategyTemperature) || valueConfig.strategyTemperature <= 0
+    || !Number.isFinite(valueConfig.strategyQuadraticScale)
+    || valueConfig.strategyQuadraticScale < 0
+    || !Number.isFinite(valueConfig.strategyQuadraticVolatilityMs)
+    || valueConfig.strategyQuadraticVolatilityMs <= 0
     || typeof valueConfig.strategyVolatilityScaling !== "boolean") {
-    throw new Error("VW-KAMA value and strategy temperature settings are invalid.");
+    throw new Error("VW-KAMA value and strategy calibration settings are invalid.");
   }
   if ([
     valueConfig.opportunityEpsilon,

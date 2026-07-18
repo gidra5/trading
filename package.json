@@ -15,6 +15,7 @@
     "benchmark:strategies": "tsx scripts/benchmark-strategies.ts",
     "benchmark:sigmoid-sigma": "tsx scripts/benchmark-sigmoid-sigma-fit.ts",
     "benchmark:kama:cuda": "tsx scripts/benchmark-vw-kama-cuda.ts",
+    "benchmark:kama:value:cuda": "tsx scripts/benchmark-vw-kama-value-cuda.ts",
     "benchmark:kama:cuda:7d": "tsx scripts/compare-vw-kama-cuda-7d.ts",
     "build:cuda": "node scripts/build-vw-kama-cuda.mjs",
     "search:kama": "tsx scripts/search-volume-weighted-kama.ts",

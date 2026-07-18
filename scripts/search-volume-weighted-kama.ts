@@ -15,6 +15,7 @@ import {
   prepareExposureValueOracle,
   shareExposureValueOracle,
   strategyExposureTemperatures,
+  strategyExposureVolatilities,
   type ExposureValueOracle,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
 import {
@@ -37,9 +38,10 @@ import { perfectMarginOracle } from "../packages/bot-algo/src/perfect-margin-ora
 import type { PerfectMarginOracleResult } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { TradingCandle } from "../packages/bot-algo/src/trading-api.js";
 import {
+  clearVwKamaCudaFitnessCaseCache,
   evaluateVwKamaCudaBatch,
+  evaluateVwKamaCudaFitnessCases,
   prepareExposureValueOracleCuda,
-  VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE,
   vwKamaCudaStatus,
 } from "../packages/bot-algo/src/vw-kama-cuda.js";
 
@@ -92,10 +94,13 @@ interface Args {
   exposureGridSize: number;
   exposureMinimum: number;
   exposureMaximum: number;
+  maxEffectiveExposure: number;
   valueHorizonMode: VwKamaValueHorizonMode;
   valueHorizonMs: number;
   oracleTemperature: number;
   strategyTemperature: number;
+  strategyQuadraticScale: number;
+  strategyQuadraticVolatilityMs: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
@@ -223,6 +228,7 @@ interface CaseData {
   preparedOracle?: VwKamaPreparedOracle;
   valueOracle?: ExposureValueOracle;
   strategyTemperatures?: Float32Array;
+  strategyQuadraticVolatilities?: Float32Array;
   valueHorizonMs?: number;
   days: number;
 }
@@ -369,8 +375,8 @@ const DAY = 86_400_000;
 const HOUR = 3_600_000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const stamp = new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 17);
-// RTX 3060 measurements put the serial-CPU/CUDA crossover between two and four
-// candidates across 5k-60k-candle cases. Keep only genuinely tiny batches on CPU.
+// RTX 3060 measurements put the crossover around four independent candidate-case
+// lanes. Resident multi-case scheduling makes case parallelism equivalent to candidates.
 const CUDA_AUTO_MIN_CANDIDATES = 4;
 const searchTelemetry: SearchTelemetry[] = [];
 let candidatePool: CandidatePool | null = null;
@@ -402,7 +408,7 @@ if (candidateWorker) {
 } else if (!windowJob) {
   queueMicrotask(() => {
     void run(parseArgs(process.argv.slice(2)))
-      .finally(closeCandidatePool)
+      .finally(closeSearchResources)
       .catch((error) => {
         console.error(error instanceof Error ? error.stack ?? error.message : error);
         process.exitCode = 1;
@@ -415,7 +421,7 @@ if (candidateWorker) {
       .catch((error) => process.send?.({
         error: error instanceof Error ? error.stack ?? error.message : String(error),
       }))
-      .finally(closeCandidatePool);
+      .finally(closeSearchResources);
   });
 }
 
@@ -488,10 +494,13 @@ async function run(config: Args): Promise<void> {
     valueDistillation: {
       exposureGridSize: config.exposureGridSize,
       exposureRange: [config.exposureMinimum, config.exposureMaximum],
+      maxEffectiveExposure: config.maxEffectiveExposure,
       horizonMode: config.valueHorizonMode,
       horizonMs: config.valueHorizonMs,
       oracleTemperature: config.oracleTemperature,
       strategyTemperature: config.strategyTemperature,
+      strategyQuadraticScale: config.strategyQuadraticScale,
+      strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
       strategyVolatilityScaling: config.strategyVolatilityScaling,
       opportunityWeight: `max(Q)-min(Q)+${config.opportunityEpsilon}`,
       quoteLendRate: config.quoteLendRate,
@@ -653,10 +662,13 @@ function writeGlobalPresets(
         gridSize: config.exposureGridSize,
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
+        maxEffectiveExposure: config.maxEffectiveExposure,
         horizonMode: config.valueHorizonMode,
         horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
         strategyTemperature: config.strategyTemperature,
+        strategyQuadraticScale: config.strategyQuadraticScale,
+        strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
@@ -1127,6 +1139,7 @@ async function memberFitness(
       bounds,
       warmupMs,
       config,
+      config.objective === "value-distillation",
     );
     for (let index = 0; index < missing.length; index += 1) {
       cache.set(fitnessCacheKey(missing[index]!, window, config), evaluated[index]?.cases ?? []);
@@ -1555,10 +1568,13 @@ async function runPerWindow(
         gridSize: config.exposureGridSize,
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
+        maxEffectiveExposure: config.maxEffectiveExposure,
         horizonMode: config.valueHorizonMode,
         horizonMs: config.valueHorizonMs,
         oracleTemperature: config.oracleTemperature,
         strategyTemperature: config.strategyTemperature,
+        strategyQuadraticScale: config.strategyQuadraticScale,
+        strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
         quoteLendRate: config.quoteLendRate,
@@ -1871,8 +1887,17 @@ async function evaluateStageParallel(
   bounds: { start: number; end: number },
   warmupMs: number,
   config: Args,
+  fitnessOnly = false,
 ): Promise<CandidateResult[]> {
-  const gpu = await evaluateStageCuda(stage, windows, candidates, bounds, warmupMs, config);
+  const gpu = await evaluateStageCuda(
+    stage,
+    windows,
+    candidates,
+    bounds,
+    warmupMs,
+    config,
+    fitnessOnly,
+  );
   if (gpu) return gpu;
   const workers = Math.min(config.workers, candidates.length);
   if (workers <= 1 || candidates.length < workers * 4) {
@@ -1927,9 +1952,14 @@ async function evaluateStageCuda(
   bounds: { start: number; end: number },
   warmupMs: number,
   config: Args,
+  fitnessOnly: boolean,
 ): Promise<CandidateResult[] | null> {
   if (config.accelerator === "cpu" || candidates.length === 0) return null;
-  if (config.accelerator === "auto" && candidates.length < CUDA_AUTO_MIN_CANDIDATES) return null;
+  const scheduledBatchWidth = candidates.length * Math.max(1, windows.length * config.scales.length);
+  if (config.accelerator === "auto" && candidates.length < CUDA_AUTO_MIN_CANDIDATES
+    && (config.objective !== "value-distillation" || scheduledBatchWidth < CUDA_AUTO_MIN_CANDIDATES)) {
+    return null;
+  }
   const status = await vwKamaCudaStatus();
   if (!status.available) {
     if (config.accelerator === "cuda") {
@@ -1945,7 +1975,7 @@ async function evaluateStageCuda(
     console.error(
       `CUDA acceleration: ${status.device}; ${config.accelerator === "cuda"
         ? "forced for every non-empty batch"
-        : `auto uses batches of ${CUDA_AUTO_MIN_CANDIDATES}+ candidates`}.`,
+        : `auto uses ${CUDA_AUTO_MIN_CANDIDATES}+ candidate-case lanes`}.`,
     );
     cudaDeviceReported = true;
   }
@@ -1961,9 +1991,43 @@ async function evaluateStageCuda(
       }
       return null;
     }
-    const results = await evaluateVwKamaCudaBatch(
+  }
+  const scheduledFitness = fitnessOnly && config.objective === "value-distillation"
+    ? await evaluateVwKamaCudaFitnessCases(prepared.cases.map((testCase) => {
+        if (!testCase.valueOracle) {
+          throw new Error("Value-distillation fitness requires a prepared value oracle.");
+        }
+        return {
+          candles: testCase.candles as VwKamaCandleColumns,
+          options: {
+            intervalMs: testCase.scaleMs,
+            scoreStartIndex: testCase.scoreStart,
+            oracleFriction: config.oracleFriction,
+            matchWindowMs: config.matchWindowMs,
+            timingHalfLifeMs: config.timingHalfLifeMs,
+            warmupMultiple: config.warmupMultiple,
+            fitnessOnly: true,
+            valueDistillation: {
+              oracle: testCase.valueOracle,
+              strategyTemperature: config.strategyTemperature,
+              strategyQuadraticScale: config.strategyQuadraticScale,
+              strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
+              strategyVolatilityScaling: config.strategyVolatilityScaling,
+              strategyTemperatures: testCase.strategyTemperatures,
+              strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
+            },
+          },
+        };
+      }), parameters)
+    : null;
+  if (scheduledFitness) {
+    kernelMs = Math.max(0, ...scheduledFitness.map((results) => results[0]?.elapsedMs ?? 0));
+  }
+  for (let caseIndex = 0; caseIndex < prepared.cases.length; caseIndex += 1) {
+    const testCase = prepared.cases[caseIndex]!;
+    const results = scheduledFitness?.[caseIndex] ?? await evaluateVwKamaCudaBatch(
       testCase.candles as VwKamaCandleColumns,
-      testCase.preparedOracle,
+      testCase.preparedOracle!,
       parameters,
       {
         intervalMs: testCase.scaleMs,
@@ -1972,17 +2036,21 @@ async function evaluateStageCuda(
         matchWindowMs: config.matchWindowMs,
         timingHalfLifeMs: config.timingHalfLifeMs,
         warmupMultiple: config.warmupMultiple,
+        fitnessOnly: fitnessOnly && config.objective === "value-distillation",
         valueDistillation: testCase.valueOracle
           ? {
               oracle: testCase.valueOracle,
               strategyTemperature: config.strategyTemperature,
+              strategyQuadraticScale: config.strategyQuadraticScale,
+              strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
               strategyVolatilityScaling: config.strategyVolatilityScaling,
               strategyTemperatures: testCase.strategyTemperatures,
+              strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
             }
           : undefined,
       },
     );
-    kernelMs += results[0]?.elapsedMs ?? 0;
+    if (!scheduledFitness) kernelMs += results[0]?.elapsedMs ?? 0;
     for (let index = 0; index < candidates.length; index += 1) {
       const result = results[index]!;
       const parts = grouped[index]!.get(testCase.id) ?? [];
@@ -2145,6 +2213,11 @@ function closeCandidatePool(): void {
   candidatePool = null;
 }
 
+async function closeSearchResources(): Promise<void> {
+  closeCandidatePool();
+  await clearVwKamaCudaFitnessCaseCache();
+}
+
 async function evaluateStage(
   stage: Stage,
   windows: Window[],
@@ -2170,7 +2243,7 @@ async function prepareStageWindow(
   forcedValueOracleBackend?: ValueOracleBackend,
 ): Promise<PreparedStageWindow> {
   const valueOracleBackend = forcedValueOracleBackend
-    ?? await resolveValueOracleBackend(config);
+    ?? await resolveValueOracleBackend(config, windows, warmupMs);
   const key = JSON.stringify({
     stage,
     sourceDir: config.sourceDir,
@@ -2183,10 +2256,13 @@ async function prepareStageWindow(
     exposureGridSize: config.exposureGridSize,
     exposureMinimum: config.exposureMinimum,
     exposureMaximum: config.exposureMaximum,
+    maxEffectiveExposure: config.maxEffectiveExposure,
     valueHorizonMode: config.valueHorizonMode,
     valueHorizonMs: config.valueHorizonMs,
     oracleTemperature: config.oracleTemperature,
     strategyTemperature: config.strategyTemperature,
+    strategyQuadraticScale: config.strategyQuadraticScale,
+    strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
     strategyVolatilityScaling: config.strategyVolatilityScaling,
     opportunityEpsilon: config.opportunityEpsilon,
     quoteLendRate: config.quoteLendRate,
@@ -2242,10 +2318,12 @@ async function prepareStageWindow(
             ? shareExposureValueOracle(testCase.valueOracle)
             : undefined;
           const strategyTemperatures = testCase.strategyTemperatures;
+          const strategyQuadraticVolatilities = testCase.strategyQuadraticVolatilities;
           prepared.bytes += candleColumnBytes(candles)
             + preparedOracle.stateCodes.byteLength
             + (valueOracle ? exposureValueOracleBytes(valueOracle) : 0)
-            + (strategyTemperatures?.byteLength ?? 0);
+            + (strategyTemperatures?.byteLength ?? 0)
+            + (strategyQuadraticVolatilities?.byteLength ?? 0);
           prepared.cases.push({
             ...testCase,
             candles,
@@ -2253,6 +2331,7 @@ async function prepareStageWindow(
             preparedOracle,
             valueOracle,
             strategyTemperatures,
+            strategyQuadraticVolatilities,
           });
         }
       }
@@ -2296,17 +2375,29 @@ async function prepareStageWindow(
   return prepared;
 }
 
-async function resolveValueOracleBackend(config: Args): Promise<ValueOracleBackend> {
+async function resolveValueOracleBackend(
+  config: Args,
+  windows: Window[],
+  warmupMs: number,
+): Promise<ValueOracleBackend> {
   if (config.objective === "value-distillation"
     && config.accelerator === "cuda"
     && config.exposureGridSize > 1_024) {
     throw new Error("CUDA value-oracle preparation supports at most 1,024 exposure grid points.");
   }
+  const estimatedCells = windows.reduce((total, window) => total + config.scales.reduce(
+    (scaleTotal, scale) => scaleTotal
+      + Math.ceil((window.end - window.start + warmupMs) / scale) * config.exposureGridSize,
+    0,
+  ), 0);
+  const maximumFixedHorizonSteps = config.valueHorizonMode === "fixed"
+    ? Math.max(...config.scales.map((scale) => Math.max(1, Math.round(config.valueHorizonMs / scale))))
+    : Number.POSITIVE_INFINITY;
   if (config.objective !== "value-distillation"
     || config.accelerator === "cpu"
     || config.exposureGridSize > 1_024
-    || (config.accelerator === "auto"
-      && config.exposureGridSize < VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE)) return "cpu";
+    || (config.accelerator === "auto" && maximumFixedHorizonSteps < 8)
+    || (config.accelerator === "auto" && estimatedCells < 10_000_000)) return "cpu";
   const status = await vwKamaCudaStatus();
   return status.available ? "cuda" : "cpu";
 }
@@ -2403,6 +2494,7 @@ async function buildCases(
         });
         let valueOracle: ExposureValueOracle | undefined;
         let strategyTemperatures: Float32Array | undefined;
+        let strategyQuadraticVolatilities: Float32Array | undefined;
         let valueHorizonMs: number | undefined;
         if (config.objective === "value-distillation") {
           const prices = caseCandles.map((candle) => candle.close);
@@ -2421,6 +2513,7 @@ async function buildCases(
             gridSize: config.exposureGridSize,
             minExposure: config.exposureMinimum,
             maxExposure: config.exposureMaximum,
+            maxEffectiveExposure: config.maxEffectiveExposure,
             temperature: config.oracleTemperature,
             opportunityEpsilon: config.opportunityEpsilon,
             quoteLendRate: config.quoteLendRate,
@@ -2440,6 +2533,11 @@ async function buildCases(
               options,
             );
           }
+          strategyQuadraticVolatilities = strategyExposureVolatilities(
+            prices,
+            Math.max(1, Math.round(config.strategyQuadraticVolatilityMs / scaleMs)),
+            true,
+          );
           strategyTemperatures = strategyExposureTemperatures(prices, {
             intervalMs: scaleMs,
             horizonSteps,
@@ -2457,6 +2555,7 @@ async function buildCases(
           oracle,
           valueOracle,
           strategyTemperatures,
+          strategyQuadraticVolatilities,
           valueHorizonMs,
           days: Math.max(scaleMs / DAY, scored.length * scaleMs / DAY),
         });
@@ -2530,8 +2629,11 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
       ? {
           oracle: testCase.valueOracle,
           strategyTemperature: config.strategyTemperature,
+          strategyQuadraticScale: config.strategyQuadraticScale,
+          strategyQuadraticVolatilityMs: config.strategyQuadraticVolatilityMs,
           strategyVolatilityScaling: config.strategyVolatilityScaling,
           strategyTemperatures: testCase.strategyTemperatures,
+          strategyQuadraticVolatilities: testCase.strategyQuadraticVolatilities,
         }
       : undefined,
   });
@@ -3196,8 +3298,10 @@ function parseArgs(argv: string[]): Args {
     "mean-reversion-volatility-range", "mean-reversion-reversal-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
     "screen-scales", "workers", "accelerator", "objective", "score-version",
-    "exposure-grid-size", "exposure-min", "exposure-max", "value-horizon-mode", "value-horizon", "oracle-temperature",
-    "strategy-temperature", "strategy-volatility-scaling",
+    "exposure-grid-size", "exposure-min", "exposure-max", "max-effective-exposure",
+    "value-horizon-mode", "value-horizon", "oracle-temperature",
+    "strategy-temperature", "strategy-quadratic-scale", "strategy-quadratic-volatility-window",
+    "strategy-volatility-scaling",
     "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
     "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
@@ -3230,11 +3334,17 @@ function parseArgs(argv: string[]): Args {
   if (objective !== "signal" && objective !== "value-distillation") {
     throw new Error("--objective must be signal or value-distillation.");
   }
-  if (valueHorizonMode !== "fixed" && valueHorizonMode !== "oracle-average-trade") {
-    throw new Error("--value-horizon-mode must be fixed or oracle-average-trade.");
+  if (valueHorizonMode !== "fixed" && valueHorizonMode !== "oracle-half-average-trade") {
+    throw new Error("--value-horizon-mode must be fixed or oracle-half-average-trade.");
   }
-  const exposureMinimum = bounded(get("exposure-min", "-1"), "exposure-min", -100, -Number.EPSILON);
-  const exposureMaximum = bounded(get("exposure-max", "1"), "exposure-max", Number.EPSILON, 100);
+  const exposureMinimum = bounded(get("exposure-min", "-100"), "exposure-min", -100, -Number.EPSILON);
+  const exposureMaximum = bounded(get("exposure-max", "100"), "exposure-max", Number.EPSILON, 100);
+  const maxEffectiveExposure = bounded(
+    get("max-effective-exposure", "250"),
+    "max-effective-exposure",
+    Math.max(Math.abs(exposureMinimum), Math.abs(exposureMaximum)),
+    10_000,
+  );
   if (scoreVersion !== VW_KAMA_SCORE_VERSION) {
     throw new Error(`--score-version must be ${VW_KAMA_SCORE_VERSION}.`);
   }
@@ -3275,13 +3385,21 @@ function parseArgs(argv: string[]): Args {
     accelerator,
     objective: objective as SearchObjective,
     scoreVersion,
-    exposureGridSize: integer(get("exposure-grid-size", "21"), "exposure-grid-size", 3),
+    exposureGridSize: integer(get("exposure-grid-size", "150"), "exposure-grid-size", 3),
     exposureMinimum,
     exposureMaximum,
+    maxEffectiveExposure,
     valueHorizonMode,
-    valueHorizonMs: parseDuration(get("value-horizon", "1h")),
+    valueHorizonMs: parseDuration(get("value-horizon", "1s")),
     oracleTemperature: positive(get("oracle-temperature", "0.01"), "oracle-temperature"),
     strategyTemperature: positive(get("strategy-temperature", "0.001"), "strategy-temperature"),
+    strategyQuadraticScale: nonNegative(
+      get("strategy-quadratic-scale", "0"),
+      "strategy-quadratic-scale",
+    ),
+    strategyQuadraticVolatilityMs: parseDuration(
+      get("strategy-quadratic-volatility-window", "1h"),
+    ),
     strategyVolatilityScaling: booleanValue(
       get("strategy-volatility-scaling", "false"),
       "strategy-volatility-scaling",
@@ -3551,7 +3669,7 @@ function report(
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-      ? `- Oracle exposures: ${config.exposureGridSize} points over [${config.exposureMinimum}, ${config.exposureMaximum}], ${config.valueHorizonMode === "fixed" ? `${formatDuration(config.valueHorizonMs)} fixed` : `average time between consecutive oracle trades (${formatDuration(config.valueHorizonMs)} fallback)`} forced-exposure horizon, value temperature ${config.oracleTemperature}; strategy truncated-exponential temperature ${config.strategyTemperature} scales with sqrt(H/dt)${config.strategyVolatilityScaling ? " and the trailing-H standard deviation of simple returns" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}, ${config.valueHorizonMode === "fixed" ? `${formatDuration(config.valueHorizonMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHorizonMs)} fallback)`} forced-exposure horizon, value temperature ${config.oracleTemperature}; strategy exp(b1*a - ${config.strategyQuadraticScale}*v^2*a^2), where v is causal log-return volatility over ${formatDuration(config.strategyQuadraticVolatilityMs)}; temperature ${config.strategyTemperature} scales with sqrt(H/dt)${config.strategyVolatilityScaling ? " and trailing-H volatility" : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
       ? "- Candidate fitness is the negative of median/P90 cross-entropy, equally weighted; every scale/window case has equal weight."
@@ -3697,12 +3815,15 @@ function help(): void {
   --workers 12                      Candidate shards for global search; window shards in per-window mode
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
   --objective signal                signal or value-distillation fitness
-  --exposure-grid-size 21 --exposure-min -1 --exposure-max 1
-  --value-horizon-mode fixed        fixed or oracle-average-trade
-  --value-horizon 1h                Fixed H, or fallback when oracle intervals are unavailable
+  --exposure-grid-size 150 --exposure-min -100 --exposure-max 100
+  --value-horizon-mode fixed        fixed or oracle-half-average-trade
+  --value-horizon 1s                Fixed H (one candle by default), or adaptive fallback
+  --max-effective-exposure 250      Liquidate only after drift exceeds this absolute exposure
+  --strategy-quadratic-scale 0  Nonnegative b2' in b2=-b2'*v^2
+  --strategy-quadratic-volatility-window 1h  Separate trailing window used for b2 volatility
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
   --strategy-temperature 0.001      Base temperature; scales by sqrt(H/dt)
-  --strategy-volatility-scaling false  Also multiply by trailing-H simple-return stddev
+  --strategy-volatility-scaling false  Also multiply temperature by trailing-H log-return stddev
   --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
   --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
@@ -3799,6 +3920,7 @@ function formatDuration(ms: number): string {
 function formatRange(range: Range, format: (value: number) => string = String): string { return `${format(range.min)}..${format(range.max)}`; }
 function positive(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`--${label} must be positive.`); return parsed; }
 function nonNegative(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`--${label} must be non-negative.`); return parsed; }
+function finiteNumber(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed)) throw new Error(`--${label} must be finite.`); return parsed; }
 function bounded(value: string, label: string, minimum: number, maximum: number): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) throw new Error(`--${label} must be between ${minimum} and ${maximum}.`); return parsed; }
 function integer(value: string, label: string, minimum = 1): number { const parsed = Number(value); if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new Error(`--${label} must be an integer >= ${minimum}.`); return parsed; }
 function booleanValue(value: string, label: string): boolean {

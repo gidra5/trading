@@ -9,15 +9,17 @@ import {
   PeakValleyStrategy,
   peakValleyWarmupSamples,
   perfectMarginOracle,
+  prepareExposureValueOracle,
   prepareVwKamaOracle,
   resolveVwKamaValueHorizonSteps,
   signalBeyondFriction,
+  strategyExposureVolatilities,
   vwKamaParametersFromPeakValleySignal,
   type Candle,
   type VwKamaTransition,
 } from "../src/index.js";
 
-test("VW-KAMA value horizon can follow the oracle's average inter-trade time", () => {
+test("VW-KAMA value horizon can use half the oracle's average inter-trade time", () => {
   const candles = Array.from({ length: 8 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -38,8 +40,8 @@ test("VW-KAMA value horizon can follow the oracle's average inter-trade time", (
     1,
     stateCodes,
     1_000,
-    { horizonMode: "oracle-average-trade", horizonMs: 5_000 },
-  ), 3);
+    { horizonMode: "oracle-half-average-trade", horizonMs: 5_000 },
+  ), 1);
   assert.equal(resolveVwKamaValueHorizonSteps(
     candles,
     1,
@@ -49,7 +51,7 @@ test("VW-KAMA value horizon can follow the oracle's average inter-trade time", (
   ), 5);
 });
 
-test("VW-KAMA oracle-average value horizon falls back without two oracle transitions", () => {
+test("VW-KAMA half-oracle-average value horizon falls back without two oracle transitions", () => {
   const candles = Array.from({ length: 4 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -68,7 +70,7 @@ test("VW-KAMA oracle-average value horizon falls back without two oracle transit
     1,
     Uint8Array.from([0, 0, 1, 1]),
     1_000,
-    { horizonMode: "oracle-average-trade", horizonMs: 4_000 },
+    { horizonMode: "oracle-half-average-trade", horizonMs: 4_000 },
   ), 4);
 });
 
@@ -266,6 +268,65 @@ test("VW-KAMA evaluator produces causal transitions and bounded chart traces", (
       .every(Number.isFinite)
     && item.rsi >= 0 && item.rsi <= 100
     && item.adx >= 0 && item.adx <= 100));
+});
+
+test("VW-KAMA b2 volatility window is independent from the one-step value horizon", () => {
+  const closes = [100, 102, 99, 103, 101];
+  const candles = closes.map((close, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: index === 0 ? close : closes[index - 1]!,
+    high: Math.max(close, index === 0 ? close : closes[index - 1]!),
+    low: Math.min(close, index === 0 ? close : closes[index - 1]!),
+    close,
+    volume: 1,
+    closed: true,
+  }));
+  const valueOracle = prepareExposureValueOracle(closes, {
+    scoreStartIndex: 1,
+    horizonSteps: 1,
+    friction: 0,
+    gridSize: 5,
+    temperature: 0.01,
+    includeProbabilities: true,
+  });
+  const quadraticScale = 1_000;
+  const result = evaluateVwKamaOracle(candles, {
+    intervalMs: 1_000,
+    scoreStartTime: candles[1]!.openTime,
+    parameters: {
+      efficiencyMs: 1_000,
+      fastMs: 1_000,
+      slowMs: 1_000,
+      power: 1,
+      volumeMs: 1_000,
+      volumeCap: 1,
+      volumePower: 0,
+      deadbandBpsHour: 0,
+      deadbandMode: "hold",
+    },
+    oracleFriction: 0,
+    matchWindowMs: 10_000,
+    timingHalfLifeMs: 1_000,
+    warmupMultiple: 1,
+    maxPoints: 10,
+    valueDistillation: {
+      oracle: valueOracle,
+      strategyTemperature: 0.001,
+      strategyQuadraticScale: quadraticScale,
+      strategyQuadraticVolatilityMs: 3_000,
+      strategyVolatilityScaling: false,
+    },
+  });
+  const point = result.valueDistributions.at(-1)!;
+  const expectedVolatility = strategyExposureVolatilities(closes, 3).at(-1)!;
+  assert.ok(expectedVolatility > 0);
+  assert.ok(Math.abs(point.strategyQuadraticVolatility - expectedVolatility) < 1e-12);
+  assert.ok(Math.abs(
+    point.strategyQuadraticCoefficient + quadraticScale * expectedVolatility ** 2,
+  ) < 1e-12);
 });
 
 test("VW-KAMA log rate is invariant to the asset price scale", () => {

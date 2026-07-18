@@ -6,26 +6,47 @@ of transition F1/agreement:
 ```bash
 npm run search:kama -- \
   --objective value-distillation \
-  --exposure-grid-size 21 \
-  --exposure-min -1 --exposure-max 1 \
-  --value-horizon-mode oracle-average-trade \
-  --value-horizon 1h \
+  --exposure-grid-size 150 \
+  --exposure-min -100 --exposure-max 100 \
+  --max-effective-exposure 250 \
+  --value-horizon-mode fixed \
+  --value-horizon 1s \
   --oracle-temperature 0.01 \
   --strategy-temperature 0.001 \
+  --strategy-quadratic-scale 0 \
+  --strategy-quadratic-volatility-window 1h \
   --strategy-volatility-scaling true
 ```
 
-`--accelerator auto` and `--accelerator cuda` support this objective. CUDA can prepare the
-friction-aware Bellman oracle itself, parallelizing each exposure-grid step, and then evaluate
-candidate batches. The oracle is prepared once per candle segment and shared by CPU workers or
-copied once into each CUDA candidate batch. `cuda` forces both preparation and candidate
-evaluation onto CUDA. `auto` uses the numerically equivalent CPU recurrence below 129 grid
-points, where the sequential time dependency outweighs grid parallelism on the benchmarked
-consumer GPU; it selects CUDA for grids from 129 through the native 1,024-point limit when CUDA
-is available. On an actual 86,400-candle BTC one-second day, grid 101 took 20.40s on CPU versus
-21.91s CUDA, while grid 129 took 32.80s CPU versus 26.79s CUDA. The inspector exposes the full
-native grid range, follows the same crossover, and retains full probability rows for the
-selected chart point.
+`--accelerator auto` and `--accelerator cuda` support this objective. The exact Bellman update
+uses separable buy/sell fee factors, reducing each time step from `O(grid²)` to `O(grid)`.
+CUDA precomputes holding-return prefixes, then evaluates the `H` independent backward residue
+chains concurrently. CPU preparation uses compact outcome and continuation rings. The oracle is
+prepared once per candle segment and retained by the prepared-stage cache.
+
+Candidate fitness cases remain resident on the GPU across generations. Search therefore uploads
+columns and oracle sufficient statistics once, then communicates only packed parameters and
+fitness results. Fitness-only evaluation omits transition alignment, return diagnostics, oracle
+paths, and other candidate-independent columns; oracle first and second moments remain resident
+for the quadratic cross-entropy. Full diagnostics still run for
+reported fit/validation/holdout results. Multiple resident cases are launched on independent CUDA
+streams, and recurrent change rings use packed per-candidate offsets instead of a rectangular
+`candidateCount × maximumPeriod × 2` allocation.
+
+`cuda` forces CUDA oracle preparation and candidate evaluation. `auto` uses CUDA oracle
+preparation when the estimated stage contains at least 10 million candle-grid cells and fixed
+`H >= 8`, amortizing context startup and providing enough independent residue chains; smaller or
+`H=1` preparations use the optimized CPU recurrence. Candidate scheduling
+uses CUDA at four or more candidate-case lanes. The inspector uses CUDA for at least 10 million
+scored candle-grid cells with `H >= 8`, otherwise CPU avoids one-request startup overhead. The
+native CUDA grid limit and the UI maximum are both 1,024 grid points.
+
+The repeatable benchmark is `npm run benchmark:kama:value:cuda`. On the RTX 3060 Laptop test
+device, 20,000 candles × grid 101 × `H=300` improved from 4.85s to about 0.37s on CPU and from
+5.01s to about 0.14s of CUDA kernel time. For 384 mixed-feature candidates, fitness-only
+evaluation is about 63ms versus 246ms for full diagnostics; scheduling four resident cases takes
+about 80ms versus 280ms serially. CPU/CUDA parity tests cover retained probabilities, policy,
+cross-entropy, returns, and scheduled fitness.
 
 ## Oracle value
 
@@ -35,17 +56,20 @@ exactly `a` throughout `H`, so price drift is corrected by intermediate rebalanc
 same friction model. The continuation is a backward Bellman recurrence from `t + H` over the
 exposure grid. Near the segment end, the hold is truncated at the last available close.
 
-`--value-horizon-mode fixed` uses `--value-horizon` directly. With
-`--value-horizon-mode oracle-average-trade`, each continuous scored segment resolves `H` as the
-arithmetic mean of the elapsed times between consecutive executable perfect-margin-oracle state
-changes. The result is rounded to the nearest candle interval. If the segment has fewer than two
-oracle transitions, `--value-horizon` is used as the fallback. The inspector displays the resolved
-`H`; search preparation logs its range and holdout reports include it per case.
+`--value-horizon-mode fixed` uses `--value-horizon` directly and defaults to one candle (`1s` is
+one step at every supported scale). With
+`--value-horizon-mode oracle-half-average-trade`, each continuous scored segment resolves `H` as
+half the arithmetic mean of the elapsed times between consecutive executable
+perfect-margin-oracle state changes. The result is rounded to the nearest candle interval. If the
+segment has fewer than two oracle transitions, `--value-horizon` is used as the fallback. The
+inspector displays the resolved `H`; search preparation logs its range and holdout reports include
+it per case.
 
 Rebalancing uses the exact buy/sell fee equations recorded in `tasks.md`. Maintenance applies
-the configured per-candle quote lend, quote borrow, and asset borrow rates. If marked effective
-exposure leaves the configured grid bounds, the position is liquidated to quote using friction
-and continuation resumes from flat.
+the configured per-candle quote lend, quote borrow, and asset borrow rates. Trades may select only
+targets inside `[exposure-min, exposure-max]`. Price and fee drift may carry the marked position
+outside that target range; liquidation to quote occurs only when its absolute fee-adjusted
+exposure exceeds `max-effective-exposure` (250× by default).
 
 The oracle preference is:
 
@@ -57,22 +81,35 @@ Training examples are weighted by:
 
 ## Candidate distribution and loss
 
-For evaluation, the signed KAMA rate defines a truncated exponential distribution over the
-exposure grid:
+For evaluation, the signed KAMA rate and volatility-scaled quadratic coefficient define a
+quadratic exponential distribution over the exposure grid:
 
-`s_t(a) = exp(kappa_t * a) / sum_A exp(kappa_t * A)`
+`s_t(a) = exp(kappa_t * a + b2_t * a²) / sum_A exp(kappa_t * A + b2_t * A²)`
 
 `kappa_t = (rateBpsHour_t / 10000) * (H / 1h) / effectiveTemperature_t`
 
+`v_t = populationStdDev(log(close_i / close_(i-1)))` over the causal trailing quadratic
+volatility window
+
+`b2_t = -strategyQuadraticScale * v_t²`
+
 A positive rate biases probability toward the maximum exposure, a negative rate toward the
-minimum, and a zero rate is uniform. The effective temperature is:
+minimum. The configured nonnegative scale `b2'` therefore always produces a concave quadratic:
+larger volatility concentrates probability more strongly around its interior mode. A zero scale
+or zero measured volatility gives `b2=0` and recovers the original truncated exponential with
+its exact constant-time partition. The effective temperature is:
+
+The quadratic volatility window defaults to `1h`. At each candle scale it is rounded to the
+nearest positive candle count. If it resolves to one return, its population standard deviation
+is zero and the quadratic term is inactive at that scale.
 
 `effectiveTemperature = strategyTemperature * sqrt(H / dt)`
 
-Enabling `strategyVolatilityScaling` additionally multiplies effective temperature by the
-population standard deviation of simple close-to-close returns over the same trailing `H`
-interval. It is causal: only returns known at the current candle close are included. Thus
-high-volatility periods make the exposure preference softer and low-volatility periods sharper.
+Enabling `strategyVolatilityScaling` additionally multiplies effective temperature by the same
+calculation over the value horizon `H`, independently of the quadratic volatility window. Both
+measurements are causal and include only log returns known at the current candle close. Thus the
+optional temperature scaling softens the linear rate preference using trailing-H volatility,
+while the quadratic term grows with volatility measured over its separately configured window.
 
 The case loss is the normalized opportunity-weighted cross-entropy:
 
@@ -84,13 +121,16 @@ diagnostic.
 
 The standard search also writes its validation-selected volume-aware and canonical finalists
 to `data/benchmarks/vw-kama-global-presets.json`. The KAMA inspector loads these presets and
-uses the exact horizon, oracle temperature, exposure grid, strategy temperature, and volatility
-setting stored with the run.
+uses the exact horizon, exposure limits, temperatures, quadratic scale, quadratic volatility
+window, and temperature-volatility setting stored with the run.
 
-Because `log s_t(a) = kappa_t*a - log Z_t`, exact cross-entropy is simply
-`log Z_t - kappa_t*E_p[a]`; it only needs the oracle distribution mean. The oracle cache retains
-the second moment for diagnostics, but candidate loss does not need it. CUDA and CPU calculate
-the same loss.
+Because `log s_t(a) = kappa_t*a + b2_t*a² - log Z_t`, exact cross-entropy is
+`log Z_t - kappa_t*E_p[a] - b2_t*E_p[a²]`. The oracle cache therefore retains both sufficient
+moments. CUDA and CPU calculate the same per-candle coefficient and loss. `b2_t=0` stays on the
+constant-time geometric-series path. For negative `b2_t`, concavity bounds a fixed-width window
+around the discrete mode; omitted tails are below Float64 resolution on CPU and Float32 resolution
+on CUDA. The forward quadratic recurrence gives every GPU candidate the same loop count at each
+candle. The generic positive-quadratic helper retains the full-grid sum.
 
 ## Inspector visualization
 
@@ -138,7 +178,7 @@ execution-level PnL.
 
 - Single asset and a fixed exposure grid.
 - Close-to-close price observations.
-- Fixed or per-segment oracle-average `H` target-exposure hold followed by perfect-oracle
+- Fixed or per-segment half-oracle-average `H` target-exposure hold followed by perfect-oracle
   continuation.
 - Per-candle borrow/lend rates, defaulting to zero.
 - Strategy temperature and optional volatility normalization are search-level calibration

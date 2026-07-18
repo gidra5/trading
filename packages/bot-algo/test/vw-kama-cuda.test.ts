@@ -11,6 +11,7 @@ import { prepareExposureValueOracle } from "../src/exposure-value-distillation.j
 import type { TradingCandle } from "../src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
+  evaluateVwKamaCudaFitnessCases,
   vwKamaCudaStatus,
 } from "../src/vw-kama-cuda.js";
 
@@ -51,12 +52,33 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     valueDistillation: {
       oracle: valueOracle,
       strategyTemperature: 0.001,
+      strategyQuadraticScale: 200_000,
+      strategyQuadraticVolatilityMs: 120 * MINUTE,
       strategyVolatilityScaling: true,
     },
   };
   const gpu = await evaluateVwKamaCudaBatch(columns, prepared, candidates, common);
+  const fitnessOnly = await evaluateVwKamaCudaBatch(columns, prepared, candidates, {
+    ...common,
+    fitnessOnly: true,
+  });
+  const [scheduledFitness] = await evaluateVwKamaCudaFitnessCases([{
+    candles: columns,
+    options: { ...common, fitnessOnly: true },
+  }], candidates);
   assert.equal(gpu.length, candidates.length);
   for (let index = 0; index < candidates.length; index += 1) {
+    assert.ok(Math.abs(
+      fitnessOnly[index]!.distillationWeightedCrossEntropy
+        - gpu[index]!.distillationWeightedCrossEntropy,
+    ) < 1e-6);
+    assert.equal(
+      scheduledFitness![index]!.distillationWeightedCrossEntropy,
+      fitnessOnly[index]!.distillationWeightedCrossEntropy,
+    );
+    assert.ok(Math.abs(
+      fitnessOnly[index]!.distillationWeight - gpu[index]!.distillationWeight,
+    ) < 1e-9);
     const cpu = evaluateVwKamaOracle(columns, {
       ...common,
       scoreStartTime: candles[scoreStartIndex]!.openTime,

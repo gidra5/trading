@@ -37,13 +37,16 @@ const detailDebounceMs = 120;
 const detailMaxCandles = 5_000;
 const detailTriggerCandles = detailMaxCandles * 4;
 const defaultValueDistillation: VwKamaValueDistillationConfig = {
-  gridSize: 21,
-  minExposure: -1,
-  maxExposure: 1,
+  gridSize: 150,
+  minExposure: -100,
+  maxExposure: 100,
+  maxEffectiveExposure: 250,
   horizonMode: "fixed",
-  horizonMs: 60 * 60_000,
+  horizonMs: 1_000,
   oracleTemperature: 0.01,
   strategyTemperature: 0.001,
+  strategyQuadraticScale: 0,
+  strategyQuadraticVolatilityMs: 60 * 60_000,
   strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
   quoteLendRate: 0,
@@ -175,7 +178,7 @@ const metricHelp = {
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
   distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
-  valueHorizon: "Resolved H used by the value oracle and strategy distribution. Oracle-average mode uses the mean time between consecutive executable oracle state changes; the fixed value is used when fewer than two oracle transitions exist.",
+  valueHorizon: "Resolved H used by the value oracle and strategy distribution. Adaptive mode uses half the mean time between consecutive executable oracle state changes; the fixed value is used when fewer than two oracle transitions exist.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
   oracleReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the executable hindsight Bellman policy and the same friction.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
@@ -1159,17 +1162,20 @@ export function KamaInspectorPage() {
               <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
-              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={1024} step={2} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
-              <InspectorSelect label="Value horizon source" value={valueConfig().horizonMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-average-trade", label: "Average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMode: value as VwKamaValueDistillationConfig["horizonMode"] }))} />
+              <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={1024} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
+              <InspectorSelect label="Value horizon source" value={valueConfig().horizonMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMode: value as VwKamaValueDistillationConfig["horizonMode"] }))} />
               <DurationInput label={valueConfig().horizonMode === "fixed" ? "Value horizon H" : "Fallback horizon H"} value={valueConfig().horizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMs: value }))} />
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
               <InspectorNumber label="Base strategy temperature" value={valueConfig().strategyTemperature} min={0.000001} step={0.0001} onInput={(value) => setValueConfig((current) => ({ ...current, strategyTemperature: value }))} />
-              <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
+              <InspectorNumber label="Strategy quadratic scale b₂′" value={valueConfig().strategyQuadraticScale} min={0} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, strategyQuadraticScale: value }))} />
+              <DurationInput label="Quadratic volatility window" value={valueConfig().strategyQuadraticVolatilityMs} onInput={(value) => setValueConfig((current) => ({ ...current, strategyQuadraticVolatilityMs: value }))} />
+              <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H log-return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
+              <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              Oracle friction shapes both retrospective paths. H can be fixed or resolved per continuous segment as the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. The strategy curve is a truncated exponential exp(exposure × signed H-return / temperature): rate chooses the favored side and temperature scales by √(H/dt). Optional volatility scaling multiplies it by the causal standard deviation of simple returns over the same trailing H interval. Return paths start at equity 1 and exposure 0.
+              Oracle friction shapes both retrospective paths. H defaults to one candle and can be fixed or resolved per continuous segment as half the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. Trades target only the configured exposure grid, while price and fee drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Return paths start at equity 1 and exposure 0.
             </div>
           </details>
         </section>
@@ -1332,7 +1338,7 @@ export function KamaInspectorPage() {
                           <h3 class="text-sm font-semibold">Oracle and predicted exposure distributions</h3>
                         </div>
                         <div class="text-xs tabular-nums text-ink-300">
-                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / target {signedExposure(point().oracleOptimalExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
+                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / target {signedExposure(point().oracleOptimalExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
                         </div>
                       </div>
                       <ExposureDistributionChart point={point()} />

@@ -11,15 +11,17 @@ import {
   createExposureValueOracleStorage,
   shareExposureValueOracle,
   strategyExposureTemperatures,
+  strategyExposureVolatilities,
   type ExposureValueOracleOptions,
 } from "./exposure-value-distillation.js";
 
 const PARAMETER_SIZE = 196;
 const RESULT_SIZE = 152;
 const INT_PARAMETER_COUNT = 20;
-export const VW_KAMA_CUDA_VALUE_ORACLE_AUTO_MIN_GRID_SIZE = 129;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
 const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
+
+type CudaHandle = number | bigint;
 
 interface NativeCuda {
   deviceCount(): number;
@@ -27,6 +29,47 @@ interface NativeCuda {
   lastError(): string;
   parameterSize(): number;
   resultSize(): number;
+  createFitnessCase(
+    high: Float64Array | null,
+    low: Float64Array | null,
+    close: Float64Array,
+    volume: Float64Array,
+    valueMeans: Float32Array,
+    valueSecondMoments: Float32Array,
+    valueWeights: Float32Array,
+    strategyTemperatures: Float32Array,
+    strategyQuadraticVolatilities: Float32Array,
+    candleCount: number,
+    scoreStart: number,
+    intervalMs: number,
+    valueHorizonSteps: number,
+    oracleFriction: number,
+    quoteLendRate: number,
+    quoteBorrowRate: number,
+    assetBorrowRate: number,
+    valueGridSize: number,
+    valueGridMinimum: number,
+    valueGridMaximum: number,
+    maximumEffectiveExposure: number,
+    strategyQuadraticScale: number,
+    includeHighLow: number,
+    residentBytes: Float64Array,
+  ): CudaHandle;
+  evaluateFitnessCase(
+    handle: CudaHandle,
+    parameters: Buffer,
+    candidateCount: number,
+    output: Buffer,
+  ): number;
+  evaluateFitnessCases(
+    handles: BigUint64Array,
+    caseCount: number,
+    parameters: Buffer,
+    candidateCount: number,
+    output: Buffer,
+  ): number;
+  fitnessCaseDeviceBytes(handle: CudaHandle): number;
+  destroyFitnessCase(handle: CudaHandle): number;
   prepareValueOracle(
     prices: Float64Array,
     priceCount: number,
@@ -35,6 +78,7 @@ interface NativeCuda {
     gridSize: number,
     minimumExposure: number,
     maximumExposure: number,
+    maximumEffectiveExposure: number,
     temperature: number,
     friction: number,
     opportunityEpsilon: number,
@@ -59,12 +103,13 @@ interface NativeCuda {
     volume: Float64Array,
     oracleCodes: Uint8Array,
     valueMeans: Float32Array | null,
-    valueOptimalExposures: Float32Array | null,
     valueSecondMoments: Float32Array | null,
+    valueOptimalExposures: Float32Array | null,
     valueEntropies: Float32Array | null,
     valueWeights: Float32Array | null,
     valueOpportunities: Float32Array | null,
     strategyTemperatures: Float32Array | null,
+    strategyQuadraticVolatilities: Float32Array | null,
     candleCount: number,
     scoreStart: number,
     intervalMs: number,
@@ -78,8 +123,11 @@ interface NativeCuda {
     valueGridSize: number,
     valueGridMinimum: number,
     valueGridMaximum: number,
+    maximumEffectiveExposure: number,
+    strategyQuadraticScale: number,
     parameters: Buffer,
     candidateCount: number,
+    fitnessOnly: number,
     output: Buffer,
   ): number;
 }
@@ -91,11 +139,15 @@ export interface VwKamaCudaBatchOptions {
   matchWindowMs: number;
   timingHalfLifeMs: number;
   warmupMultiple: number;
+  fitnessOnly?: boolean;
   valueDistillation?: {
     oracle: ExposureValueOracle;
     strategyTemperature: number;
+    strategyQuadraticScale: number;
+    strategyQuadraticVolatilityMs: number;
     strategyVolatilityScaling: boolean;
     strategyTemperatures?: Float32Array;
+    strategyQuadraticVolatilities?: Float32Array;
   };
 }
 
@@ -130,6 +182,13 @@ export interface VwKamaCudaStatus {
   libraryPath: string;
 }
 
+export interface VwKamaCudaFitnessBatchCase {
+  candles: VwKamaCandleColumns;
+  options: VwKamaCudaBatchOptions & {
+    valueDistillation: NonNullable<VwKamaCudaBatchOptions["valueDistillation"]>;
+  };
+}
+
 export interface ExposureValueOracleCudaResult {
   oracle: ExposureValueOracle;
   kernelMs: number;
@@ -137,6 +196,15 @@ export interface ExposureValueOracleCudaResult {
 
 let loaded: NativeCuda | null | undefined;
 let loadFailure: string | undefined;
+let nextObjectId = 1;
+const objectIds = new WeakMap<object, number>();
+const fitnessCaseCache = new Map<string, CachedFitnessCase>();
+let fitnessCaseCacheBytes = 0;
+
+interface CachedFitnessCase {
+  handle: CudaHandle;
+  deviceBytes: number;
+}
 
 export async function vwKamaCudaStatus(): Promise<VwKamaCudaStatus> {
   const libraryPath = cudaLibraryPath();
@@ -185,6 +253,14 @@ export async function evaluateVwKamaCudaBatch(
   )) {
     throw new Error("VW-KAMA CUDA value oracle does not cover the candle columns.");
   }
+  const strategyQuadraticVolatilities = valueDistillation
+    ? valueDistillation.strategyQuadraticVolatilities ?? strategyExposureVolatilities(
+      candles.close,
+      Math.max(1, Math.round(
+        valueDistillation.strategyQuadraticVolatilityMs / options.intervalMs,
+      )),
+    )
+    : null;
   const strategyTemperatures = valueDistillation
     ? valueDistillation.strategyTemperatures ?? strategyExposureTemperatures(candles.close, {
       intervalMs: options.intervalMs,
@@ -193,8 +269,10 @@ export async function evaluateVwKamaCudaBatch(
       scaleByVolatility: valueDistillation.strategyVolatilityScaling,
     })
     : null;
-  if (strategyTemperatures && strategyTemperatures.length < candles.length) {
-    throw new Error("VW-KAMA CUDA strategy temperatures do not cover the candle columns.");
+  if ((strategyTemperatures && strategyTemperatures.length < candles.length)
+    || (strategyQuadraticVolatilities
+      && strategyQuadraticVolatilities.length < candles.length)) {
+    throw new Error("VW-KAMA CUDA strategy calibration does not cover the candle columns.");
   }
   const native = await loadNative();
   const parameterBuffer = Buffer.alloc(candidates.length * PARAMETER_SIZE);
@@ -202,6 +280,39 @@ export async function evaluateVwKamaCudaBatch(
     writeParameters(parameterBuffer, index * PARAMETER_SIZE, candidates[index]!, options);
   }
   const output = Buffer.alloc(candidates.length * RESULT_SIZE);
+  if (options.fitnessOnly && valueDistillation && strategyTemperatures) {
+    const includeHighLow = candidates.some(candidateNeedsDmi);
+    const cacheKey = fitnessCaseKey(
+      candles,
+      valueDistillation.oracle,
+      options,
+      includeHighLow,
+      valueDistillation.strategyTemperatures,
+      valueDistillation.strategyQuadraticVolatilities,
+    );
+    const testCase = getOrCreateFitnessCase(
+      native,
+      cacheKey,
+      candles,
+      valueDistillation.oracle,
+      strategyTemperatures,
+      strategyQuadraticVolatilities!,
+      options,
+      includeHighLow,
+    );
+    const status = native.evaluateFitnessCase(
+      testCase.handle,
+      parameterBuffer,
+      candidates.length,
+      output,
+    );
+    if (status !== 0) throw new Error(`VW-KAMA resident CUDA evaluation failed: ${native.lastError()}`);
+    refreshFitnessCaseBytes(native, cacheKey, testCase);
+    return Array.from(
+      { length: candidates.length },
+      (_, index) => readResult(output, index * RESULT_SIZE),
+    );
+  }
   const status = native.evaluate(
     candles.closeTime,
     candles.high,
@@ -210,12 +321,13 @@ export async function evaluateVwKamaCudaBatch(
     candles.volume,
     oracle.stateCodes,
     valueDistillation?.oracle.means ?? null,
-    valueDistillation?.oracle.optimalExposures ?? null,
     valueDistillation?.oracle.secondMoments ?? null,
-    valueDistillation?.oracle.entropies ?? null,
+    options.fitnessOnly ? null : valueDistillation?.oracle.optimalExposures ?? null,
+    options.fitnessOnly ? null : valueDistillation?.oracle.entropies ?? null,
     valueDistillation?.oracle.weights ?? null,
-    valueDistillation?.oracle.opportunities ?? null,
+    options.fitnessOnly ? null : valueDistillation?.oracle.opportunities ?? null,
     strategyTemperatures,
+    strategyQuadraticVolatilities,
     candles.length,
     options.scoreStartIndex,
     options.intervalMs,
@@ -229,12 +341,112 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.grid.length ?? 0,
     valueDistillation?.oracle.grid[0] ?? 0,
     valueDistillation?.oracle.grid[valueDistillation.oracle.grid.length - 1] ?? 0,
+    valueDistillation?.oracle.execution.maxEffectiveExposure ?? 250,
+    valueDistillation?.strategyQuadraticScale ?? 0,
     parameterBuffer,
     candidates.length,
+    options.fitnessOnly ? 1 : 0,
     output,
   );
   if (status !== 0) throw new Error(`VW-KAMA CUDA evaluation failed: ${native.lastError()}`);
   return Array.from({ length: candidates.length }, (_, index) => readResult(output, index * RESULT_SIZE));
+}
+
+export async function evaluateVwKamaCudaFitnessCases(
+  cases: readonly VwKamaCudaFitnessBatchCase[],
+  candidates: readonly VwKamaParameters[],
+): Promise<VwKamaCudaCaseResult[][]> {
+  if (cases.length === 0 || candidates.length === 0) return cases.map(() => []);
+  const native = await loadNative();
+  const handles = new BigUint64Array(cases.length);
+  const caseKeys: string[] = [];
+  const cachedCases: CachedFitnessCase[] = [];
+  const parameterBuffer = Buffer.alloc(cases.length * candidates.length * PARAMETER_SIZE);
+  const includeHighLow = candidates.some(candidateNeedsDmi);
+  const scheduledKeys = new Set<string>();
+  for (let caseIndex = 0; caseIndex < cases.length; caseIndex += 1) {
+    const request = cases[caseIndex]!;
+    const { candles, options } = request;
+    const distillation = options.valueDistillation;
+    const quadraticVolatilities = distillation.strategyQuadraticVolatilities
+      ?? strategyExposureVolatilities(
+        candles.close,
+        Math.max(1, Math.round(
+          distillation.strategyQuadraticVolatilityMs / options.intervalMs,
+        )),
+      );
+    const temperatures = distillation.strategyTemperatures ?? strategyExposureTemperatures(
+      candles.close,
+      {
+        intervalMs: options.intervalMs,
+        horizonSteps: distillation.oracle.horizonSteps,
+        temperature: distillation.strategyTemperature,
+        scaleByVolatility: distillation.strategyVolatilityScaling,
+      },
+    );
+    if (
+      distillation.oracle.means.length < candles.length
+      || distillation.oracle.secondMoments.length < candles.length
+      || distillation.oracle.weights.length < candles.length
+      || temperatures.length < candles.length
+      || quadraticVolatilities.length < candles.length
+    ) {
+      throw new Error(`VW-KAMA CUDA fitness case ${caseIndex} does not cover its candle columns.`);
+    }
+    const key = fitnessCaseKey(
+      candles,
+      distillation.oracle,
+      options,
+      includeHighLow,
+      distillation.strategyTemperatures,
+      distillation.strategyQuadraticVolatilities,
+    );
+    if (scheduledKeys.has(key)) {
+      throw new Error("VW-KAMA CUDA fitness cases must be distinct within one scheduled batch.");
+    }
+    scheduledKeys.add(key);
+    const cached = getOrCreateFitnessCase(
+      native,
+      key,
+      candles,
+      distillation.oracle,
+      temperatures,
+      quadraticVolatilities,
+      options,
+      includeHighLow,
+    );
+    handles[caseIndex] = BigInt(cached.handle);
+    caseKeys.push(key);
+    cachedCases.push(cached);
+    for (let candidate = 0; candidate < candidates.length; candidate += 1) {
+      writeParameters(
+        parameterBuffer,
+        (caseIndex * candidates.length + candidate) * PARAMETER_SIZE,
+        candidates[candidate]!,
+        options,
+      );
+    }
+  }
+  const output = Buffer.alloc(cases.length * candidates.length * RESULT_SIZE);
+  const status = native.evaluateFitnessCases(
+    handles,
+    cases.length,
+    parameterBuffer,
+    candidates.length,
+    output,
+  );
+  if (status !== 0) throw new Error(`VW-KAMA CUDA fitness scheduler failed: ${native.lastError()}`);
+  for (let index = 0; index < cachedCases.length; index += 1) {
+    refreshFitnessCaseBytes(native, caseKeys[index]!, cachedCases[index]!, false);
+  }
+  admitFitnessCaseBytes(native, 0);
+  return cases.map((_, caseIndex) => Array.from(
+    { length: candidates.length },
+    (_, candidate) => readResult(
+      output,
+      (caseIndex * candidates.length + candidate) * RESULT_SIZE,
+    ),
+  ));
 }
 
 export async function prepareExposureValueOracleCuda(
@@ -257,6 +469,7 @@ export async function prepareExposureValueOracleCuda(
     options.gridSize,
     oracle.execution.minExposure,
     oracle.execution.maxExposure,
+    oracle.execution.maxEffectiveExposure,
     options.temperature,
     oracle.execution.friction,
     Math.max(0, options.opportunityEpsilon ?? 1e-6),
@@ -301,17 +514,32 @@ async function loadNative(): Promise<NativeCuda> {
       lastError: library.func("str vw_kama_cuda_last_error()"),
       parameterSize: library.func("int vw_kama_cuda_params_size()"),
       resultSize: library.func("int vw_kama_cuda_result_size()"),
+      createFitnessCase: library.func("vw_kama_cuda_create_fitness_case", "uint64_t", [
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        "int", "int", "double", "int", "double", "double", "double", "double",
+        "int", "double", "double", "double", "double", "int", pointer,
+      ]),
+      evaluateFitnessCase: library.func(
+        "int vw_kama_cuda_evaluate_fitness_case(uint64_t, void*, int, void*)",
+      ),
+      evaluateFitnessCases: library.func(
+        "int vw_kama_cuda_evaluate_fitness_cases(void*, int, void*, int, void*)",
+      ),
+      fitnessCaseDeviceBytes: library.func(
+        "double vw_kama_cuda_fitness_case_device_bytes(uint64_t)",
+      ),
+      destroyFitnessCase: library.func("int vw_kama_cuda_destroy_fitness_case(uint64_t)"),
       prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle", "int", [
         pointer, "int", "int", "int", "int",
-        "double", "double", "double", "double", "double", "double", "double", "double",
+        "double", "double", "double", "double", "double", "double", "double", "double", "double",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
       ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         "int", "int", "double", "int", "double", "double", "double", "double", "double", "double",
-        "int", "double", "double",
-        pointer, "int", pointer,
+        "int", "double", "double", "double", "double",
+        pointer, "int", "int", pointer,
       ]),
     };
     if (native.parameterSize() !== PARAMETER_SIZE || native.resultSize() !== RESULT_SIZE) {
@@ -324,6 +552,136 @@ async function loadNative(): Promise<NativeCuda> {
     loadFailure = error instanceof Error ? error.message : String(error);
     throw error;
   }
+}
+
+export async function clearVwKamaCudaFitnessCaseCache(): Promise<void> {
+  if (fitnessCaseCache.size === 0) return;
+  const native = await loadNative();
+  for (const testCase of fitnessCaseCache.values()) {
+    native.destroyFitnessCase(testCase.handle);
+  }
+  fitnessCaseCache.clear();
+  fitnessCaseCacheBytes = 0;
+}
+
+function getOrCreateFitnessCase(
+  native: NativeCuda,
+  key: string,
+  candles: VwKamaCandleColumns,
+  oracle: ExposureValueOracle,
+  strategyTemperatures: Float32Array,
+  strategyQuadraticVolatilities: Float32Array,
+  options: VwKamaCudaBatchOptions,
+  includeHighLow: boolean,
+): CachedFitnessCase {
+  const cached = fitnessCaseCache.get(key);
+  if (cached) {
+    fitnessCaseCache.delete(key);
+    fitnessCaseCache.set(key, cached);
+    return cached;
+  }
+  const estimatedBytes = candles.length * (includeHighLow ? 9 : 7) * Float32Array.BYTES_PER_ELEMENT;
+  admitFitnessCaseBytes(native, estimatedBytes);
+  const residentBytes = new Float64Array(1);
+  const handle = native.createFitnessCase(
+    includeHighLow ? candles.high : null,
+    includeHighLow ? candles.low : null,
+    candles.close,
+    candles.volume,
+    oracle.means,
+    oracle.secondMoments,
+    oracle.weights,
+    strategyTemperatures,
+    strategyQuadraticVolatilities,
+    candles.length,
+    options.scoreStartIndex,
+    options.intervalMs,
+    oracle.horizonSteps,
+    options.oracleFriction,
+    oracle.execution.quoteLendRate,
+    oracle.execution.quoteBorrowRate,
+    oracle.execution.assetBorrowRate,
+    oracle.grid.length,
+    oracle.grid[0]!,
+    oracle.grid[oracle.grid.length - 1]!,
+    oracle.execution.maxEffectiveExposure,
+    options.valueDistillation?.strategyQuadraticScale ?? 0,
+    includeHighLow ? 1 : 0,
+    residentBytes,
+  );
+  if (Number(handle) === 0) throw new Error(`Failed to create resident CUDA fitness case: ${native.lastError()}`);
+  const result = { handle, deviceBytes: residentBytes[0]! };
+  fitnessCaseCache.set(key, result);
+  fitnessCaseCacheBytes += result.deviceBytes;
+  return result;
+}
+
+function refreshFitnessCaseBytes(
+  native: NativeCuda,
+  key: string,
+  testCase: CachedFitnessCase,
+  evict = true,
+): void {
+  const bytes = native.fitnessCaseDeviceBytes(testCase.handle);
+  fitnessCaseCacheBytes += bytes - testCase.deviceBytes;
+  testCase.deviceBytes = bytes;
+  fitnessCaseCache.delete(key);
+  fitnessCaseCache.set(key, testCase);
+  if (evict) admitFitnessCaseBytes(native, 0, key);
+}
+
+function admitFitnessCaseBytes(native: NativeCuda, incomingBytes: number, retainedKey?: string): void {
+  const budget = fitnessCaseBudgetBytes();
+  for (const [key, testCase] of fitnessCaseCache) {
+    if (fitnessCaseCacheBytes + incomingBytes <= budget) break;
+    if (key === retainedKey) continue;
+    native.destroyFitnessCase(testCase.handle);
+    fitnessCaseCache.delete(key);
+    fitnessCaseCacheBytes -= testCase.deviceBytes;
+  }
+}
+
+function fitnessCaseBudgetBytes(): number {
+  const configured = Number(process.env.VW_KAMA_CUDA_CASE_CACHE_BYTES ?? 1_500_000_000);
+  return Number.isFinite(configured) && configured > 0 ? configured : 1_500_000_000;
+}
+
+function fitnessCaseKey(
+  candles: VwKamaCandleColumns,
+  oracle: ExposureValueOracle,
+  options: VwKamaCudaBatchOptions,
+  includeHighLow: boolean,
+  strategyTemperatures?: Float32Array,
+  strategyQuadraticVolatilities?: Float32Array,
+): string {
+  return [
+    objectId(candles),
+    objectId(oracle),
+    strategyTemperatures ? objectId(strategyTemperatures) : "generated",
+    strategyQuadraticVolatilities
+      ? objectId(strategyQuadraticVolatilities)
+      : "generated",
+    options.scoreStartIndex,
+    options.intervalMs,
+    oracle.horizonSteps,
+    includeHighLow ? 1 : 0,
+    options.valueDistillation?.strategyTemperature,
+    options.valueDistillation?.strategyQuadraticScale,
+    options.valueDistillation?.strategyQuadraticVolatilityMs,
+    options.valueDistillation?.strategyVolatilityScaling ? 1 : 0,
+  ].join(":");
+}
+
+function objectId(value: object): number {
+  const existing = objectIds.get(value);
+  if (existing !== undefined) return existing;
+  const created = nextObjectId++;
+  objectIds.set(value, created);
+  return created;
+}
+
+function candidateNeedsDmi(candidate: VwKamaParameters): boolean {
+  return (candidate.confirmationMix ?? 0) > 0 && (candidate.confirmationDmiWeight ?? 0) > 0;
 }
 
 function cudaLibraryPath(): string {

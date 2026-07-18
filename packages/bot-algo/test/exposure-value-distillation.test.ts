@@ -9,10 +9,14 @@ import {
   observeExposureReturn,
   observeExposureValueDistillation,
   prepareExposureValueOracle,
+  quadraticExponentialLogNormalizer,
   rebalanceEquityFactor,
   shareExposureValueOracle,
   strategyExposureProbabilities,
+  strategyExposureQuadraticCoefficient,
   strategyExposureTemperatures,
+  strategyExposureVolatilities,
+  truncatedExponentialLogNormalizer,
 } from "../src/exposure-value-distillation.js";
 import {
   prepareExposureValueOracleCuda,
@@ -64,6 +68,28 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
     assert.deepEqual(gpu.modalExposures, cpu.modalExposures);
     assert.deepEqual(gpu.optimalExposures, cpu.optimalExposures);
   }
+
+  const leveragedOptions = {
+    scoreStartIndex: 300,
+    horizonSteps: 5,
+    friction: 0.00175,
+    gridSize: 21,
+    minExposure: -100,
+    maxExposure: 100,
+    maxEffectiveExposure: 250,
+    temperature: 0.01,
+  };
+  const leveragedCpu = prepareExposureValueOracle(prices, leveragedOptions);
+  const { oracle: leveragedGpu } = await prepareExposureValueOracleCuda(prices, leveragedOptions);
+  let maximumMeanError = 0;
+  for (let index = 300; index < prices.length; index += 1) {
+    maximumMeanError = Math.max(
+      maximumMeanError,
+      Math.abs(leveragedCpu.means[index]! - leveragedGpu.means[index]!),
+    );
+  }
+  assert.ok(maximumMeanError < 2e-3, `leveraged mean drifted by ${maximumMeanError}`);
+  assert.deepEqual(leveragedGpu.optimalExposures, leveragedCpu.optimalExposures);
 });
 
 test("exposure value oracle prefers the sign of the next price move", () => {
@@ -183,6 +209,70 @@ test("distillation loss rewards a signed-rate exponential biased toward the orac
   assert.ok(alignedMetrics.score > opposedMetrics.score);
 });
 
+test("truncated exponential partition matches explicit log-sum-exp", () => {
+  for (const gridSize of [3, 21, 101, 1_024]) {
+    for (const slope of [0, 1e-12, -1e-12, 0.7, -4.2, 1_000, -1_000]) {
+      const minimum = -1.5;
+      const maximum = 2;
+      const values = Array.from({ length: gridSize }, (_, index) =>
+        slope * (minimum + index / (gridSize - 1) * (maximum - minimum)));
+      const peak = Math.max(...values);
+      const expected = peak + Math.log(values.reduce(
+        (sum, value) => sum + Math.exp(value - peak),
+        0,
+      ));
+      const actual = truncatedExponentialLogNormalizer(gridSize, minimum, maximum, slope);
+      assert.ok(Math.abs(actual - expected) < 1e-10, {
+        gridSize,
+        slope,
+        expected,
+        actual,
+      });
+    }
+  }
+});
+
+test("quadratic exponential partition and probabilities match explicit log-sum-exp", () => {
+  const minimum = -3;
+  const maximum = 5;
+  for (const gridSize of [3, 21, 101]) {
+    for (const linear of [-4, 0, 2.5]) {
+      for (const quadratic of [-2, -0.01, 0, 0.03, 1.5]) {
+        const values = Array.from({ length: gridSize }, (_, index) => {
+          const exposure = minimum + index / (gridSize - 1) * (maximum - minimum);
+          return linear * exposure + quadratic * exposure * exposure;
+        });
+        const peak = Math.max(...values);
+        const expected = peak + Math.log(values.reduce(
+          (sum, value) => sum + Math.exp(value - peak),
+          0,
+        ));
+        const actual = quadraticExponentialLogNormalizer(
+          gridSize,
+          minimum,
+          maximum,
+          linear,
+          quadratic,
+        );
+        assert.ok(Math.abs(actual - expected) < 1e-10, {
+          gridSize,
+          linear,
+          quadratic,
+          expected,
+          actual,
+        });
+      }
+    }
+  }
+
+  const grid = new Float64Array([-2, -1, 0, 1, 2]);
+  const concave = strategyExposureProbabilities(grid, 0, 3_600_000, 1, -1);
+  const convex = strategyExposureProbabilities(grid, 0, 3_600_000, 1, 1);
+  assert.ok(concave[2]! > concave[0]!);
+  assert.ok(convex[0]! > convex[2]!);
+  assert.ok(Math.abs(convex[0]! - convex.at(-1)!) < 1e-12);
+});
+
 test("rebalance factor follows the exact buy and sell fee equations", () => {
   const fee = 0.01;
   assert.ok(Math.abs(
@@ -234,7 +324,7 @@ test("signed rate selects the side and lower temperature increases concentration
   assert.ok(colder.at(-1)! > positive.at(-1)!);
 });
 
-test("strategy temperature scales with sqrt(H / dt) and optional trailing-H volatility", () => {
+test("strategy calibration uses trailing-H log-return volatility", () => {
   const hourly = strategyExposureTemperatures([100, 101], {
     intervalMs: 3_600_000,
     horizonSteps: 1,
@@ -254,7 +344,20 @@ test("strategy temperature scales with sqrt(H / dt) and optional trailing-H vola
     temperature: 0.01,
     scaleByVolatility: true,
   });
-  assert.ok(Math.abs(exact[2]! - 0.01 * Math.sqrt(2) * 0.1) < 1e-8);
+  const firstReturn = Math.log(1.1);
+  const secondReturn = Math.log(0.9);
+  const expectedVolatility = Math.abs(firstReturn - secondReturn) / 2;
+  assert.ok(Math.abs(exact[2]! - 0.01 * Math.sqrt(2) * expectedVolatility) < 1e-8);
+
+  const volatilities = strategyExposureVolatilities([100, 110, 99], 2);
+  assert.ok(Math.abs(volatilities[2]! - expectedVolatility) < 1e-8);
+  const quadraticScale = 250;
+  assert.ok(Math.abs(
+    strategyExposureQuadraticCoefficient(quadraticScale, volatilities[2]!)
+      + quadraticScale * volatilities[2]! * volatilities[2]!,
+  ) < 1e-12);
+  assert.equal(strategyExposureQuadraticCoefficient(quadraticScale, volatilities[0]!), 0);
+  assert.throws(() => strategyExposureQuadraticCoefficient(-1, expectedVolatility));
 
   const prices = (amplitude: number): number[] => Array.from({ length: 20 }, (_, index) =>
     100 * Math.exp((index % 2 === 0 ? -1 : 1) * amplitude));
@@ -279,6 +382,7 @@ test("return measurement starts flat and marks the requested exposure", () => {
     friction: 0,
     minExposure: -1,
     maxExposure: 1,
+    maxEffectiveExposure: 250,
     quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
@@ -288,4 +392,24 @@ test("return measurement starts flat and marks the requested exposure", () => {
   assert.ok(Math.abs(metrics.totalReturn - 0.1) < 1e-12);
   assert.equal(metrics.rebalanceCount, 1);
   assert.equal(metrics.turnover, 1);
+});
+
+test("tradable exposure may drift beyond its target bound up to the effective limit", () => {
+  const execution = {
+    friction: 0.00175,
+    minExposure: -100,
+    maxExposure: 100,
+    maxEffectiveExposure: 250,
+    quoteLendRate: 0,
+    quoteBorrowRate: 0,
+    assetBorrowRate: 0,
+  };
+  const returns = createExposureReturnAccumulator();
+  observeExposureReturn(returns, 100, 100, 99.9, execution);
+  assert.equal(returns.liquidationCount, 0);
+  assert.ok(returns.exposure > 100 && returns.exposure < 250);
+
+  observeExposureReturn(returns, 100, 100, 99.5, execution);
+  assert.equal(returns.liquidationCount, 1);
+  assert.equal(returns.exposure, 0);
 });

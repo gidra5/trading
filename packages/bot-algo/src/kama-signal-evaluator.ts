@@ -36,7 +36,9 @@ import {
   observeExposureReturn,
   observeExposureValueDistillation,
   strategyExposureProbabilities,
+  strategyExposureQuadraticCoefficient,
   strategyExposureTemperatures,
+  strategyExposureVolatilities,
   type ExposureReturnMetrics,
   type ExposureValueDistillationMetrics,
   type ExposureValueOracle,
@@ -47,13 +49,13 @@ const DAY_MS = 86_400_000;
 const F1_WEIGHT = 0.2;
 const AGREEMENT_WEIGHT = 0.6;
 const CLEANLINESS_WEIGHT = 0.2;
-export const VW_KAMA_SCORE_VERSION = 6;
+export const VW_KAMA_SCORE_VERSION = 8;
 
 export type VwKamaDeadbandMode = "flat" | "hold" | "hysteresis";
 export type VwKamaAgreementMode = "sizing" | "confidence";
 export type VwKamaRateMode = "relative" | "log";
 export type VwKamaThresholdResponse = "proportional" | "inverse";
-export type VwKamaValueHorizonMode = "fixed" | "oracle-average-trade";
+export type VwKamaValueHorizonMode = "fixed" | "oracle-half-average-trade";
 
 export interface VwKamaParameters {
   efficiencyMs: number;
@@ -208,10 +210,13 @@ export interface VwKamaValueDistillationConfig {
   gridSize: number;
   minExposure: number;
   maxExposure: number;
+  maxEffectiveExposure: number;
   horizonMode: VwKamaValueHorizonMode;
   horizonMs: number;
   oracleTemperature: number;
   strategyTemperature: number;
+  strategyQuadraticScale: number;
+  strategyQuadraticVolatilityMs: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
   quoteLendRate: number;
@@ -365,6 +370,9 @@ export interface VwKamaValueDistributionPoint {
   strategyMeanExposure: number;
   strategyRateBpsHour: number;
   strategyTemperature: number;
+  strategyQuadraticVolatility: number;
+  strategyQuadraticScale: number;
+  strategyQuadraticCoefficient: number;
   oracleEntropy: number;
   opportunity: number;
   crossEntropy: number;
@@ -414,8 +422,11 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
   valueDistillation?: {
     oracle: ExposureValueOracle;
     strategyTemperature: number;
+    strategyQuadraticScale: number;
+    strategyQuadraticVolatilityMs: number;
     strategyVolatilityScaling: boolean;
     strategyTemperatures?: Float32Array;
+    strategyQuadraticVolatilities?: Float32Array;
   };
 }
 
@@ -507,7 +518,7 @@ export function averageVwKamaOracleTradeIntervalMs(
   return intervalCount > 0 ? intervalSum / intervalCount : null;
 }
 
-/** Resolves fixed H or the oracle's average inter-trade interval to candle steps. */
+/** Resolves fixed H or half the oracle's average inter-trade interval to candle steps. */
 export function resolveVwKamaValueHorizonSteps(
   candles: VwKamaCandleSeries,
   scoreStartIndex: number,
@@ -515,10 +526,11 @@ export function resolveVwKamaValueHorizonSteps(
   intervalMs: number,
   config: Pick<VwKamaValueDistillationConfig, "horizonMode" | "horizonMs">,
 ): number {
-  const average = config.horizonMode === "oracle-average-trade"
+  const average = config.horizonMode === "oracle-half-average-trade"
     ? averageVwKamaOracleTradeIntervalMs(candles, scoreStartIndex, stateCodes)
     : null;
-  return Math.max(1, Math.round((average ?? config.horizonMs) / intervalMs));
+  const horizonMs = average === null ? config.horizonMs : average * 0.5;
+  return Math.max(1, Math.round(horizonMs / intervalMs));
 }
 
 export type VwKamaEvaluation = Omit<
@@ -719,9 +731,20 @@ export function evaluateVwKamaOracle(
         strategy: createExposureReturnAccumulator(),
       }
     : null;
+  const valuePrices = options.valueDistillation
+    ? isCandleColumns(candles) ? candles.close : candles.map((item) => item.close)
+    : null;
+  const strategyQuadraticVolatilities = options.valueDistillation
+    ? options.valueDistillation.strategyQuadraticVolatilities ?? strategyExposureVolatilities(
+      valuePrices!,
+      Math.max(1, Math.round(
+        options.valueDistillation.strategyQuadraticVolatilityMs / options.intervalMs,
+      )),
+    )
+    : null;
   const strategyTemperatures = options.valueDistillation
     ? options.valueDistillation.strategyTemperatures ?? strategyExposureTemperatures(
-      isCandleColumns(candles) ? candles.close : candles.map((item) => item.close),
+      valuePrices!,
       {
         intervalMs: options.intervalMs,
         horizonSteps: options.valueDistillation.oracle.horizonSteps,
@@ -730,8 +753,10 @@ export function evaluateVwKamaOracle(
       },
     )
     : null;
-  if (strategyTemperatures && strategyTemperatures.length < candles.length) {
-    throw new Error("VW-KAMA strategy temperatures do not cover the candle series.");
+  if ((strategyTemperatures && strategyTemperatures.length < candles.length)
+    || (strategyQuadraticVolatilities
+      && strategyQuadraticVolatilities.length < candles.length)) {
+    throw new Error("VW-KAMA strategy calibration does not cover the candle series.");
   }
   const signalFriction = options.oracleFriction
     * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
@@ -912,6 +937,10 @@ export function evaluateVwKamaOracle(
         exposureFromCode(oracleStateCodes[index] ?? 0),
       );
       if (valueDistillation && options.valueDistillation) {
+        const quadraticCoefficient = strategyExposureQuadraticCoefficient(
+          options.valueDistillation.strategyQuadraticScale,
+          strategyQuadraticVolatilities![index]!,
+        );
         observeExposureValueDistillation(
           valueDistillation,
           options.valueDistillation.oracle,
@@ -919,6 +948,7 @@ export function evaluateVwKamaOracle(
           rate,
           options.intervalMs,
           strategyTemperatures![index]!,
+          quadraticCoefficient,
         );
         if (valueReturns && index + 1 < candles.length) {
           const price = closeAt(candles, index);
@@ -996,6 +1026,8 @@ export function evaluateVwKamaOracle(
           options.intervalMs,
           options.valueDistillation.oracle,
           strategyTemperatures![index]!,
+          options.valueDistillation.strategyQuadraticScale,
+          strategyQuadraticVolatilities![index]!,
         ));
       }
       if (points.at(-1)?.time !== candle.closeTime) points.push(statePoint(candle, current, current));
@@ -1107,13 +1139,20 @@ function valueDistributionPoint(
   intervalMs: number,
   oracle: ExposureValueOracle,
   strategyTemperature: number,
+  strategyQuadraticScale: number,
+  strategyQuadraticVolatility: number,
 ): VwKamaValueDistributionPoint {
+  const strategyQuadraticCoefficient = strategyExposureQuadraticCoefficient(
+    strategyQuadraticScale,
+    strategyQuadraticVolatility,
+  );
   const oracleProbabilities = exposureValueOracleProbabilities(oracle, candleIndex);
   const strategyProbabilities = strategyExposureProbabilities(
     oracle.grid,
     rateBpsPerHour,
     intervalMs * oracle.horizonSteps,
     strategyTemperature,
+    strategyQuadraticCoefficient,
   );
   let strategyMeanExposure = 0;
   let crossEntropy = 0;
@@ -1135,6 +1174,9 @@ function valueDistributionPoint(
     strategyMeanExposure,
     strategyRateBpsHour: rateBpsPerHour,
     strategyTemperature,
+    strategyQuadraticVolatility,
+    strategyQuadraticScale,
+    strategyQuadraticCoefficient,
     oracleEntropy: oracle.entropies[candleIndex]!,
     opportunity: oracle.opportunities[candleIndex]!,
     crossEntropy,
