@@ -44,19 +44,20 @@ scored candle-grid cells, otherwise CPU avoids one-request startup overhead. The
 native CUDA grid limit and the UI maximum are both 1,024 grid points.
 
 The repeatable benchmark is `npm run benchmark:kama:value:cuda`. On the RTX 3060 Laptop test
-device, 20,000 candles × grid 101 × `H=300` improved from 4.85s to about 0.37s on CPU and from
-5.01s to about 0.14s of CUDA kernel time. For 384 mixed-feature candidates, fitness-only
-evaluation is about 63ms versus 246ms for full diagnostics; scheduling four resident cases takes
-about 80ms versus 280ms serially. CPU/CUDA parity tests cover retained probabilities, policy,
-cross-entropy, returns, and scheduled fitness.
+device, the exact untouched-hold recurrence for 20,000 candles × grid 101 × `H=300` takes about
+11.69s on CPU and 2.41s of CUDA wall time (1.92s in CUDA kernels), a 4.9× wall-time speedup. For
+384 mixed-feature candidates, fitness-only evaluation takes about 174ms versus 364ms for full
+diagnostics; scheduling four resident cases takes about 177ms versus 661ms serially. CPU/CUDA
+parity tests cover retained probabilities, policy, drifted exposure paths, cross-entropy, returns,
+and scheduled fitness.
 
 ## Oracle value
 
-For every scored time `t` and grid exposure `a`, the oracle computes `Q_t(a)`: force exposure
-`a` for holding period `H`, then follow the optimal policy until final-equity time
-`T = min(t + valueHorizon, segmentEnd)`. The target exposure remains exactly `a` throughout `H`,
-so price drift is corrected by intermediate rebalances using the same friction model. The finite
-Bellman continuation runs from `t + H` through `T`.
+For every scored time `t` and grid exposure `a`, the oracle computes `Q_t(a)`: rebalance to
+`a` once, leave the resulting portfolio untouched for holding period `H`, then follow the optimal
+policy until final-equity time `T = min(t + valueHorizon, segmentEnd)`. Exposure drifts naturally
+throughout `H`; maintenance is applied but no target-restoring trades occur. At `t + H`, the
+Bellman continuation compares grid rebalances with keeping the exact drifted exposure unchanged.
 
 `--value-holding-period-mode fixed` uses `--value-holding-period` directly and defaults to one
 candle (`1s` is one step at every supported scale). With

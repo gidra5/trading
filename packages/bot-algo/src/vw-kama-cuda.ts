@@ -94,14 +94,18 @@ interface NativeCuda {
     quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
+    initialExposure: number,
+    terminalIndex: number,
     means: Float32Array,
     secondMoments: Float32Array,
     modalExposures: Float32Array,
-    optimalExposures: Float32Array,
     entropies: Float32Array,
     weights: Float32Array,
     opportunities: Float32Array,
     probabilities: Float32Array | null,
+    pathExposures: Float32Array,
+    pathEquities: Float64Array,
+    pathMetrics: Float64Array,
     elapsedMs: Float64Array,
   ): number;
   evaluate(
@@ -274,7 +278,7 @@ export async function evaluateVwKamaCudaBatch(
     : null;
   if (valueDistillation && (
     valueDistillation.oracle.means.length < candles.length
-    || valueDistillation.oracle.optimalExposures.length < candles.length
+    || valueDistillation.oracle.path.exposures.length < candles.length
     || valueDistillation.oracle.secondMoments.length < candles.length
     || valueDistillation.oracle.entropies.length < candles.length
     || valueDistillation.oracle.weights.length < candles.length
@@ -348,7 +352,10 @@ export async function evaluateVwKamaCudaBatch(
     refreshFitnessCaseBytes(native, cacheKey, testCase);
     return Array.from(
       { length: candidates.length },
-      (_, index) => readResult(output, index * RESULT_SIZE),
+      (_, index) => withCoherentOracleReturn(
+        readResult(output, index * RESULT_SIZE),
+        valueDistillation.oracle,
+      ),
     );
   }
   const status = native.evaluate(
@@ -360,7 +367,7 @@ export async function evaluateVwKamaCudaBatch(
     oracle.stateCodes,
     valueDistillation?.oracle.means ?? null,
     valueDistillation?.oracle.secondMoments ?? null,
-    options.fitnessOnly ? null : valueDistillation?.oracle.optimalExposures ?? null,
+    options.fitnessOnly ? null : valueDistillation?.oracle.path.exposures ?? null,
     lossEnabled || !options.fitnessOnly ? valueDistillation?.oracle.entropies ?? null : null,
     valueDistillation?.oracle.weights ?? null,
     options.fitnessOnly ? null : valueDistillation?.oracle.opportunities ?? null,
@@ -393,7 +400,13 @@ export async function evaluateVwKamaCudaBatch(
     output,
   );
   if (status !== 0) throw new Error(`VW-KAMA CUDA evaluation failed: ${native.lastError()}`);
-  return Array.from({ length: candidates.length }, (_, index) => readResult(output, index * RESULT_SIZE));
+  return Array.from(
+    { length: candidates.length },
+    (_, index) => withCoherentOracleReturn(
+      readResult(output, index * RESULT_SIZE),
+      valueDistillation?.oracle,
+    ),
+  );
 }
 
 export async function evaluateVwKamaCudaFitnessCases(
@@ -495,13 +508,26 @@ export async function evaluateVwKamaCudaFitnessCases(
     refreshFitnessCaseBytes(native, caseKeys[index]!, cachedCases[index]!, false);
   }
   admitFitnessCaseBytes(native, 0);
-  return cases.map((_, caseIndex) => Array.from(
+  return cases.map((testCase, caseIndex) => Array.from(
     { length: candidates.length },
-    (_, candidate) => readResult(
-      output,
-      (caseIndex * candidates.length + candidate) * RESULT_SIZE,
+    (_, candidate) => withCoherentOracleReturn(
+      readResult(output, (caseIndex * candidates.length + candidate) * RESULT_SIZE),
+      testCase.options.valueDistillation.oracle,
     ),
   ));
+}
+
+function withCoherentOracleReturn(
+  result: VwKamaCudaCaseResult,
+  oracle?: ExposureValueOracle,
+): VwKamaCudaCaseResult {
+  if (!oracle) return result;
+  return {
+    ...result,
+    oracleFinalEquity: Math.exp(oracle.path.logReturn),
+    oracleMaxDrawdown: oracle.path.maxDrawdown,
+    oracleTurnover: oracle.path.turnover,
+  };
 }
 
 export async function prepareExposureValueOracleCuda(
@@ -516,6 +542,8 @@ export async function prepareExposureValueOracleCuda(
   const source = prices instanceof Float64Array ? prices : Float64Array.from(prices);
   const oracle = createExposureValueOracleStorage(source, options, false);
   const elapsedMs = new Float64Array(1);
+  const pathMetrics = new Float64Array(5);
+  const terminalIndex = options.terminalIndex ?? source.length - 1;
   const status = native.prepareValueOracle(
     source,
     source.length,
@@ -532,18 +560,40 @@ export async function prepareExposureValueOracleCuda(
     oracle.execution.quoteLendRate,
     oracle.execution.quoteBorrowRate,
     oracle.execution.assetBorrowRate,
+    options.initialExposure ?? 0,
+    terminalIndex,
     oracle.means,
     oracle.secondMoments,
     oracle.modalExposures,
-    oracle.optimalExposures,
     oracle.entropies,
     oracle.weights,
     oracle.opportunities,
     oracle.probabilities ?? null,
+    oracle.path.exposures,
+    oracle.path.equities,
+    pathMetrics,
     elapsedMs,
   );
   if (status !== 0) {
     throw new Error(`Exposure-value CUDA oracle failed: ${native.lastError()}`);
+  }
+  oracle.path = {
+    startIndex: options.scoreStartIndex,
+    terminalIndex,
+    initialExposure: options.initialExposure ?? 0,
+    terminalExposure: 0,
+    logReturn: pathMetrics[0]!,
+    totalReturn: Math.expm1(pathMetrics[0]!),
+    exposures: oracle.path.exposures,
+    equities: oracle.path.equities,
+    maxDrawdown: pathMetrics[1]!,
+    turnover: pathMetrics[2]!,
+    rebalanceCount: pathMetrics[3]!,
+    liquidationCount: pathMetrics[4]!,
+  };
+  if (!Number.isFinite(oracle.path.logReturn)
+    || ((options.initialExposure ?? 0) === 0 && oracle.path.totalReturn < -1e-10)) {
+    throw new Error("CUDA exposure-value Q0 violated the cash-baseline invariant.");
   }
   return {
     oracle: shared ? shareExposureValueOracle(oracle) : oracle,
@@ -590,7 +640,9 @@ async function loadNative(): Promise<NativeCuda> {
       prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle", "int", [
         pointer, "int", "int", "int", "int", "int",
         "double", "double", "double", "double", "double", "double", "double", "double", "double",
-        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        "double", "int",
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer,
       ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,

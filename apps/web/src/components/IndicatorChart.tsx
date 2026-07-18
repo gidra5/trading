@@ -40,6 +40,16 @@ export interface IndicatorChartSeries {
   suffix?: string;
 }
 
+interface IndicatorLaneLayout {
+  visible: IndicatorChartPoint[];
+  visibleOverlays: IndicatorChartOverlay[];
+  minimum: number;
+  maximum: number;
+  top: number;
+  bottom: number;
+  yFor: (value: number) => number;
+}
+
 interface IndicatorChartProps {
   series: IndicatorChartSeries[];
   events?: IndicatorChartEvent[];
@@ -80,6 +90,13 @@ export function IndicatorChart(props: IndicatorChartProps) {
     const duration = Math.max(1, props.end - props.start);
     const xFor = (time: number) => CANDLE_CHART_PLOT_LEFT
       + (time - props.start) / duration * (right - CANDLE_CHART_PLOT_LEFT);
+    const laneLayouts = props.series.map((series, lane) => indicatorLaneLayout(
+      series,
+      props.start,
+      props.end,
+      lane * laneHeight + 6,
+      lane * laneHeight + laneHeight - 6,
+    ));
 
     context.strokeStyle = "#242833";
     context.lineWidth = 1;
@@ -94,36 +111,7 @@ export function IndicatorChart(props: IndicatorChartProps) {
 
     props.series.forEach((series, lane) => {
       const laneTop = lane * laneHeight;
-      const top = laneTop + 6;
-      const bottom = laneTop + laneHeight - 6;
-      const visible = series.points.filter((point) =>
-        point.time >= props.start && point.time < props.end && Number.isFinite(point.value));
-      const visibleOverlays = (series.overlays ?? []).map((overlay) => ({
-        ...overlay,
-        points: overlay.points.filter((point) =>
-          point.time >= props.start && point.time < props.end && Number.isFinite(point.value)),
-      }));
-      const values = [
-        ...visible.map((point) => point.value),
-        ...visibleOverlays.flatMap((overlay) => overlay.points.map((point) => point.value)),
-      ];
-      let minimum = series.minimum ?? Math.min(...values, 0);
-      let maximum = series.maximum ?? Math.max(...values, 1);
-      if (series.symmetric) {
-        const magnitude = Math.max(Math.abs(minimum), Math.abs(maximum), Number.EPSILON);
-        minimum = -magnitude;
-        maximum = magnitude;
-      }
-      if (!(maximum > minimum)) {
-        const padding = Math.max(1, Math.abs(maximum) * 0.05);
-        minimum -= padding;
-        maximum += padding;
-      } else if (series.minimum === undefined || series.maximum === undefined) {
-        const padding = (maximum - minimum) * 0.08;
-        if (series.minimum === undefined) minimum -= padding;
-        if (series.maximum === undefined) maximum += padding;
-      }
-      const yFor = (value: number) => top + (maximum - value) / (maximum - minimum) * (bottom - top);
+      const { top, bottom, visible, visibleOverlays, minimum, maximum, yFor } = laneLayouts[lane]!;
 
       if (lane > 0) {
         context.strokeStyle = "#2b303b";
@@ -224,6 +212,37 @@ export function IndicatorChart(props: IndicatorChartProps) {
         const lane = props.series.findIndex((series) => series.id === nearest.seriesId);
         if (lane >= 0) drawEventTooltip(context, x, lane * laneHeight + 24, right, nearest.label);
       }
+      props.series.forEach((series, lane) => {
+        const layout = laneLayouts[lane]!;
+        const values = [
+          { label: series.label, color: series.color, point: nearestPoint(layout.visible, cursorTime) },
+          ...layout.visibleOverlays.map((overlay) => ({
+            label: overlay.label,
+            color: overlay.color,
+            point: nearestPoint(overlay.points, cursorTime),
+          })),
+        ].filter((entry): entry is { label: string; color: string; point: IndicatorChartPoint } =>
+          entry.point !== undefined);
+        for (const entry of values) {
+          context.fillStyle = entry.color;
+          context.beginPath();
+          context.arc(x, layout.yFor(entry.point.value), 3, 0, Math.PI * 2);
+          context.fill();
+        }
+        if (values.length > 0) {
+          drawValueTooltip(
+            context,
+            x,
+            lane * laneHeight + 22,
+            right,
+            values.map((entry) => ({
+              label: entry.label,
+              color: entry.color,
+              value: formatIndicator(entry.point.value, series),
+            })),
+          );
+        }
+      });
       context.restore();
     }
   };
@@ -286,7 +305,8 @@ export function IndicatorChart(props: IndicatorChartProps) {
     const fraction = Math.max(0, Math.min(1,
       (event.clientX - bounds.left - CANDLE_CHART_PLOT_LEFT)
         / Math.max(1, right - CANDLE_CHART_PLOT_LEFT)));
-    const time = props.start + fraction * Math.max(1, props.end - props.start);
+    const rawTime = props.start + fraction * Math.max(1, props.end - props.start);
+    const time = nearestSeriesTime(props.series, rawTime, props.start, props.end) ?? rawTime;
     setInternalCursorTime(time);
     props.onCursorTimeChange?.(time);
   };
@@ -315,6 +335,85 @@ export function IndicatorChart(props: IndicatorChartProps) {
       onWheel={handleWheel}
     />
   );
+}
+
+function indicatorLaneLayout(
+  series: IndicatorChartSeries,
+  start: number,
+  end: number,
+  top: number,
+  bottom: number,
+): IndicatorLaneLayout {
+  const visible = series.points.filter((point) =>
+    point.time >= start && point.time < end && Number.isFinite(point.value));
+  const visibleOverlays = (series.overlays ?? []).map((overlay) => ({
+    ...overlay,
+    points: overlay.points.filter((point) =>
+      point.time >= start && point.time < end && Number.isFinite(point.value)),
+  }));
+  const values = [
+    ...visible.map((point) => point.value),
+    ...visibleOverlays.flatMap((overlay) => overlay.points.map((point) => point.value)),
+  ];
+  let minimum = series.minimum ?? Math.min(...values, 0);
+  let maximum = series.maximum ?? Math.max(...values, 1);
+  if (series.symmetric) {
+    const magnitude = Math.max(Math.abs(minimum), Math.abs(maximum), Number.EPSILON);
+    minimum = -magnitude;
+    maximum = magnitude;
+  }
+  if (!(maximum > minimum)) {
+    const padding = Math.max(1, Math.abs(maximum) * 0.05);
+    minimum -= padding;
+    maximum += padding;
+  } else if (series.minimum === undefined || series.maximum === undefined) {
+    const padding = (maximum - minimum) * 0.08;
+    if (series.minimum === undefined) minimum -= padding;
+    if (series.maximum === undefined) maximum += padding;
+  }
+  return {
+    visible,
+    visibleOverlays,
+    minimum,
+    maximum,
+    top,
+    bottom,
+    yFor: (value: number) => top + (maximum - value) / (maximum - minimum) * (bottom - top),
+  };
+}
+
+function nearestPoint(
+  points: IndicatorChartPoint[],
+  time: number,
+): IndicatorChartPoint | undefined {
+  if (points.length === 0) return undefined;
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.time < time) low = middle + 1;
+    else high = middle;
+  }
+  const right = points[Math.min(points.length - 1, low)]!;
+  const left = points[Math.max(0, low - 1)]!;
+  return Math.abs(left.time - time) <= Math.abs(right.time - time) ? left : right;
+}
+
+function nearestSeriesTime(
+  series: IndicatorChartSeries[],
+  time: number,
+  start: number,
+  end: number,
+): number | undefined {
+  let nearest: IndicatorChartPoint | undefined;
+  for (const item of series) {
+    for (const points of [item.points, ...(item.overlays ?? []).map((overlay) => overlay.points)]) {
+      const point = nearestPoint(points, time);
+      if (!point || point.time < start || point.time >= end) continue;
+      if (!nearest || Math.abs(point.time - time) < Math.abs(nearest.time - time)) nearest = point;
+    }
+  }
+  return nearest?.time;
 }
 
 function drawSeriesLine(
@@ -379,6 +478,36 @@ function drawEventTooltip(
   context.textAlign = "left";
   context.textBaseline = "middle";
   context.fillText(label, left + 7, y + 11, width - 14);
+}
+
+function drawValueTooltip(
+  context: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  right: number,
+  values: Array<{ label: string; color: string; value: string }>,
+): void {
+  context.font = "11px Inter, sans-serif";
+  const lineHeight = 17;
+  const width = Math.min(360, Math.max(...values.map((item) =>
+    context.measureText(`${item.label}: ${item.value}`).width), 0) + 18);
+  const height = values.length * lineHeight + 8;
+  const left = x + 10 + width <= right
+    ? x + 10
+    : Math.max(CANDLE_CHART_PLOT_LEFT, x - width - 10);
+  context.fillStyle = "rgba(22, 25, 32, 0.94)";
+  context.fillRect(left, y, width, height);
+  values.forEach((item, index) => {
+    context.fillStyle = item.color;
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.fillText(
+      `${item.label}: ${item.value}`,
+      left + 9,
+      y + 5 + lineHeight * index + lineHeight / 2,
+      width - 18,
+    );
+  });
 }
 
 function nearestEvent(

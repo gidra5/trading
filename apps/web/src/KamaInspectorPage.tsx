@@ -17,6 +17,7 @@ import type {
   VwKamaTransition,
   VwKamaValueDistillationConfig,
   VwKamaValueDistributionPoint,
+  VwKamaValueOraclePathPoint,
 } from "@trading/bot-algo";
 import {
   CandleChart,
@@ -37,13 +38,15 @@ const detailDebounceMs = 120;
 const detailMaxCandles = 5_000;
 const detailTriggerCandles = detailMaxCandles * 4;
 const defaultValueDistillation: VwKamaValueDistillationConfig = {
-  gridSize: 150,
+  gridSize: 151,
   minExposure: -100,
   maxExposure: 100,
   maxEffectiveExposure: 250,
+  initialExposure: 0,
   holdingPeriodMode: "fixed",
   holdingPeriodMs: 1_000,
-  valueHorizonMs: 1_000,
+  valueHorizonMode: "full-window",
+  valueHorizonMs: 3 * 86_400_000,
   horizonEndMode: "truncate",
   oracleTemperature: 0.01,
   strategyVolatilityScaling: false,
@@ -189,10 +192,10 @@ const metricHelp = {
   entropyGap: "Opportunity-weighted squared excess of strategy entropy over oracle entropy, normalized by the grid's maximum entropy.",
   stateMutualInformation: "Normalized Gaussian variance-decomposition estimate of how much the strategy exposure distribution changes across market states. Higher is more state-responsive.",
   oracleMutualInformation: "Normalized dependence between soft oracle and strategy exposure distributions. Approximate mode uses distribution moments; precise mode computes categorical MI over the configured exposure bins.",
-  valueHoldingPeriod: "Resolved H for which each candidate exposure is forced. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
+  valueHoldingPeriod: "Resolved H between oracle decisions. An action rebalances once, then quote and asset quantities remain untouched while exposure drifts until the next decision. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
   valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
-  oracleReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the executable hindsight Bellman policy and the same friction.",
+  oracleReturn: "exp(Q₀(initial exposure))−1 for one full-window Bellman policy after the mandatory terminal rebalance to zero, including friction and maintenance.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
 } as const;
 
@@ -268,7 +271,20 @@ export function KamaInspectorPage() {
       + metrics.signalCleanliness * weights.cleanliness;
   };
   const candles = createMemo(() => result()?.candles ?? []);
-  const oracle = createMemo(() => result()?.oracle ?? emptyOracle);
+  const chartCandles = createMemo(() => mergeDetailCandles(candles(), detail(), result()));
+  const valueOraclePath = createMemo(() => {
+    const analysis = result();
+    return mergeDetailValueOraclePath(
+      analysis?.valueOraclePath ?? [],
+      detail(),
+      analysis,
+    );
+  });
+  const oracle = createMemo(() => exposurePathOracle(
+    valueOraclePath(),
+    chartCandles(),
+    oracleFriction(),
+  ));
   const candidatePoints = createMemo(() => result()?.candidatePath.points ?? []);
   const candidateStatePoints = createMemo(() => {
     const analysis = result();
@@ -389,6 +405,29 @@ export function KamaInspectorPage() {
       })] : []),
     ];
   });
+  const valueOracleSeries = createMemo<IndicatorChartSeries[]>(() => {
+    const path = valueOraclePath();
+    if (path.length === 0) return [];
+    return [
+      {
+        id: "value-oracle-exposure",
+        label: "Full-window optimal exposure",
+        color: "#22d3ee",
+        points: path.map((point) => ({ time: point.time, value: point.exposure })),
+        symmetric: true,
+        references: [{ value: 0 }],
+        decimals: 3,
+      },
+      {
+        id: "value-oracle-equity",
+        label: "Full-window oracle equity",
+        color: "#22c55e",
+        points: path.map((point) => ({ time: point.time, value: point.equity })),
+        minimum: 0,
+        decimals: 4,
+      },
+    ];
+  });
   const rejectionEvents = createMemo<IndicatorChartEvent[]>(() =>
     diagnosticVisibility().kamaRate ? signalRejectionEvents(indicatorPoints()) : []);
   const activeDiagnosticCount = createMemo(() =>
@@ -436,7 +475,6 @@ export function KamaInspectorPage() {
     timeRange(),
     Math.min(timeRange().end - timeRange().start, Math.max(2, result()?.intervalMs ?? intervalMs()) * 2),
   ));
-  const chartCandles = createMemo(() => mergeDetailCandles(candles(), detail(), result()));
   const chartViewport = createMemo(() => candleViewport(chartCandles(), visibleTimeRange()));
   const chartResolution = createMemo(() => visibleResolution(
     candles(),
@@ -1197,8 +1235,13 @@ export function KamaInspectorPage() {
               />
               <InspectorSelect label="Holding-period source" value={valueConfig().holdingPeriodMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMode: value as VwKamaValueDistillationConfig["holdingPeriodMode"] }))} />
               <DurationInput label={valueConfig().holdingPeriodMode === "fixed" ? "Holding period H" : "Fallback holding period H"} value={valueConfig().holdingPeriodMs} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMs: value, valueHorizonMs: Math.max(current.valueHorizonMs, value) }))} />
-              <DurationInput label="Value horizon T−t" value={valueConfig().valueHorizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMs: Math.max(value, current.holdingPeriodMs) }))} />
-              <InspectorSelect label="Horizon at window end" value={valueConfig().horizonEndMode} options={[{ value: "truncate", label: "Truncate at window end" }, { value: "extend", label: "Use future candles" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonEndMode: value as VwKamaValueDistillationConfig["horizonEndMode"] }))} />
+              <InspectorSelect label="Value horizon" value={valueConfig().valueHorizonMode ?? "full-window"} options={[{ value: "full-window", label: "Full selected window" }, { value: "fixed", label: "Fixed duration" }]} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMode: value as "full-window" | "fixed" }))} />
+              <Show when={valueConfig().valueHorizonMode === "fixed"}>
+                <DurationInput label="Fixed value horizon T−t" value={valueConfig().valueHorizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMs: Math.max(value, current.holdingPeriodMs) }))} />
+              </Show>
+              <Show when={valueConfig().valueHorizonMode === "fixed"}>
+                <InspectorSelect label="Horizon at window end" value={valueConfig().horizonEndMode} options={[{ value: "truncate", label: "Truncate at window end" }, { value: "extend", label: "Use future candles" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonEndMode: value as VwKamaValueDistillationConfig["horizonEndMode"] }))} />
+              </Show>
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
               <InspectorNumber label="Excess-entropy λ" value={valueConfig().entropyGapLambda} min={0} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, entropyGapLambda: value }))} />
               <InspectorNumber label="State MI λ" value={valueConfig().stateMutualInformationLambda} min={0} step={0.01} onInput={(value) => setValueConfig((current) => ({ ...current, stateMutualInformationLambda: value }))} />
@@ -1211,9 +1254,13 @@ export function KamaInspectorPage() {
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
               <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
+              <InspectorNumber label="Initial exposure" value={valueConfig().initialExposure} min={-valueConfig().maxEffectiveExposure} max={valueConfig().maxEffectiveExposure} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, initialExposure: value }))} />
+              <InspectorNumber label="Quote lend maintenance / hour" value={valueConfig().quoteLendRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, quoteLendRate: value }))} />
+              <InspectorNumber label="Quote borrow maintenance / hour" value={valueConfig().quoteBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, quoteBorrowRate: value }))} />
+              <InspectorNumber label="Asset borrow maintenance / hour" value={valueConfig().assetBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, assetBorrowRate: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              Oracle friction shapes both retrospective paths. H defaults to one candle and can be fixed or resolved per continuous segment as half the average interval between consecutive executable oracle trades; the fallback is used when fewer than two oracle transitions exist. Q holds each input exposure for H, including drift-correcting rebalances, before perfect-oracle continuation. Trades target only the configured exposure grid, while price and fee drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Loss terms with λ=0 are skipped. Precise oracle MI retains the soft oracle distribution and uses an additional binned GPU pass; approximate mode uses fused moment accumulators. Return paths start at equity 1 and exposure 0.
+                        The displayed oracle return is exp(Q₀(initial exposure))−1 for one coherent policy ending at the selected terminal candle, where exposure is forcibly closed to zero. T−t defaults to the full selected window; fixed duration remains available for rolling targets. H defaults to one candle and can be fixed or resolved per continuous segment as half the average interval between consecutive executable oracle trades. Each action rebalances once, then lets quote and asset quantities drift untouched for H candles while maintenance continues; at the next decision, keeping the exact drifted exposure is compared with every grid rebalance after friction. Price and maintenance drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Loss terms with λ=0 are skipped. Precise oracle MI retains the soft oracle distribution and uses an additional binned GPU pass; approximate mode uses fused moment accumulators.
             </div>
           </details>
         </section>
@@ -1257,11 +1304,16 @@ export function KamaInspectorPage() {
                       <ScoreCard label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
                       <ScoreCard label="Mixed exp(−KL)" value={ratioPercent(value().mixedScore)} description={metricHelp.mixedLoss} />
                       <ScoreCard label="Resolved holding H" value={formatDuration(value().holdingPeriodMs)} description={metricHelp.valueHoldingPeriod} />
-                      <ScoreCard label="Value horizon T−t" value={formatDuration(value().valueHorizonMs)} description={metricHelp.valueHorizon} />
+                      <ScoreCard
+                        label="Value horizon T−t"
+                        value={valueConfig().valueHorizonMode === "fixed"
+                          ? formatDuration(value().valueHorizonMs)
+                          : "Full selected window"}
+                        description={metricHelp.valueHorizon}
+                      />
                       <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
-                      <ScoreCard label="Oracle return" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
+                      <ScoreCard label="Oracle exp(Q₀)−1" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
                       <ScoreCard label="Strategy drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
-                      <ScoreCard label="Oracle drawdown" value={ratioPercent(value().returns.oracle.maxDrawdown)} description={metricHelp.drawdown} />
                     </>
                   )}
                 </Show>
@@ -1382,7 +1434,7 @@ export function KamaInspectorPage() {
                           <h3 class="text-sm font-semibold">Oracle and predicted exposure distributions</h3>
                         </div>
                         <div class="text-xs tabular-nums text-ink-300">
-                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / target {signedExposure(point().oracleOptimalExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
+                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
                         </div>
                       </div>
                       <ExposureDistributionChart point={point()} />
@@ -1402,6 +1454,24 @@ export function KamaInspectorPage() {
                       <IndicatorChart
                         series={diagnosticSeries()}
                         events={rejectionEvents()}
+                        start={visibleTimeRange().start}
+                        end={visibleTimeRange().end}
+                        cursorTime={cursorTime()}
+                        onCursorTimeChange={setCursorTime}
+                        onZoom={zoomViewport}
+                        onPan={panViewport}
+                      />
+                    </div>
+                  </div>
+                </Show>
+                <Show when={valueOracleSeries().length > 0}>
+                  <div class="mt-3">
+                    <div class="mb-1 text-xs text-ink-400">
+                      Full-window Bellman solution · this same exposure path drives the Oracle band above; green is timestamp-aligned marked equity after friction and maintenance; the last point is liquidated to zero exposure.
+                    </div>
+                    <div class="h-60">
+                      <IndicatorChart
+                        series={valueOracleSeries()}
                         start={visibleTimeRange().start}
                         end={visibleTimeRange().end}
                         cursorTime={cursorTime()}
@@ -1491,11 +1561,11 @@ function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint 
   return (
     <div>
       <div class="mb-2 flex flex-wrap gap-4 text-xs tabular-nums text-ink-300">
-        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mode <strong class="text-cyan-200">{signedExposure(props.point.oracleModalExposure)}</strong> · target <strong class="text-cyan-100">{signedExposure(props.point.oracleOptimalExposure)}</strong> · mean {signedExposure(props.point.oracleMeanExposure)}</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mode <strong class="text-cyan-200">{signedExposure(props.point.oracleModalExposure)}</strong> · path <strong class="text-cyan-100">{signedExposure(props.point.oraclePathExposure)}</strong> · mean {signedExposure(props.point.oracleMeanExposure)}</span>
         <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mode <strong class="text-violet-200">{signedExposure(strategyMode())}</strong> · target <strong class="text-violet-100">{signedExposure(props.point.candidateExposure)}</strong> · mean {signedExposure(props.point.strategyMeanExposure)}</span>
         <span>Oracle entropy {formatQuote(props.point.oracleEntropy, 4)}</span>
       </div>
-      <div class="relative h-52 border-b border-line" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and target ${signedExposure(props.point.oracleOptimalExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
+      <div class="relative h-52 border-b border-line" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and path ${signedExposure(props.point.oraclePathExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
         <div
           class="grid h-full items-end gap-0.5 px-1 pt-2"
           style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
@@ -1532,7 +1602,7 @@ function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint 
         <div class="pointer-events-none absolute inset-x-1 bottom-0 top-2" aria-hidden="true">
           <div
             class="absolute inset-y-0 -translate-x-px border-l-2 border-dashed border-cyan-100/90"
-            style={{ left: markerPosition(props.point.oracleOptimalExposure) }}
+            style={{ left: markerPosition(props.point.oraclePathExposure) }}
           />
           <div
             class="absolute inset-y-0 translate-x-px border-l-2 border-dashed border-violet-100/90"
@@ -2130,6 +2200,55 @@ function mergeDetailCandles(
   ].sort((left, right) => left.openTime - right.openTime);
 }
 
+function exposurePathOracle(
+  path: VwKamaValueOraclePathPoint[],
+  candles: Candle[],
+  friction: number,
+): BacktestOraclePath {
+  if (path.length === 0) return { ...emptyOracle, friction };
+  let previous: OracleState = "flat";
+  const points = path.map((point): BacktestOraclePoint => {
+    const state: OracleState = point.exposure > Number.EPSILON
+      ? "long"
+      : point.exposure < -Number.EPSILON ? "short" : "flat";
+    const candle = nearestCandle(candles, point.time);
+    const result = {
+      time: point.time,
+      price: candle?.close ?? 0,
+      fromState: previous,
+      state,
+      action: previous === state
+        ? "hold" as const
+        : previous === "flat"
+          ? "open" as const
+          : state === "flat" ? "close" as const : "switch" as const,
+    };
+    previous = state;
+    return result;
+  });
+  return {
+    mode: "fixed-notional",
+    eventMode: "close",
+    leverage: Math.max(...path.map((point) => Math.abs(point.exposure)), 0),
+    friction,
+    points,
+  };
+}
+
+function nearestCandle(candles: Candle[], time: number): Candle | undefined {
+  if (candles.length === 0) return undefined;
+  let low = 0;
+  let high = candles.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (candles[middle]!.closeTime < time) low = middle + 1;
+    else high = middle;
+  }
+  const right = candles[Math.min(candles.length - 1, low)]!;
+  const left = candles[Math.max(0, low - 1)]!;
+  return Math.abs(left.closeTime - time) <= Math.abs(right.closeTime - time) ? left : right;
+}
+
 function mergeDetailKamaSeries(
   overview: BacktestChartSmaSeries,
   detail: VwKamaCandleRangeResponse | undefined,
@@ -2180,6 +2299,23 @@ function mergeDetailValueDistributions(
   return [
     ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
     ...detail.valueDistributions.filter((point) =>
+      point.time >= replacement.start && point.time < replacement.end),
+  ].sort((left, right) => left.time - right.time);
+}
+
+function mergeDetailValueOraclePath(
+  overview: VwKamaValueOraclePathPoint[],
+  detail: VwKamaCandleRangeResponse | undefined,
+  analysis: VwKamaInspectorResponse | undefined,
+): VwKamaValueOraclePathPoint[] {
+  if (!detail?.valueOraclePath?.length || !analysis
+    || detail.windowId !== analysis.window.id
+    || detail.intervalMs !== analysis.intervalMs) return overview;
+  const replacement = detailReplacementRange(analysis.candles, detail.candles);
+  if (!replacement) return overview;
+  return [
+    ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
+    ...detail.valueOraclePath.filter((point) =>
       point.time >= replacement.start && point.time < replacement.end),
   ].sort((left, right) => left.time - right.time);
 }

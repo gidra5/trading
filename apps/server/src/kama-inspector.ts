@@ -41,6 +41,7 @@ const MAX_WARMUP_MS = 3 * DAY_MS;
 const MAX_CHART_CANDLES = 2_000;
 const MIN_RANGE_CANDLES = 100;
 const MAX_RANGE_CANDLES = 5_000;
+const MIN_CUDA_ORACLE_HOLDING_STEPS = 2;
 let cudaValueOracleFallbackReported = false;
 const SCALES = [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000]
   .map((intervalMs) => ({ label: duration(intervalMs), intervalMs }));
@@ -140,13 +141,15 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
   timingHalfLifeMs: 10 * 60_000,
   warmupMultiple: 3,
   valueDistillation: {
-    gridSize: 150,
+    gridSize: 151,
     minExposure: -100,
     maxExposure: 100,
     maxEffectiveExposure: 250,
+    initialExposure: 0,
     holdingPeriodMode: "fixed",
     holdingPeriodMs: 1_000,
-    valueHorizonMs: 1_000,
+    valueHorizonMode: "full-window",
+    valueHorizonMs: 3 * DAY_MS,
     horizonEndMode: "truncate",
     oracleTemperature: 0.01,
     strategyVolatilityScaling: false,
@@ -351,7 +354,8 @@ export class KamaInspectorEngine {
     const selected = WINDOWS.find((item) => item.id === request.windowId);
     if (!selected) throw new Error(`Unknown VW-KAMA window: ${request.windowId}`);
     validateWindowScale(selected, request.intervalMs);
-    const sourceEndTime = selected.endTime + (request.valueDistillation!.horizonEndMode === "extend"
+    const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
+      && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
       : 0);
     const cached = this.cachedWindow(selected, sourceEndTime);
@@ -407,7 +411,8 @@ export class KamaInspectorEngine {
 
   async candles(input: VwKamaCandleRangeRequest): Promise<VwKamaCandleRangeResponse> {
     const { request, selected } = normalizeCandleRangeRequest(input);
-    const sourceEndTime = selected.endTime + (request.valueDistillation!.horizonEndMode === "extend"
+    const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
+      && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
       : 0);
     const cached = this.cachedWindow(selected, sourceEndTime);
@@ -422,6 +427,7 @@ export class KamaInspectorEngine {
     const renderedTimes = rendered.candles.map((candle) => candle.closeTime);
     const indicatorPoints: VwKamaIndicatorPoint[] = [];
     const valueDistributions: VwKamaCandleRangeResponse["valueDistributions"] = [];
+    const valueOraclePath: VwKamaCandleRangeResponse["valueOraclePath"] = [];
     const warmupMs = candidateWarmupMs(request);
     for (const [index, segment] of segments.entries()) {
       const firstTime = segment[0]?.closeTime;
@@ -460,6 +466,7 @@ export class KamaInspectorEngine {
       });
       indicatorPoints.push(...evaluation.indicatorPoints);
       valueDistributions.push(...evaluation.valueDistributions);
+      valueOraclePath.push(...evaluation.valueOraclePath);
     }
     indicatorPoints.sort((left, right) => left.time - right.time);
     return {
@@ -479,6 +486,7 @@ export class KamaInspectorEngine {
       },
       indicatorPoints,
       valueDistributions: valueDistributions.sort((left, right) => left.time - right.time),
+      valueOraclePath: valueOraclePath.sort((left, right) => left.time - right.time),
     };
   }
 
@@ -550,11 +558,14 @@ export class KamaInspectorEngine {
       request.intervalMs,
       config,
     );
-    const valueHorizonSteps = Math.max(1, Math.round(config.valueHorizonMs / request.intervalMs));
+    const valueHorizonSteps = config.valueHorizonMode === "fixed"
+      ? Math.max(1, Math.round(config.valueHorizonMs / request.intervalMs))
+      : Math.max(1, scoreEndIndex - scoreStartIndex - 1);
     if (valueHorizonSteps < holdingPeriodSteps) {
       throw new Error("Resolved holding period exceeds the configured value horizon.");
     }
-    if (config.horizonEndMode === "extend" && candles.length - scoreEndIndex < valueHorizonSteps) {
+    if (config.valueHorizonMode === "fixed" && config.horizonEndMode === "extend"
+      && candles.length - scoreEndIndex < valueHorizonSteps) {
       throw new Error("Value horizon requires more continuous post-window candles.");
     }
     const key = [
@@ -567,9 +578,11 @@ export class KamaInspectorEngine {
       config.minExposure,
       config.maxExposure,
       config.maxEffectiveExposure,
+      config.initialExposure,
       config.holdingPeriodMode,
       config.holdingPeriodMs,
       holdingPeriodSteps,
+      config.valueHorizonMode,
       config.valueHorizonMs,
       valueHorizonSteps,
       config.horizonEndMode,
@@ -582,7 +595,7 @@ export class KamaInspectorEngine {
     const existing = cached.valueOracles.get(key);
     if (existing) return existing;
     const pending = Promise.resolve().then(async () => {
-      const valueCandles = config.horizonEndMode === "extend"
+      const valueCandles = config.valueHorizonMode === "fixed" && config.horizonEndMode === "extend"
         ? candles
         : candles.slice(0, scoreEndIndex);
       const prices = valueCandles.map((candle) => candle.close);
@@ -595,15 +608,21 @@ export class KamaInspectorEngine {
         minExposure: config.minExposure,
         maxExposure: config.maxExposure,
         maxEffectiveExposure: config.maxEffectiveExposure,
+        initialExposure: config.initialExposure,
+        terminalIndex: scoreEndIndex - 1,
         temperature: config.oracleTemperature,
         opportunityEpsilon: config.opportunityEpsilon,
-        quoteLendRate: config.quoteLendRate,
-        quoteBorrowRate: config.quoteBorrowRate,
-        assetBorrowRate: config.assetBorrowRate,
+        quoteLendRate: hourlyRatePerCandle(config.quoteLendRate, request.intervalMs),
+        quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, request.intervalMs),
+        assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, request.intervalMs),
         includeProbabilities: true,
       };
       const oracleCells = (candles.length - scoreStartIndex) * config.gridSize;
-      if (oracleCells >= 10_000_000 && config.gridSize <= 1_024) {
+      // The CUDA full-window reconstruction launches one residue chain per holding
+      // step. H=1 therefore under-utilizes the device badly; the checkpointed CPU
+      // scan is both faster and numerically more stable for this common default.
+      if (holdingPeriodSteps >= MIN_CUDA_ORACLE_HOLDING_STEPS
+        && oracleCells >= 10_000_000 && config.gridSize <= 1_024) {
         const status = await vwKamaCudaStatus();
         if (status.available) {
           try {
@@ -737,6 +756,7 @@ function combineEvaluations(
   const statePoints = results.flatMap((item) => item.statePoints);
   const indicatorPoints = results.flatMap((item) => item.indicatorPoints);
   const valueDistributions = results.flatMap((item) => item.valueDistributions);
+  const valueOraclePath = results.flatMap((item) => item.valueOraclePath);
   const rendered = renderCandleRange(
     continuousSegments(scored, request.intervalMs),
     request.intervalMs,
@@ -768,6 +788,7 @@ function combineEvaluations(
     statePoints,
     indicatorPoints,
     valueDistributions,
+    valueOraclePath,
     candidateTransitions,
     oracleTransitions,
   };
@@ -943,6 +964,10 @@ function combineExposureReturns(parts: ExposureReturnMetrics[]): ExposureReturnM
   };
 }
 
+function hourlyRatePerCandle(hourlyRate: number, intervalMs: number): number {
+  return Math.expm1(Math.log1p(hourlyRate) * intervalMs / 3_600_000);
+}
+
 function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest {
   if (!SCALES.some((item) => item.intervalMs === input.intervalMs)) {
     throw new Error(`Unsupported VW-KAMA scale: ${input.intervalMs}`);
@@ -1104,10 +1129,21 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     )) {
     throw new Error("VW-KAMA effective exposure must cover the tradable exposure range.");
   }
+  const zeroGridPosition = -valueConfig.minExposure
+    / (valueConfig.maxExposure - valueConfig.minExposure) * (valueConfig.gridSize - 1);
+  if (Math.abs(zeroGridPosition - Math.round(zeroGridPosition)) > 1e-9) {
+    throw new Error("VW-KAMA value grid must contain exact zero exposure.");
+  }
+  if (!Number.isFinite(valueConfig.initialExposure)
+    || Math.abs(valueConfig.initialExposure) > valueConfig.maxEffectiveExposure) {
+    throw new Error("VW-KAMA initial exposure exceeds the effective-exposure limit.");
+  }
   if (!["fixed", "oracle-half-average-trade"].includes(valueConfig.holdingPeriodMode)
     || !Number.isFinite(valueConfig.holdingPeriodMs) || valueConfig.holdingPeriodMs <= 0
+    || !["full-window", "fixed"].includes(valueConfig.valueHorizonMode ?? "full-window")
     || !Number.isFinite(valueConfig.valueHorizonMs)
-    || valueConfig.valueHorizonMs < valueConfig.holdingPeriodMs
+    || (valueConfig.valueHorizonMode === "fixed"
+      && valueConfig.valueHorizonMs < valueConfig.holdingPeriodMs)
     || !["truncate", "extend"].includes(valueConfig.horizonEndMode)
     || !Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
     || typeof valueConfig.strategyVolatilityScaling !== "boolean") {

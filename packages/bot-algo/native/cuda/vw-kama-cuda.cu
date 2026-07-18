@@ -776,7 +776,7 @@ __device__ __forceinline__ double normalized_gaussian_correlation_information(
   ));
 }
 
-__global__ void prepare_value_oracle_steps_kernel(
+__global__ void prepare_value_oracle_holds_kernel(
   const double* prices,
   int price_count,
   int score_start,
@@ -789,8 +789,7 @@ __global__ void prepare_value_oracle_steps_kernel(
   double quote_lend_rate,
   double quote_borrow_rate,
   double asset_borrow_rate,
-  double* first_values,
-  double* continued_values,
+  double* holding_values,
   double* endpoint_exposures
 ) {
   const size_t cell = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -806,31 +805,18 @@ __global__ void prepare_value_oracle_steps_kernel(
     maximum_exposure
   );
   if (time == price_count - 1) {
-    first_values[cell] = 0.0;
-    continued_values[cell] = 0.0;
+    holding_values[cell] = 0.0;
     endpoint_exposures[cell] = exposure;
     return;
   }
-  const OracleHoldingOutcome current_outcome = oracle_holding_outcome(
-    exposure,
-    prices[time],
-    prices[time + 1],
-    friction,
-    minimum_exposure,
-    maximum_exposure,
-    maximum_effective_exposure,
-    quote_lend_rate,
-    quote_borrow_rate,
-    asset_borrow_rate
-  );
-  first_values[cell] = current_outcome.equity_factor > 0.0
-    ? log(current_outcome.equity_factor)
-    : -INFINITY;
-  if (time > 0) {
-    const OracleHoldingOutcome previous_outcome = oracle_holding_outcome(
-      exposure,
-      prices[time - 1],
-      prices[time],
+  const int endpoint_time = min(price_count - 1, time + holding_period_steps);
+  double log_return = 0.0;
+  double current_exposure = exposure;
+  for (int move = time; move < endpoint_time; ++move) {
+    const OracleHoldingOutcome outcome = oracle_holding_outcome(
+      current_exposure,
+      prices[move],
+      prices[move + 1],
       friction,
       minimum_exposure,
       maximum_exposure,
@@ -839,82 +825,16 @@ __global__ void prepare_value_oracle_steps_kernel(
       quote_borrow_rate,
       asset_borrow_rate
     );
-    const double rebalance = oracle_rebalance_equity_factor(
-      previous_outcome.exposure,
-      exposure,
-      friction
-    );
-    continued_values[cell] = rebalance > 0.0 && current_outcome.equity_factor > 0.0
-      ? log(rebalance) + log(current_outcome.equity_factor)
-      : -INFINITY;
-  } else {
-    continued_values[cell] = 0.0;
+    if (!(outcome.equity_factor > 0.0)) {
+      log_return = -INFINITY;
+      current_exposure = 0.0;
+      break;
+    }
+    log_return += log(outcome.equity_factor);
+    current_exposure = outcome.exposure;
   }
-  const int endpoint_time = min(price_count - 1, time + holding_period_steps);
-  const OracleHoldingOutcome endpoint_outcome = oracle_holding_outcome(
-    exposure,
-    prices[endpoint_time - 1],
-    prices[endpoint_time],
-    friction,
-    minimum_exposure,
-    maximum_exposure,
-    maximum_effective_exposure,
-    quote_lend_rate,
-    quote_borrow_rate,
-    asset_borrow_rate
-  );
-  endpoint_exposures[cell] = endpoint_outcome.exposure;
-}
-
-__global__ void prefix_value_oracle_continuations_kernel(
-  int price_count,
-  int score_start,
-  int grid_size,
-  double* continued_values,
-  int32_t* invalid_prefix
-) {
-  const int exposure_index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (exposure_index >= grid_size) return;
-  double sum = 0.0;
-  int invalid_count = 0;
-  for (int time = score_start; time < price_count; ++time) {
-    const size_t index = static_cast<size_t>(time - score_start) * grid_size + exposure_index;
-    const double value = continued_values[index];
-    if (isfinite(value)) sum += value;
-    else ++invalid_count;
-    continued_values[index] = sum;
-    invalid_prefix[index] = invalid_count;
-  }
-}
-
-__global__ void finish_value_oracle_holds_kernel(
-  int price_count,
-  int score_start,
-  int holding_period_steps,
-  int grid_size,
-  double* first_values,
-  const double* continued_prefix,
-  const int32_t* invalid_prefix
-) {
-  const size_t cell = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int scored_count = price_count - score_start;
-  const size_t cell_count = static_cast<size_t>(scored_count) * grid_size;
-  if (cell >= cell_count) return;
-  const int exposure_index = cell % grid_size;
-  const int time = score_start + cell / grid_size;
-  if (time == price_count - 1) {
-    first_values[cell] = 0.0;
-    return;
-  }
-  const int endpoint_time = min(price_count - 1, time + holding_period_steps);
-  const size_t start_index = static_cast<size_t>(time - score_start) * grid_size
-    + exposure_index;
-  const size_t end_index = static_cast<size_t>(endpoint_time - 1 - score_start) * grid_size
-    + exposure_index;
-  const int invalid_count = invalid_prefix[end_index] - invalid_prefix[start_index];
-  first_values[cell] = invalid_count == 0 && isfinite(first_values[cell])
-    ? first_values[cell] + continued_prefix[end_index] - continued_prefix[start_index]
-    : -INFINITY;
+  holding_values[cell] = log_return;
+  endpoint_exposures[cell] = current_exposure;
 }
 
 __global__ void prepare_value_oracle_chains_kernel(
@@ -945,7 +865,8 @@ __global__ void prepare_value_oracle_chains_kernel(
   float* probabilities,
   bool finite_horizon,
   bool has_prior_continuation,
-  bool collect_statistics
+  bool collect_statistics,
+  bool terminal_closeout
 ) {
   const int exposure_index = threadIdx.x;
   const int first_time = finite_horizon
@@ -963,7 +884,16 @@ __global__ void prepare_value_oracle_chains_kernel(
     const size_t row = static_cast<size_t>(time - score_start) * grid_size;
     if (exposure_index < grid_size) {
       if (time == price_count - 1) {
-        forced_values[exposure_index] = 0.0;
+        const double exposure = oracle_grid_exposure(
+          exposure_index,
+          grid_size,
+          minimum_exposure,
+          maximum_exposure
+        );
+        const double closeout = oracle_rebalance_equity_factor(exposure, 0.0, friction);
+        forced_values[exposure_index] = terminal_closeout && closeout > 0.0
+          ? log(closeout)
+          : 0.0;
       } else {
         const int endpoint_time = min(price_count - 1, time + holding_period_steps);
         const size_t index = row + exposure_index;
@@ -1061,8 +991,12 @@ __global__ void prepare_value_oracle_chains_kernel(
 
     if (time == price_count - 1) {
       if (exposure_index < grid_size) {
-        continuations[row + exposure_index] = 0.0;
-        policy[row + exposure_index] = exposure_index;
+        continuations[row + exposure_index] = forced_values[exposure_index];
+        const double zero_position = -minimum_exposure
+          / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+        policy[row + exposure_index] = terminal_closeout
+          ? static_cast<uint16_t>(llround(zero_position))
+          : exposure_index;
       }
       synchronize_oracle_grid();
       continue;
@@ -1171,6 +1105,32 @@ __global__ void prepare_value_oracle_chains_kernel(
   }
 }
 
+__global__ void initialize_value_oracle_terminal_kernel(
+  int terminal_time,
+  int score_start,
+  int grid_size,
+  double minimum_exposure,
+  double maximum_exposure,
+  double friction,
+  double* continuations,
+  uint16_t* policy
+) {
+  const int exposure_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (exposure_index >= grid_size) return;
+  const double exposure = oracle_grid_exposure(
+    exposure_index,
+    grid_size,
+    minimum_exposure,
+    maximum_exposure
+  );
+  const double closeout = oracle_rebalance_equity_factor(exposure, 0.0, friction);
+  const size_t row = static_cast<size_t>(terminal_time - score_start) * grid_size;
+  continuations[row + exposure_index] = closeout > 0.0 ? log(closeout) : -INFINITY;
+  const double zero_position = -minimum_exposure
+    / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+  policy[row + exposure_index] = static_cast<uint16_t>(llround(zero_position));
+}
+
 __global__ void reconstruct_value_oracle_policy_kernel(
   const double* prices,
   int price_count,
@@ -1184,39 +1144,119 @@ __global__ void reconstruct_value_oracle_policy_kernel(
   double quote_lend_rate,
   double quote_borrow_rate,
   double asset_borrow_rate,
-  const uint16_t* policy,
-  float* optimal_exposures
+  double initial_exposure,
+  const double* holding_values,
+  const double* endpoint_exposures,
+  const double* continuations,
+  float* path_exposures,
+  double* path_equities,
+  double* path_metrics
 ) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  double current_exposure = 0.0;
-  double target = 0.0;
+  double current_exposure = initial_exposure;
+  double equity = 1.0;
+  double peak_equity = 1.0;
+  double maximum_drawdown = 0.0;
+  double turnover = 0.0;
+  double rebalance_count = 0.0;
+  double liquidation_count = 0.0;
   int remaining_hold_steps = 0;
-  for (int time = score_start; time < price_count; ++time) {
+  path_equities[score_start] = equity;
+  for (int time = score_start; time + 1 < price_count; ++time) {
     if (remaining_hold_steps == 0) {
-      const double raw_position = (current_exposure - minimum_exposure)
-        / (maximum_exposure - minimum_exposure) * (grid_size - 1);
-      const int current_index = static_cast<int>(llround(fmax(
-        0.0,
-        fmin(static_cast<double>(grid_size - 1), raw_position)
-      )));
-      target = oracle_grid_exposure(
-        policy[(time - score_start) * grid_size + current_index],
-        grid_size,
-        minimum_exposure,
-        maximum_exposure
-      );
+      const size_t row = static_cast<size_t>(time - score_start) * grid_size;
+      const int endpoint_time = min(price_count - 1, time + holding_period_steps);
+      const double* endpoint_continuation = continuations
+        + static_cast<size_t>(endpoint_time - score_start) * grid_size;
+      double no_trade_log_return = 0.0;
+      double no_trade_exposure = current_exposure;
+      for (int move = time; move < endpoint_time; ++move) {
+        const OracleHoldingOutcome outcome = oracle_holding_outcome(
+          no_trade_exposure,
+          prices[move],
+          prices[move + 1],
+          friction,
+          minimum_exposure,
+          maximum_exposure,
+          maximum_effective_exposure,
+          quote_lend_rate,
+          quote_borrow_rate,
+          asset_borrow_rate
+        );
+        if (!(outcome.equity_factor > 0.0)) {
+          no_trade_log_return = -INFINITY;
+          no_trade_exposure = 0.0;
+          break;
+        }
+        no_trade_log_return += log(outcome.equity_factor);
+        no_trade_exposure = outcome.exposure;
+      }
+      double best = isfinite(no_trade_log_return)
+        ? no_trade_log_return + oracle_interpolate(
+            endpoint_continuation,
+            grid_size,
+            minimum_exposure,
+            maximum_exposure,
+            no_trade_exposure
+          )
+        : -INFINITY;
+      double target = current_exposure;
+      for (int target_index = 0; target_index < grid_size; ++target_index) {
+        const size_t index = row + target_index;
+        if (!isfinite(holding_values[index])) continue;
+        const double candidate_target = oracle_grid_exposure(
+          target_index,
+          grid_size,
+          minimum_exposure,
+          maximum_exposure
+        );
+        const double rebalance = oracle_rebalance_equity_factor(
+          current_exposure,
+          candidate_target,
+          friction
+        );
+        if (!(rebalance > 0.0)) continue;
+        const double forced = holding_values[index] + oracle_interpolate(
+          endpoint_continuation,
+          grid_size,
+          minimum_exposure,
+          maximum_exposure,
+          endpoint_exposures[index]
+        );
+        const double value = log(rebalance) + forced;
+        if (value > best) {
+          best = value;
+          target = candidate_target;
+        }
+      }
+      const double exposure_change = fabs(target - current_exposure);
+      if (exposure_change > 2.220446049250313e-16) {
+        const double rebalance = oracle_rebalance_equity_factor(
+          current_exposure,
+          target,
+          friction
+        );
+        if (!(rebalance > 0.0)) {
+          equity = 0.0;
+          current_exposure = 0.0;
+          maximum_drawdown = 1.0;
+          path_equities[time + 1] = equity;
+          remaining_hold_steps = min(holding_period_steps, price_count - 1 - time) - 1;
+          continue;
+        }
+        equity *= rebalance;
+        current_exposure = target;
+        turnover += exposure_change;
+        rebalance_count += 1.0;
+        peak_equity = fmax(peak_equity, equity);
+        maximum_drawdown = fmax(maximum_drawdown, 1.0 - equity / peak_equity);
+      }
       remaining_hold_steps = min(holding_period_steps, price_count - 1 - time);
     }
-    optimal_exposures[time] = static_cast<float>(target);
-    if (time + 1 >= price_count) continue;
-    const double rebalance = oracle_rebalance_equity_factor(current_exposure, target, friction);
-    if (!(rebalance > 0.0)) {
-      current_exposure = 0.0;
-      --remaining_hold_steps;
-      continue;
-    }
-    current_exposure = oracle_holding_outcome(
-      target,
+    path_exposures[time] = static_cast<float>(current_exposure);
+    const double held_exposure = current_exposure;
+    const OracleHoldingOutcome outcome = oracle_holding_outcome(
+      held_exposure,
       prices[time],
       prices[time + 1],
       friction,
@@ -1226,9 +1266,37 @@ __global__ void reconstruct_value_oracle_policy_kernel(
       quote_lend_rate,
       quote_borrow_rate,
       asset_borrow_rate
-    ).exposure;
+    );
+    equity *= outcome.equity_factor;
+    current_exposure = outcome.exposure;
+    if (held_exposure != 0.0 && outcome.exposure == 0.0) liquidation_count += 1.0;
+    peak_equity = fmax(peak_equity, equity);
+    maximum_drawdown = fmax(
+      maximum_drawdown,
+      peak_equity > 0.0 ? 1.0 - equity / peak_equity : 1.0
+    );
+    path_equities[time + 1] = equity;
     --remaining_hold_steps;
   }
+  const int terminal = price_count - 1;
+  if (equity > 0.0 && fabs(current_exposure) > 2.220446049250313e-16) {
+    const double closeout = oracle_rebalance_equity_factor(current_exposure, 0.0, friction);
+    turnover += fabs(current_exposure);
+    rebalance_count += 1.0;
+    equity = closeout > 0.0 ? equity * closeout : 0.0;
+    peak_equity = fmax(peak_equity, equity);
+    maximum_drawdown = fmax(
+      maximum_drawdown,
+      peak_equity > 0.0 ? 1.0 - equity / peak_equity : 1.0
+    );
+  }
+  path_exposures[terminal] = 0.0f;
+  path_equities[terminal] = equity;
+  path_metrics[0] = equity > 0.0 ? log(equity) : -INFINITY;
+  path_metrics[1] = maximum_drawdown;
+  path_metrics[2] = turnover;
+  path_metrics[3] = rebalance_count;
+  path_metrics[4] = liquidation_count;
 }
 
 __device__ __forceinline__ int candidate_state(
@@ -2296,31 +2364,40 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
   double quote_lend_rate,
   double quote_borrow_rate,
   double asset_borrow_rate,
+  double initial_exposure,
+  int terminal_index,
   float* means,
   float* second_moments,
   float* modal_exposures,
-  float* optimal_exposures,
   float* entropies,
   float* weights,
   float* opportunities,
   float* probabilities,
+  float* path_exposures,
+  double* path_equities,
+  double* path_metrics,
   double* elapsed_ms
 ) {
   try {
-    if (!prices || !means || !second_moments || !modal_exposures || !optimal_exposures
-      || !entropies || !weights || !opportunities || !elapsed_ms) {
+    if (!prices || !means || !second_moments || !modal_exposures
+      || !entropies || !weights || !opportunities || !path_exposures
+      || !path_equities || !path_metrics
+      || !elapsed_ms) {
       throw std::runtime_error("Exposure-value CUDA oracle received a null pointer");
     }
     if (price_count < 2 || score_start < 0 || score_start >= price_count
       || holding_period_steps < 1 || value_horizon_steps < holding_period_steps
-      || grid_size < 3 || grid_size > 1024) {
+      || grid_size < 3 || grid_size > 1024 || terminal_index <= score_start
+      || terminal_index >= price_count) {
       throw std::runtime_error("Exposure-value CUDA oracle received invalid dimensions");
     }
     if (!(minimum_exposure < 0.0) || !(maximum_exposure > 0.0)
       || maximum_effective_exposure < fmax(fabs(minimum_exposure), fabs(maximum_exposure))
       || !(temperature > 0.0) || friction < 0.0 || friction >= 1.0
       || opportunity_epsilon < 0.0 || quote_lend_rate < 0.0
-      || quote_borrow_rate < 0.0 || asset_borrow_rate < 0.0) {
+      || quote_borrow_rate < 0.0 || asset_borrow_rate < 0.0
+      || !std::isfinite(initial_exposure)
+      || std::abs(initial_exposure) > maximum_effective_exposure) {
       throw std::runtime_error("Exposure-value CUDA oracle received invalid options");
     }
 
@@ -2333,15 +2410,13 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     size_t total_device_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_device_bytes, &total_device_bytes), "query oracle CUDA memory");
     const size_t required_cell_bytes = oracle_cells
-      * (5 * sizeof(double) + sizeof(int32_t) + sizeof(uint16_t));
+      * (4 * sizeof(double) + sizeof(uint16_t));
     if (required_cell_bytes > free_device_bytes * 4 / 5) {
       throw std::runtime_error("Exposure-value CUDA oracle grid exceeds the device-memory admission limit");
     }
     DeviceBuffer<double> continuations(oracle_cells);
     DeviceBuffer<double> alternate_continuations(oracle_cells);
     DeviceBuffer<double> holding_values(oracle_cells);
-    DeviceBuffer<double> continued_values(oracle_cells);
-    DeviceBuffer<int32_t> invalid_prefix(oracle_cells);
     DeviceBuffer<double> endpoint_exposures(oracle_cells);
     const bool separable_rebalance_costs = 1.0 - friction * maximum_exposure > 0.0
       && 1.0 - friction + friction * minimum_exposure > 0.0;
@@ -2355,13 +2430,15 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     DeviceBuffer<float> device_means(price_count);
     DeviceBuffer<float> device_second_moments(price_count);
     DeviceBuffer<float> device_modal_exposures(price_count);
-    DeviceBuffer<float> device_optimal_exposures(price_count);
     DeviceBuffer<float> device_entropies(price_count);
     DeviceBuffer<float> device_weights(price_count);
     DeviceBuffer<float> device_opportunities(price_count);
     DeviceBuffer<float> device_probabilities(
       probabilities ? static_cast<size_t>(price_count) * grid_size : 0
     );
+    DeviceBuffer<float> device_path_exposures(price_count);
+    DeviceBuffer<double> device_path_equities(price_count);
+    DeviceBuffer<double> device_path_metrics(5);
 
     cuda_check(cudaMemcpy(
       device_prices.get(),
@@ -2421,7 +2498,6 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     cuda_check(cudaMemset(device_means.get(), 0, price_count * sizeof(float)), "clear oracle means");
     cuda_check(cudaMemset(device_second_moments.get(), 0, price_count * sizeof(float)), "clear oracle second moments");
     cuda_check(cudaMemset(device_modal_exposures.get(), 0, price_count * sizeof(float)), "clear oracle modes");
-    cuda_check(cudaMemset(device_optimal_exposures.get(), 0, price_count * sizeof(float)), "clear oracle policy");
     cuda_check(cudaMemset(device_entropies.get(), 0, price_count * sizeof(float)), "clear oracle entropies");
     cuda_check(cudaMemset(device_weights.get(), 0, price_count * sizeof(float)), "clear oracle weights");
     cuda_check(cudaMemset(device_opportunities.get(), 0, price_count * sizeof(float)), "clear oracle opportunities");
@@ -2432,6 +2508,16 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         static_cast<size_t>(price_count) * grid_size * sizeof(float)
       ), "clear oracle probabilities");
     }
+    cuda_check(cudaMemset(
+      device_path_exposures.get(),
+      0,
+      price_count * sizeof(float)
+    ), "clear exposure-value path exposures");
+    cuda_check(cudaMemset(
+      device_path_equities.get(),
+      0,
+      price_count * sizeof(double)
+    ), "clear exposure-value path equities");
 
     cudaEvent_t start_event;
     cudaEvent_t stop_event;
@@ -2442,12 +2528,12 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     while (threads < grid_size) threads *= 2;
     const int hold_threads = 256;
     const int hold_blocks = static_cast<int>((oracle_cells + hold_threads - 1) / hold_threads);
-    const int prefix_threads = 128;
-    const int prefix_blocks = (grid_size + prefix_threads - 1) / prefix_threads;
-    auto prepare_holds = [&](int duration_steps) {
-      prepare_value_oracle_steps_kernel<<<hold_blocks, hold_threads>>>(
+    const int terminal_threads = 128;
+    const int terminal_blocks = (grid_size + terminal_threads - 1) / terminal_threads;
+    auto prepare_holds = [&](int active_price_count, int duration_steps) {
+      prepare_value_oracle_holds_kernel<<<hold_blocks, hold_threads>>>(
         device_prices.get(),
-        price_count,
+        active_price_count,
         score_start,
         duration_steps,
         grid_size,
@@ -2459,33 +2545,14 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         quote_borrow_rate,
         asset_borrow_rate,
         holding_values.get(),
-        continued_values.get(),
         endpoint_exposures.get()
       );
-      cuda_check(cudaGetLastError(), "launch exposure-value step precomputation kernel");
-      prefix_value_oracle_continuations_kernel<<<prefix_blocks, prefix_threads>>>(
-        price_count,
-        score_start,
-        grid_size,
-        continued_values.get(),
-        invalid_prefix.get()
-      );
-      cuda_check(cudaGetLastError(), "launch exposure-value continuation prefix kernel");
-      finish_value_oracle_holds_kernel<<<hold_blocks, hold_threads>>>(
-        price_count,
-        score_start,
-        duration_steps,
-        grid_size,
-        holding_values.get(),
-        continued_values.get(),
-        invalid_prefix.get()
-      );
-      cuda_check(cudaGetLastError(), "launch exposure-value hold assembly kernel");
+      cuda_check(cudaGetLastError(), "launch exposure-value hold precomputation kernel");
     };
     const size_t chain_storage_bytes = static_cast<size_t>(threads)
       * (3 * sizeof(double) + 2 * sizeof(uint16_t));
-    if (value_horizon_steps >= price_count - 1) {
-      prepare_holds(holding_period_steps);
+    if (value_horizon_steps >= price_count - 1 - score_start) {
+      prepare_holds(price_count, holding_period_steps);
       const int chain_count = std::min(holding_period_steps, scored_count);
       prepare_value_oracle_chains_kernel<<<chain_count, threads, chain_storage_bytes>>>(
         price_count, score_start, holding_period_steps, grid_size,
@@ -2495,7 +2562,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         continuations.get(), policy.get(), device_means.get(), device_second_moments.get(),
         device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
         device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
-        false, false, true
+        false, false, true, false
       );
     } else {
       std::vector<int> block_durations;
@@ -2508,7 +2575,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
       double* current = continuations.get();
       for (int level = static_cast<int>(block_durations.size()) - 1; level >= 0; --level) {
         const int duration = block_durations[level];
-        prepare_holds(duration);
+        prepare_holds(price_count, duration);
         prepare_value_oracle_chains_kernel<<<scored_count, threads, chain_storage_bytes>>>(
           price_count, score_start, duration, grid_size,
           minimum_exposure, maximum_exposure, temperature, friction, opportunity_epsilon,
@@ -2517,7 +2584,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
           current, policy.get(), device_means.get(), device_second_moments.get(),
           device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
           device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
-          true, prior != nullptr, level == 0
+          true, prior != nullptr, level == 0, false
         );
         prior = current;
         current = current == continuations.get()
@@ -2526,9 +2593,35 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
       }
     }
     cuda_check(cudaGetLastError(), "launch exposure-value oracle chain kernels");
+    const int path_price_count = terminal_index + 1;
+    const int path_scored_count = path_price_count - score_start;
+    prepare_holds(path_price_count, holding_period_steps);
+    initialize_value_oracle_terminal_kernel<<<terminal_blocks, terminal_threads>>>(
+      terminal_index,
+      score_start,
+      grid_size,
+      minimum_exposure,
+      maximum_exposure,
+      friction,
+      continuations.get(),
+      policy.get()
+    );
+    cuda_check(cudaGetLastError(), "initialize full-window oracle terminal row");
+    const int path_chain_count = std::min(holding_period_steps, path_scored_count);
+    prepare_value_oracle_chains_kernel<<<path_chain_count, threads, chain_storage_bytes>>>(
+      path_price_count, score_start, holding_period_steps, grid_size,
+      minimum_exposure, maximum_exposure, temperature, friction, opportunity_epsilon,
+      holding_values.get(), endpoint_exposures.get(), rebalance_logs.get(),
+      separable_rebalance_costs, sell_logs.get(), buy_logs.get(), nullptr,
+      continuations.get(), policy.get(), device_means.get(), device_second_moments.get(),
+      device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
+      device_opportunities.get(), nullptr,
+      false, false, false, true
+    );
+    cuda_check(cudaGetLastError(), "launch full-window exposure-value Bellman kernel");
     reconstruct_value_oracle_policy_kernel<<<1, 1>>>(
       device_prices.get(),
-      price_count,
+      path_price_count,
       score_start,
       holding_period_steps,
       grid_size,
@@ -2539,8 +2632,13 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
       quote_lend_rate,
       quote_borrow_rate,
       asset_borrow_rate,
-      policy.get(),
-      device_optimal_exposures.get()
+      initial_exposure,
+      holding_values.get(),
+      endpoint_exposures.get(),
+      continuations.get(),
+      device_path_exposures.get(),
+      device_path_equities.get(),
+      device_path_metrics.get()
     );
     cuda_check(cudaGetLastError(), "launch exposure-value policy kernel");
     cuda_check(cudaEventRecord(stop_event), "record oracle CUDA stop event");
@@ -2566,10 +2664,22 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     copy_output(means, device_means, "copy oracle means");
     copy_output(second_moments, device_second_moments, "copy oracle second moments");
     copy_output(modal_exposures, device_modal_exposures, "copy oracle modes");
-    copy_output(optimal_exposures, device_optimal_exposures, "copy oracle policy");
     copy_output(entropies, device_entropies, "copy oracle entropies");
     copy_output(weights, device_weights, "copy oracle weights");
     copy_output(opportunities, device_opportunities, "copy oracle opportunities");
+    copy_output(path_exposures, device_path_exposures, "copy full-window oracle exposures");
+    cuda_check(cudaMemcpy(
+      path_equities,
+      device_path_equities.get(),
+      price_count * sizeof(double),
+      cudaMemcpyDeviceToHost
+    ), "copy full-window oracle equities");
+    cuda_check(cudaMemcpy(
+      path_metrics,
+      device_path_metrics.get(),
+      5 * sizeof(double),
+      cudaMemcpyDeviceToHost
+    ), "copy full-window oracle metrics");
     if (probabilities) {
       cuda_check(cudaMemcpy(
         probabilities,

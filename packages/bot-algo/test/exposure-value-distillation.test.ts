@@ -36,7 +36,7 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
     const options = {
       scoreStartIndex: 300,
       holdingPeriodSteps: 17,
-      valueHorizonSteps: 2_000,
+      valueHorizonSteps: prices.length - 1 - 300,
       friction: 0.00175,
       gridSize,
       minExposure: -1,
@@ -68,8 +68,82 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
       assert.ok(maximumError < 2e-5, `${key} drifted by ${maximumError} at grid ${gridSize}`);
     }
     assert.deepEqual(gpu.modalExposures, cpu.modalExposures);
-    assert.deepEqual(gpu.optimalExposures, cpu.optimalExposures);
+    assert.deepEqual(gpu.path.exposures, cpu.path.exposures);
   }
+
+  const oneStepOptions = {
+    scoreStartIndex: 300,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 2_000,
+    friction: 0.00175,
+    gridSize: 21,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature: 0.001,
+    initialExposure: 0,
+  };
+  const oneStepCpu = prepareExposureValueOracle(prices, oneStepOptions);
+  const { oracle: oneStepGpu } = await prepareExposureValueOracleCuda(prices, oneStepOptions);
+  assert.deepEqual(oneStepGpu.path.exposures, oneStepCpu.path.exposures);
+  assert.ok(Math.abs(oneStepGpu.path.logReturn - oneStepCpu.path.logReturn) < 1e-10);
+  assert.equal(oneStepGpu.path.terminalExposure, 0);
+  assert.ok(oneStepGpu.path.totalReturn >= 0);
+
+  const boundedOptions = {
+    ...oneStepOptions,
+    holdingPeriodSteps: 17,
+    initialExposure: 0.3,
+    terminalIndex: 1_700,
+  };
+  const boundedCpu = prepareExposureValueOracle(prices, boundedOptions);
+  const { oracle: boundedGpu } = await prepareExposureValueOracleCuda(prices, boundedOptions);
+  assert.deepEqual(boundedGpu.path.exposures, boundedCpu.path.exposures);
+  assert.ok(Math.abs(boundedGpu.path.logReturn - boundedCpu.path.logReturn) < 1e-10);
+  assert.equal(boundedGpu.path.exposures[boundedOptions.terminalIndex], 0);
+  assert.equal(boundedGpu.path.equities[boundedOptions.terminalIndex + 1], 0);
+
+  const monotonicOptions = {
+    scoreStartIndex: 0,
+    terminalIndex: 3,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction: 0.001,
+    gridSize: 21,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature: 0.001,
+  };
+  const monotonicCpu = prepareExposureValueOracle([100, 110, 121, 133.1], monotonicOptions);
+  const { oracle: monotonicGpu } = await prepareExposureValueOracleCuda(
+    [100, 110, 121, 133.1],
+    monotonicOptions,
+  );
+  for (const oracle of [monotonicCpu, monotonicGpu]) {
+    assert.ok(oracle.path.totalReturn > 0);
+    assert.ok(oracle.path.maxDrawdown <= monotonicOptions.friction * 2);
+    assert.equal(oracle.path.exposures[monotonicOptions.terminalIndex], 0);
+  }
+
+  const driftOptions = {
+    scoreStartIndex: 0,
+    terminalIndex: 2,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 2,
+    friction: 0.01,
+    gridSize: 5,
+    minExposure: -0.5,
+    maxExposure: 0.5,
+    maxEffectiveExposure: 2,
+    temperature: 0.005,
+  };
+  const driftCpu = prepareExposureValueOracle([100, 110, 111], driftOptions);
+  const { oracle: driftGpu } = await prepareExposureValueOracleCuda(
+    [100, 110, 111],
+    driftOptions,
+  );
+  assert.deepEqual(driftGpu.path.exposures, driftCpu.path.exposures);
+  assert.equal(driftGpu.path.rebalanceCount, 2);
+  assert.ok(Math.abs(driftGpu.path.logReturn - driftCpu.path.logReturn) < 1e-10);
 
   const leveragedOptions = {
     scoreStartIndex: 300,
@@ -92,7 +166,7 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
     );
   }
   assert.ok(maximumMeanError < 2e-3, `leveraged mean drifted by ${maximumMeanError}`);
-  assert.deepEqual(leveragedGpu.optimalExposures, leveragedCpu.optimalExposures);
+  assert.deepEqual(leveragedGpu.path.exposures, leveragedCpu.path.exposures);
 });
 
 test("exposure value oracle prefers the sign of the next price move", () => {
@@ -111,10 +185,104 @@ test("exposure value oracle prefers the sign of the next price move", () => {
 
   assert.ok(up.means[0]! > 0.5);
   assert.ok(down.means[0]! < -0.5);
-  assert.equal(up.optimalExposures[0], 1);
-  assert.equal(down.optimalExposures[0], -1);
+  assert.equal(up.path.exposures[0], 1);
+  assert.equal(down.path.exposures[0], -1);
   assert.ok(up.opportunities[0]! > 0);
   assert.ok(Math.abs(up.means[1]!) < 1e-7);
+});
+
+test("full-window oracle reports Q0 at the input exposure and liquidates at T", () => {
+  const friction = 0.001;
+  const oracle = prepareExposureValueOracle([100, 110, 121, 133.1], {
+    scoreStartIndex: 0,
+    terminalIndex: 3,
+    initialExposure: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction,
+    gridSize: 21,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature: 0.005,
+  });
+
+  assert.equal(oracle.path.startIndex, 0);
+  assert.equal(oracle.path.terminalIndex, 3);
+  assert.equal(oracle.path.initialExposure, 0);
+  assert.equal(oracle.path.terminalExposure, 0);
+  assert.equal(oracle.path.exposures[3], 0);
+  assert.ok(oracle.path.totalReturn > 0);
+  assert.ok(Math.abs(oracle.path.totalReturn - Math.expm1(oracle.path.logReturn)) < 1e-12);
+  assert.ok(Math.abs(oracle.path.equities[3]! - Math.exp(oracle.path.logReturn)) < 1e-12);
+  assert.ok(oracle.path.maxDrawdown <= friction * 2);
+});
+
+test("full-window horizon is measured from score start rather than the warmup prefix", () => {
+  const options = {
+    scoreStartIndex: 2,
+    terminalIndex: 5,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction: 0.001,
+    gridSize: 21,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature: 0.005,
+  };
+  const withWarmup = prepareExposureValueOracle([80, 90, 100, 110, 105, 120], options);
+  const scoredOnly = prepareExposureValueOracle([100, 110, 105, 120], {
+    ...options,
+    scoreStartIndex: 0,
+    terminalIndex: 3,
+  });
+
+  assert.deepEqual(
+    Array.from(withWarmup.means.subarray(2)),
+    Array.from(scoredOnly.means),
+  );
+  assert.deepEqual(
+    Array.from(withWarmup.path.exposures.subarray(2)),
+    Array.from(scoredOnly.path.exposures),
+  );
+  assert.ok(Math.abs(withWarmup.path.logReturn - scoredOnly.path.logReturn) < 1e-12);
+});
+
+test("full-window oracle stays in cash on a flat market and includes terminal closeout", () => {
+  const flat = prepareExposureValueOracle([100, 100, 100, 100], {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction: 0.00175,
+    gridSize: 21,
+    temperature: 0.005,
+  });
+  assert.equal(flat.path.totalReturn, 0);
+  assert.deepEqual(flat.path.exposures, new Float32Array(4));
+
+  const initiallyLong = prepareExposureValueOracle([100, 100], {
+    scoreStartIndex: 0,
+    terminalIndex: 1,
+    initialExposure: 1,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 1,
+    friction: 0.00175,
+    gridSize: 21,
+    temperature: 0.005,
+  });
+  assert.equal(initiallyLong.path.exposures[1], 0);
+  assert.ok(initiallyLong.path.totalReturn < 0);
+  assert.ok(Math.abs(initiallyLong.path.totalReturn) <= 0.00175 * 1.01);
+});
+
+test("value grid must include cash as an exact state", () => {
+  assert.throws(() => prepareExposureValueOracle([100, 101], {
+    scoreStartIndex: 0,
+    friction: 0,
+    gridSize: 20,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature: 0.005,
+  }), /exact zero/);
 });
 
 test("exposure value oracle retains selected H when the segment tail truncates the hold", () => {
@@ -131,7 +299,7 @@ test("exposure value oracle retains selected H when the segment tail truncates t
   assert.equal(oracle.valueHorizonSteps, 10);
 });
 
-test("exposure value holds the input target for H before perfect continuation", () => {
+test("exposure value holds the post-action portfolio for H before perfect continuation", () => {
   const prices = [100, 120, 60, 60];
   const oneStep = prepareExposureValueOracle(prices, {
     scoreStartIndex: 0,
@@ -152,7 +320,8 @@ test("exposure value holds the input target for H before perfect continuation", 
 
   assert.equal(oneStep.modalExposures[0], 1);
   assert.equal(twoSteps.modalExposures[0], -1);
-  assert.equal(twoSteps.optimalExposures[0], twoSteps.optimalExposures[1]);
+  assert.equal(twoSteps.path.exposures[0], -1);
+  assert.ok(Math.abs(twoSteps.path.exposures[1]! + 1.5) < 1e-7);
 });
 
 test("value horizon T caps final equity independently from holding period H", () => {
@@ -203,7 +372,7 @@ test("a scored oracle prefix can keep values from post-window candles", () => {
   assert.equal(truncated.modalExposures[0], -1);
 });
 
-test("H-step oracle values include drift-correcting rebalances", () => {
+test("H-step oracle values let the portfolio drift without intermediate rebalancing", () => {
   const prices = [100, 98, 95];
   const friction = 0.00175;
   const temperature = 0.01;
@@ -217,11 +386,7 @@ test("H-step oracle values include drift-correcting rebalances", () => {
     includeProbabilities: true,
   });
   const values = Array.from(oracle.grid, (exposure) => {
-    const firstFactor = 1 - exposure + exposure * prices[1]! / prices[0]!;
-    const driftedExposure = exposure * prices[1]! / prices[0]! / firstFactor;
-    const rebalance = rebalanceEquityFactor(driftedExposure, exposure, friction);
-    const secondFactor = 1 - exposure + exposure * prices[2]! / prices[1]!;
-    return Math.log(firstFactor * rebalance * secondFactor);
+    return Math.log(1 - exposure + exposure * prices[2]! / prices[0]!);
   });
   const maximum = Math.max(...values);
   const weights = values.map((value) => Math.exp((value - maximum) / temperature));
@@ -230,6 +395,27 @@ test("H-step oracle values include drift-correcting rebalances", () => {
   for (let index = 0; index < weights.length; index += 1) {
     assert.ok(Math.abs(actual[index]! - weights[index]! / total) < 1e-6);
   }
+});
+
+test("the full-window oracle can keep an off-grid drifted exposure without trading", () => {
+  const oracle = prepareExposureValueOracle([100, 110, 111], {
+    scoreStartIndex: 0,
+    terminalIndex: 2,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 2,
+    friction: 0.01,
+    gridSize: 5,
+    minExposure: -0.5,
+    maxExposure: 0.5,
+    maxEffectiveExposure: 2,
+    temperature: 0.005,
+  });
+  const drifted = 0.5 * 1.1 / (0.5 + 0.5 * 1.1);
+
+  assert.equal(oracle.path.exposures[0], 0.5);
+  assert.ok(Math.abs(oracle.path.exposures[1]! - drifted) < 1e-7);
+  assert.equal(oracle.path.rebalanceCount, 2);
+  assert.ok(oracle.path.totalReturn > 0);
 });
 
 test("flat future prices produce a uniform exposure preference", () => {

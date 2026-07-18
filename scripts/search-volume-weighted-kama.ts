@@ -99,6 +99,7 @@ interface Args {
   exposureMinimum: number;
   exposureMaximum: number;
   maxEffectiveExposure: number;
+  initialExposure: number;
   valueHoldingPeriodMode: VwKamaHoldingPeriodMode;
   valueHoldingPeriodMs: number;
   valueHorizonMs: number;
@@ -526,6 +527,7 @@ async function run(config: Args): Promise<void> {
       exposureGridSize: config.exposureGridSize,
       exposureRange: [config.exposureMinimum, config.exposureMaximum],
       maxEffectiveExposure: config.maxEffectiveExposure,
+      initialExposure: config.initialExposure,
       holdingPeriodMode: config.valueHoldingPeriodMode,
       holdingPeriodMs: config.valueHoldingPeriodMs,
       valueHorizonMs: config.valueHorizonMs,
@@ -706,6 +708,7 @@ function writeGlobalPresets(
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
         maxEffectiveExposure: config.maxEffectiveExposure,
+        initialExposure: config.initialExposure,
         holdingPeriodMode: config.valueHoldingPeriodMode,
         holdingPeriodMs: config.valueHoldingPeriodMs,
         valueHorizonMs: config.valueHorizonMs,
@@ -1632,6 +1635,7 @@ async function runPerWindow(
         minExposure: config.exposureMinimum,
         maxExposure: config.exposureMaximum,
         maxEffectiveExposure: config.maxEffectiveExposure,
+        initialExposure: config.initialExposure,
         holdingPeriodMode: config.valueHoldingPeriodMode,
         holdingPeriodMs: config.valueHoldingPeriodMs,
         valueHorizonMs: config.valueHorizonMs,
@@ -2637,11 +2641,13 @@ async function buildCases(
             minExposure: config.exposureMinimum,
             maxExposure: config.exposureMaximum,
             maxEffectiveExposure: config.maxEffectiveExposure,
+            initialExposure: config.initialExposure,
+            terminalIndex: caseCandles.length - 1,
             temperature: config.oracleTemperature,
             opportunityEpsilon: config.opportunityEpsilon,
-            quoteLendRate: config.quoteLendRate,
-            quoteBorrowRate: config.quoteBorrowRate,
-            assetBorrowRate: config.assetBorrowRate,
+            quoteLendRate: hourlyRatePerCandle(config.quoteLendRate, scaleMs),
+            quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, scaleMs),
+            assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, scaleMs),
             includeProbabilities: config.oracleMutualInformationLambda > 0
               && config.oracleMutualInformationMode === "precise",
           };
@@ -3454,7 +3460,7 @@ function parseArgs(argv: string[]): Args {
     "mean-reversion-volatility-range", "mean-reversion-reversal-threshold-range",
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
     "screen-scales", "workers", "accelerator", "objective", "score-version",
-    "exposure-grid-size", "exposure-min", "exposure-max", "max-effective-exposure",
+    "exposure-grid-size", "exposure-min", "exposure-max", "max-effective-exposure", "initial-exposure",
     "value-holding-period-mode", "value-holding-period", "value-horizon",
     "value-horizon-end-mode", "oracle-temperature",
     "strategy-temperature-range", "strategy-quadratic-scale-range",
@@ -3511,7 +3517,7 @@ function parseArgs(argv: string[]): Args {
   if (oracleMutualInformationMode !== "approximate" && oracleMutualInformationMode !== "precise") {
     throw new Error("--oracle-mi-mode must be approximate or precise.");
   }
-  const exposureGridSize = integer(get("exposure-grid-size", "150"), "exposure-grid-size", 3);
+  const exposureGridSize = integer(get("exposure-grid-size", "151"), "exposure-grid-size", 3);
   const mutualInformationBins = integer(get("mi-bins", "15"), "mi-bins", 2);
   if (mutualInformationBins > Math.min(32, exposureGridSize)) {
     throw new Error("--mi-bins cannot exceed min(32, --exposure-grid-size).");
@@ -3524,6 +3530,17 @@ function parseArgs(argv: string[]): Args {
     Math.max(Math.abs(exposureMinimum), Math.abs(exposureMaximum)),
     10_000,
   );
+  const initialExposure = bounded(
+    get("initial-exposure", "0"),
+    "initial-exposure",
+    -maxEffectiveExposure,
+    maxEffectiveExposure,
+  );
+  const zeroGridPosition = -exposureMinimum
+    / (exposureMaximum - exposureMinimum) * (exposureGridSize - 1);
+  if (Math.abs(zeroGridPosition - Math.round(zeroGridPosition)) > 1e-9) {
+    throw new Error("--exposure-grid-size/range must include exact zero exposure.");
+  }
   if (scoreVersion !== VW_KAMA_SCORE_VERSION) {
     throw new Error(`--score-version must be ${VW_KAMA_SCORE_VERSION}.`);
   }
@@ -3575,6 +3592,7 @@ function parseArgs(argv: string[]): Args {
     exposureMinimum,
     exposureMaximum,
     maxEffectiveExposure,
+    initialExposure,
     valueHoldingPeriodMode,
     valueHoldingPeriodMs,
     valueHorizonMs,
@@ -4043,12 +4061,13 @@ function help(): void {
   --workers 12                      Candidate shards for global search; window shards in per-window mode
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
   --objective signal                signal or value-distillation fitness
-  --exposure-grid-size 150 --exposure-min -100 --exposure-max 100
+  --exposure-grid-size 151 --exposure-min -100 --exposure-max 100
   --value-holding-period-mode fixed fixed or oracle-half-average-trade
   --value-holding-period 1s         Fixed H (one candle by default), or adaptive fallback
   --value-horizon 1s                Final-equity horizon T−t; must be at least H
   --value-horizon-end-mode truncate truncate at window end, or extend into future candles
   --max-effective-exposure 250      Liquidate only after drift exceeds this absolute exposure
+  --initial-exposure 0              Exposure supplied to Q0 at the scored-window start
   --strategy-quadratic-scale-range 0..1000000  Candidate b2' in b2=-b2'*v^2
   --strategy-quadratic-volatility-window-range 1m..24h
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
@@ -4158,6 +4177,7 @@ function formatRange(range: Range, format: (value: number) => string = String): 
 function positive(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`--${label} must be positive.`); return parsed; }
 function nonNegative(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`--${label} must be non-negative.`); return parsed; }
 function finiteNumber(value: string, label: string): number { const parsed = Number(value); if (!Number.isFinite(parsed)) throw new Error(`--${label} must be finite.`); return parsed; }
+function hourlyRatePerCandle(hourlyRate: number, intervalMs: number): number { return Math.expm1(Math.log1p(hourlyRate) * intervalMs / 3_600_000); }
 function bounded(value: string, label: string, minimum: number, maximum: number): number { const parsed = Number(value); if (!Number.isFinite(parsed) || parsed < minimum || parsed > maximum) throw new Error(`--${label} must be between ${minimum} and ${maximum}.`); return parsed; }
 function integer(value: string, label: string, minimum = 1): number { const parsed = Number(value); if (!Number.isSafeInteger(parsed) || parsed < minimum) throw new Error(`--${label} must be an integer >= ${minimum}.`); return parsed; }
 function booleanValue(value: string, label: string): boolean {

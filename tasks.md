@@ -169,7 +169,7 @@ we need to adjust the oracle evaluation:
          8. otherwise u_{t+1}=u^-_{t+1} and q_{t+1}=q^-_{t+1}
    6. The oracle defines exposure based on the future returns:
       1. a_t=L^+ if r_t>0 and a_t=-L^- if r_t<0
-      2. or more generally a_t=argmax_a(Q_t(a))
+      2. or more generally a_t=argmax_a(Q_t(a)), which can be found with DP
    7. Then the definition for oracle's return is simply the log return over initial and final equity:
       1. Q_t(a)=ln E_T/E_t
       2. H is the forced holding period for a; T-t is the independently configured value horizon.
@@ -203,3 +203,14 @@ we need to adjust the oracle evaluation:
 
 8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
 9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
+
+1. implement transition aware policy distribution. 
+2. Loss should learn the whole distribution over input-output pairs.
+3. Your heatmap visual idea is a good one. Compute color relative to value of holding. 
+4. Slices for oracle path, candidate state, prediction are also useful, we should show them. The current ones are also useful i think, we can interpret them as having target and current state match, eliminating the transition cost.
+5. For difference choose whichever is more useful for interpretation.
+6. Use canvas for rendering it as suggested
+7. Implement the pipeline redesign you suggested.
+8. dont implement minimum order size constraints.
+9. uniform weight for operational prior.
+10. use avg regret as time weight

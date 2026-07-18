@@ -278,6 +278,8 @@ export function CandleChart(props: CandleChartProps) {
         plot,
         priceToY,
         timeToX,
+        smaSeries,
+        stateBands,
         canvasPlot.bottom,
       );
     }
@@ -540,8 +542,8 @@ export function CandleChart(props: CandleChartProps) {
   const crosshairTime = () => props.cursorTime ?? selectedTime();
 
   const updateSelectionFromPointer = (event: { offsetX: number; offsetY?: number }) => {
-    props.onCursorTimeChange?.(timeAtOffset(event.offsetX));
     const selection = selectionAtOffset(event.offsetX, event.offsetY);
+    props.onCursorTimeChange?.(selection?.time);
     if (!selection) {
       return;
     }
@@ -555,17 +557,6 @@ export function CandleChart(props: CandleChartProps) {
     }
     setInternalSelectedTime(selection.time);
     props.onSelectionChange?.(selection);
-  };
-
-  const timeAtOffset = (offsetX: number): number | undefined => {
-    const chartViewport = currentViewport();
-    const candles = props.candles.slice(chartViewport.start, chartViewport.end);
-    if (candles.length === 0) return undefined;
-    const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
-    const startTime = candles[0]!.openTime;
-    const endTime = candles.at(-1)!.closeTime;
-    const normalized = clamp((offsetX - plot.left) / Math.max(1, plot.right - plot.left), 0, 1);
-    return startTime + normalized * Math.max(1, endTime - startTime);
   };
 
   const selectionAtOffset = (offsetX: number, offsetY?: number): CandleChartSelection | undefined => {
@@ -600,7 +591,7 @@ export function CandleChart(props: CandleChartProps) {
       offsetY,
     );
     return {
-      time: oracle?.time ?? extremum?.time ?? time,
+      time: oracle?.time ?? extremum?.time ?? candle.closeTime,
       candle,
       annotations: annotationsForCandle((props.annotations ?? []).filter(annotationVisible), candle),
       extremum,
@@ -1666,6 +1657,8 @@ function drawSelectedCandle(
   plot: { left: number; right: number; top: number; bottom: number },
   priceToY: (price: number) => number,
   timeToX: (time: number) => number,
+  smaSeries: BacktestChartSmaSeries[],
+  stateBands: CandleChartStateBand[],
   lineBottom = plot.bottom,
 ): void {
   const markerTime = selectedTime ?? (candle.openTime + candle.closeTime) / 2;
@@ -1702,7 +1695,52 @@ function drawSelectedCandle(
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(label, labelLeft + labelWidth / 2, lineBottom - 9);
+
+  const values = [
+    `O ${formatQuote(candle.open, 2)}  H ${formatQuote(candle.high, 2)}  L ${formatQuote(candle.low, 2)}  C ${formatQuote(candle.close, 2)}`,
+    ...smaSeries.flatMap((series) => {
+      const point = nearestTimedPoint(series.points, markerTime);
+      return point ? [`${series.label} ${formatQuote(point.value, 4)}`] : [];
+    }),
+    ...stateBands.flatMap((band) => {
+      const point = stateBandPointAtTime(band.points, markerTime);
+      if (!point) return [];
+      const exposure = point.exposure === undefined ? "" : ` ${formatQuote(point.exposure, 3)}`;
+      return [`${band.label} ${point.state}${exposure}`];
+    }),
+  ];
+  ctx.font = "11px Inter, sans-serif";
+  const valueWidth = Math.min(
+    plot.right - plot.left,
+    Math.max(...values.map((value) => ctx.measureText(value).width), 0) + 16,
+  );
+  const valueHeight = values.length * 17 + 8;
+  const valueLeft = x + 10 + valueWidth <= plot.right
+    ? x + 10
+    : Math.max(plot.left, x - valueWidth - 10);
+  const valueTop = plot.top + 6;
+  ctx.fillStyle = "rgba(22, 25, 32, 0.94)";
+  ctx.fillRect(valueLeft, valueTop, valueWidth, valueHeight);
+  ctx.fillStyle = "#eef1f8";
+  ctx.textAlign = "left";
+  values.forEach((value, index) => {
+    ctx.fillText(value, valueLeft + 8, valueTop + 5 + index * 17 + 8.5, valueWidth - 16);
+  });
   ctx.restore();
+}
+
+function nearestTimedPoint<T extends { time: number }>(points: readonly T[], time: number): T | undefined {
+  if (points.length === 0) return undefined;
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.time < time) low = middle + 1;
+    else high = middle;
+  }
+  const right = points[Math.min(points.length - 1, low)]!;
+  const left = points[Math.max(0, low - 1)]!;
+  return Math.abs(left.time - time) <= Math.abs(right.time - time) ? left : right;
 }
 
 function formatCursorTime(time: number): string {

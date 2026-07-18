@@ -12,7 +12,24 @@ export interface ExposureValueOracleOptions {
   quoteLendRate?: number;
   quoteBorrowRate?: number;
   assetBorrowRate?: number;
+  initialExposure?: number;
+  terminalIndex?: number;
   includeProbabilities?: boolean;
+}
+
+export interface ExposureValueOraclePath {
+  startIndex: number;
+  terminalIndex: number;
+  initialExposure: number;
+  terminalExposure: 0;
+  logReturn: number;
+  totalReturn: number;
+  exposures: Float32Array;
+  equities: Float64Array;
+  maxDrawdown: number;
+  turnover: number;
+  rebalanceCount: number;
+  liquidationCount: number;
 }
 
 export interface ExposureValueOracle {
@@ -23,12 +40,12 @@ export interface ExposureValueOracle {
   means: Float32Array;
   secondMoments: Float32Array;
   modalExposures: Float32Array;
-  optimalExposures: Float32Array;
   entropies: Float32Array;
   weights: Float32Array;
   opportunities: Float32Array;
   probabilities?: Float32Array;
   execution: ExposureExecutionOptions;
+  path: ExposureValueOraclePath;
 }
 
 export interface ExposureExecutionOptions {
@@ -141,9 +158,9 @@ export interface StrategyExposureTemperatureOptions {
 /**
  * Builds p_t(a) ∝ exp(Q_t(a) / temperature) over a fixed exposure grid.
  *
- * Q_t(a) keeps target exposure a for H price moves, then follows the optimal
- * friction-aware policy until T. Keeping the target fixed includes the intermediate
- * rebalances needed to undo price drift. Portfolio value is homogeneous, so
+ * Q_t(a) rebalances to exposure a once, leaves the resulting quote and asset
+ * quantities untouched for H price moves, then follows the optimal friction-aware
+ * policy until T. Portfolio value is homogeneous, so
  * the Bellman state needs only the current marked exposure rather than equity.
  */
 export function prepareExposureValueOracle(
@@ -152,15 +169,16 @@ export function prepareExposureValueOracle(
   shared = false,
 ): ExposureValueOracle {
   const oracle = createExposureValueOracleStorage(prices, options, shared);
-  if (oracle.valueHorizonSteps >= prices.length - 1) {
-    return prepareSegmentEndingExposureValueOracle(prices, options, oracle);
+  if (oracle.valueHorizonSteps >= prices.length - 1 - options.scoreStartIndex) {
+    prepareSegmentEndingExposureValueOracle(prices, options, oracle);
+    prepareExposureValueOraclePath(prices, options, oracle);
+    return oracle;
   }
   const {
     grid,
     means,
     secondMoments,
     modalExposures,
-    optimalExposures,
     entropies,
     weights,
     opportunities,
@@ -251,28 +269,7 @@ export function prepareExposureValueOracle(
     currentContinuations = new Float64Array(cellCount);
   }
 
-  let currentExposure = 0;
-  let target = 0;
-  let remainingHoldSteps = 0;
-  for (let time = options.scoreStartIndex; time < prices.length; time += 1) {
-    if (remainingHoldSteps === 0) {
-      const currentIndex = Math.round(clamp(
-        (currentExposure - grid[0]!) / (grid[grid.length - 1]! - grid[0]!) * (grid.length - 1),
-        0,
-        grid.length - 1,
-      ));
-      target = grid[policy[(time - options.scoreStartIndex) * grid.length + currentIndex]!]!;
-      remainingHoldSteps = Math.min(holdingPeriodSteps, prices.length - 1 - time);
-    }
-    optimalExposures[time] = target;
-    if (time + 1 >= prices.length) continue;
-    const rebalance = rebalanceEquityFactor(currentExposure, target, execution.friction);
-    currentExposure = rebalance > 0
-      ? holdingOutcome(target, prices[time]!, prices[time + 1]!, execution).exposure
-      : 0;
-    remainingHoldSteps -= 1;
-  }
-
+  prepareExposureValueOraclePath(prices, options, oracle);
   return oracle;
 }
 
@@ -286,7 +283,6 @@ function prepareSegmentEndingExposureValueOracle(
     means,
     secondMoments,
     modalExposures,
-    optimalExposures,
     entropies,
     weights,
     opportunities,
@@ -301,77 +297,33 @@ function prepareSegmentEndingExposureValueOracle(
     { length: ringLength },
     () => new Float64Array(grid.length),
   );
-  const outcomeExposureRing = Array.from(
-    { length: ringLength },
-    () => new Float64Array(grid.length),
-  );
-  const continuedValueRing = Array.from(
-    { length: ringLength },
-    () => new Float64Array(grid.length),
-  );
-  const nextOutcomeEquities = new Float64Array(grid.length);
-  const rollingValues = new Float64Array(grid.length);
-  const rollingInvalidCounts = new Int32Array(grid.length);
-  const policy = new Uint16Array((prices.length - options.scoreStartIndex) * grid.length);
   const prefixValues = new Float64Array(grid.length);
   const suffixValues = new Float64Array(grid.length);
   const prefixTargets = new Uint16Array(grid.length);
   const suffixTargets = new Uint16Array(grid.length);
   const separableRebalanceCosts = 1 - execution.friction * grid[grid.length - 1]! > 0
     && 1 - execution.friction + execution.friction * grid[0]! > 0;
-
   for (let time = prices.length - 1; time >= options.scoreStartIndex; time -= 1) {
     if (time === prices.length - 1) {
       forcedValues.fill(0);
     } else {
       const endpointTime = Math.min(prices.length - 1, time + holdingPeriodSteps);
       const endpointContinuation = continuationRing[endpointTime % ringLength]!;
-      const endpointExposures = outcomeExposureRing[(endpointTime - 1) % ringLength]!;
-      const currentOutcomeExposures = outcomeExposureRing[time % ringLength]!;
-      const addedContinuations = continuedValueRing[(time + 1) % ringLength]!;
       for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
-        const exposure = grid[exposureIndex]!;
-        const currentOutcome = holdingOutcome(
-          exposure,
-          prices[time]!,
-          prices[time + 1]!,
+        const holding = holdingBlockOutcome(
+          prices,
+          time,
+          endpointTime,
+          grid[exposureIndex]!,
           execution,
         );
-        currentOutcomeExposures[exposureIndex] = currentOutcome.exposure;
-        let rolling = rollingValues[exposureIndex]!;
-        let invalidCount = rollingInvalidCounts[exposureIndex]!;
-        if (time + 1 < prices.length - 1) {
-          const nextEquity = nextOutcomeEquities[exposureIndex]!;
-          if (nextEquity > 0) rolling -= Math.log(nextEquity);
-          else invalidCount -= 1;
-          const rebalance = rebalanceEquityFactor(
-            currentOutcome.exposure,
-            exposure,
-            execution.friction,
-          );
-          const added = rebalance > 0 && nextEquity > 0
-            ? Math.log(rebalance) + Math.log(nextEquity)
-            : Number.NEGATIVE_INFINITY;
-          addedContinuations[exposureIndex] = added;
-          if (Number.isFinite(added)) rolling += added;
-          else invalidCount += 1;
-        }
-        const removedTime = time + holdingPeriodSteps;
-        if (removedTime < prices.length - 1) {
-          const removed = continuedValueRing[removedTime % ringLength]![exposureIndex]!;
-          if (Number.isFinite(removed)) rolling -= removed;
-          else invalidCount -= 1;
-        }
-        const first = currentOutcome.equityFactor > 0
-          ? Math.log(currentOutcome.equityFactor)
-          : Number.NEGATIVE_INFINITY;
-        if (Number.isFinite(first)) rolling += first;
-        else invalidCount += 1;
-        rollingValues[exposureIndex] = rolling;
-        rollingInvalidCounts[exposureIndex] = invalidCount;
-        nextOutcomeEquities[exposureIndex] = currentOutcome.equityFactor;
-        forcedValues[exposureIndex] = invalidCount === 0
-          ? rolling + interpolateRow(endpointContinuation, 0, grid, endpointExposures[exposureIndex]!)
+        forcedValues[exposureIndex] = Number.isFinite(holding.logReturn)
+          ? holding.logReturn + interpolateRow(
+              endpointContinuation,
+              0,
+              grid,
+              holding.exposure,
+            )
           : Number.NEGATIVE_INFINITY;
       }
     }
@@ -396,33 +348,251 @@ function prepareSegmentEndingExposureValueOracle(
       suffixValues,
       prefixTargets,
       suffixTargets,
-      policy,
-      (time - options.scoreStartIndex) * grid.length,
     );
   }
 
-  let currentExposure = 0;
-  let target = 0;
-  let remainingHoldSteps = 0;
-  for (let time = options.scoreStartIndex; time < prices.length; time += 1) {
-    if (remainingHoldSteps === 0) {
-      const currentIndex = Math.round(clamp(
-        (currentExposure - grid[0]!) / (grid[grid.length - 1]! - grid[0]!) * (grid.length - 1),
-        0,
-        grid.length - 1,
-      ));
-      target = grid[policy[(time - options.scoreStartIndex) * grid.length + currentIndex]!]!;
-      remainingHoldSteps = Math.min(holdingPeriodSteps, prices.length - 1 - time);
-    }
-    optimalExposures[time] = target;
-    if (time + 1 >= prices.length) continue;
-    const rebalance = rebalanceEquityFactor(currentExposure, target, execution.friction);
-    currentExposure = rebalance > 0
-      ? holdingOutcome(target, prices[time]!, prices[time + 1]!, execution).exposure
-      : 0;
-    remainingHoldSteps -= 1;
-  }
   return oracle;
+}
+
+/**
+ * Solves one coherent hindsight control problem from score start through the
+ * selected terminal candle. The terminal value is the fee-aware rebalance to
+ * zero exposure; rolling Q targets and their shorter horizons remain separate.
+ *
+ * The Bellman rows are checkpointed and recomputed block-by-block while the
+ * policy is rolled forward. This keeps memory at O(grid * sqrt(decisions))
+ * rather than retaining a policy row for every candle.
+ */
+export function prepareExposureValueOraclePath(
+  prices: ArrayLike<number>,
+  options: ExposureValueOracleOptions,
+  oracle: ExposureValueOracle,
+): void {
+  const start = options.scoreStartIndex;
+  const terminal = options.terminalIndex ?? prices.length - 1;
+  const holdingSteps = oracle.holdingPeriodSteps;
+  const decisionTimes = [start];
+  while (decisionTimes.at(-1)! < terminal) {
+    decisionTimes.push(Math.min(terminal, decisionTimes.at(-1)! + holdingSteps));
+  }
+  const decisionCount = decisionTimes.length;
+  const grid = oracle.grid;
+  const gridSize = grid.length;
+  const blockSize = Math.max(1, Math.ceil(Math.sqrt(decisionCount - 1)));
+  const checkpoints = new Map<number, Float64Array>();
+  let nextValues: Float64Array<ArrayBufferLike> = new Float64Array(gridSize);
+  for (let index = 0; index < gridSize; index += 1) {
+    const closeout = rebalanceEquityFactor(grid[index]!, 0, oracle.execution.friction);
+    nextValues[index] = closeout > 0 ? Math.log(closeout) : Number.NEGATIVE_INFINITY;
+  }
+  checkpoints.set(decisionCount - 1, nextValues.slice());
+  const scratch = createFullWindowScratch(gridSize);
+  for (let decision = decisionCount - 2; decision >= 0; decision -= 1) {
+    const currentValues = fullWindowBellmanRow(
+      prices,
+      decisionTimes[decision]!,
+      decisionTimes[decision + 1]!,
+      nextValues,
+      grid,
+      oracle.execution,
+      scratch,
+    );
+    nextValues = currentValues;
+    if (decision % blockSize === 0) checkpoints.set(decision, currentValues.slice());
+  }
+
+  const accumulator = createExposureReturnAccumulator(options.initialExposure ?? 0);
+  const exposures = oracle.path.exposures;
+  const equities = oracle.path.equities;
+  equities[start] = accumulator.equity;
+  let currentExposure = accumulator.exposure;
+  for (let blockStart = 0; blockStart < decisionCount - 1; blockStart += blockSize) {
+    const blockEnd = Math.min(decisionCount - 1, blockStart + blockSize);
+    const rows = new Float64Array((blockEnd - blockStart + 1) * gridSize);
+    rows.set(checkpoints.get(blockEnd)!, (blockEnd - blockStart) * gridSize);
+    for (let decision = blockEnd - 1; decision >= blockStart; decision -= 1) {
+      const nextRow = rows.subarray(
+        (decision - blockStart + 1) * gridSize,
+        (decision - blockStart + 2) * gridSize,
+      );
+      const currentRow = fullWindowBellmanRow(
+        prices,
+        decisionTimes[decision]!,
+        decisionTimes[decision + 1]!,
+        nextRow,
+        grid,
+        oracle.execution,
+        scratch,
+      );
+      rows.set(currentRow, (decision - blockStart) * gridSize);
+    }
+    for (let decision = blockStart; decision < blockEnd; decision += 1) {
+      const from = decisionTimes[decision]!;
+      const to = decisionTimes[decision + 1]!;
+      const nextRow = rows.subarray(
+        (decision - blockStart + 1) * gridSize,
+        (decision - blockStart + 2) * gridSize,
+      );
+      prepareFullWindowForcedValues(
+        prices,
+        from,
+        to,
+        nextRow,
+        grid,
+        oracle.execution,
+        scratch,
+      );
+      const noTrade = holdingBlockOutcome(
+        prices,
+        from,
+        to,
+        currentExposure,
+        oracle.execution,
+      );
+      let best = Number.isFinite(noTrade.logReturn)
+        ? noTrade.logReturn + interpolateRow(nextRow, 0, grid, noTrade.exposure)
+        : Number.NEGATIVE_INFINITY;
+      let target = currentExposure;
+      for (let targetIndex = 0; targetIndex < gridSize; targetIndex += 1) {
+        const rebalance = rebalanceEquityFactor(
+          currentExposure,
+          grid[targetIndex]!,
+          oracle.execution.friction,
+        );
+        const forced = scratch.forcedValues[targetIndex]!;
+        const value = rebalance > 0 && Number.isFinite(forced)
+          ? Math.log(rebalance) + forced
+          : Number.NEGATIVE_INFINITY;
+        if (value > best) {
+          best = value;
+          target = grid[targetIndex]!;
+        }
+      }
+      const actionChangesExposure = Math.abs(target - currentExposure) > Number.EPSILON;
+      for (let time = from; time < to; time += 1) {
+        const activeExposure = time === from ? target : accumulator.exposure;
+        exposures[time] = activeExposure;
+        if (time === from && actionChangesExposure) {
+          observeExposureReturn(
+            accumulator,
+            activeExposure,
+            prices[time]!,
+            prices[time + 1]!,
+            oracle.execution,
+          );
+        } else {
+          observeHeldExposureReturn(
+            accumulator,
+            prices[time]!,
+            prices[time + 1]!,
+            oracle.execution,
+          );
+        }
+        equities[time + 1] = accumulator.equity;
+      }
+      currentExposure = accumulator.exposure;
+    }
+  }
+  closeExposureReturn(accumulator, oracle.execution);
+  exposures[terminal] = 0;
+  equities[terminal] = accumulator.equity;
+  const metrics = finalizeExposureReturn(accumulator);
+  const cashBaseline = createExposureReturnAccumulator(options.initialExposure ?? 0);
+  for (let time = start; time < terminal; time += 1) {
+    observeExposureReturn(
+      cashBaseline,
+      0,
+      prices[time]!,
+      prices[time + 1]!,
+      oracle.execution,
+    );
+  }
+  closeExposureReturn(cashBaseline, oracle.execution);
+  if (metrics.equity + 1e-10 < cashBaseline.equity) {
+    throw new Error(
+      `Exposure value oracle Q0 ${metrics.equity} is below its cash baseline ${cashBaseline.equity}.`,
+    );
+  }
+  oracle.path = {
+    startIndex: start,
+    terminalIndex: terminal,
+    initialExposure: options.initialExposure ?? 0,
+    terminalExposure: 0,
+    logReturn: metrics.logReturn,
+    totalReturn: metrics.totalReturn,
+    exposures,
+    equities,
+    maxDrawdown: metrics.maxDrawdown,
+    turnover: metrics.turnover,
+    rebalanceCount: metrics.rebalanceCount,
+    liquidationCount: metrics.liquidationCount,
+  };
+}
+
+interface FullWindowScratch {
+  forcedValues: Float64Array;
+  endpointExposures: Float64Array;
+  prefixValues: Float64Array;
+  suffixValues: Float64Array;
+  prefixTargets: Uint16Array;
+  suffixTargets: Uint16Array;
+}
+
+function createFullWindowScratch(gridSize: number): FullWindowScratch {
+  return {
+    forcedValues: new Float64Array(gridSize),
+    endpointExposures: new Float64Array(gridSize),
+    prefixValues: new Float64Array(gridSize),
+    suffixValues: new Float64Array(gridSize),
+    prefixTargets: new Uint16Array(gridSize),
+    suffixTargets: new Uint16Array(gridSize),
+  };
+}
+
+function fullWindowBellmanRow(
+  prices: ArrayLike<number>,
+  start: number,
+  end: number,
+  nextValues: Float64Array,
+  grid: Float64Array,
+  execution: ExposureExecutionOptions,
+  scratch: FullWindowScratch,
+): Float64Array {
+  prepareFullWindowForcedValues(prices, start, end, nextValues, grid, execution, scratch);
+  const result = new Float64Array(grid.length);
+  fillOptimalContinuation(
+    scratch.forcedValues,
+    result,
+    0,
+    grid,
+    execution.friction,
+    1 - execution.friction * grid[grid.length - 1]! > 0
+      && 1 - execution.friction + execution.friction * grid[0]! > 0,
+    scratch.prefixValues,
+    scratch.suffixValues,
+    scratch.prefixTargets,
+    scratch.suffixTargets,
+  );
+  return result;
+}
+
+function prepareFullWindowForcedValues(
+  prices: ArrayLike<number>,
+  start: number,
+  end: number,
+  nextValues: Float64Array,
+  grid: Float64Array,
+  execution: ExposureExecutionOptions,
+  scratch: FullWindowScratch,
+): void {
+  for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+    const target = grid[targetIndex]!;
+    const holding = holdingBlockOutcome(prices, start, end, target, execution);
+    scratch.endpointExposures[targetIndex] = holding.exposure;
+    scratch.forcedValues[targetIndex] = Number.isFinite(holding.logReturn)
+      ? holding.logReturn + interpolateRow(nextValues, 0, grid, holding.exposure)
+      : Number.NEGATIVE_INFINITY;
+  }
 }
 
 interface HoldingTransitions {
@@ -438,27 +608,8 @@ function prepareHoldingTransitions(
 ): HoldingTransitions {
   const values = new Float64Array(prices.length * grid.length);
   const endpointExposures = new Float64Array(values.length);
-  const firstLogs = new Float64Array(prices.length);
-  const outcomeExposures = new Float64Array(prices.length);
-  const continuedPrefix = new Float64Array(prices.length + 1);
-  const invalidPrefix = new Int32Array(prices.length + 1);
   for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
     const target = grid[exposureIndex]!;
-    for (let move = 0; move + 1 < prices.length; move += 1) {
-      const outcome = holdingOutcome(target, prices[move]!, prices[move + 1]!, execution);
-      outcomeExposures[move] = outcome.exposure;
-      firstLogs[move] = outcome.equityFactor > 0
-        ? Math.log(outcome.equityFactor)
-        : Number.NEGATIVE_INFINITY;
-      const rebalance = move === 0
-        ? 1
-        : rebalanceEquityFactor(outcomeExposures[move - 1]!, target, execution.friction);
-      const continued = rebalance > 0 && outcome.equityFactor > 0
-        ? Math.log(rebalance) + Math.log(outcome.equityFactor)
-        : Number.NEGATIVE_INFINITY;
-      continuedPrefix[move + 1] = continuedPrefix[move]! + (Number.isFinite(continued) ? continued : 0);
-      invalidPrefix[move + 1] = invalidPrefix[move]! + (Number.isFinite(continued) ? 0 : 1);
-    }
     for (let time = 0; time < prices.length; time += 1) {
       const cell = time * grid.length + exposureIndex;
       const endpointTime = Math.min(prices.length - 1, time + duration);
@@ -467,12 +618,9 @@ function prepareHoldingTransitions(
         endpointExposures[cell] = target;
         continue;
       }
-      const invalidCount = invalidPrefix[endpointTime]! - invalidPrefix[time + 1]!
-        + (Number.isFinite(firstLogs[time]!) ? 0 : 1);
-      values[cell] = invalidCount === 0
-        ? firstLogs[time]! + continuedPrefix[endpointTime]! - continuedPrefix[time + 1]!
-        : Number.NEGATIVE_INFINITY;
-      endpointExposures[cell] = outcomeExposures[endpointTime - 1]!;
+      const holding = holdingBlockOutcome(prices, time, endpointTime, target, execution);
+      values[cell] = holding.logReturn;
+      endpointExposures[cell] = holding.exposure;
     }
   }
   return { values, endpointExposures };
@@ -550,6 +698,21 @@ export function createExposureValueOracleStorage(
   for (let index = 0; index < grid.length; index += 1) {
     grid[index] = minExposure + index / (grid.length - 1) * (maxExposure - minExposure);
   }
+  const initialExposure = options.initialExposure ?? 0;
+  const emptyPath = {
+    startIndex: options.scoreStartIndex,
+    terminalIndex: options.terminalIndex ?? prices.length - 1,
+    initialExposure,
+    terminalExposure: 0 as const,
+    logReturn: 0,
+    totalReturn: 0,
+    exposures: float32(prices.length, shared),
+    equities: float64(prices.length, shared),
+    maxDrawdown: 0,
+    turnover: 0,
+    rebalanceCount: 0,
+    liquidationCount: 0,
+  };
   return {
     scoreStartIndex: options.scoreStartIndex,
     holdingPeriodSteps,
@@ -558,7 +721,6 @@ export function createExposureValueOracleStorage(
     means: float32(prices.length, shared),
     secondMoments: float32(prices.length, shared),
     modalExposures: float32(prices.length, shared),
-    optimalExposures: float32(prices.length, shared),
     entropies: float32(prices.length, shared),
     weights: float32(prices.length, shared),
     opportunities: float32(prices.length, shared),
@@ -574,6 +736,7 @@ export function createExposureValueOracleStorage(
       quoteBorrowRate: options.quoteBorrowRate ?? 0,
       assetBorrowRate: options.assetBorrowRate ?? 0,
     },
+    path: emptyPath,
   };
 }
 
@@ -586,12 +749,16 @@ export function shareExposureValueOracle(oracle: ExposureValueOracle): ExposureV
     means: sharedCopy(oracle.means),
     secondMoments: sharedCopy(oracle.secondMoments),
     modalExposures: sharedCopy(oracle.modalExposures),
-    optimalExposures: sharedCopy(oracle.optimalExposures),
     entropies: sharedCopy(oracle.entropies),
     weights: sharedCopy(oracle.weights),
     opportunities: sharedCopy(oracle.opportunities),
     ...(oracle.probabilities ? { probabilities: sharedCopy(oracle.probabilities) } : {}),
     execution: { ...oracle.execution },
+    path: {
+      ...oracle.path,
+      exposures: sharedCopy(oracle.path.exposures),
+      equities: sharedCopy(oracle.path.equities),
+    },
   };
 }
 
@@ -608,13 +775,17 @@ export function truncateExposureValueOracle(
     means: oracle.means.subarray(0, length),
     secondMoments: oracle.secondMoments.subarray(0, length),
     modalExposures: oracle.modalExposures.subarray(0, length),
-    optimalExposures: oracle.optimalExposures.subarray(0, length),
     entropies: oracle.entropies.subarray(0, length),
     weights: oracle.weights.subarray(0, length),
     opportunities: oracle.opportunities.subarray(0, length),
     ...(oracle.probabilities
       ? { probabilities: oracle.probabilities.subarray(0, length * oracle.grid.length) }
       : {}),
+    path: {
+      ...oracle.path,
+      exposures: oracle.path.exposures.subarray(0, length),
+      equities: oracle.path.equities.subarray(0, length),
+    },
   };
 }
 
@@ -623,10 +794,11 @@ export function exposureValueOracleBytes(oracle: ExposureValueOracle): number {
     + oracle.means.byteLength
     + oracle.secondMoments.byteLength
     + oracle.modalExposures.byteLength
-    + oracle.optimalExposures.byteLength
     + oracle.entropies.byteLength
     + oracle.weights.byteLength
     + oracle.opportunities.byteLength
+    + oracle.path.exposures.byteLength
+    + oracle.path.equities.byteLength
     + (oracle.probabilities?.byteLength ?? 0);
 }
 
@@ -959,10 +1131,13 @@ export function strategyExposureQuadraticCoefficient(
   return coefficient;
 }
 
-export function createExposureReturnAccumulator(): ExposureReturnAccumulator {
+export function createExposureReturnAccumulator(initialExposure = 0): ExposureReturnAccumulator {
+  if (!Number.isFinite(initialExposure)) {
+    throw new Error("Exposure return initial exposure must be finite.");
+  }
   return {
     equity: 1,
-    exposure: 0,
+    exposure: initialExposure,
     peakEquity: 1,
     maxDrawdown: 0,
     turnover: 0,
@@ -970,6 +1145,29 @@ export function createExposureReturnAccumulator(): ExposureReturnAccumulator {
     liquidationCount: 0,
     sampleCount: 0,
   };
+}
+
+export function closeExposureReturn(
+  accumulator: ExposureReturnAccumulator,
+  options: ExposureExecutionOptions,
+): void {
+  if (!(accumulator.equity > 0) || Math.abs(accumulator.exposure) <= Number.EPSILON) {
+    accumulator.exposure = 0;
+    return;
+  }
+  const change = Math.abs(accumulator.exposure);
+  const rebalance = rebalanceEquityFactor(accumulator.exposure, 0, options.friction);
+  if (!(rebalance > 0)) {
+    accumulator.equity = 0;
+    accumulator.exposure = 0;
+    accumulator.maxDrawdown = 1;
+    return;
+  }
+  accumulator.equity *= rebalance;
+  accumulator.exposure = 0;
+  accumulator.turnover += change;
+  accumulator.rebalanceCount += 1;
+  updateDrawdown(accumulator);
 }
 
 export function observeExposureReturn(
@@ -997,7 +1195,17 @@ export function observeExposureReturn(
     accumulator.rebalanceCount += 1;
     updateDrawdown(accumulator);
   }
-  const holding = holdingOutcome(target, price, nextPrice, options);
+  observeHeldExposureReturn(accumulator, price, nextPrice, options, target);
+}
+
+function observeHeldExposureReturn(
+  accumulator: ExposureReturnAccumulator,
+  price: number,
+  nextPrice: number,
+  options: ExposureExecutionOptions,
+  exposure = accumulator.exposure,
+): void {
+  const holding = holdingOutcome(exposure, price, nextPrice, options);
   accumulator.equity *= holding.equityFactor;
   accumulator.exposure = holding.exposure;
   accumulator.liquidationCount += holding.liquidated ? 1 : 0;
@@ -1012,6 +1220,24 @@ export function finalizeExposureReturn(
     ...accumulator,
     totalReturn: accumulator.equity - 1,
     logReturn: accumulator.equity > 0 ? Math.log(accumulator.equity) : Number.NEGATIVE_INFINITY,
+  };
+}
+
+export function exposureValueOraclePathMetrics(oracle: ExposureValueOracle): ExposureReturnMetrics {
+  const equity = Math.exp(oracle.path.logReturn);
+  let peakEquity = 1;
+  for (const value of oracle.path.equities) peakEquity = Math.max(peakEquity, value);
+  return {
+    equity,
+    exposure: 0,
+    peakEquity,
+    maxDrawdown: oracle.path.maxDrawdown,
+    turnover: oracle.path.turnover,
+    rebalanceCount: oracle.path.rebalanceCount,
+    liquidationCount: oracle.path.liquidationCount,
+    sampleCount: Math.max(0, oracle.path.terminalIndex - oracle.path.startIndex),
+    totalReturn: oracle.path.totalReturn,
+    logReturn: oracle.path.logReturn,
   };
 }
 
@@ -1446,6 +1672,26 @@ function holdingOutcome(
   return { equityFactor: markedEquity, exposure: assetValue / markedEquity, liquidated: false };
 }
 
+function holdingBlockOutcome(
+  prices: ArrayLike<number>,
+  start: number,
+  end: number,
+  initialExposure: number,
+  options: ExposureExecutionOptions,
+): { logReturn: number; exposure: number } {
+  let logReturn = 0;
+  let exposure = initialExposure;
+  for (let time = start; time < end; time += 1) {
+    const outcome = holdingOutcome(exposure, prices[time]!, prices[time + 1]!, options);
+    if (!(outcome.equityFactor > 0)) {
+      return { logReturn: Number.NEGATIVE_INFINITY, exposure: 0 };
+    }
+    logReturn += Math.log(outcome.equityFactor);
+    exposure = outcome.exposure;
+  }
+  return { logReturn, exposure };
+}
+
 function updateDrawdown(accumulator: ExposureReturnAccumulator): void {
   accumulator.peakEquity = Math.max(accumulator.peakEquity, accumulator.equity);
   accumulator.maxDrawdown = Math.max(
@@ -1509,9 +1755,23 @@ export function validateExposureValueOracleOptions(
   if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= 0 || maximum <= 0) {
     throw new Error("Exposure value oracle bounds must contain zero.");
   }
+  const zeroGridPosition = -minimum / (maximum - minimum) * (options.gridSize - 1);
+  if (Math.abs(zeroGridPosition - Math.round(zeroGridPosition)) > 1e-9) {
+    throw new Error("Exposure value oracle grid must contain an exact zero-exposure point.");
+  }
   if (!Number.isFinite(maximumEffective)
     || maximumEffective < Math.max(Math.abs(minimum), Math.abs(maximum))) {
     throw new Error("Exposure value oracle effective exposure must cover the tradable grid.");
+  }
+  const initialExposure = options.initialExposure ?? 0;
+  if (!Number.isFinite(initialExposure) || Math.abs(initialExposure) > maximumEffective) {
+    throw new Error("Exposure value oracle initial exposure exceeds the effective-exposure limit.");
+  }
+  const terminalIndex = options.terminalIndex ?? prices.length - 1;
+  if (!Number.isInteger(terminalIndex)
+    || terminalIndex <= options.scoreStartIndex
+    || terminalIndex >= prices.length) {
+    throw new Error("Exposure value oracle terminal candle is outside the scored price series.");
   }
   const finiteNonNegative = [
     options.friction,
