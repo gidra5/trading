@@ -42,7 +42,8 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
   }));
   const valueOracle = prepareExposureValueOracle(candles.map((candle) => candle.close), {
     scoreStartIndex,
-    horizonSteps: 30,
+    holdingPeriodSteps: 30,
+    valueHorizonSteps: 90,
     friction: 0.00175,
     gridSize: 21,
     temperature: 0.01,

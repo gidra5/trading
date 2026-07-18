@@ -72,8 +72,10 @@ async function main(): Promise<void> {
   for (const { start, end } of ranges) for (let day = start; day <= end; day += DAY_MS) {
     const date = new Date(day).toISOString().slice(0, 10);
     const target = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? ".gz" : ""}`);
+    const alternate = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? "" : ".gz"}`);
     const expected = DAY_MS / intervalMs;
-    const cached = await validatedCount(target, day, expected);
+    const cached = await validatedCount(target, day, expected)
+      || await validatedCount(alternate, day, expected);
     if (cached > 0) {
       total += cached;
       if (!quiet) console.log(`${date}: cached (${cached.toLocaleString()} candles)`);

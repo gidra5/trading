@@ -120,7 +120,8 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.ok(analysis.candles.length <= 2_000);
     assert.ok(analysis.valueDistributions.length > 0);
     assert.ok(analysis.metrics.valueDistillation);
-    assert.equal(analysis.metrics.valueDistillation!.horizonMs, 1_000);
+    assert.equal(analysis.metrics.valueDistillation!.holdingPeriodMs, 1_000);
+    assert.equal(analysis.metrics.valueDistillation!.valueHorizonMs, 1_000);
     assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.strategy.totalReturn));
     assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.oracle.totalReturn));
     assert.equal(analysis.indicatorPoints.length, analysis.kamaSeries.points.length);

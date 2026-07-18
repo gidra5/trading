@@ -26,10 +26,17 @@ async function run(): Promise<void> {
   const candidateCount = positiveInteger(process.argv[2] ?? "384", "candidate count");
   const candleCount = positiveInteger(process.argv[3] ?? "20000", "candle count");
   const gridSize = positiveInteger(process.argv[4] ?? "101", "grid size");
-  const horizonSteps = positiveInteger(process.argv[5] ?? "300", "horizon steps");
-  const caseCount = positiveInteger(process.argv[6] ?? "4", "case count");
+  const holdingPeriodSteps = positiveInteger(process.argv[5] ?? "300", "holding-period steps");
+  const valueHorizonSteps = positiveInteger(
+    process.argv[6] ?? String(candleCount),
+    "value-horizon steps",
+  );
+  if (valueHorizonSteps < holdingPeriodSteps) {
+    throw new Error("Value-horizon steps must be at least holding-period steps.");
+  }
+  const caseCount = positiveInteger(process.argv[7] ?? "4", "case count");
   const strategyQuadraticScale = nonNegativeNumber(
-    process.argv[7] ?? "0",
+    process.argv[8] ?? "0",
     "strategy quadratic scale",
   );
   const scoreStartIndex = Math.max(1_000, Math.floor(candleCount * 0.25));
@@ -42,7 +49,8 @@ async function run(): Promise<void> {
   const prices = candles.map((candle) => candle.close);
   const oracleOptions = {
     scoreStartIndex,
-    horizonSteps,
+    holdingPeriodSteps,
+    valueHorizonSteps,
     friction: 0.00175,
     gridSize,
     temperature: 0.001,
@@ -143,7 +151,8 @@ async function run(): Promise<void> {
       candidateCount,
       candleCount,
       gridSize,
-      horizonSteps,
+      holdingPeriodSteps,
+      valueHorizonSteps,
       caseCount,
       scoreStartIndex,
       strategyQuadraticScale,

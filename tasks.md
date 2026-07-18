@@ -172,6 +172,9 @@ we need to adjust the oracle evaluation:
       2. or more generally a_t=argmax_a(Q_t(a))
    7. Then the definition for oracle's return is simply the log return over initial and final equity:
       1. Q_t(a)=ln E_T/E_t
+      2. H is the forced holding period for a; T-t is the independently configured value horizon.
+      3. In truncate mode, T=min(t+valueHorizon, segmentEnd).
+      4. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
    8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
    9. bellman equation???
 2. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).

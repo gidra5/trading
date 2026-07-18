@@ -41,8 +41,10 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   minExposure: -100,
   maxExposure: 100,
   maxEffectiveExposure: 250,
-  horizonMode: "fixed",
-  horizonMs: 1_000,
+  holdingPeriodMode: "fixed",
+  holdingPeriodMs: 1_000,
+  valueHorizonMs: 1_000,
+  horizonEndMode: "truncate",
   oracleTemperature: 0.01,
   strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
@@ -178,7 +180,8 @@ const metricHelp = {
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
   distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
-  valueHorizon: "Resolved H used by the value oracle and strategy distribution. Adaptive mode uses half the mean time between consecutive executable oracle state changes; the fixed value is used when fewer than two oracle transitions exist.",
+  valueHoldingPeriod: "Resolved H for which each candidate exposure is forced. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
+  valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
   oracleReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the executable hindsight Bellman policy and the same friction.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
@@ -1169,8 +1172,10 @@ export function KamaInspectorPage() {
               <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
               <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
               <InspectorNumber label="Value grid points" value={valueConfig().gridSize} min={3} max={1024} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, gridSize: Math.round(value) }))} />
-              <InspectorSelect label="Value horizon source" value={valueConfig().horizonMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMode: value as VwKamaValueDistillationConfig["horizonMode"] }))} />
-              <DurationInput label={valueConfig().horizonMode === "fixed" ? "Value horizon H" : "Fallback horizon H"} value={valueConfig().horizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, horizonMs: value }))} />
+              <InspectorSelect label="Holding-period source" value={valueConfig().holdingPeriodMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMode: value as VwKamaValueDistillationConfig["holdingPeriodMode"] }))} />
+              <DurationInput label={valueConfig().holdingPeriodMode === "fixed" ? "Holding period H" : "Fallback holding period H"} value={valueConfig().holdingPeriodMs} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMs: value, valueHorizonMs: Math.max(current.valueHorizonMs, value) }))} />
+              <DurationInput label="Value horizon T−t" value={valueConfig().valueHorizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMs: Math.max(value, current.holdingPeriodMs) }))} />
+              <InspectorSelect label="Horizon at window end" value={valueConfig().horizonEndMode} options={[{ value: "truncate", label: "Truncate at window end" }, { value: "extend", label: "Use future candles" }]} onInput={(value) => setValueConfig((current) => ({ ...current, horizonEndMode: value as VwKamaValueDistillationConfig["horizonEndMode"] }))} />
               <InspectorNumber label="Oracle temperature" value={valueConfig().oracleTemperature} min={0.000001} step={0.001} onInput={(value) => setValueConfig((current) => ({ ...current, oracleTemperature: value }))} />
               <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H log-return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
@@ -1216,7 +1221,8 @@ export function KamaInspectorPage() {
                     <>
                       <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
                       <ScoreCard label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
-                      <ScoreCard label="Resolved horizon H" value={formatDuration(value().horizonMs)} description={metricHelp.valueHorizon} />
+                      <ScoreCard label="Resolved holding H" value={formatDuration(value().holdingPeriodMs)} description={metricHelp.valueHoldingPeriod} />
+                      <ScoreCard label="Value horizon T−t" value={formatDuration(value().valueHorizonMs)} description={metricHelp.valueHorizon} />
                       <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
                       <ScoreCard label="Oracle return" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
                       <ScoreCard label="Strategy drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />

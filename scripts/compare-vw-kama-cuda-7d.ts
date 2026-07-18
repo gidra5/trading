@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
@@ -520,7 +521,14 @@ async function loadSource(start: number, end: number): Promise<TradingCandle[]> 
   const candles: TradingCandle[] = [];
   for (let day = utcDay(start); day < end; day += DAY) {
     const date = new Date(day).toISOString().slice(0, 10);
-    const content = await fs.readFile(path.join(sourceDir, `${date}.jsonl`), "utf8");
+    const plainFile = path.join(sourceDir, `${date}.jsonl`);
+    let content: string;
+    try {
+      content = await fs.readFile(plainFile, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      content = gunzipSync(await fs.readFile(`${plainFile}.gz`)).toString("utf8");
+    }
     for (const line of content.split("\n")) {
       if (!line) continue;
       const candle = JSON.parse(line) as TradingCandle;

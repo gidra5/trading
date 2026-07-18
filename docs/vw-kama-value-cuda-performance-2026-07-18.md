@@ -1,7 +1,7 @@
 # VW-KAMA value-search performance pass — 2026-07-18
 
 This pass optimized the exact value-distillation implementation without changing its objective,
-fee equations, `H`-step holding semantics, or deterministic lower-exposure tie break.
+fee equations, `H`-step holding semantics, segment-ending `T`, or deterministic lower-exposure tie break.
 
 ## Retained changes
 
@@ -10,9 +10,10 @@ fee equations, `H`-step holding semantics, or deterministic lower-exposure tie b
   log-sum-exp and the oracle's resident second moment.
 - Bellman recurrence: separable buy/sell fee factors use prefix and suffix maxima, reducing the
   continuation update from `O(G²)` to `O(G)` on CPU and `O(log G)` scan depth on CUDA.
-- Holding values: CPU reuses marked outcomes and continued-value rings. CUDA computes one-step
-  values in parallel, builds continuation prefixes, assembles all `H`-step holding returns, and
-  executes the `H` independent backward residue chains concurrently.
+- Holding values: CPU reuses marked outcomes and continuation prefixes. CUDA computes one-step
+  values in parallel, builds continuation prefixes, and assembles all `H`-step holding returns.
+  A segment-ending `T` uses the independent backward residue chains; a finite rolling `T` launches
+  all scored starting times concurrently for each holding-period block.
 - Fitness specialization: evolutionary value fitness calculates only strategy state and weighted
   cross-entropy. Transition alignment, lag percentiles, oracle/strategy returns, drawdown, and
   turnover are deferred to diagnostic evaluation.
@@ -38,7 +39,7 @@ fee equations, `H`-step holding semantics, or deterministic lower-exposure tie b
 ## Measurements
 
 Device: NVIDIA GeForce RTX 3060 Laptop GPU. Oracle workload: 20,000 synthetic candles, 19,000
-scored candles, grid 101, `H=300`. Times vary slightly with clocks; ratios below use repeated warm
+scored candles, grid 101, `H=300`, with `T` at the segment end. Times vary slightly with clocks; ratios below use repeated warm
 runs from the same implementation steps.
 
 | Oracle implementation | Time | Relative to original |
@@ -76,7 +77,7 @@ volatility over a separately configured trailing duration.
 The concave quadratic normalizer now sums a curvature-derived, mode-centered fixed window using
 the quadratic's constant second difference. Its tail bound is below the target numeric precision;
 the zero-coefficient geometric path and positive-quadratic full-grid fallback are unchanged. On
-20,000 candles, grid 150, `H=300`, 384 candidates, four cases, and quadratic scale 200,000, the
+20,000 candles, grid 150, `H=300`, segment-ending `T`, 384 candidates, four cases, and quadratic scale 200,000, the
 resident fitness kernel improved from 120.2 ms to 107.5 ms (10.6%), and the scheduled four-case
 kernel improved from 127.1 ms to 114.5 ms (9.9%), with zero fitness/diagnostic loss drift.
 
@@ -98,9 +99,9 @@ Run:
 
 ```bash
 npm run build:cuda
-npm run benchmark:kama:value:cuda -- 384 20000 101 300 4
+npm run benchmark:kama:value:cuda -- 384 20000 101 300 20000 4
 # final optional argument selects nonnegative quadratic scale b2'
-npm run benchmark:kama:value:cuda -- 384 20000 101 300 4 200000
+npm run benchmark:kama:value:cuda -- 384 20000 101 300 20000 4 200000
 npm test -w @trading/bot-algo
 npm run typecheck
 npm run build

@@ -9,8 +9,10 @@ npm run search:kama -- \
   --exposure-grid-size 150 \
   --exposure-min -100 --exposure-max 100 \
   --max-effective-exposure 250 \
-  --value-horizon-mode fixed \
+  --value-holding-period-mode fixed \
+  --value-holding-period 1s \
   --value-horizon 1s \
+  --value-horizon-end-mode truncate \
   --oracle-temperature 0.01 \
   --strategy-temperature-range 0.000001..0.1 \
   --strategy-quadratic-scale-range 0..1000000 \
@@ -20,11 +22,11 @@ npm run search:kama -- \
   --strategy-volatility-scaling true
 ```
 
-`--accelerator auto` and `--accelerator cuda` support this objective. The exact Bellman update
-uses separable buy/sell fee factors, reducing each time step from `O(grid²)` to `O(grid)`.
-CUDA precomputes holding-return prefixes, then evaluates the `H` independent backward residue
-chains concurrently. CPU preparation uses compact outcome and continuation rings. The oracle is
-prepared once per candle segment and retained by the prepared-stage cache.
+`--accelerator auto` and `--accelerator cuda` support this objective. The exact finite-horizon
+Bellman update uses separable buy/sell fee factors, reducing each time step from `O(grid²)` to
+`O(grid)`. CPU and CUDA both evaluate the rolling horizon in holding-period blocks; CUDA launches
+all scored starting times in parallel at each Bellman depth. The oracle is prepared once per
+candle segment and retained by the prepared-stage cache.
 
 Candidate fitness cases remain resident on the GPU across generations. Search therefore uploads
 columns and oracle sufficient statistics once, then communicates only packed parameters and
@@ -36,11 +38,9 @@ streams, and recurrent change rings use packed per-candidate offsets instead of 
 `candidateCount × maximumPeriod × 2` allocation.
 
 `cuda` forces CUDA oracle preparation and candidate evaluation. `auto` uses CUDA oracle
-preparation when the estimated stage contains at least 10 million candle-grid cells and fixed
-`H >= 8`, amortizing context startup and providing enough independent residue chains; smaller or
-`H=1` preparations use the optimized CPU recurrence. Candidate scheduling
+preparation after its normal size checks. Candidate scheduling
 uses CUDA at four or more candidate-case lanes. The inspector uses CUDA for at least 10 million
-scored candle-grid cells with `H >= 8`, otherwise CPU avoids one-request startup overhead. The
+scored candle-grid cells, otherwise CPU avoids one-request startup overhead. The
 native CUDA grid limit and the UI maximum are both 1,024 grid points.
 
 The repeatable benchmark is `npm run benchmark:kama:value:cuda`. On the RTX 3060 Laptop test
@@ -53,19 +53,24 @@ cross-entropy, returns, and scheduled fitness.
 ## Oracle value
 
 For every scored time `t` and grid exposure `a`, the oracle computes `Q_t(a)`: force exposure
-`a` for the next value horizon `H`, then follow the optimal policy. The target exposure remains
-exactly `a` throughout `H`, so price drift is corrected by intermediate rebalances using the
-same friction model. The continuation is a backward Bellman recurrence from `t + H` over the
-exposure grid. Near the segment end, the hold is truncated at the last available close.
+`a` for holding period `H`, then follow the optimal policy until final-equity time
+`T = min(t + valueHorizon, segmentEnd)`. The target exposure remains exactly `a` throughout `H`,
+so price drift is corrected by intermediate rebalances using the same friction model. The finite
+Bellman continuation runs from `t + H` through `T`.
 
-`--value-horizon-mode fixed` uses `--value-horizon` directly and defaults to one candle (`1s` is
-one step at every supported scale). With
-`--value-horizon-mode oracle-half-average-trade`, each continuous scored segment resolves `H` as
+`--value-holding-period-mode fixed` uses `--value-holding-period` directly and defaults to one
+candle (`1s` is one step at every supported scale). With
+`--value-holding-period-mode oracle-half-average-trade`, each continuous scored segment resolves `H` as
 half the arithmetic mean of the elapsed times between consecutive executable
 perfect-margin-oracle state changes. The result is rounded to the nearest candle interval. If the
-segment has fewer than two oracle transitions, `--value-horizon` is used as the fallback. The
-inspector displays the resolved `H`; search preparation logs its range and holdout reports include
-it per case.
+segment has fewer than two oracle transitions, `--value-holding-period` is used as the fallback.
+`--value-horizon` independently sets `T-t` and must be at least the configured fallback `H`; if an
+adaptive `H` is longer, preparation fails and reports that the horizon must be increased. With
+`--value-horizon-end-mode truncate` (the default), `T` is capped at the scored window's last close.
+With `--value-horizon-end-mode extend`, preparation loads post-window candles and keeps
+`T=t+valueHorizon` for every scored example. Candidate scoring still ends at the window boundary;
+only the hindsight oracle target may read beyond it. Missing or discontinuous post-window candles
+are an error in `extend` mode. The inspector and reports display both durations and the end mode.
 
 Rebalancing uses the exact buy/sell fee equations recorded in `tasks.md`. Maintenance applies
 the configured per-candle quote lend, quote borrow, and asset borrow rates. Trades may select only
@@ -111,7 +116,7 @@ is zero and the quadratic term is inactive at that scale.
 `effectiveTemperature = strategyTemperature * sqrt(H / dt)`
 
 Enabling `strategyVolatilityScaling` additionally multiplies effective temperature by the same
-calculation over the value horizon `H`, independently of the quadratic volatility window. Both
+calculation over the holding period `H`, independently of the quadratic volatility window. Both
 measurements are causal and include only log returns known at the current candle close. Thus the
 optional temperature scaling softens the linear rate preference using trailing-H volatility,
 while the quadratic term grows with volatility measured over its separately configured window.
@@ -126,7 +131,7 @@ diagnostic.
 
 The standard search also writes its validation-selected volume-aware and canonical finalists
 to `data/benchmarks/vw-kama-global-presets.json`. The KAMA inspector loads these presets and
-uses the exact horizon, exposure limits, temperatures, quadratic scale, quadratic volatility
+uses the exact holding period, value horizon, exposure limits, temperatures, quadratic scale, quadratic volatility
 window, and temperature-volatility setting stored with the run.
 
 Because `log s_t(a) = kappa_t*a + b2_t*a² - log Z_t`, exact cross-entropy is

@@ -16,6 +16,7 @@ import {
   strategyExposureQuadraticCoefficient,
   strategyExposureTemperatures,
   strategyExposureVolatilities,
+  truncateExposureValueOracle,
   truncatedExponentialLogNormalizer,
 } from "../src/exposure-value-distillation.js";
 import {
@@ -34,7 +35,8 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
   for (const gridSize of [21, 65]) {
     const options = {
       scoreStartIndex: 300,
-      horizonSteps: 17,
+      holdingPeriodSteps: 17,
+      valueHorizonSteps: 2_000,
       friction: 0.00175,
       gridSize,
       minExposure: -1,
@@ -71,7 +73,8 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
 
   const leveragedOptions = {
     scoreStartIndex: 300,
-    horizonSteps: 5,
+    holdingPeriodSteps: 5,
+    valueHorizonSteps: 2_000,
     friction: 0.00175,
     gridSize: 21,
     minExposure: -100,
@@ -117,27 +120,31 @@ test("exposure value oracle prefers the sign of the next price move", () => {
 test("exposure value oracle retains selected H when the segment tail truncates the hold", () => {
   const oracle = prepareExposureValueOracle([100, 101, 102], {
     scoreStartIndex: 0,
-    horizonSteps: 10,
+    holdingPeriodSteps: 10,
+    valueHorizonSteps: 10,
     friction: 0,
     gridSize: 3,
     temperature: 0.01,
   });
 
-  assert.equal(oracle.horizonSteps, 10);
+  assert.equal(oracle.holdingPeriodSteps, 10);
+  assert.equal(oracle.valueHorizonSteps, 10);
 });
 
 test("exposure value holds the input target for H before perfect continuation", () => {
   const prices = [100, 120, 60, 60];
   const oneStep = prepareExposureValueOracle(prices, {
     scoreStartIndex: 0,
-    horizonSteps: 1,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
     friction: 0,
     gridSize: 21,
     temperature: 0.005,
   });
   const twoSteps = prepareExposureValueOracle(prices, {
     scoreStartIndex: 0,
-    horizonSteps: 2,
+    holdingPeriodSteps: 2,
+    valueHorizonSteps: 3,
     friction: 0,
     gridSize: 21,
     temperature: 0.005,
@@ -148,13 +155,62 @@ test("exposure value holds the input target for H before perfect continuation", 
   assert.equal(twoSteps.optimalExposures[0], twoSteps.optimalExposures[1]);
 });
 
+test("value horizon T caps final equity independently from holding period H", () => {
+  const prices = [100, 90, 200, 50];
+  const shortHorizon = prepareExposureValueOracle(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 1,
+    friction: 0.1,
+    gridSize: 21,
+    temperature: 0.01,
+  });
+  const longHorizon = prepareExposureValueOracle(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction: 0.1,
+    gridSize: 21,
+    temperature: 0.01,
+  });
+
+  assert.equal(shortHorizon.modalExposures[0], -1);
+  assert.equal(longHorizon.modalExposures[0], 0);
+  assert.equal(shortHorizon.holdingPeriodSteps, longHorizon.holdingPeriodSteps);
+  assert.notEqual(shortHorizon.valueHorizonSteps, longHorizon.valueHorizonSteps);
+});
+
+test("a scored oracle prefix can keep values from post-window candles", () => {
+  const options = {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 3,
+    friction: 0.1,
+    gridSize: 21,
+    temperature: 0.01,
+  };
+  const extended = truncateExposureValueOracle(
+    prepareExposureValueOracle([100, 90, 200, 50], options),
+    2,
+  );
+  const truncated = prepareExposureValueOracle([100, 90], {
+    ...options,
+    valueHorizonSteps: 1,
+  });
+
+  assert.equal(extended.means.length, 2);
+  assert.equal(extended.modalExposures[0], 0);
+  assert.equal(truncated.modalExposures[0], -1);
+});
+
 test("H-step oracle values include drift-correcting rebalances", () => {
   const prices = [100, 98, 95];
   const friction = 0.00175;
   const temperature = 0.01;
   const oracle = prepareExposureValueOracle(prices, {
     scoreStartIndex: 0,
-    horizonSteps: 2,
+    holdingPeriodSteps: 2,
+    valueHorizonSteps: 2,
     friction,
     gridSize: 5,
     temperature,
@@ -327,12 +383,12 @@ test("signed rate selects the side and lower temperature increases concentration
 test("strategy calibration uses trailing-H log-return volatility", () => {
   const hourly = strategyExposureTemperatures([100, 101], {
     intervalMs: 3_600_000,
-    horizonSteps: 1,
+    holdingPeriodSteps: 1,
     temperature: 0.01,
   });
   const quarterHourly = strategyExposureTemperatures([100, 101], {
     intervalMs: 900_000,
-    horizonSteps: 4,
+    holdingPeriodSteps: 4,
     temperature: 0.01,
   });
   assert.ok(Math.abs(hourly[0]! - 0.01) < 1e-8);
@@ -340,7 +396,7 @@ test("strategy calibration uses trailing-H log-return volatility", () => {
 
   const exact = strategyExposureTemperatures([100, 110, 99], {
     intervalMs: 60_000,
-    horizonSteps: 2,
+    holdingPeriodSteps: 2,
     temperature: 0.01,
     scaleByVolatility: true,
   });
@@ -363,13 +419,13 @@ test("strategy calibration uses trailing-H log-return volatility", () => {
     100 * Math.exp((index % 2 === 0 ? -1 : 1) * amplitude));
   const low = strategyExposureTemperatures(prices(0.001), {
     intervalMs: 60_000,
-    horizonSteps: 10,
+    holdingPeriodSteps: 10,
     temperature: 0.01,
     scaleByVolatility: true,
   });
   const high = strategyExposureTemperatures(prices(0.01), {
     intervalMs: 60_000,
-    horizonSteps: 10,
+    holdingPeriodSteps: 10,
     temperature: 0.01,
     scaleByVolatility: true,
   });

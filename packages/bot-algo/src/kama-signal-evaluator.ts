@@ -49,13 +49,14 @@ const DAY_MS = 86_400_000;
 const F1_WEIGHT = 0.2;
 const AGREEMENT_WEIGHT = 0.6;
 const CLEANLINESS_WEIGHT = 0.2;
-export const VW_KAMA_SCORE_VERSION = 8;
+export const VW_KAMA_SCORE_VERSION = 10;
 
 export type VwKamaDeadbandMode = "flat" | "hold" | "hysteresis";
 export type VwKamaAgreementMode = "sizing" | "confidence";
 export type VwKamaRateMode = "relative" | "log";
 export type VwKamaThresholdResponse = "proportional" | "inverse";
-export type VwKamaValueHorizonMode = "fixed" | "oracle-half-average-trade";
+export type VwKamaHoldingPeriodMode = "fixed" | "oracle-half-average-trade";
+export type VwKamaValueHorizonEndMode = "truncate" | "extend";
 
 export interface VwKamaParameters {
   efficiencyMs: number;
@@ -218,8 +219,10 @@ export interface VwKamaValueDistillationConfig {
   minExposure: number;
   maxExposure: number;
   maxEffectiveExposure: number;
-  horizonMode: VwKamaValueHorizonMode;
-  horizonMs: number;
+  holdingPeriodMode: VwKamaHoldingPeriodMode;
+  holdingPeriodMs: number;
+  valueHorizonMs: number;
+  horizonEndMode: VwKamaValueHorizonEndMode;
   oracleTemperature: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
@@ -326,7 +329,8 @@ export interface VwKamaAccuracyMetrics {
 }
 
 export interface VwKamaValueDistillationMetrics extends ExposureValueDistillationMetrics {
-  horizonMs: number;
+  holdingPeriodMs: number;
+  valueHorizonMs: number;
   returns: {
     oracle: ExposureReturnMetrics;
     strategy: ExposureReturnMetrics;
@@ -520,18 +524,18 @@ export function averageVwKamaOracleTradeIntervalMs(
 }
 
 /** Resolves fixed H or half the oracle's average inter-trade interval to candle steps. */
-export function resolveVwKamaValueHorizonSteps(
+export function resolveVwKamaHoldingPeriodSteps(
   candles: VwKamaCandleSeries,
   scoreStartIndex: number,
   stateCodes: Uint8Array,
   intervalMs: number,
-  config: Pick<VwKamaValueDistillationConfig, "horizonMode" | "horizonMs">,
+  config: Pick<VwKamaValueDistillationConfig, "holdingPeriodMode" | "holdingPeriodMs">,
 ): number {
-  const average = config.horizonMode === "oracle-half-average-trade"
+  const average = config.holdingPeriodMode === "oracle-half-average-trade"
     ? averageVwKamaOracleTradeIntervalMs(candles, scoreStartIndex, stateCodes)
     : null;
-  const horizonMs = average === null ? config.horizonMs : average * 0.5;
-  return Math.max(1, Math.round(horizonMs / intervalMs));
+  const holdingPeriodMs = average === null ? config.holdingPeriodMs : average * 0.5;
+  return Math.max(1, Math.round(holdingPeriodMs / intervalMs));
 }
 
 export type VwKamaEvaluation = Omit<
@@ -748,7 +752,7 @@ export function evaluateVwKamaOracle(
       valuePrices!,
       {
         intervalMs: options.intervalMs,
-        horizonSteps: options.valueDistillation.oracle.horizonSteps,
+        holdingPeriodSteps: options.valueDistillation.oracle.holdingPeriodSteps,
         temperature: 1,
         scaleByVolatility: options.valueDistillation.strategyVolatilityScaling,
       },
@@ -1077,7 +1081,8 @@ export function evaluateVwKamaOracle(
     ...(valueDistillation && valueReturns
       ? { valueDistillation: {
           ...finalizeExposureValueDistillation(valueDistillation),
-          horizonMs: options.valueDistillation!.oracle.horizonSteps * options.intervalMs,
+          holdingPeriodMs: options.valueDistillation!.oracle.holdingPeriodSteps * options.intervalMs,
+          valueHorizonMs: options.valueDistillation!.oracle.valueHorizonSteps * options.intervalMs,
           returns: {
             oracle: finalizeExposureReturn(valueReturns.oracle),
             strategy: finalizeExposureReturn(valueReturns.strategy),
@@ -1153,7 +1158,7 @@ function valueDistributionPoint(
   const strategyProbabilities = strategyExposureProbabilities(
     oracle.grid,
     rateBpsPerHour,
-    intervalMs * oracle.horizonSteps,
+    intervalMs * oracle.holdingPeriodSteps,
     strategyTemperature,
     strategyQuadraticCoefficient,
   );

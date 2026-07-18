@@ -11,7 +11,7 @@ import {
   perfectMarginOracle,
   prepareExposureValueOracle,
   prepareVwKamaOracle,
-  resolveVwKamaValueHorizonSteps,
+  resolveVwKamaHoldingPeriodSteps,
   signalBeyondFriction,
   strategyExposureVolatilities,
   vwKamaParametersFromPeakValleySignal,
@@ -19,7 +19,7 @@ import {
   type VwKamaTransition,
 } from "../src/index.js";
 
-test("VW-KAMA value horizon can use half the oracle's average inter-trade time", () => {
+test("VW-KAMA holding period can use half the oracle's average inter-trade time", () => {
   const candles = Array.from({ length: 8 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -35,23 +35,23 @@ test("VW-KAMA value horizon can use half the oracle's average inter-trade time",
   const stateCodes = Uint8Array.from([0, 1, 1, 2, 2, 2, 0, 0]);
 
   assert.equal(averageVwKamaOracleTradeIntervalMs(candles, 1, stateCodes), 2_500);
-  assert.equal(resolveVwKamaValueHorizonSteps(
+  assert.equal(resolveVwKamaHoldingPeriodSteps(
     candles,
     1,
     stateCodes,
     1_000,
-    { horizonMode: "oracle-half-average-trade", horizonMs: 5_000 },
+    { holdingPeriodMode: "oracle-half-average-trade", holdingPeriodMs: 5_000 },
   ), 1);
-  assert.equal(resolveVwKamaValueHorizonSteps(
+  assert.equal(resolveVwKamaHoldingPeriodSteps(
     candles,
     1,
     stateCodes,
     1_000,
-    { horizonMode: "fixed", horizonMs: 5_000 },
+    { holdingPeriodMode: "fixed", holdingPeriodMs: 5_000 },
   ), 5);
 });
 
-test("VW-KAMA half-oracle-average value horizon falls back without two oracle transitions", () => {
+test("VW-KAMA half-oracle-average holding period falls back without two oracle transitions", () => {
   const candles = Array.from({ length: 4 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -65,12 +65,12 @@ test("VW-KAMA half-oracle-average value horizon falls back without two oracle tr
     closed: true,
   }));
 
-  assert.equal(resolveVwKamaValueHorizonSteps(
+  assert.equal(resolveVwKamaHoldingPeriodSteps(
     candles,
     1,
     Uint8Array.from([0, 0, 1, 1]),
     1_000,
-    { horizonMode: "oracle-half-average-trade", horizonMs: 4_000 },
+    { holdingPeriodMode: "oracle-half-average-trade", holdingPeriodMs: 4_000 },
   ), 4);
 });
 
@@ -270,7 +270,7 @@ test("VW-KAMA evaluator produces causal transitions and bounded chart traces", (
     && item.adx >= 0 && item.adx <= 100));
 });
 
-test("VW-KAMA b2 volatility window is independent from the one-step value horizon", () => {
+test("VW-KAMA b2 volatility window is independent from the one-step holding period", () => {
   const closes = [100, 102, 99, 103, 101];
   const candles = closes.map((close, index): Candle => ({
     symbol: "BTCUSDT",
@@ -286,7 +286,7 @@ test("VW-KAMA b2 volatility window is independent from the one-step value horizo
   }));
   const valueOracle = prepareExposureValueOracle(closes, {
     scoreStartIndex: 1,
-    horizonSteps: 1,
+    holdingPeriodSteps: 1,
     friction: 0,
     gridSize: 5,
     temperature: 0.01,
