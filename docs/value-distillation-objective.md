@@ -10,8 +10,8 @@ npm run search:kama -- \
   --exposure-min -100 --exposure-max 100 \
   --max-effective-exposure 250 \
   --value-holding-period-mode fixed \
-  --value-holding-period 1s \
-  --value-horizon 1s \
+  --value-holding-period 60s \
+  --value-horizon 1h \
   --value-horizon-end-mode truncate \
   --oracle-temperature 0.01 \
   --strategy-temperature-range 0.000001..0.1 \
@@ -62,13 +62,13 @@ policy until final-equity time `T = min(t + valueHorizon, segmentEnd)`. Exposure
 throughout `H`; maintenance is applied but no target-restoring trades occur. At `t + H`, the
 Bellman continuation compares grid rebalances with keeping the exact drifted exposure unchanged.
 
-`--value-holding-period-mode fixed` uses `--value-holding-period` directly and defaults to one
-candle (`1s` is one step at every supported scale). With
+`--value-holding-period-mode fixed` uses `--value-holding-period` directly and defaults to 60
+seconds. With
 `--value-holding-period-mode oracle-half-average-trade`, each continuous scored segment resolves `H` as
 half the arithmetic mean of the elapsed times between consecutive executable
 perfect-margin-oracle state changes. The result is rounded to the nearest candle interval. If the
 segment has fewer than two oracle transitions, `--value-holding-period` is used as the fallback.
-`--value-horizon` independently sets `T-t` and must be at least the configured fallback `H`; if an
+`--value-horizon` independently sets `T-t`, defaults to one hour, and must be at least the configured fallback `H`; if an
 adaptive `H` is longer, preparation fails and reports that the horizon must be increased. With
 `--value-horizon-end-mode truncate` (the default), `T` is capped at the scored window's last close.
 With `--value-horizon-end-mode extend`, preparation loads post-window candles and keeps
@@ -207,7 +207,9 @@ at that same candidate state. The oracle, prediction, and difference heatmap pan
 independently; visible panels reflow to fill the available width. Oracle and prediction row modes,
 row means, the oracle-path row, candidate row, and `x + a = 0` trace also have independent shared
 marking toggles that apply to every visible heatmap.
-Grid-squared matrices are derived only for the selected point in the browser; workers and API
+Rectangular `stateGrid × actionGrid` matrices are derived only for the selected point in the
+browser. The vertical state axis spans the full effective-exposure interval (normally
+`[-250,250]`), while the horizontal action axis remains executable `[-100,100]`; workers and API
 payloads keep compact sufficient statistics.
 
 Hovering a cell in the oracle or prediction heatmap adds two curves to the conditional-slices
@@ -272,7 +274,7 @@ execution-level PnL.
 - Fixed or per-segment half-oracle-average `H` target-exposure hold followed by perfect-oracle
   continuation.
 - Per-candle borrow/lend rates, defaulting to zero.
-- Uniform operational weighting over all grid current exposures; no minimum-order or absolute
+- Uniform operational weighting over all full-range current-state exposures; no minimum-order or absolute
   balance state.
 - Existing transition metrics remain diagnostic and can still be selected with
   `--objective signal`.

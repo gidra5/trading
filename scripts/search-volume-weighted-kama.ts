@@ -3527,8 +3527,8 @@ function parseArgs(argv: string[]): Args {
   const accelerator = get("accelerator", "auto");
   const objective = get("objective", "signal");
   const valueHoldingPeriodMode = get("value-holding-period-mode", "fixed");
-  const valueHoldingPeriodMs = parseDuration(get("value-holding-period", "1s"));
-  const valueHorizonMs = parseDuration(get("value-horizon", "1s"));
+  const valueHoldingPeriodMs = parseDuration(get("value-holding-period", "60s"));
+  const valueHorizonMs = parseDuration(get("value-horizon", "1h"));
   const valueHorizonEndMode = get("value-horizon-end-mode", "truncate");
   const oracleMutualInformationMode = get("oracle-mi-mode", "approximate");
   const scoreVersion = integer(get("score-version", String(VW_KAMA_SCORE_VERSION)), "score-version");
@@ -4110,8 +4110,8 @@ function help(): void {
   --objective signal                signal or value-distillation fitness
   --exposure-grid-size 151 --exposure-min -100 --exposure-max 100
   --value-holding-period-mode fixed fixed or oracle-half-average-trade
-  --value-holding-period 1s         Fixed H (one candle by default), or adaptive fallback
-  --value-horizon 1s                Final-equity horizon T−t; must be at least H
+  --value-holding-period 60s        Fixed H, or adaptive fallback
+  --value-horizon 1h                Final-equity horizon T−t; must be at least H
   --value-horizon-end-mode truncate truncate at window end, or extend into future candles
   --max-effective-exposure 250      Liquidate only after drift exceeds this absolute exposure
   --initial-exposure 0              Exposure supplied to Q0 at the scored-window start

@@ -405,6 +405,9 @@ export interface VwKamaValueDistributionPoint {
   oracleEntropy: number;
   oraclePolicyEntropy: number;
   strategyPolicyEntropy: number;
+  currentExposureMinimum: number;
+  currentExposureMaximum: number;
+  currentExposureGridSize: number;
   opportunity: number;
   averageRegret: number;
   crossEntropy: number;
@@ -1255,6 +1258,7 @@ function valueDistributionPoint(
   });
   const strategyPolicy = strategyExposureTransitionStatistics(
     oracle.grid,
+    oracle.currentGrid,
     rateBpsPerHour,
     intervalMs * oracle.holdingPeriodSteps,
     strategyTemperature,
@@ -1305,6 +1309,9 @@ function valueDistributionPoint(
     oracleEntropy: oracle.entropies[candleIndex]!,
     oraclePolicyEntropy: oracle.policyEntropies[candleIndex]!,
     strategyPolicyEntropy: strategyPolicy.entropy,
+    currentExposureMinimum: oracle.currentGrid[0]!,
+    currentExposureMaximum: oracle.currentGrid[oracle.currentGrid.length - 1]!,
+    currentExposureGridSize: oracle.currentGrid.length,
     opportunity: oracle.opportunities[candleIndex]!,
     averageRegret: oracle.averageRegrets[candleIndex]!,
     crossEntropy,

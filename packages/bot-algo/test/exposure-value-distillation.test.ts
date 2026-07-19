@@ -403,6 +403,24 @@ test("value grid must include cash as an exact state", () => {
   }), /exact zero/);
 });
 
+test("current-state grid spans the effective exposure boundary independently of actions", () => {
+  const oracle = prepareExposureValueOracle([100, 101], {
+    scoreStartIndex: 0,
+    friction: 0.00175,
+    gridSize: 151,
+    minExposure: -100,
+    maxExposure: 100,
+    maxEffectiveExposure: 250,
+    temperature: 0.01,
+  });
+  assert.equal(oracle.grid[0], -100);
+  assert.equal(oracle.grid.at(-1), 100);
+  assert.equal(oracle.currentGrid[0], -250);
+  assert.equal(oracle.currentGrid.at(-1), 250);
+  assert.equal(oracle.currentGrid[(oracle.currentGrid.length - 1) / 2], 0);
+  assert.equal(oracle.currentGrid.length, oracle.grid.length);
+});
+
 test("exposure value oracle retains selected H when the segment tail truncates the hold", () => {
   const oracle = prepareExposureValueOracle([100, 101, 102], {
     scoreStartIndex: 0,
@@ -557,6 +575,7 @@ test("transition-aware oracle statistics learn every current-target exposure pai
     scoreStartIndex: 0,
     friction,
     gridSize: 3,
+    maxEffectiveExposure: 2,
     temperature,
     includeProbabilities: true,
     opportunityEpsilon: 1e-6,
@@ -567,7 +586,7 @@ test("transition-aware oracle statistics learn every current-target exposure pai
   let meanLogRebalance = 0;
   let entropy = 0;
   let averageRegret = 0;
-  for (const current of oracle.grid) {
+  for (const current of oracle.currentGrid) {
     const logits = Array.from(oracle.grid, (target, index) =>
       Math.log(postAction[index]!)
         + Math.log(rebalanceEquityFactor(current, target, friction)) / temperature);
@@ -583,13 +602,15 @@ test("transition-aware oracle statistics learn every current-target exposure pai
       const probability = probabilities[index]! / total;
       const target = oracle.grid[index]!;
       const logRebalance = Math.log(rebalanceEquityFactor(current, target, friction));
-      mean += probability * target / oracle.grid.length;
-      secondMoment += probability * target * target / oracle.grid.length;
-      meanLogRebalance += probability * logRebalance / oracle.grid.length;
-      if (probability > 0) entropy -= probability * Math.log(probability) / oracle.grid.length;
+      mean += probability * target / oracle.currentGrid.length;
+      secondMoment += probability * target * target / oracle.currentGrid.length;
+      meanLogRebalance += probability * logRebalance / oracle.currentGrid.length;
+      if (probability > 0) {
+        entropy -= probability * Math.log(probability) / oracle.currentGrid.length;
+      }
     }
   }
-  averageRegret /= oracle.grid.length;
+  averageRegret /= oracle.currentGrid.length;
   assert.ok(Math.abs(oracle.policyMeans[0]! - mean) < 1e-6);
   assert.ok(Math.abs(oracle.policySecondMoments[0]! - secondMoment) < 1e-6);
   assert.ok(Math.abs(oracle.policyMeanLogRebalances[0]! - meanLogRebalance) < 1e-6);
@@ -769,6 +790,7 @@ test("strategy normal mixture is normalized and its transition loss matches a fu
     scoreStartIndex: 0,
     friction: 0.01,
     gridSize: 9,
+    maxEffectiveExposure: 2,
     temperature: 0.03,
     includeProbabilities: true,
   });
@@ -793,7 +815,7 @@ test("strategy normal mixture is normalized and its transition loss matches a fu
 
   const oracleBase = exposureValueOracleProbabilities(oracle, 0);
   let expected = 0;
-  for (const current of oracle.grid) {
+  for (const current of oracle.currentGrid) {
     const oracleConditional = conditionalExposureProbabilities(
       oracleBase,
       oracle.grid,
@@ -811,7 +833,7 @@ test("strategy normal mixture is normalized and its transition loss matches a fu
     for (let index = 0; index < oracle.grid.length; index += 1) {
       expected -= oracleConditional[index]!
         * Math.log(Math.max(Number.MIN_VALUE, strategyConditional[index]!))
-        / oracle.grid.length;
+        / oracle.currentGrid.length;
     }
   }
   const actual = strategyExposureTransitionCrossEntropy(
@@ -837,6 +859,7 @@ test("conditional policy bins match a grid-squared reference", () => {
   const bins = 3;
   const actual = binnedConditionalExposureProbabilities(
     base,
+    grid,
     grid,
     friction,
     transitionScale,

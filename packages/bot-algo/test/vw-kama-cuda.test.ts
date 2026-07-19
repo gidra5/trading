@@ -15,10 +15,50 @@ import type { TradingCandle } from "../src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
   evaluateVwKamaCudaFitnessCases,
+  prepareExposureValueOracleCuda,
   vwKamaCudaStatus,
 } from "../src/vw-kama-cuda.js";
 
 const MINUTE = 60_000;
+
+test("CUDA rolling-horizon oracle matches CPU statistics through liquidations", async (context) => {
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    context.skip(status.reason);
+    return;
+  }
+  const prices = Float64Array.from([
+    100, 90, 105, 80, 120, 75, 130, 85, 110, 70,
+    140, 95, 100, 60, 150, 100, 90, 120, 80, 100,
+  ]);
+  const options = {
+    scoreStartIndex: 1,
+    holdingPeriodSteps: 5,
+    valueHorizonSteps: 15,
+    friction: 0.00175,
+    gridSize: 21,
+    minExposure: -10,
+    maxExposure: 10,
+    maxEffectiveExposure: 12,
+    temperature: 0.01,
+    includeProbabilities: true,
+  };
+  const cpu = prepareExposureValueOracle(prices, options);
+  const gpu = (await prepareExposureValueOracleCuda(prices, options)).oracle;
+  for (const field of [
+    "means", "secondMoments", "entropies", "policyMeans", "policySecondMoments",
+    "policyMeanLogRebalances", "policyEntropies", "averageRegrets", "weights",
+    "opportunities",
+  ] as const) {
+    for (let index = options.scoreStartIndex; index < prices.length; index += 1) {
+      assert.ok(
+        Math.abs(cpu[field][index]! - gpu[field][index]!) < 1e-5,
+        `${field}[${index}] drifted: CPU ${cpu[field][index]}, CUDA ${gpu[field][index]}`,
+      );
+    }
+  }
+  assert.ok(Math.abs(cpu.path.logReturn - gpu.path.logReturn) < 1e-10);
+});
 
 test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
   const status = await vwKamaCudaStatus();
@@ -77,12 +117,28 @@ test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {
     ...common,
     fitnessOnly: true,
   });
+  const baseLossOnly = await evaluateVwKamaCudaBatch(columns, prepared, candidates, {
+    ...common,
+    fitnessOnly: true,
+    valueDistillation: {
+      ...common.valueDistillation,
+      lossConfig: DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+    },
+  });
+  assert.ok(baseLossOnly.every((result) =>
+    Number.isFinite(result.distillationWeightedCrossEntropy)));
   const [scheduledFitness] = await evaluateVwKamaCudaFitnessCases([{
     candles: columns,
     options: { ...common, fitnessOnly: true },
   }], candidates);
   assert.equal(gpu.length, candidates.length);
   for (let index = 0; index < candidates.length; index += 1) {
+    assert.ok(
+      Math.abs(baseLossOnly[index]!.distillationWeightedCrossEntropy
+        - gpu[index]!.distillationWeightedCrossEntropy)
+        <= Math.max(1e-3, Math.abs(gpu[index]!.distillationWeightedCrossEntropy) * 5e-4),
+      `${index}: fast base ${baseLossOnly[index]!.distillationWeightedCrossEntropy}, diagnostic ${gpu[index]!.distillationWeightedCrossEntropy}`,
+    );
     assert.ok(Math.abs(
       fitnessOnly[index]!.distillationWeightedCrossEntropy
         - gpu[index]!.distillationWeightedCrossEntropy,

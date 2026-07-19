@@ -149,9 +149,9 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     maxEffectiveExposure: 250,
     initialExposure: 0,
     holdingPeriodMode: "fixed",
-    holdingPeriodMs: 1_000,
-    valueHorizonMode: "full-window",
-    valueHorizonMs: 3 * DAY_MS,
+    holdingPeriodMs: 60_000,
+    valueHorizonMode: "fixed",
+    valueHorizonMs: 60 * 60_000,
     horizonEndMode: "truncate",
     oracleTemperature: 0.01,
     strategyVolatilityScaling: false,
@@ -621,8 +621,8 @@ export class KamaInspectorEngine {
       };
       const oracleCells = (candles.length - scoreStartIndex) * config.gridSize;
       // The CUDA full-window reconstruction launches one residue chain per holding
-      // step. H=1 therefore under-utilizes the device badly; the checkpointed CPU
-      // scan is both faster and numerically more stable for this common default.
+      // step. Very small H therefore under-utilizes the device; keep those cases on
+      // the checkpointed CPU scan.
       if (holdingPeriodSteps >= MIN_CUDA_ORACLE_HOLDING_STEPS
         && oracleCells >= 10_000_000 && config.gridSize <= 1_024) {
         const status = await vwKamaCudaStatus();

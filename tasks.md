@@ -203,7 +203,3 @@ we need to adjust the oracle evaluation:
 
 8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
 9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
-
-that is compute value in 3 action classes, choose top two values from these and compute first minus second and aggregate over input exposures. then normalize the weights
-
-lets update the distribution model to be sum of two exponential distributions split around x with their own rates. So something like p(a|x)=exp(b1*a|a<x)+exp(b2*a|a>=x)

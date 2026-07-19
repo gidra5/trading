@@ -17,6 +17,12 @@
       "development": "./src/exposure-value-distillation.ts",
       "import": "./dist/exposure-value-distillation.js",
       "default": "./src/exposure-value-distillation.ts"
+    },
+    "./conditional-exposure-distribution": {
+      "types": "./src/conditional-exposure-distribution.ts",
+      "development": "./src/conditional-exposure-distribution.ts",
+      "import": "./dist/conditional-exposure-distribution.js",
+      "default": "./src/conditional-exposure-distribution.ts"
     }
   },
   "scripts": {

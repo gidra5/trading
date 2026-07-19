@@ -326,6 +326,9 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
     },
   });
   const point = result.valueDistributions.at(-1)!;
+  assert.equal(point.currentExposureMinimum, -valueOracle.execution.maxEffectiveExposure);
+  assert.equal(point.currentExposureMaximum, valueOracle.execution.maxEffectiveExposure);
+  assert.equal(point.currentExposureGridSize, valueOracle.currentGrid.length);
   const expectedVolatility = strategyExposureVolatilities(closes, 3).at(-1)!;
   assert.ok(expectedVolatility > 0);
   assert.ok(Math.abs(point.strategyQuadraticVolatility - expectedVolatility) < 1e-12);

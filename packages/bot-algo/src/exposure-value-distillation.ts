@@ -37,7 +37,10 @@ export interface ExposureValueOracle {
   holdingPeriodSteps: number;
   valueHorizonSteps: number;
   temperature: number;
+  /** Executable target/action exposures. */
   grid: Float64Array;
+  /** Current strategy states, including drift up to the liquidation boundary. */
+  currentGrid: Float64Array;
   means: Float32Array;
   secondMoments: Float32Array;
   modalExposures: Float32Array;
@@ -307,6 +310,7 @@ export function prepareExposureValueOracle(
         const policy = transitionOracleStatistics(
           forcedValues,
           grid,
+          oracle.currentGrid,
           execution.friction,
           options.temperature,
           transitionScratch,
@@ -413,6 +417,7 @@ function prepareSegmentEndingExposureValueOracle(
     const policy = transitionOracleStatistics(
       forcedValues,
       grid,
+      oracle.currentGrid,
       execution.friction,
       options.temperature,
       transitionScratch,
@@ -785,6 +790,13 @@ export function createExposureValueOracleStorage(
   for (let index = 0; index < grid.length; index += 1) {
     grid[index] = minExposure + index / (grid.length - 1) * (maxExposure - minExposure);
   }
+  const maxEffectiveExposure = options.maxEffectiveExposure ?? 250;
+  const currentHalfIntervals = Math.max(1, Math.floor(options.gridSize / 2));
+  const currentGrid = float64(currentHalfIntervals * 2 + 1, shared);
+  for (let index = 0; index < currentGrid.length; index += 1) {
+    currentGrid[index] = -maxEffectiveExposure
+      + index / (currentGrid.length - 1) * (2 * maxEffectiveExposure);
+  }
   const initialExposure = options.initialExposure ?? 0;
   const emptyPath = {
     startIndex: options.scoreStartIndex,
@@ -806,6 +818,7 @@ export function createExposureValueOracleStorage(
     valueHorizonSteps,
     temperature: options.temperature,
     grid,
+    currentGrid,
     means: float32(prices.length, shared),
     secondMoments: float32(prices.length, shared),
     modalExposures: float32(prices.length, shared),
@@ -824,7 +837,7 @@ export function createExposureValueOracleStorage(
       friction: Math.max(0, options.friction),
       minExposure,
       maxExposure,
-      maxEffectiveExposure: options.maxEffectiveExposure ?? 250,
+      maxEffectiveExposure,
       quoteLendRate: options.quoteLendRate ?? 0,
       quoteBorrowRate: options.quoteBorrowRate ?? 0,
       assetBorrowRate: options.assetBorrowRate ?? 0,
@@ -840,6 +853,7 @@ export function shareExposureValueOracle(oracle: ExposureValueOracle): ExposureV
     valueHorizonSteps: oracle.valueHorizonSteps,
     temperature: oracle.temperature,
     grid: sharedCopy(oracle.grid),
+    currentGrid: sharedCopy(oracle.currentGrid),
     means: sharedCopy(oracle.means),
     secondMoments: sharedCopy(oracle.secondMoments),
     modalExposures: sharedCopy(oracle.modalExposures),
@@ -895,6 +909,7 @@ export function truncateExposureValueOracle(
 
 export function exposureValueOracleBytes(oracle: ExposureValueOracle): number {
   return oracle.grid.byteLength
+    + oracle.currentGrid.byteLength
     + oracle.means.byteLength
     + oracle.secondMoments.byteLength
     + oracle.modalExposures.byteLength
@@ -1579,6 +1594,7 @@ export function observeExposureValueDistillation(
   const statistics = transitionDistributionStatistics(
     scratch.baseLogits,
     oracle.grid,
+    oracle.currentGrid,
     oracle.execution.friction,
     frictionFraction / temperature,
     scratch,
@@ -1601,6 +1617,7 @@ export function observeExposureValueDistillation(
       ),
       scratch.baseLogits,
       oracle.grid,
+      oracle.currentGrid,
       oracle.execution.friction,
       1 / oracle.temperature,
       scratch,
@@ -1661,6 +1678,7 @@ export function observeExposureValueDistillation(
       binnedConditionalExposureProbabilities(
         oracleProbabilities.subarray(probabilityOffset, probabilityOffset + oracle.grid.length),
         oracle.grid,
+        oracle.currentGrid,
         oracle.execution.friction,
         1 / oracle.temperature,
         bins,
@@ -1670,6 +1688,7 @@ export function observeExposureValueDistillation(
       binnedConditionalExposureProbabilities(
         diagonalProbabilities,
         oracle.grid,
+        oracle.currentGrid,
         oracle.execution.friction,
         frictionFraction / temperature,
         bins,
@@ -1695,6 +1714,7 @@ export function observeExposureValueDistillation(
 export function binnedConditionalExposureProbabilities(
   baseProbabilities: ArrayLike<number>,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   transitionLogScale: number,
   bins: number,
@@ -1705,12 +1725,29 @@ export function binnedConditionalExposureProbabilities(
   if (scratch.baseLogs.length !== grid.length || scratch.sellBins.length !== bins) {
     throw new Error("Conditional exposure bin scratch does not match the grid and bin count.");
   }
+  if (!hasSeparableCurrentStateFactors(currentGrid, friction)) {
+    for (const current of currentGrid) {
+      let total = 0;
+      const weights = new Float64Array(grid.length);
+      for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+        const factor = rebalanceEquityFactor(current, grid[targetIndex]!, friction);
+        const weight = factor > 0 && baseProbabilities[targetIndex]! > 0
+          ? baseProbabilities[targetIndex]! * Math.exp(transitionLogScale * Math.log(factor))
+          : 0;
+        weights[targetIndex] = weight;
+        total += weight;
+      }
+      if (!(total > 0)) continue;
+      for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+        const bin = Math.min(bins - 1, Math.floor(targetIndex * bins / grid.length));
+        result[bin] += weights[targetIndex]! / total / currentGrid.length;
+      }
+    }
+    return result;
+  }
   const { baseLogs, sellTargetWeights, buyTargetWeights, sellBins, buyBins } = scratch;
   sellBins.fill(0);
   buyBins.fill(0);
-  let minimumBase = Number.POSITIVE_INFINITY;
-  let maximumBase = Number.NEGATIVE_INFINITY;
-  let minimumAdjacentCost = Number.POSITIVE_INFINITY;
   let maximumAdjusted = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < grid.length; index += 1) {
     const probability = baseProbabilities[index]!;
@@ -1719,32 +1756,11 @@ export function binnedConditionalExposureProbabilities(
     const sellDenominator = 1 - friction * exposure;
     const buyDenominator = 1 - friction + friction * exposure;
     baseLogs[index] = base;
-    minimumBase = Math.min(minimumBase, base);
-    maximumBase = Math.max(maximumBase, base);
     maximumAdjusted = Math.max(
       maximumAdjusted,
       base - transitionLogScale * Math.log(sellDenominator),
       base - transitionLogScale * Math.log(buyDenominator),
     );
-    if (index > 0) {
-      const previous = grid[index - 1]!;
-      for (const factor of [
-        rebalanceEquityFactor(previous, exposure, friction),
-        rebalanceEquityFactor(exposure, previous, friction),
-      ]) {
-        if (factor > 0 && factor < 1) {
-          minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(factor));
-        }
-      }
-    }
-  }
-  if (Number.isFinite(minimumAdjacentCost)
-    && transitionLogScale * minimumAdjacentCost > maximumBase - minimumBase + 30) {
-    for (let index = 0; index < grid.length; index += 1) {
-      const bin = Math.min(bins - 1, Math.floor(index * bins / grid.length));
-      result[bin] += 1 / grid.length;
-    }
-    return result;
   }
   let sellTotal = 0;
   let buyTotal = 0;
@@ -1764,13 +1780,16 @@ export function binnedConditionalExposureProbabilities(
     buyBins[bin] += buyWeight;
     buyTotal += buyWeight;
   }
-  for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
-    const current = grid[stateIndex]!;
-    const currentBin = Math.min(bins - 1, Math.floor(stateIndex * bins / grid.length));
-    sellBins[currentBin] += sellTargetWeights[stateIndex]!;
-    sellTotal += sellTargetWeights[stateIndex]!;
-    buyBins[currentBin] = Math.max(0, buyBins[currentBin]! - buyTargetWeights[stateIndex]!);
-    buyTotal = Math.max(0, buyTotal - buyTargetWeights[stateIndex]!);
+  let targetCursor = 0;
+  for (const current of currentGrid) {
+    while (targetCursor < grid.length && grid[targetCursor]! <= current) {
+      const targetBin = Math.min(bins - 1, Math.floor(targetCursor * bins / grid.length));
+      sellBins[targetBin] += sellTargetWeights[targetCursor]!;
+      sellTotal += sellTargetWeights[targetCursor]!;
+      buyBins[targetBin] = Math.max(0, buyBins[targetBin]! - buyTargetWeights[targetCursor]!);
+      buyTotal = Math.max(0, buyTotal - buyTargetWeights[targetCursor]!);
+      targetCursor += 1;
+    }
     const sellLogScale = transitionLogScale * Math.log(1 - friction * current);
     const buyLogScale = transitionLogScale * Math.log(1 - friction + friction * current);
     const rowMaximum = Math.max(
@@ -1783,7 +1802,7 @@ export function binnedConditionalExposureProbabilities(
     if (!(rowTotal > 0)) continue;
     for (let bin = 0; bin < bins; bin += 1) {
       result[bin] += (sellScale * sellBins[bin]! + buyScale * buyBins[bin]!)
-        / rowTotal / grid.length;
+        / rowTotal / currentGrid.length;
     }
   }
   return result;
@@ -2382,6 +2401,7 @@ function conditionalQuadraticFitDiagnostics(
  */
 export function strategyExposureTransitionStatistics(
   grid: Float64Array,
+  currentGrid: Float64Array,
   rateBpsPerHour: number,
   holdingPeriodMs: number,
   temperature: number,
@@ -2406,6 +2426,7 @@ export function strategyExposureTransitionStatistics(
   return transitionDistributionStatistics(
     scratch.baseLogits,
     grid,
+    currentGrid,
     friction,
     Math.max(0, frictionFraction) / temperature,
     scratch,
@@ -2439,6 +2460,7 @@ export function strategyExposureTransitionCrossEntropy(
   const statistics = transitionDistributionStatistics(
     scratch.baseLogits,
     oracle.grid,
+    oracle.currentGrid,
     oracle.execution.friction,
     transitionLogScale,
     scratch,
@@ -2457,6 +2479,7 @@ export function strategyExposureTransitionCrossEntropy(
       ),
       scratch.baseLogits,
       oracle.grid,
+      oracle.currentGrid,
       oracle.execution.friction,
       1 / oracle.temperature,
       scratch,
@@ -2617,6 +2640,25 @@ export function rebalanceEquityFactor(fromExposure: number, toExposure: number, 
   return 1 - fee * -difference / denominator;
 }
 
+function upperBoundExposure(grid: Float64Array, exposure: number): number {
+  let low = 0;
+  let high = grid.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (grid[middle]! <= exposure) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function hasSeparableCurrentStateFactors(grid: Float64Array, friction: number): boolean {
+  for (const current of grid) {
+    if (!(1 - friction * current > 0)
+      || !(1 - friction + friction * current > 0)) return false;
+  }
+  return true;
+}
+
 function createTransitionDistributionScratch(gridSize: number): TransitionDistributionScratch {
   const array = () => new Float64Array(gridSize);
   return {
@@ -2647,6 +2689,7 @@ function transitionCrossExpectation(
   oracleBaseProbabilities: ArrayLike<number>,
   targetBaseLogits: Float64Array,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   transitionLogScale: number,
   scratch: TransitionDistributionScratch,
@@ -2654,6 +2697,19 @@ function transitionCrossExpectation(
   const size = grid.length;
   if (oracleBaseProbabilities.length !== size || targetBaseLogits.length !== size) {
     throw new Error("Transition cross-expectation arrays do not match the exposure grid.");
+  }
+  for (const current of currentGrid) {
+    if (!(1 - friction * current > 0)
+      || !(1 - friction + friction * current > 0)) {
+      return bruteTransitionCrossExpectation(
+        oracleBaseProbabilities,
+        targetBaseLogits,
+        grid,
+        currentGrid,
+        friction,
+        transitionLogScale,
+      );
+    }
   }
   let sellLogSum = Number.NEGATIVE_INFINITY;
   let sellMeanTarget = 0;
@@ -2666,6 +2722,7 @@ function transitionCrossExpectation(
         oracleBaseProbabilities,
         targetBaseLogits,
         grid,
+        currentGrid,
         friction,
         transitionLogScale,
       );
@@ -2694,6 +2751,7 @@ function transitionCrossExpectation(
         oracleBaseProbabilities,
         targetBaseLogits,
         grid,
+        currentGrid,
         friction,
         transitionLogScale,
       );
@@ -2712,11 +2770,13 @@ function transitionCrossExpectation(
   }
 
   let expectation = 0;
-  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
-    const stateExposure = grid[stateIndex]!;
-    const sellTotal = transitionLogScale * Math.log(1 - friction * stateExposure)
-      + scratch.sellWeights[stateIndex]!;
-    const buyIndex = stateIndex + 1;
+  for (const stateExposure of currentGrid) {
+    const buyIndex = upperBoundExposure(grid, stateExposure);
+    const sellIndex = buyIndex - 1;
+    const sellTotal = sellIndex >= 0
+      ? transitionLogScale * Math.log(1 - friction * stateExposure)
+        + scratch.sellWeights[sellIndex]!
+      : Number.NEGATIVE_INFINITY;
     const buyTotal = buyIndex < size
       ? transitionLogScale * Math.log(1 - friction + friction * stateExposure)
         + scratch.buyWeights[buyIndex]!
@@ -2724,21 +2784,22 @@ function transitionCrossExpectation(
     const total = logAddExp(sellTotal, buyTotal);
     const sellShare = Number.isFinite(sellTotal) ? Math.exp(sellTotal - total) : 0;
     const buyShare = Number.isFinite(buyTotal) ? Math.exp(buyTotal - total) : 0;
-    expectation += sellShare * scratch.sellBaseLogits[stateIndex]!
+    expectation += (sellIndex >= 0 ? sellShare * scratch.sellBaseLogits[sellIndex]! : 0)
       + (buyIndex < size ? buyShare * scratch.buyBaseLogits[buyIndex]! : 0);
   }
-  return expectation / size;
+  return expectation / currentGrid.length;
 }
 
 function bruteTransitionCrossExpectation(
   oracleBaseProbabilities: ArrayLike<number>,
   targetBaseLogits: Float64Array,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   transitionLogScale: number,
 ): number {
   let result = 0;
-  for (const currentExposure of grid) {
+  for (const currentExposure of currentGrid) {
     let total = 0;
     let weighted = 0;
     for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
@@ -2751,7 +2812,7 @@ function bruteTransitionCrossExpectation(
     }
     if (total > 0) result += weighted / total;
   }
-  return result / grid.length;
+  return result / currentGrid.length;
 }
 
 /**
@@ -2762,16 +2823,21 @@ function bruteTransitionCrossExpectation(
 function transitionDistributionStatistics(
   baseLogits: Float64Array,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   transitionLogScale: number,
   scratch: TransitionDistributionScratch,
 ): TransitionDistributionStatistics {
   const size = grid.length;
   let maximum = Number.NEGATIVE_INFINITY;
-  let minimumBase = Number.POSITIVE_INFINITY;
-  let maximumBase = Number.NEGATIVE_INFINITY;
-  let minimumAdjacentCost = Number.POSITIVE_INFINITY;
   let separable = Number.isFinite(transitionLogScale) && transitionLogScale >= 0;
+  for (const current of currentGrid) {
+    if (!(1 - friction * current > 0)
+      || !(1 - friction + friction * current > 0)) {
+      separable = false;
+      break;
+    }
+  }
   for (let index = 0; index < size; index += 1) {
     const exposure = grid[index]!;
     const sellDenominator = 1 - friction * exposure;
@@ -2786,49 +2852,15 @@ function transitionDistributionStatistics(
       base - transitionLogScale * Math.log(sellDenominator),
       base - transitionLogScale * Math.log(buyDenominator),
     );
-    minimumBase = Math.min(minimumBase, base);
-    maximumBase = Math.max(maximumBase, base);
-    if (index > 0) {
-      const previous = grid[index - 1]!;
-      const buyFactor = rebalanceEquityFactor(previous, exposure, friction);
-      const sellFactor = rebalanceEquityFactor(exposure, previous, friction);
-      if (buyFactor > 0 && buyFactor < 1) {
-        minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(buyFactor));
-      }
-      if (sellFactor > 0 && sellFactor < 1) {
-        minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(sellFactor));
-      }
-    }
   }
   if (!separable) {
     return bruteTransitionDistributionStatistics(
       baseLogits,
       grid,
+      currentGrid,
       friction,
       transitionLogScale,
     );
-  }
-
-  // If even the cheapest transition dominates the complete base-logit range,
-  // every conditional row is the hold action to floating-point precision.
-  if (Number.isFinite(minimumAdjacentCost)
-    && transitionLogScale * minimumAdjacentCost > maximumBase - minimumBase + 30) {
-    let mean = 0;
-    let secondMoment = 0;
-    let logNormalizer = 0;
-    for (let index = 0; index < size; index += 1) {
-      const exposure = grid[index]!;
-      mean += exposure;
-      secondMoment += exposure * exposure;
-      logNormalizer += baseLogits[index]!;
-    }
-    return {
-      logNormalizer: logNormalizer / size,
-      mean: mean / size,
-      secondMoment: secondMoment / size,
-      meanLogRebalance: 0,
-      entropy: 0,
-    };
   }
 
   let sellWeight = 0;
@@ -2892,34 +2924,39 @@ function transitionDistributionStatistics(
   let secondMoment = 0;
   let meanLogRebalance = 0;
   let entropy = 0;
-  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
-    const stateExposure = grid[stateIndex]!;
+  for (const stateExposure of currentGrid) {
+    const buyIndex = upperBoundExposure(grid, stateExposure);
+    const sellIndex = buyIndex - 1;
     const sellCurrentLog = Math.log(1 - friction * stateExposure);
     const buyCurrentLog = Math.log(1 - friction + friction * stateExposure);
     const sellScale = Math.exp(transitionLogScale * sellCurrentLog);
     const buyScale = Math.exp(transitionLogScale * buyCurrentLog);
-    const buyIndex = stateIndex + 1;
-    const sellTotal = sellScale * scratch.sellWeights[stateIndex]!;
+    const sellTotal = sellIndex >= 0 ? sellScale * scratch.sellWeights[sellIndex]! : 0;
     const buyTotal = buyIndex < size ? buyScale * scratch.buyWeights[buyIndex]! : 0;
     const total = sellTotal + buyTotal;
     if (!(total > 0) || !Number.isFinite(total)) {
       return bruteTransitionDistributionStatistics(
         baseLogits,
         grid,
+        currentGrid,
         friction,
         transitionLogScale,
       );
     }
-    const weightedMean = sellScale * scratch.sellMeans[stateIndex]!
+    const weightedMean = (sellIndex >= 0 ? sellScale * scratch.sellMeans[sellIndex]! : 0)
       + (buyIndex < size ? buyScale * scratch.buyMeans[buyIndex]! : 0);
-    const weightedSecondMoment = sellScale * scratch.sellSecondMoments[stateIndex]!
+    const weightedSecondMoment = (sellIndex >= 0
+      ? sellScale * scratch.sellSecondMoments[sellIndex]!
+      : 0)
       + (buyIndex < size ? buyScale * scratch.buySecondMoments[buyIndex]! : 0);
-    const weightedBaseLogit = sellScale * scratch.sellBaseLogits[stateIndex]!
+    const weightedBaseLogit = (sellIndex >= 0
+      ? sellScale * scratch.sellBaseLogits[sellIndex]!
+      : 0)
       + (buyIndex < size ? buyScale * scratch.buyBaseLogits[buyIndex]! : 0);
-    const weightedLogRebalance = sellScale * (
-      sellCurrentLog * scratch.sellWeights[stateIndex]!
-      - scratch.sellLogDenominators[stateIndex]!
-    ) + (buyIndex < size ? buyScale * (
+    const weightedLogRebalance = (sellIndex >= 0 ? sellScale * (
+      sellCurrentLog * scratch.sellWeights[sellIndex]!
+      - scratch.sellLogDenominators[sellIndex]!
+    ) : 0) + (buyIndex < size ? buyScale * (
       buyCurrentLog * scratch.buyWeights[buyIndex]!
       - scratch.buyLogDenominators[buyIndex]!
     ) : 0);
@@ -2937,17 +2974,18 @@ function transitionDistributionStatistics(
     );
   }
   return {
-    logNormalizer: logNormalizer / size,
-    mean: mean / size,
-    secondMoment: secondMoment / size,
-    meanLogRebalance: meanLogRebalance / size,
-    entropy: entropy / size,
+    logNormalizer: logNormalizer / currentGrid.length,
+    mean: mean / currentGrid.length,
+    secondMoment: secondMoment / currentGrid.length,
+    meanLogRebalance: meanLogRebalance / currentGrid.length,
+    entropy: entropy / currentGrid.length,
   };
 }
 
 function bruteTransitionDistributionStatistics(
   baseLogits: Float64Array,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   transitionLogScale: number,
 ): TransitionDistributionStatistics {
@@ -2956,8 +2994,7 @@ function bruteTransitionDistributionStatistics(
   let averageSecondMoment = 0;
   let averageMeanLogRebalance = 0;
   let averageEntropy = 0;
-  for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
-    const stateExposure = grid[stateIndex]!;
+  for (const stateExposure of currentGrid) {
     let maximum = Number.NEGATIVE_INFINITY;
     const logits = new Float64Array(grid.length);
     const logRebalances = new Float64Array(grid.length);
@@ -2991,7 +3028,7 @@ function bruteTransitionDistributionStatistics(
     averageMeanLogRebalance += meanLogRebalance / total;
     averageEntropy += Math.max(0, rowLogNormalizer - meanLogit / total);
   }
-  const scale = 1 / grid.length;
+  const scale = 1 / currentGrid.length;
   return {
     logNormalizer: averageLogNormalizer * scale,
     mean: averageMean * scale,
@@ -3004,6 +3041,7 @@ function bruteTransitionDistributionStatistics(
 function transitionOracleStatistics(
   values: Float64Array,
   grid: Float64Array,
+  currentGrid: Float64Array,
   friction: number,
   temperature: number,
   scratch: TransitionDistributionScratch,
@@ -3014,6 +3052,7 @@ function transitionOracleStatistics(
   const statistics = transitionDistributionStatistics(
     scratch.baseLogits,
     grid,
+    currentGrid,
     friction,
     1 / temperature,
     scratch,
@@ -3022,7 +3061,8 @@ function transitionOracleStatistics(
   const meanValue = values.reduce((sum, value) => sum + value, 0) / values.length;
   if (values.every(Number.isFinite)
     && 1 - friction * grid[grid.length - 1]! > 0
-    && 1 - friction + friction * grid[0]! > 0) {
+    && 1 - friction + friction * grid[0]! > 0
+    && hasSeparableCurrentStateFactors(currentGrid, friction)) {
     let sellMaximum = Number.NEGATIVE_INFINITY;
     for (let index = 0; index < grid.length; index += 1) {
       sellMaximum = Math.max(
@@ -3039,19 +3079,22 @@ function transitionOracleStatistics(
       );
       scratch.suffixRawBuyMaxima[index] = buyMaximum;
     }
-    for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
-      const stateExposure = grid[stateIndex]!;
+    for (const stateExposure of currentGrid) {
+      const buyIndex = upperBoundExposure(grid, stateExposure);
+      const sellIndex = buyIndex - 1;
       const sellCurrentLog = Math.log(1 - friction * stateExposure);
       const buyCurrentLog = Math.log(1 - friction + friction * stateExposure);
-      const buyIndex = stateIndex + 1;
       const best = Math.max(
-        sellCurrentLog + scratch.prefixRawSellMaxima[stateIndex]!,
+        sellIndex >= 0
+          ? sellCurrentLog + scratch.prefixRawSellMaxima[sellIndex]!
+          : Number.NEGATIVE_INFINITY,
         buyIndex < grid.length
           ? buyCurrentLog + scratch.suffixRawBuyMaxima[buyIndex]!
           : Number.NEGATIVE_INFINITY,
       );
-      const sellLogSum = (stateIndex + 1) * sellCurrentLog
-        - scratch.prefixRawSellLogs[stateIndex]!;
+      const sellLogSum = sellIndex >= 0
+        ? (sellIndex + 1) * sellCurrentLog - scratch.prefixRawSellLogs[sellIndex]!
+        : 0;
       const buyLogSum = buyIndex < grid.length
         ? (grid.length - buyIndex) * buyCurrentLog - scratch.suffixRawBuyLogs[buyIndex]!
         : 0;
@@ -3060,9 +3103,9 @@ function transitionOracleStatistics(
         best - meanValue - (sellLogSum + buyLogSum) / grid.length,
       );
     }
-    averageRegret /= grid.length;
+    averageRegret /= currentGrid.length;
   } else {
-    for (const stateExposure of grid) {
+    for (const stateExposure of currentGrid) {
       let best = Number.NEGATIVE_INFINITY;
       let total = 0;
       let count = 0;
@@ -3076,7 +3119,7 @@ function transitionOracleStatistics(
       }
       if (count > 0) averageRegret += Math.max(0, best - total / count);
     }
-    averageRegret /= grid.length;
+    averageRegret /= currentGrid.length;
   }
   return { ...statistics, averageRegret };
 }

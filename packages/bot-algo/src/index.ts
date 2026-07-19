@@ -13,6 +13,7 @@ export * from "./indicators.js";
 export type * from "./backtest-trace.js";
 export * from "./perfect-margin-oracle.js";
 export * from "./exposure-value-distillation.js";
+export * from "./conditional-exposure-distribution.js";
 export * from "./kama-signal-evaluator.js";
 export * from "./vw-kama-cuda.js";
 export * from "./signal-memory.js";

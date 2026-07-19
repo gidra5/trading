@@ -4,7 +4,7 @@ The displayed value-oracle return is one coherent full-window control result:
 
 `oracle return = exp(Q_0(initialExposure)) - 1 = E_T / E_0 - 1`.
 
-The selected window supplies all prices. The value horizon defaults to **Full selected window**, so a three-day one-second example uses all 259,199 price moves between its 259,200 candles without requiring the user to enter `259200`. The last candle is the terminal state and forcibly rebalances to exact zero exposure. A fixed rolling horizon remains available for experiments; soft-Q distributions used by the distillation loss remain separate from the reported full-window path.
+The selected window supplies all prices. Training targets default to a fixed 60-second holding period and one-hour rolling value horizon. Truncate mode shortens targets near the selected window's end. The separately reported oracle return remains one coherent full-window policy: the last candle is its terminal state and forcibly rebalances to exact zero exposure.
 
 ## Bellman execution
 
@@ -16,9 +16,9 @@ The soft training target is transition-aware. Let `F_t(a)` be the forced-action 
 
 `p_oracle,t(a|x) = softmax_a(Q_t(x,a) / oracleTemperature)`,
 
-where `R(x→a)` is the exact fee-aware equity factor. Thus the target is a two-argument current-to-target policy, not one unconditioned target distribution. The exposure grid is used for both arguments during training. The operational prior over input `x` is uniform, so sudden external changes can move execution to any represented current exposure without leaving the learned state space.
+where `R(x→a)` is the exact fee-aware equity factor. Thus the target is a two-argument current-to-target policy, not one unconditioned target distribution. The axes deliberately use different grids: target actions `a` stay on the executable `[-100, 100]` grid, while current states `x` span the complete `[-maxEffectiveExposure, +maxEffectiveExposure]` interval, including the default liquidation boundary at `±250`. The state grid uses the same point count as an odd action grid (or one extra point for an even grid), always containing zero and both boundaries without multiplying per-candle training work. The operational prior over `x` is uniform across this full state grid, so drift or prior strategy errors remain inside the learned state space.
 
-The CPU solver retains square-root-spaced Bellman checkpoints and recomputes each block while reconstructing the policy. Its memory is `O(grid * sqrt(decisions))`; its separable buy/sell scans avoid a quadratic target search. The CUDA solver computes untouched forced-hold transitions in parallel, initializes the terminal closeout in an ordered kernel, runs parallel residue chains with the same separable scans, and reconstructs decisions against the exact marked current exposure rather than a nearest grid state.
+The CPU solver retains square-root-spaced Bellman checkpoints and recomputes each block while reconstructing the policy. Its memory is `O(actionGrid * sqrt(decisions))`; separable buy/sell prefix/suffix scans reduce every conditional statistic over both axes in `O(actionGrid + stateGrid)` rather than materializing their product. The CUDA solver computes untouched forced-hold transitions in parallel, initializes the terminal closeout in an ordered kernel, runs parallel residue chains with the same separable scans, and reconstructs decisions against the exact marked current exposure rather than a nearest grid state.
 
 Exact zero must be present in the grid. This makes staying in cash an executable baseline. The solver rejects a `Q_0` result below the immediate-cash baseline; with zero initial exposure and non-negative maintenance inputs, terminal return therefore cannot be negative. A nonzero input exposure can lose only the unavoidable cost of reaching the cash baseline when no profitable path exists.
 

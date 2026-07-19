@@ -14,6 +14,18 @@ fee equations, `H`-step holding semantics, segment-ending `T`, or deterministic 
   values in parallel, builds continuation prefixes, and assembles all `H`-step holding returns.
   A segment-ending `T` uses the independent backward residue chains; a finite rolling `T` launches
   all scored starting times concurrently for each holding-period block.
+- Fixed rolling horizons cache each distinct holding-transition duration, so `H=60s, T-t=1h`
+  prepares the common 60-step table once rather than 60 times. In the default zero-maintenance
+  regime, rolling price extrema prove when liquidation cannot occur and safe holding blocks
+  collapse to one exact endpoint-ratio update; exceptional blocks retain stepwise replay.
+- Rolling-horizon conditional-policy statistics use separable prefix/suffix fee sums, reducing the
+  target preparation from `O(candles * grid²)` to `O(candles * grid)`. Invalid/liquidated rows keep
+  the exact brute-force fallback.
+- The resident base-loss kernel no longer reads the optional oracle-entropy column when the
+  entropy-gap coefficient is zero. With all auxiliary coefficients zero, it evaluates only the
+  required cross-entropy normalizer and target expectation in Float32 for the zero-mixture model,
+  keeping the base training objective on its compact layout. Normal-mixture candidates retain the
+  full numerically stable statistics path.
 - Fitness specialization: evolutionary value fitness calculates only strategy state and weighted
   cross-entropy. Transition alignment, lag percentiles, oracle/strategy returns, drawdown, and
   turnover are deferred to diagnostic evaluation.
@@ -65,7 +77,17 @@ The base-feature transfer microbenchmark fell from 54.3 ms one-shot wall time to
 case residency. Four-case scheduling improved mixed-feature wall time by about 3.5×. Fitness and
 diagnostic weighted cross-entropy had zero measured drift.
 
-With the new one-candle default, the same 20,000-candle/grid-101 oracle takes about 315 ms on the
+For the `H=60s, T-t=1h` default at grid 151, a 20,000-candle synthetic oracle fell from
+21,991 ms to 1,483 ms of CUDA kernel time (14.8×). The full 259,200-candle three-day case takes
+20,191 ms kernel / 22,044 ms wall on the same RTX 3060 Laptop GPU. Oracle targets are prepared and
+cached once per case; subsequent training generations reuse the resident target columns.
+
+For 384 candidates on 20,000 candles, grid 151, the default base-loss fitness kernel fell from
+12,885 ms to 233 ms (55.3×); the optimized result had zero displayed cross-entropy drift against
+the diagnostic evaluator. Optional entropy and mutual-information objectives retain the fuller
+statistics path.
+
+With the former one-candle default, the same 20,000-candle/grid-101 oracle takes about 315 ms on the
 optimized CPU but 2.8 s in the CUDA kernel because `H=1` exposes only one sequential backward
 residue chain. Auto routing therefore keeps fixed `H<8` oracle preparation on CPU while candidate
 fitness remains on CUDA. At grid 101, the earlier constant-coefficient benchmark increased the
@@ -120,7 +142,7 @@ Run:
 
 ```bash
 npm run build:cuda
-npm run benchmark:kama:value:cuda -- 384 20000 101 300 20000 4
+npm run benchmark:kama:value:cuda -- 384 20000 151 60 3600 4
 # final optional argument selects nonnegative quadratic scale b2'
 npm run benchmark:kama:value:cuda -- 384 20000 101 300 20000 4 200000
 npm test -w @trading/bot-algo

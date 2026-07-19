@@ -873,6 +873,7 @@ function binnedOracleProbabilities(oracle: ExposureValueOracle, bins: number): F
     binnedConditionalExposureProbabilities(
       oracle.probabilities.subarray(sourceOffset, sourceOffset + gridSize),
       oracle.grid,
+      oracle.currentGrid,
       oracle.execution.friction,
       1 / oracle.temperature,
       bins,

@@ -29,9 +29,9 @@ async function run(): Promise<void> {
   const candidateCount = positiveInteger(process.argv[2] ?? "384", "candidate count");
   const candleCount = positiveInteger(process.argv[3] ?? "20000", "candle count");
   const gridSize = positiveInteger(process.argv[4] ?? "101", "grid size");
-  const holdingPeriodSteps = positiveInteger(process.argv[5] ?? "300", "holding-period steps");
+  const holdingPeriodSteps = positiveInteger(process.argv[5] ?? "60", "holding-period steps");
   const valueHorizonSteps = positiveInteger(
-    process.argv[6] ?? String(candleCount),
+    process.argv[6] ?? "3600",
     "value-horizon steps",
   );
   if (valueHorizonSteps < holdingPeriodSteps) {
