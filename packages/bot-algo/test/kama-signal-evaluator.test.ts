@@ -289,7 +289,10 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
     scoreStartIndex: 1,
     holdingPeriodSteps: 1,
     friction: 0,
-    gridSize: 5,
+    gridSize: 7,
+    minExposure: -10,
+    maxExposure: 20,
+    maxEffectiveExposure: 50,
     temperature: 0.01,
     includeProbabilities: true,
   });
@@ -329,6 +332,17 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
   assert.ok(Math.abs(
     point.strategyQuadraticCoefficient + quadraticScale * expectedVolatility ** 2,
   ) < 1e-12);
+  assert.ok(Math.abs(
+    point.strategyLinearCoefficient
+      - point.strategyRateBpsHour / 10_000 * 1_000 / 3_600_000 / point.strategyTemperature,
+  ) < 1e-12);
+  assert.ok(result.candidateTransitions.length > 0);
+  for (const transition of result.candidateTransitions) {
+    const expected = transition.state === "long"
+      ? transition.sizeFraction * 20
+      : transition.state === "short" ? transition.sizeFraction * -10 : 0;
+    assert.ok(Math.abs(transition.exposure - expected) < 1e-12);
+  }
 });
 
 test("VW-KAMA log rate is invariant to the asset price scale", () => {

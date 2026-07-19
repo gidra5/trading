@@ -102,6 +102,8 @@ const BASELINE_GLOBAL_PARAMETERS = {
   strategyTemperature: 0.001,
   strategyQuadraticScale: 0,
   strategyQuadraticVolatilityMs: 60 * 60_000,
+  strategyNormalMixture: 0,
+  strategyNormalSigma: 25,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -924,6 +926,7 @@ function combineMetrics(
         weightedEntropyGap,
         weightSum: distillationWeight,
         opportunitySum: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0),
+        averageRegretSum: valueParts.reduce((sum, item) => sum + item.averageRegretSum, 0),
         sampleCount: valueParts.reduce((sum, item) => sum + item.sampleCount, 0),
         crossEntropy,
         oracleEntropy,
@@ -937,6 +940,8 @@ function combineMetrics(
         klDivergence: Math.max(0, crossEntropy - oracleEntropy),
         score: Math.exp(-Math.max(0, crossEntropy - oracleEntropy)),
         meanOpportunity: valueParts.reduce((sum, item) => sum + item.opportunitySum, 0)
+          / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
+        meanAverageRegret: valueParts.reduce((sum, item) => sum + item.averageRegretSum, 0)
           / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
         returns: {
           oracle: combineExposureReturns(valueParts.map((item) => item.returns.oracle)),
@@ -1016,6 +1021,8 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   request.parameters.strategyTemperature ??= 0.001;
   request.parameters.strategyQuadraticScale ??= 0;
   request.parameters.strategyQuadraticVolatilityMs ??= 60 * 60_000;
+  request.parameters.strategyNormalMixture ??= 0;
+  request.parameters.strategyNormalSigma ??= 25;
   request.parameters.buyMaxFraction ??= 1;
   request.parameters.sellMaxFraction ??= 1;
   request.parameters.buySizingSigmaBpsHour ??= 1e12;
@@ -1096,6 +1103,7 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     request.parameters.thresholdInverseMaxBpsHour,
     request.parameters.signalFrictionFraction,
     request.parameters.strategyQuadraticScale,
+    request.parameters.strategyNormalMixture,
     request.parameters.buyMaxFraction,
     request.parameters.sellMaxFraction,
     request.parameters.confirmationAccelerationWeight,
@@ -1173,13 +1181,16 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   if (!Number.isFinite(request.parameters.strategyTemperature)
     || request.parameters.strategyTemperature <= 0
     || !Number.isFinite(request.parameters.strategyQuadraticVolatilityMs)
-    || request.parameters.strategyQuadraticVolatilityMs <= 0) {
-    throw new Error("VW-KAMA strategy distribution temperature and volatility window must be positive.");
+    || request.parameters.strategyQuadraticVolatilityMs <= 0
+    || !Number.isFinite(request.parameters.strategyNormalSigma)
+    || request.parameters.strategyNormalSigma <= 0) {
+    throw new Error("VW-KAMA strategy distribution temperature, volatility window, and normal sigma must be positive.");
   }
   if (![
     request.parameters.confirmationMix,
     request.parameters.confirmationMinQuality,
     request.parameters.hysteresisReleaseRatio,
+    request.parameters.strategyNormalMixture,
     request.parameters.confirmationEmaGateStrength,
   ]
     .every((value) => Number.isFinite(value) && value >= 0 && value <= 1)) {

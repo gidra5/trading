@@ -8,6 +8,8 @@ import type {
 } from "./kama-signal-evaluator.js";
 import type { ExposureValueOracle } from "./exposure-value-distillation.js";
 import {
+  binnedConditionalExposureProbabilities,
+  createExposureConditionalBinScratch,
   createExposureValueOracleStorage,
   normalizeExposureValueDistillationLossConfig,
   shareExposureValueOracle,
@@ -16,7 +18,7 @@ import {
   type ExposureValueOracleOptions,
 } from "./exposure-value-distillation.js";
 
-const PARAMETER_SIZE = 208;
+const PARAMETER_SIZE = 216;
 const RESULT_SIZE = 192;
 const INT_PARAMETER_COUNT = 21;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
@@ -37,8 +39,10 @@ interface NativeCuda {
     volume: Float64Array,
     valueMeans: Float32Array,
     valueSecondMoments: Float32Array,
+    valueMeanLogRebalances: Float32Array,
     valueEntropies: Float32Array,
     valueWeights: Float32Array,
+    oracleProbabilities: Float32Array | null,
     strategyTemperatures: Float32Array,
     strategyQuadraticVolatilities: Float32Array,
     oracleBinProbabilities: Float32Array | null,
@@ -47,6 +51,7 @@ interface NativeCuda {
     intervalMs: number,
     valueHoldingPeriodSteps: number,
     oracleFriction: number,
+    oracleTemperature: number,
     quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
@@ -100,6 +105,11 @@ interface NativeCuda {
     secondMoments: Float32Array,
     modalExposures: Float32Array,
     entropies: Float32Array,
+    policyMeans: Float32Array,
+    policySecondMoments: Float32Array,
+    policyMeanLogRebalances: Float32Array,
+    policyEntropies: Float32Array,
+    averageRegrets: Float32Array,
     weights: Float32Array,
     opportunities: Float32Array,
     probabilities: Float32Array | null,
@@ -117,9 +127,11 @@ interface NativeCuda {
     oracleCodes: Uint8Array,
     valueMeans: Float32Array | null,
     valueSecondMoments: Float32Array | null,
+    valueMeanLogRebalances: Float32Array | null,
     valueOptimalExposures: Float32Array | null,
     valueEntropies: Float32Array | null,
     valueWeights: Float32Array | null,
+    oracleProbabilities: Float32Array | null,
     valueOpportunities: Float32Array | null,
     oracleBinProbabilities: Float32Array | null,
     strategyTemperatures: Float32Array | null,
@@ -129,6 +141,7 @@ interface NativeCuda {
     intervalMs: number,
     valueHoldingPeriodSteps: number,
     oracleFriction: number,
+    oracleTemperature: number,
     quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
@@ -226,7 +239,7 @@ let fitnessCaseCacheBytes = 0;
 interface CachedFitnessCase {
   handle: CudaHandle;
   deviceBytes: number;
-  preciseScratchBytes: number;
+  lossScratchBytes: number;
 }
 
 export async function vwKamaCudaStatus(): Promise<VwKamaCudaStatus> {
@@ -276,11 +289,19 @@ export async function evaluateVwKamaCudaBatch(
   const oracleBinProbabilities = valueDistillation && preciseOracleMutualInformationEnabled(loss)
     ? binnedOracleProbabilities(valueDistillation.oracle, loss.mutualInformationBins)
     : null;
+  const normalMixtureEnabled = candidates.some(
+    (candidate) => (candidate.strategyNormalMixture ?? 0) > 0,
+  );
+  if (valueDistillation && normalMixtureEnabled && !valueDistillation.oracle.probabilities) {
+    throw new Error("CUDA strategy normal-mixture loss requires retained oracle probabilities.");
+  }
   if (valueDistillation && (
     valueDistillation.oracle.means.length < candles.length
     || valueDistillation.oracle.path.exposures.length < candles.length
-    || valueDistillation.oracle.secondMoments.length < candles.length
-    || valueDistillation.oracle.entropies.length < candles.length
+    || valueDistillation.oracle.policyMeans.length < candles.length
+    || valueDistillation.oracle.policySecondMoments.length < candles.length
+    || valueDistillation.oracle.policyMeanLogRebalances.length < candles.length
+    || valueDistillation.oracle.policyEntropies.length < candles.length
     || valueDistillation.oracle.weights.length < candles.length
     || valueDistillation.oracle.opportunities.length < candles.length
   )) {
@@ -327,13 +348,15 @@ export async function evaluateVwKamaCudaBatch(
       options,
       includeHighLow,
     );
-    const preciseScratchBytes = preciseOracleMutualInformationEnabled(loss)
+    const lossScratchBytes = valueDistillation
       ? candidates.length * (candles.length - options.scoreStartIndex) * 3
           * Float32Array.BYTES_PER_ELEMENT
-        + candidates.length * loss.mutualInformationBins * loss.mutualInformationBins
-          * Float64Array.BYTES_PER_ELEMENT
+        + (preciseOracleMutualInformationEnabled(loss)
+          ? candidates.length * loss.mutualInformationBins * loss.mutualInformationBins
+            * Float64Array.BYTES_PER_ELEMENT
+          : 0)
       : 0;
-    const additionalScratchBytes = Math.max(0, preciseScratchBytes - testCase.preciseScratchBytes);
+    const additionalScratchBytes = Math.max(0, lossScratchBytes - testCase.lossScratchBytes);
     if (testCase.deviceBytes + additionalScratchBytes > fitnessCaseBudgetBytes()) {
       throw new Error(
         `Precise oracle MI needs about ${formatByteCount(testCase.deviceBytes + additionalScratchBytes)} `
@@ -348,7 +371,7 @@ export async function evaluateVwKamaCudaBatch(
       output,
     );
     if (status !== 0) throw new Error(`VW-KAMA resident CUDA evaluation failed: ${native.lastError()}`);
-    testCase.preciseScratchBytes = Math.max(testCase.preciseScratchBytes, preciseScratchBytes);
+    testCase.lossScratchBytes = Math.max(testCase.lossScratchBytes, lossScratchBytes);
     refreshFitnessCaseBytes(native, cacheKey, testCase);
     return Array.from(
       { length: candidates.length },
@@ -365,11 +388,13 @@ export async function evaluateVwKamaCudaBatch(
     candles.close,
     candles.volume,
     oracle.stateCodes,
-    valueDistillation?.oracle.means ?? null,
-    valueDistillation?.oracle.secondMoments ?? null,
+    valueDistillation?.oracle.policyMeans ?? null,
+    valueDistillation?.oracle.policySecondMoments ?? null,
+    valueDistillation?.oracle.policyMeanLogRebalances ?? null,
     options.fitnessOnly ? null : valueDistillation?.oracle.path.exposures ?? null,
-    lossEnabled || !options.fitnessOnly ? valueDistillation?.oracle.entropies ?? null : null,
+    lossEnabled || !options.fitnessOnly ? valueDistillation?.oracle.policyEntropies ?? null : null,
     valueDistillation?.oracle.weights ?? null,
+    valueDistillation?.oracle.probabilities ?? null,
     options.fitnessOnly ? null : valueDistillation?.oracle.opportunities ?? null,
     oracleBinProbabilities,
     strategyTemperatures,
@@ -379,6 +404,7 @@ export async function evaluateVwKamaCudaBatch(
     options.intervalMs,
     valueDistillation?.oracle.holdingPeriodSteps ?? 1,
     options.oracleFriction,
+    valueDistillation?.oracle.temperature ?? 1,
     valueDistillation?.oracle.execution.quoteLendRate ?? 0,
     valueDistillation?.oracle.execution.quoteBorrowRate ?? 0,
     valueDistillation?.oracle.execution.assetBorrowRate ?? 0,
@@ -566,6 +592,11 @@ export async function prepareExposureValueOracleCuda(
     oracle.secondMoments,
     oracle.modalExposures,
     oracle.entropies,
+    oracle.policyMeans,
+    oracle.policySecondMoments,
+    oracle.policyMeanLogRebalances,
+    oracle.policyEntropies,
+    oracle.averageRegrets,
     oracle.weights,
     oracle.opportunities,
     oracle.probabilities ?? null,
@@ -622,8 +653,8 @@ async function loadNative(): Promise<NativeCuda> {
       resultSize: library.func("int vw_kama_cuda_result_size()"),
       createFitnessCase: library.func("vw_kama_cuda_create_fitness_case", "uint64_t", [
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer,
-        "int", "int", "double", "int", "double", "double", "double", "double",
+        pointer, pointer, pointer,
+        "int", "int", "double", "int", "double", "double", "double", "double", "double",
         "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "int", "int", pointer,
       ]),
@@ -642,12 +673,14 @@ async function loadNative(): Promise<NativeCuda> {
         "double", "double", "double", "double", "double", "double", "double", "double", "double",
         "double", "int",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer,
       ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
-        "int", "int", "double", "int", "double", "double", "double", "double", "double", "double",
+        pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer,
+        "int", "int", "double", "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "int",
         pointer, "int", "int", pointer,
@@ -701,7 +734,8 @@ function getOrCreateFitnessCase(
   const lossEnabled = loss.entropyGapLambda > 0
     || loss.stateMutualInformationLambda > 0
     || loss.oracleMutualInformationLambda > 0;
-  const baseResidentColumns = (includeHighLow ? 9 : 7) + (lossEnabled ? 1 : 0);
+  const baseResidentColumns = (includeHighLow ? 10 : 8) + (lossEnabled ? 1 : 0)
+    + (oracle.probabilities ? oracle.grid.length : 0);
   const preciseResidentColumns = oracleBinProbabilities ? loss.mutualInformationBins : 0;
   const estimatedResidentBytes = candles.length
     * (baseResidentColumns + preciseResidentColumns)
@@ -713,10 +747,12 @@ function getOrCreateFitnessCase(
     includeHighLow ? candles.low : null,
     candles.close,
     candles.volume,
-    oracle.means,
-    oracle.secondMoments,
-    oracle.entropies,
+    oracle.policyMeans,
+    oracle.policySecondMoments,
+    oracle.policyMeanLogRebalances,
+    oracle.policyEntropies,
     oracle.weights,
+    oracle.probabilities ?? null,
     strategyTemperatures,
     strategyQuadraticVolatilities,
     oracleBinProbabilities,
@@ -725,6 +761,7 @@ function getOrCreateFitnessCase(
     options.intervalMs,
     oracle.holdingPeriodSteps,
     options.oracleFriction,
+    oracle.temperature,
     oracle.execution.quoteLendRate,
     oracle.execution.quoteBorrowRate,
     oracle.execution.assetBorrowRate,
@@ -742,7 +779,7 @@ function getOrCreateFitnessCase(
     residentBytes,
   );
   if (Number(handle) === 0) throw new Error(`Failed to create resident CUDA fitness case: ${native.lastError()}`);
-  const result = { handle, deviceBytes: residentBytes[0]!, preciseScratchBytes: 0 };
+  const result = { handle, deviceBytes: residentBytes[0]!, lossScratchBytes: 0 };
   fitnessCaseCache.set(key, result);
   fitnessCaseCacheBytes += result.deviceBytes;
   return result;
@@ -828,13 +865,21 @@ function binnedOracleProbabilities(oracle: ExposureValueOracle, bins: number): F
   if (cached) return cached;
   const result = new Float32Array(oracle.means.length * bins);
   const gridSize = oracle.grid.length;
+  const scratch = createExposureConditionalBinScratch(gridSize, bins);
+  const binned = new Float64Array(bins);
   for (let candle = 0; candle < oracle.means.length; candle += 1) {
     const sourceOffset = candle * gridSize;
     const targetOffset = candle * bins;
-    for (let gridIndex = 0; gridIndex < gridSize; gridIndex += 1) {
-      const bin = Math.min(bins - 1, Math.floor(gridIndex * bins / gridSize));
-      result[targetOffset + bin] += oracle.probabilities[sourceOffset + gridIndex]!;
-    }
+    binnedConditionalExposureProbabilities(
+      oracle.probabilities.subarray(sourceOffset, sourceOffset + gridSize),
+      oracle.grid,
+      oracle.execution.friction,
+      1 / oracle.temperature,
+      bins,
+      binned,
+      scratch,
+    );
+    result.set(binned, targetOffset);
   }
   cache.set(bins, result);
   return result;
@@ -917,9 +962,11 @@ function writeParameters(
     parameters.signalFrictionFraction ?? 1,
     parameters.strategyTemperature ?? 0.001,
     parameters.strategyQuadraticScale ?? 0,
+    parameters.strategyNormalMixture ?? 0,
+    parameters.strategyNormalSigma ?? 25,
     options.warmupMultiple,
   ];
-  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 31) {
+  if (integers.length !== INT_PARAMETER_COUNT || floats.length !== 33) {
     throw new Error("VW-KAMA CUDA parameter layout is inconsistent.");
   }
   for (let index = 0; index < integers.length; index += 1) {

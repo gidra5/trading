@@ -36,11 +36,17 @@ export interface ExposureValueOracle {
   scoreStartIndex: number;
   holdingPeriodSteps: number;
   valueHorizonSteps: number;
+  temperature: number;
   grid: Float64Array;
   means: Float32Array;
   secondMoments: Float32Array;
   modalExposures: Float32Array;
   entropies: Float32Array;
+  policyMeans: Float32Array;
+  policySecondMoments: Float32Array;
+  policyMeanLogRebalances: Float32Array;
+  policyEntropies: Float32Array;
+  averageRegrets: Float32Array;
   weights: Float32Array;
   opportunities: Float32Array;
   probabilities?: Float32Array;
@@ -81,6 +87,7 @@ export interface ExposureValueDistillationAccumulator {
   weightedEntropyGap: number;
   weightSum: number;
   opportunitySum: number;
+  averageRegretSum: number;
   sampleCount: number;
 }
 
@@ -97,6 +104,7 @@ export interface ExposureValueDistillationMetrics extends ExposureValueDistillat
   klDivergence: number;
   score: number;
   meanOpportunity: number;
+  meanAverageRegret: number;
 }
 
 export type ExposureValueOracleMutualInformationMode = "approximate" | "precise";
@@ -129,6 +137,16 @@ interface ExposureValueDistillationState {
   preciseJoint: Float64Array | null;
   preciseOracleBins: Float64Array | null;
   preciseStrategyBins: Float64Array | null;
+  conditionalBinScratch: ExposureConditionalBinScratch | null;
+  transitionScratch: TransitionDistributionScratch | null;
+}
+
+export interface ExposureConditionalBinScratch {
+  baseLogs: Float64Array;
+  sellTargetWeights: Float64Array;
+  buyTargetWeights: Float64Array;
+  sellBins: Float64Array;
+  buyBins: Float64Array;
 }
 
 interface QuadraticExponentialStatistics {
@@ -137,6 +155,38 @@ interface QuadraticExponentialStatistics {
   secondMoment: number;
   entropy: number;
   probabilities?: Float64Array;
+}
+
+export interface ExposureTransitionPolicyStatistics {
+  logNormalizer: number;
+  mean: number;
+  secondMoment: number;
+  meanLogRebalance: number;
+  entropy: number;
+}
+
+type TransitionDistributionStatistics = ExposureTransitionPolicyStatistics;
+
+interface TransitionOracleStatistics extends ExposureTransitionPolicyStatistics {
+  averageRegret: number;
+}
+
+interface TransitionDistributionScratch {
+  baseLogits: Float64Array;
+  sellWeights: Float64Array;
+  sellMeans: Float64Array;
+  sellSecondMoments: Float64Array;
+  sellBaseLogits: Float64Array;
+  sellLogDenominators: Float64Array;
+  buyWeights: Float64Array;
+  buyMeans: Float64Array;
+  buySecondMoments: Float64Array;
+  buyBaseLogits: Float64Array;
+  buyLogDenominators: Float64Array;
+  prefixRawSellLogs: Float64Array;
+  suffixRawBuyLogs: Float64Array;
+  prefixRawSellMaxima: Float64Array;
+  suffixRawBuyMaxima: Float64Array;
 }
 
 const distillationStates = new WeakMap<
@@ -156,7 +206,8 @@ export interface StrategyExposureTemperatureOptions {
 }
 
 /**
- * Builds p_t(a) ∝ exp(Q_t(a) / temperature) over a fixed exposure grid.
+ * Builds the post-action F_t(a) preference plus sufficient statistics for
+ * p_t(a | x) ∝ exp((F_t(a) + log R(x→a)) / temperature) on a fixed grid.
  *
  * Q_t(a) rebalances to exposure a once, leaves the resulting quote and asset
  * quantities untouched for H price moves, then follows the optimal friction-aware
@@ -180,6 +231,11 @@ export function prepareExposureValueOracle(
     secondMoments,
     modalExposures,
     entropies,
+    policyMeans,
+    policySecondMoments,
+    policyMeanLogRebalances,
+    policyEntropies,
+    averageRegrets,
     weights,
     opportunities,
     probabilities,
@@ -197,6 +253,7 @@ export function prepareExposureValueOracle(
   const suffixValues = new Float64Array(grid.length);
   const prefixTargets = new Uint16Array(grid.length);
   const suffixTargets = new Uint16Array(grid.length);
+  const transitionScratch = createTransitionDistributionScratch(grid.length);
   const separableRebalanceCosts = 1 - execution.friction * grid[grid.length - 1]! > 0
     && 1 - execution.friction + execution.friction * grid[0]! > 0;
 
@@ -247,7 +304,19 @@ export function prepareExposureValueOracle(
         modalExposures[time] = statistics.optimalExposure;
         entropies[time] = statistics.entropy;
         opportunities[time] = statistics.opportunity;
-        weights[time] = statistics.opportunity + opportunityEpsilon;
+        const policy = transitionOracleStatistics(
+          forcedValues,
+          grid,
+          execution.friction,
+          options.temperature,
+          transitionScratch,
+        );
+        policyMeans[time] = policy.mean;
+        policySecondMoments[time] = policy.secondMoment;
+        policyMeanLogRebalances[time] = policy.meanLogRebalance;
+        policyEntropies[time] = policy.entropy;
+        averageRegrets[time] = policy.averageRegret;
+        weights[time] = policy.averageRegret + opportunityEpsilon;
       }
 
       fillOptimalContinuation(
@@ -284,6 +353,11 @@ function prepareSegmentEndingExposureValueOracle(
     secondMoments,
     modalExposures,
     entropies,
+    policyMeans,
+    policySecondMoments,
+    policyMeanLogRebalances,
+    policyEntropies,
+    averageRegrets,
     weights,
     opportunities,
     probabilities,
@@ -301,6 +375,7 @@ function prepareSegmentEndingExposureValueOracle(
   const suffixValues = new Float64Array(grid.length);
   const prefixTargets = new Uint16Array(grid.length);
   const suffixTargets = new Uint16Array(grid.length);
+  const transitionScratch = createTransitionDistributionScratch(grid.length);
   const separableRebalanceCosts = 1 - execution.friction * grid[grid.length - 1]! > 0
     && 1 - execution.friction + execution.friction * grid[0]! > 0;
   for (let time = prices.length - 1; time >= options.scoreStartIndex; time -= 1) {
@@ -335,7 +410,19 @@ function prepareSegmentEndingExposureValueOracle(
     modalExposures[time] = statistics.optimalExposure;
     entropies[time] = statistics.entropy;
     opportunities[time] = statistics.opportunity;
-    weights[time] = statistics.opportunity + opportunityEpsilon;
+    const policy = transitionOracleStatistics(
+      forcedValues,
+      grid,
+      execution.friction,
+      options.temperature,
+      transitionScratch,
+    );
+    policyMeans[time] = policy.mean;
+    policySecondMoments[time] = policy.secondMoment;
+    policyMeanLogRebalances[time] = policy.meanLogRebalance;
+    policyEntropies[time] = policy.entropy;
+    averageRegrets[time] = policy.averageRegret;
+    weights[time] = policy.averageRegret + opportunityEpsilon;
 
     fillOptimalContinuation(
       forcedValues,
@@ -717,11 +804,17 @@ export function createExposureValueOracleStorage(
     scoreStartIndex: options.scoreStartIndex,
     holdingPeriodSteps,
     valueHorizonSteps,
+    temperature: options.temperature,
     grid,
     means: float32(prices.length, shared),
     secondMoments: float32(prices.length, shared),
     modalExposures: float32(prices.length, shared),
     entropies: float32(prices.length, shared),
+    policyMeans: float32(prices.length, shared),
+    policySecondMoments: float32(prices.length, shared),
+    policyMeanLogRebalances: float32(prices.length, shared),
+    policyEntropies: float32(prices.length, shared),
+    averageRegrets: float32(prices.length, shared),
     weights: float32(prices.length, shared),
     opportunities: float32(prices.length, shared),
     ...(options.includeProbabilities
@@ -745,11 +838,17 @@ export function shareExposureValueOracle(oracle: ExposureValueOracle): ExposureV
     scoreStartIndex: oracle.scoreStartIndex,
     holdingPeriodSteps: oracle.holdingPeriodSteps,
     valueHorizonSteps: oracle.valueHorizonSteps,
+    temperature: oracle.temperature,
     grid: sharedCopy(oracle.grid),
     means: sharedCopy(oracle.means),
     secondMoments: sharedCopy(oracle.secondMoments),
     modalExposures: sharedCopy(oracle.modalExposures),
     entropies: sharedCopy(oracle.entropies),
+    policyMeans: sharedCopy(oracle.policyMeans),
+    policySecondMoments: sharedCopy(oracle.policySecondMoments),
+    policyMeanLogRebalances: sharedCopy(oracle.policyMeanLogRebalances),
+    policyEntropies: sharedCopy(oracle.policyEntropies),
+    averageRegrets: sharedCopy(oracle.averageRegrets),
     weights: sharedCopy(oracle.weights),
     opportunities: sharedCopy(oracle.opportunities),
     ...(oracle.probabilities ? { probabilities: sharedCopy(oracle.probabilities) } : {}),
@@ -776,6 +875,11 @@ export function truncateExposureValueOracle(
     secondMoments: oracle.secondMoments.subarray(0, length),
     modalExposures: oracle.modalExposures.subarray(0, length),
     entropies: oracle.entropies.subarray(0, length),
+    policyMeans: oracle.policyMeans.subarray(0, length),
+    policySecondMoments: oracle.policySecondMoments.subarray(0, length),
+    policyMeanLogRebalances: oracle.policyMeanLogRebalances.subarray(0, length),
+    policyEntropies: oracle.policyEntropies.subarray(0, length),
+    averageRegrets: oracle.averageRegrets.subarray(0, length),
     weights: oracle.weights.subarray(0, length),
     opportunities: oracle.opportunities.subarray(0, length),
     ...(oracle.probabilities
@@ -795,6 +899,11 @@ export function exposureValueOracleBytes(oracle: ExposureValueOracle): number {
     + oracle.secondMoments.byteLength
     + oracle.modalExposures.byteLength
     + oracle.entropies.byteLength
+    + oracle.policyMeans.byteLength
+    + oracle.policySecondMoments.byteLength
+    + oracle.policyMeanLogRebalances.byteLength
+    + oracle.policyEntropies.byteLength
+    + oracle.averageRegrets.byteLength
     + oracle.weights.byteLength
     + oracle.opportunities.byteLength
     + oracle.path.exposures.byteLength
@@ -824,6 +933,9 @@ export function strategyExposureProbabilities(
   holdingPeriodMs: number,
   temperature: number,
   quadraticCoefficient = 0,
+  normalCenter = 0,
+  normalMixture = 0,
+  normalSigma = 25,
 ): Float64Array {
   if (grid.length < 2) {
     throw new Error("Strategy exposure distribution requires at least two grid points.");
@@ -832,11 +944,41 @@ export function strategyExposureProbabilities(
   if (!Number.isFinite(quadraticCoefficient)) {
     throw new Error("Strategy exposure distribution requires a finite quadratic coefficient.");
   }
+  validateStrategyNormalMixture(normalCenter, normalMixture, normalSigma);
+  const quadraticLogNormalizer = quadraticExponentialLogNormalizer(
+    grid.length,
+    grid[0]!,
+    grid[grid.length - 1]!,
+    slope,
+    quadraticCoefficient,
+  );
+  const normalQuadraticCoefficient = -0.5 / (normalSigma * normalSigma);
+  const normalLinearCoefficient = normalCenter / (normalSigma * normalSigma);
+  const normalLogNormalizer = normalMixture > 0
+    ? quadraticExponentialLogNormalizer(
+        grid.length,
+        grid[0]!,
+        grid[grid.length - 1]!,
+        normalLinearCoefficient,
+        normalQuadraticCoefficient,
+      )
+    : 0;
   const probabilities = new Float64Array(grid.length);
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < grid.length; index += 1) {
     const exposure = grid[index]!;
-    const logWeight = slope * exposure + quadraticCoefficient * exposure * exposure;
+    const logWeight = strategyMixtureBaseLogit(
+      exposure,
+      slope,
+      quadraticCoefficient,
+      quadraticLogNormalizer,
+      normalCenter,
+      normalMixture,
+      normalSigma,
+      normalLinearCoefficient,
+      normalQuadraticCoefficient,
+      normalLogNormalizer,
+    );
     probabilities[index] = logWeight;
     maximum = Math.max(maximum, logWeight);
   }
@@ -850,6 +992,98 @@ export function strategyExposureProbabilities(
     probabilities[index] /= total;
   }
   return probabilities;
+}
+
+function validateStrategyNormalMixture(
+  normalCenter: number,
+  normalMixture: number,
+  normalSigma: number,
+): void {
+  if (!Number.isFinite(normalCenter)
+    || !Number.isFinite(normalMixture) || normalMixture < 0 || normalMixture > 1
+    || !Number.isFinite(normalSigma) || normalSigma <= 0) {
+    throw new Error(
+      "Strategy normal mixture requires a finite center, a weight from zero through one, and positive sigma.",
+    );
+  }
+}
+
+function strategyMixtureBaseLogit(
+  exposure: number,
+  linearCoefficient: number,
+  quadraticCoefficient: number,
+  quadraticLogNormalizer: number,
+  normalCenter: number,
+  normalMixture: number,
+  normalSigma: number,
+  normalLinearCoefficient = normalCenter / (normalSigma * normalSigma),
+  normalQuadraticCoefficient = -0.5 / (normalSigma * normalSigma),
+  normalLogNormalizer = 0,
+): number {
+  const quadraticLogProbability = linearCoefficient * exposure
+    + quadraticCoefficient * exposure * exposure
+    - quadraticLogNormalizer;
+  if (normalMixture <= 0) return quadraticLogProbability;
+  const normalLogProbability = normalLinearCoefficient * exposure
+    + normalQuadraticCoefficient * exposure * exposure
+    - normalLogNormalizer;
+  if (normalMixture >= 1) return normalLogProbability;
+  return logAddExp(
+    Math.log1p(-normalMixture) + quadraticLogProbability,
+    Math.log(normalMixture) + normalLogProbability,
+  );
+}
+
+function logAddExp(left: number, right: number): number {
+  if (!Number.isFinite(left)) return right;
+  if (!Number.isFinite(right)) return left;
+  const maximum = Math.max(left, right);
+  return maximum + Math.log(Math.exp(left - maximum) + Math.exp(right - maximum));
+}
+
+function fillStrategyMixtureBaseLogits(
+  output: Float64Array,
+  grid: Float64Array,
+  linearCoefficient: number,
+  quadraticCoefficient: number,
+  normalCenter: number,
+  normalMixture: number,
+  normalSigma: number,
+): number {
+  validateStrategyNormalMixture(normalCenter, normalMixture, normalSigma);
+  const quadraticLogNormalizer = quadraticExponentialLogNormalizer(
+    grid.length,
+    grid[0]!,
+    grid[grid.length - 1]!,
+    linearCoefficient,
+    quadraticCoefficient,
+  );
+  const normalQuadraticCoefficient = -0.5 / (normalSigma * normalSigma);
+  const normalLinearCoefficient = normalCenter / (normalSigma * normalSigma);
+  const normalLogNormalizer = normalMixture > 0
+    ? quadraticExponentialLogNormalizer(
+        grid.length,
+        grid[0]!,
+        grid[grid.length - 1]!,
+        normalLinearCoefficient,
+        normalQuadraticCoefficient,
+      )
+    : 0;
+  for (let index = 0; index < grid.length; index += 1) {
+    output[index] = strategyMixtureBaseLogit(
+      grid[index]!,
+      linearCoefficient,
+      quadraticCoefficient,
+      quadraticLogNormalizer,
+      normalCenter,
+      normalMixture,
+      normalSigma,
+      normalLinearCoefficient,
+      normalQuadraticCoefficient,
+      normalLogNormalizer,
+    );
+  }
+  return quadraticLogNormalizer;
 }
 
 /**
@@ -1277,6 +1511,7 @@ export function createExposureValueDistillationAccumulator(
     weightedEntropyGap: 0,
     weightSum: 0,
     opportunitySum: 0,
+    averageRegretSum: 0,
     sampleCount: 0,
   };
   distillationStates.set(accumulator, {
@@ -1291,6 +1526,8 @@ export function createExposureValueDistillationAccumulator(
     preciseJoint: null,
     preciseOracleBins: null,
     preciseStrategyBins: null,
+    conditionalBinScratch: null,
+    transitionScratch: null,
   });
   return accumulator;
 }
@@ -1303,6 +1540,10 @@ export function observeExposureValueDistillation(
   intervalMs: number,
   temperature: number,
   quadraticCoefficient = 0,
+  frictionFraction = 1,
+  normalCenter = 0,
+  normalMixture = 0,
+  normalSigma = 25,
 ): void {
   if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) return;
   const state = distillationStates.get(accumulator);
@@ -1316,40 +1557,67 @@ export function observeExposureValueDistillation(
     intervalMs * oracle.holdingPeriodSteps,
     temperature,
   );
+  if (!Number.isFinite(frictionFraction) || frictionFraction < 0) {
+    throw new Error("Strategy transition friction fraction must be finite and non-negative.");
+  }
   const lossEnabled = state.config.entropyGapLambda > 0
     || state.config.stateMutualInformationLambda > 0
     || state.config.oracleMutualInformationLambda > 0;
   const preciseEnabled = state.config.oracleMutualInformationLambda > 0
     && state.config.oracleMutualInformationMode === "precise";
-  const statistics = lossEnabled
-    ? quadraticExponentialStatistics(
-        oracle.grid.length,
-        oracle.grid[0]!,
-        oracle.grid[oracle.grid.length - 1]!,
-        slope,
-        quadraticCoefficient,
-        preciseEnabled,
-      )
-    : null;
-  const logNormalizer = statistics?.logNormalizer ?? quadraticExponentialLogNormalizer(
-    oracle.grid.length,
-    oracle.grid[0]!,
-    oracle.grid[oracle.grid.length - 1]!,
+  state.transitionScratch ??= createTransitionDistributionScratch(oracle.grid.length);
+  const scratch = state.transitionScratch;
+  const quadraticLogNormalizer = fillStrategyMixtureBaseLogits(
+    scratch.baseLogits,
+    oracle.grid,
     slope,
     quadraticCoefficient,
+    normalCenter,
+    normalMixture,
+    normalSigma,
   );
-  const mean = oracle.means[candleIndex]!;
-  const secondMoment = oracle.secondMoments[candleIndex]!;
+  const statistics = transitionDistributionStatistics(
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.execution.friction,
+    frictionFraction / temperature,
+    scratch,
+  );
+  const mean = oracle.policyMeans[candleIndex]!;
+  const secondMoment = oracle.policySecondMoments[candleIndex]!;
+  let targetBaseLogit = slope * mean
+    + quadraticCoefficient * secondMoment
+    - quadraticLogNormalizer;
+  if (normalMixture > 0) {
+    if (!oracle.probabilities) {
+      throw new Error(
+        "Strategy normal-mixture loss requires retained oracle probabilities.",
+      );
+    }
+    targetBaseLogit = transitionCrossExpectation(
+      oracle.probabilities.subarray(
+        candleIndex * oracle.grid.length,
+        (candleIndex + 1) * oracle.grid.length,
+      ),
+      scratch.baseLogits,
+      oracle.grid,
+      oracle.execution.friction,
+      1 / oracle.temperature,
+      scratch,
+    );
+  }
   const crossEntropy = Math.max(
     0,
-    logNormalizer - slope * mean - quadraticCoefficient * secondMoment,
+    statistics.logNormalizer
+      - targetBaseLogit
+      - frictionFraction / temperature * oracle.policyMeanLogRebalances[candleIndex]!,
   );
   const weight = oracle.weights[candleIndex]!;
   accumulator.weightedCrossEntropy += weight * crossEntropy;
-  accumulator.weightedOracleEntropy += weight * oracle.entropies[candleIndex]!;
-  if (statistics) {
+  accumulator.weightedOracleEntropy += weight * oracle.policyEntropies[candleIndex]!;
+  if (lossEnabled) {
     const logGridSize = Math.log(oracle.grid.length);
-    const oracleEntropy = oracle.entropies[candleIndex]!;
+    const oracleEntropy = oracle.policyEntropies[candleIndex]!;
     const normalizedExcessEntropy = Math.max(0, statistics.entropy - oracleEntropy) / logGridSize;
     accumulator.weightedStrategyEntropy += weight * statistics.entropy;
     accumulator.weightedEntropyGap += weight * normalizedExcessEntropy * normalizedExcessEntropy;
@@ -1363,8 +1631,18 @@ export function observeExposureValueDistillation(
     state.weightedOracleSecondMoment += weight * secondMoment;
     state.weightedOracleStrategyMeanProduct += weight * mean * statistics.mean;
     if (preciseEnabled) {
+      const diagonalProbabilities = strategyExposureProbabilities(
+        oracle.grid,
+        rateBpsPerHour,
+        intervalMs * oracle.holdingPeriodSteps,
+        temperature,
+        quadraticCoefficient,
+        normalCenter,
+        normalMixture,
+        normalSigma,
+      );
       const oracleProbabilities = oracle.probabilities;
-      if (!oracleProbabilities || !statistics.probabilities) {
+      if (!oracleProbabilities) {
         throw new Error("Precise oracle mutual information requires retained oracle probabilities.");
       }
       const bins = state.config.mutualInformationBins;
@@ -1376,11 +1654,28 @@ export function observeExposureValueDistillation(
       oracleBins.fill(0);
       strategyBins.fill(0);
       const probabilityOffset = candleIndex * oracle.grid.length;
-      for (let index = 0; index < oracle.grid.length; index += 1) {
-        const bin = Math.min(bins - 1, Math.floor(index * bins / oracle.grid.length));
-        oracleBins[bin] += oracleProbabilities[probabilityOffset + index]!;
-        strategyBins[bin] += statistics.probabilities[index]!;
-      }
+      state.conditionalBinScratch ??= createExposureConditionalBinScratch(
+        oracle.grid.length,
+        bins,
+      );
+      binnedConditionalExposureProbabilities(
+        oracleProbabilities.subarray(probabilityOffset, probabilityOffset + oracle.grid.length),
+        oracle.grid,
+        oracle.execution.friction,
+        1 / oracle.temperature,
+        bins,
+        oracleBins,
+        state.conditionalBinScratch,
+      );
+      binnedConditionalExposureProbabilities(
+        diagonalProbabilities,
+        oracle.grid,
+        oracle.execution.friction,
+        frictionFraction / temperature,
+        bins,
+        strategyBins,
+        state.conditionalBinScratch,
+      );
       for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
         for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
           state.preciseJoint[oracleBin * bins + strategyBin] += weight
@@ -1392,7 +1687,787 @@ export function observeExposureValueDistillation(
   }
   accumulator.weightSum += weight;
   accumulator.opportunitySum += oracle.opportunities[candleIndex]!;
+  accumulator.averageRegretSum += oracle.averageRegrets[candleIndex]!;
   accumulator.sampleCount += 1;
+}
+
+/** Bins the conditional target marginal after uniformly averaging current grid states. */
+export function binnedConditionalExposureProbabilities(
+  baseProbabilities: ArrayLike<number>,
+  grid: Float64Array,
+  friction: number,
+  transitionLogScale: number,
+  bins: number,
+  result: Float64Array<ArrayBufferLike> = new Float64Array(bins),
+  scratch = createExposureConditionalBinScratch(grid.length, bins),
+): Float64Array<ArrayBufferLike> {
+  result.fill(0);
+  if (scratch.baseLogs.length !== grid.length || scratch.sellBins.length !== bins) {
+    throw new Error("Conditional exposure bin scratch does not match the grid and bin count.");
+  }
+  const { baseLogs, sellTargetWeights, buyTargetWeights, sellBins, buyBins } = scratch;
+  sellBins.fill(0);
+  buyBins.fill(0);
+  let minimumBase = Number.POSITIVE_INFINITY;
+  let maximumBase = Number.NEGATIVE_INFINITY;
+  let minimumAdjacentCost = Number.POSITIVE_INFINITY;
+  let maximumAdjusted = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < grid.length; index += 1) {
+    const probability = baseProbabilities[index]!;
+    const base = probability > 0 ? Math.log(probability) : Math.log(1e-300);
+    const exposure = grid[index]!;
+    const sellDenominator = 1 - friction * exposure;
+    const buyDenominator = 1 - friction + friction * exposure;
+    baseLogs[index] = base;
+    minimumBase = Math.min(minimumBase, base);
+    maximumBase = Math.max(maximumBase, base);
+    maximumAdjusted = Math.max(
+      maximumAdjusted,
+      base - transitionLogScale * Math.log(sellDenominator),
+      base - transitionLogScale * Math.log(buyDenominator),
+    );
+    if (index > 0) {
+      const previous = grid[index - 1]!;
+      for (const factor of [
+        rebalanceEquityFactor(previous, exposure, friction),
+        rebalanceEquityFactor(exposure, previous, friction),
+      ]) {
+        if (factor > 0 && factor < 1) {
+          minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(factor));
+        }
+      }
+    }
+  }
+  if (Number.isFinite(minimumAdjacentCost)
+    && transitionLogScale * minimumAdjacentCost > maximumBase - minimumBase + 30) {
+    for (let index = 0; index < grid.length; index += 1) {
+      const bin = Math.min(bins - 1, Math.floor(index * bins / grid.length));
+      result[bin] += 1 / grid.length;
+    }
+    return result;
+  }
+  let sellTotal = 0;
+  let buyTotal = 0;
+  for (let index = 0; index < grid.length; index += 1) {
+    const exposure = grid[index]!;
+    const sellWeight = Math.exp(
+      baseLogs[index]! - transitionLogScale * Math.log(1 - friction * exposure)
+        - maximumAdjusted,
+    );
+    const buyWeight = Math.exp(
+      baseLogs[index]! - transitionLogScale * Math.log(1 - friction + friction * exposure)
+        - maximumAdjusted,
+    );
+    const bin = Math.min(bins - 1, Math.floor(index * bins / grid.length));
+    sellTargetWeights[index] = sellWeight;
+    buyTargetWeights[index] = buyWeight;
+    buyBins[bin] += buyWeight;
+    buyTotal += buyWeight;
+  }
+  for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
+    const current = grid[stateIndex]!;
+    const currentBin = Math.min(bins - 1, Math.floor(stateIndex * bins / grid.length));
+    sellBins[currentBin] += sellTargetWeights[stateIndex]!;
+    sellTotal += sellTargetWeights[stateIndex]!;
+    buyBins[currentBin] = Math.max(0, buyBins[currentBin]! - buyTargetWeights[stateIndex]!);
+    buyTotal = Math.max(0, buyTotal - buyTargetWeights[stateIndex]!);
+    const sellLogScale = transitionLogScale * Math.log(1 - friction * current);
+    const buyLogScale = transitionLogScale * Math.log(1 - friction + friction * current);
+    const rowMaximum = Math.max(
+      sellTotal > 0 ? sellLogScale + Math.log(sellTotal) : Number.NEGATIVE_INFINITY,
+      buyTotal > 0 ? buyLogScale + Math.log(buyTotal) : Number.NEGATIVE_INFINITY,
+    );
+    const sellScale = Math.exp(sellLogScale - rowMaximum);
+    const buyScale = Math.exp(buyLogScale - rowMaximum);
+    const rowTotal = sellScale * sellTotal + buyScale * buyTotal;
+    if (!(rowTotal > 0)) continue;
+    for (let bin = 0; bin < bins; bin += 1) {
+      result[bin] += (sellScale * sellBins[bin]! + buyScale * buyBins[bin]!)
+        / rowTotal / grid.length;
+    }
+  }
+  return result;
+}
+
+export function createExposureConditionalBinScratch(
+  gridSize: number,
+  bins: number,
+): ExposureConditionalBinScratch {
+  return {
+    baseLogs: new Float64Array(gridSize),
+    sellTargetWeights: new Float64Array(gridSize),
+    buyTargetWeights: new Float64Array(gridSize),
+    sellBins: new Float64Array(bins),
+    buyBins: new Float64Array(bins),
+  };
+}
+
+/**
+ * Returns the exact conditional target policy represented by the transition-aware
+ * distillation loss for one current exposure. The input probabilities are the
+ * post-action target distribution before transition friction is applied.
+ */
+export function conditionalExposureProbabilities(
+  baseProbabilities: ArrayLike<number>,
+  grid: ArrayLike<number>,
+  currentExposure: number,
+  friction: number,
+  transitionLogScale: number,
+  result: Float64Array<ArrayBufferLike> = new Float64Array(grid.length),
+): Float64Array<ArrayBufferLike> {
+  if (baseProbabilities.length !== grid.length || grid.length < 2) {
+    throw new Error("Conditional exposure probabilities require matching probability and grid arrays.");
+  }
+  if (!Number.isFinite(currentExposure) || !Number.isFinite(friction) || friction < 0
+    || !Number.isFinite(transitionLogScale) || transitionLogScale < 0) {
+    throw new Error("Conditional exposure probabilities require finite state and non-negative costs.");
+  }
+  if (result.length !== grid.length) {
+    throw new Error("Conditional exposure probability output does not match the grid.");
+  }
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < grid.length; index += 1) {
+    const probability = baseProbabilities[index]!;
+    const factor = rebalanceEquityFactor(currentExposure, grid[index]!, friction);
+    const logit = probability > 0 && factor > 0
+      ? Math.log(probability) + transitionLogScale * Math.log(factor)
+      : Number.NEGATIVE_INFINITY;
+    result[index] = logit;
+    maximum = Math.max(maximum, logit);
+  }
+  let total = 0;
+  for (let index = 0; index < result.length; index += 1) {
+    const probability = Number.isFinite(result[index]!)
+      ? Math.exp(result[index]! - maximum)
+      : 0;
+    result[index] = probability;
+    total += probability;
+  }
+  if (!(total > 0)) {
+    throw new Error("Conditional exposure policy has no valid target action.");
+  }
+  for (let index = 0; index < result.length; index += 1) result[index] /= total;
+  return result;
+}
+
+export interface ConditionalQuadraticPolicyFitOptions {
+  friction: number;
+  transitionLogScale: number;
+  objective?: "forward-kl" | "probability-mse";
+  initialLinearCoefficient?: number;
+  initialQuadraticCoefficient?: number;
+  constrainQuadraticNonPositive?: boolean;
+  maxIterations?: number;
+  tolerance?: number;
+}
+
+export interface ConditionalQuadraticPolicyFit {
+  objective: "forward-kl" | "probability-mse";
+  linearCoefficient: number;
+  quadraticCoefficient: number;
+  crossEntropy: number;
+  klDivergence: number;
+  meanSquaredError: number;
+  iterations: number;
+  converged: boolean;
+}
+
+/** Evaluates the predictor's exact conditional quadratic-exponential policy. */
+export function conditionalQuadraticExposureProbabilities(
+  grid: ArrayLike<number>,
+  currentExposure: number,
+  linearCoefficient: number,
+  quadraticCoefficient: number,
+  friction: number,
+  transitionLogScale: number,
+  result: Float64Array<ArrayBufferLike> = new Float64Array(grid.length),
+): Float64Array<ArrayBufferLike> {
+  if (grid.length < 2 || result.length !== grid.length
+    || !Number.isFinite(currentExposure) || !Number.isFinite(linearCoefficient)
+    || !Number.isFinite(quadraticCoefficient) || !Number.isFinite(friction) || friction < 0
+    || !Number.isFinite(transitionLogScale) || transitionLogScale < 0) {
+    throw new Error("Conditional quadratic policy requires a valid grid and finite coefficients.");
+  }
+  let maximum = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < grid.length; index += 1) {
+    const exposure = grid[index]!;
+    const factor = rebalanceEquityFactor(currentExposure, exposure, friction);
+    const logit = factor > 0
+      ? linearCoefficient * exposure + quadraticCoefficient * exposure * exposure
+        + transitionLogScale * Math.log(factor)
+      : Number.NEGATIVE_INFINITY;
+    result[index] = logit;
+    maximum = Math.max(maximum, logit);
+  }
+  let total = 0;
+  for (let index = 0; index < result.length; index += 1) {
+    const weight = Number.isFinite(result[index]!) ? Math.exp(result[index]! - maximum) : 0;
+    result[index] = weight;
+    total += weight;
+  }
+  if (!(total > 0)) throw new Error("Conditional quadratic policy has no valid target action.");
+  for (let index = 0; index < result.length; index += 1) result[index] /= total;
+  return result;
+}
+
+/**
+ * Projects one or more target policy rows onto the predictor's shared
+ * b1*a + b2*a^2 family. Forward KL is the default training-aligned objective;
+ * probability MSE provides a literal pointwise least-squares visualization fit.
+ * Current exposures identify each row and the transition term remains fixed.
+ */
+export function fitConditionalQuadraticPolicy(
+  grid: ArrayLike<number>,
+  targetProbabilities: ArrayLike<number>,
+  currentExposures: ArrayLike<number>,
+  options: ConditionalQuadraticPolicyFitOptions,
+): ConditionalQuadraticPolicyFit {
+  if (options.objective === "probability-mse") {
+    return fitConditionalQuadraticPolicyMse(
+      grid,
+      targetProbabilities,
+      currentExposures,
+      options,
+    );
+  }
+  const size = grid.length;
+  const rows = currentExposures.length;
+  if (size < 3 || rows < 1 || targetProbabilities.length !== rows * size) {
+    throw new Error("Conditional quadratic fit requires complete target rows on one exposure grid.");
+  }
+  const minimum = grid[0]!;
+  const maximum = grid[size - 1]!;
+  const center = (minimum + maximum) / 2;
+  const exposureScale = (maximum - minimum) / 2;
+  if (!(exposureScale > 0) || !Number.isFinite(options.friction) || options.friction < 0
+    || !Number.isFinite(options.transitionLogScale) || options.transitionLogScale < 0) {
+    throw new Error("Conditional quadratic fit requires ordered exposures and non-negative costs.");
+  }
+  const normalizedExposures = Float64Array.from(
+    { length: size },
+    (_, index) => (grid[index]! - center) / exposureScale,
+  );
+  const targetMeans = new Float64Array(rows * 3);
+  let targetEntropy = 0;
+  for (let row = 0; row < rows; row += 1) {
+    const current = currentExposures[row]!;
+    if (!Number.isFinite(current)) throw new Error("Conditional quadratic fit state is not finite.");
+    let probabilityTotal = 0;
+    for (let index = 0; index < size; index += 1) {
+      const probability = targetProbabilities[row * size + index]!;
+      if (!Number.isFinite(probability) || probability < 0) {
+        throw new Error("Conditional quadratic fit probabilities must be finite and non-negative.");
+      }
+      probabilityTotal += probability;
+    }
+    if (!(probabilityTotal > 0)) throw new Error("Conditional quadratic fit target row is empty.");
+    for (let index = 0; index < size; index += 1) {
+      const probability = targetProbabilities[row * size + index]! / probabilityTotal;
+      if (!(probability > 0)) continue;
+      const z = normalizedExposures[index]!;
+      const factor = rebalanceEquityFactor(current, grid[index]!, options.friction);
+      if (!(factor > 0)) continue;
+      targetMeans[row * 3] += probability * z;
+      targetMeans[row * 3 + 1] += probability * z * z;
+      targetMeans[row * 3 + 2] += probability * Math.log(factor);
+      targetEntropy -= probability * Math.log(probability) / rows;
+    }
+  }
+
+  const constrained = options.constrainQuadraticNonPositive ?? true;
+  const initialB2 = options.initialQuadraticCoefficient ?? 0;
+  let beta2 = initialB2 * exposureScale * exposureScale;
+  let beta1 = exposureScale * (options.initialLinearCoefficient ?? 0)
+    + 2 * center * exposureScale * initialB2;
+  if (constrained) beta2 = Math.min(0, beta2);
+  const evaluate = (candidateBeta1: number, candidateBeta2: number) => {
+    let objective = 0;
+    let gradient1 = 0;
+    let gradient2 = 0;
+    let hessian11 = 0;
+    let hessian12 = 0;
+    let hessian22 = 0;
+    const logits = new Float64Array(size);
+    for (let row = 0; row < rows; row += 1) {
+      const current = currentExposures[row]!;
+      let rowMaximum = Number.NEGATIVE_INFINITY;
+      for (let index = 0; index < size; index += 1) {
+        const z = normalizedExposures[index]!;
+        const factor = rebalanceEquityFactor(current, grid[index]!, options.friction);
+        const logit = factor > 0
+          ? candidateBeta1 * z + candidateBeta2 * z * z
+            + options.transitionLogScale * Math.log(factor)
+          : Number.NEGATIVE_INFINITY;
+        logits[index] = logit;
+        rowMaximum = Math.max(rowMaximum, logit);
+      }
+      let total = 0;
+      let moment1 = 0;
+      let moment2 = 0;
+      let moment3 = 0;
+      let moment4 = 0;
+      for (let index = 0; index < size; index += 1) {
+        if (!Number.isFinite(logits[index])) continue;
+        const weight = Math.exp(logits[index]! - rowMaximum);
+        const z = normalizedExposures[index]!;
+        const z2 = z * z;
+        total += weight;
+        moment1 += weight * z;
+        moment2 += weight * z2;
+        moment3 += weight * z2 * z;
+        moment4 += weight * z2 * z2;
+      }
+      const modelMean1 = moment1 / total;
+      const modelMean2 = moment2 / total;
+      const targetMean1 = targetMeans[row * 3]!;
+      const targetMean2 = targetMeans[row * 3 + 1]!;
+      objective += (
+        rowMaximum + Math.log(total)
+          - candidateBeta1 * targetMean1
+          - candidateBeta2 * targetMean2
+          - options.transitionLogScale * targetMeans[row * 3 + 2]!
+      ) / rows;
+      gradient1 += (modelMean1 - targetMean1) / rows;
+      gradient2 += (modelMean2 - targetMean2) / rows;
+      hessian11 += Math.max(0, moment2 / total - modelMean1 * modelMean1) / rows;
+      hessian12 += (moment3 / total - modelMean1 * modelMean2) / rows;
+      hessian22 += Math.max(0, moment4 / total - modelMean2 * modelMean2) / rows;
+    }
+    return { objective, gradient1, gradient2, hessian11, hessian12, hessian22 };
+  };
+
+  const maximumIterations = Math.max(1, Math.floor(options.maxIterations ?? 40));
+  const tolerance = Math.max(Number.EPSILON, options.tolerance ?? 1e-10);
+  let state = evaluate(beta1, beta2);
+  let converged = false;
+  let iterations = 0;
+  for (; iterations < maximumIterations; iterations += 1) {
+    const quadraticAtBoundary = constrained && beta2 >= -tolerance && state.gradient2 < 0;
+    const projectedGradient2 = quadraticAtBoundary ? 0 : state.gradient2;
+    if (Math.hypot(state.gradient1, projectedGradient2) <= tolerance) {
+      converged = true;
+      break;
+    }
+    const ridge = 1e-10;
+    const h11 = state.hessian11 + ridge;
+    const h22 = state.hessian22 + ridge;
+    let step1: number;
+    let step2: number;
+    if (quadraticAtBoundary) {
+      step1 = -state.gradient1 / h11;
+      step2 = 0;
+    } else {
+      const determinant = h11 * h22 - state.hessian12 * state.hessian12;
+      if (determinant > 1e-14) {
+        step1 = -(h22 * state.gradient1 - state.hessian12 * state.gradient2) / determinant;
+        step2 = -(-state.hessian12 * state.gradient1 + h11 * state.gradient2) / determinant;
+      } else {
+        step1 = -state.gradient1 / h11;
+        step2 = -state.gradient2 / h22;
+      }
+    }
+    let accepted = false;
+    for (let lineScale = 1; lineScale >= 1 / 4096; lineScale /= 2) {
+      const nextBeta1 = beta1 + lineScale * step1;
+      const nextBeta2 = constrained
+        ? Math.min(0, beta2 + lineScale * step2)
+        : beta2 + lineScale * step2;
+      const next = evaluate(nextBeta1, nextBeta2);
+      if (next.objective <= state.objective + 1e-13) {
+        beta1 = nextBeta1;
+        beta2 = nextBeta2;
+        state = next;
+        accepted = true;
+        break;
+      }
+    }
+    if (!accepted) break;
+  }
+  if (!converged) {
+    const quadraticAtBoundary = constrained && beta2 >= -tolerance && state.gradient2 < 0;
+    converged = Math.hypot(state.gradient1, quadraticAtBoundary ? 0 : state.gradient2)
+      <= Math.sqrt(tolerance);
+  }
+  const quadraticCoefficient = beta2 / (exposureScale * exposureScale);
+  const linearCoefficient = beta1 / exposureScale - 2 * center * quadraticCoefficient;
+  const diagnostics = conditionalQuadraticFitDiagnostics(
+    grid,
+    targetProbabilities,
+    currentExposures,
+    linearCoefficient,
+    quadraticCoefficient,
+    options,
+  );
+  return {
+    objective: "forward-kl",
+    linearCoefficient,
+    quadraticCoefficient,
+    crossEntropy: state.objective,
+    klDivergence: Math.max(0, state.objective - targetEntropy),
+    meanSquaredError: diagnostics.meanSquaredError,
+    iterations,
+    converged,
+  };
+}
+
+function fitConditionalQuadraticPolicyMse(
+  grid: ArrayLike<number>,
+  targetProbabilities: ArrayLike<number>,
+  currentExposures: ArrayLike<number>,
+  options: ConditionalQuadraticPolicyFitOptions,
+): ConditionalQuadraticPolicyFit {
+  const klSeed = fitConditionalQuadraticPolicy(
+    grid,
+    targetProbabilities,
+    currentExposures,
+    { ...options, objective: "forward-kl" },
+  );
+  const size = grid.length;
+  const rows = currentExposures.length;
+  const minimum = grid[0]!;
+  const maximum = grid[size - 1]!;
+  const center = (minimum + maximum) / 2;
+  const exposureScale = (maximum - minimum) / 2;
+  const normalizedExposures = Float64Array.from(
+    { length: size },
+    (_, index) => (grid[index]! - center) / exposureScale,
+  );
+  const targets = new Float64Array(rows * size);
+  const fixedLogits = new Float64Array(rows * size);
+  for (let row = 0; row < rows; row += 1) {
+    let total = 0;
+    for (let index = 0; index < size; index += 1) {
+      total += targetProbabilities[row * size + index]!;
+    }
+    for (let index = 0; index < size; index += 1) {
+      const offset = row * size + index;
+      targets[offset] = targetProbabilities[offset]! / total;
+      const factor = rebalanceEquityFactor(
+        currentExposures[row]!,
+        grid[index]!,
+        options.friction,
+      );
+      fixedLogits[offset] = factor > 0
+        ? options.transitionLogScale * Math.log(factor)
+        : Number.NEGATIVE_INFINITY;
+    }
+  }
+  const divisor = rows * size;
+  const logits = new Float64Array(size);
+  const probabilities = new Float64Array(size);
+  const evaluate = (candidateBeta1: number, candidateBeta2: number) => {
+    let objective = 0;
+    let gradient1 = 0;
+    let gradient2 = 0;
+    let hessian11 = 0;
+    let hessian12 = 0;
+    let hessian22 = 0;
+    for (let row = 0; row < rows; row += 1) {
+      let rowMaximum = Number.NEGATIVE_INFINITY;
+      for (let index = 0; index < size; index += 1) {
+        const fixed = fixedLogits[row * size + index]!;
+        const z = normalizedExposures[index]!;
+        const logit = Number.isFinite(fixed)
+          ? candidateBeta1 * z + candidateBeta2 * z * z + fixed
+          : Number.NEGATIVE_INFINITY;
+        logits[index] = logit;
+        rowMaximum = Math.max(rowMaximum, logit);
+      }
+      let total = 0;
+      let modelMean1 = 0;
+      let modelMean2 = 0;
+      for (let index = 0; index < size; index += 1) {
+        const probability = Number.isFinite(logits[index])
+          ? Math.exp(logits[index]! - rowMaximum)
+          : 0;
+        probabilities[index] = probability;
+        total += probability;
+      }
+      for (let index = 0; index < size; index += 1) {
+        const probability = probabilities[index]! / total;
+        const z = normalizedExposures[index]!;
+        probabilities[index] = probability;
+        modelMean1 += probability * z;
+        modelMean2 += probability * z * z;
+      }
+      for (let index = 0; index < size; index += 1) {
+        const z = normalizedExposures[index]!;
+        const probability = probabilities[index]!;
+        const residual = probability - targets[row * size + index]!;
+        const jacobian1 = probability * (z - modelMean1);
+        const jacobian2 = probability * (z * z - modelMean2);
+        objective += residual * residual / divisor;
+        gradient1 += 2 * residual * jacobian1 / divisor;
+        gradient2 += 2 * residual * jacobian2 / divisor;
+        hessian11 += 2 * jacobian1 * jacobian1 / divisor;
+        hessian12 += 2 * jacobian1 * jacobian2 / divisor;
+        hessian22 += 2 * jacobian2 * jacobian2 / divisor;
+      }
+    }
+    return { objective, gradient1, gradient2, hessian11, hessian12, hessian22 };
+  };
+
+  const toNormalized = (linearCoefficient: number, quadraticCoefficient: number) => ({
+    beta1: exposureScale * linearCoefficient
+      + 2 * center * exposureScale * quadraticCoefficient,
+    beta2: quadraticCoefficient * exposureScale * exposureScale,
+  });
+  const constrained = options.constrainQuadraticNonPositive ?? true;
+  const klNormalized = toNormalized(
+    klSeed.linearCoefficient,
+    klSeed.quadraticCoefficient,
+  );
+  const initialNormalized = toNormalized(
+    options.initialLinearCoefficient ?? 0,
+    options.initialQuadraticCoefficient ?? 0,
+  );
+  const rawSeeds = [
+    klNormalized,
+    initialNormalized,
+    { beta1: 0, beta2: 0 },
+    { beta1: klNormalized.beta1, beta2: 0 },
+  ];
+  const seeds = rawSeeds.filter((seed, index) => rawSeeds.findIndex((candidate) =>
+    Math.abs(candidate.beta1 - seed.beta1) <= 1e-12
+      && Math.abs(candidate.beta2 - seed.beta2) <= 1e-12) === index);
+  const maximumIterations = Math.max(1, Math.floor(options.maxIterations ?? 32));
+  const tolerance = Math.max(Number.EPSILON, options.tolerance ?? 1e-10);
+  let best: {
+    beta1: number;
+    beta2: number;
+    state: ReturnType<typeof evaluate>;
+    iterations: number;
+    converged: boolean;
+  } | undefined;
+  for (const seed of seeds) {
+    let beta1 = seed.beta1;
+    let beta2 = constrained ? Math.min(0, seed.beta2) : seed.beta2;
+    let state = evaluate(beta1, beta2);
+    let converged = false;
+    let iterations = 0;
+    for (; iterations < maximumIterations; iterations += 1) {
+      const quadraticAtBoundary = constrained
+        && beta2 >= -tolerance && state.gradient2 < 0;
+      const projectedGradient2 = quadraticAtBoundary ? 0 : state.gradient2;
+      if (Math.hypot(state.gradient1, projectedGradient2) <= tolerance) {
+        converged = true;
+        break;
+      }
+      const ridge = Math.max(1e-12, (state.hessian11 + state.hessian22) * 1e-8);
+      const h11 = state.hessian11 + ridge;
+      const h22 = state.hessian22 + ridge;
+      let step1: number;
+      let step2: number;
+      if (quadraticAtBoundary) {
+        step1 = -state.gradient1 / h11;
+        step2 = 0;
+      } else {
+        const determinant = h11 * h22 - state.hessian12 * state.hessian12;
+        if (determinant > 1e-20) {
+          step1 = -(h22 * state.gradient1 - state.hessian12 * state.gradient2)
+            / determinant;
+          step2 = -(-state.hessian12 * state.gradient1 + h11 * state.gradient2)
+            / determinant;
+        } else {
+          step1 = -state.gradient1 / h11;
+          step2 = -state.gradient2 / h22;
+        }
+      }
+      if (!(state.gradient1 * step1 + projectedGradient2 * step2 < 0)) {
+        step1 = -state.gradient1;
+        step2 = -projectedGradient2;
+      }
+      let accepted = false;
+      for (let lineScale = 1; lineScale >= 1 / 1_024; lineScale /= 2) {
+        const nextBeta1 = beta1 + lineScale * step1;
+        const nextBeta2 = constrained
+          ? Math.min(0, beta2 + lineScale * step2)
+          : beta2 + lineScale * step2;
+        const next = evaluate(nextBeta1, nextBeta2);
+        if (next.objective < state.objective - 1e-16) {
+          beta1 = nextBeta1;
+          beta2 = nextBeta2;
+          state = next;
+          accepted = true;
+          break;
+        }
+      }
+      if (!accepted) break;
+    }
+    if (!converged) {
+      const quadraticAtBoundary = constrained
+        && beta2 >= -tolerance && state.gradient2 < 0;
+      converged = Math.hypot(
+        state.gradient1,
+        quadraticAtBoundary ? 0 : state.gradient2,
+      ) <= Math.sqrt(tolerance);
+    }
+    if (!best || state.objective < best.state.objective) {
+      best = { beta1, beta2, state, iterations, converged };
+    }
+  }
+  if (!best) throw new Error("Conditional quadratic MSE fit did not produce a candidate.");
+  const quadraticCoefficient = best.beta2 / (exposureScale * exposureScale);
+  const linearCoefficient = best.beta1 / exposureScale
+    - 2 * center * quadraticCoefficient;
+  const diagnostics = conditionalQuadraticFitDiagnostics(
+    grid,
+    targetProbabilities,
+    currentExposures,
+    linearCoefficient,
+    quadraticCoefficient,
+    options,
+  );
+  return {
+    objective: "probability-mse",
+    linearCoefficient,
+    quadraticCoefficient,
+    crossEntropy: diagnostics.crossEntropy,
+    klDivergence: diagnostics.klDivergence,
+    meanSquaredError: diagnostics.meanSquaredError,
+    iterations: best.iterations,
+    converged: best.converged,
+  };
+}
+
+function conditionalQuadraticFitDiagnostics(
+  grid: ArrayLike<number>,
+  targetProbabilities: ArrayLike<number>,
+  currentExposures: ArrayLike<number>,
+  linearCoefficient: number,
+  quadraticCoefficient: number,
+  options: Pick<ConditionalQuadraticPolicyFitOptions, "friction" | "transitionLogScale">,
+): { crossEntropy: number; klDivergence: number; meanSquaredError: number } {
+  const size = grid.length;
+  const rows = currentExposures.length;
+  const model = new Float64Array(size);
+  let crossEntropy = 0;
+  let targetEntropy = 0;
+  let meanSquaredError = 0;
+  for (let row = 0; row < rows; row += 1) {
+    let targetTotal = 0;
+    for (let index = 0; index < size; index += 1) {
+      targetTotal += targetProbabilities[row * size + index]!;
+    }
+    conditionalQuadraticExposureProbabilities(
+      grid,
+      currentExposures[row]!,
+      linearCoefficient,
+      quadraticCoefficient,
+      options.friction,
+      options.transitionLogScale,
+      model,
+    );
+    for (let index = 0; index < size; index += 1) {
+      const target = targetProbabilities[row * size + index]! / targetTotal;
+      const predicted = model[index]!;
+      if (target > 0) {
+        crossEntropy -= target * Math.log(Math.max(1e-300, predicted)) / rows;
+        targetEntropy -= target * Math.log(target) / rows;
+      }
+      const residual = predicted - target;
+      meanSquaredError += residual * residual / (rows * size);
+    }
+  }
+  return {
+    crossEntropy,
+    klDivergence: Math.max(0, crossEntropy - targetEntropy),
+    meanSquaredError,
+  };
+}
+
+/**
+ * Statistics of the strategy policy p(target | current exposure), averaged with
+ * the uniform operational prior over every current-exposure grid state.
+ */
+export function strategyExposureTransitionStatistics(
+  grid: Float64Array,
+  rateBpsPerHour: number,
+  holdingPeriodMs: number,
+  temperature: number,
+  quadraticCoefficient: number,
+  friction: number,
+  frictionFraction = 1,
+  normalCenter = 0,
+  normalMixture = 0,
+  normalSigma = 25,
+): ExposureTransitionPolicyStatistics {
+  const slope = strategyExposureLogSlope(rateBpsPerHour, holdingPeriodMs, temperature);
+  const scratch = createTransitionDistributionScratch(grid.length);
+  fillStrategyMixtureBaseLogits(
+    scratch.baseLogits,
+    grid,
+    slope,
+    quadraticCoefficient,
+    normalCenter,
+    normalMixture,
+    normalSigma,
+  );
+  return transitionDistributionStatistics(
+    scratch.baseLogits,
+    grid,
+    friction,
+    Math.max(0, frictionFraction) / temperature,
+    scratch,
+  );
+}
+
+export function strategyExposureTransitionCrossEntropy(
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+  rateBpsPerHour: number,
+  holdingPeriodMs: number,
+  temperature: number,
+  quadraticCoefficient: number,
+  frictionFraction = 1,
+  normalCenter = 0,
+  normalMixture = 0,
+  normalSigma = 25,
+): number {
+  const slope = strategyExposureLogSlope(rateBpsPerHour, holdingPeriodMs, temperature);
+  const scratch = createTransitionDistributionScratch(oracle.grid.length);
+  const quadraticLogNormalizer = fillStrategyMixtureBaseLogits(
+    scratch.baseLogits,
+    oracle.grid,
+    slope,
+    quadraticCoefficient,
+    normalCenter,
+    normalMixture,
+    normalSigma,
+  );
+  const transitionLogScale = frictionFraction / temperature;
+  const statistics = transitionDistributionStatistics(
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.execution.friction,
+    transitionLogScale,
+    scratch,
+  );
+  let targetBaseLogit = slope * oracle.policyMeans[candleIndex]!
+    + quadraticCoefficient * oracle.policySecondMoments[candleIndex]!
+    - quadraticLogNormalizer;
+  if (normalMixture > 0) {
+    if (!oracle.probabilities) {
+      throw new Error("Strategy normal-mixture loss requires retained oracle probabilities.");
+    }
+    targetBaseLogit = transitionCrossExpectation(
+      oracle.probabilities.subarray(
+        candleIndex * oracle.grid.length,
+        (candleIndex + 1) * oracle.grid.length,
+      ),
+      scratch.baseLogits,
+      oracle.grid,
+      oracle.execution.friction,
+      1 / oracle.temperature,
+      scratch,
+    );
+  }
+  return Math.max(
+    0,
+    statistics.logNormalizer
+      - targetBaseLogit
+      - transitionLogScale * oracle.policyMeanLogRebalances[candleIndex]!,
+  );
 }
 
 export function finalizeExposureValueDistillation(
@@ -1437,6 +2512,9 @@ export function finalizeExposureValueDistillation(
     score: Math.exp(-klDivergence),
     meanOpportunity: accumulator.sampleCount > 0
       ? accumulator.opportunitySum / accumulator.sampleCount
+      : 0,
+    meanAverageRegret: accumulator.sampleCount > 0
+      ? accumulator.averageRegretSum / accumulator.sampleCount
       : 0,
   };
 }
@@ -1537,6 +2615,470 @@ export function rebalanceEquityFactor(fromExposure: number, toExposure: number, 
   const denominator = 1 - fee * toExposure;
   if (denominator <= 0) return Number.NEGATIVE_INFINITY;
   return 1 - fee * -difference / denominator;
+}
+
+function createTransitionDistributionScratch(gridSize: number): TransitionDistributionScratch {
+  const array = () => new Float64Array(gridSize);
+  return {
+    baseLogits: array(),
+    sellWeights: array(),
+    sellMeans: array(),
+    sellSecondMoments: array(),
+    sellBaseLogits: array(),
+    sellLogDenominators: array(),
+    buyWeights: array(),
+    buyMeans: array(),
+    buySecondMoments: array(),
+    buyBaseLogits: array(),
+    buyLogDenominators: array(),
+    prefixRawSellLogs: array(),
+    suffixRawBuyLogs: array(),
+    prefixRawSellMaxima: array(),
+    suffixRawBuyMaxima: array(),
+  };
+}
+
+/**
+ * Uniformly averages E[targetBaseLogit | current exposure] under an oracle
+ * conditional policy. Buy and sell rebalance factors are separable, so the
+ * complete conditional map is reduced with two stable linear scans.
+ */
+function transitionCrossExpectation(
+  oracleBaseProbabilities: ArrayLike<number>,
+  targetBaseLogits: Float64Array,
+  grid: Float64Array,
+  friction: number,
+  transitionLogScale: number,
+  scratch: TransitionDistributionScratch,
+): number {
+  const size = grid.length;
+  if (oracleBaseProbabilities.length !== size || targetBaseLogits.length !== size) {
+    throw new Error("Transition cross-expectation arrays do not match the exposure grid.");
+  }
+  let sellLogSum = Number.NEGATIVE_INFINITY;
+  let sellMeanTarget = 0;
+  for (let index = 0; index < size; index += 1) {
+    const exposure = grid[index]!;
+    const denominator = 1 - friction * exposure;
+    const probability = oracleBaseProbabilities[index]!;
+    if (!(denominator > 0) || !Number.isFinite(probability) || probability < 0) {
+      return bruteTransitionCrossExpectation(
+        oracleBaseProbabilities,
+        targetBaseLogits,
+        grid,
+        friction,
+        transitionLogScale,
+      );
+    }
+    const adjusted = probability > 0
+      ? Math.log(probability) - transitionLogScale * Math.log(denominator)
+      : Number.NEGATIVE_INFINITY;
+    const nextLogSum = logAddExp(sellLogSum, adjusted);
+    const addedShare = Number.isFinite(adjusted) ? Math.exp(adjusted - nextLogSum) : 0;
+    const retainedShare = Number.isFinite(sellLogSum) ? Math.exp(sellLogSum - nextLogSum) : 0;
+    sellMeanTarget = retainedShare * sellMeanTarget
+      + addedShare * targetBaseLogits[index]!;
+    sellLogSum = nextLogSum;
+    scratch.sellWeights[index] = sellLogSum;
+    scratch.sellBaseLogits[index] = sellMeanTarget;
+  }
+
+  let buyLogSum = Number.NEGATIVE_INFINITY;
+  let buyMeanTarget = 0;
+  for (let index = size - 1; index >= 0; index -= 1) {
+    const exposure = grid[index]!;
+    const denominator = 1 - friction + friction * exposure;
+    const probability = oracleBaseProbabilities[index]!;
+    if (!(denominator > 0)) {
+      return bruteTransitionCrossExpectation(
+        oracleBaseProbabilities,
+        targetBaseLogits,
+        grid,
+        friction,
+        transitionLogScale,
+      );
+    }
+    const adjusted = probability > 0
+      ? Math.log(probability) - transitionLogScale * Math.log(denominator)
+      : Number.NEGATIVE_INFINITY;
+    const nextLogSum = logAddExp(buyLogSum, adjusted);
+    const addedShare = Number.isFinite(adjusted) ? Math.exp(adjusted - nextLogSum) : 0;
+    const retainedShare = Number.isFinite(buyLogSum) ? Math.exp(buyLogSum - nextLogSum) : 0;
+    buyMeanTarget = retainedShare * buyMeanTarget
+      + addedShare * targetBaseLogits[index]!;
+    buyLogSum = nextLogSum;
+    scratch.buyWeights[index] = buyLogSum;
+    scratch.buyBaseLogits[index] = buyMeanTarget;
+  }
+
+  let expectation = 0;
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const stateExposure = grid[stateIndex]!;
+    const sellTotal = transitionLogScale * Math.log(1 - friction * stateExposure)
+      + scratch.sellWeights[stateIndex]!;
+    const buyIndex = stateIndex + 1;
+    const buyTotal = buyIndex < size
+      ? transitionLogScale * Math.log(1 - friction + friction * stateExposure)
+        + scratch.buyWeights[buyIndex]!
+      : Number.NEGATIVE_INFINITY;
+    const total = logAddExp(sellTotal, buyTotal);
+    const sellShare = Number.isFinite(sellTotal) ? Math.exp(sellTotal - total) : 0;
+    const buyShare = Number.isFinite(buyTotal) ? Math.exp(buyTotal - total) : 0;
+    expectation += sellShare * scratch.sellBaseLogits[stateIndex]!
+      + (buyIndex < size ? buyShare * scratch.buyBaseLogits[buyIndex]! : 0);
+  }
+  return expectation / size;
+}
+
+function bruteTransitionCrossExpectation(
+  oracleBaseProbabilities: ArrayLike<number>,
+  targetBaseLogits: Float64Array,
+  grid: Float64Array,
+  friction: number,
+  transitionLogScale: number,
+): number {
+  let result = 0;
+  for (const currentExposure of grid) {
+    let total = 0;
+    let weighted = 0;
+    for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+      const factor = rebalanceEquityFactor(currentExposure, grid[targetIndex]!, friction);
+      const probability = oracleBaseProbabilities[targetIndex]!;
+      if (!(factor > 0) || !(probability > 0)) continue;
+      const weight = probability * Math.exp(transitionLogScale * Math.log(factor));
+      total += weight;
+      weighted += weight * targetBaseLogits[targetIndex]!;
+    }
+    if (total > 0) result += weighted / total;
+  }
+  return result / grid.length;
+}
+
+/**
+ * Uniformly averages p(target | current exposure) over every input exposure on the grid.
+ * Exact buy/sell fee factors are separable, so all rows require two linear scans rather
+ * than materializing the grid-squared policy kernel.
+ */
+function transitionDistributionStatistics(
+  baseLogits: Float64Array,
+  grid: Float64Array,
+  friction: number,
+  transitionLogScale: number,
+  scratch: TransitionDistributionScratch,
+): TransitionDistributionStatistics {
+  const size = grid.length;
+  let maximum = Number.NEGATIVE_INFINITY;
+  let minimumBase = Number.POSITIVE_INFINITY;
+  let maximumBase = Number.NEGATIVE_INFINITY;
+  let minimumAdjacentCost = Number.POSITIVE_INFINITY;
+  let separable = Number.isFinite(transitionLogScale) && transitionLogScale >= 0;
+  for (let index = 0; index < size; index += 1) {
+    const exposure = grid[index]!;
+    const sellDenominator = 1 - friction * exposure;
+    const buyDenominator = 1 - friction + friction * exposure;
+    const base = baseLogits[index]!;
+    if (!(sellDenominator > 0) || !(buyDenominator > 0) || !Number.isFinite(base)) {
+      separable = false;
+      break;
+    }
+    maximum = Math.max(
+      maximum,
+      base - transitionLogScale * Math.log(sellDenominator),
+      base - transitionLogScale * Math.log(buyDenominator),
+    );
+    minimumBase = Math.min(minimumBase, base);
+    maximumBase = Math.max(maximumBase, base);
+    if (index > 0) {
+      const previous = grid[index - 1]!;
+      const buyFactor = rebalanceEquityFactor(previous, exposure, friction);
+      const sellFactor = rebalanceEquityFactor(exposure, previous, friction);
+      if (buyFactor > 0 && buyFactor < 1) {
+        minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(buyFactor));
+      }
+      if (sellFactor > 0 && sellFactor < 1) {
+        minimumAdjacentCost = Math.min(minimumAdjacentCost, -Math.log(sellFactor));
+      }
+    }
+  }
+  if (!separable) {
+    return bruteTransitionDistributionStatistics(
+      baseLogits,
+      grid,
+      friction,
+      transitionLogScale,
+    );
+  }
+
+  // If even the cheapest transition dominates the complete base-logit range,
+  // every conditional row is the hold action to floating-point precision.
+  if (Number.isFinite(minimumAdjacentCost)
+    && transitionLogScale * minimumAdjacentCost > maximumBase - minimumBase + 30) {
+    let mean = 0;
+    let secondMoment = 0;
+    let logNormalizer = 0;
+    for (let index = 0; index < size; index += 1) {
+      const exposure = grid[index]!;
+      mean += exposure;
+      secondMoment += exposure * exposure;
+      logNormalizer += baseLogits[index]!;
+    }
+    return {
+      logNormalizer: logNormalizer / size,
+      mean: mean / size,
+      secondMoment: secondMoment / size,
+      meanLogRebalance: 0,
+      entropy: 0,
+    };
+  }
+
+  let sellWeight = 0;
+  let sellMean = 0;
+  let sellSecondMoment = 0;
+  let sellBaseLogit = 0;
+  let sellLogDenominator = 0;
+  let rawSellLogs = 0;
+  let rawSellMaximum = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < size; index += 1) {
+    const exposure = grid[index]!;
+    const logDenominator = Math.log(1 - friction * exposure);
+    const base = baseLogits[index]!;
+    const weight = Math.exp(base - transitionLogScale * logDenominator - maximum);
+    sellWeight += weight;
+    sellMean += weight * exposure;
+    sellSecondMoment += weight * exposure * exposure;
+    sellBaseLogit += weight * base;
+    sellLogDenominator += weight * logDenominator;
+    rawSellLogs += logDenominator;
+    rawSellMaximum = Math.max(rawSellMaximum, base - logDenominator);
+    scratch.sellWeights[index] = sellWeight;
+    scratch.sellMeans[index] = sellMean;
+    scratch.sellSecondMoments[index] = sellSecondMoment;
+    scratch.sellBaseLogits[index] = sellBaseLogit;
+    scratch.sellLogDenominators[index] = sellLogDenominator;
+    scratch.prefixRawSellLogs[index] = rawSellLogs;
+    scratch.prefixRawSellMaxima[index] = rawSellMaximum;
+  }
+
+  let buyWeight = 0;
+  let buyMean = 0;
+  let buySecondMoment = 0;
+  let buyBaseLogit = 0;
+  let buyLogDenominator = 0;
+  let rawBuyLogs = 0;
+  let rawBuyMaximum = Number.NEGATIVE_INFINITY;
+  for (let index = size - 1; index >= 0; index -= 1) {
+    const exposure = grid[index]!;
+    const logDenominator = Math.log(1 - friction + friction * exposure);
+    const base = baseLogits[index]!;
+    const weight = Math.exp(base - transitionLogScale * logDenominator - maximum);
+    buyWeight += weight;
+    buyMean += weight * exposure;
+    buySecondMoment += weight * exposure * exposure;
+    buyBaseLogit += weight * base;
+    buyLogDenominator += weight * logDenominator;
+    rawBuyLogs += logDenominator;
+    rawBuyMaximum = Math.max(rawBuyMaximum, base - logDenominator);
+    scratch.buyWeights[index] = buyWeight;
+    scratch.buyMeans[index] = buyMean;
+    scratch.buySecondMoments[index] = buySecondMoment;
+    scratch.buyBaseLogits[index] = buyBaseLogit;
+    scratch.buyLogDenominators[index] = buyLogDenominator;
+    scratch.suffixRawBuyLogs[index] = rawBuyLogs;
+    scratch.suffixRawBuyMaxima[index] = rawBuyMaximum;
+  }
+
+  let logNormalizer = 0;
+  let mean = 0;
+  let secondMoment = 0;
+  let meanLogRebalance = 0;
+  let entropy = 0;
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const stateExposure = grid[stateIndex]!;
+    const sellCurrentLog = Math.log(1 - friction * stateExposure);
+    const buyCurrentLog = Math.log(1 - friction + friction * stateExposure);
+    const sellScale = Math.exp(transitionLogScale * sellCurrentLog);
+    const buyScale = Math.exp(transitionLogScale * buyCurrentLog);
+    const buyIndex = stateIndex + 1;
+    const sellTotal = sellScale * scratch.sellWeights[stateIndex]!;
+    const buyTotal = buyIndex < size ? buyScale * scratch.buyWeights[buyIndex]! : 0;
+    const total = sellTotal + buyTotal;
+    if (!(total > 0) || !Number.isFinite(total)) {
+      return bruteTransitionDistributionStatistics(
+        baseLogits,
+        grid,
+        friction,
+        transitionLogScale,
+      );
+    }
+    const weightedMean = sellScale * scratch.sellMeans[stateIndex]!
+      + (buyIndex < size ? buyScale * scratch.buyMeans[buyIndex]! : 0);
+    const weightedSecondMoment = sellScale * scratch.sellSecondMoments[stateIndex]!
+      + (buyIndex < size ? buyScale * scratch.buySecondMoments[buyIndex]! : 0);
+    const weightedBaseLogit = sellScale * scratch.sellBaseLogits[stateIndex]!
+      + (buyIndex < size ? buyScale * scratch.buyBaseLogits[buyIndex]! : 0);
+    const weightedLogRebalance = sellScale * (
+      sellCurrentLog * scratch.sellWeights[stateIndex]!
+      - scratch.sellLogDenominators[stateIndex]!
+    ) + (buyIndex < size ? buyScale * (
+      buyCurrentLog * scratch.buyWeights[buyIndex]!
+      - scratch.buyLogDenominators[buyIndex]!
+    ) : 0);
+    const rowLogNormalizer = maximum + Math.log(total);
+    const rowMeanLogRebalance = weightedLogRebalance / total;
+    logNormalizer += rowLogNormalizer;
+    mean += weightedMean / total;
+    secondMoment += weightedSecondMoment / total;
+    meanLogRebalance += rowMeanLogRebalance;
+    entropy += Math.max(
+      0,
+      rowLogNormalizer
+        - weightedBaseLogit / total
+        - transitionLogScale * rowMeanLogRebalance,
+    );
+  }
+  return {
+    logNormalizer: logNormalizer / size,
+    mean: mean / size,
+    secondMoment: secondMoment / size,
+    meanLogRebalance: meanLogRebalance / size,
+    entropy: entropy / size,
+  };
+}
+
+function bruteTransitionDistributionStatistics(
+  baseLogits: Float64Array,
+  grid: Float64Array,
+  friction: number,
+  transitionLogScale: number,
+): TransitionDistributionStatistics {
+  let averageLogNormalizer = 0;
+  let averageMean = 0;
+  let averageSecondMoment = 0;
+  let averageMeanLogRebalance = 0;
+  let averageEntropy = 0;
+  for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
+    const stateExposure = grid[stateIndex]!;
+    let maximum = Number.NEGATIVE_INFINITY;
+    const logits = new Float64Array(grid.length);
+    const logRebalances = new Float64Array(grid.length);
+    for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+      const factor = rebalanceEquityFactor(stateExposure, grid[targetIndex]!, friction);
+      const logRebalance = factor > 0 ? Math.log(factor) : Number.NEGATIVE_INFINITY;
+      const logit = baseLogits[targetIndex]! + transitionLogScale * logRebalance;
+      logits[targetIndex] = logit;
+      logRebalances[targetIndex] = logRebalance;
+      maximum = Math.max(maximum, logit);
+    }
+    let total = 0;
+    let mean = 0;
+    let secondMoment = 0;
+    let meanLogRebalance = 0;
+    let meanLogit = 0;
+    for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+      if (!Number.isFinite(logits[targetIndex])) continue;
+      const weight = Math.exp(logits[targetIndex]! - maximum);
+      const exposure = grid[targetIndex]!;
+      total += weight;
+      mean += weight * exposure;
+      secondMoment += weight * exposure * exposure;
+      meanLogRebalance += weight * logRebalances[targetIndex]!;
+      meanLogit += weight * logits[targetIndex]!;
+    }
+    const rowLogNormalizer = maximum + Math.log(total);
+    averageLogNormalizer += rowLogNormalizer;
+    averageMean += mean / total;
+    averageSecondMoment += secondMoment / total;
+    averageMeanLogRebalance += meanLogRebalance / total;
+    averageEntropy += Math.max(0, rowLogNormalizer - meanLogit / total);
+  }
+  const scale = 1 / grid.length;
+  return {
+    logNormalizer: averageLogNormalizer * scale,
+    mean: averageMean * scale,
+    secondMoment: averageSecondMoment * scale,
+    meanLogRebalance: averageMeanLogRebalance * scale,
+    entropy: averageEntropy * scale,
+  };
+}
+
+function transitionOracleStatistics(
+  values: Float64Array,
+  grid: Float64Array,
+  friction: number,
+  temperature: number,
+  scratch: TransitionDistributionScratch,
+): TransitionOracleStatistics {
+  for (let index = 0; index < values.length; index += 1) {
+    scratch.baseLogits[index] = values[index]! / temperature;
+  }
+  const statistics = transitionDistributionStatistics(
+    scratch.baseLogits,
+    grid,
+    friction,
+    1 / temperature,
+    scratch,
+  );
+  let averageRegret = 0;
+  const meanValue = values.reduce((sum, value) => sum + value, 0) / values.length;
+  if (values.every(Number.isFinite)
+    && 1 - friction * grid[grid.length - 1]! > 0
+    && 1 - friction + friction * grid[0]! > 0) {
+    let sellMaximum = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < grid.length; index += 1) {
+      sellMaximum = Math.max(
+        sellMaximum,
+        values[index]! - Math.log(1 - friction * grid[index]!),
+      );
+      scratch.prefixRawSellMaxima[index] = sellMaximum;
+    }
+    let buyMaximum = Number.NEGATIVE_INFINITY;
+    for (let index = grid.length - 1; index >= 0; index -= 1) {
+      buyMaximum = Math.max(
+        buyMaximum,
+        values[index]! - Math.log(1 - friction + friction * grid[index]!),
+      );
+      scratch.suffixRawBuyMaxima[index] = buyMaximum;
+    }
+    for (let stateIndex = 0; stateIndex < grid.length; stateIndex += 1) {
+      const stateExposure = grid[stateIndex]!;
+      const sellCurrentLog = Math.log(1 - friction * stateExposure);
+      const buyCurrentLog = Math.log(1 - friction + friction * stateExposure);
+      const buyIndex = stateIndex + 1;
+      const best = Math.max(
+        sellCurrentLog + scratch.prefixRawSellMaxima[stateIndex]!,
+        buyIndex < grid.length
+          ? buyCurrentLog + scratch.suffixRawBuyMaxima[buyIndex]!
+          : Number.NEGATIVE_INFINITY,
+      );
+      const sellLogSum = (stateIndex + 1) * sellCurrentLog
+        - scratch.prefixRawSellLogs[stateIndex]!;
+      const buyLogSum = buyIndex < grid.length
+        ? (grid.length - buyIndex) * buyCurrentLog - scratch.suffixRawBuyLogs[buyIndex]!
+        : 0;
+      averageRegret += Math.max(
+        0,
+        best - meanValue - (sellLogSum + buyLogSum) / grid.length,
+      );
+    }
+    averageRegret /= grid.length;
+  } else {
+    for (const stateExposure of grid) {
+      let best = Number.NEGATIVE_INFINITY;
+      let total = 0;
+      let count = 0;
+      for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+        const factor = rebalanceEquityFactor(stateExposure, grid[targetIndex]!, friction);
+        if (!(factor > 0) || !Number.isFinite(values[targetIndex])) continue;
+        const value = values[targetIndex]! + Math.log(factor);
+        best = Math.max(best, value);
+        total += value;
+        count += 1;
+      }
+      if (count > 0) averageRegret += Math.max(0, best - total / count);
+    }
+    averageRegret /= grid.length;
+  }
+  return { ...statistics, averageRegret };
 }
 
 function preferenceStatistics(

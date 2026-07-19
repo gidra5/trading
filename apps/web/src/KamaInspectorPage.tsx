@@ -1,5 +1,10 @@
 import { For, Show, batch, createEffect, createMemo, createSignal, createUniqueId, onCleanup, onMount } from "solid-js";
 import { Activity, ArrowLeft, Info, RefreshCw } from "lucide-solid";
+import {
+  conditionalExposureProbabilities,
+  conditionalQuadraticExposureProbabilities,
+  fitConditionalQuadraticPolicy,
+} from "@trading/bot-algo/exposure-value-distillation";
 import type {
   BacktestChartAnnotation,
   BacktestChartSmaSeries,
@@ -7,6 +12,7 @@ import type {
   BacktestOraclePoint,
   BacktestTrace,
   Candle,
+  ConditionalQuadraticPolicyFit,
   VwKamaCandleRangeResponse,
   VwKamaInspectorCatalog,
   VwKamaIndicatorPoint,
@@ -136,6 +142,8 @@ const defaults: VwKamaParameters = {
   strategyTemperature: 0.001,
   strategyQuadraticScale: 0,
   strategyQuadraticVolatilityMs: 60 * 60_000,
+  strategyNormalMixture: 0,
+  strategyNormalSigma: 25,
   buyMaxFraction: 1,
   sellMaxFraction: 1,
   buySizingSigmaBpsHour: 1e12,
@@ -187,7 +195,8 @@ const metricHelp = {
   cleanliness: "Matched transitions divided by all candidate transitions: matched / (matched + extra). Higher is better, and this contributes 20% of the overall score.",
   signals: "Candidate long, short, or flat state changes per scored day.",
   candles: "Candles included in scoring after warmup candles are excluded.",
-  distillation: "Opportunity-weighted cross-entropy between the hindsight value oracle and the strategy exposure distribution. Lower is better.",
+  distillation: "Average-regret-weighted cross-entropy over the complete conditional current-exposure → target-exposure policy. Current exposure is weighted uniformly. Lower is better.",
+  averageRegret: "Time weight before epsilon: for each current exposure, best conditional oracle value minus the mean value of all target actions, averaged uniformly over current exposures.",
   mixedLoss: "Optimizer objective: cross-entropy plus the weighted excess-entropy penalty, minus weighted state and oracle mutual information. Lower is better.",
   entropyGap: "Opportunity-weighted squared excess of strategy entropy over oracle entropy, normalized by the grid's maximum entropy.",
   stateMutualInformation: "Normalized Gaussian variance-decomposition estimate of how much the strategy exposure distribution changes across market states. Higher is more state-responsive.",
@@ -488,9 +497,10 @@ export function KamaInspectorPage() {
     detail(),
     result(),
   ));
+  const inspectedTime = () => selectedTime() ?? cursorTime();
   const selectedDistribution = createMemo(() => nearestValueDistribution(
     valueDistributions(),
-    selectedTime() ?? cursorTime(),
+    inspectedTime(),
   ));
   const comparisons = createMemo(() => compareTransitions(
     result()?.candidateTransitions ?? [],
@@ -567,9 +577,12 @@ export function KamaInspectorPage() {
     });
     setDetail(undefined);
     const distributions = analysis.valueDistributions;
+    setSelectedTime(undefined);
     if (distributions.length > 0) {
-      setSelectedTime(distributions.reduce((best, point) =>
+      setCursorTime(distributions.reduce((best, point) =>
         point.opportunity > best.opportunity ? point : best).time);
+    } else {
+      setCursorTime(undefined);
     }
   });
 
@@ -1151,6 +1164,8 @@ export function KamaInspectorPage() {
             <InspectorNumber label="Base strategy temperature" value={parameters().strategyTemperature ?? 0.001} min={0.000001} step={0.0001} onInput={(value) => update("strategyTemperature", value)} />
             <InspectorNumber label="Strategy quadratic scale b₂′" value={parameters().strategyQuadraticScale ?? 0} min={0} step={1} onInput={(value) => update("strategyQuadraticScale", value)} />
             <DurationInput label="Quadratic volatility window" value={parameters().strategyQuadraticVolatilityMs ?? 60 * 60_000} onInput={(value) => update("strategyQuadraticVolatilityMs", value)} />
+            <InspectorNumber label="Target-normal mixture" value={parameters().strategyNormalMixture ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("strategyNormalMixture", value)} />
+            <InspectorNumber label="Target-normal sigma (exposure)" value={parameters().strategyNormalSigma ?? 25} min={0.000001} step={1} onInput={(value) => update("strategyNormalSigma", value)} />
             <DurationInput label="Efficiency" value={parameters().efficiencyMs} onInput={(value) => update("efficiencyMs", value)} />
             <DurationInput label="ER volume EMA" value={parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs} onInput={(value) => update("efficiencyVolumeEmaMs", value)} />
             <InspectorNumber label="ER volume power" value={parameters().efficiencyVolumePower ?? 0} min={0} step={0.1} onInput={(value) => update("efficiencyVolumePower", value)} />
@@ -1297,6 +1312,7 @@ export function KamaInspectorPage() {
                   {(value) => (
                     <>
                       <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
+                      <ScoreCard label="Mean avg regret" value={formatQuote(value().meanAverageRegret, 6)} description={metricHelp.averageRegret} />
                       <ScoreCard label="Mixed loss" value={formatQuote(value().mixedLoss, 5)} description={metricHelp.mixedLoss} />
                       <ScoreCard label="Entropy gap" value={formatQuote(value().entropyGap, 5)} description={metricHelp.entropyGap} />
                       <ScoreCard label="State MI" value={ratioPercent(value().stateMutualInformation)} description={metricHelp.stateMutualInformation} />
@@ -1393,7 +1409,7 @@ export function KamaInspectorPage() {
                   </div>
                 </div>
                 <div class="mb-3 text-xs text-ink-400">
-                  Purple L / F / S marks the candidate target state. Red and green L / S marks are retrospective oracle actions.
+                  Purple L / F / S marks the candidate target state. Red and green L / S marks are retrospective oracle actions. Hover to inspect a timestamp, click to pin it across the charts, and double-click to unpin.
                 </div>
                 <div class={diagnosticSeries().length > 0
                   ? "h-80 lg:h-[calc(100vh-27rem)] lg:min-h-[300px]"
@@ -1412,16 +1428,14 @@ export function KamaInspectorPage() {
                     interactive
                     timeNavigation
                     viewport={chartViewport()}
-                    cursorTime={cursorTime()}
+                    cursorTime={inspectedTime()}
                     selectedTime={selectedTime()}
                     highlightedAnnotation={matchedCandidate()}
                     stateBands={chartStateBands()}
                     onOracleHoverChange={setHoveredOracle}
                     onViewportChange={updateViewportFromChart}
                     onCursorTimeChange={setCursorTime}
-                    onSelectionChange={(selection) => {
-                      if (selection) setSelectedTime(selection.candle.closeTime);
-                    }}
+                    onPinnedSelectionChange={(selection) => setSelectedTime(selection?.time)}
                     emptyLabel="No analyzed candles"
                   />
                 </div>
@@ -1430,16 +1444,23 @@ export function KamaInspectorPage() {
                     <div class="mt-3 rounded-2 border border-line bg-ink-800/50 p-3">
                       <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
                         <div>
-                          <div class="muted-label">Selected chart point</div>
-                          <h3 class="text-sm font-semibold">Oracle and predicted exposure distributions</h3>
+                          <div class="muted-label">{selectedTime() !== undefined
+                            ? "Pinned chart point"
+                            : cursorTime() !== undefined
+                              ? "Hovered chart point"
+                              : "Latest chart point"}</div>
                         </div>
                         <div class="text-xs tabular-nums text-ink-300">
-                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · effective T {formatQuote(point().strategyTemperature, 6)} · CE {formatQuote(point().crossEntropy, 5)} · opportunity {formatQuote(point().opportunity, 6)}
+                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · normal mix {ratioPercent(point().strategyNormalMixture)} / σ {formatQuote(point().strategyNormalSigma, 3)} · effective strategy τ {formatQuote(point().strategyTemperature, 6)} · conditional CE {formatQuote(point().crossEntropy, 5)} · avg regret {formatQuote(point().averageRegret, 6)}
                         </div>
                       </div>
-                      <ExposureDistributionChart point={point()} />
-                      <div class="mt-2 text-xs text-ink-400">
-                        Cyan is the hindsight soft value oracle; purple is the signed-rate truncated exponential used by the loss. Click or hover the price chart to inspect another rendered candle.
+                      <TransitionPolicyDiagnostics point={point()} />
+                      <div class="mt-5 border-t border-line pt-4">
+                        <h3 class="mb-2 text-sm font-semibold">Oracle and predicted exposure distributions</h3>
+                        <ExposureDistributionChart point={point()} />
+                        <div class="mt-2 text-xs text-ink-400">
+                          These post-action target preferences set current exposure equal to target, so transition cost is zero. Hover the price chart to preview another rendered candle, click to pin it across charts, or double-click to resume following hover.
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1456,7 +1477,7 @@ export function KamaInspectorPage() {
                         events={rejectionEvents()}
                         start={visibleTimeRange().start}
                         end={visibleTimeRange().end}
-                        cursorTime={cursorTime()}
+                        cursorTime={inspectedTime()}
                         onCursorTimeChange={setCursorTime}
                         onZoom={zoomViewport}
                         onPan={panViewport}
@@ -1474,7 +1495,7 @@ export function KamaInspectorPage() {
                         series={valueOracleSeries()}
                         start={visibleTimeRange().start}
                         end={visibleTimeRange().end}
-                        cursorTime={cursorTime()}
+                        cursorTime={inspectedTime()}
                         onCursorTimeChange={setCursorTime}
                         onZoom={zoomViewport}
                         onPan={panViewport}
@@ -1548,10 +1569,57 @@ export function KamaInspectorPage() {
   );
 }
 
-function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint }) {
+type ExposureDistributionSeries = "oracle" | "oracleFit" | "prediction";
+
+function ExposureDistributionChart(props: {
+  point: VwKamaValueDistributionPoint;
+}) {
+  const [visibleSeries, setVisibleSeries] = createSignal<Record<ExposureDistributionSeries, boolean>>({
+    oracle: true,
+    oracleFit: true,
+    prediction: true,
+  });
+  const toggleSeries = (series: ExposureDistributionSeries) => setVisibleSeries((visible) => ({
+    ...visible,
+    [series]: !visible[series],
+  }));
+  const exposures = createMemo(() => Float64Array.from(
+    props.point.values,
+    (value) => value.exposure,
+  ));
+  const oracleProbabilities = createMemo(() => Float64Array.from(
+    props.point.values,
+    (value) => value.oracleProbability,
+  ));
+  const oracleFit = createMemo(() => fitConditionalQuadraticPolicy(
+    exposures(),
+    oracleProbabilities(),
+    Float64Array.of(0),
+    {
+      friction: 0,
+      transitionLogScale: 0,
+      objective: "probability-mse",
+      initialLinearCoefficient: props.point.strategyLinearCoefficient,
+      initialQuadraticCoefficient: props.point.strategyQuadraticCoefficient,
+    },
+  ));
+  const fittedOracleProbabilities = createMemo(() => conditionalQuadraticExposureProbabilities(
+    exposures(),
+    0,
+    oracleFit().linearCoefficient,
+    oracleFit().quadraticCoefficient,
+    0,
+    0,
+  ));
+  const predictedProbabilities = createMemo(() => Float64Array.from(
+    props.point.values,
+    (value) => value.strategyProbability,
+  ));
   const maximum = () => Math.max(
     Number.EPSILON,
-    ...props.point.values.flatMap((value) => [value.oracleProbability, value.strategyProbability]),
+    ...(visibleSeries().oracle ? oracleProbabilities() : []),
+    ...(visibleSeries().oracleFit ? fittedOracleProbabilities() : []),
+    ...(visibleSeries().prediction ? predictedProbabilities() : []),
   );
   const strategyMode = () => distributionMode(props.point.values, "strategyProbability");
   const markerPosition = (exposure: number) => distributionMarkerPosition(
@@ -1564,71 +1632,1224 @@ function ExposureDistributionChart(props: { point: VwKamaValueDistributionPoint 
         <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mode <strong class="text-cyan-200">{signedExposure(props.point.oracleModalExposure)}</strong> · path <strong class="text-cyan-100">{signedExposure(props.point.oraclePathExposure)}</strong> · mean {signedExposure(props.point.oracleMeanExposure)}</span>
         <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mode <strong class="text-violet-200">{signedExposure(strategyMode())}</strong> · target <strong class="text-violet-100">{signedExposure(props.point.candidateExposure)}</strong> · mean {signedExposure(props.point.strategyMeanExposure)}</span>
         <span>Oracle entropy {formatQuote(props.point.oracleEntropy, 4)}</span>
+        <span>Post-action CE {formatQuote(props.point.postActionCrossEntropy, 5)}</span>
+        <span class="text-cyan-200">Oracle probability-MSE fit {formatQuadraticFit(oracleFit())}</span>
+        <span class="text-violet-200">Prediction exact b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)} · normal {ratioPercent(props.point.strategyNormalMixture)} @ target, σ {formatQuote(props.point.strategyNormalSigma, 3)}</span>
       </div>
-      <div class="relative h-52 border-b border-line" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and path ${signedExposure(props.point.oraclePathExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
-        <div
-          class="grid h-full items-end gap-0.5 px-1 pt-2"
-          style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
-        >
-          <For each={props.point.values}>
-            {(value) => {
-              const oracleMode = () => value.exposure === props.point.oracleModalExposure;
-              const predictedMode = () => value.exposure === strategyMode();
-              return (
-                <div
-                  class="group relative flex h-full items-end justify-center gap-px"
-                  classList={{
-                    "bg-cyan-400/8": oracleMode() && !predictedMode(),
-                    "bg-violet-400/8": predictedMode() && !oracleMode(),
-                    "bg-gradient-to-r from-cyan-400/10 to-violet-400/10": oracleMode() && predictedMode(),
-                  }}
-                  title={`Exposure ${signedExposure(value.exposure)} · oracle ${ratioPercent(value.oracleProbability)}${oracleMode() ? " (mode)" : ""} · strategy ${ratioPercent(value.strategyProbability)}${predictedMode() ? " (mode)" : ""}`}
-                >
-                  <div
-                    class="w-[44%] min-w-px rounded-t-sm bg-cyan-400/80"
-                    classList={{ "outline outline-2 outline-offset-1 outline-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.8)]": oracleMode() }}
-                    style={{ height: `${value.oracleProbability / maximum() * 100}%` }}
-                  />
-                  <div
-                    class="w-[44%] min-w-px rounded-t-sm bg-violet-400/80"
-                    classList={{ "outline outline-2 outline-offset-1 outline-violet-200 shadow-[0_0_10px_rgba(167,139,250,0.8)]": predictedMode() }}
-                    style={{ height: `${value.strategyProbability / maximum() * 100}%` }}
-                  />
-                </div>
-              );
-            }}
-          </For>
+      <div class="relative h-52 pl-11" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and path ${signedExposure(props.point.oraclePathExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
+        <ProbabilityScaleLabels maximum={maximum()} />
+        <div class="relative h-full overflow-hidden border-y border-line bg-ink-900/25">
+          <svg
+            class="absolute inset-0 h-full w-full"
+            viewBox="0 0 1000 200"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            <DistributionGrid />
+            <Show when={visibleSeries().oracle}>
+              <DistributionSamples
+                probabilities={oracleProbabilities()}
+                exposures={exposures()}
+                maximum={maximum()}
+                color="#22d3ee"
+              />
+            </Show>
+            <Show when={visibleSeries().oracleFit}>
+              <DistributionCurve probabilities={fittedOracleProbabilities()} maximum={maximum()} color="#a5f3fc" lineWidth={2.25} opacity={0.74} />
+            </Show>
+            <Show when={visibleSeries().prediction}>
+              <DistributionCurve probabilities={predictedProbabilities()} maximum={maximum()} color="#c4b5fd" lineWidth={2.25} opacity={0.74} />
+            </Show>
+          </svg>
+          <div class="pointer-events-none absolute inset-0" aria-hidden="true">
+            <Show when={visibleSeries().oracle}>
+              <div
+                class="absolute inset-y-0 -translate-x-px border-l-2 border-dashed border-cyan-100/90"
+                style={{ left: markerPosition(props.point.oraclePathExposure) }}
+              />
+            </Show>
+            <Show when={visibleSeries().prediction}>
+              <div
+                class="absolute inset-y-0 translate-x-px border-l-2 border-dashed border-violet-100/90"
+                style={{ left: markerPosition(props.point.candidateExposure) }}
+              />
+            </Show>
+          </div>
         </div>
-        <div class="pointer-events-none absolute inset-x-1 bottom-0 top-2" aria-hidden="true">
-          <div
-            class="absolute inset-y-0 -translate-x-px border-l-2 border-dashed border-cyan-100/90"
-            style={{ left: markerPosition(props.point.oraclePathExposure) }}
-          />
-          <div
-            class="absolute inset-y-0 translate-x-px border-l-2 border-dashed border-violet-100/90"
-            style={{ left: markerPosition(props.point.candidateExposure) }}
-          />
-        </div>
       </div>
-      <div
-        class="grid gap-0.5 px-1 pt-1 text-center text-[10px] tabular-nums text-ink-400"
-        style={{ "grid-template-columns": `repeat(${props.point.values.length}, minmax(0, 1fr))` }}
-      >
-        <For each={props.point.values}>
-          {(value, index) => (
-            <span classList={{ invisible: index() % Math.max(1, Math.ceil(props.point.values.length / 9)) !== 0 && index() !== props.point.values.length - 1 }}>
-              {formatQuote(value.exposure, 1)}
-            </span>
-          )}
-        </For>
+      <div class="ml-11">
+        <DistributionExposureAxis values={props.point.values} />
       </div>
-      <div class="mt-0.5 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[10px] uppercase tracking-wider text-ink-500">
-        <span>Target exposure</span>
-        <span class="text-cyan-200">outlined bar = oracle mode · dashed line = oracle target</span>
-        <span class="text-violet-200">outlined bar = strategy mode · dashed line = strategy target</span>
+      <div class="mt-1 flex flex-wrap items-center justify-center gap-1.5">
+        <ChartSeriesToggle label="Oracle samples + path" color="#22d3ee" points active={visibleSeries().oracle} onClick={() => toggleSeries("oracle")} />
+        <ChartSeriesToggle label="Oracle probability-MSE fit" color="#a5f3fc" active={visibleSeries().oracleFit} onClick={() => toggleSeries("oracleFit")} />
+        <ChartSeriesToggle label="Exact prediction + target" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
       </div>
     </div>
   );
+}
+
+type DistributionProbability = "oracleProbability" | "strategyProbability";
+
+interface TransitionHeatmaps {
+  oracle: Float64Array;
+  strategy: Float64Array;
+  residual: Float64Array;
+}
+
+type TransitionHeatmapPanel = "oracle" | "prediction" | "difference";
+type TransitionDistributionSource = "oracle" | "prediction";
+interface TransitionHeatmapSelection {
+  source: TransitionDistributionSource;
+  stateIndex: number;
+  targetIndex: number;
+  currentExposure: number;
+  targetExposure: number;
+}
+interface TransitionHoverSlices extends TransitionHeatmapSelection {
+  row: Float64Array;
+  column: Float64Array;
+}
+type TransitionHeatmapMarking =
+  | "oracleMode"
+  | "oracleMean"
+  | "predictionMode"
+  | "predictionMean"
+  | "oraclePathRow"
+  | "candidateRow"
+  | "oppositeExposure";
+type TransitionHeatmapMarkings = Record<TransitionHeatmapMarking, boolean>;
+
+function TransitionPolicyDiagnostics(props: {
+  point: VwKamaValueDistributionPoint;
+}) {
+  const [visibleHeatmaps, setVisibleHeatmaps] = createSignal<Record<TransitionHeatmapPanel, boolean>>({
+    oracle: true,
+    prediction: true,
+    difference: true,
+  });
+  const toggleHeatmap = (panel: TransitionHeatmapPanel) => setVisibleHeatmaps((visible) => ({
+    ...visible,
+    [panel]: !visible[panel],
+  }));
+  const visibleHeatmapCount = () => Object.values(visibleHeatmaps())
+    .filter(Boolean)
+    .length;
+  const [visibleHeatmapMarkings, setVisibleHeatmapMarkings] = createSignal<TransitionHeatmapMarkings>({
+    oracleMode: true,
+    oracleMean: true,
+    predictionMode: true,
+    predictionMean: true,
+    oraclePathRow: true,
+    candidateRow: true,
+    oppositeExposure: true,
+  });
+  const toggleHeatmapMarking = (marking: TransitionHeatmapMarking) => setVisibleHeatmapMarkings((visible) => ({
+    ...visible,
+    [marking]: !visible[marking],
+  }));
+  const [hoveredHeatmapCell, setHoveredHeatmapCell] = createSignal<TransitionHeatmapSelection>();
+  const [selectedHeatmapCell, setSelectedHeatmapCell] = createSignal<TransitionHeatmapSelection>();
+  createEffect(() => {
+    props.point.time;
+    setHoveredHeatmapCell();
+    setSelectedHeatmapCell();
+  });
+  const matrices = createMemo(() => transitionHeatmaps(
+    props.point,
+    props.point.oracleTemperature,
+    props.point.friction,
+    props.point.frictionFraction,
+  ));
+  const hoveredHeatmapSlices = createMemo<TransitionHoverSlices | undefined>(() => {
+    const activeCell = selectedHeatmapCell() ?? hoveredHeatmapCell();
+    if (!activeCell) return undefined;
+    const matrix = activeCell.source === "oracle" ? matrices().oracle : matrices().strategy;
+    const size = props.point.values.length;
+    const row = matrix.slice(activeCell.stateIndex * size, (activeCell.stateIndex + 1) * size);
+    const column = new Float64Array(size);
+    for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+      column[stateIndex] = matrix[stateIndex * size + activeCell.targetIndex]!;
+    }
+    return { ...activeCell, row, column };
+  });
+  const probabilityScale = createMemo(() => robustPositiveScale(
+    matrices().oracle,
+    matrices().strategy,
+  ));
+  const oracleModes = createMemo(() => transitionModeIndices(
+    matrices().oracle,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const strategyModes = createMemo(() => transitionModeIndices(
+    matrices().strategy,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const oracleMeans = createMemo(() => transitionRowMeans(
+    matrices().oracle,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const strategyMeans = createMemo(() => transitionRowMeans(
+    matrices().strategy,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const oracleOppositeExposureSlice = createMemo(() => transitionAntiDiagonalSlice(
+    matrices().oracle,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const strategyOppositeExposureSlice = createMemo(() => transitionAntiDiagonalSlice(
+    matrices().strategy,
+    props.point.values.map((value) => value.exposure),
+  ));
+  const oraclePathSlice = createMemo(() => conditionalExposureSlice(
+    props.point.values,
+    "oracleProbability",
+    props.point.oraclePathExposure,
+    props.point.friction,
+    props.point.oracleTemperature,
+    1,
+  ));
+  const oracleCandidateSlice = createMemo(() => conditionalExposureSlice(
+    props.point.values,
+    "oracleProbability",
+    props.point.candidateExposure,
+    props.point.friction,
+    props.point.oracleTemperature,
+    1,
+  ));
+  const exposureGrid = createMemo(() => Float64Array.from(
+    props.point.values,
+    (value) => value.exposure,
+  ));
+  const predictionTransitionScale = () => props.point.frictionFraction
+    / props.point.strategyTemperature;
+  const fitOptions = () => ({
+    friction: props.point.friction,
+    transitionLogScale: predictionTransitionScale(),
+    objective: "probability-mse" as const,
+    initialLinearCoefficient: props.point.strategyLinearCoefficient,
+    initialQuadraticCoefficient: props.point.strategyQuadraticCoefficient,
+  });
+  const oraclePathFit = createMemo(() => fitConditionalQuadraticPolicy(
+    exposureGrid(),
+    oraclePathSlice(),
+    Float64Array.of(props.point.oraclePathExposure),
+    fitOptions(),
+  ));
+  const oracleCandidateFit = createMemo(() => fitConditionalQuadraticPolicy(
+    exposureGrid(),
+    oracleCandidateSlice(),
+    Float64Array.of(props.point.candidateExposure),
+    fitOptions(),
+  ));
+  const wholePolicyFit = createMemo(() => fitConditionalQuadraticPolicy(
+    exposureGrid(),
+    matrices().oracle,
+    exposureGrid(),
+    fitOptions(),
+  ));
+  const oraclePathFitCurve = createMemo(() => fittedConditionalCurve(
+    exposureGrid(),
+    props.point.oraclePathExposure,
+    oraclePathFit(),
+    props.point.friction,
+    predictionTransitionScale(),
+  ));
+  const oracleCandidateFitCurve = createMemo(() => fittedConditionalCurve(
+    exposureGrid(),
+    props.point.candidateExposure,
+    oracleCandidateFit(),
+    props.point.friction,
+    predictionTransitionScale(),
+  ));
+  const wholePolicyCandidateCurve = createMemo(() => fittedConditionalCurve(
+    exposureGrid(),
+    props.point.candidateExposure,
+    wholePolicyFit(),
+    props.point.friction,
+    predictionTransitionScale(),
+  ));
+  const exactPredictionCurve = createMemo(() => conditionalExposureProbabilities(
+    Float64Array.from(props.point.values, (value) => value.strategyProbability),
+    exposureGrid(),
+    props.point.candidateExposure,
+    props.point.friction,
+    predictionTransitionScale(),
+  ));
+  return (
+    <div class="mt-5 border-t border-line pt-4">
+      <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
+        <div>
+          <h4 class="text-sm font-semibold">Transition-aware policy</h4>
+          <div class="text-xs text-ink-400">
+            Rows are current exposure x; columns are target exposure a. Every row is the normalized conditional distribution used by the loss and sums to 100%.
+          </div>
+        </div>
+        <div class="text-xs tabular-nums text-ink-300">
+          uniform input-state prior · oracle policy mean {signedExposure(props.point.oraclePolicyMeanExposure)} · prediction mean {signedExposure(props.point.strategyPolicyMeanExposure)} · entropy {formatQuote(props.point.oraclePolicyEntropy, 4)} / {formatQuote(props.point.strategyPolicyEntropy, 4)}
+        </div>
+      </div>
+      <div class="mb-2 flex flex-wrap items-center justify-center gap-1.5">
+        <ChartSeriesToggle label="Oracle heatmap" color="#22d3ee" heatmap active={visibleHeatmaps().oracle} onClick={() => toggleHeatmap("oracle")} />
+        <ChartSeriesToggle label="Prediction heatmap" color="#a78bfa" heatmap active={visibleHeatmaps().prediction} onClick={() => toggleHeatmap("prediction")} />
+        <ChartSeriesToggle label="Difference heatmap" color="#fb7185" secondaryColor="#22d3ee" heatmap active={visibleHeatmaps().difference} onClick={() => toggleHeatmap("difference")} />
+      </div>
+      <Show
+        when={visibleHeatmapCount() > 0}
+        fallback={<div class="rounded-xl border border-dashed border-line py-8 text-center text-xs text-ink-500">All heatmaps hidden.</div>}
+      >
+        <div
+          class="grid gap-3"
+          classList={{
+            "lg:grid-cols-3": visibleHeatmapCount() >= 3,
+            "lg:grid-cols-2": visibleHeatmapCount() === 2,
+            "lg:grid-cols-1": visibleHeatmapCount() <= 1,
+          }}
+        >
+          <Show when={visibleHeatmaps().oracle}>
+            <TransitionHeatmapCanvas
+              title="Oracle p(a | x)"
+              matrix={matrices().oracle}
+              exposures={props.point.values.map((value) => value.exposure)}
+              scale={probabilityScale()}
+              palette="cyan"
+              oracleModes={oracleModes()}
+              strategyModes={strategyModes()}
+              oracleMeans={oracleMeans()}
+              strategyMeans={strategyMeans()}
+              oracleCurrentExposure={props.point.oraclePathExposure}
+              candidateCurrentExposure={props.point.candidateExposure}
+              markings={visibleHeatmapMarkings()}
+              sliceSource="oracle"
+              selectedCell={selectedHeatmapCell()}
+              onSliceHover={setHoveredHeatmapCell}
+              onSliceSelect={setSelectedHeatmapCell}
+              onSliceDeselect={() => setSelectedHeatmapCell()}
+            />
+          </Show>
+          <Show when={visibleHeatmaps().prediction}>
+            <TransitionHeatmapCanvas
+              title="Prediction s(a | x)"
+              matrix={matrices().strategy}
+              exposures={props.point.values.map((value) => value.exposure)}
+              scale={probabilityScale()}
+              palette="violet"
+              oracleModes={oracleModes()}
+              strategyModes={strategyModes()}
+              oracleMeans={oracleMeans()}
+              strategyMeans={strategyMeans()}
+              oracleCurrentExposure={props.point.oraclePathExposure}
+              candidateCurrentExposure={props.point.candidateExposure}
+              markings={visibleHeatmapMarkings()}
+              sliceSource="prediction"
+              selectedCell={selectedHeatmapCell()}
+              onSliceHover={setHoveredHeatmapCell}
+              onSliceSelect={setSelectedHeatmapCell}
+              onSliceDeselect={() => setSelectedHeatmapCell()}
+            />
+          </Show>
+          <Show when={visibleHeatmaps().difference}>
+            <TransitionHeatmapCanvas
+              title="Prediction − oracle probability"
+              matrix={matrices().residual}
+              exposures={props.point.values.map((value) => value.exposure)}
+              scale={robustAbsoluteScale(matrices().residual)}
+              palette="difference"
+              oracleModes={oracleModes()}
+              strategyModes={strategyModes()}
+              oracleMeans={oracleMeans()}
+              strategyMeans={strategyMeans()}
+              oracleCurrentExposure={props.point.oraclePathExposure}
+              candidateCurrentExposure={props.point.candidateExposure}
+              markings={visibleHeatmapMarkings()}
+              selectedCell={selectedHeatmapCell()}
+              onSliceDeselect={() => setSelectedHeatmapCell()}
+            />
+          </Show>
+        </div>
+      </Show>
+      <div class="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-[10px] uppercase tracking-wider text-ink-500">
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />oracle probability</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />predicted probability</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-rose-400" />difference below oracle</span>
+        <span>difference: positive = excess predicted mass</span>
+      </div>
+      <div class="mt-2 flex flex-wrap items-center justify-center gap-1.5">
+        <span class="mr-1 text-[10px] font-medium uppercase tracking-wider text-ink-500">Heatmap markings</span>
+        <ChartSeriesToggle label="Oracle row mode" color="#67e8f9" points active={visibleHeatmapMarkings().oracleMode} onClick={() => toggleHeatmapMarking("oracleMode")} />
+        <ChartSeriesToggle label="Oracle row mean" color="#67e8f9" points active={visibleHeatmapMarkings().oracleMean} onClick={() => toggleHeatmapMarking("oracleMean")} />
+        <ChartSeriesToggle label="Prediction row mode" color="#c4b5fd" points active={visibleHeatmapMarkings().predictionMode} onClick={() => toggleHeatmapMarking("predictionMode")} />
+        <ChartSeriesToggle label="Prediction row mean" color="#c4b5fd" points active={visibleHeatmapMarkings().predictionMean} onClick={() => toggleHeatmapMarking("predictionMean")} />
+        <ChartSeriesToggle label={`Oracle path row ${signedExposure(props.point.oraclePathExposure)}`} color="#67e8f9" active={visibleHeatmapMarkings().oraclePathRow} onClick={() => toggleHeatmapMarking("oraclePathRow")} />
+        <ChartSeriesToggle label={`Candidate row ${signedExposure(props.point.candidateExposure)}`} color="#6ee7b7" dashed active={visibleHeatmapMarkings().candidateRow} onClick={() => toggleHeatmapMarking("candidateRow")} />
+        <ChartSeriesToggle label="x + a = 0 trace" color="#fbbf24" dashed active={visibleHeatmapMarkings().oppositeExposure} onClick={() => toggleHeatmapMarking("oppositeExposure")} />
+      </div>
+      <div class="mt-4">
+        <div class="mb-2 text-xs font-medium text-ink-300">Conditional slices across exposure</div>
+        <div class="mb-2 text-[11px] text-ink-400">
+          Fits minimize pointwise probability MSE, mean((oracle − quadratic)²), across the displayed actions or the whole conditional map. Hover an oracle or prediction heatmap cell to add its row and column here; click to pin it and double-click any heatmap to deselect. The x + a = 0 and hovered-column cross-sections keep raw conditional cell probabilities and are not renormalized. KL(p∥q) remains a diagnostic because training still uses cross-entropy.
+        </div>
+        <div class="mb-2 grid gap-1 text-[11px] tabular-nums text-ink-300 md:grid-cols-2 xl:grid-cols-4">
+          <span class="text-cyan-200">Oracle @ path · {formatQuadraticFit(oraclePathFit())}</span>
+          <span class="text-emerald-200">Oracle @ candidate · {formatQuadraticFit(oracleCandidateFit())}</span>
+          <span class="text-amber-200">Whole-map oracle · {formatQuadraticFit(wholePolicyFit())}</span>
+          <span class="text-violet-200">Prediction exact mixture · b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)} · normal {ratioPercent(props.point.strategyNormalMixture)}, σ {formatQuote(props.point.strategyNormalSigma, 3)}</span>
+        </div>
+        <ConditionalPolicyCurveChart
+          values={props.point.values}
+          oraclePath={oraclePathSlice()}
+          oracleCandidate={oracleCandidateSlice()}
+          oraclePathFit={oraclePathFitCurve()}
+          oracleCandidateFit={oracleCandidateFitCurve()}
+          wholePolicyCandidateFit={wholePolicyCandidateCurve()}
+          prediction={exactPredictionCurve()}
+          oracleOppositeExposure={oracleOppositeExposureSlice()}
+          predictionOppositeExposure={strategyOppositeExposureSlice()}
+          inspectedSlices={hoveredHeatmapSlices()}
+          slicesPinned={selectedHeatmapCell() !== undefined}
+          onReleasePinnedSlices={() => setSelectedHeatmapCell()}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TransitionHeatmapCanvas(props: {
+  title: string;
+  matrix: Float64Array;
+  exposures: number[];
+  scale: number;
+  palette: "cyan" | "violet" | "difference";
+  oracleModes: Uint16Array;
+  strategyModes: Uint16Array;
+  oracleMeans: Float64Array;
+  strategyMeans: Float64Array;
+  oracleCurrentExposure: number;
+  candidateCurrentExposure: number;
+  markings: TransitionHeatmapMarkings;
+  sliceSource?: TransitionDistributionSource;
+  selectedCell?: TransitionHeatmapSelection;
+  onSliceHover?: (selection?: TransitionHeatmapSelection) => void;
+  onSliceSelect?: (selection: TransitionHeatmapSelection) => void;
+  onSliceDeselect?: () => void;
+}) {
+  let canvas!: HTMLCanvasElement;
+  const [hovered, setHovered] = createSignal<{
+    current: number;
+    target: number;
+    value: number;
+    oracleMode: number;
+    strategyMode: number;
+    oracleMean: number;
+    strategyMean: number;
+  }>();
+  createEffect(() => {
+    const selectedCell = props.selectedCell;
+    const selectedHere = selectedCell?.source === props.sliceSource ? selectedCell : undefined;
+    drawTransitionHeatmap(
+      canvas,
+      props.matrix,
+      props.exposures.length,
+      props.scale,
+      props.palette,
+      props.exposures,
+      props.oracleModes,
+      props.strategyModes,
+      props.oracleMeans,
+      props.strategyMeans,
+      props.oracleCurrentExposure,
+      props.candidateCurrentExposure,
+      props.markings,
+      selectedHere?.stateIndex,
+      selectedHere?.targetIndex,
+    );
+  });
+  const cellAt = (event: MouseEvent) => {
+    const bounds = canvas.getBoundingClientRect();
+    const size = props.exposures.length;
+    const targetIndex = Math.max(0, Math.min(
+      size - 1,
+      Math.floor((event.clientX - bounds.left) / bounds.width * size),
+    ));
+    const displayRow = Math.max(0, Math.min(
+      size - 1,
+      Math.floor((event.clientY - bounds.top) / bounds.height * size),
+    ));
+    const stateIndex = size - 1 - displayRow;
+    return {
+      stateIndex,
+      targetIndex,
+      current: props.exposures[stateIndex]!,
+      target: props.exposures[targetIndex]!,
+      value: props.matrix[stateIndex * size + targetIndex]!,
+      oracleMode: props.exposures[props.oracleModes[stateIndex]!]!,
+      strategyMode: props.exposures[props.strategyModes[stateIndex]!]!,
+      oracleMean: props.oracleMeans[stateIndex]!,
+      strategyMean: props.strategyMeans[stateIndex]!,
+    };
+  };
+  const sliceSelection = (cell: ReturnType<typeof cellAt>): TransitionHeatmapSelection | undefined =>
+    props.sliceSource
+      ? {
+          source: props.sliceSource,
+          stateIndex: cell.stateIndex,
+          targetIndex: cell.targetIndex,
+          currentExposure: cell.current,
+          targetExposure: cell.target,
+        }
+      : undefined;
+  const inspect = (event: MouseEvent) => {
+    const cell = cellAt(event);
+    setHovered({
+      current: cell.current,
+      target: cell.target,
+      value: cell.value,
+      oracleMode: cell.oracleMode,
+      strategyMode: cell.strategyMode,
+      oracleMean: cell.oracleMean,
+      strategyMean: cell.strategyMean,
+    });
+    props.onSliceHover?.(sliceSelection(cell));
+  };
+  return (
+    <div class="rounded-xl border border-line bg-ink-900/55 p-2">
+      <div class="mb-1 flex items-center justify-between gap-2 text-xs">
+        <span class="font-medium text-ink-200">{props.title}</span>
+        <span class="tabular-nums text-ink-500">
+          {props.palette === "difference" ? "±" : "color max "}{ratioPercent(props.scale)}
+        </span>
+      </div>
+      <canvas
+        ref={canvas}
+        width={props.exposures.length * 4}
+        height={props.exposures.length * 4}
+        class="aspect-square w-full cursor-crosshair border border-line [image-rendering:pixelated]"
+        aria-label={`${props.title}; horizontal target exposure, vertical current exposure`}
+        onMouseMove={inspect}
+        onMouseLeave={() => {
+          setHovered();
+          props.onSliceHover?.();
+        }}
+        onClick={(event) => {
+          const selection = sliceSelection(cellAt(event));
+          if (selection) props.onSliceSelect?.(selection);
+        }}
+        onDblClick={(event) => {
+          event.preventDefault();
+          props.onSliceDeselect?.();
+        }}
+      />
+      <div class="mt-1 flex justify-between text-[10px] text-ink-500">
+        <span>current + / target −</span><span>target exposure →</span><span>current + / target +</span>
+      </div>
+      <div class="min-h-4 text-center text-[10px] tabular-nums text-ink-300">
+        <Show when={hovered()}>{(cell) => (
+          <>x {signedExposure(cell().current)} → a {signedExposure(cell().target)} · {props.palette === "difference" ? "Δ " : "p "}{ratioPercent(cell().value)} · modes <span class="text-cyan-300">oracle {signedExposure(cell().oracleMode)}</span> / <span class="text-violet-300">prediction {signedExposure(cell().strategyMode)}</span> · means <span class="text-cyan-300">oracle {signedExposure(cell().oracleMean)}</span> / <span class="text-violet-300">prediction {signedExposure(cell().strategyMean)}</span></>
+        )}</Show>
+      </div>
+    </div>
+  );
+}
+
+function fittedConditionalCurve(
+  grid: Float64Array,
+  currentExposure: number,
+  fit: ConditionalQuadraticPolicyFit,
+  friction: number,
+  transitionLogScale: number,
+): Float64Array<ArrayBufferLike> {
+  return conditionalQuadraticExposureProbabilities(
+    grid,
+    currentExposure,
+    fit.linearCoefficient,
+    fit.quadraticCoefficient,
+    friction,
+    transitionLogScale,
+  );
+}
+
+type ConditionalPolicySeries =
+  | "oraclePath"
+  | "oracleCandidate"
+  | "oracleOppositeExposure"
+  | "oraclePathFit"
+  | "oracleCandidateFit"
+  | "wholePolicyCandidateFit"
+  | "prediction"
+  | "predictionOppositeExposure"
+  | "inspectedRow"
+  | "inspectedColumn";
+
+function ConditionalPolicyCurveChart(props: {
+  values: VwKamaValueDistributionPoint["values"];
+  oraclePath: Float64Array;
+  oracleCandidate: Float64Array;
+  oraclePathFit: Float64Array<ArrayBufferLike>;
+  oracleCandidateFit: Float64Array<ArrayBufferLike>;
+  wholePolicyCandidateFit: Float64Array<ArrayBufferLike>;
+  prediction: Float64Array<ArrayBufferLike>;
+  oracleOppositeExposure: Float64Array;
+  predictionOppositeExposure: Float64Array;
+  inspectedSlices?: TransitionHoverSlices;
+  slicesPinned: boolean;
+  onReleasePinnedSlices: () => void;
+}) {
+  const [visibleSeries, setVisibleSeries] = createSignal<Record<ConditionalPolicySeries, boolean>>({
+    oraclePath: true,
+    oracleCandidate: true,
+    oracleOppositeExposure: true,
+    oraclePathFit: true,
+    oracleCandidateFit: true,
+    wholePolicyCandidateFit: true,
+    prediction: true,
+    predictionOppositeExposure: true,
+    inspectedRow: true,
+    inspectedColumn: true,
+  });
+  const toggleSeries = (series: ConditionalPolicySeries) => setVisibleSeries((visible) => ({
+    ...visible,
+    [series]: !visible[series],
+  }));
+  const maximum = () => Math.max(
+    Number.EPSILON,
+    ...(visibleSeries().oraclePath ? props.oraclePath : []),
+    ...(visibleSeries().oracleCandidate ? props.oracleCandidate : []),
+    ...(visibleSeries().oraclePathFit ? props.oraclePathFit : []),
+    ...(visibleSeries().oracleCandidateFit ? props.oracleCandidateFit : []),
+    ...(visibleSeries().wholePolicyCandidateFit ? props.wholePolicyCandidateFit : []),
+    ...(visibleSeries().prediction ? props.prediction : []),
+    ...(visibleSeries().oracleOppositeExposure ? props.oracleOppositeExposure : []),
+    ...(visibleSeries().predictionOppositeExposure ? props.predictionOppositeExposure : []),
+    ...(visibleSeries().inspectedRow && props.inspectedSlices ? props.inspectedSlices.row : []),
+    ...(visibleSeries().inspectedColumn && props.inspectedSlices ? props.inspectedSlices.column : []),
+  );
+  return (
+    <div>
+      <Show when={props.inspectedSlices}>{(slices) => (
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-ink-900/45 px-2.5 py-1.5 text-[11px] tabular-nums text-ink-300">
+          <span>
+            <strong class={slices().source === "oracle" ? "text-cyan-200" : "text-violet-200"}>
+              {props.slicesPinned ? "Pinned" : "Hovered"} {slices().source}
+            </strong>
+            {" · "}x {signedExposure(slices().currentExposure)} · a {signedExposure(slices().targetExposure)}
+            {" · "}<span class="text-ink-400">white is normalized row p(target | x); gold dashed is the raw column p(a | current)</span>
+          </span>
+          <Show when={props.slicesPinned}>
+            <button
+              type="button"
+              class="rounded-full border border-line px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-ink-300 transition hover:border-ink-300 hover:text-ink-100"
+              onClick={props.onReleasePinnedSlices}
+            >
+              Follow hover
+            </button>
+          </Show>
+        </div>
+      )}</Show>
+      <div class="relative h-52 pl-11">
+        <ProbabilityScaleLabels maximum={maximum()} />
+        <div class="relative h-full overflow-hidden border-y border-line bg-ink-900/25">
+          <svg
+            class="absolute inset-0 h-full w-full"
+            viewBox="0 0 1000 200"
+            preserveAspectRatio="none"
+            role="img"
+            aria-label="Conditional oracle samples, fitted quadratic policies, exact predicted policy, x plus a equals zero cross-sections, and inspected heatmap row and column slices"
+          >
+            <DistributionGrid />
+            <Show when={visibleSeries().oraclePath}>
+              <DistributionSamples
+                probabilities={props.oraclePath}
+                exposures={props.values.map((value) => value.exposure)}
+                maximum={maximum()}
+                color="#22d3ee"
+              />
+            </Show>
+            <Show when={visibleSeries().oracleCandidate}>
+              <DistributionSamples
+                probabilities={props.oracleCandidate}
+                exposures={props.values.map((value) => value.exposure)}
+                maximum={maximum()}
+                color="#34d399"
+              />
+            </Show>
+            <Show when={visibleSeries().oracleOppositeExposure}>
+              <DistributionSamples
+                probabilities={props.oracleOppositeExposure}
+                exposures={props.values.map((value) => value.exposure)}
+                maximum={maximum()}
+                color="#fb923c"
+              />
+            </Show>
+            <Show when={visibleSeries().oraclePathFit}>
+              <DistributionCurve probabilities={props.oraclePathFit} maximum={maximum()} color="#a5f3fc" lineWidth={2.25} opacity={0.72} />
+            </Show>
+            <Show when={visibleSeries().oracleCandidateFit}>
+              <DistributionCurve probabilities={props.oracleCandidateFit} maximum={maximum()} color="#6ee7b7" lineWidth={2.25} opacity={0.72} />
+            </Show>
+            <Show when={visibleSeries().wholePolicyCandidateFit}>
+              <DistributionCurve probabilities={props.wholePolicyCandidateFit} maximum={maximum()} color="#fcd34d" lineWidth={2.25} opacity={0.76} dashed />
+            </Show>
+            <Show when={visibleSeries().prediction}>
+              <DistributionCurve probabilities={props.prediction} maximum={maximum()} color="#c4b5fd" lineWidth={2.5} opacity={0.74} />
+            </Show>
+            <Show when={visibleSeries().predictionOppositeExposure}>
+              <DistributionCurve probabilities={props.predictionOppositeExposure} maximum={maximum()} color="#f472b6" lineWidth={2.25} opacity={0.78} dashed />
+            </Show>
+            <Show when={visibleSeries().inspectedRow ? props.inspectedSlices : undefined}>{(slices) => (
+              <DistributionCurve probabilities={slices().row} maximum={maximum()} color="#f8fafc" lineWidth={3} opacity={0.96} />
+            )}</Show>
+            <Show when={visibleSeries().inspectedColumn ? props.inspectedSlices : undefined}>{(slices) => (
+              <DistributionCurve probabilities={slices().column} maximum={maximum()} color="#fbbf24" lineWidth={2.75} opacity={0.94} dashed />
+            )}</Show>
+          </svg>
+        </div>
+      </div>
+      <div class="ml-11">
+        <DistributionExposureAxis values={props.values} />
+      </div>
+      <div class="mt-1 flex flex-wrap items-center justify-center gap-1.5">
+        <ChartSeriesToggle label="Oracle @ path" color="#22d3ee" points active={visibleSeries().oraclePath} onClick={() => toggleSeries("oraclePath")} />
+        <ChartSeriesToggle label="Path fit" color="#a5f3fc" active={visibleSeries().oraclePathFit} onClick={() => toggleSeries("oraclePathFit")} />
+        <ChartSeriesToggle label="Oracle @ candidate" color="#34d399" points active={visibleSeries().oracleCandidate} onClick={() => toggleSeries("oracleCandidate")} />
+        <ChartSeriesToggle label="Candidate fit" color="#6ee7b7" active={visibleSeries().oracleCandidateFit} onClick={() => toggleSeries("oracleCandidateFit")} />
+        <ChartSeriesToggle label="Whole-map fit @ candidate" color="#fcd34d" dashed active={visibleSeries().wholePolicyCandidateFit} onClick={() => toggleSeries("wholePolicyCandidateFit")} />
+        <ChartSeriesToggle label="Exact prediction" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
+        <ChartSeriesToggle label="Oracle x + a = 0" color="#fb923c" points active={visibleSeries().oracleOppositeExposure} onClick={() => toggleSeries("oracleOppositeExposure")} />
+        <ChartSeriesToggle label="Prediction x + a = 0" color="#f472b6" dashed active={visibleSeries().predictionOppositeExposure} onClick={() => toggleSeries("predictionOppositeExposure")} />
+        <Show when={props.inspectedSlices}>{(slices) => (
+          <>
+            <ChartSeriesToggle label={`${slices().source} hovered row`} color="#f8fafc" active={visibleSeries().inspectedRow} onClick={() => toggleSeries("inspectedRow")} />
+            <ChartSeriesToggle label={`${slices().source} hovered column`} color="#fbbf24" dashed active={visibleSeries().inspectedColumn} onClick={() => toggleSeries("inspectedColumn")} />
+          </>
+        )}</Show>
+      </div>
+    </div>
+  );
+}
+
+function ChartSeriesToggle(props: {
+  label: string;
+  color: string;
+  secondaryColor?: string;
+  active: boolean;
+  dashed?: boolean;
+  heatmap?: boolean;
+  points?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      class="inline-flex min-h-7 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider transition hover:border-ink-300 hover:text-ink-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/45"
+      classList={{
+        "border-ink-400 bg-ink-800 text-ink-200": props.active,
+        "border-line bg-ink-900/40 text-ink-500 opacity-50": !props.active,
+      }}
+      aria-pressed={props.active}
+      onClick={props.onClick}
+    >
+      <Show
+        when={props.heatmap}
+        fallback={(
+          <span class="relative inline-block h-2 w-5 shrink-0" aria-hidden="true">
+            <span
+              class="absolute inset-x-0 top-1/2 border-t-2"
+              classList={{ "border-dashed": props.dashed }}
+              style={{ "border-color": props.color }}
+            />
+            <Show when={props.points}>
+              <span
+                class="absolute left-1/2 top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full"
+                style={{ "background-color": props.color }}
+              />
+            </Show>
+          </span>
+        )}
+      >
+        <span
+          class="inline-block h-3 w-3 shrink-0 rounded-sm border border-white/20"
+          style={{
+            background: props.secondaryColor
+              ? `linear-gradient(135deg, ${props.color}, ${props.secondaryColor})`
+              : props.color,
+          }}
+          aria-hidden="true"
+        />
+      </Show>
+      <span>{props.label}</span>
+    </button>
+  );
+}
+
+function DistributionCurve(props: {
+  probabilities: ArrayLike<number>;
+  maximum: number;
+  color: string;
+  lineWidth?: number;
+  opacity?: number;
+  dashed?: boolean;
+}) {
+  return (
+    <path
+      d={distributionCurvePath(props.probabilities, props.maximum)}
+      vector-effect="non-scaling-stroke"
+      style={{
+        fill: "none",
+        stroke: props.color,
+        "stroke-width": `${props.lineWidth ?? 2}px`,
+        "stroke-dasharray": props.dashed ? "7 5" : "none",
+        opacity: `${props.opacity ?? 1}`,
+      }}
+    />
+  );
+}
+
+function DistributionSamples(props: {
+  probabilities: ArrayLike<number>;
+  exposures: ArrayLike<number>;
+  maximum: number;
+  color: string;
+}) {
+  const points = () => Array.from(
+    { length: props.probabilities.length },
+    (_, index) => ({
+      x: (index + 0.5) / props.probabilities.length * 1_000,
+      y: distributionCurveY(props.probabilities[index]!, props.maximum),
+      exposure: props.exposures[index]!,
+      probability: props.probabilities[index]!,
+    }),
+  );
+  return (
+    <g>
+      <DistributionCurve
+        probabilities={props.probabilities}
+        maximum={props.maximum}
+        color={props.color}
+        lineWidth={1}
+        opacity={0.38}
+      />
+      <For each={points()}>{(point) => (
+        <circle
+          cx={point.x}
+          cy={point.y}
+          r="1.6"
+          vector-effect="non-scaling-stroke"
+          style={{ fill: props.color, opacity: "0.58" }}
+        >
+          <title>{`Exposure ${signedExposure(point.exposure)} · probability ${ratioPercent(point.probability)}`}</title>
+        </circle>
+      )}</For>
+    </g>
+  );
+}
+
+function DistributionGrid() {
+  return (
+    <g aria-hidden="true">
+      <For each={[5, 100, 195]}>{(y) => (
+        <line
+          x1="0"
+          x2="1000"
+          y1={y}
+          y2={y}
+          vector-effect="non-scaling-stroke"
+          style={{ stroke: "rgba(100, 116, 139, 0.28)", "stroke-width": "1px" }}
+        />
+      )}</For>
+    </g>
+  );
+}
+
+function ProbabilityScaleLabels(props: { maximum: number }) {
+  return (
+    <div class="pointer-events-none absolute inset-y-0 left-0 w-10 text-right text-[10px] tabular-nums text-ink-500" aria-hidden="true">
+      <span class="absolute right-1 top-0 -translate-y-1/2">{ratioPercent(props.maximum)}</span>
+      <span class="absolute right-1 top-1/2 -translate-y-1/2">{ratioPercent(props.maximum / 2)}</span>
+      <span class="absolute bottom-0 right-1 translate-y-1/2">0%</span>
+    </div>
+  );
+}
+
+function distributionCurvePath(
+  probabilities: ArrayLike<number>,
+  maximum: number,
+  width = 1_000,
+  height = 200,
+): string {
+  if (probabilities.length === 0) return "";
+  const verticalPadding = 5;
+  return Array.from({ length: probabilities.length }, (_, index) => {
+    const x = (index + 0.5) / probabilities.length * width;
+    const y = distributionCurveY(probabilities[index]!, maximum, height, verticalPadding);
+    return `${index === 0 ? "M" : "L"}${x.toFixed(3)},${y.toFixed(3)}`;
+  }).join(" ");
+}
+
+function distributionCurveY(
+  probability: number,
+  maximum: number,
+  height = 200,
+  verticalPadding = 5,
+): number {
+  return height - verticalPadding
+    - Math.max(0, probability) / Math.max(Number.EPSILON, maximum)
+      * (height - verticalPadding * 2);
+}
+
+function formatCoefficient(value: number): string {
+  const magnitude = Math.abs(value);
+  if (magnitude === 0) return "0";
+  return magnitude >= 1e-4 && magnitude < 1e4
+    ? formatQuote(value, 7)
+    : value.toExponential(4);
+}
+
+function formatQuadraticFit(fit: ConditionalQuadraticPolicyFit): string {
+  return `${fit.converged ? "converged" : "not converged"} · b₁ ${formatCoefficient(fit.linearCoefficient)}`
+    + ` · b₂ ${formatCoefficient(fit.quadraticCoefficient)}`
+    + ` · MSE ${formatCoefficient(fit.meanSquaredError)}`
+    + ` · KL(p∥q) ${formatQuote(fit.klDivergence, 6)}`;
+}
+
+function DistributionExposureAxis(props: { values: VwKamaValueDistributionPoint["values"] }) {
+  return (
+    <div class="grid gap-0.5 px-1 pt-1 text-center text-[10px] tabular-nums text-ink-400"
+      style={{ "grid-template-columns": `repeat(${props.values.length}, minmax(0, 1fr))` }}>
+      <For each={props.values}>{(value, index) => (
+        <span classList={{ invisible: index() % Math.max(1, Math.ceil(props.values.length / 9)) !== 0 && index() !== props.values.length - 1 }}>
+          {formatQuote(value.exposure, 1)}
+        </span>
+      )}</For>
+    </div>
+  );
+}
+
+function transitionHeatmaps(
+  point: VwKamaValueDistributionPoint,
+  oracleTemperature: number,
+  friction: number,
+  frictionFraction: number,
+): TransitionHeatmaps {
+  const size = point.values.length;
+  const oracle = new Float64Array(size * size);
+  const strategy = new Float64Array(size * size);
+  const residual = new Float64Array(size * size);
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const current = point.values[stateIndex]!.exposure;
+    const oracleRow = conditionalExposureSlice(
+      point.values,
+      "oracleProbability",
+      current,
+      friction,
+      oracleTemperature,
+      1,
+    );
+    const strategyRow = conditionalExposureSlice(
+      point.values,
+      "strategyProbability",
+      current,
+      friction,
+      point.strategyTemperature,
+      frictionFraction,
+    );
+    for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+      const offset = stateIndex * size + targetIndex;
+      oracle[offset] = oracleRow[targetIndex]!;
+      strategy[offset] = strategyRow[targetIndex]!;
+      residual[offset] = strategyRow[targetIndex]! - oracleRow[targetIndex]!;
+    }
+  }
+  return { oracle, strategy, residual };
+}
+
+function conditionalExposureSlice(
+  values: VwKamaValueDistributionPoint["values"],
+  probability: DistributionProbability,
+  currentExposure: number,
+  friction: number,
+  temperature: number,
+  frictionScale: number,
+): Float64Array {
+  return conditionalExposureProbabilities(
+    values.map((value) => value[probability]),
+    values.map((value) => value.exposure),
+    currentExposure,
+    friction,
+    frictionScale / temperature,
+  );
+}
+
+function robustAbsoluteScale(matrix: Float64Array): number {
+  const magnitudes = Array.from(matrix, (value) => Number.isFinite(value) ? Math.abs(value) : 0)
+    .filter((value) => value > 0)
+    .sort((left, right) => left - right);
+  if (magnitudes.length === 0) return 1;
+  return Math.max(Number.EPSILON, magnitudes[Math.floor((magnitudes.length - 1) * 0.95)]!);
+}
+
+function robustPositiveScale(...matrices: Float64Array[]): number {
+  const values = matrices.flatMap((matrix) => Array.from(
+    matrix,
+    (value) => Number.isFinite(value) && value > 0 ? value : 0,
+  )).filter((value) => value > 0).sort((left, right) => left - right);
+  if (values.length === 0) return 1;
+  return Math.max(Number.EPSILON, values[Math.floor((values.length - 1) * 0.99)]!);
+}
+
+function transitionModeIndices(matrix: Float64Array, exposures: number[]): Uint16Array {
+  const size = exposures.length;
+  const result = new Uint16Array(size);
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    let bestIndex = 0;
+    let bestValue = Number.NEGATIVE_INFINITY;
+    for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+      const value = matrix[stateIndex * size + targetIndex]!;
+      if (value > bestValue || (value === bestValue
+        && Math.abs(exposures[targetIndex]!) < Math.abs(exposures[bestIndex]!))) {
+        bestValue = value;
+        bestIndex = targetIndex;
+      }
+    }
+    result[stateIndex] = bestIndex;
+  }
+  return result;
+}
+
+function transitionRowMeans(matrix: Float64Array, exposures: number[]): Float64Array {
+  const size = exposures.length;
+  const result = new Float64Array(size);
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    let total = 0;
+    let weightedExposure = 0;
+    for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+      const probability = matrix[stateIndex * size + targetIndex]!;
+      total += probability;
+      weightedExposure += probability * exposures[targetIndex]!;
+    }
+    result[stateIndex] = total > 0 ? weightedExposure / total : 0;
+  }
+  return result;
+}
+
+function transitionAntiDiagonalSlice(
+  matrix: Float64Array,
+  exposures: number[],
+): Float64Array {
+  const size = exposures.length;
+  const result = new Float64Array(size);
+  for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+    const stateIndex = nearestExposureIndex(exposures, -exposures[targetIndex]!);
+    result[targetIndex] = matrix[stateIndex * size + targetIndex]!;
+  }
+  return result;
+}
+
+function nearestExposureIndex(exposures: number[], target: number): number {
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < exposures.length; index += 1) {
+    const distance = Math.abs(exposures[index]! - target);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function exposureCanvasPosition(
+  exposures: number[],
+  target: number,
+  cellSize: number,
+): number {
+  if (exposures.length <= 1) return cellSize / 2;
+  if (target <= exposures[0]!) return cellSize / 2;
+  if (target >= exposures.at(-1)!) return (exposures.length - 0.5) * cellSize;
+  let low = 0;
+  let high = exposures.length - 1;
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (exposures[middle]! <= target) low = middle;
+    else high = middle;
+  }
+  const span = exposures[high]! - exposures[low]!;
+  const fraction = span > 0 ? (target - exposures[low]!) / span : 0;
+  return (low + fraction + 0.5) * cellSize;
+}
+
+function drawTransitionHeatmap(
+  canvas: HTMLCanvasElement,
+  matrix: Float64Array,
+  size: number,
+  scale: number,
+  palette: "cyan" | "violet" | "difference",
+  exposures: number[],
+  oracleModes: Uint16Array,
+  strategyModes: Uint16Array,
+  oracleMeans: Float64Array,
+  strategyMeans: Float64Array,
+  oracleCurrentExposure: number,
+  candidateCurrentExposure: number,
+  markings: TransitionHeatmapMarkings,
+  selectedStateIndex?: number,
+  selectedTargetIndex?: number,
+): void {
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  const cellSize = 4;
+  const renderSize = size * cellSize;
+  if (canvas.width !== renderSize) canvas.width = renderSize;
+  if (canvas.height !== renderSize) canvas.height = renderSize;
+  const image = context.createImageData(renderSize, renderSize);
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const displayRow = size - 1 - stateIndex;
+    for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+      const value = matrix[stateIndex * size + targetIndex]!;
+      const normalized = Number.isFinite(value) && scale > 0
+        ? palette === "difference"
+          ? Math.max(-1, Math.min(1, value / scale))
+          : Math.max(0, Math.min(1, value / scale))
+        : 0;
+      const intensity = Math.sqrt(Math.abs(normalized));
+      const base = [24, 31, 45];
+      const endpoint = palette === "violet"
+        ? [167, 139, 250]
+        : palette === "difference" && normalized < 0
+          ? [251, 113, 133]
+          : [34, 211, 238];
+      const red = Math.round(base[0]! + (endpoint[0]! - base[0]!) * intensity);
+      const green = Math.round(base[1]! + (endpoint[1]! - base[1]!) * intensity);
+      const blue = Math.round(base[2]! + (endpoint[2]! - base[2]!) * intensity);
+      for (let y = 0; y < cellSize; y += 1) {
+        for (let x = 0; x < cellSize; x += 1) {
+          const pixel = (
+            (displayRow * cellSize + y) * renderSize
+              + targetIndex * cellSize + x
+          ) * 4;
+          image.data[pixel] = red;
+          image.data[pixel + 1] = green;
+          image.data[pixel + 2] = blue;
+          image.data[pixel + 3] = 255;
+        }
+      }
+    }
+  }
+  context.putImageData(image, 0, 0);
+
+  const rowTop = (stateIndex: number) => (size - 1 - stateIndex) * cellSize;
+  const oracleRow = nearestExposureIndex(exposures, oracleCurrentExposure);
+  const candidateRow = nearestExposureIndex(exposures, candidateCurrentExposure);
+  context.lineWidth = 1;
+  context.setLineDash([]);
+  if (markings.oraclePathRow) {
+    context.strokeStyle = "rgba(103, 232, 249, 0.95)";
+    context.strokeRect(0.5, rowTop(oracleRow) + 0.5, renderSize - 1, cellSize - 1);
+  }
+  if (markings.candidateRow) {
+    context.setLineDash([cellSize * 2, cellSize]);
+    context.strokeStyle = "rgba(110, 231, 183, 0.95)";
+    context.strokeRect(0.5, rowTop(candidateRow) + 0.5, renderSize - 1, cellSize - 1);
+  }
+  context.setLineDash([]);
+
+  const traceOppositeExposure = () => {
+    context.beginPath();
+    for (let targetIndex = 0; targetIndex < size; targetIndex += 1) {
+      const stateIndex = nearestExposureIndex(exposures, -exposures[targetIndex]!);
+      const x = targetIndex * cellSize + cellSize / 2;
+      const y = rowTop(stateIndex) + cellSize / 2;
+      if (targetIndex === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    }
+  };
+  if (markings.oppositeExposure) {
+    context.setLineDash([cellSize * 1.5, cellSize]);
+    traceOppositeExposure();
+    context.strokeStyle = "rgba(2, 6, 23, 0.88)";
+    context.lineWidth = 2.8;
+    context.stroke();
+    traceOppositeExposure();
+    context.strokeStyle = "rgba(251, 191, 36, 0.88)";
+    context.lineWidth = 1.1;
+    context.stroke();
+  }
+  context.setLineDash([]);
+
+  const drawMode = (x: number, y: number, color: string) => {
+    context.fillStyle = "rgba(2, 6, 23, 0.95)";
+    context.fillRect(x - 1.5, y - 1.5, 3, 3);
+    context.fillStyle = color;
+    context.fillRect(x - 0.5, y - 0.5, 1, 1);
+  };
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const y = rowTop(stateIndex) + cellSize / 2;
+    const oracleX = oracleModes[stateIndex]! * cellSize + cellSize / 2;
+    const strategyX = strategyModes[stateIndex]! * cellSize + cellSize / 2;
+    if (markings.oracleMode && markings.predictionMode && oracleX === strategyX) {
+      context.fillStyle = "rgba(2, 6, 23, 0.95)";
+      context.fillRect(oracleX - 2, y - 2, 4, 4);
+      context.fillStyle = "rgb(103, 232, 249)";
+      context.fillRect(oracleX - 1, y - 1, 1, 2);
+      context.fillStyle = "rgb(196, 181, 253)";
+      context.fillRect(oracleX, y - 1, 1, 2);
+      continue;
+    }
+    if (markings.oracleMode) drawMode(oracleX, y, "rgb(103, 232, 249)");
+    if (markings.predictionMode) drawMode(strategyX, y, "rgb(196, 181, 253)");
+  }
+
+  const drawDiamond = (x: number, y: number, color: string) => {
+    context.beginPath();
+    context.moveTo(x, y - 1.8);
+    context.lineTo(x + 1.8, y);
+    context.lineTo(x, y + 1.8);
+    context.lineTo(x - 1.8, y);
+    context.closePath();
+    context.strokeStyle = "rgba(2, 6, 23, 0.9)";
+    context.lineWidth = 2.25;
+    context.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = 0.9;
+    context.stroke();
+  };
+  const drawCircle = (x: number, y: number, color: string) => {
+    context.beginPath();
+    context.arc(x, y, 1.55, 0, Math.PI * 2);
+    context.strokeStyle = "rgba(2, 6, 23, 0.9)";
+    context.lineWidth = 2.25;
+    context.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = 0.9;
+    context.stroke();
+  };
+  for (let stateIndex = 0; stateIndex < size; stateIndex += 1) {
+    const y = rowTop(stateIndex) + cellSize / 2;
+    if (markings.oracleMean) {
+      drawDiamond(
+        exposureCanvasPosition(exposures, oracleMeans[stateIndex]!, cellSize),
+        y,
+        "rgba(103, 232, 249, 0.88)",
+      );
+    }
+    if (markings.predictionMean) {
+      drawCircle(
+        exposureCanvasPosition(exposures, strategyMeans[stateIndex]!, cellSize),
+        y,
+        "rgba(196, 181, 253, 0.88)",
+      );
+    }
+  }
+  if (selectedStateIndex !== undefined && selectedTargetIndex !== undefined) {
+    const x = selectedTargetIndex * cellSize;
+    const y = rowTop(selectedStateIndex);
+    context.setLineDash([]);
+    context.strokeStyle = "rgba(2, 6, 23, 0.98)";
+    context.lineWidth = 3;
+    context.strokeRect(x + 0.5, y + 0.5, cellSize - 1, cellSize - 1);
+    context.strokeStyle = "rgba(248, 250, 252, 0.98)";
+    context.lineWidth = 1;
+    context.strokeRect(x + 0.5, y + 0.5, cellSize - 1, cellSize - 1);
+  }
 }
 
 function distributionMode(

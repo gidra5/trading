@@ -37,7 +37,10 @@ import {
   observeExposureReturn,
   observeExposureValueDistillation,
   strategyExposureProbabilities,
+  strategyExposureLogSlope,
   strategyExposureQuadraticCoefficient,
+  strategyExposureTransitionCrossEntropy,
+  strategyExposureTransitionStatistics,
   strategyExposureTemperatures,
   strategyExposureVolatilities,
   type ExposureReturnMetrics,
@@ -51,7 +54,7 @@ const DAY_MS = 86_400_000;
 const F1_WEIGHT = 0.2;
 const AGREEMENT_WEIGHT = 0.6;
 const CLEANLINESS_WEIGHT = 0.2;
-export const VW_KAMA_SCORE_VERSION = 10;
+export const VW_KAMA_SCORE_VERSION = 12;
 
 export type VwKamaDeadbandMode = "flat" | "hold" | "hysteresis";
 export type VwKamaAgreementMode = "sizing" | "confidence";
@@ -85,6 +88,8 @@ export interface VwKamaParameters {
   strategyTemperature?: number;
   strategyQuadraticScale?: number;
   strategyQuadraticVolatilityMs?: number;
+  strategyNormalMixture?: number;
+  strategyNormalSigma?: number;
   buyMaxFraction?: number;
   sellMaxFraction?: number;
   buySizingSigmaBpsHour?: number;
@@ -186,6 +191,8 @@ export function vwKamaParametersFromPeakValleySignal(
     strategyTemperature: 0.001,
     strategyQuadraticScale: 0,
     strategyQuadraticVolatilityMs: HOUR_MS,
+    strategyNormalMixture: 0,
+    strategyNormalSigma: 25,
     buyMaxFraction: Math.min(1, config.buySpendRate),
     sellMaxFraction: Math.min(1, config.sellAmountRate),
     buySizingSigmaBpsHour: Number.MAX_VALUE,
@@ -382,14 +389,26 @@ export interface VwKamaValueDistributionPoint {
   oracleModalExposure: number;
   oraclePathExposure: number;
   strategyMeanExposure: number;
+  oraclePolicyMeanExposure: number;
+  strategyPolicyMeanExposure: number;
   strategyRateBpsHour: number;
+  oracleTemperature: number;
   strategyTemperature: number;
+  friction: number;
+  frictionFraction: number;
+  strategyLinearCoefficient: number;
   strategyQuadraticVolatility: number;
   strategyQuadraticScale: number;
   strategyQuadraticCoefficient: number;
+  strategyNormalMixture: number;
+  strategyNormalSigma: number;
   oracleEntropy: number;
+  oraclePolicyEntropy: number;
+  strategyPolicyEntropy: number;
   opportunity: number;
+  averageRegret: number;
   crossEntropy: number;
+  postActionCrossEntropy: number;
   values: Array<{
     exposure: number;
     oracleProbability: number;
@@ -727,6 +746,8 @@ export function evaluateVwKamaOracle(
   const requestedTraceTimes = options.traceTimes ? new Set(options.traceTimes) : null;
   const sampleEvery = Math.max(1, Math.ceil((candles.length - scoreStart) / maxPoints));
   const agreementMode = options.parameters.agreementMode ?? "sizing";
+  const valueExposureMinimum = options.valueDistillation?.oracle.grid[0] ?? -1;
+  const valueExposureMaximum = options.valueDistillation?.oracle.grid.at(-1) ?? 1;
   let current = 0;
   let trend = 0;
   let targetFraction = 0;
@@ -908,18 +929,39 @@ export function evaluateVwKamaOracle(
     const signalIntent = includeTrace && sourceEdge && trend !== current
       ? stateName(trend)
       : null;
-    const fromExposure = candidateAgreementValue(
+    const fromAgreementExposure = candidateAgreementValue(
       agreementMode,
       current,
       targetFraction,
       anchorPrice,
       candle.close,
     );
+    const fromExposure = options.valueDistillation
+      ? index > scoreStart && valueReturns
+        ? valueReturns.strategy.exposure
+        : candidateValueExposure(
+            current,
+            targetFraction,
+            anchorPrice,
+            candle.close,
+            valueExposureMinimum,
+            valueExposureMaximum,
+          )
+      : fromAgreementExposure;
+    let requestedValueExposure = fromExposure;
     if (accepted) {
       const nextFraction = desired === 0
         ? 0
         : signalFraction(desired, rate, options.parameters) * quality;
-      const nextExposure = desired * nextFraction;
+      const nextExposure = options.valueDistillation
+        ? candidateValueTarget(
+            desired,
+            nextFraction,
+            valueExposureMinimum,
+            valueExposureMaximum,
+          )
+        : desired * nextFraction;
+      requestedValueExposure = nextExposure;
       if (index >= scoreStart) {
         candidateTransitions.push(baseTransition(
           candle,
@@ -944,18 +986,21 @@ export function evaluateVwKamaOracle(
       anchorPrice = candle.close;
       lastSignalPrice = signal.lastSignalPrice;
     }
-    const candidateExposure = candidateAgreementValue(
+    const agreementExposure = candidateAgreementValue(
       agreementMode,
       current,
       targetFraction,
       anchorPrice,
       candle.close,
     );
+    const candidateExposure = options.valueDistillation
+      ? requestedValueExposure
+      : agreementExposure;
     if (index >= scoreStart) {
       stateCredit += agreementCredit(
         agreementMode,
         current,
-        candidateExposure,
+        agreementExposure,
         exposureFromCode(oracleStateCodes[index] ?? 0),
       );
       if (valueDistillation && options.valueDistillation) {
@@ -973,6 +1018,10 @@ export function evaluateVwKamaOracle(
           options.intervalMs,
           strategyTemperature,
           quadraticCoefficient,
+          options.parameters.signalFrictionFraction ?? 1,
+          candidateExposure,
+          options.parameters.strategyNormalMixture ?? 0,
+          options.parameters.strategyNormalSigma ?? 25,
         );
         if (valueReturns && index + 1 < candles.length) {
           const price = closeAt(candles, index);
@@ -1045,6 +1094,9 @@ export function evaluateVwKamaOracle(
           (options.parameters.strategyTemperature ?? 0.001) * strategyTemperatures![index]!,
           options.parameters.strategyQuadraticScale ?? 0,
           strategyQuadraticVolatilities![index]!,
+          options.parameters.signalFrictionFraction ?? 1,
+          options.parameters.strategyNormalMixture ?? 0,
+          options.parameters.strategyNormalSigma ?? 25,
         ));
       }
       if (points.at(-1)?.time !== candle.closeTime) points.push(statePoint(candle, current, current));
@@ -1170,6 +1222,9 @@ function valueDistributionPoint(
   strategyTemperature: number,
   strategyQuadraticScale: number,
   strategyQuadraticVolatility: number,
+  frictionFraction: number,
+  strategyNormalMixture: number,
+  strategyNormalSigma: number,
 ): VwKamaValueDistributionPoint {
   const strategyQuadraticCoefficient = strategyExposureQuadraticCoefficient(
     strategyQuadraticScale,
@@ -1182,18 +1237,51 @@ function valueDistributionPoint(
     intervalMs * oracle.holdingPeriodSteps,
     strategyTemperature,
     strategyQuadraticCoefficient,
+    candidateExposure,
+    strategyNormalMixture,
+    strategyNormalSigma,
   );
   let strategyMeanExposure = 0;
-  let crossEntropy = 0;
+  let postActionCrossEntropy = 0;
   const values = Array.from(oracle.grid, (exposure, index) => {
     const oracleProbability = oracleProbabilities[index]!;
     const strategyProbability = strategyProbabilities[index]!;
     strategyMeanExposure += strategyProbability * exposure;
     if (oracleProbability > 0) {
-      crossEntropy -= oracleProbability * Math.log(Math.max(Number.MIN_VALUE, strategyProbability));
+      postActionCrossEntropy -= oracleProbability
+        * Math.log(Math.max(Number.MIN_VALUE, strategyProbability));
     }
     return { exposure, oracleProbability, strategyProbability };
   });
+  const strategyPolicy = strategyExposureTransitionStatistics(
+    oracle.grid,
+    rateBpsPerHour,
+    intervalMs * oracle.holdingPeriodSteps,
+    strategyTemperature,
+    strategyQuadraticCoefficient,
+    oracle.execution.friction,
+    frictionFraction,
+    candidateExposure,
+    strategyNormalMixture,
+    strategyNormalSigma,
+  );
+  const slope = strategyExposureLogSlope(
+    rateBpsPerHour,
+    intervalMs * oracle.holdingPeriodSteps,
+    strategyTemperature,
+  );
+  const crossEntropy = strategyExposureTransitionCrossEntropy(
+    oracle,
+    candleIndex,
+    rateBpsPerHour,
+    intervalMs * oracle.holdingPeriodSteps,
+    strategyTemperature,
+    strategyQuadraticCoefficient,
+    frictionFraction,
+    candidateExposure,
+    strategyNormalMixture,
+    strategyNormalSigma,
+  );
   return {
     time,
     candidateExposure,
@@ -1201,14 +1289,26 @@ function valueDistributionPoint(
     oracleModalExposure: oracle.modalExposures[candleIndex]!,
     oraclePathExposure: oracle.path.exposures[candleIndex]!,
     strategyMeanExposure,
+    oraclePolicyMeanExposure: oracle.policyMeans[candleIndex]!,
+    strategyPolicyMeanExposure: strategyPolicy.mean,
     strategyRateBpsHour: rateBpsPerHour,
+    oracleTemperature: oracle.temperature,
     strategyTemperature,
+    friction: oracle.execution.friction,
+    frictionFraction,
+    strategyLinearCoefficient: slope,
     strategyQuadraticVolatility,
     strategyQuadraticScale,
     strategyQuadraticCoefficient,
+    strategyNormalMixture,
+    strategyNormalSigma,
     oracleEntropy: oracle.entropies[candleIndex]!,
+    oraclePolicyEntropy: oracle.policyEntropies[candleIndex]!,
+    strategyPolicyEntropy: strategyPolicy.entropy,
     opportunity: oracle.opportunities[candleIndex]!,
+    averageRegret: oracle.averageRegrets[candleIndex]!,
     crossEntropy,
+    postActionCrossEntropy,
     values,
   };
 }
@@ -1556,6 +1656,38 @@ function candidateAgreementValue(
   return mode === "confidence"
     ? direction * fraction
     : markedExposure(direction, fraction, anchorPrice, price);
+}
+
+function candidateValueTarget(
+  direction: number,
+  fraction: number,
+  minimumExposure: number,
+  maximumExposure: number,
+): number {
+  if (direction > 0) return fraction * Math.max(0, maximumExposure);
+  if (direction < 0) return fraction * Math.min(0, minimumExposure);
+  return 0;
+}
+
+function candidateValueExposure(
+  direction: number,
+  fraction: number,
+  anchorPrice: number,
+  price: number,
+  minimumExposure: number,
+  maximumExposure: number,
+): number {
+  const target = candidateValueTarget(
+    direction,
+    fraction,
+    minimumExposure,
+    maximumExposure,
+  );
+  if (target === 0) return 0;
+  const movement = price / anchorPrice;
+  const equity = 1 + target * (movement - 1);
+  if (equity <= Number.EPSILON) return Math.sign(target) * Number.MAX_VALUE;
+  return target * movement / equity;
 }
 
 function agreementCredit(

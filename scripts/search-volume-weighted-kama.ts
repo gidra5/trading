@@ -145,6 +145,8 @@ interface Args {
   strategyTemperature: Range;
   strategyQuadraticScale: Range;
   strategyQuadraticVolatility: Range;
+  strategyNormalMixture: Range;
+  strategyNormalSigma: Range;
   buyMaxFraction: Range;
   sellMaxFraction: Range;
   buySizingSigma: Range;
@@ -204,6 +206,8 @@ interface Candidate {
   strategyTemperature: number;
   strategyQuadraticScale: number;
   strategyQuadraticVolatilityMs: number;
+  strategyNormalMixture: number;
+  strategyNormalSigma: number;
   buyMaxFraction: number;
   sellMaxFraction: number;
   buySizingSigmaBpsHour: number;
@@ -276,6 +280,7 @@ interface CaseScore {
   oracleMutualInformation: number | null;
   oracleEntropy: number | null;
   meanOpportunity: number | null;
+  meanAverageRegret: number | null;
   holdingPeriodMs: number | null;
   valueHorizonMs: number | null;
   strategyReturn: number | null;
@@ -320,6 +325,7 @@ interface CaseStats {
   distillationMixedLoss?: number;
   distillationWeight?: number;
   distillationOpportunity?: number;
+  distillationAverageRegret?: number;
   distillationSamples?: number;
   holdingPeriodMs?: number;
   valueHorizonMs?: number;
@@ -350,6 +356,7 @@ interface AggregateScore {
   stateMutualInformation: number | null;
   oracleMutualInformation: number | null;
   meanOpportunity: number | null;
+  meanAverageRegret: number | null;
   strategyReturn: number | null;
   oracleReturn: number | null;
   strategyMaxDrawdown: number | null;
@@ -588,6 +595,8 @@ async function run(config: Args): Promise<void> {
       strategyTemperature: formatRange(config.strategyTemperature),
       strategyQuadraticScale: formatRange(config.strategyQuadraticScale),
       strategyQuadraticVolatility: formatRange(config.strategyQuadraticVolatility, formatDuration),
+      strategyNormalMixture: formatRange(config.strategyNormalMixture),
+      strategyNormalSigma: formatRange(config.strategyNormalSigma),
       buyMaxFraction: formatRange(config.buyMaxFraction),
       sellMaxFraction: formatRange(config.sellMaxFraction),
       buySizingSigma: formatRange(config.buySizingSigma),
@@ -1460,6 +1469,8 @@ function genomeVector(genome: Genome, config: Args): number[] {
     unit(genome.signalFrictionFraction, config.signalFrictionFraction),
     logUnit(genome.thresholdInverseMaxBpsHour, config.thresholdInverseMax),
     logUnit(genome.thresholdInverseNoiseScaleBpsHour, config.thresholdInverseNoiseScale),
+    sparseUnit(genome.strategyNormalMixture, config.strategyNormalMixture),
+    logUnit(genome.strategyNormalSigma, config.strategyNormalSigma),
   ];
 }
 
@@ -1534,6 +1545,8 @@ function vectorGenome(vector: number[], config: Args): Genome {
     signalFrictionFraction: fromUnit(vector[46]!, config.signalFrictionFraction),
     thresholdInverseMaxBpsHour: logRange(vector[47]!, config.thresholdInverseMax),
     thresholdInverseNoiseScaleBpsHour: logRange(vector[48]!, config.thresholdInverseNoiseScale),
+    strategyNormalMixture: sparseRange(vector[49]!, config.strategyNormalMixture),
+    strategyNormalSigma: logRange(vector[50]!, config.strategyNormalSigma),
   };
 }
 
@@ -1719,9 +1732,9 @@ async function runPerWindow(
     "",
     "## Selected distribution and friction parameters",
     "",
-    "| preset | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window |",
-    "|---|---|---:|---:|---:|---:|",
-    ...documented.map(({ id, parameters }) => `| ${id} | ${parameters.thresholdNoiseResponse ?? "proportional"} | ${round(parameters.signalFrictionFraction ?? 1, 5)} | ${round(parameters.strategyTemperature ?? 0.001, 9)} | ${round(parameters.strategyQuadraticScale ?? 0, 5)} | ${formatDuration(parameters.strategyQuadraticVolatilityMs ?? HOUR)} |`),
+    "| preset | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window | normal mix | normal sigma |",
+    "|---|---|---:|---:|---:|---:|---:|---:|",
+    ...documented.map(({ id, parameters }) => `| ${id} | ${parameters.thresholdNoiseResponse ?? "proportional"} | ${round(parameters.signalFrictionFraction ?? 1, 5)} | ${round(parameters.strategyTemperature ?? 0.001, 9)} | ${round(parameters.strategyQuadraticScale ?? 0, 5)} | ${formatDuration(parameters.strategyQuadraticVolatilityMs ?? HOUR)} | ${round(parameters.strategyNormalMixture ?? 0, 5)} | ${round(parameters.strategyNormalSigma ?? 25, 5)} |`),
     "",
   ].join("\n"));
   console.error(`Presets: ${path.relative(repoRoot, config.presetOutputPath)}`);
@@ -1925,6 +1938,8 @@ function storedCandidate(value: Record<string, unknown>, index: number): Candida
       "strategyQuadraticVolatility",
       HOUR,
     ),
+    strategyNormalMixture: number("strategyNormalMixture", 0),
+    strategyNormalSigma: number("strategyNormalSigma", 25),
     buyMaxFraction: number("buyMaxFraction", 1),
     sellMaxFraction: number("sellMaxFraction", 1),
     buySizingSigmaBpsHour: number("buySizingSigmaBpsHour", 1e12),
@@ -2159,6 +2174,10 @@ async function evaluateStageCuda(
         distillationMixedLoss: result.distillationMixedLoss,
         distillationWeight: result.distillationWeight,
         distillationOpportunity: result.distillationOpportunity,
+        distillationAverageRegret: testCase.valueOracle
+          ? Math.max(0, result.distillationWeight
+            - config.opportunityEpsilon * result.stateCount)
+          : undefined,
         distillationSamples: testCase.valueOracle ? result.stateCount : 0,
         holdingPeriodMs: testCase.holdingPeriodMs,
         valueHorizonMs: testCase.valueHorizonMs,
@@ -2649,7 +2668,8 @@ async function buildCases(
             quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, scaleMs),
             assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, scaleMs),
             includeProbabilities: config.oracleMutualInformationLambda > 0
-              && config.oracleMutualInformationMode === "precise",
+              && config.oracleMutualInformationMode === "precise"
+              || config.strategyNormalMixture.max > 0,
           };
           if (valueOracleBackend === "cuda") {
             const prepared = await prepareExposureValueOracleCuda(
@@ -2743,6 +2763,7 @@ function evaluateCase(candidate: Candidate, testCase: CaseData, config: Args): C
     distillationMixedLoss: distillation?.mixedLoss,
     distillationWeight: distillation?.weightSum,
     distillationOpportunity: distillation?.opportunitySum,
+    distillationAverageRegret: distillation?.averageRegretSum,
     distillationSamples: distillation?.sampleCount,
     holdingPeriodMs: testCase.holdingPeriodMs,
     valueHorizonMs: testCase.valueHorizonMs,
@@ -2825,6 +2846,9 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
   const meanOpportunity = distillationSamples > 0
     ? sum(parts.map((part) => part.distillationOpportunity ?? 0)) / distillationSamples
     : null;
+  const meanAverageRegret = distillationSamples > 0
+    ? sum(parts.map((part) => part.distillationAverageRegret ?? 0)) / distillationSamples
+    : null;
   const horizonSamples = sum(parts.map((part) => part.valueHorizonMs === undefined
     ? 0
     : part.distillationSamples ?? 0));
@@ -2862,6 +2886,7 @@ function scoreCase(parts: CaseStats[], config: Args): CaseScore {
     oracleMutualInformation,
     oracleEntropy,
     meanOpportunity,
+    meanAverageRegret,
     holdingPeriodMs,
     valueHorizonMs,
     strategyReturn,
@@ -2897,7 +2922,7 @@ function searchScore(
 
 function scoreWeightsDescription(config: Args): string {
   return config.objective === "value-distillation"
-    ? `negative mixed loss −[CE + ${config.entropyGapLambda}·entropy-gap − ${config.stateMutualInformationLambda}·state-MI − ${config.oracleMutualInformationLambda}·oracle-MI (${config.oracleMutualInformationMode})]; examples are weighted by max(Q)-min(Q)`
+    ? `negative mixed loss −[CE + ${config.entropyGapLambda}·entropy-gap − ${config.stateMutualInformationLambda}·state-MI − ${config.oracleMutualInformationLambda}·oracle-MI (${config.oracleMutualInformationMode})]; time is weighted by average regret over a uniform current-exposure prior`
     : "timing-credited transition F1 20%, sizing/confidence agreement 60%, and signal cleanliness 20%";
 }
 
@@ -2917,6 +2942,7 @@ function aggregate(scores: CaseScore[]): AggregateScore {
     stateMutualInformation: nullableMedian(scores.map((score) => score.stateMutualInformation)),
     oracleMutualInformation: nullableMedian(scores.map((score) => score.oracleMutualInformation)),
     meanOpportunity: nullableMedian(scores.map((score) => score.meanOpportunity)),
+    meanAverageRegret: nullableMedian(scores.map((score) => score.meanAverageRegret)),
     strategyReturn: nullableMedian(scores.map((score) => score.strategyReturn)),
     oracleReturn: nullableMedian(scores.map((score) => score.oracleReturn)),
     strategyMaxDrawdown: nullableMedian(scores.map((score) => score.strategyMaxDrawdown)),
@@ -2981,6 +3007,8 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
     strategyTemperature: 0.001,
     strategyQuadraticScale: 0,
     strategyQuadraticVolatilityMs: HOUR,
+    strategyNormalMixture: 0,
+    strategyNormalSigma: 25,
     ...confirmation,
   };
   const threshold = {
@@ -3029,6 +3057,8 @@ function globalCandidates(agreementModes: AgreementMode[], oracleFriction: numbe
     strategyTemperature: productionSignal.strategyTemperature ?? 0.001,
     strategyQuadraticScale: productionSignal.strategyQuadraticScale ?? 0,
     strategyQuadraticVolatilityMs: productionSignal.strategyQuadraticVolatilityMs ?? HOUR,
+    strategyNormalMixture: productionSignal.strategyNormalMixture ?? 0,
+    strategyNormalSigma: productionSignal.strategyNormalSigma ?? 25,
     buyMaxFraction: productionSignal.buyMaxFraction ?? 1,
     sellMaxFraction: productionSignal.sellMaxFraction ?? 1,
     buySizingSigmaBpsHour: 1e12,
@@ -3123,6 +3153,8 @@ function randomGenome(config: Args, random: () => number): Genome {
     strategyTemperature: logRandom(random, config.strategyTemperature),
     strategyQuadraticScale: sparseRandom(random, config.strategyQuadraticScale),
     strategyQuadraticVolatilityMs: logRandom(random, config.strategyQuadraticVolatility),
+    strategyNormalMixture: sparseRandom(random, config.strategyNormalMixture),
+    strategyNormalSigma: logRandom(random, config.strategyNormalSigma),
     buyMaxFraction: linearRandom(random, config.buyMaxFraction),
     sellMaxFraction: linearRandom(random, config.sellMaxFraction),
     buySizingSigmaBpsHour: logRandom(random, config.buySizingSigma),
@@ -3198,6 +3230,8 @@ function candidateParameters(candidate: Candidate) {
     strategyTemperature: candidate.strategyTemperature,
     strategyQuadraticScale: candidate.strategyQuadraticScale,
     strategyQuadraticVolatilityMs: candidate.strategyQuadraticVolatilityMs,
+    strategyNormalMixture: candidate.strategyNormalMixture,
+    strategyNormalSigma: candidate.strategyNormalSigma,
     buyMaxFraction: candidate.buyMaxFraction,
     sellMaxFraction: candidate.sellMaxFraction,
     buySizingSigmaBpsHour: candidate.buySizingSigmaBpsHour,
@@ -3252,6 +3286,8 @@ function presetCandidate(preset: VwKamaPreset, index = 0): Candidate {
     strategyTemperature: preset.parameters.strategyTemperature ?? 0.001,
     strategyQuadraticScale: preset.parameters.strategyQuadraticScale ?? 0,
     strategyQuadraticVolatilityMs: preset.parameters.strategyQuadraticVolatilityMs ?? HOUR,
+    strategyNormalMixture: preset.parameters.strategyNormalMixture ?? 0,
+    strategyNormalSigma: preset.parameters.strategyNormalSigma ?? 25,
     hysteresisReleaseRatio: preset.parameters.hysteresisReleaseRatio ?? 0.25,
     buyMaxFraction: preset.parameters.buyMaxFraction ?? 1,
     sellMaxFraction: preset.parameters.sellMaxFraction ?? 1,
@@ -3683,6 +3719,15 @@ function parseArgs(argv: string[]): Args {
       get("strategy-quadratic-volatility-window-range", "1m..24h"),
       "strategy-quadratic-volatility-window-range",
     ),
+    strategyNormalMixture: fractionRange(
+      get("strategy-normal-mixture-range", "0..1"),
+      "strategy-normal-mixture-range",
+    ),
+    strategyNormalSigma: numberRange(
+      get("strategy-normal-sigma-range", "1..200"),
+      "strategy-normal-sigma-range",
+      Number.MIN_VALUE,
+    ),
     buyMaxFraction: fractionRange(get("buy-max-fraction-range", "0.05..1"), "buy-max-fraction-range"),
     sellMaxFraction: fractionRange(get("sell-max-fraction-range", "0.05..1"), "sell-max-fraction-range"),
     buySizingSigma: numberRange(get("buy-sizing-sigma-range", "0.01..300"), "buy-sizing-sigma-range", 0.000001),
@@ -3902,7 +3947,7 @@ function report(
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} holding period H and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, and quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; loss mix λH=${config.entropyGapLambda}, λS=${config.stateMutualInformationLambda}, λO=${config.oracleMutualInformationLambda}, oracle MI ${config.oracleMutualInformationMode}${config.oracleMutualInformationMode === "precise" ? ` at ${config.mutualInformationBins} bins` : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} holding period H and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}, target-normal mixture ${formatRange(config.strategyNormalMixture)}, and target-normal sigma ${formatRange(config.strategyNormalSigma)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; loss mix λH=${config.entropyGapLambda}, λS=${config.stateMutualInformationLambda}, λO=${config.oracleMutualInformationLambda}, oracle MI ${config.oracleMutualInformationMode}${config.oracleMutualInformationMode === "precise" ? ` at ${config.mutualInformationBins} bins` : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
       ? "- Candidate fitness is the negative of the equally weighted median and P90 mixed loss; every scale/window case has equal weight."
@@ -3928,9 +3973,9 @@ function report(
     "",
     "## Finalist distribution and friction parameters",
     "",
-    "| candidate | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window |",
-    "|---|---|---:|---:|---:|---:|",
-    ...test.map(({ candidate }) => `| ${candidate.id} | ${candidate.thresholdNoiseResponse} | ${round(candidate.signalFrictionFraction, 5)} | ${round(candidate.strategyTemperature, 9)} | ${round(candidate.strategyQuadraticScale, 5)} | ${formatDuration(candidate.strategyQuadraticVolatilityMs)} |`),
+    "| candidate | noise response | candidate friction | strategy temperature | quadratic scale | quadratic volatility window | normal mix | normal sigma |",
+    "|---|---|---:|---:|---:|---:|---:|---:|",
+    ...test.map(({ candidate }) => `| ${candidate.id} | ${candidate.thresholdNoiseResponse} | ${round(candidate.signalFrictionFraction, 5)} | ${round(candidate.strategyTemperature, 9)} | ${round(candidate.strategyQuadraticScale, 5)} | ${formatDuration(candidate.strategyQuadraticVolatilityMs)} | ${round(candidate.strategyNormalMixture, 5)} | ${round(candidate.strategyNormalSigma, 5)} |`),
     "",
     "## Finalist confirmation parameters",
     "",
@@ -3952,9 +3997,9 @@ function report(
     "",
     ...(config.objective === "value-distillation"
       ? [
-        "| candidate | scale/window | H | T−t | mixed loss | entropy gap | state MI | oracle MI | mixed KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | opportunity | signal score | agreement | signals/day |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableDuration(item.holdingPeriodMs)} | ${formatNullableDuration(item.valueHorizonMs)} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.entropyGap)} | ${formatNullableNumber(item.stateMutualInformation)} | ${formatNullableNumber(item.oracleMutualInformation)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
+        "| candidate | scale/window | H | T−t | mixed loss | entropy gap | state MI | oracle MI | mixed KL | exp(-KL) | strategy return | oracle return | strategy DD | oracle DD | avg regret | opportunity | signal score | agreement | signals/day |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ...test.flatMap((result) => result.cases.map((item) => `| ${result.candidate.id} | ${item.caseId} | ${formatNullableDuration(item.holdingPeriodMs)} | ${formatNullableDuration(item.valueHorizonMs)} | ${formatNullableNumber(item.valueDistillationLoss)} | ${formatNullableNumber(item.entropyGap)} | ${formatNullableNumber(item.stateMutualInformation)} | ${formatNullableNumber(item.oracleMutualInformation)} | ${formatNullableNumber(item.valueDistillationKl)} | ${formatNullablePercent(item.valueDistillationScore)} | ${formatNullablePercent(item.strategyReturn)} | ${formatNullablePercent(item.oracleReturn)} | ${formatNullablePercent(item.strategyMaxDrawdown)} | ${formatNullablePercent(item.oracleMaxDrawdown)} | ${formatNullableNumber(item.meanAverageRegret, 6)} | ${formatNullableNumber(item.meanOpportunity, 6)} | ${pct(item.signalScore)} | ${pct(item.exposureAgreement)} | ${round(item.signalsPerDay, 2)} |`)),
       ]
       : [
         "| candidate | scale/window | score | precision | recall | F1 | agreement | cleanliness | noise/signal | signals/day | timing error P50 | timing error P90 |",
@@ -4012,6 +4057,8 @@ function compactCandidate(candidate: Candidate): Record<string, string | number>
     strategyTemperature: round(candidate.strategyTemperature, 9),
     strategyQuadraticScale: round(candidate.strategyQuadraticScale, 5),
     strategyQuadraticVolatility: formatDuration(candidate.strategyQuadraticVolatilityMs),
+    strategyNormalMixture: round(candidate.strategyNormalMixture, 5),
+    strategyNormalSigma: round(candidate.strategyNormalSigma, 5),
     buyMaxFraction: round(candidate.buyMaxFraction, 5),
     sellMaxFraction: round(candidate.sellMaxFraction, 5),
     buySizingSigmaBpsHour: round(candidate.buySizingSigmaBpsHour, 5),
@@ -4070,6 +4117,8 @@ function help(): void {
   --initial-exposure 0              Exposure supplied to Q0 at the scored-window start
   --strategy-quadratic-scale-range 0..1000000  Candidate b2' in b2=-b2'*v^2
   --strategy-quadratic-volatility-window-range 1m..24h
+  --strategy-normal-mixture-range 0..1  Target-centered truncated-normal mixture weight
+  --strategy-normal-sigma-range 1..200  Target-normal width in exposure units
   --oracle-temperature 0.01         Soft oracle value temperature in log-return units
   --strategy-temperature-range 0.000001..0.1  Candidate base temperature
   --strategy-volatility-scaling false  Also multiply temperature by trailing-H log-return stddev
@@ -4078,7 +4127,7 @@ function help(): void {
   --oracle-mi-lambda 0             Reward normalized oracle/strategy information
   --oracle-mi-mode approximate     approximate Gaussian moments or precise soft categorical bins
   --mi-bins 15                     Precise-MI exposure bins (2..min(32, grid size))
-  --opportunity-epsilon 0.000001    Added to max(Q)-min(Q) example weights
+  --opportunity-epsilon 0.000001    Added to uniform-state average-regret time weights
   --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
   --seed-candidates FILE,...        Put prior fit JSONL/preset candidates in generation zero

@@ -204,13 +204,6 @@ we need to adjust the oracle evaluation:
 8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
 9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
 
-1. implement transition aware policy distribution. 
-2. Loss should learn the whole distribution over input-output pairs.
-3. Your heatmap visual idea is a good one. Compute color relative to value of holding. 
-4. Slices for oracle path, candidate state, prediction are also useful, we should show them. The current ones are also useful i think, we can interpret them as having target and current state match, eliminating the transition cost.
-5. For difference choose whichever is more useful for interpretation.
-6. Use canvas for rendering it as suggested
-7. Implement the pipeline redesign you suggested.
-8. dont implement minimum order size constraints.
-9. uniform weight for operational prior.
-10. use avg regret as time weight
+that is compute value in 3 action classes, choose top two values from these and compute first minus second and aggregate over input exposures. then normalize the weights
+
+lets update the distribution model to be sum of two exponential distributions split around x with their own rates. So something like p(a|x)=exp(b1*a|a<x)+exp(b2*a|a>=x)

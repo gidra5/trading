@@ -69,10 +69,12 @@ struct VwKamaParams {
   float signal_friction_fraction;
   float strategy_temperature;
   float strategy_quadratic_scale;
+  float strategy_normal_mixture;
+  float strategy_normal_sigma;
   float warmup_multiple;
 };
 
-static_assert(sizeof(VwKamaParams) == 208, "VwKamaParams ABI changed");
+static_assert(sizeof(VwKamaParams) == 216, "VwKamaParams ABI changed");
 
 struct VwKamaResult {
   double state_credit;
@@ -184,6 +186,7 @@ struct CudaFitnessCase {
   float interval_ms = 0.0f;
   int value_holding_period_steps = 1;
   float oracle_friction = 0.0f;
+  float oracle_temperature = 1.0f;
   float quote_lend_rate = 0.0f;
   float quote_borrow_rate = 0.0f;
   float asset_borrow_rate = 0.0f;
@@ -207,8 +210,10 @@ struct CudaFitnessCase {
   DeviceBuffer<float> volume;
   DeviceBuffer<float> value_means;
   DeviceBuffer<float> value_second_moments;
+  DeviceBuffer<float> value_mean_log_rebalances;
   DeviceBuffer<float> value_entropies;
   DeviceBuffer<float> value_weights;
+  DeviceBuffer<float> oracle_probabilities;
   DeviceBuffer<float> oracle_bin_probabilities;
   DeviceBuffer<float> strategy_temperatures;
   DeviceBuffer<float> strategy_quadratic_volatilities;
@@ -216,7 +221,7 @@ struct CudaFitnessCase {
   DeviceBuffer<uint64_t> change_offsets;
   DeviceBuffer<float> changes;
   DeviceBuffer<DeviceResult> results;
-  DeviceBuffer<float> precise_features;
+  DeviceBuffer<float> loss_features;
   DeviceBuffer<double> precise_joint;
 };
 
@@ -286,6 +291,17 @@ __device__ __forceinline__ float agreement_value(
   return mode == 1
     ? static_cast<float>(direction) * fraction
     : marked_exposure(direction, fraction, anchor_price, price);
+}
+
+__device__ __forceinline__ float value_target_exposure(
+  int direction,
+  float fraction,
+  float minimum_exposure,
+  float maximum_exposure
+) {
+  if (direction > 0) return fraction * fmaxf(0.0f, maximum_exposure);
+  if (direction < 0) return fraction * fminf(0.0f, minimum_exposure);
+  return 0.0f;
 }
 
 __device__ __forceinline__ float agreement_credit(
@@ -618,6 +634,360 @@ struct QuadraticExponentialStatistics {
   float entropy;
 };
 
+struct TransitionDistributionStatistics {
+  float log_normalizer;
+  float mean;
+  float second_moment;
+  float mean_log_rebalance;
+  float entropy;
+};
+
+__device__ __forceinline__ double strategy_mixture_base_logit(
+  double exposure,
+  double linear_coefficient,
+  double quadratic_coefficient,
+  double quadratic_log_normalizer,
+  double normal_mixture,
+  double normal_linear_coefficient,
+  double normal_quadratic_coefficient,
+  double normal_log_normalizer
+) {
+  const double quadratic_log_probability = linear_coefficient * exposure
+    + quadratic_coefficient * exposure * exposure - quadratic_log_normalizer;
+  if (normal_mixture <= 0.0) return quadratic_log_probability;
+  const double normal_log_probability = normal_linear_coefficient * exposure
+    + normal_quadratic_coefficient * exposure * exposure - normal_log_normalizer;
+  if (normal_mixture >= 1.0) return normal_log_probability;
+  const double left = log1p(-normal_mixture) + quadratic_log_probability;
+  const double right = log(normal_mixture) + normal_log_probability;
+  const double maximum = fmax(left, right);
+  return maximum + log(exp(left - maximum) + exp(right - maximum));
+}
+
+__device__ __forceinline__ double log_add_exp(double left, double right) {
+  if (!isfinite(left)) return right;
+  if (!isfinite(right)) return left;
+  const double maximum = fmax(left, right);
+  return maximum + log(exp(left - maximum) + exp(right - maximum));
+}
+
+__device__ __forceinline__ TransitionDistributionStatistics
+transition_quadratic_statistics(
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float linear_coefficient,
+  float quadratic_coefficient,
+  float normal_center,
+  float normal_mixture,
+  float normal_sigma,
+  float friction,
+  float transition_log_scale
+) {
+  const double spacing = static_cast<double>(maximum_exposure - minimum_exposure)
+    / (grid_size - 1);
+  const double quadratic_log_normalizer = quadratic_exponential_log_normalizer(
+    grid_size,
+    minimum_exposure,
+    maximum_exposure,
+    linear_coefficient,
+    quadratic_coefficient
+  );
+  const double normal_variance = static_cast<double>(normal_sigma) * normal_sigma;
+  const double normal_linear_coefficient = normal_center / normal_variance;
+  const double normal_quadratic_coefficient = -0.5 / normal_variance;
+  const double normal_log_normalizer = normal_mixture > 0.0f
+    ? quadratic_exponential_log_normalizer(
+        grid_size,
+        minimum_exposure,
+        maximum_exposure,
+        normal_linear_coefficient,
+        normal_quadratic_coefficient
+      )
+    : 0.0;
+  double minimum_base_logit = INFINITY;
+  double maximum_base_logit = -INFINITY;
+  double minimum_adjacent_cost = INFINITY;
+  for (int index = 0; index < grid_size; ++index) {
+    const double exposure = minimum_exposure + index * spacing;
+    const double base = strategy_mixture_base_logit(
+      exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+      normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+      normal_log_normalizer
+    );
+    minimum_base_logit = fmin(minimum_base_logit, base);
+    maximum_base_logit = fmax(maximum_base_logit, base);
+    if (index > 0) {
+      const double previous = exposure - spacing;
+      const double buy_factor = rebalance_equity_factor(previous, exposure, friction);
+      const double sell_factor = rebalance_equity_factor(exposure, previous, friction);
+      if (buy_factor > 0.0 && buy_factor < 1.0) {
+        minimum_adjacent_cost = fmin(minimum_adjacent_cost, -log(buy_factor));
+      }
+      if (sell_factor > 0.0 && sell_factor < 1.0) {
+        minimum_adjacent_cost = fmin(minimum_adjacent_cost, -log(sell_factor));
+      }
+    }
+  }
+  if (isfinite(minimum_adjacent_cost)
+      && transition_log_scale * minimum_adjacent_cost
+        > maximum_base_logit - minimum_base_logit + 30.0) {
+    double average_log_normalizer = 0.0;
+    double average_mean = 0.0;
+    double average_second_moment = 0.0;
+    for (int index = 0; index < grid_size; ++index) {
+      const double exposure = minimum_exposure + index * spacing;
+      average_log_normalizer += strategy_mixture_base_logit(
+        exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+        normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+        normal_log_normalizer
+      );
+      average_mean += exposure;
+      average_second_moment += exposure * exposure;
+    }
+    const double scale = 1.0 / grid_size;
+    return {
+      static_cast<float>(average_log_normalizer * scale),
+      static_cast<float>(average_mean * scale),
+      static_cast<float>(average_second_moment * scale),
+      0.0f,
+      0.0f,
+    };
+  }
+
+  double buy_mean = 0.0;
+  double buy_second_moment = 0.0;
+  double buy_base_logit = 0.0;
+  double buy_log_denominator = 0.0;
+  double buy_log_sum = -INFINITY;
+  for (int index = 0; index < grid_size; ++index) {
+    const double exposure = minimum_exposure + index * spacing;
+    const double base = strategy_mixture_base_logit(
+      exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+      normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+      normal_log_normalizer
+    );
+    const double log_denominator = log(1.0 - friction + friction * exposure);
+    const double adjusted = base - transition_log_scale * log_denominator;
+    const double next_log_sum = log_add_exp(buy_log_sum, adjusted);
+    const double added_share = exp(adjusted - next_log_sum);
+    const double retained_share = isfinite(buy_log_sum)
+      ? exp(buy_log_sum - next_log_sum)
+      : 0.0;
+    buy_mean = retained_share * buy_mean + added_share * exposure;
+    buy_second_moment = retained_share * buy_second_moment
+      + added_share * exposure * exposure;
+    buy_base_logit = retained_share * buy_base_logit + added_share * base;
+    buy_log_denominator = retained_share * buy_log_denominator
+      + added_share * log_denominator;
+    buy_log_sum = next_log_sum;
+  }
+
+  double sell_mean = 0.0;
+  double sell_second_moment = 0.0;
+  double sell_base_logit = 0.0;
+  double sell_log_denominator = 0.0;
+  double sell_log_sum = -INFINITY;
+  double average_log_normalizer = 0.0;
+  double average_mean = 0.0;
+  double average_second_moment = 0.0;
+  double average_mean_log_rebalance = 0.0;
+  double average_entropy = 0.0;
+
+  for (int state_index = 0; state_index < grid_size; ++state_index) {
+    const double state_exposure = minimum_exposure + state_index * spacing;
+    const double state_base = strategy_mixture_base_logit(
+      state_exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+      normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+      normal_log_normalizer
+    );
+    const double sell_denominator_log = log(1.0 - friction * state_exposure);
+    const double buy_denominator_log = log(1.0 - friction + friction * state_exposure);
+    const double sell_adjusted_logit = state_base
+      - transition_log_scale * sell_denominator_log;
+    const double buy_adjusted_logit = state_base
+      - transition_log_scale * buy_denominator_log;
+    const double next_sell_log_sum = log_add_exp(sell_log_sum, sell_adjusted_logit);
+    const double added_sell_share = exp(sell_adjusted_logit - next_sell_log_sum);
+    const double retained_sell_share = isfinite(sell_log_sum)
+      ? exp(sell_log_sum - next_sell_log_sum)
+      : 0.0;
+    sell_mean = retained_sell_share * sell_mean + added_sell_share * state_exposure;
+    sell_second_moment = retained_sell_share * sell_second_moment
+      + added_sell_share * state_exposure * state_exposure;
+    sell_base_logit = retained_sell_share * sell_base_logit + added_sell_share * state_base;
+    sell_log_denominator = retained_sell_share * sell_log_denominator
+      + added_sell_share * sell_denominator_log;
+    sell_log_sum = next_sell_log_sum;
+
+    if (isfinite(buy_log_sum)) {
+      const double removed_share = fmin(1.0, exp(buy_adjusted_logit - buy_log_sum));
+      const double retained_share = 1.0 - removed_share;
+      if (retained_share <= 1.0e-12) {
+        buy_log_sum = -INFINITY;
+        buy_mean = 0.0;
+        buy_second_moment = 0.0;
+        buy_base_logit = 0.0;
+        buy_log_denominator = 0.0;
+      } else {
+        buy_mean = (buy_mean - removed_share * state_exposure) / retained_share;
+        buy_second_moment = (
+          buy_second_moment - removed_share * state_exposure * state_exposure
+        ) / retained_share;
+        buy_base_logit = (buy_base_logit - removed_share * state_base) / retained_share;
+        buy_log_denominator = (
+          buy_log_denominator - removed_share * buy_denominator_log
+        ) / retained_share;
+        buy_log_sum += log(retained_share);
+      }
+    }
+
+    const double sell_log_total = isfinite(sell_log_sum)
+      ? transition_log_scale * sell_denominator_log + sell_log_sum
+      : -INFINITY;
+    const double buy_log_total = isfinite(buy_log_sum)
+      ? transition_log_scale * buy_denominator_log + buy_log_sum
+      : -INFINITY;
+    const double row_log_total = log_add_exp(sell_log_total, buy_log_total);
+    const double sell_share = isfinite(sell_log_total)
+      ? exp(sell_log_total - row_log_total)
+      : 0.0;
+    const double buy_share = isfinite(buy_log_total)
+      ? exp(buy_log_total - row_log_total)
+      : 0.0;
+    const double row_mean = sell_share * sell_mean + buy_share * buy_mean;
+    const double row_second_moment = sell_share * sell_second_moment
+      + buy_share * buy_second_moment;
+    const double sell_mean_log_rebalance = sell_denominator_log - sell_log_denominator;
+    const double buy_mean_log_rebalance = buy_denominator_log - buy_log_denominator;
+    const double row_mean_log_rebalance = sell_share * sell_mean_log_rebalance
+      + buy_share * buy_mean_log_rebalance;
+    const double row_mean_base_logit = sell_share * sell_base_logit
+      + buy_share * buy_base_logit;
+    const double row_log_normalizer = row_log_total;
+    average_log_normalizer += row_log_normalizer;
+    average_mean += row_mean;
+    average_second_moment += row_second_moment;
+    average_mean_log_rebalance += row_mean_log_rebalance;
+    average_entropy += fmin(log(static_cast<double>(grid_size)), fmax(
+      0.0,
+      row_log_normalizer - row_mean_base_logit
+        - transition_log_scale * row_mean_log_rebalance
+    ));
+  }
+  const double scale = 1.0 / grid_size;
+  return {
+    static_cast<float>(average_log_normalizer * scale),
+    static_cast<float>(average_mean * scale),
+    static_cast<float>(average_second_moment * scale),
+    static_cast<float>(average_mean_log_rebalance * scale),
+    static_cast<float>(average_entropy * scale),
+  };
+}
+
+__device__ __forceinline__ double transition_mixture_cross_expectation(
+  const float* oracle_base_probabilities,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float linear_coefficient,
+  float quadratic_coefficient,
+  float normal_center,
+  float normal_mixture,
+  float normal_sigma,
+  float friction,
+  float oracle_transition_log_scale
+) {
+  const double spacing = static_cast<double>(maximum_exposure - minimum_exposure)
+    / (grid_size - 1);
+  const double quadratic_log_normalizer = quadratic_exponential_log_normalizer(
+    grid_size, minimum_exposure, maximum_exposure,
+    linear_coefficient, quadratic_coefficient
+  );
+  const double normal_variance = static_cast<double>(normal_sigma) * normal_sigma;
+  const double normal_linear_coefficient = normal_center / normal_variance;
+  const double normal_quadratic_coefficient = -0.5 / normal_variance;
+  const double normal_log_normalizer = normal_mixture > 0.0f
+    ? quadratic_exponential_log_normalizer(
+        grid_size, minimum_exposure, maximum_exposure,
+        normal_linear_coefficient, normal_quadratic_coefficient
+      )
+    : 0.0;
+  double buy_log_sum = -INFINITY;
+  double buy_mean_target = 0.0;
+  for (int index = 0; index < grid_size; ++index) {
+    const double probability = oracle_base_probabilities[index];
+    if (!(probability > 0.0)) continue;
+    const double exposure = minimum_exposure + index * spacing;
+    const double adjusted = log(probability)
+      - oracle_transition_log_scale * log(1.0 - friction + friction * exposure);
+    const double next_log_sum = log_add_exp(buy_log_sum, adjusted);
+    const double added_share = exp(adjusted - next_log_sum);
+    const double retained_share = isfinite(buy_log_sum)
+      ? exp(buy_log_sum - next_log_sum)
+      : 0.0;
+    buy_mean_target = retained_share * buy_mean_target
+      + added_share * strategy_mixture_base_logit(
+        exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+        normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+        normal_log_normalizer
+      );
+    buy_log_sum = next_log_sum;
+  }
+
+  double sell_log_sum = -INFINITY;
+  double sell_mean_target = 0.0;
+  double average = 0.0;
+  for (int state_index = 0; state_index < grid_size; ++state_index) {
+    const double state_exposure = minimum_exposure + state_index * spacing;
+    const double probability = oracle_base_probabilities[state_index];
+    const double state_target = strategy_mixture_base_logit(
+      state_exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+      normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+      normal_log_normalizer
+    );
+    const double sell_denominator_log = log(1.0 - friction * state_exposure);
+    const double buy_denominator_log = log(1.0 - friction + friction * state_exposure);
+    if (probability > 0.0) {
+      const double sell_adjusted = log(probability)
+        - oracle_transition_log_scale * sell_denominator_log;
+      const double next_sell_log_sum = log_add_exp(sell_log_sum, sell_adjusted);
+      const double added_share = exp(sell_adjusted - next_sell_log_sum);
+      const double retained_share = isfinite(sell_log_sum)
+        ? exp(sell_log_sum - next_sell_log_sum)
+        : 0.0;
+      sell_mean_target = retained_share * sell_mean_target + added_share * state_target;
+      sell_log_sum = next_sell_log_sum;
+
+      if (isfinite(buy_log_sum)) {
+        const double buy_adjusted = log(probability)
+          - oracle_transition_log_scale * buy_denominator_log;
+        const double removed_share = fmin(1.0, exp(buy_adjusted - buy_log_sum));
+        const double retained = 1.0 - removed_share;
+        if (retained <= 1.0e-12) {
+          buy_log_sum = -INFINITY;
+          buy_mean_target = 0.0;
+        } else {
+          buy_mean_target = (buy_mean_target - removed_share * state_target) / retained;
+          buy_log_sum += log(retained);
+        }
+      }
+    }
+
+    const double sell_total = isfinite(sell_log_sum)
+      ? oracle_transition_log_scale * sell_denominator_log + sell_log_sum
+      : -INFINITY;
+    const double buy_total = isfinite(buy_log_sum)
+      ? oracle_transition_log_scale * buy_denominator_log + buy_log_sum
+      : -INFINITY;
+    const double row_total = log_add_exp(sell_total, buy_total);
+    const double sell_share = isfinite(sell_total) ? exp(sell_total - row_total) : 0.0;
+    const double buy_share = isfinite(buy_total) ? exp(buy_total - row_total) : 0.0;
+    average += sell_share * sell_mean_target + buy_share * buy_mean_target;
+  }
+  return average / grid_size;
+}
+
 __device__ __forceinline__ QuadraticExponentialStatistics quadratic_exponential_statistics(
   int grid_size,
   float minimum_exposure,
@@ -860,6 +1230,11 @@ __global__ void prepare_value_oracle_chains_kernel(
   float* second_moments,
   float* modal_exposures,
   float* entropies,
+  float* policy_means,
+  float* policy_second_moments,
+  float* policy_mean_log_rebalances,
+  float* policy_entropies,
+  float* average_regrets,
   float* weights,
   float* opportunities,
   float* probabilities,
@@ -875,9 +1250,14 @@ __global__ void prepare_value_oracle_chains_kernel(
   const int last_time = finite_horizon ? first_time : score_start;
   extern __shared__ unsigned char chain_storage[];
   double* forced_values = reinterpret_cast<double*>(chain_storage);
-  double* scan_values_a = forced_values + blockDim.x;
-  double* scan_values_b = scan_values_a + blockDim.x;
-  uint16_t* scan_targets_a = reinterpret_cast<uint16_t*>(scan_values_b + blockDim.x);
+  double* state_policy_means = forced_values + blockDim.x;
+  double* state_policy_second_moments = state_policy_means + blockDim.x;
+  double* state_policy_mean_log_rebalances = state_policy_second_moments + blockDim.x;
+  double* state_policy_entropies = state_policy_mean_log_rebalances + blockDim.x;
+  double* state_average_regrets = state_policy_entropies + blockDim.x;
+  double* scan_values_a = state_policy_means;
+  double* scan_values_b = state_policy_second_moments;
+  uint16_t* scan_targets_a = reinterpret_cast<uint16_t*>(state_average_regrets + blockDim.x);
   uint16_t* scan_targets_b = scan_targets_a + blockDim.x;
 
   for (int time = first_time; time >= last_time; time -= holding_period_steps) {
@@ -941,7 +1321,6 @@ __global__ void prepare_value_oracle_chains_kernel(
         modal_exposures[time] = 0.0f;
         entropies[time] = 0.0f;
         opportunities[time] = 0.0f;
-        weights[time] = static_cast<float>(opportunity_epsilon);
       } else {
         double total = 0.0;
         double weighted = 0.0;
@@ -984,8 +1363,107 @@ __global__ void prepare_value_oracle_chains_kernel(
         ));
         entropies[time] = static_cast<float>(log(total) - weighted_log_weight / total);
         opportunities[time] = static_cast<float>(opportunity);
-        weights[time] = static_cast<float>(opportunity + opportunity_epsilon);
       }
+    }
+    synchronize_oracle_grid();
+
+    if (collect_statistics && exposure_index < grid_size) {
+      const double current_exposure = oracle_grid_exposure(
+        exposure_index,
+        grid_size,
+        minimum_exposure,
+        maximum_exposure
+      );
+      double maximum_logit = -INFINITY;
+      double best_value = -INFINITY;
+      double uniform_value_sum = 0.0;
+      int valid_count = 0;
+      for (int target_index = 0; target_index < grid_size; ++target_index) {
+        const double factor = oracle_rebalance_equity_factor(
+          current_exposure,
+          oracle_grid_exposure(target_index, grid_size, minimum_exposure, maximum_exposure),
+          friction
+        );
+        if (!(factor > 0.0) || !isfinite(forced_values[target_index])) continue;
+        const double value = forced_values[target_index] + log(factor);
+        maximum_logit = fmax(maximum_logit, value / temperature);
+        best_value = fmax(best_value, value);
+        uniform_value_sum += value;
+        ++valid_count;
+      }
+      double total = 0.0;
+      double weighted_mean = 0.0;
+      double weighted_second_moment = 0.0;
+      double weighted_log_rebalance = 0.0;
+      double weighted_logit = 0.0;
+      if (valid_count > 0) {
+        for (int target_index = 0; target_index < grid_size; ++target_index) {
+          const double target_exposure = oracle_grid_exposure(
+            target_index,
+            grid_size,
+            minimum_exposure,
+            maximum_exposure
+          );
+          const double factor = oracle_rebalance_equity_factor(
+            current_exposure,
+            target_exposure,
+            friction
+          );
+          if (!(factor > 0.0) || !isfinite(forced_values[target_index])) continue;
+          const double log_rebalance = log(factor);
+          const double logit = (forced_values[target_index] + log_rebalance) / temperature;
+          const double probability_weight = exp(logit - maximum_logit);
+          total += probability_weight;
+          weighted_mean += probability_weight * target_exposure;
+          weighted_second_moment += probability_weight * target_exposure * target_exposure;
+          weighted_log_rebalance += probability_weight * log_rebalance;
+          weighted_logit += probability_weight * logit;
+        }
+      }
+      if (total > 0.0) {
+        const double row_log_normalizer = maximum_logit + log(total);
+        state_policy_means[exposure_index] = weighted_mean / total;
+        state_policy_second_moments[exposure_index] = weighted_second_moment / total;
+        state_policy_mean_log_rebalances[exposure_index] = weighted_log_rebalance / total;
+        state_policy_entropies[exposure_index] = fmax(
+          0.0,
+          row_log_normalizer - weighted_logit / total
+        );
+        state_average_regrets[exposure_index] = fmax(
+          0.0,
+          best_value - uniform_value_sum / valid_count
+        );
+      } else {
+        state_policy_means[exposure_index] = 0.0;
+        state_policy_second_moments[exposure_index] = 0.0;
+        state_policy_mean_log_rebalances[exposure_index] = 0.0;
+        state_policy_entropies[exposure_index] = 0.0;
+        state_average_regrets[exposure_index] = 0.0;
+      }
+    }
+    synchronize_oracle_grid();
+    if (collect_statistics && exposure_index == 0) {
+      double mean = 0.0;
+      double second_moment = 0.0;
+      double mean_log_rebalance = 0.0;
+      double entropy = 0.0;
+      double average_regret = 0.0;
+      for (int index = 0; index < grid_size; ++index) {
+        mean += state_policy_means[index];
+        second_moment += state_policy_second_moments[index];
+        mean_log_rebalance += state_policy_mean_log_rebalances[index];
+        entropy += state_policy_entropies[index];
+        average_regret += state_average_regrets[index];
+      }
+      const double inverse_grid_size = 1.0 / grid_size;
+      policy_means[time] = static_cast<float>(mean * inverse_grid_size);
+      policy_second_moments[time] = static_cast<float>(second_moment * inverse_grid_size);
+      policy_mean_log_rebalances[time] = static_cast<float>(
+        mean_log_rebalance * inverse_grid_size
+      );
+      policy_entropies[time] = static_cast<float>(entropy * inverse_grid_size);
+      average_regrets[time] = static_cast<float>(average_regret * inverse_grid_size);
+      weights[time] = static_cast<float>(average_regret * inverse_grid_size + opportunity_epsilon);
     }
     synchronize_oracle_grid();
 
@@ -1372,6 +1850,7 @@ __global__ void evaluate_kernel(
   const uint8_t* oracle_codes,
   const float* value_means,
   const float* value_second_moments,
+  const float* value_mean_log_rebalances,
   const float* value_entropies,
   const float* value_optimal_exposures,
   const float* value_weights,
@@ -1402,7 +1881,7 @@ __global__ void evaluate_kernel(
   const int32_t* transition_offsets,
   uint32_t* transitions,
   int transition_capacity,
-  float* precise_features,
+  float* loss_features,
   bool fitness_only,
   bool write_transitions
 ) {
@@ -1513,16 +1992,6 @@ __global__ void evaluate_kernel(
   bool has_last_signal = false;
   float state_credit = 0.0f;
   int signal_count = 0;
-  double distillation_weighted_cross_entropy = 0.0;
-  double distillation_weight = 0.0;
-  double distillation_weighted_strategy_entropy = 0.0;
-  double distillation_weighted_entropy_gap = 0.0;
-  double weighted_strategy_mean = 0.0;
-  double weighted_strategy_second_moment = 0.0;
-  double weighted_strategy_variance = 0.0;
-  double weighted_oracle_mean = 0.0;
-  double weighted_oracle_second_moment = 0.0;
-  double weighted_oracle_strategy_mean_product = 0.0;
   double strategy_equity = 1.0;
   double oracle_equity = 1.0;
   float strategy_exposure = 0.0f;
@@ -1538,11 +2007,6 @@ __global__ void evaluate_kernel(
     && strategy_quadratic_volatilities
     && value_means
     && value_weights;
-  const bool loss_enabled = distillation_enabled && (
-    entropy_gap_lambda > 0.0f
-    || state_mutual_information_lambda > 0.0f
-    || oracle_mutual_information_lambda > 0.0f
-  );
   const int quadratic_capacity = max(1, p.strategy_quadratic_volatility_samples);
   int quadratic_count = 0;
   double quadratic_sum = 0.0;
@@ -1807,6 +2271,7 @@ __global__ void evaluate_kernel(
         );
     const float quality = desired == 0 ? 1.0f : confirmation;
 
+    bool transition_accepted = false;
     if (
       source_edge
       && desired != current
@@ -1829,21 +2294,30 @@ __global__ void evaluate_kernel(
       anchor_price = price;
       last_signal_price = price;
       has_last_signal = true;
+      transition_accepted = true;
     }
 
     if (index >= score_start && !write_transitions) {
-      const float exposure = agreement_value(
+      const float agreement_exposure = agreement_value(
         p.agreement_mode,
         current,
         target_fraction,
         anchor_price,
         price
       );
+      const float exposure = transition_accepted || index == score_start
+        ? value_target_exposure(
+            current,
+            target_fraction,
+            value_grid_minimum,
+            value_grid_maximum
+          )
+        : strategy_exposure;
       if (!fitness_only) {
         state_credit += agreement_credit(
           p.agreement_mode,
           current,
-          exposure,
+          agreement_exposure,
           state_from_code(oracle_codes[index])
         );
       }
@@ -1865,67 +2339,17 @@ __global__ void evaluate_kernel(
           p.strategy_quadratic_scale == 0.0f || volatility == 0.0f
             ? 0.0f
             : -p.strategy_quadratic_scale * volatility * volatility;
-        const QuadraticExponentialStatistics statistics = loss_enabled
-          ? quadratic_exponential_statistics(
-              value_grid_size,
-              value_grid_minimum,
-              value_grid_maximum,
-              slope,
-              strategy_quadratic_coefficient
-            )
-          : QuadraticExponentialStatistics {
-              quadratic_exponential_log_normalizer(
-                value_grid_size,
-                value_grid_minimum,
-                value_grid_maximum,
-                slope,
-                strategy_quadratic_coefficient
-              ),
-              0.0f,
-              0.0f,
-              0.0f,
-            };
-        const float log_normalizer = statistics.log_normalizer;
-        const float cross_entropy = fmaxf(
-          0.0f,
-          log_normalizer - slope * value_means[index]
-            - strategy_quadratic_coefficient * value_second_moments[index]
-        );
-        const float weight = value_weights[index];
-        distillation_weighted_cross_entropy += static_cast<double>(weight * cross_entropy);
-        distillation_weight += weight;
-        if (loss_enabled) {
-          const float oracle_entropy = value_entropies[index];
-          const double normalized_excess_entropy = fmax(
-            0.0,
-            static_cast<double>(statistics.entropy - oracle_entropy)
-              / log(static_cast<double>(value_grid_size))
-          );
-          distillation_weighted_strategy_entropy += weight * statistics.entropy;
-          distillation_weighted_entropy_gap += weight
-            * normalized_excess_entropy * normalized_excess_entropy;
-          weighted_strategy_mean += weight * statistics.mean;
-          weighted_strategy_second_moment += weight * statistics.second_moment;
-          weighted_strategy_variance += weight * fmax(
-            0.0,
-            static_cast<double>(statistics.second_moment)
-              - static_cast<double>(statistics.mean) * statistics.mean
-          );
-          weighted_oracle_mean += weight * value_means[index];
-          weighted_oracle_second_moment += weight * value_second_moments[index];
-          weighted_oracle_strategy_mean_product += weight
-            * value_means[index] * statistics.mean;
-          if (precise_features && oracle_mutual_information_mode == 1) {
-            const size_t feature = (
-              static_cast<size_t>(candidate) * (candle_count - score_start)
-              + index - score_start
-            ) * 3;
-            precise_features[feature] = slope;
-            precise_features[feature + 1] = strategy_quadratic_coefficient;
-            precise_features[feature + 2] = log_normalizer;
-          }
+        if (loss_features) {
+          const size_t feature = (
+            static_cast<size_t>(candidate) * (candle_count - score_start)
+            + index - score_start
+          ) * 3;
+          loss_features[feature] = slope;
+          loss_features[feature + 1] = strategy_quadratic_coefficient;
+          loss_features[feature + 2] = exposure;
         }
-        if (!fitness_only && index + 1 < candle_count) {
+        if ((!fitness_only || p.strategy_normal_mixture > 0.0f)
+          && index + 1 < candle_count) {
           advance_return(
             exposure,
             price,
@@ -1968,45 +2392,17 @@ __global__ void evaluate_kernel(
   }
 
   if (!write_transitions) {
-    const double inverse_weight = distillation_weight > 0.0 ? 1.0 / distillation_weight : 0.0;
-    const double strategy_mean = weighted_strategy_mean * inverse_weight;
-    const double strategy_second_moment = weighted_strategy_second_moment * inverse_weight;
-    const double state_mutual_information = state_mutual_information_lambda > 0.0f
-      ? normalized_gaussian_variance_information(
-          fmax(0.0, strategy_second_moment - strategy_mean * strategy_mean),
-          weighted_strategy_variance * inverse_weight,
-          value_grid_size
-        )
-      : 0.0;
-    const double oracle_mutual_information = oracle_mutual_information_lambda > 0.0f
-      && oracle_mutual_information_mode == 0
-      ? normalized_gaussian_correlation_information(
-          weighted_oracle_mean * inverse_weight,
-          weighted_oracle_second_moment * inverse_weight,
-          strategy_mean,
-          strategy_second_moment,
-          weighted_oracle_strategy_mean_product * inverse_weight,
-          value_grid_size
-        )
-      : 0.0;
-    const double mixed_loss = distillation_weight > 0.0
-      ? distillation_weighted_cross_entropy * inverse_weight
-        + entropy_gap_lambda * distillation_weighted_entropy_gap * inverse_weight
-        - state_mutual_information_lambda * state_mutual_information
-        - oracle_mutual_information_lambda * oracle_mutual_information
-      : 0.0;
     results[candidate].state_credit = state_credit;
     results[candidate].signal_count = signal_count;
-    results[candidate].distillation_weighted_cross_entropy = distillation_weighted_cross_entropy;
+    results[candidate].distillation_weighted_cross_entropy = 0.0;
     results[candidate].distillation_weighted_oracle_entropy = 0.0;
-    results[candidate].distillation_weight = distillation_weight;
+    results[candidate].distillation_weight = 0.0;
     results[candidate].distillation_opportunity = 0.0;
-    results[candidate].distillation_weighted_strategy_entropy =
-      distillation_weighted_strategy_entropy;
-    results[candidate].distillation_weighted_entropy_gap = distillation_weighted_entropy_gap;
-    results[candidate].distillation_state_mutual_information = state_mutual_information;
-    results[candidate].distillation_oracle_mutual_information = oracle_mutual_information;
-    results[candidate].distillation_mixed_loss = mixed_loss;
+    results[candidate].distillation_weighted_strategy_entropy = 0.0;
+    results[candidate].distillation_weighted_entropy_gap = 0.0;
+    results[candidate].distillation_state_mutual_information = 0.0;
+    results[candidate].distillation_oracle_mutual_information = 0.0;
+    results[candidate].distillation_mixed_loss = 0.0;
     results[candidate].strategy_final_equity = strategy_equity;
     results[candidate].oracle_final_equity = oracle_equity;
     results[candidate].strategy_max_drawdown = strategy_max_drawdown;
@@ -2016,18 +2412,177 @@ __global__ void evaluate_kernel(
   }
 }
 
-constexpr int MAX_MUTUAL_INFORMATION_BINS = 32;
+constexpr int CONDITIONAL_LOSS_THREADS = 128;
 
-__global__ void precise_oracle_mutual_information_joint_kernel(
-  const float* oracle_bin_probabilities,
+__global__ void conditional_policy_loss_kernel(
+  const float* value_means,
+  const float* value_second_moments,
+  const float* value_mean_log_rebalances,
+  const float* value_entropies,
   const float* value_weights,
-  const float* precise_features,
+  const float* oracle_probabilities,
+  const float* strategy_temperatures,
+  const float* loss_features,
   int candle_count,
   int score_start,
   int candidate_count,
   int grid_size,
   float minimum_exposure,
   float maximum_exposure,
+  float friction,
+  float oracle_temperature,
+  float entropy_gap_lambda,
+  float state_mutual_information_lambda,
+  float oracle_mutual_information_lambda,
+  int oracle_mutual_information_mode,
+  const VwKamaParams* parameters,
+  DeviceResult* results
+) {
+  const int candidate = blockIdx.x;
+  if (candidate >= candidate_count || threadIdx.x >= CONDITIONAL_LOSS_THREADS) return;
+  const VwKamaParams p = parameters[candidate];
+  const int scored_count = candle_count - score_start;
+  double local[10] = {};
+  for (int scored_index = threadIdx.x; scored_index < scored_count;
+      scored_index += blockDim.x) {
+    const int candle_index = score_start + scored_index;
+    const size_t feature = (
+      static_cast<size_t>(candidate) * scored_count + scored_index
+    ) * 3;
+    const float slope = loss_features[feature];
+    const float quadratic_coefficient = loss_features[feature + 1];
+    const float normal_center = loss_features[feature + 2];
+    const float effective_temperature = p.strategy_temperature
+      * strategy_temperatures[candle_index];
+    const float transition_log_scale = p.signal_friction_fraction
+      / fmaxf(1e-20f, effective_temperature);
+    const TransitionDistributionStatistics statistics = transition_quadratic_statistics(
+      grid_size,
+      minimum_exposure,
+      maximum_exposure,
+      slope,
+      quadratic_coefficient,
+      normal_center,
+      p.strategy_normal_mixture,
+      p.strategy_normal_sigma,
+      friction,
+      transition_log_scale
+    );
+    const float quadratic_log_normalizer = quadratic_exponential_log_normalizer(
+      grid_size,
+      minimum_exposure,
+      maximum_exposure,
+      slope,
+      quadratic_coefficient
+    );
+    const double target_base_logit = p.strategy_normal_mixture > 0.0f
+      ? transition_mixture_cross_expectation(
+          oracle_probabilities + static_cast<size_t>(candle_index) * grid_size,
+          grid_size,
+          minimum_exposure,
+          maximum_exposure,
+          slope,
+          quadratic_coefficient,
+          normal_center,
+          p.strategy_normal_mixture,
+          p.strategy_normal_sigma,
+          friction,
+          1.0f / oracle_temperature
+        )
+      : slope * value_means[candle_index]
+        + quadratic_coefficient * value_second_moments[candle_index]
+        - quadratic_log_normalizer;
+    const double weight = value_weights[candle_index];
+    const double cross_entropy = fmax(
+      0.0,
+      static_cast<double>(statistics.log_normalizer)
+        - target_base_logit
+        - transition_log_scale * value_mean_log_rebalances[candle_index]
+    );
+    const double normalized_excess_entropy = fmax(
+      0.0,
+      static_cast<double>(statistics.entropy - value_entropies[candle_index])
+        / log(static_cast<double>(grid_size))
+    );
+    local[0] += weight * cross_entropy;
+    local[1] += weight;
+    local[2] += weight * statistics.entropy;
+    local[3] += weight * normalized_excess_entropy * normalized_excess_entropy;
+    local[4] += weight * statistics.mean;
+    local[5] += weight * statistics.second_moment;
+    local[6] += weight * fmax(
+      0.0,
+      static_cast<double>(statistics.second_moment)
+        - static_cast<double>(statistics.mean) * statistics.mean
+    );
+    local[7] += weight * value_means[candle_index];
+    local[8] += weight * value_second_moments[candle_index];
+    local[9] += weight * value_means[candle_index] * statistics.mean;
+  }
+  __shared__ double shared[10][CONDITIONAL_LOSS_THREADS];
+  for (int metric = 0; metric < 10; ++metric) shared[metric][threadIdx.x] = local[metric];
+  __syncthreads();
+  for (int stride = CONDITIONAL_LOSS_THREADS / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      for (int metric = 0; metric < 10; ++metric) {
+        shared[metric][threadIdx.x] += shared[metric][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x != 0) return;
+  const double inverse_weight = shared[1][0] > 0.0 ? 1.0 / shared[1][0] : 0.0;
+  const double strategy_mean = shared[4][0] * inverse_weight;
+  const double strategy_second_moment = shared[5][0] * inverse_weight;
+  const double state_mutual_information = state_mutual_information_lambda > 0.0f
+    ? normalized_gaussian_variance_information(
+        fmax(0.0, strategy_second_moment - strategy_mean * strategy_mean),
+        shared[6][0] * inverse_weight,
+        grid_size
+      )
+    : 0.0;
+  const double oracle_mutual_information = oracle_mutual_information_lambda > 0.0f
+      && oracle_mutual_information_mode == 0
+    ? normalized_gaussian_correlation_information(
+        shared[7][0] * inverse_weight,
+        shared[8][0] * inverse_weight,
+        strategy_mean,
+        strategy_second_moment,
+        shared[9][0] * inverse_weight,
+        grid_size
+      )
+    : 0.0;
+  const double mixed_loss = shared[1][0] > 0.0
+    ? shared[0][0] * inverse_weight
+      + entropy_gap_lambda * shared[3][0] * inverse_weight
+      - state_mutual_information_lambda * state_mutual_information
+      - oracle_mutual_information_lambda * oracle_mutual_information
+    : 0.0;
+  DeviceResult& result = results[candidate];
+  result.distillation_weighted_cross_entropy = shared[0][0];
+  result.distillation_weight = shared[1][0];
+  result.distillation_weighted_strategy_entropy = shared[2][0];
+  result.distillation_weighted_entropy_gap = shared[3][0];
+  result.distillation_state_mutual_information = state_mutual_information;
+  result.distillation_oracle_mutual_information = oracle_mutual_information;
+  result.distillation_mixed_loss = mixed_loss;
+}
+
+constexpr int MAX_MUTUAL_INFORMATION_BINS = 32;
+
+__global__ void precise_oracle_mutual_information_joint_kernel(
+  const float* oracle_bin_probabilities,
+  const float* value_weights,
+  const float* strategy_temperatures,
+  const float* loss_features,
+  const VwKamaParams* parameters,
+  int candle_count,
+  int score_start,
+  int candidate_count,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float friction,
   int bins,
   double* precise_joint
 ) {
@@ -2035,6 +2590,7 @@ __global__ void precise_oracle_mutual_information_joint_kernel(
   const int candidate = lane / bins;
   const int strategy_bin = lane % bins;
   if (candidate >= candidate_count) return;
+  const VwKamaParams p = parameters[candidate];
   double joint[MAX_MUTUAL_INFORMATION_BINS] = {};
   const int scored_count = candle_count - score_start;
   const int grid_start = (strategy_bin * grid_size + bins - 1) / bins;
@@ -2044,19 +2600,98 @@ __global__ void precise_oracle_mutual_information_joint_kernel(
     const size_t feature = (
       static_cast<size_t>(candidate) * scored_count + scored_index
     ) * 3;
-    const float linear_coefficient = precise_features[feature];
-    const float quadratic_coefficient = precise_features[feature + 1];
-    const float log_normalizer = precise_features[feature + 2];
-    double strategy_probability = 0.0;
-    for (int grid_index = grid_start; grid_index < grid_end; ++grid_index) {
-      const float exposure = minimum_exposure + grid_index * spacing;
-      strategy_probability += exp(
-        static_cast<double>(linear_coefficient) * exposure
-        + static_cast<double>(quadratic_coefficient) * exposure * exposure
-        - log_normalizer
+    const float linear_coefficient = loss_features[feature];
+    const float quadratic_coefficient = loss_features[feature + 1];
+    const float normal_center = loss_features[feature + 2];
+    const int candle_index = score_start + scored_index;
+    const float transition_log_scale = p.signal_friction_fraction / fmaxf(
+      1e-20f,
+      p.strategy_temperature * strategy_temperatures[candle_index]
+    );
+    const double quadratic_log_normalizer = quadratic_exponential_log_normalizer(
+      grid_size, minimum_exposure, maximum_exposure,
+      linear_coefficient, quadratic_coefficient
+    );
+    const double normal_variance = static_cast<double>(p.strategy_normal_sigma)
+      * p.strategy_normal_sigma;
+    const double normal_linear_coefficient = normal_center / normal_variance;
+    const double normal_quadratic_coefficient = -0.5 / normal_variance;
+    const double normal_log_normalizer = p.strategy_normal_mixture > 0.0f
+      ? quadratic_exponential_log_normalizer(
+          grid_size, minimum_exposure, maximum_exposure,
+          normal_linear_coefficient, normal_quadratic_coefficient
+        )
+      : 0.0;
+    double maximum_adjusted = -INFINITY;
+    for (int grid_index = 0; grid_index < grid_size; ++grid_index) {
+      const double exposure = minimum_exposure + grid_index * spacing;
+      const double base = strategy_mixture_base_logit(
+        exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+        p.strategy_normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+        normal_log_normalizer
+      );
+      maximum_adjusted = fmax(
+        maximum_adjusted,
+        fmax(
+          base - transition_log_scale * log(1.0 - friction * exposure),
+          base - transition_log_scale * log(1.0 - friction + friction * exposure)
+        )
       );
     }
-    const int candle_index = score_start + scored_index;
+    double buy_total = 0.0;
+    double buy_bin = 0.0;
+    for (int grid_index = 0; grid_index < grid_size; ++grid_index) {
+      const double exposure = minimum_exposure + grid_index * spacing;
+      const double base = strategy_mixture_base_logit(
+        exposure, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+        p.strategy_normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+        normal_log_normalizer
+      );
+      const double weight = exp(
+        base - transition_log_scale * log(1.0 - friction + friction * exposure)
+          - maximum_adjusted
+      );
+      buy_total += weight;
+      if (grid_index >= grid_start && grid_index < grid_end) buy_bin += weight;
+    }
+    double sell_total = 0.0;
+    double sell_bin = 0.0;
+    double strategy_probability = 0.0;
+    for (int state_index = 0; state_index < grid_size; ++state_index) {
+      const double current = minimum_exposure + state_index * spacing;
+      const double base = strategy_mixture_base_logit(
+        current, linear_coefficient, quadratic_coefficient, quadratic_log_normalizer,
+        p.strategy_normal_mixture, normal_linear_coefficient, normal_quadratic_coefficient,
+        normal_log_normalizer
+      );
+      const double sell_weight = exp(
+        base - transition_log_scale * log(1.0 - friction * current) - maximum_adjusted
+      );
+      const double buy_weight = exp(
+        base - transition_log_scale * log(1.0 - friction + friction * current)
+          - maximum_adjusted
+      );
+      sell_total += sell_weight;
+      buy_total = fmax(0.0, buy_total - buy_weight);
+      if (state_index >= grid_start && state_index < grid_end) {
+        sell_bin += sell_weight;
+        buy_bin = fmax(0.0, buy_bin - buy_weight);
+      }
+      const double sell_log_scale = transition_log_scale * log(1.0 - friction * current);
+      const double buy_log_scale = transition_log_scale
+        * log(1.0 - friction + friction * current);
+      const double row_maximum = fmax(
+        sell_total > 0.0 ? sell_log_scale + log(sell_total) : -INFINITY,
+        buy_total > 0.0 ? buy_log_scale + log(buy_total) : -INFINITY
+      );
+      const double sell_scale = exp(sell_log_scale - row_maximum);
+      const double buy_scale = exp(buy_log_scale - row_maximum);
+      const double total = sell_scale * sell_total + buy_scale * buy_total;
+      if (total > 0.0) {
+        strategy_probability += (sell_scale * sell_bin + buy_scale * buy_bin)
+          / total / grid_size;
+      }
+    }
     const double weighted_strategy_probability = value_weights[candle_index]
       * strategy_probability;
     const size_t oracle_offset = static_cast<size_t>(candle_index) * bins;
@@ -2136,16 +2771,54 @@ __global__ void finalize_precise_oracle_mutual_information_kernel(
     - oracle_mutual_information_lambda * normalized;
 }
 
-void prepare_precise_fitness_storage(CudaFitnessCase* test_case, int candidate_count) {
-  if (test_case->oracle_mutual_information_lambda <= 0.0f
-    || test_case->oracle_mutual_information_mode != 1) return;
+void prepare_loss_fitness_storage(CudaFitnessCase* test_case, int candidate_count) {
+  if (test_case->value_grid_size < 3) return;
   const size_t scored_count = test_case->candle_count - test_case->score_start;
-  test_case->precise_features.allocate(
+  test_case->loss_features.allocate(
     static_cast<size_t>(candidate_count) * scored_count * 3
   );
+  if (test_case->oracle_mutual_information_lambda <= 0.0f
+    || test_case->oracle_mutual_information_mode != 1) return;
   test_case->precise_joint.allocate(
     static_cast<size_t>(candidate_count)
       * test_case->mutual_information_bins * test_case->mutual_information_bins
+  );
+}
+
+void launch_conditional_fitness_kernel(
+  CudaFitnessCase* test_case,
+  int candidate_count,
+  cudaStream_t stream = nullptr
+) {
+  if (test_case->value_grid_size < 3) return;
+  conditional_policy_loss_kernel<<<
+    candidate_count,
+    CONDITIONAL_LOSS_THREADS,
+    0,
+    stream
+  >>>(
+    test_case->value_means.get(),
+    test_case->value_second_moments.get(),
+    test_case->value_mean_log_rebalances.get(),
+    test_case->value_entropies.get(),
+    test_case->value_weights.get(),
+    test_case->oracle_probabilities.get(),
+    test_case->strategy_temperatures.get(),
+    test_case->loss_features.get(),
+    test_case->candle_count,
+    test_case->score_start,
+    candidate_count,
+    test_case->value_grid_size,
+    test_case->value_grid_minimum,
+    test_case->value_grid_maximum,
+    test_case->oracle_friction,
+    test_case->oracle_temperature,
+    test_case->entropy_gap_lambda,
+    test_case->state_mutual_information_lambda,
+    test_case->oracle_mutual_information_lambda,
+    test_case->oracle_mutual_information_mode,
+    test_case->parameters.get(),
+    test_case->results.get()
   );
 }
 
@@ -2166,13 +2839,16 @@ void launch_precise_fitness_kernels(
   >>>(
     test_case->oracle_bin_probabilities.get(),
     test_case->value_weights.get(),
-    test_case->precise_features.get(),
+    test_case->strategy_temperatures.get(),
+    test_case->loss_features.get(),
+    test_case->parameters.get(),
     test_case->candle_count,
     test_case->score_start,
     candidate_count,
     test_case->value_grid_size,
     test_case->value_grid_minimum,
     test_case->value_grid_maximum,
+    test_case->oracle_friction,
     test_case->mutual_information_bins,
     test_case->precise_joint.get()
   );
@@ -2370,6 +3046,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
   float* second_moments,
   float* modal_exposures,
   float* entropies,
+  float* policy_means,
+  float* policy_second_moments,
+  float* policy_mean_log_rebalances,
+  float* policy_entropies,
+  float* average_regrets,
   float* weights,
   float* opportunities,
   float* probabilities,
@@ -2380,7 +3061,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
 ) {
   try {
     if (!prices || !means || !second_moments || !modal_exposures
-      || !entropies || !weights || !opportunities || !path_exposures
+      || !entropies || !policy_means || !policy_second_moments
+      || !policy_mean_log_rebalances || !policy_entropies || !average_regrets
+      || !weights || !opportunities || !path_exposures
       || !path_equities || !path_metrics
       || !elapsed_ms) {
       throw std::runtime_error("Exposure-value CUDA oracle received a null pointer");
@@ -2431,6 +3114,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     DeviceBuffer<float> device_second_moments(price_count);
     DeviceBuffer<float> device_modal_exposures(price_count);
     DeviceBuffer<float> device_entropies(price_count);
+    DeviceBuffer<float> device_policy_means(price_count);
+    DeviceBuffer<float> device_policy_second_moments(price_count);
+    DeviceBuffer<float> device_policy_mean_log_rebalances(price_count);
+    DeviceBuffer<float> device_policy_entropies(price_count);
+    DeviceBuffer<float> device_average_regrets(price_count);
     DeviceBuffer<float> device_weights(price_count);
     DeviceBuffer<float> device_opportunities(price_count);
     DeviceBuffer<float> device_probabilities(
@@ -2499,6 +3187,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     cuda_check(cudaMemset(device_second_moments.get(), 0, price_count * sizeof(float)), "clear oracle second moments");
     cuda_check(cudaMemset(device_modal_exposures.get(), 0, price_count * sizeof(float)), "clear oracle modes");
     cuda_check(cudaMemset(device_entropies.get(), 0, price_count * sizeof(float)), "clear oracle entropies");
+    cuda_check(cudaMemset(device_policy_means.get(), 0, price_count * sizeof(float)), "clear oracle policy means");
+    cuda_check(cudaMemset(device_policy_second_moments.get(), 0, price_count * sizeof(float)), "clear oracle policy second moments");
+    cuda_check(cudaMemset(device_policy_mean_log_rebalances.get(), 0, price_count * sizeof(float)), "clear oracle policy mean rebalance logs");
+    cuda_check(cudaMemset(device_policy_entropies.get(), 0, price_count * sizeof(float)), "clear oracle policy entropies");
+    cuda_check(cudaMemset(device_average_regrets.get(), 0, price_count * sizeof(float)), "clear oracle average regrets");
     cuda_check(cudaMemset(device_weights.get(), 0, price_count * sizeof(float)), "clear oracle weights");
     cuda_check(cudaMemset(device_opportunities.get(), 0, price_count * sizeof(float)), "clear oracle opportunities");
     if (probabilities) {
@@ -2550,7 +3243,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
       cuda_check(cudaGetLastError(), "launch exposure-value hold precomputation kernel");
     };
     const size_t chain_storage_bytes = static_cast<size_t>(threads)
-      * (3 * sizeof(double) + 2 * sizeof(uint16_t));
+      * (6 * sizeof(double) + 2 * sizeof(uint16_t));
     if (value_horizon_steps >= price_count - 1 - score_start) {
       prepare_holds(price_count, holding_period_steps);
       const int chain_count = std::min(holding_period_steps, scored_count);
@@ -2560,7 +3253,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         holding_values.get(), endpoint_exposures.get(), rebalance_logs.get(),
         separable_rebalance_costs, sell_logs.get(), buy_logs.get(), nullptr,
         continuations.get(), policy.get(), device_means.get(), device_second_moments.get(),
-        device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
+        device_modal_exposures.get(), device_entropies.get(), device_policy_means.get(),
+        device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
+        device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
         device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
         false, false, true, false
       );
@@ -2582,7 +3277,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
           holding_values.get(), endpoint_exposures.get(), rebalance_logs.get(),
           separable_rebalance_costs, sell_logs.get(), buy_logs.get(), prior,
           current, policy.get(), device_means.get(), device_second_moments.get(),
-          device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
+          device_modal_exposures.get(), device_entropies.get(), device_policy_means.get(),
+          device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
+          device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
           device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
           true, prior != nullptr, level == 0, false
         );
@@ -2614,7 +3311,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
       holding_values.get(), endpoint_exposures.get(), rebalance_logs.get(),
       separable_rebalance_costs, sell_logs.get(), buy_logs.get(), nullptr,
       continuations.get(), policy.get(), device_means.get(), device_second_moments.get(),
-      device_modal_exposures.get(), device_entropies.get(), device_weights.get(),
+      device_modal_exposures.get(), device_entropies.get(), device_policy_means.get(),
+      device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
+      device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
       device_opportunities.get(), nullptr,
       false, false, false, true
     );
@@ -2665,6 +3364,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     copy_output(second_moments, device_second_moments, "copy oracle second moments");
     copy_output(modal_exposures, device_modal_exposures, "copy oracle modes");
     copy_output(entropies, device_entropies, "copy oracle entropies");
+    copy_output(policy_means, device_policy_means, "copy oracle policy means");
+    copy_output(policy_second_moments, device_policy_second_moments, "copy oracle policy second moments");
+    copy_output(policy_mean_log_rebalances, device_policy_mean_log_rebalances, "copy oracle policy mean rebalance logs");
+    copy_output(policy_entropies, device_policy_entropies, "copy oracle policy entropies");
+    copy_output(average_regrets, device_average_regrets, "copy oracle average regrets");
     copy_output(weights, device_weights, "copy oracle weights");
     copy_output(opportunities, device_opportunities, "copy oracle opportunities");
     copy_output(path_exposures, device_path_exposures, "copy full-window oracle exposures");
@@ -2703,8 +3407,10 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   const double* volume,
   const float* value_means,
   const float* value_second_moments,
+  const float* value_mean_log_rebalances,
   const float* value_entropies,
   const float* value_weights,
+  const float* oracle_probabilities,
   const float* strategy_temperatures,
   const float* strategy_quadratic_volatilities,
   const float* oracle_bin_probabilities,
@@ -2713,6 +3419,7 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   double interval_ms,
   int value_holding_period_steps,
   double oracle_friction,
+  double oracle_temperature,
   double quote_lend_rate,
   double quote_borrow_rate,
   double asset_borrow_rate,
@@ -2730,7 +3437,8 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   double* resident_bytes
 ) {
   try {
-    if (!close || !volume || !value_means || !value_second_moments || !value_entropies
+    if (!close || !volume || !value_means || !value_second_moments
+      || !value_mean_log_rebalances || !value_entropies
       || !value_weights || !strategy_temperatures || !strategy_quadratic_volatilities
       || !resident_bytes || (include_high_low && (!high || !low))) {
       throw std::runtime_error("CUDA fitness case received a null input pointer");
@@ -2748,7 +3456,8 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
       || mutual_information_bins > std::min(MAX_MUTUAL_INFORMATION_BINS, value_grid_size)
       || (oracle_mutual_information_lambda > 0.0 && oracle_mutual_information_mode == 1
         && !oracle_bin_probabilities)
-      || oracle_friction < 0.0 || quote_lend_rate < 0.0
+      || oracle_friction < 0.0 || !std::isfinite(oracle_temperature)
+      || oracle_temperature <= 0.0 || quote_lend_rate < 0.0
       || quote_borrow_rate < 0.0 || asset_borrow_rate < 0.0) {
       throw std::runtime_error("CUDA fitness case received invalid dimensions or options");
     }
@@ -2759,6 +3468,7 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
     result->interval_ms = static_cast<float>(interval_ms);
     result->value_holding_period_steps = value_holding_period_steps;
     result->oracle_friction = static_cast<float>(oracle_friction);
+    result->oracle_temperature = static_cast<float>(oracle_temperature);
     result->quote_lend_rate = static_cast<float>(quote_lend_rate);
     result->quote_borrow_rate = static_cast<float>(quote_borrow_rate);
     result->asset_borrow_rate = static_cast<float>(asset_borrow_rate);
@@ -2799,8 +3509,12 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
       || state_mutual_information_lambda > 0.0
       || oracle_mutual_information_lambda > 0.0;
     result->value_second_moments.allocate(candle_count);
+    result->value_mean_log_rebalances.allocate(candle_count);
     result->value_entropies.allocate(loss_enabled ? candle_count : 0);
     result->value_weights.allocate(candle_count);
+    result->oracle_probabilities.allocate(
+      oracle_probabilities ? static_cast<size_t>(candle_count) * value_grid_size : 0
+    );
     result->strategy_temperatures.allocate(candle_count);
     result->strategy_quadratic_volatilities.allocate(candle_count);
     const bool precise_enabled = oracle_mutual_information_lambda > 0.0
@@ -2818,10 +3532,19 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
     cuda_check(cudaMemcpy(result->volume.get(), host_volume.data(), candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident volume");
     cuda_check(cudaMemcpy(result->value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value means");
     cuda_check(cudaMemcpy(result->value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value second moments");
+    cuda_check(cudaMemcpy(result->value_mean_log_rebalances.get(), value_mean_log_rebalances, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value mean rebalance logs");
     if (loss_enabled) {
       cuda_check(cudaMemcpy(result->value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value entropies");
     }
     cuda_check(cudaMemcpy(result->value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident value weights");
+    if (oracle_probabilities) {
+      cuda_check(cudaMemcpy(
+        result->oracle_probabilities.get(),
+        oracle_probabilities,
+        static_cast<size_t>(candle_count) * value_grid_size * sizeof(float),
+        cudaMemcpyHostToDevice
+      ), "upload resident oracle probabilities");
+    }
     cuda_check(cudaMemcpy(result->strategy_temperatures.get(), strategy_temperatures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident strategy temperatures");
     cuda_check(cudaMemcpy(result->strategy_quadratic_volatilities.get(), strategy_quadratic_volatilities, candle_count * sizeof(float), cudaMemcpyHostToDevice), "upload resident strategy quadratic volatilities");
     if (precise_enabled) {
@@ -2833,7 +3556,10 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
       ), "upload resident oracle MI bins");
     }
     result->resident_bytes = static_cast<size_t>(candle_count)
-      * ((include_high_low ? 9 : 7) + (loss_enabled ? 1 : 0)) * sizeof(float)
+      * ((include_high_low ? 10 : 8) + (loss_enabled ? 1 : 0)) * sizeof(float)
+      + (oracle_probabilities
+        ? static_cast<size_t>(candle_count) * value_grid_size * sizeof(float)
+        : 0)
       + (precise_enabled
         ? static_cast<size_t>(candle_count) * mutual_information_bins * sizeof(float)
         : 0);
@@ -2862,6 +3588,17 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
     auto* output = static_cast<VwKamaResult*>(output_data);
     std::vector<uint64_t> host_change_offsets(candidate_count + 1, 0);
     for (int index = 0; index < candidate_count; ++index) {
+      if (!std::isfinite(parameters[index].strategy_normal_mixture)
+        || parameters[index].strategy_normal_mixture < 0.0f
+        || parameters[index].strategy_normal_mixture > 1.0f
+        || !std::isfinite(parameters[index].strategy_normal_sigma)
+        || parameters[index].strategy_normal_sigma <= 0.0f) {
+        throw std::runtime_error("CUDA fitness strategy normal-mixture parameters are invalid");
+      }
+      if (parameters[index].strategy_normal_mixture > 0.0f
+        && !test_case->oracle_probabilities.get()) {
+        throw std::runtime_error("CUDA fitness normal-mixture loss requires oracle probabilities");
+      }
       const bool dmi_enabled = parameters[index].confirmation_mix > 0.0f
         && parameters[index].confirmation_dmi_weight > 0.0f;
       if (dmi_enabled && !test_case->has_high_low) {
@@ -2876,7 +3613,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
     test_case->change_offsets.allocate(candidate_count + 1);
     test_case->changes.allocate(host_change_offsets.back());
     test_case->results.allocate(candidate_count);
-    prepare_precise_fitness_storage(test_case, candidate_count);
+    prepare_loss_fitness_storage(test_case, candidate_count);
     cuda_check(cudaMemcpy(
       test_case->parameters.get(),
       parameters,
@@ -2905,6 +3642,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
       nullptr,
       test_case->value_means.get(),
       test_case->value_second_moments.get(),
+      test_case->value_mean_log_rebalances.get(),
       test_case->value_entropies.get(),
       nullptr,
       test_case->value_weights.get(),
@@ -2935,11 +3673,13 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
       nullptr,
       nullptr,
       0,
-      test_case->precise_features.get(),
+      test_case->loss_features.get(),
       true,
       false
     );
     cuda_check(cudaGetLastError(), "launch resident VW-KAMA fitness kernel");
+    launch_conditional_fitness_kernel(test_case, candidate_count);
+    cuda_check(cudaGetLastError(), "launch resident conditional-policy loss kernel");
     launch_precise_fitness_kernels(test_case, candidate_count);
     cuda_check(cudaGetLastError(), "launch resident precise oracle MI kernels");
     cuda_check(cudaEventRecord(stop_event), "record resident fitness stop event");
@@ -3040,7 +3780,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
       test_case->change_offsets.allocate(candidate_count + 1);
       test_case->changes.allocate(offsets.back());
       test_case->results.allocate(candidate_count);
-      prepare_precise_fitness_storage(test_case, candidate_count);
+      prepare_loss_fitness_storage(test_case, candidate_count);
       cuda_check(cudaMemcpy(
         test_case->parameters.get(),
         parameters,
@@ -3071,6 +3811,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
         nullptr,
         test_case->value_means.get(),
         test_case->value_second_moments.get(),
+        test_case->value_mean_log_rebalances.get(),
         test_case->value_entropies.get(),
         nullptr,
         test_case->value_weights.get(),
@@ -3101,11 +3842,13 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
         nullptr,
         nullptr,
         0,
-        test_case->precise_features.get(),
+        test_case->loss_features.get(),
         true,
         false
       );
       cuda_check(cudaGetLastError(), "launch scheduled resident VW-KAMA fitness kernel");
+      launch_conditional_fitness_kernel(test_case, candidate_count, streams[case_index]);
+      cuda_check(cudaGetLastError(), "launch scheduled conditional-policy loss kernel");
       launch_precise_fitness_kernels(test_case, candidate_count, streams[case_index]);
       cuda_check(cudaGetLastError(), "launch scheduled precise oracle MI kernels");
       cuda_check(cudaEventRecord(stops[case_index], streams[case_index]), "record scheduled fitness stop");
@@ -3177,7 +3920,7 @@ extern "C" double vw_kama_cuda_fitness_case_device_bytes(uint64_t handle) {
     + test_case->change_offsets.capacity() * sizeof(uint64_t)
     + test_case->changes.capacity() * sizeof(float)
     + test_case->results.capacity() * sizeof(DeviceResult)
-    + test_case->precise_features.capacity() * sizeof(float)
+    + test_case->loss_features.capacity() * sizeof(float)
     + test_case->precise_joint.capacity() * sizeof(double));
 }
 
@@ -3206,9 +3949,11 @@ extern "C" int vw_kama_cuda_evaluate(
   const uint8_t* oracle_codes,
   const float* value_means,
   const float* value_second_moments,
+  const float* value_mean_log_rebalances,
   const float* value_optimal_exposures,
   const float* value_entropies,
   const float* value_weights,
+  const float* oracle_probabilities,
   const float* value_opportunities,
   const float* oracle_bin_probabilities,
   const float* strategy_temperatures,
@@ -3218,6 +3963,7 @@ extern "C" int vw_kama_cuda_evaluate(
   double interval_ms,
   int value_holding_period_steps,
   double oracle_friction,
+  double oracle_temperature,
   double quote_lend_rate,
   double quote_borrow_rate,
   double asset_borrow_rate,
@@ -3247,6 +3993,7 @@ extern "C" int vw_kama_cuda_evaluate(
     }
     if (interval_ms <= 0 || value_holding_period_steps < 1
       || match_window_ms < 0 || timing_half_life_ms <= 0
+      || !std::isfinite(oracle_temperature) || oracle_temperature <= 0
       || quote_lend_rate < 0 || quote_borrow_rate < 0 || asset_borrow_rate < 0) {
       throw std::runtime_error("VW-KAMA CUDA received invalid timing options");
     }
@@ -3259,6 +4006,7 @@ extern "C" int vw_kama_cuda_evaluate(
     if (distillation_enabled && (
       !value_means
       || !value_second_moments
+      || !value_mean_log_rebalances
       || !value_weights
       || !strategy_temperatures
       || !strategy_quadratic_volatilities
@@ -3288,6 +4036,16 @@ extern "C" int vw_kama_cuda_evaluate(
 
     bool any_dmi_enabled = false;
     for (int index = 0; index < candidate_count; ++index) {
+      if (!std::isfinite(parameters[index].strategy_normal_mixture)
+        || parameters[index].strategy_normal_mixture < 0.0f
+        || parameters[index].strategy_normal_mixture > 1.0f
+        || !std::isfinite(parameters[index].strategy_normal_sigma)
+        || parameters[index].strategy_normal_sigma <= 0.0f) {
+        throw std::runtime_error("VW-KAMA strategy normal-mixture parameters are invalid");
+      }
+      if (parameters[index].strategy_normal_mixture > 0.0f && !oracle_probabilities) {
+        throw std::runtime_error("VW-KAMA normal-mixture loss requires oracle probabilities");
+      }
       any_dmi_enabled = any_dmi_enabled || (
         parameters[index].confirmation_mix > 0.0f
         && parameters[index].confirmation_dmi_weight > 0.0f
@@ -3321,6 +4079,7 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<uint8_t> device_oracle(fitness_only ? 0 : candle_count);
     DeviceBuffer<float> device_value_means(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_second_moments(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_value_mean_log_rebalances(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_value_entropies(
       distillation_enabled && loss_enabled ? candle_count : 0
     );
@@ -3328,6 +4087,11 @@ extern "C" int vw_kama_cuda_evaluate(
       distillation_enabled && !fitness_only ? candle_count : 0
     );
     DeviceBuffer<float> device_value_weights(distillation_enabled ? candle_count : 0);
+    DeviceBuffer<float> device_oracle_probabilities(
+      distillation_enabled && oracle_probabilities
+        ? static_cast<size_t>(candle_count) * value_grid_size
+        : 0
+    );
     DeviceBuffer<float> device_strategy_temperatures(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_strategy_quadratic_volatilities(distillation_enabled ? candle_count : 0);
     DeviceBuffer<float> device_oracle_bin_probabilities(
@@ -3337,8 +4101,8 @@ extern "C" int vw_kama_cuda_evaluate(
     DeviceBuffer<uint64_t> device_change_offsets(candidate_count + 1);
     DeviceBuffer<float> device_changes(host_change_offsets.back());
     DeviceBuffer<DeviceResult> device_results(candidate_count);
-    DeviceBuffer<float> device_precise_features(
-      precise_enabled
+    DeviceBuffer<float> device_loss_features(
+      distillation_enabled
         ? static_cast<size_t>(candidate_count) * (candle_count - score_start) * 3
         : 0
     );
@@ -3362,10 +4126,19 @@ extern "C" int vw_kama_cuda_evaluate(
     if (distillation_enabled) {
       cuda_check(cudaMemcpy(device_value_means.get(), value_means, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value means");
       cuda_check(cudaMemcpy(device_value_second_moments.get(), value_second_moments, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value second moments");
+      cuda_check(cudaMemcpy(device_value_mean_log_rebalances.get(), value_mean_log_rebalances, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value mean rebalance logs");
       if (loss_enabled) {
         cuda_check(cudaMemcpy(device_value_entropies.get(), value_entropies, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value entropies");
       }
       cuda_check(cudaMemcpy(device_value_weights.get(), value_weights, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy value weights");
+      if (oracle_probabilities) {
+        cuda_check(cudaMemcpy(
+          device_oracle_probabilities.get(),
+          oracle_probabilities,
+          static_cast<size_t>(candle_count) * value_grid_size * sizeof(float),
+          cudaMemcpyHostToDevice
+        ), "copy oracle probabilities");
+      }
       cuda_check(cudaMemcpy(device_strategy_temperatures.get(), strategy_temperatures, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy strategy temperatures");
       cuda_check(cudaMemcpy(device_strategy_quadratic_volatilities.get(), strategy_quadratic_volatilities, candle_count * sizeof(float), cudaMemcpyHostToDevice), "copy strategy quadratic volatilities");
       if (precise_enabled) {
@@ -3439,6 +4212,7 @@ extern "C" int vw_kama_cuda_evaluate(
       device_oracle.get(),
       device_value_means.get(),
       device_value_second_moments.get(),
+      device_value_mean_log_rebalances.get(),
       device_value_entropies.get(),
       device_value_optimal_exposures.get(),
       device_value_weights.get(),
@@ -3469,11 +4243,39 @@ extern "C" int vw_kama_cuda_evaluate(
       device_transition_offsets.get(),
       device_transitions.get(),
       capture_capacity,
-      device_precise_features.get(),
+      device_loss_features.get(),
       fitness_only != 0,
       false
     );
     cuda_check(cudaGetLastError(), "launch VW-KAMA score kernel");
+
+    if (distillation_enabled) {
+      conditional_policy_loss_kernel<<<candidate_count, CONDITIONAL_LOSS_THREADS>>>(
+        device_value_means.get(),
+        device_value_second_moments.get(),
+        device_value_mean_log_rebalances.get(),
+        device_value_entropies.get(),
+        device_value_weights.get(),
+        device_oracle_probabilities.get(),
+        device_strategy_temperatures.get(),
+        device_loss_features.get(),
+        candle_count,
+        score_start,
+        candidate_count,
+        value_grid_size,
+        static_cast<float>(value_grid_minimum),
+        static_cast<float>(value_grid_maximum),
+        static_cast<float>(oracle_friction),
+        static_cast<float>(oracle_temperature),
+        static_cast<float>(entropy_gap_lambda),
+        static_cast<float>(state_mutual_information_lambda),
+        static_cast<float>(oracle_mutual_information_lambda),
+        oracle_mutual_information_mode,
+        device_parameters.get(),
+        device_results.get()
+      );
+      cuda_check(cudaGetLastError(), "launch conditional-policy loss kernel");
+    }
 
     if (precise_enabled) {
       const int joint_threads = 128;
@@ -3484,13 +4286,16 @@ extern "C" int vw_kama_cuda_evaluate(
       >>>(
         device_oracle_bin_probabilities.get(),
         device_value_weights.get(),
-        device_precise_features.get(),
+        device_strategy_temperatures.get(),
+        device_loss_features.get(),
+        device_parameters.get(),
         candle_count,
         score_start,
         candidate_count,
         value_grid_size,
         static_cast<float>(value_grid_minimum),
         static_cast<float>(value_grid_maximum),
+        static_cast<float>(oracle_friction),
         mutual_information_bins,
         device_precise_joint.get()
       );
@@ -3594,6 +4399,7 @@ extern "C" int vw_kama_cuda_evaluate(
         device_oracle.get(),
         device_value_means.get(),
         device_value_second_moments.get(),
+        device_value_mean_log_rebalances.get(),
         device_value_entropies.get(),
         device_value_optimal_exposures.get(),
         device_value_weights.get(),

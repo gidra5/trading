@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  binnedConditionalExposureProbabilities,
+  conditionalExposureProbabilities,
+  conditionalQuadraticExposureProbabilities,
   createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
   exposureValueOracleProbabilities,
   finalizeExposureReturn,
   finalizeExposureValueDistillation,
+  fitConditionalQuadraticPolicy,
   observeExposureReturn,
   observeExposureValueDistillation,
   prepareExposureValueOracle,
@@ -15,6 +19,7 @@ import {
   strategyExposureProbabilities,
   strategyExposureQuadraticCoefficient,
   strategyExposureTemperatures,
+  strategyExposureTransitionCrossEntropy,
   strategyExposureVolatilities,
   truncateExposureValueOracle,
   truncatedExponentialLogNormalizer,
@@ -23,6 +28,114 @@ import {
   prepareExposureValueOracleCuda,
   vwKamaCudaStatus,
 } from "../src/vw-kama-cuda.js";
+
+test("conditional exposure probabilities are the normalized transition policy used by the loss", () => {
+  const grid = Float64Array.of(-1, 0, 1);
+  const base = Float64Array.of(0.2, 0.3, 0.5);
+  const current = -0.4;
+  const friction = 0.01;
+  const transitionLogScale = 7;
+  const actual = conditionalExposureProbabilities(
+    base,
+    grid,
+    current,
+    friction,
+    transitionLogScale,
+  );
+  const unnormalized = Array.from(grid, (target, index) =>
+    base[index]! * rebalanceEquityFactor(current, target, friction) ** transitionLogScale);
+  const total = unnormalized.reduce((sum, value) => sum + value, 0);
+
+  assert.ok(Math.abs(Array.from(actual).reduce((sum, value) => sum + value, 0) - 1) < 1e-12);
+  for (let index = 0; index < actual.length; index += 1) {
+    assert.ok(Math.abs(actual[index]! - unnormalized[index]! / total) < 1e-12);
+  }
+});
+
+test("conditional quadratic policy fit recovers shared predictor coefficients", () => {
+  const grid = Float64Array.from({ length: 41 }, (_, index) => -2 + index / 10);
+  const currentExposures = Float64Array.of(-1.7, -0.3, 0.8, 1.9);
+  const linearCoefficient = 0.7;
+  const quadraticCoefficient = -0.4;
+  const friction = 0.012;
+  const transitionLogScale = 5;
+  const targets = new Float64Array(grid.length * currentExposures.length);
+  for (let row = 0; row < currentExposures.length; row += 1) {
+    conditionalQuadraticExposureProbabilities(
+      grid,
+      currentExposures[row]!,
+      linearCoefficient,
+      quadraticCoefficient,
+      friction,
+      transitionLogScale,
+      targets.subarray(row * grid.length, (row + 1) * grid.length),
+    );
+  }
+  const fit = fitConditionalQuadraticPolicy(grid, targets, currentExposures, {
+    friction,
+    transitionLogScale,
+  });
+
+  assert.equal(fit.converged, true);
+  assert.ok(Math.abs(fit.linearCoefficient - linearCoefficient) < 1e-7, fit);
+  assert.ok(Math.abs(fit.quadraticCoefficient - quadraticCoefficient) < 1e-7, fit);
+  assert.ok(fit.klDivergence < 1e-10, fit);
+});
+
+test("probability-MSE quadratic fit minimizes pointwise distribution error", () => {
+  const grid = Float64Array.from({ length: 101 }, (_, index) => -1 + index / 50);
+  const targets = Float64Array.from(grid, (exposure) =>
+    0.7 * Math.exp(-18 * (exposure - 0.55) ** 2)
+      + 0.3 * Math.exp(1.2 * exposure));
+  const mseFit = fitConditionalQuadraticPolicy(
+    grid,
+    targets,
+    Float64Array.of(0),
+    { friction: 0, transitionLogScale: 0, objective: "probability-mse" },
+  );
+  const klFit = fitConditionalQuadraticPolicy(
+    grid,
+    targets,
+    Float64Array.of(0),
+    { friction: 0, transitionLogScale: 0, objective: "forward-kl" },
+  );
+  const probabilityMse = (linearCoefficient: number, quadraticCoefficient: number) => {
+    const predicted = conditionalQuadraticExposureProbabilities(
+      grid,
+      0,
+      linearCoefficient,
+      quadraticCoefficient,
+      0,
+      0,
+    );
+    const targetTotal = targets.reduce((sum, value) => sum + value, 0);
+    return predicted.reduce((sum, probability, index) => {
+      const residual = probability - targets[index]! / targetTotal;
+      return sum + residual * residual / grid.length;
+    }, 0);
+  };
+
+  assert.equal(mseFit.objective, "probability-mse");
+  assert.equal(mseFit.converged, true, mseFit);
+  assert.ok(Math.abs(probabilityMse(
+    mseFit.linearCoefficient,
+    mseFit.quadraticCoefficient,
+  ) - mseFit.meanSquaredError) < 1e-14, mseFit);
+  assert.ok(mseFit.meanSquaredError < probabilityMse(
+    klFit.linearCoefficient,
+    klFit.quadraticCoefficient,
+  ), { mseFit, klFit });
+  for (const [linearOffset, quadraticOffset] of [
+    [-0.02, 0],
+    [0.02, 0],
+    [0, -0.02],
+  ]) {
+    assert.ok(mseFit.meanSquaredError <= probabilityMse(
+      mseFit.linearCoefficient + linearOffset,
+      mseFit.quadraticCoefficient + quadraticOffset,
+    ), { mseFit, linearOffset, quadraticOffset });
+  }
+});
 
 test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (context) => {
   const status = await vwKamaCudaStatus();
@@ -55,6 +168,11 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
       "means",
       "secondMoments",
       "entropies",
+      "policyMeans",
+      "policySecondMoments",
+      "policyMeanLogRebalances",
+      "policyEntropies",
+      "averageRegrets",
       "weights",
       "opportunities",
       "probabilities",
@@ -432,6 +550,54 @@ test("flat future prices produce a uniform exposure preference", () => {
   assert.ok(oracle.opportunities[0]! < 1e-12);
 });
 
+test("transition-aware oracle statistics learn every current-target exposure pair", () => {
+  const temperature = 0.02;
+  const friction = 0.01;
+  const oracle = prepareExposureValueOracle([100, 110], {
+    scoreStartIndex: 0,
+    friction,
+    gridSize: 3,
+    temperature,
+    includeProbabilities: true,
+    opportunityEpsilon: 1e-6,
+  });
+  const postAction = exposureValueOracleProbabilities(oracle, 0);
+  let mean = 0;
+  let secondMoment = 0;
+  let meanLogRebalance = 0;
+  let entropy = 0;
+  let averageRegret = 0;
+  for (const current of oracle.grid) {
+    const logits = Array.from(oracle.grid, (target, index) =>
+      Math.log(postAction[index]!)
+        + Math.log(rebalanceEquityFactor(current, target, friction)) / temperature);
+    const maximum = Math.max(...logits);
+    const probabilities = logits.map((logit) => Math.exp(logit - maximum));
+    const total = probabilities.reduce((sum, value) => sum + value, 0);
+    const conditionalValues = Array.from(oracle.grid, (target, index) =>
+      temperature * Math.log(postAction[index]!)
+        + Math.log(rebalanceEquityFactor(current, target, friction)));
+    averageRegret += Math.max(...conditionalValues)
+      - conditionalValues.reduce((sum, value) => sum + value, 0) / conditionalValues.length;
+    for (let index = 0; index < oracle.grid.length; index += 1) {
+      const probability = probabilities[index]! / total;
+      const target = oracle.grid[index]!;
+      const logRebalance = Math.log(rebalanceEquityFactor(current, target, friction));
+      mean += probability * target / oracle.grid.length;
+      secondMoment += probability * target * target / oracle.grid.length;
+      meanLogRebalance += probability * logRebalance / oracle.grid.length;
+      if (probability > 0) entropy -= probability * Math.log(probability) / oracle.grid.length;
+    }
+  }
+  averageRegret /= oracle.grid.length;
+  assert.ok(Math.abs(oracle.policyMeans[0]! - mean) < 1e-6);
+  assert.ok(Math.abs(oracle.policySecondMoments[0]! - secondMoment) < 1e-6);
+  assert.ok(Math.abs(oracle.policyMeanLogRebalances[0]! - meanLogRebalance) < 1e-6);
+  assert.ok(Math.abs(oracle.policyEntropies[0]! - entropy) < 1e-6);
+  assert.ok(Math.abs(oracle.averageRegrets[0]! - averageRegret) < 1e-6);
+  assert.ok(Math.abs(oracle.weights[0]! - (averageRegret + 1e-6)) < 1e-6);
+});
+
 test("distillation loss rewards a signed-rate exponential biased toward the oracle", () => {
   const oracle = prepareExposureValueOracle([100, 110], {
     scoreStartIndex: 0,
@@ -596,6 +762,99 @@ test("retained oracle and strategy distributions are normalized", () => {
   const strategyProbabilities = strategyExposureProbabilities(oracle.grid, 100, 3_600_000, 0.01);
   assert.ok(Math.abs(oracleProbabilities.reduce((sum, value) => sum + value, 0) - 1) < 1e-6);
   assert.ok(Math.abs(strategyProbabilities.reduce((sum, value) => sum + value, 0) - 1) < 1e-12);
+});
+
+test("strategy normal mixture is normalized and its transition loss matches a full conditional map", () => {
+  const oracle = prepareExposureValueOracle([100, 102, 99], {
+    scoreStartIndex: 0,
+    friction: 0.01,
+    gridSize: 9,
+    temperature: 0.03,
+    includeProbabilities: true,
+  });
+  const rate = 40;
+  const holdingMs = 3_600_000;
+  const temperature = 0.05;
+  const quadratic = -0.2;
+  const center = 0.35;
+  const mixture = 0.4;
+  const sigma = 0.3;
+  const strategyBase = strategyExposureProbabilities(
+    oracle.grid,
+    rate,
+    holdingMs,
+    temperature,
+    quadratic,
+    center,
+    mixture,
+    sigma,
+  );
+  assert.ok(Math.abs(strategyBase.reduce((sum, value) => sum + value, 0) - 1) < 1e-12);
+
+  const oracleBase = exposureValueOracleProbabilities(oracle, 0);
+  let expected = 0;
+  for (const current of oracle.grid) {
+    const oracleConditional = conditionalExposureProbabilities(
+      oracleBase,
+      oracle.grid,
+      current,
+      oracle.execution.friction,
+      1 / oracle.temperature,
+    );
+    const strategyConditional = conditionalExposureProbabilities(
+      strategyBase,
+      oracle.grid,
+      current,
+      oracle.execution.friction,
+      1 / temperature,
+    );
+    for (let index = 0; index < oracle.grid.length; index += 1) {
+      expected -= oracleConditional[index]!
+        * Math.log(Math.max(Number.MIN_VALUE, strategyConditional[index]!))
+        / oracle.grid.length;
+    }
+  }
+  const actual = strategyExposureTransitionCrossEntropy(
+    oracle,
+    0,
+    rate,
+    holdingMs,
+    temperature,
+    quadratic,
+    1,
+    center,
+    mixture,
+    sigma,
+  );
+  assert.ok(Math.abs(actual - expected) < 1e-8, `${actual} != ${expected}`);
+});
+
+test("conditional policy bins match a grid-squared reference", () => {
+  const grid = new Float64Array([-1, -0.5, 0, 0.5, 1]);
+  const base = strategyExposureProbabilities(grid, 35, 3_600_000, 0.03, -0.2);
+  const friction = 0.01;
+  const transitionScale = 20;
+  const bins = 3;
+  const actual = binnedConditionalExposureProbabilities(
+    base,
+    grid,
+    friction,
+    transitionScale,
+    bins,
+  );
+  const expected = new Float64Array(bins);
+  for (const current of grid) {
+    const weights = Array.from(grid, (target, index) =>
+      base[index]! * rebalanceEquityFactor(current, target, friction) ** transitionScale);
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    for (let index = 0; index < grid.length; index += 1) {
+      const bin = Math.min(bins - 1, Math.floor(index * bins / grid.length));
+      expected[bin] += weights[index]! / total / grid.length;
+    }
+  }
+  for (let bin = 0; bin < bins; bin += 1) {
+    assert.ok(Math.abs(actual[bin]! - expected[bin]!) < 1e-12);
+  }
 });
 
 test("signed rate selects the side and lower temperature increases concentration", () => {

@@ -81,6 +81,27 @@ the zero-coefficient geometric path and positive-quadratic full-grid fallback ar
 resident fitness kernel improved from 120.2 ms to 107.5 ms (10.6%), and the scheduled four-case
 kernel improved from 127.1 ms to 114.5 ms (9.9%), with zero fitness/diagnostic loss drift.
 
+## Transition-aware policy pass
+
+The later current-exposure → target-exposure objective adds an `O(grid)` conditional-policy
+scan per candidate and candle. Keeping that scan inside the original thread-per-candidate signal
+kernel initially under-occupied the GPU: 64 candidates × 5,000 candles × grid 51 took about
+5.89 s of fitness kernel time on the same RTX 3060 Laptop GPU.
+
+The retained pipeline separates the sequential signal recurrence from the independent loss work.
+The signal kernel writes two Float32 features per candidate/candle (linear and quadratic
+coefficients). A second kernel assigns one 128-thread block to each candidate, distributes candles
+across the block, evaluates transition-aware partitions and moments in parallel, then reduces ten
+loss sufficient statistics in shared memory. Approximate entropy/state/oracle MI are fused into
+that pass; precise oracle MI reuses the same features in its optional binned pass.
+
+On 64 candidates, 5,000 candles, grid 51, `H=30`, quadratic scale 200,000, and all approximate
+loss components enabled, fitness fell to 288 ms kernel / 301 ms wall. Full diagnostics took
+327 ms kernel / 341 ms wall. That is a 20.5× fitness-kernel improvement over the first
+transition-aware implementation, with zero fitness/diagnostic loss drift. Two resident cases took
+594 ms serially and 465 ms with stream scheduling (1.28×); the loss kernel now saturates more of
+the device, so there is intentionally less unused capacity for concurrent cases.
+
 ## Rejected changes
 
 - A serial CUDA prefix/suffix fee scan was removed after increasing the oracle kernel from about

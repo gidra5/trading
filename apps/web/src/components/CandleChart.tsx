@@ -31,6 +31,7 @@ interface CandleChartProps {
   highlightedAnnotation?: BacktestChartAnnotation;
   stateBands?: CandleChartStateBand[];
   onSelectionChange?: (selection: CandleChartSelection | undefined) => void;
+  onPinnedSelectionChange?: (selection: CandleChartSelection | undefined) => void;
   onExtremumHoverChange?: (extremum: BacktestExtremumTrace | undefined) => void;
   onOracleHoverChange?: (point: BacktestOraclePoint | undefined) => void;
   onViewportChange?: (viewport: CandleChartViewport) => void;
@@ -88,6 +89,8 @@ export function CandleChart(props: CandleChartProps) {
     | {
         pointerId: number;
         startX: number;
+        startY: number;
+        moved: boolean;
         viewport: CandleChartViewport;
         timeRange?: { start: number; end: number };
       }
@@ -395,6 +398,8 @@ export function CandleChart(props: CandleChartProps) {
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
+      startY: event.clientY,
+      moved: false,
       viewport: currentViewport(),
       timeRange: props.timeNavigation ? viewportTimeRange(currentViewport()) : undefined,
     };
@@ -411,6 +416,10 @@ export function CandleChart(props: CandleChartProps) {
     }
 
     event.preventDefault();
+    if (Math.abs(event.clientX - dragState.startX) > 4
+      || Math.abs(event.clientY - dragState.startY) > 4) {
+      dragState.moved = true;
+    }
     const plot = getPlotBounds(canvas.clientWidth, canvas.clientHeight);
     if (props.timeNavigation && dragState.timeRange) {
       const duration = dragState.timeRange.end - dragState.timeRange.start;
@@ -426,17 +435,25 @@ export function CandleChart(props: CandleChartProps) {
     commitViewport({ start, end: start + visible });
   };
 
-  const handlePointerUp = (event: PointerEvent) => {
+  const finishPointerInteraction = (event: PointerEvent, allowPin: boolean) => {
     if (!dragState || event.pointerId !== dragState.pointerId) {
       return;
     }
 
+    const shouldPin = allowPin && !dragState.moved;
     if (canvas.hasPointerCapture(event.pointerId)) {
       canvas.releasePointerCapture(event.pointerId);
     }
     dragState = undefined;
     setIsDragging(false);
+    if (shouldPin) {
+      const selection = selectionAtOffset(event.offsetX, event.offsetY);
+      if (selection) props.onPinnedSelectionChange?.(selection);
+    }
   };
+
+  const handlePointerUp = (event: PointerEvent) => finishPointerInteraction(event, true);
+  const handlePointerCancel = (event: PointerEvent) => finishPointerInteraction(event, false);
 
   const handleKeyDown = (event: KeyboardEvent) => {
     if (!props.interactive || props.candles.length < 2) {
@@ -464,6 +481,14 @@ export function CandleChart(props: CandleChartProps) {
   };
 
   const resetViewport = () => commitViewport(defaultViewport(props.candles.length));
+  const handleDoubleClick = (event: MouseEvent) => {
+    if (props.onPinnedSelectionChange) {
+      event.preventDefault();
+      props.onPinnedSelectionChange(undefined);
+      return;
+    }
+    resetViewport();
+  };
 
   const zoomBy = (scale: number, anchor = 0.5) => {
     const total = props.candles.length;
@@ -678,11 +703,15 @@ export function CandleChart(props: CandleChartProps) {
         "cursor-grabbing": isDragging(),
       }}
       tabIndex={props.interactive ? 0 : undefined}
-      title={props.interactive ? "Drag to pan. Wheel to zoom. Hover extrema for order error or oracle markers for exact actions. Double-click to reset." : undefined}
+      title={props.interactive
+        ? props.onPinnedSelectionChange
+          ? "Drag to pan. Wheel to zoom. Hover to inspect. Click to pin the timestamp; double-click to unpin."
+          : "Drag to pan. Wheel to zoom. Hover extrema for order error or oracle markers for exact actions. Double-click to reset."
+        : undefined}
       style={{ "touch-action": props.interactive ? "none" : "auto" }}
-      onDblClick={props.interactive ? resetViewport : undefined}
+      onDblClick={props.interactive ? handleDoubleClick : undefined}
       onKeyDown={handleKeyDown}
-      onPointerCancel={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerLeave={() => {
