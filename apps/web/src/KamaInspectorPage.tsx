@@ -1718,6 +1718,7 @@ interface TransitionHoverSlices extends TransitionHeatmapSelection {
   row: Float64Array;
   column: Float64Array;
   columnExposures: Float64Array;
+  pinned: boolean;
 }
 type TransitionHeatmapMarking =
   | "oracleMode"
@@ -1760,11 +1761,26 @@ function TransitionPolicyDiagnostics(props: {
     [marking]: !visible[marking],
   }));
   const [hoveredHeatmapCell, setHoveredHeatmapCell] = createSignal<TransitionHeatmapSelection>();
-  const [selectedHeatmapCell, setSelectedHeatmapCell] = createSignal<TransitionHeatmapSelection>();
+  const [selectedHeatmapCells, setSelectedHeatmapCells] = createSignal<Partial<
+    Record<TransitionDistributionSource, TransitionHeatmapSelection>
+  >>({});
+  const selectHeatmapCell = (selection: TransitionHeatmapSelection) => {
+    setSelectedHeatmapCells((selected) => ({
+      ...selected,
+      [selection.source]: selection,
+    }));
+  };
+  const deselectHeatmap = (source: TransitionDistributionSource) => {
+    setSelectedHeatmapCells((selected) => {
+      const next = { ...selected };
+      delete next[source];
+      return next;
+    });
+  };
   createEffect(() => {
     props.point.time;
     setHoveredHeatmapCell();
-    setSelectedHeatmapCell();
+    setSelectedHeatmapCells({});
   });
   const matrices = createMemo(() => transitionHeatmaps(
     props.point,
@@ -1800,25 +1816,34 @@ function TransitionPolicyDiagnostics(props: {
     props.point.candidateExposure,
     conditionalModelFit().parameters,
   ));
-  const hoveredHeatmapSlices = createMemo<TransitionHoverSlices | undefined>(() => {
-    const activeCell = selectedHeatmapCell() ?? hoveredHeatmapCell();
-    if (!activeCell) return undefined;
-    const matrix = activeCell.source === "oracle"
+  const heatmapSlices = (selection: TransitionHeatmapSelection, pinned: boolean) => {
+    const matrix = selection.source === "oracle"
       ? matrices().oracle
-      : activeCell.source === "prediction"
+      : selection.source === "prediction"
         ? matrices().strategy
         : fittedPolicy();
     const targetSize = targetExposures().length;
     const stateSize = currentExposures().length;
     const row = matrix.slice(
-      activeCell.stateIndex * targetSize,
-      (activeCell.stateIndex + 1) * targetSize,
+      selection.stateIndex * targetSize,
+      (selection.stateIndex + 1) * targetSize,
     );
     const column = new Float64Array(stateSize);
     for (let stateIndex = 0; stateIndex < stateSize; stateIndex += 1) {
-      column[stateIndex] = matrix[stateIndex * targetSize + activeCell.targetIndex]!;
+      column[stateIndex] = matrix[stateIndex * targetSize + selection.targetIndex]!;
     }
-    return { ...activeCell, row, column, columnExposures: currentExposures() };
+    return { ...selection, row, column, columnExposures: currentExposures(), pinned };
+  };
+  const inspectedHeatmapSlices = createMemo<TransitionHoverSlices[]>(() => {
+    const selected = selectedHeatmapCells();
+    const slices = (["oracle", "prediction", "fit"] as const)
+      .flatMap((source) => selected[source] ? [heatmapSlices(selected[source]!, true)] : []);
+    const hovered = hoveredHeatmapCell();
+    const duplicatesPinnedCell = hovered && selected[hovered.source]
+      && selected[hovered.source]!.stateIndex === hovered.stateIndex
+      && selected[hovered.source]!.targetIndex === hovered.targetIndex;
+    if (hovered && !duplicatesPinnedCell) slices.push(heatmapSlices(hovered, false));
+    return slices;
   });
   const probabilityScale = createMemo(() => robustPositiveScale(
     matrices().oracle,
@@ -1966,10 +1991,10 @@ function TransitionPolicyDiagnostics(props: {
               candidateCurrentExposure={props.point.candidateExposure}
               markings={visibleHeatmapMarkings()}
               sliceSource="oracle"
-              selectedCell={selectedHeatmapCell()}
+              selectedCell={selectedHeatmapCells().oracle}
               onSliceHover={setHoveredHeatmapCell}
-              onSliceSelect={setSelectedHeatmapCell}
-              onSliceDeselect={() => setSelectedHeatmapCell()}
+              onSliceSelect={selectHeatmapCell}
+              onSliceDeselect={() => deselectHeatmap("oracle")}
             />
           </Show>
           <Show when={visibleHeatmaps().prediction}>
@@ -1988,10 +2013,10 @@ function TransitionPolicyDiagnostics(props: {
               candidateCurrentExposure={props.point.candidateExposure}
               markings={visibleHeatmapMarkings()}
               sliceSource="prediction"
-              selectedCell={selectedHeatmapCell()}
+              selectedCell={selectedHeatmapCells().prediction}
               onSliceHover={setHoveredHeatmapCell}
-              onSliceSelect={setSelectedHeatmapCell}
-              onSliceDeselect={() => setSelectedHeatmapCell()}
+              onSliceSelect={selectHeatmapCell}
+              onSliceDeselect={() => deselectHeatmap("prediction")}
             />
           </Show>
           <Show when={visibleHeatmaps().difference}>
@@ -2009,8 +2034,6 @@ function TransitionPolicyDiagnostics(props: {
               oracleCurrentExposure={props.point.oraclePathExposure}
               candidateCurrentExposure={props.point.candidateExposure}
               markings={visibleHeatmapMarkings()}
-              selectedCell={selectedHeatmapCell()}
-              onSliceDeselect={() => setSelectedHeatmapCell()}
             />
           </Show>
           <Show when={visibleHeatmaps().fit}>
@@ -2029,10 +2052,10 @@ function TransitionPolicyDiagnostics(props: {
               candidateCurrentExposure={props.point.candidateExposure}
               markings={visibleHeatmapMarkings()}
               sliceSource="fit"
-              selectedCell={selectedHeatmapCell()}
+              selectedCell={selectedHeatmapCells().fit}
               onSliceHover={setHoveredHeatmapCell}
-              onSliceSelect={setSelectedHeatmapCell}
-              onSliceDeselect={() => setSelectedHeatmapCell()}
+              onSliceSelect={selectHeatmapCell}
+              onSliceDeselect={() => deselectHeatmap("fit")}
             />
           </Show>
           <Show when={visibleHeatmaps().fitDifference}>
@@ -2050,8 +2073,6 @@ function TransitionPolicyDiagnostics(props: {
               oracleCurrentExposure={props.point.oraclePathExposure}
               candidateCurrentExposure={props.point.candidateExposure}
               markings={visibleHeatmapMarkings()}
-              selectedCell={selectedHeatmapCell()}
-              onSliceDeselect={() => setSelectedHeatmapCell()}
             />
           </Show>
         </div>
@@ -2076,7 +2097,7 @@ function TransitionPolicyDiagnostics(props: {
       <div class="mt-4">
         <div class="mb-2 text-xs font-medium text-ink-300">Conditional slices across exposure</div>
         <div class="mb-2 text-[11px] text-ink-400">
-          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap uses the documented order-independent three-transition surface and minimizes truncated conditional cross-entropy over the whole oracle map. Hover an oracle, prediction, or fitted-model cell to add its row and column here; click to pin it and double-click any heatmap to deselect. The x + a = 0 and hovered-column cross-sections keep raw conditional cell probabilities and are not renormalized.
+          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap uses the documented order-independent three-transition surface and minimizes truncated conditional cross-entropy over the whole oracle map. Hover an oracle, prediction, or fitted-model cell to add its row and column here. Click once to pin one point independently on each heatmap; double-click a heatmap to release only its point. The x + a = 0 and inspected-column cross-sections keep raw conditional cell probabilities and are not renormalized.
         </div>
         <div class="mb-2 grid gap-1 text-[11px] tabular-nums text-ink-300 md:grid-cols-2 xl:grid-cols-4">
           <span class="text-cyan-200">Oracle @ path · {formatQuadraticFit(oraclePathFit())}</span>
@@ -2099,9 +2120,9 @@ function TransitionPolicyDiagnostics(props: {
           prediction={exactPredictionCurve()}
           oracleOppositeExposure={oracleOppositeExposureSlice()}
           predictionOppositeExposure={strategyOppositeExposureSlice()}
-          inspectedSlices={hoveredHeatmapSlices()}
-          slicesPinned={selectedHeatmapCell() !== undefined}
-          onReleasePinnedSlices={() => setSelectedHeatmapCell()}
+          inspectedSlices={inspectedHeatmapSlices()}
+          onReleasePinnedSlice={deselectHeatmap}
+          onReleasePinnedSlices={() => setSelectedHeatmapCells({})}
         />
       </div>
     </div>
@@ -2287,8 +2308,8 @@ function ConditionalPolicyCurveChart(props: {
   prediction: Float64Array<ArrayBufferLike>;
   oracleOppositeExposure: Float64Array;
   predictionOppositeExposure: Float64Array;
-  inspectedSlices?: TransitionHoverSlices;
-  slicesPinned: boolean;
+  inspectedSlices: TransitionHoverSlices[];
+  onReleasePinnedSlice: (source: TransitionDistributionSource) => void;
   onReleasePinnedSlices: () => void;
 }) {
   const [visibleSeries, setVisibleSeries] = createSignal<Record<ConditionalPolicySeries, boolean>>({
@@ -2317,35 +2338,48 @@ function ConditionalPolicyCurveChart(props: {
     ...(visibleSeries().prediction ? props.prediction : []),
     ...(visibleSeries().oracleOppositeExposure ? props.oracleOppositeExposure : []),
     ...(visibleSeries().predictionOppositeExposure ? props.predictionOppositeExposure : []),
-    ...(visibleSeries().inspectedRow && props.inspectedSlices ? props.inspectedSlices.row : []),
-    ...(visibleSeries().inspectedColumn && props.inspectedSlices ? props.inspectedSlices.column : []),
+    ...(visibleSeries().inspectedRow
+      ? props.inspectedSlices.flatMap((slices) => Array.from(slices.row))
+      : []),
+    ...(visibleSeries().inspectedColumn
+      ? props.inspectedSlices.flatMap((slices) => Array.from(slices.column))
+      : []),
   );
+  const hasPinnedSlices = () => props.inspectedSlices.some((slices) => slices.pinned);
   return (
     <div>
-      <Show when={props.inspectedSlices}>{(slices) => (
+      <Show when={props.inspectedSlices.length > 0}>
         <div class="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-ink-900/45 px-2.5 py-1.5 text-[11px] tabular-nums text-ink-300">
-          <span>
-            <strong class={slices().source === "oracle"
-              ? "text-cyan-200"
-              : slices().source === "fit"
-                ? "text-amber-200"
-                : "text-violet-200"}>
-              {props.slicesPinned ? "Pinned" : "Hovered"} {slices().source}
-            </strong>
-            {" · "}x {signedExposure(slices().currentExposure)} · a {signedExposure(slices().targetExposure)}
-            {" · "}<span class="text-ink-400">white is normalized row p(target | x); gold dashed is the raw column p(a | current), clipped to the action-axis range</span>
-          </span>
-          <Show when={props.slicesPinned}>
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <For each={props.inspectedSlices}>{(slices) => (
+              <span>
+                <strong style={{ color: transitionInspectionColor(slices.source) }}>
+                  {slices.pinned ? "Pinned" : "Hovered"} {transitionInspectionLabel(slices.source)}
+                </strong>
+                {" · "}x {signedExposure(slices.currentExposure)} · a {signedExposure(slices.targetExposure)}
+                <Show when={slices.pinned}>
+                  <button
+                    type="button"
+                    class="ml-1 text-ink-500 transition hover:text-ink-100"
+                    aria-label={`Release ${transitionInspectionLabel(slices.source)} selection`}
+                    onClick={() => props.onReleasePinnedSlice(slices.source)}
+                  >×</button>
+                </Show>
+              </span>
+            )}</For>
+            <span class="text-ink-400">solid rows are normalized p(target | x); dashed columns are raw p(a | current), clipped to the action-axis range</span>
+          </div>
+          <Show when={hasPinnedSlices()}>
             <button
               type="button"
               class="rounded-full border border-line px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-ink-300 transition hover:border-ink-300 hover:text-ink-100"
               onClick={props.onReleasePinnedSlices}
             >
-              Follow hover
+              Clear pinned
             </button>
           </Show>
         </div>
-      )}</Show>
+      </Show>
       <div class="relative h-52 pl-11">
         <ProbabilityScaleLabels maximum={maximum()} />
         <div class="relative h-full overflow-hidden border-y border-line bg-ink-900/25">
@@ -2396,22 +2430,28 @@ function ConditionalPolicyCurveChart(props: {
             <Show when={visibleSeries().predictionOppositeExposure}>
               <DistributionCurve probabilities={props.predictionOppositeExposure} maximum={maximum()} color="#f472b6" lineWidth={2.25} opacity={0.78} dashed />
             </Show>
-            <Show when={visibleSeries().inspectedRow ? props.inspectedSlices : undefined}>{(slices) => (
-              <DistributionCurve probabilities={slices().row} maximum={maximum()} color="#f8fafc" lineWidth={3} opacity={0.96} />
-            )}</Show>
-            <Show when={visibleSeries().inspectedColumn ? props.inspectedSlices : undefined}>{(slices) => (
+            <For each={visibleSeries().inspectedRow ? props.inspectedSlices : []}>{(slices) => (
               <DistributionCurve
-                probabilities={slices().column}
-                exposures={slices().columnExposures}
+                probabilities={slices.row}
+                maximum={maximum()}
+                color={transitionInspectionColor(slices.source)}
+                lineWidth={slices.pinned ? 3 : 2.25}
+                opacity={slices.pinned ? 0.96 : 0.7}
+              />
+            )}</For>
+            <For each={visibleSeries().inspectedColumn ? props.inspectedSlices : []}>{(slices) => (
+              <DistributionCurve
+                probabilities={slices.column}
+                exposures={slices.columnExposures}
                 minimumExposure={props.values[0]!.exposure}
                 maximumExposure={props.values.at(-1)!.exposure}
                 maximum={maximum()}
-                color="#fbbf24"
-                lineWidth={2.75}
-                opacity={0.94}
+                color={transitionInspectionColor(slices.source)}
+                lineWidth={slices.pinned ? 2.75 : 2}
+                opacity={slices.pinned ? 0.9 : 0.62}
                 dashed
               />
-            )}</Show>
+            )}</For>
           </svg>
         </div>
       </div>
@@ -2427,15 +2467,23 @@ function ConditionalPolicyCurveChart(props: {
         <ChartSeriesToggle label="Exact prediction" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
         <ChartSeriesToggle label="Oracle x + a = 0" color="#fb923c" points active={visibleSeries().oracleOppositeExposure} onClick={() => toggleSeries("oracleOppositeExposure")} />
         <ChartSeriesToggle label="Prediction x + a = 0" color="#f472b6" dashed active={visibleSeries().predictionOppositeExposure} onClick={() => toggleSeries("predictionOppositeExposure")} />
-        <Show when={props.inspectedSlices}>{(slices) => (
+        <Show when={props.inspectedSlices.length > 0}>
           <>
-            <ChartSeriesToggle label={`${slices().source} hovered row`} color="#f8fafc" active={visibleSeries().inspectedRow} onClick={() => toggleSeries("inspectedRow")} />
-            <ChartSeriesToggle label={`${slices().source} hovered column`} color="#fbbf24" dashed active={visibleSeries().inspectedColumn} onClick={() => toggleSeries("inspectedColumn")} />
+            <ChartSeriesToggle label="Inspected rows" color="#f8fafc" active={visibleSeries().inspectedRow} onClick={() => toggleSeries("inspectedRow")} />
+            <ChartSeriesToggle label="Inspected columns" color="#f8fafc" dashed active={visibleSeries().inspectedColumn} onClick={() => toggleSeries("inspectedColumn")} />
           </>
-        )}</Show>
+        </Show>
       </div>
     </div>
   );
+}
+
+function transitionInspectionColor(source: TransitionDistributionSource): string {
+  return source === "oracle" ? "#67e8f9" : source === "prediction" ? "#c4b5fd" : "#fbbf24";
+}
+
+function transitionInspectionLabel(source: TransitionDistributionSource): string {
+  return source === "oracle" ? "oracle" : source === "prediction" ? "prediction" : "fitted model";
 }
 
 function ChartSeriesToggle(props: {
@@ -2640,7 +2688,8 @@ function formatQuadraticFit(fit: ConditionalQuadraticPolicyFit): string {
 }
 
 function formatConditionalFit(fit: ConditionalFourSegmentPolicyFit): string {
-  return `${fit.converged ? "converged" : "stopped"} in ${fit.iterations} iterations`
+  return `${fit.converged ? "converged" : "stopped"} by ${fit.termination}`
+    + ` · ${fit.restarts} starts · ${fit.iterations} best-start iterations`
     + ` · CE ${formatQuote(fit.crossEntropy, 6)}`
     + ` · KL(p∥q) ${formatQuote(fit.klDivergence, 6)}`
     + ` · MSE ${formatCoefficient(fit.meanSquaredError)}`;
@@ -2650,12 +2699,14 @@ function formatConditionalGlobalParameters(fit: ConditionalFourSegmentPolicyFit)
   const parameters = fit.parameters;
   return `latent [${signedExposure(parameters.latentLower)}, ${signedExposure(parameters.latentUpper)}]`
     + ` · visible [${signedExposure(parameters.visibleLower)}, ${signedExposure(parameters.visibleUpper)}]`
+    + ` · gate w [${formatQuote(parameters.leftSupportWidth, 3)}, ${formatQuote(parameters.rightSupportWidth, 3)}]`
+    + ` · gate ρ [${formatCoefficient(parameters.leftSupportSharpness)}, ${formatCoefficient(parameters.rightSupportSharpness)}]`
     + ` · c₁ ${signedExposure(parameters.c1)} · c₂ ${signedExposure(parameters.c2)}`
+    + ` · ${formatLinearConditionalParameter("b", parameters.baseSlope)}`
     + ` · ${formatLinearConditionalParameter("βc₁", parameters.betaC1)}`
+    + ` · ${formatLinearConditionalParameter("βx", parameters.betaX)}`
     + ` · ${formatLinearConditionalParameter("βc₂", parameters.betaC2)}`
-    + ` · ${formatLinearConditionalParameter("t", parameters.tilt)}`
-    + ` · ${formatLinearConditionalParameter("raw r", parameters.strengthRaw)}`
-    + ` · ${formatLinearConditionalParameter("raw sd", parameters.widthRaw)}`;
+    + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`;
 }
 
 function formatLinearConditionalParameter(
@@ -2672,9 +2723,6 @@ function formatConditionalSliceParameters(parameters: ConditionalFourSegmentSlic
     + ` · b ${formatCoefficient(parameters.baseSlope)}`
     + ` · β [${formatCoefficient(parameters.betaC1)}, ${formatCoefficient(parameters.betaX)}, ${formatCoefficient(parameters.betaC2)}]`
     + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`
-    + ` · t ${formatCoefficient(parameters.tilt)}`
-    + ` · r ${formatCoefficient(parameters.strength)}`
-    + ` · sd ${formatQuote(parameters.width, 4)}`
     + ` · ordered slopes [${parameters.segmentSlopes.map(formatCoefficient).join(", ")}]`;
 }
 

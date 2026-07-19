@@ -17,17 +17,15 @@ const parameters: ConditionalFourSegmentParameters = {
   c2: 40,
   leftSupportWidth: 75,
   rightSupportWidth: 75,
-  supportSharpness: 1,
+  leftSupportSharpness: 0.7,
+  rightSupportSharpness: 1.8,
+  baseSlope: [0.012, 0.004],
   betaC1: [0.025, -0.008],
+  betaX: [-0.04, 0.005],
   betaC2: [-0.018, 0.006],
-  tilt: [0.003, 0.012],
-  strengthRaw: [-3.2, 0.25],
-  widthRaw: [3.2, -0.15],
-  kappaC1Raw: -1.8,
-  kappaC2Raw: -1.5,
-  minimumStrength: 1e-5,
-  minimumWidth: 0.5,
-  minimumKappa: 1e-4,
+  kappaC1: 0.15,
+  kappaX: 0.22,
+  kappaC2: 0.2,
 };
 
 test("conditional four-segment rows use strict visible truncation and normalization", () => {
@@ -51,6 +49,64 @@ test("conditional four-segment parameters remain finite as the moving breakpoint
   }
 });
 
+test("left and right compact-envelope sharpnesses independently affect boundary rows", () => {
+  const actions = Float64Array.from({ length: 49 }, (_, index) => -240 + index * 10);
+  const visibleSupportParameters = { ...parameters, visibleLower: -240, visibleUpper: 240 };
+  const baselineLeft = conditionalFourSegmentExposureProbabilities(actions, 0, visibleSupportParameters);
+  const sharperLeft = conditionalFourSegmentExposureProbabilities(actions, 0, {
+    ...visibleSupportParameters,
+    leftSupportSharpness: 3,
+  });
+  const baselineRight = conditionalFourSegmentExposureProbabilities(actions, 0, visibleSupportParameters);
+  const sharperRight = conditionalFourSegmentExposureProbabilities(actions, 0, {
+    ...visibleSupportParameters,
+    rightSupportSharpness: 3,
+  });
+
+  assert.ok(baselineLeft.some((value, index) => Math.abs(value - sharperLeft[index]!) > 1e-6));
+  assert.ok(baselineRight.some((value, index) => Math.abs(value - sharperRight[index]!) > 1e-6));
+});
+
+test("compact-envelope taper widths are independently fitted", () => {
+  const actions = Float64Array.from({ length: 49 }, (_, index) => -240 + index * 10);
+  const currents = Float64Array.of(-120, 0, 120);
+  const targetParameters: ConditionalFourSegmentParameters = {
+    ...parameters,
+    visibleLower: -240,
+    visibleUpper: 240,
+    leftSupportWidth: 42,
+    rightSupportWidth: 86,
+    leftSupportSharpness: 0.8,
+    rightSupportSharpness: 1.4,
+    baseSlope: [0, 0],
+    betaC1: [0, 0],
+    betaX: [0, 0],
+    betaC2: [0, 0],
+  };
+  const target = conditionalFourSegmentPolicyMatrix(actions, currents, targetParameters);
+  const fit = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -240,
+    visibleUpper: 240,
+    initialLeftSupportWidth: 100,
+    initialRightSupportWidth: 100,
+    maxIterations: 140,
+    sampleStates: currents.length,
+    sampleActions: actions.length,
+  });
+
+  assert.ok(Math.abs(fit.parameters.leftSupportWidth - 100) > 1, fit);
+  assert.ok(Math.abs(fit.parameters.rightSupportWidth - 100) > 1, fit);
+  assert.ok(fit.parameters.leftSupportWidth > 0, fit);
+  assert.ok(fit.parameters.rightSupportWidth > 0, fit);
+  assert.ok(
+    fit.parameters.leftSupportWidth + fit.parameters.rightSupportWidth < 500,
+    fit,
+  );
+  assert.ok(fit.meanSquaredError < 1e-7, fit);
+});
+
 test("conditional four-segment fitter learns a complete conditional surface", () => {
   const actions = Float64Array.from({ length: 31 }, (_, index) => -100 + index * 200 / 30);
   const currents = Float64Array.from({ length: 17 }, (_, index) => -240 + index * 480 / 16);
@@ -60,8 +116,8 @@ test("conditional four-segment fitter learns a complete conditional surface", ()
     latentUpper: 250,
     visibleLower: -100,
     visibleUpper: 100,
-    c1: -35,
-    c2: 40,
+    initialC1: -35,
+    initialC2: 40,
     maxIterations: 70,
     sampleStates: currents.length,
     sampleActions: actions.length,
@@ -74,6 +130,74 @@ test("conditional four-segment fitter learns a complete conditional surface", ()
 
   assert.ok(fit.iterations > 0 && fit.iterations <= 70, fit);
   assert.ok(Number.isFinite(fit.crossEntropy) && Number.isFinite(fit.klDivergence), fit);
+  assert.ok(fit.parameters.leftSupportSharpness > 0, fit);
+  assert.ok(fit.parameters.rightSupportSharpness > 0, fit);
   assert.ok(fittedMse < uniformMse * 0.25, { fit, fittedMse, uniformMse });
   assert.ok(Math.abs(fittedMse - fit.meanSquaredError) < 1e-14, { fit, fittedMse });
+});
+
+test("simple visible log-gradient fit keeps both unused breakpoints outside the visible window", () => {
+  const actions = Float64Array.from({ length: 41 }, (_, index) => -100 + index * 5);
+  const currents = Float64Array.from({ length: 9 }, (_, index) => -240 + index * 60);
+  const slope = 0.012;
+  const row = Float64Array.from(actions, (action) => Math.exp(slope * action));
+  const total = row.reduce((sum, value) => sum + value, 0);
+  for (let index = 0; index < row.length; index += 1) row[index] /= total;
+  const target = Float64Array.from(
+    { length: currents.length * actions.length },
+    (_, index) => row[index % actions.length]!,
+  );
+  const fit = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -100,
+    visibleUpper: 100,
+    maxIterations: 50,
+  });
+
+  assert.ok(fit.parameters.c1 < -100, fit);
+  assert.ok(fit.parameters.c2 > 100, fit);
+  assert.ok(Math.abs(fit.parameters.baseSlope[0] - slope) < 1e-8, fit);
+  assert.ok(Math.abs(fit.parameters.betaC1[0]) < 1e-8, fit);
+  assert.ok(Math.abs(fit.parameters.betaX[0]) < 1e-8, fit);
+  assert.ok(Math.abs(fit.parameters.betaC2[0]) < 1e-8, fit);
+  assert.ok(fit.meanSquaredError < 1e-16, fit);
+});
+
+test("breakpoints and a positive moving slope change are freely learned", () => {
+  const actions = Float64Array.from({ length: 41 }, (_, index) => -100 + index * 5);
+  const currents = Float64Array.from({ length: 13 }, (_, index) => -90 + index * 15);
+  const targetParameters: ConditionalFourSegmentParameters = {
+    ...parameters,
+    c1: -58,
+    c2: 47,
+    baseSlope: [0.025, 0],
+    betaC1: [-0.065, 0],
+    betaX: [0.024, 0],
+    betaC2: [0.075, 0],
+    kappaC1: 0.45,
+    kappaX: 0.35,
+    kappaC2: 0.5,
+  };
+  const target = conditionalFourSegmentPolicyMatrix(actions, currents, targetParameters);
+  const fit = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -100,
+    visibleUpper: 100,
+    initialC1: -20,
+    initialC2: 20,
+    maxIterations: 160,
+    restartCount: 3,
+    sampleStates: currents.length,
+    sampleActions: actions.length,
+  });
+
+  assert.ok(
+    Math.abs(fit.parameters.c1 - targetParameters.c1) < 25,
+    JSON.stringify(fit),
+  );
+  assert.ok(Math.abs(fit.parameters.c2 - targetParameters.c2) < 25, fit);
+  assert.ok(fit.parameters.betaX[0] > 0, fit);
+  assert.ok(fit.meanSquaredError < 2e-6, fit);
 });

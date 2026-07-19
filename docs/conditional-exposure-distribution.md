@@ -592,8 +592,8 @@ Here `betaC1`, `betaX`, and `betaC2` are log-slope changes. They are not absolut
 ### Parameter evaluation
 
 ```js
-function poly2(c, z) {
-  return c[0] + c[1] * z + c[2] * z * z;
+function linear(c, z) {
+  return c[0] + c[1] * z;
 }
 
 function parametersAtX(x, theta) {
@@ -602,42 +602,14 @@ function parametersAtX(x, theta) {
     / (theta.xUpper - theta.xLower)
   );
 
-  const betaC1 = poly2(theta.betaC1Coef, xi);
-  const betaC2 = poly2(theta.betaC2Coef, xi);
-  const tilt = poly2(theta.tiltCoef, xi);
-  const strength = positive(poly2(theta.strengthCoef, xi));
-  const width = positive(
-    poly2(theta.widthCoef, xi),
-    theta.minWidth
-  );
+  const baseSlope = linear(theta.baseSlopeCoef, xi);
+  const betaC1 = linear(theta.betaC1Coef, xi);
+  const betaX = linear(theta.betaXCoef, xi);
+  const betaC2 = linear(theta.betaC2Coef, xi);
 
-  const kappaC1 = positive(poly2(theta.kappaC1Coef, xi));
-  const kappaC2 = positive(poly2(theta.kappaC2Coef, xi));
-  const betaX = -2 * strength;
-  const kappaX = Math.max(
-    theta.minKappa,
-    2 / (strength * width * width)
-  );
-
-  const u1 = sigmoid(kappaC1 * (x - theta.c1));
-  const u2 = sigmoid(kappaC2 * (x - theta.c2));
-
-  // For exact centering, this must be the derivative with respect
-  // to a of logCompactEnvelope(a, ...) evaluated at a = x.
-  const gateSlope = logCompactEnvelopeSlope(
-    x,
-    theta.latentLower,
-    theta.latentUpper,
-    theta.supportParams
-  );
-
-  // This makes d/da log p(a|x) at a=x exactly equal to `tilt`.
-  const baseSlope = (
-    tilt + strength
-    - betaC1 * u1
-    - betaC2 * u2
-    - gateSlope
-  );
+  const kappaC1 = positive(theta.kappaC1Raw, theta.minKappa);
+  const kappaX = positive(theta.kappaXRaw, theta.minKappa);
+  const kappaC2 = positive(theta.kappaC2Raw, theta.minKappa);
 
   return {
     latentLower: theta.latentLower,
@@ -658,7 +630,7 @@ function parametersAtX(x, theta) {
 }
 ```
 
-If exact centering is not required, replace the derived `baseSlope` with an independently fitted function and optionally allow `betaX` to be any real-valued function.
+This free form is the default fitted model because a moving slope change need not be a stationary ridge. When exact centering is known to be appropriate, use the constrained construction from Section 9 instead.
 
 ### Visible hard truncation
 
@@ -761,7 +733,8 @@ For several representative values of \(x\):
    and estimate \(\kappa_x\approx2/(rs_d^2)\).
 6. Estimate each fixed \(\kappa\) from its transition width using \(\kappa\approx4.394/w_{10\text{--}90}\).
 7. Regress the slice-wise jump estimates on scaled \(x\) to initialize the smooth parameter functions.
-8. Optimize the full truncated conditional likelihood.
+8. Run several deterministic starts, including one with both fixed breakpoints outside the visible window.
+9. Optimize the full truncated conditional likelihood with analytic gradients and report iteration-limit or line-search termination separately from convergence.
 
 Near \(x=c_1\) or \(x=c_2\), initialize using nearby slices where the two transitions are separated. Co-centered transitions are generally difficult to decompose from a single slice.
 
@@ -772,13 +745,14 @@ Start with:
 - fixed latent support, for example \([-250,250]\);
 - fixed visible window, for example \([-100,100]\);
 - the compact-support envelope only at the latent endpoints;
+- independently trainable positive compact-envelope sharpnesses \(\rho_L,\rho_R\) and physical taper widths \(w_L,w_R\), with an ordered positive transform enforcing \(w_L+w_R<A_+-A_-\);
 - no smoothing at the visible endpoints;
-- fixed \(c_1<c_2\) inside the latent support;
+- globally trainable \(c_1<c_2\) over the entire latent support, fixed with respect to \(x\) and represented by an ordered transform;
 - no restriction on whether \(x\) is below, between, or above \(c_1,c_2\);
-- linear functions of scaled \(x\) for \(\beta_{c_1}\), \(\beta_{c_2}\), \(t\), \(\log r\), and \(\log s_d\);
-- constant \(\kappa_{c_1}\) and \(\kappa_{c_2}\);
-- \(\beta_x=-2r\) and \(\kappa_x=2/(rs_d^2)\);
-- \(b=t+r-\beta_{c_1}u_1-\beta_{c_2}u_2-g_x\) when the tilt at \(a=x\) is to be controlled exactly;
+- independently fitted linear functions of scaled \(x\) for \(b\), \(\beta_{c_1}\), \(\beta_x\), and \(\beta_{c_2}\);
+- independently trainable positive constants \(\kappa_{c_1}\), \(\kappa_x\), and \(\kappa_{c_2}\);
+- empirical initialization from row-wise visible log-gradients;
+- deterministic multi-start optimization of the truncated cross-entropy with analytic gradients;
 - a separate visible normalizer for every \(x\).
 
 ## 19. Model checks
