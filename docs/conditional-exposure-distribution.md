@@ -733,8 +733,10 @@ For several representative values of \(x\):
    and estimate \(\kappa_x\approx2/(rs_d^2)\).
 6. Estimate each fixed \(\kappa\) from its transition width using \(\kappa\approx4.394/w_{10\text{--}90}\).
 7. Regress the slice-wise jump estimates on scaled \(x\) to initialize the smooth parameter functions.
-8. Run several deterministic starts, including one with both fixed breakpoints outside the visible window.
-9. Optimize the full truncated conditional likelihood with analytic gradients and report iteration-limit or line-search termination separately from convergence.
+8. Detect fixed-breakpoint restart candidates from aggregate row log-slope curvature, excluding a neighborhood of each row's moving \(a=x\) transition. These are data-derived initial values, not fixed locations.
+9. Run several deterministic starts, including the detected fixed transitions and one with both fixed breakpoints outside the visible window.
+10. At each start, first optimize only the linear \(b\) and \(\beta\) coefficients while locations, sharpnesses, and endpoint tapers remain fixed. Then jointly optimize all parameters. This prevents poorly initialized slopes from dragging a correctly detected breakpoint into a different local minimum.
+11. Optimize the full truncated conditional likelihood with analytic gradients and report iteration-limit or line-search termination separately from convergence.
 
 Near \(x=c_1\) or \(x=c_2\), initialize using nearby slices where the two transitions are separated. Co-centered transitions are generally difficult to decompose from a single slice.
 
@@ -750,8 +752,9 @@ Start with:
 - globally trainable \(c_1<c_2\) over the entire latent support, fixed with respect to \(x\) and represented by an ordered transform;
 - no restriction on whether \(x\) is below, between, or above \(c_1,c_2\);
 - independently fitted linear functions of scaled \(x\) for \(b\), \(\beta_{c_1}\), \(\beta_x\), and \(\beta_{c_2}\);
-- independently trainable positive constants \(\kappa_{c_1}\), \(\kappa_x\), and \(\kappa_{c_2}\);
+- independently trainable positive constants \(\kappa_{c_1}\), \(\kappa_x\), and \(\kappa_{c_2}\), with the default floor \(\kappa_{\min}=4.394/(A_+-A_-)\) so that a transition cannot degenerate into an almost affine term across the entire latent support;
 - empirical initialization from row-wise visible log-gradients;
+- a weak identifiability penalty when a latent endpoint taper overlaps the visible window, because otherwise a trainable taper can impersonate a fixed interior transition; this is a soft preference and does not fix either taper width;
 - deterministic multi-start optimization of the truncated cross-entropy with analytic gradients;
 - a separate visible normalizer for every \(x\).
 

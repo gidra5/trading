@@ -201,3 +201,69 @@ test("breakpoints and a positive moving slope change are freely learned", () => 
   assert.ok(fit.parameters.betaX[0] > 0, fit);
   assert.ok(fit.meanSquaredError < 2e-6, fit);
 });
+
+test("aggregate log-slope seeds recover a visible second breakpoint without kappa collapse", () => {
+  const actions = Float64Array.from({ length: 51 }, (_, index) => -100 + index * 4);
+  const currents = Float64Array.from({ length: 25 }, (_, index) => -240 + index * 20);
+  const targetParameters: ConditionalFourSegmentParameters = {
+    ...parameters,
+    c1: -94,
+    c2: 81,
+    baseSlope: [-0.025, 0],
+    betaC1: [0.04, 0],
+    betaX: [-0.06, 0.008],
+    betaC2: [-0.055, 0],
+    kappaC1: 0.8,
+    kappaX: 0.55,
+    kappaC2: 0.9,
+  };
+  const target = conditionalFourSegmentPolicyMatrix(actions, currents, targetParameters);
+  const fit = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -100,
+    visibleUpper: 100,
+    sampleStates: currents.length,
+    sampleActions: actions.length,
+  });
+
+  assert.ok(
+    Math.abs(fit.parameters.c1 - targetParameters.c1) < 15,
+    JSON.stringify(fit),
+  );
+  assert.ok(
+    Math.abs(fit.parameters.c2 - targetParameters.c2) < 15,
+    JSON.stringify(fit),
+  );
+  assert.ok(fit.parameters.kappaC2 >= 4.394 / 500, fit);
+  assert.ok(fit.parameters.betaC2[0] < 0, fit);
+  assert.ok(fit.meanSquaredError < 2e-6, JSON.stringify(fit));
+});
+
+test("moving slope changes are not clipped at the former beta limit", () => {
+  const actions = Float64Array.from({ length: 41 }, (_, index) => -100 + index * 5);
+  const currents = Float64Array.from({ length: 13 }, (_, index) => -90 + index * 15);
+  const targetParameters: ConditionalFourSegmentParameters = {
+    ...parameters,
+    c1: -150,
+    c2: 150,
+    baseSlope: [0.18, 0],
+    betaC1: [0, 0],
+    betaX: [-0.36, 0],
+    betaC2: [0, 0],
+    kappaX: 0.6,
+  };
+  const target = conditionalFourSegmentPolicyMatrix(actions, currents, targetParameters);
+  const fit = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -100,
+    visibleUpper: 100,
+    maxIterations: 160,
+    sampleStates: currents.length,
+    sampleActions: actions.length,
+  });
+
+  assert.ok(fit.parameters.betaX[0] < -0.3, JSON.stringify(fit));
+  assert.ok(fit.meanSquaredError < 1e-8, JSON.stringify(fit));
+});

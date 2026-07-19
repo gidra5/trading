@@ -7,6 +7,7 @@ import {
 } from "@trading/bot-algo/exposure-value-distillation";
 import {
   conditionalFourSegmentExposureProbabilities,
+  conditionalFourSegmentLogSlope,
   conditionalFourSegmentParametersAt,
   conditionalFourSegmentPolicyMatrix,
   fitConditionalFourSegmentPolicy,
@@ -1800,7 +1801,6 @@ function TransitionPolicyDiagnostics(props: {
       latentUpper: props.point.currentExposureMaximum,
       visibleLower: targetExposures()[0]!,
       visibleUpper: targetExposures().at(-1)!,
-      maxIterations: 60,
     },
   ));
   const fittedPolicy = createMemo(() => conditionalFourSegmentPolicyMatrix(
@@ -1812,10 +1812,39 @@ function TransitionPolicyDiagnostics(props: {
     fittedPolicy(),
     (probability, index) => probability - matrices().oracle[index]!,
   ));
-  const fittedCandidateParameters = createMemo(() => conditionalFourSegmentParametersAt(
-    props.point.candidateExposure,
+  const fittedInspection = createMemo(() => {
+    const selected = selectedHeatmapCells().fit;
+    const hovered = hoveredHeatmapCell();
+    return selected ?? (hovered?.source === "fit" ? hovered : undefined) ?? {
+      currentExposure: props.point.candidateExposure,
+      targetExposure: props.point.candidateExposure,
+    };
+  });
+  const fittedInspectionParameters = createMemo(() => conditionalFourSegmentParametersAt(
+    fittedInspection().currentExposure,
     conditionalModelFit().parameters,
   ));
+  const fittedInspectionSlopes = createMemo(() => {
+    const inspection = fittedInspection();
+    const parameters = conditionalModelFit().parameters;
+    return {
+      left: conditionalFourSegmentLogSlope(
+        targetExposures()[0]!,
+        inspection.currentExposure,
+        parameters,
+      ),
+      selected: conditionalFourSegmentLogSlope(
+        inspection.targetExposure,
+        inspection.currentExposure,
+        parameters,
+      ),
+      right: conditionalFourSegmentLogSlope(
+        targetExposures().at(-1)!,
+        inspection.currentExposure,
+        parameters,
+      ),
+    };
+  });
   const heatmapSlices = (selection: TransitionHeatmapSelection, pinned: boolean) => {
     const matrix = selection.source === "oracle"
       ? matrices().oracle
@@ -2108,7 +2137,8 @@ function TransitionPolicyDiagnostics(props: {
         <div class="mb-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[10px] leading-relaxed tabular-nums text-ink-300">
           <div class="font-medium uppercase tracking-wider text-amber-200">Fitted conditional-distribution parameters</div>
           <div>{formatConditionalGlobalParameters(conditionalModelFit())}</div>
-          <div class="text-amber-100">At current observation x {signedExposure(props.point.candidateExposure)} · {formatConditionalSliceParameters(fittedCandidateParameters())}</div>
+          <div class="text-amber-100">At inspected fitted row x {signedExposure(fittedInspection().currentExposure)} · {formatConditionalSliceParameters(fittedInspectionParameters())}</div>
+          <div class="text-amber-100">Effective ∂a log q · V− {formatCoefficient(fittedInspectionSlopes().left)} · a {signedExposure(fittedInspection().targetExposure)} {formatCoefficient(fittedInspectionSlopes().selected)} · V+ {formatCoefficient(fittedInspectionSlopes().right)}</div>
         </div>
         <ConditionalPolicyCurveChart
           values={props.point.values}
@@ -2723,7 +2753,7 @@ function formatConditionalSliceParameters(parameters: ConditionalFourSegmentSlic
     + ` · b ${formatCoefficient(parameters.baseSlope)}`
     + ` · β [${formatCoefficient(parameters.betaC1)}, ${formatCoefficient(parameters.betaX)}, ${formatCoefficient(parameters.betaC2)}]`
     + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`
-    + ` · ordered slopes [${parameters.segmentSlopes.map(formatCoefficient).join(", ")}]`;
+    + ` · asymptotic ordered slopes [${parameters.segmentSlopes.map(formatCoefficient).join(", ")}]`;
 }
 
 function DistributionExposureAxis(props: { values: VwKamaValueDistributionPoint["values"] }) {

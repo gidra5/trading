@@ -110,6 +110,16 @@ const LEFT_WIDTH_RAW = 13;
 const RIGHT_WIDTH_RAW = 14;
 const LEFT_SHARPNESS_RAW = 15;
 const RIGHT_SHARPNESS_RAW = 16;
+const LINEAR_PARAMETER_INDICES = [
+  BASE_0,
+  BASE_1,
+  BETA_C1_0,
+  BETA_C1_1,
+  BETA_X_0,
+  BETA_X_1,
+  BETA_C2_0,
+  BETA_C2_1,
+] as const;
 
 /** Fits the documented order-independent conditional four-segment surface. */
 export function fitConditionalFourSegmentPolicy(
@@ -122,12 +132,13 @@ export function fitConditionalFourSegmentPolicy(
   const visibleLower = options.visibleLower ?? actionGrid[0]!;
   const visibleUpper = options.visibleUpper ?? actionGrid[actionGrid.length - 1]!;
   const visibleSpan = visibleUpper - visibleLower;
+  const latentSpan = options.latentUpper - options.latentLower;
   const fixed: FixedParameters = {
     latentLower: options.latentLower,
     latentUpper: options.latentUpper,
     visibleLower,
     visibleUpper,
-    minimumKappa: options.minimumKappa ?? 1e-5,
+    minimumKappa: options.minimumKappa ?? 4.394 / latentSpan,
     minimumSupportSharpness: options.minimumSupportSharpness ?? 1e-5,
     slopeScale: 1 / visibleSpan,
   };
@@ -171,7 +182,29 @@ export function fitConditionalFourSegmentPolicy(
   const tolerance = Math.max(Number.EPSILON, options.tolerance ?? 1e-6);
   let best: OptimizationResult | undefined;
   for (let restart = 0; restart < restartCount; restart += 1) {
-    const candidate = optimizeBfgs(initialValues[restart]!, objective, maximumIterations, tolerance);
+    let candidate: OptimizationResult;
+    if (maximumIterations === 1) {
+      candidate = optimizeBfgs(initialValues[restart]!, objective, 1, tolerance);
+    } else {
+      const warmupIterations = Math.min(
+        30,
+        maximumIterations - 1,
+        Math.max(1, Math.floor(maximumIterations / 4)),
+      );
+      const warmup = optimizeBfgs(
+        initialValues[restart]!,
+        maskedObjective(objective, LINEAR_PARAMETER_INDICES),
+        warmupIterations,
+        tolerance,
+      );
+      candidate = optimizeBfgs(
+        warmup.raw,
+        objective,
+        maximumIterations - warmup.iterations,
+        tolerance,
+      );
+      candidate.iterations += warmup.iterations;
+    }
     if (!best || candidate.loss < best.loss) best = candidate;
   }
   if (!best) throw new Error("Conditional four-segment optimizer did not run.");
@@ -183,6 +216,20 @@ export function fitConditionalFourSegmentPolicy(
     restarts: restartCount,
     termination: best.termination,
     converged: best.converged,
+  };
+}
+
+function maskedObjective(
+  objective: (raw: Float64Array) => ObjectiveValue,
+  activeParameters: readonly number[],
+): (raw: Float64Array) => ObjectiveValue {
+  const active = new Set(activeParameters);
+  return (raw) => {
+    const value = objective(raw);
+    for (let parameter = 0; parameter < value.gradient.length; parameter += 1) {
+      if (!active.has(parameter)) value.gradient[parameter] = 0;
+    }
+    return value;
   };
 }
 
@@ -261,6 +308,23 @@ export function conditionalFourSegmentParametersAt(
     kappaC2: parameters.kappaC2,
     segmentSlopes: slopes as [number, number, number, number],
   };
+}
+
+/** Effective action derivative of the normalized row's log density. */
+export function conditionalFourSegmentLogSlope(
+  action: number,
+  currentExposure: number,
+  parameters: ConditionalFourSegmentParameters,
+): number {
+  if (!(action > parameters.latentLower && action < parameters.latentUpper)) {
+    return Number.NaN;
+  }
+  const slice = conditionalFourSegmentParametersAt(currentExposure, parameters);
+  return slice.baseSlope
+    + slice.betaC1 * sigmoid(slice.kappaC1 * (action - parameters.c1))
+    + slice.betaX * sigmoid(slice.kappaX * (action - currentExposure))
+    + slice.betaC2 * sigmoid(slice.kappaC2 * (action - parameters.c2))
+    + compactEnvelopeLogSlope(action, parameters);
 }
 
 function logKernel(
@@ -365,6 +429,18 @@ function conditionalCrossEntropyWithGradient(
     loss += variationPenalty * raw[parameter]! ** 2;
     gradient[parameter] += 2 * variationPenalty * raw[parameter]!;
   }
+  const visibleSpan = fixed.visibleUpper - fixed.visibleLower;
+  const leftPlateauLimit = fixed.visibleLower - fixed.latentLower;
+  const rightPlateauLimit = fixed.latentUpper - fixed.visibleUpper;
+  const leftOverlap = Math.max(0, mapped.leftSupportWidth - leftPlateauLimit);
+  const rightOverlap = Math.max(0, mapped.rightSupportWidth - rightPlateauLimit);
+  const overlapPenalty = 5e-3 / (visibleSpan * visibleSpan);
+  loss += overlapPenalty * (leftOverlap * leftOverlap + rightOverlap * rightOverlap);
+  const leftWidthPenaltyDerivative = 2 * overlapPenalty * leftOverlap;
+  const rightWidthPenaltyDerivative = 2 * overlapPenalty * rightOverlap;
+  gradient[LEFT_WIDTH_RAW] += leftWidthPenaltyDerivative * mapped.leftWidthDerivative
+    + rightWidthPenaltyDerivative * mapped.rightLeftWidthDerivative;
+  gradient[RIGHT_WIDTH_RAW] += rightWidthPenaltyDerivative * mapped.rightWidthDerivative;
   return { loss, gradient };
 }
 
@@ -428,7 +504,8 @@ function optimizeBfgs(
     inverseHessian = updateInverseHessian(inverseHessian, parameterDelta, gradientDelta);
     raw = nextRaw;
     value = nextValue;
-    if (stableIterations >= 4 && maximumAbsolute(value.gradient) <= Math.sqrt(tolerance)) {
+    if (stableIterations >= 4
+      && maximumAbsolute(value.gradient) <= Math.max(tolerance * 10, 1e-5)) {
       return {
         ...value,
         raw,
@@ -465,7 +542,9 @@ function empiricalInitialValues(
     outsideC1 + 1e-6,
     fixed.latentUpper - 1e-6,
   );
+  const detected = empiricalFixedBreakpointLocations(actions, targets, states);
   const locations: Array<readonly [number, number, boolean]> = [
+    ...(detected ? [[detected[0], detected[1], true] as const] : []),
     [outsideC1, outsideC2, false],
     [fixed.visibleLower + visibleSpan / 3, fixed.visibleUpper - visibleSpan / 3, true],
     [
@@ -487,6 +566,74 @@ function empiricalInitialValues(
     options,
     index === 0 ? baselineWidths : overlappingWidths,
   ));
+}
+
+function empiricalFixedBreakpointLocations(
+  actions: Float64Array,
+  targets: Float64Array,
+  states: Float64Array,
+): readonly [number, number] | undefined {
+  const actionSpan = actions.at(-1)! - actions[0]!;
+  const typicalStep = actionSpan / (actions.length - 1);
+  const movingExclusion = Math.max(typicalStep * 3, actionSpan / 12);
+  const scores = new Float64Array(actions.length);
+  for (let actionIndex = 1; actionIndex < actions.length - 1; actionIndex += 1) {
+    const location = actions[actionIndex]!;
+    let signedChange = 0;
+    let absoluteChange = 0;
+    let contributingRows = 0;
+    for (let row = 0; row < states.length; row += 1) {
+      if (Math.abs(states[row]! - location) <= movingExclusion) continue;
+      const probabilities = targets.subarray(row * actions.length, (row + 1) * actions.length);
+      const maximum = probabilities.reduce((best, value) => Math.max(best, value), 0);
+      if (probabilities[actionIndex]! < maximum * 1e-6) continue;
+      const logProbabilities = stableLogProbabilities(probabilities);
+      const leftSlope = (logProbabilities[actionIndex]! - logProbabilities[actionIndex - 1]!)
+        / (actions[actionIndex]! - actions[actionIndex - 1]!);
+      const rightSlope = (logProbabilities[actionIndex + 1]! - logProbabilities[actionIndex]!)
+        / (actions[actionIndex + 1]! - actions[actionIndex]!);
+      const change = rightSlope - leftSlope;
+      signedChange += change;
+      absoluteChange += Math.abs(change);
+      contributingRows += 1;
+    }
+    if (contributingRows > 0) {
+      const meanChange = signedChange / contributingRows;
+      const meanAbsoluteChange = absoluteChange / contributingRows;
+      scores[actionIndex] = Math.abs(meanChange) + meanAbsoluteChange * 0.15;
+    }
+  }
+  const smoothed = new Float64Array(scores.length);
+  for (let index = 1; index < scores.length - 1; index += 1) {
+    let weightedScore = 0;
+    let totalWeight = 0;
+    for (let offset = -2; offset <= 2; offset += 1) {
+      const neighbor = index + offset;
+      if (neighbor <= 0 || neighbor >= scores.length - 1) continue;
+      const weight = 3 - Math.abs(offset);
+      weightedScore += scores[neighbor]! * weight;
+      totalWeight += weight;
+    }
+    smoothed[index] = totalWeight > 0 ? weightedScore / totalWeight : 0;
+  }
+  const minimumSeparation = Math.max(typicalStep * 3, actionSpan / 10);
+  const candidates = Array.from(
+    { length: actions.length - 2 },
+    (_, offset) => offset + 1,
+  ).filter((index) => smoothed[index]! > 1e-9)
+    .sort((left, right) => smoothed[right]! - smoothed[left]!);
+  const selected: number[] = [];
+  for (const index of candidates) {
+    const location = actions[index]!;
+    if (selected.every((selectedLocation) =>
+      Math.abs(selectedLocation - location) >= minimumSeparation)) {
+      selected.push(location);
+      if (selected.length === 2) break;
+    }
+  }
+  return selected.length === 2
+    ? selected.sort((left, right) => left - right) as [number, number]
+    : undefined;
 }
 
 function empiricalInitialRaw(
@@ -650,6 +797,22 @@ function compactEnvelopeLogValue(
     (parameters.latentUpper - action) / parameters.rightSupportWidth,
     parameters.rightSupportSharpness,
   );
+}
+
+function compactEnvelopeLogSlope(
+  action: number,
+  parameters: ConditionalFourSegmentParameters,
+): number {
+  const left = logCompactStepWithDerivative(
+    (action - parameters.latentLower) / parameters.leftSupportWidth,
+    parameters.leftSupportSharpness,
+  );
+  const right = logCompactStepWithDerivative(
+    (parameters.latentUpper - action) / parameters.rightSupportWidth,
+    parameters.rightSupportSharpness,
+  );
+  return left.coordinateDerivative / parameters.leftSupportWidth
+    - right.coordinateDerivative / parameters.rightSupportWidth;
 }
 
 function compactEnvelopeLogValueMapped(
@@ -971,9 +1134,6 @@ function maximumAbsolute(values: Float64Array): number {
 function boundUnconstrainedParameters(raw: Float64Array): void {
   raw[C1_RAW] = clamp(raw[C1_RAW]!, -14, 14);
   raw[C2_RAW] = clamp(raw[C2_RAW]!, -14, 14);
-  for (let index = BASE_0; index <= BETA_C2_1; index += 1) {
-    raw[index] = clamp(raw[index]!, -50, 50);
-  }
   for (let index = KAPPA_C1_RAW; index <= RIGHT_SHARPNESS_RAW; index += 1) {
     raw[index] = clamp(raw[index]!, -16, 12);
   }
