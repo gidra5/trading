@@ -9,11 +9,16 @@ import { KamaInspectorEngine } from "../src/kama-inspector.js";
 
 const WINDOW_ID = "shape-up-low-2024-02";
 const START = Date.parse("2024-02-24T00:00:00.000Z");
+const LATEST_END = Date.parse("2024-02-27T00:00:00.000Z");
+const FIXED_NOW = LATEST_END + 12 * 60 * 60_000;
 
 test("KAMA inspector serves truthful viewport candle resolutions", async () => {
   const dataDir = await fixture();
   try {
-    const engine = new KamaInspectorEngine(dataDir);
+    const engine = new KamaInspectorEngine(dataDir, { now: () => FIXED_NOW });
+    const latest = engine.catalog().windows.find((window) => window.id === "latest");
+    assert.equal(latest?.endTime, LATEST_END);
+    assert.match(latest?.label ?? "", /last 7 days/);
     const raw = await engine.candles({
       ...analysisRequest(),
       startTime: START,
@@ -28,7 +33,8 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(raw.valueDistributions.length, raw.candles.length);
     assert.ok(raw.valueDistributions.every((point) =>
       Math.abs(point.values.reduce((sum, value) => sum + value.oracleProbability, 0) - 1) < 1e-6
-      && Math.abs(point.values.reduce((sum, value) => sum + value.strategyProbability, 0) - 1) < 1e-9));
+      && Math.abs(point.values.reduce((sum, value) => sum + value.strategyProbability, 0) - 1) < 1e-9
+      && point.predictor !== undefined));
     assert.deepEqual(
       raw.kamaSeries.points.map((point) => point.time),
       raw.candles.map((candle) => candle.closeTime),
@@ -46,6 +52,25 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
       && Array.isArray(point.rejectionReasons)));
     assert.ok(raw.candles.every((candle) =>
       candle.interval === "1s" && candle.closeTime - candle.openTime === 999));
+
+    const directDefaults = engine.catalog().defaults.predictor!;
+    const direct = await engine.candles({
+      ...analysisRequest(),
+      predictor: { ...directDefaults, model: "direct-indicator" },
+      startTime: START,
+      endTime: START + 5_000,
+      maxCandles: 100,
+    });
+    assert.equal(direct.valueDistributions.length, direct.candles.length);
+    assert.ok(direct.valueDistributions.every((point) =>
+      point.predictor?.model === "direct-indicator"
+      && point.predictor.conditionalParameters !== undefined
+      && point.predictor.directMetadata !== undefined
+      && Object.keys(point.predictor.directMetadata.parameterVector17).length === 17
+      && Math.abs(point.values.reduce(
+        (sum, value) => sum + value.strategyProbability,
+        0,
+      ) - 1) < 1e-9));
 
     const wide = await engine.candles({
       ...analysisRequest(),
@@ -152,6 +177,62 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
       }
     }
     assert.ok(compared > 50);
+
+    const fastValueConfig = {
+      ...engine.catalog().defaults.valueDistillation!,
+      gridSize: 11,
+      holdingPeriodMs: 1_000,
+      valueHorizonMs: 10_000,
+    };
+    const legacy = await engine.candles({
+      ...analysisRequest(),
+      predictor: {
+        ...engine.catalog().defaults.predictor!,
+        model: "legacy",
+      },
+      valueDistillation: fastValueConfig,
+      startTime: START,
+      endTime: START + 5_000,
+      maxCandles: 100,
+    });
+    assert.ok(legacy.valueDistributions.every((point) => point.predictor === undefined));
+
+    const fit = await engine.fitPredictor({
+      ...analysisRequest(),
+      predictor: engine.catalog().defaults.predictor,
+      valueDistillation: fastValueConfig,
+      time: START + 100_999,
+    });
+    assert.equal(fit.time, START + 100_999);
+    assert.ok(fit.point.predictor);
+    assert.ok(fit.fittedCrossEntropy <= fit.baselineCrossEntropy + 1e-9);
+    assert.equal(fit.iterations, 97);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("latest inspector days have no configured ceiling and missing history is fetched", async () => {
+  const dataDir = await fixture();
+  const attempted: string[] = [];
+  try {
+    const engine = new KamaInspectorEngine(dataDir, {
+      now: () => FIXED_NOW,
+      fetchDailyShard: async ({ date }) => {
+        attempted.push(date);
+        throw new Error("test archive endpoint is offline");
+      },
+    });
+    await assert.rejects(
+      engine.analyze({
+        ...analysisRequest(),
+        windowId: "latest",
+        latestDays: 366,
+        intervalMs: 60_000,
+      }),
+      /Failed to fetch missing BTCUSDT 1s shard .*test archive endpoint is offline/,
+    );
+    assert.equal(attempted.length, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -220,8 +301,20 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
         hindsight: true,
       },
     }]));
-    const engine = new KamaInspectorEngine(dataDir);
+    const engine = new KamaInspectorEngine(dataDir, { now: () => FIXED_NOW });
     const catalog = engine.catalog();
+    assert.equal(catalog.windows.some((window) => window.id === "latest"), true);
+    assert.equal(catalog.predictorPresets.length, 68);
+    assert.equal(catalog.defaults.predictor?.model, "handcrafted");
+    for (const model of ["handcrafted", "direct-indicator"] as const) {
+      const presets = catalog.predictorPresets.filter((preset) => preset.model === model);
+      assert.equal(presets.length, 34);
+      assert.ok(presets.some((preset) => preset.scope === "global"));
+      assert.ok(presets.some((preset) =>
+        preset.scope === "window" && preset.windowId === WINDOW_ID && preset.intervalMs === 60_000));
+      assert.ok(catalog.windows.filter((window) => window.id !== "latest").every((window) =>
+        presets.some((preset) => preset.scope === "window" && preset.windowId === window.id)));
+    }
     assert.equal(catalog.defaults.intervalMs, 1_000);
     assert.equal(catalog.windows.find((window) => window.id === "fit-1")?.label, "Optimizer fit 1");
     const fullFit = catalog.windows.find((window) => window.id === "fit-full");

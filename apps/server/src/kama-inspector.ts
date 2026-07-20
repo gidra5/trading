@@ -8,6 +8,13 @@ import {
   evaluateVwKamaOracle,
   noiseSignalRatio,
   perfectMarginOracle,
+  prepareHandcraftedIndicatorStates,
+  DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
+  HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS,
+  DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+  exposureProbabilityTransitionCrossEntropy,
+  predictHandcraftedIndicatorRegret,
+  prepareHandcraftedIndicatorStateAt,
   prepareExposureValueOracle,
   prepareExposureValueOracleCuda,
   normalizeExposureValueDistillationLossConfig,
@@ -30,10 +37,17 @@ import {
   type VwKamaIndicatorPoint,
   type VwKamaParameters,
   type VwKamaPreset,
+  type VwKamaPredictorFitRequest,
+  type VwKamaPredictorFitResponse,
   type VwKamaTransition,
   type ExposureReturnMetrics,
   type ExposureValueOracle,
+  type HandcraftedIndicatorPredictorParameters,
+  type DirectIndicatorPredictorParameters,
 } from "@trading/bot-algo";
+import { fetchBinanceSpotDailyShard } from "./binance-history-cache.js";
+import { HANDCRAFTED_PREDICTOR_PRESETS } from "./handcrafted-predictor-presets.js";
+import { DIRECT_INDICATOR_PREDICTOR_PRESETS } from "./direct-indicator-predictor-presets.js";
 
 const DAY_MS = 86_400_000;
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -45,7 +59,7 @@ const MIN_CUDA_ORACLE_HOLDING_STEPS = 2;
 let cudaValueOracleFallbackReported = false;
 const SCALES = [1_000, 5_000, 15_000, 60_000, 300_000, 900_000, 3_600_000]
   .map((intervalMs) => ({ label: duration(intervalMs), intervalMs }));
-const WINDOWS = [
+const STATIC_WINDOWS = [
   window("fit-full", "Optimizer fit · full", "Optimizer fit", "2025-03-19", "2025-11-13"),
   window("fit-1", "Optimizer fit 1", "Optimizer fit", "2025-03-19", "2025-05-17"),
   window("fit-2", "Optimizer fit 2", "Optimizer fit", "2025-05-18", "2025-07-16"),
@@ -136,8 +150,14 @@ const BASELINE_GLOBAL_PARAMETERS = {
 
 const DEFAULT_REQUEST: VwKamaInspectorRequest = {
   windowId: "shape-up-low-2024-02",
+  latestDays: 7,
   intervalMs: 1_000,
   parameters: structuredClone(BASELINE_GLOBAL_PARAMETERS),
+  predictor: {
+    model: "handcrafted",
+    handcraftedParameters: { ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS },
+    directIndicatorParameters: { ...DEFAULT_DIRECT_INDICATOR_PARAMETERS },
+  },
   oracleFriction: 0.00175,
   matchWindowMs: 2 * 3_600_000,
   timingHalfLifeMs: 10 * 60_000,
@@ -252,7 +272,18 @@ interface CachedWindow {
   valueOracles: Map<string, Promise<ExposureValueOracle>>;
 }
 
-type InspectorResult = VwKamaInspectorResponse | VwKamaCandleRangeResponse;
+interface MissingDailyShardRequest {
+  dataDir: string;
+  date: string;
+  day: number;
+}
+
+export interface KamaInspectorEngineOptions {
+  now?: () => number;
+  fetchDailyShard?: (request: MissingDailyShardRequest) => Promise<void>;
+}
+
+type InspectorResult = VwKamaInspectorResponse | VwKamaCandleRangeResponse | VwKamaPredictorFitResponse;
 
 interface PendingRequest {
   resolve: (result: InspectorResult) => void;
@@ -284,9 +315,13 @@ export class KamaInspector {
     return this.request("candles", input);
   }
 
+  fitPredictor(input: VwKamaPredictorFitRequest): Promise<VwKamaPredictorFitResponse> {
+    return this.request("fit-predictor", input);
+  }
+
   private request<T extends InspectorResult>(
-    type: "analyze" | "candles",
-    input: VwKamaInspectorRequest | VwKamaCandleRangeRequest,
+    type: "analyze" | "candles" | "fit-predictor",
+    input: VwKamaInspectorRequest | VwKamaCandleRangeRequest | VwKamaPredictorFitRequest,
   ): Promise<T> {
     const worker = this.getWorker();
     const id = this.nextId++;
@@ -343,18 +378,26 @@ export class KamaInspector {
 
 export class KamaInspectorEngine {
   private cache: CachedWindow | null = null;
+  private readonly pendingShardFetches = new Map<string, Promise<void>>();
+  private readonly now: () => number;
+  private readonly fetchDailyShard: (request: MissingDailyShardRequest) => Promise<void>;
 
-  constructor(private readonly dataDir: string) {}
+  constructor(
+    private readonly dataDir: string,
+    options: KamaInspectorEngineOptions = {},
+  ) {
+    this.now = options.now ?? Date.now;
+    this.fetchDailyShard = options.fetchDailyShard ?? fetchBinanceSpotDailyShard;
+  }
 
   catalog(): VwKamaInspectorCatalog {
-    return inspectorCatalog(this.dataDir);
+    return inspectorCatalog(this.dataDir, this.now());
   }
 
   async analyze(input: VwKamaInspectorRequest): Promise<VwKamaInspectorResponse> {
     const startedAt = performance.now();
     const request = normalizeRequest(input);
-    const selected = WINDOWS.find((item) => item.id === request.windowId);
-    if (!selected) throw new Error(`Unknown VW-KAMA window: ${request.windowId}`);
+    const selected = resolveInspectorWindow(request.windowId, request.latestDays, this.now());
     validateWindowScale(selected, request.intervalMs);
     const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
       && request.valueDistillation!.horizonEndMode === "extend"
@@ -394,6 +437,7 @@ export class KamaInspectorEngine {
             oracle: valueOracle,
             strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
             lossConfig: request.valueDistillation!,
+            ...handcraftedPredictorOptions(request, candles),
           },
         }),
       });
@@ -412,7 +456,7 @@ export class KamaInspectorEngine {
   }
 
   async candles(input: VwKamaCandleRangeRequest): Promise<VwKamaCandleRangeResponse> {
-    const { request, selected } = normalizeCandleRangeRequest(input);
+    const { request, selected } = normalizeCandleRangeRequest(input, this.now());
     const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
       && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
@@ -464,6 +508,7 @@ export class KamaInspectorEngine {
           oracle: valueOracle,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
           lossConfig: request.valueDistillation!,
+          ...handcraftedPredictorOptions(request, candles),
         },
       });
       indicatorPoints.push(...evaluation.indicatorPoints);
@@ -492,11 +537,88 @@ export class KamaInspectorEngine {
     };
   }
 
+  async fitPredictor(input: VwKamaPredictorFitRequest): Promise<VwKamaPredictorFitResponse> {
+    const startedAt = performance.now();
+    const request = normalizeRequest(input);
+    if (request.predictor?.model !== "handcrafted") {
+      throw new Error("Per-candle fitting is available only for the handcrafted forecast model.");
+    }
+    if (!Number.isFinite(input.time)) throw new Error("Predictor fit time must be finite.");
+    const selected = resolveInspectorWindow(request.windowId, request.latestDays, this.now());
+    validateWindowScale(selected, request.intervalMs);
+    const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
+      && request.valueDistillation!.horizonEndMode === "extend"
+      ? request.valueDistillation!.valueHorizonMs
+      : 0);
+    const cached = this.cachedWindow(selected, sourceEndTime);
+    const segments = await this.scaledSegments(cached, request.intervalMs);
+    const warmupMs = candidateWarmupMs(request);
+
+    for (const [segmentIndex, candles] of segments.entries()) {
+      const candleIndex = candles.findIndex((candle) => candle.closeTime === input.time);
+      if (candleIndex < 0) continue;
+      const scoreEndIndex = candleLowerBound(candles, selected.endTime);
+      const scoreStart = Math.max(
+        selected.startTime,
+        candles[0]!.openTime + (segmentIndex > 0 ? warmupMs : 0),
+      );
+      const scoreStartIndex = candleLowerBound(candles, scoreStart);
+      if (candleIndex < scoreStartIndex || candleIndex >= scoreEndIndex) {
+        throw new Error("Predictor fit candle is outside the scored inspector range.");
+      }
+      const oracle = await this.oracle(cached, request, candles);
+      const valueOracle = await this.exposureOracle(
+        cached,
+        request,
+        candles,
+        scoreStartIndex,
+        scoreEndIndex,
+        oracle.stateCodes,
+      );
+      const prices = candles.map((candle) => candle.close);
+      const fit = fitHandcraftedPredictorAtCandle(
+        prices,
+        candleIndex,
+        request.intervalMs,
+        valueOracle,
+        request.predictor.handcraftedParameters,
+        input.time,
+      );
+      const states = prepareHandcraftedIndicatorStates(prices, request.intervalMs, fit.parameters);
+      const evaluation = evaluateVwKamaOracle(candles, {
+        ...request,
+        scoreStartTime: scoreStart,
+        scoreStartIndex,
+        maxPoints: 1,
+        traceTimes: [input.time],
+        oracleResult: oracle,
+        valueDistillation: {
+          oracle: valueOracle,
+          strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
+          lossConfig: request.valueDistillation!,
+          handcraftedPredictor: { parameters: fit.parameters, states },
+        },
+      });
+      const point = evaluation.valueDistributions.find((item) => item.time === input.time);
+      if (!point) throw new Error("Predictor fit did not produce the requested candle distribution.");
+      return {
+        time: input.time,
+        point,
+        baselineCrossEntropy: fit.baselineCrossEntropy,
+        fittedCrossEntropy: fit.crossEntropy,
+        iterations: fit.iterations,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      };
+    }
+    throw new Error("Predictor fit candle is not present in the selected continuous history.");
+  }
+
   private cachedWindow(selected: VwKamaInspectorWindow, sourceEndTime: number): CachedWindow {
-    if (this.cache?.id === selected.id && this.cache.sourceEndTime === sourceEndTime) return this.cache;
+    const cacheId = `${selected.id}:${selected.startTime}`;
+    if (this.cache?.id === cacheId && this.cache.sourceEndTime === sourceEndTime) return this.cache;
     const source = this.loadSource(selected, sourceEndTime);
     const cached = {
-      id: selected.id,
+      id: cacheId,
       sourceEndTime,
       sourceIntervalMs: selected.sourceIntervalMs,
       source,
@@ -670,9 +792,23 @@ export class KamaInspectorEngine {
         content = await readDailyShard(root, date);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new Error(`Missing BTCUSDT ${sourceLabel} shard ${date}; representative fetch is not complete.`);
+          if (selected.id !== "latest") {
+            throw new Error(`Missing BTCUSDT ${sourceLabel} shard ${date}; representative fetch is not complete.`);
+          }
+          await this.fetchMissingDailyShard(date, day);
+          try {
+            content = await readDailyShard(root, date);
+          } catch (readError) {
+            if ((readError as NodeJS.ErrnoException).code === "ENOENT") {
+              throw new Error(
+                `Failed to fetch missing BTCUSDT ${sourceLabel} shard ${date}: downloader completed without creating the shard.`,
+              );
+            }
+            throw readError;
+          }
+        } else {
+          throw error;
         }
-        throw error;
       }
       for (const line of content.split("\n")) {
         if (!line) continue;
@@ -684,11 +820,23 @@ export class KamaInspectorEngine {
     if (candles.length === 0) throw new Error(`No BTCUSDT 1s candles for ${selected.label}.`);
     return candles;
   }
+
+  private fetchMissingDailyShard(date: string, day: number): Promise<void> {
+    const existing = this.pendingShardFetches.get(date);
+    if (existing) return existing;
+    const pending = this.fetchDailyShard({ dataDir: this.dataDir, date, day }).catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to fetch missing BTCUSDT 1s shard ${date}: ${reason}`);
+    }).finally(() => this.pendingShardFetches.delete(date));
+    this.pendingShardFetches.set(date, pending);
+    return pending;
+  }
 }
 
-function inspectorCatalog(dataDir: string): VwKamaInspectorCatalog {
+function inspectorCatalog(dataDir: string, now = Date.now()): VwKamaInspectorCatalog {
   return {
-    windows: WINDOWS.map((item) => ({ ...item })),
+    windows: [latestInspectorWindow(DEFAULT_REQUEST.latestDays, now),
+      ...STATIC_WINDOWS.map((item) => ({ ...item }))],
     scales: SCALES.map((item) => ({ ...item })),
     defaults: structuredClone(DEFAULT_REQUEST),
     presets: [
@@ -696,6 +844,10 @@ function inspectorCatalog(dataDir: string): VwKamaInspectorCatalog {
       ...loadGlobalPresets(dataDir),
       ...loadWindowPresets(dataDir),
     ],
+    predictorPresets: [
+      ...HANDCRAFTED_PREDICTOR_PRESETS,
+      ...DIRECT_INDICATOR_PREDICTOR_PRESETS,
+    ].map((preset) => structuredClone(preset)),
   };
 }
 
@@ -712,7 +864,7 @@ function loadGlobalPresets(dataDir: string): VwKamaPreset[] {
 
 function loadWindowPresets(dataDir: string): VwKamaPreset[] {
   return loadPresets(dataDir, "vw-kama-window-presets.json").flatMap((preset) => {
-    const window = WINDOWS.find((item) => item.id === preset.windowId);
+    const window = STATIC_WINDOWS.find((item) => item.id === preset.windowId);
     const scale = preset.intervalMs == null
       ? null
       : SCALES.find((item) => item.intervalMs === preset.intervalMs);
@@ -973,11 +1125,152 @@ function hourlyRatePerCandle(hourlyRate: number, intervalMs: number): number {
   return Math.expm1(Math.log1p(hourlyRate) * intervalMs / 3_600_000);
 }
 
+function handcraftedPredictorOptions(
+  request: VwKamaInspectorRequest,
+  candles: Candle[],
+): {
+  handcraftedPredictor?: {
+    parameters: HandcraftedIndicatorPredictorParameters;
+    states: ReturnType<typeof prepareHandcraftedIndicatorStates>;
+  };
+  directIndicatorPredictor?: {
+    parameters: DirectIndicatorPredictorParameters;
+    states: ReturnType<typeof prepareHandcraftedIndicatorStates>;
+  };
+} {
+  const model = request.predictor?.model;
+  if (model !== "handcrafted" && model !== "direct-indicator") return {};
+  const predictor = request.predictor!;
+  const prices = candles.map((candle) => candle.close);
+  if (model === "handcrafted") {
+    const parameters = predictor.handcraftedParameters;
+    return {
+      handcraftedPredictor: {
+        parameters,
+        states: prepareHandcraftedIndicatorStates(prices, request.intervalMs, parameters),
+      },
+    };
+  }
+  const parameters = predictor.directIndicatorParameters;
+  return {
+    directIndicatorPredictor: {
+      parameters,
+      states: prepareHandcraftedIndicatorStates(prices, request.intervalMs, parameters),
+    },
+  };
+}
+
+interface PerCandlePredictorFit {
+  parameters: HandcraftedIndicatorPredictorParameters;
+  baselineCrossEntropy: number;
+  crossEntropy: number;
+  iterations: number;
+}
+
+function fitHandcraftedPredictorAtCandle(
+  prices: ArrayLike<number>,
+  candleIndex: number,
+  intervalMs: number,
+  oracle: ExposureValueOracle,
+  startingParameters: HandcraftedIndicatorPredictorParameters,
+  seed: number,
+): PerCandlePredictorFit {
+  const score = (parameters: HandcraftedIndicatorPredictorParameters): number => {
+    const state = prepareHandcraftedIndicatorStateAt(prices, candleIndex, intervalMs, parameters);
+    const prediction = predictHandcraftedIndicatorRegret(
+      oracle.grid,
+      state,
+      parameters,
+      {
+        intervalMs,
+        holdingPeriodSteps: oracle.holdingPeriodSteps,
+        valueHorizonSteps: oracle.valueHorizonSteps,
+        temperature: oracle.temperature,
+        execution: oracle.execution,
+      },
+    );
+    return exposureProbabilityTransitionCrossEntropy(
+      oracle,
+      candleIndex,
+      prediction.probabilities,
+      1 / oracle.temperature,
+    );
+  };
+  const baselineCrossEntropy = score(startingParameters);
+  let best = { parameters: { ...startingParameters }, crossEntropy: baselineCrossEntropy };
+  let iterations = 1;
+  const random = mulberry32((Math.floor(seed) ^ 0x51f17e5d) >>> 0);
+  const keys = Object.keys(startingParameters) as Array<keyof HandcraftedIndicatorPredictorParameters>;
+  const candidates: HandcraftedIndicatorPredictorParameters[] = [
+    { ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS },
+  ];
+  while (candidates.length < 48) {
+    const candidate = {} as HandcraftedIndicatorPredictorParameters;
+    for (const key of keys) {
+      const [minimum, maximum] = HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS[key];
+      candidate[key] = Math.exp(Math.log(minimum) + random() * (Math.log(maximum) - Math.log(minimum)));
+    }
+    candidates.push(candidate);
+  }
+  for (const parameters of candidates) {
+    const crossEntropy = score(parameters);
+    iterations += 1;
+    if (crossEntropy < best.crossEntropy) best = { parameters, crossEntropy };
+  }
+  for (let round = 0; round < 4; round += 1) {
+    const multiplier = 1 + 0.75 / (round + 1);
+    const center = best.parameters;
+    for (const key of keys) for (const scale of [1 / multiplier, multiplier]) {
+      const [minimum, maximum] = HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS[key];
+      const parameters = {
+        ...center,
+        [key]: clamp(center[key] * scale, minimum, maximum),
+      };
+      const crossEntropy = score(parameters);
+      iterations += 1;
+      if (crossEntropy < best.crossEntropy) best = { parameters, crossEntropy };
+    }
+  }
+  return {
+    parameters: best.parameters,
+    baselineCrossEntropy,
+    crossEntropy: best.crossEntropy,
+    iterations,
+  };
+}
+
+function mulberry32(seed: number): () => number {
+  return () => {
+    seed |= 0;
+    seed = seed + 0x6D2B79F5 | 0;
+    let value = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    value = value + Math.imul(value ^ value >>> 7, 61 | value) ^ value;
+    return ((value ^ value >>> 14) >>> 0) / 4_294_967_296;
+  };
+}
+
 function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest {
   if (!SCALES.some((item) => item.intervalMs === input.intervalMs)) {
     throw new Error(`Unsupported VW-KAMA scale: ${input.intervalMs}`);
   }
   const request = structuredClone(input);
+  request.latestDays = normalizeLatestDays(request.latestDays);
+  request.predictor = {
+    model: request.predictor?.model ?? "handcrafted",
+    handcraftedParameters: {
+      ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
+      ...request.predictor?.handcraftedParameters,
+    },
+    directIndicatorParameters: {
+      ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+      ...request.predictor?.directIndicatorParameters,
+    },
+  };
+  if (request.predictor.model !== "legacy"
+    && request.predictor.model !== "handcrafted"
+    && request.predictor.model !== "direct-indicator") {
+    throw new Error("VW-KAMA predictor model must be legacy, handcrafted, or direct-indicator.");
+  }
   request.valueDistillation = {
     ...DEFAULT_REQUEST.valueDistillation!,
     ...request.valueDistillation,
@@ -1223,13 +1516,12 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   return request;
 }
 
-function normalizeCandleRangeRequest(input: VwKamaCandleRangeRequest): {
+function normalizeCandleRangeRequest(input: VwKamaCandleRangeRequest, now: number): {
   request: Omit<VwKamaCandleRangeRequest, "maxCandles"> & { maxCandles: number };
   selected: VwKamaInspectorWindow;
 } {
   const analysis = normalizeRequest(input);
-  const selected = WINDOWS.find((item) => item.id === analysis.windowId);
-  if (!selected) throw new Error(`Unknown VW-KAMA window: ${input.windowId}`);
+  const selected = resolveInspectorWindow(analysis.windowId, analysis.latestDays, now);
   validateWindowScale(selected, analysis.intervalMs);
   const requestedStart = Number(input.startTime);
   const requestedEnd = Number(input.endTime);
@@ -1431,6 +1723,42 @@ function window(
     endTime: Date.parse(`${end}T00:00:00.000Z`) + DAY_MS,
     sourceIntervalMs,
   };
+}
+
+function resolveInspectorWindow(
+  windowId: string,
+  latestDays: number | undefined,
+  now: number,
+): VwKamaInspectorWindow {
+  if (windowId === "latest") return latestInspectorWindow(latestDays, now);
+  const selected = STATIC_WINDOWS.find((item) => item.id === windowId);
+  if (!selected) throw new Error(`Unknown VW-KAMA window: ${windowId}`);
+  return selected;
+}
+
+function latestInspectorWindow(requestedDays: number | undefined, now: number): VwKamaInspectorWindow {
+  const days = normalizeLatestDays(requestedDays);
+  const endTime = utcDay(now);
+  const startTime = endTime - days * DAY_MS;
+  if (!Number.isFinite(startTime) || Number.isNaN(new Date(startTime).getTime())) {
+    throw new Error("Latest inspector history range exceeds the supported timestamp range.");
+  }
+  return {
+    id: "latest",
+    label: `Latest history · last ${days} day${days === 1 ? "" : "s"}`,
+    group: "Latest",
+    startTime,
+    endTime,
+    sourceIntervalMs: 1_000,
+  };
+}
+
+function normalizeLatestDays(value: number | undefined): number {
+  const days = value ?? 7;
+  if (!Number.isSafeInteger(days) || days < 1) {
+    throw new Error("Latest inspector history days must be a positive integer.");
+  }
+  return days;
 }
 
 function validateWindowScale(window: VwKamaInspectorWindow, intervalMs: number): void {

@@ -12,6 +12,8 @@ import {
   conditionalFourSegmentPolicyMatrix,
   fitConditionalFourSegmentPolicy,
 } from "@trading/bot-algo/conditional-exposure-distribution";
+import { DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS } from "@trading/bot-algo/handcrafted-indicator-predictor";
+import { DEFAULT_DIRECT_INDICATOR_PARAMETERS } from "@trading/bot-algo/direct-indicator-conditional-predictor";
 import type {
   BacktestChartAnnotation,
   BacktestChartSmaSeries,
@@ -22,6 +24,9 @@ import type {
   ConditionalFourSegmentPolicyFit,
   ConditionalFourSegmentSliceParameters,
   ConditionalQuadraticPolicyFit,
+  DirectIndicatorPredictorParameters,
+  DirectIndicatorParameterVector17,
+  HandcraftedIndicatorPredictorParameters,
   VwKamaCandleRangeResponse,
   VwKamaInspectorCatalog,
   VwKamaIndicatorPoint,
@@ -29,6 +34,9 @@ import type {
   VwKamaInspectorResponse,
   VwKamaParameters,
   VwKamaPreset,
+  VwKamaPredictorFitResponse,
+  VwKamaPredictorModel,
+  VwKamaPredictorPreset,
   VwKamaTransition,
   VwKamaValueDistillationConfig,
   VwKamaValueDistributionPoint,
@@ -207,12 +215,12 @@ const metricHelp = {
   distillation: "Average-regret-weighted cross-entropy over the complete conditional current-exposure → target-exposure policy. Current exposure is weighted uniformly. Lower is better.",
   averageRegret: "Time weight before epsilon: for each current exposure, best conditional oracle value minus the mean value of all target actions, averaged uniformly over current exposures.",
   mixedLoss: "Optimizer objective: cross-entropy plus the weighted excess-entropy penalty, minus weighted state and oracle mutual information. Lower is better.",
-  entropyGap: "Opportunity-weighted squared excess of strategy entropy over oracle entropy, normalized by the grid's maximum entropy.",
+  entropyGap: "Opportunity-weighted squared excess of forecast entropy over oracle entropy, normalized by the grid's maximum entropy.",
   stateMutualInformation: "Normalized Gaussian variance-decomposition estimate of how much the strategy exposure distribution changes across market states. Higher is more state-responsive.",
   oracleMutualInformation: "Normalized dependence between soft oracle and strategy exposure distributions. Approximate mode uses distribution moments; precise mode computes categorical MI over the configured exposure bins.",
   valueHoldingPeriod: "Resolved H between oracle decisions. An action rebalances once, then quote and asset quantities remain untouched while exposure drifts until the next decision. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
   valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
-  strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the strategy's actual exposure and the configured friction.",
+  strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the sampled forecast-regret mean exposure and configured friction.",
   oracleReturn: "exp(Q₀(initial exposure))−1 for one full-window Bellman policy after the mandatory terminal rebalance to zero, including friction and maintenance.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
 } as const;
@@ -220,9 +228,18 @@ const metricHelp = {
 export function KamaInspectorPage() {
   const [catalog, setCatalog] = createSignal<VwKamaInspectorCatalog>();
   const [windowId, setWindowId] = createSignal("");
+  const [latestDays, setLatestDays] = createSignal(7);
   const [intervalMs, setIntervalMs] = createSignal(60_000);
   const [parameters, setParameters] = createSignal({ ...defaults });
   const [selectedPresetId, setSelectedPresetId] = createSignal("custom");
+  const [predictorModel, setPredictorModel] = createSignal<VwKamaPredictorModel>("handcrafted");
+  const [handcraftedParameters, setHandcraftedParameters] = createSignal<HandcraftedIndicatorPredictorParameters>({
+    ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
+  });
+  const [directIndicatorParameters, setDirectIndicatorParameters] = createSignal<DirectIndicatorPredictorParameters>({
+    ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+  });
+  const [selectedPredictorPresetId, setSelectedPredictorPresetId] = createSignal("custom");
   const [rankedPair, setRankedPair] = createSignal<"current" | "best" | "worst">("current");
   const [oracleFriction, setOracleFriction] = createSignal(0.00175);
   const [matchWindowMs, setMatchWindowMs] = createSignal(2 * 3_600_000);
@@ -263,6 +280,12 @@ export function KamaInspectorPage() {
     catalog()?.presets.find((preset) => preset.id === selectedPresetId()));
   const globalPreset = createMemo(() =>
     catalog()?.presets.find((preset) => preset.scope === "global"));
+  const selectedPredictorPreset = createMemo(() =>
+    catalog()?.predictorPresets.find((preset) => preset.id === selectedPredictorPresetId()));
+  const modelPredictorPresets = createMemo(() => (catalog()?.predictorPresets ?? [])
+    .filter((preset) => preset.model === predictorModel()));
+  const globalPredictorPreset = createMemo(() =>
+    modelPredictorPresets().find((preset) => preset.scope === "global"));
   const rankedPresets = createMemo(() => (catalog()?.presets ?? [])
     .flatMap((preset) => {
       const score = preset.score ?? preset.historicalScore;
@@ -544,7 +567,31 @@ export function KamaInspectorPage() {
   createEffect(() => {
     const id = windowId();
     const interval = intervalMs();
+    const preset = selectedPredictorPreset();
+    const model = predictorModel();
+    if ((model !== "handcrafted" && model !== "direct-indicator") || !id
+      || preset?.scope !== "window"
+      || preset.windowId === id && (preset.intervalMs == null || preset.intervalMs === interval)) return;
+    const next = modelPredictorPresets().find((item) => item.scope === "window"
+      && item.windowId === id
+      && (item.intervalMs == null || item.intervalMs === interval))
+      ?? globalPredictorPreset();
+    setSelectedPredictorPresetId(next?.id ?? "custom");
+    if (next?.model === "handcrafted") {
+      setHandcraftedParameters({ ...next.parameters } as HandcraftedIndicatorPredictorParameters);
+    } else if (next?.model === "direct-indicator") {
+      setDirectIndicatorParameters({ ...next.parameters } as DirectIndicatorPredictorParameters);
+    }
+  });
+
+  createEffect(() => {
+    const id = windowId();
+    const recentDays = latestDays();
+    const interval = intervalMs();
     const config = parameters();
+    const model = predictorModel();
+    const forecastParameters = handcraftedParameters();
+    const directParameters = directIndicatorParameters();
     const friction = oracleFriction();
     const matchWindow = matchWindowMs();
     const timingHalfLife = timingHalfLifeMs();
@@ -559,8 +606,14 @@ export function KamaInspectorPage() {
       analysisTimer = undefined;
       const request = {
         windowId: id,
+        latestDays: recentDays,
         intervalMs: interval,
         parameters: config,
+        predictor: {
+          model,
+          handcraftedParameters: { ...forecastParameters },
+          directIndicatorParameters: { ...directParameters },
+        },
         oracleFriction: friction,
         matchWindowMs: matchWindow,
         timingHalfLifeMs: timingHalfLife,
@@ -576,8 +629,9 @@ export function KamaInspectorPage() {
     const analysis = result();
     if (!analysis) return;
     const bounds = timeRange();
-    const reset = analysis.window.id !== viewportWindowId;
-    viewportWindowId = analysis.window.id;
+    const viewportKey = `${analysis.window.id}:${analysis.window.startTime}:${analysis.window.endTime}`;
+    const reset = viewportKey !== viewportWindowId;
+    viewportWindowId = viewportKey;
     setTimeViewport((current) => {
       const next = reset || !current
         ? bounds
@@ -645,9 +699,24 @@ export function KamaInspectorPage() {
       }
       setCatalog(next);
       setWindowId(next.defaults.windowId ?? next.windows[0]!.id);
+      setLatestDays(next.defaults.latestDays ?? 7);
       setIntervalMs(next.defaults.intervalMs ?? next.scales[0]!.intervalMs);
       setParameters({ ...next.defaults.parameters });
       setSelectedPresetId(next.presets.find((preset) => preset.scope === "global")?.id ?? "custom");
+      const predictor = next.defaults.predictor;
+      setPredictorModel(predictor?.model ?? "handcrafted");
+      setHandcraftedParameters({
+        ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
+        ...predictor?.handcraftedParameters,
+      });
+      setDirectIndicatorParameters({
+        ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+        ...predictor?.directIndicatorParameters,
+      });
+      setSelectedPredictorPresetId(
+        next.predictorPresets.find((preset) => preset.scope === "global"
+          && preset.model === (predictor?.model ?? "handcrafted"))?.id ?? "custom",
+      );
       setRankedPair("current");
       setOracleFriction(next.defaults.oracleFriction);
       setMatchWindowMs(next.defaults.matchWindowMs);
@@ -748,6 +817,42 @@ export function KamaInspectorPage() {
     setParameters((current) => ({ ...current, [key]: value }));
   };
 
+  const updateHandcraftedParameter = <K extends keyof HandcraftedIndicatorPredictorParameters>(
+    key: K,
+    value: HandcraftedIndicatorPredictorParameters[K],
+  ) => {
+    setSelectedPredictorPresetId("custom");
+    setHandcraftedParameters((current) => ({ ...current, [key]: value }));
+  };
+
+  const updateDirectIndicatorParameter = <K extends keyof DirectIndicatorPredictorParameters>(
+    key: K,
+    value: DirectIndicatorPredictorParameters[K],
+  ) => {
+    setSelectedPredictorPresetId("custom");
+    setDirectIndicatorParameters((current) => ({ ...current, [key]: value }));
+  };
+
+  const choosePredictorModel = (model: VwKamaPredictorModel) => batch(() => {
+    setPredictorModel(model);
+    if (model === "legacy") {
+      setSelectedPredictorPresetId("custom");
+      return;
+    }
+    const preset = (catalog()?.predictorPresets ?? []).find((item) =>
+      item.model === model && item.scope === "global");
+    setSelectedPredictorPresetId(preset?.id ?? "custom");
+    if (model === "handcrafted") {
+      setHandcraftedParameters({
+        ...(preset?.parameters ?? DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS),
+      } as HandcraftedIndicatorPredictorParameters);
+    } else {
+      setDirectIndicatorParameters({
+        ...(preset?.parameters ?? DEFAULT_DIRECT_INDICATOR_PARAMETERS),
+      } as DirectIndicatorPredictorParameters);
+    }
+  });
+
   const updateScoreWeight = (key: keyof ScoreWeights, percent: number) =>
     setScoreWeights((current) => ({ ...current, [key]: Math.max(0, percent) / 100 }));
 
@@ -762,6 +867,25 @@ export function KamaInspectorPage() {
       return;
     }
     inspectPreset(preset);
+  };
+
+  const applyPredictorPreset = (id: string) => {
+    const preset = catalog()?.predictorPresets.find((item) => item.id === id);
+    if (!preset) {
+      setSelectedPredictorPresetId("custom");
+      return;
+    }
+    batch(() => {
+      if (preset.windowId) setWindowId(preset.windowId);
+      if (preset.intervalMs) setIntervalMs(preset.intervalMs);
+      setPredictorModel(preset.model);
+      setSelectedPredictorPresetId(preset.id);
+      if (preset.model === "handcrafted") {
+        setHandcraftedParameters({ ...preset.parameters } as HandcraftedIndicatorPredictorParameters);
+      } else {
+        setDirectIndicatorParameters({ ...preset.parameters } as DirectIndicatorPredictorParameters);
+      }
+    });
   };
 
   const inspectPreset = (preset: VwKamaPreset) => batch(() => {
@@ -847,7 +971,7 @@ export function KamaInspectorPage() {
           {(message) => <ErrorNotice message={message()} onRetry={() => void loadCatalog()} />}
         </Show>
 
-        <Show when={latestOptimization()}>
+        <Show when={predictorModel() === "legacy" ? latestOptimization() : undefined}>
           {(preset) => {
             const run = () => preset().optimization;
             const incumbent = () => preset().incumbentScore;
@@ -890,7 +1014,7 @@ export function KamaInspectorPage() {
           }}
         </Show>
 
-        <Show when={scaleWindowResults().length > 0}>
+        <Show when={predictorModel() === "legacy" && scaleWindowResults().length > 0}>
           <section class="panel">
             <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
               <div>
@@ -959,7 +1083,7 @@ export function KamaInspectorPage() {
           <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <div class="muted-label">Experiment</div>
-              <h2 class="text-lg font-semibold">Window and signal parameters</h2>
+              <h2 class="text-lg font-semibold">{predictorModel() === "legacy" ? "Window and signal parameters" : "Window and predictor parameters"}</h2>
             </div>
             <div class="flex items-center gap-2 text-xs text-ink-300">
               <Activity class={loading() ? "animate-pulse text-accent" : "text-gain"} size={15} />
@@ -973,7 +1097,9 @@ export function KamaInspectorPage() {
               value={windowId()}
               options={(catalog()?.windows ?? []).map((window) => ({
                 value: window.id,
-                label: `${window.label} · ${formatDateRange(window.startTime, window.endTime)}`,
+                label: window.id === "latest"
+                  ? latestHistoryLabel(latestDays(), window.endTime)
+                  : `${window.label} · ${formatDateRange(window.startTime, window.endTime)}`,
               }))}
               onInput={(value) => {
                 const nextWindow = catalog()?.windows.find((window) => window.id === value);
@@ -986,6 +1112,15 @@ export function KamaInspectorPage() {
                 });
               }}
             />
+            <Show when={windowId() === "latest"}>
+              <InspectorNumber
+                label="Latest history (days)"
+                value={latestDays()}
+                min={1}
+                step={1}
+                onInput={(value) => setLatestDays(Math.round(value))}
+              />
+            </Show>
             <InspectorSelect
               label="Candle scale"
               value={String(intervalMs())}
@@ -998,56 +1133,163 @@ export function KamaInspectorPage() {
                 setIntervalMs(Number(value));
               }}
             />
-            <InspectorSelect
-              label="Ranked window/config pair"
-              value={rankedPair()}
-              options={[
-                { value: "current", label: "Current selection" },
-                ...(bestPreset() ? [{ value: "best", label: `Best · ${rankedPresetLabel(bestPreset()!, catalog())}` }] : []),
-                ...(worstPreset() ? [{ value: "worst", label: `Worst · ${rankedPresetLabel(worstPreset()!, catalog())}` }] : []),
-              ]}
-              onInput={applyRankedPair}
-            />
-            <InspectorSearchSelect
-              label={`Parameter preset · ${(catalog()?.presets.length ?? 0) + 1} configs`}
-              value={selectedPresetId()}
-              options={[
-                { value: "custom", label: "Custom parameters", keywords: "manual editable" },
-                ...(catalog()?.presets ?? []).map(presetOption),
-              ]}
-              onInput={applyPreset}
-            />
-            <Show when={selectedPreset()?.source}>
-              {(source) => (
-                <div class="flex items-end text-xs text-ink-400 md:col-span-2">
-                  {source()}
-                  <Show when={selectedPreset()?.score !== undefined}>
-                    {` · stored ${presetScoreLabel(selectedPreset()!, selectedPreset()!.score!)}`}
-                  </Show>
-                </div>
-              )}
-            </Show>
-            <div class="rounded-2 border border-line bg-ink-800/50 p-3 md:col-span-2">
-              <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <div class="text-sm font-medium">Scoring weights</div>
-                  <div class="mt-0.5 text-xs text-ink-400">
-                    Applied immediately to the displayed live score. Values are normalized to 100%; optimizer default is 20 / 60 / 20.
+            <Show when={predictorModel() === "legacy"}>
+              <InspectorSelect
+                label="Ranked window/config pair"
+                value={rankedPair()}
+                options={[
+                  { value: "current", label: "Current selection" },
+                  ...(bestPreset() ? [{ value: "best", label: `Best · ${rankedPresetLabel(bestPreset()!, catalog())}` }] : []),
+                  ...(worstPreset() ? [{ value: "worst", label: `Worst · ${rankedPresetLabel(worstPreset()!, catalog())}` }] : []),
+                ]}
+                onInput={applyRankedPair}
+              />
+              <InspectorSearchSelect
+                label={`VW-KAMA signal preset · ${(catalog()?.presets.length ?? 0) + 1} configs`}
+                value={selectedPresetId()}
+                options={[
+                  { value: "custom", label: "Custom parameters", keywords: "manual editable" },
+                  ...(catalog()?.presets ?? []).map(presetOption),
+                ]}
+                onInput={applyPreset}
+              />
+              <Show when={selectedPreset()?.source}>
+                {(source) => (
+                  <div class="flex items-end text-xs text-ink-400 md:col-span-2">
+                    {source()}
+                    <Show when={selectedPreset()?.score !== undefined}>
+                      {` · stored ${presetScoreLabel(selectedPreset()!, selectedPreset()!.score!)}`}
+                    </Show>
                   </div>
+                )}
+              </Show>
+            </Show>
+            <div class="rounded-2 border border-violet-400/20 bg-violet-400/5 p-3 md:col-span-2">
+              <div class="mb-3">
+                <div class="text-sm font-medium text-violet-100">Exposure prediction model</div>
+                <div class="mt-0.5 text-xs text-ink-400">
+                  Choose the distribution compared with the exposure-value oracle. Only controls used by the selected model are shown.
                 </div>
-                <button class="btn px-2 py-1 text-xs" type="button" onClick={() => setScoreWeights({ ...defaultScoreWeights })}>
-                  Reset 20 / 60 / 20
-                </button>
               </div>
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                <InspectorNumber label="F1 weight (%)" value={round(scoreWeights().f1 * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("f1", value)} />
-                <InspectorNumber label="Agreement weight (%)" value={round(scoreWeights().agreement * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("agreement", value)} />
-                <InspectorNumber label="Cleanliness weight (%)" value={round(scoreWeights().cleanliness * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("cleanliness", value)} />
-              </div>
-              <div class="mt-2 text-xs tabular-nums text-ink-400">
-                Effective mix: {ratioPercent(normalizedScoreWeights().f1)} F1 · {ratioPercent(normalizedScoreWeights().agreement)} agreement · {ratioPercent(normalizedScoreWeights().cleanliness)} cleanliness
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <InspectorSelect
+                  label="Prediction model"
+                  value={predictorModel()}
+                  options={[
+                    { value: "handcrafted", label: "Handcrafted drift/variance forecast" },
+                    { value: "direct-indicator", label: "Direct indicator → 17-parameter distribution" },
+                    { value: "legacy", label: "Legacy KAMA-rate distribution" },
+                  ]}
+                  onInput={(value) => choosePredictorModel(value as VwKamaPredictorModel)}
+                />
+                <Show when={predictorModel() === "handcrafted"}>
+                  <InspectorSearchSelect
+                    label={`Forecast preset · ${modelPredictorPresets().length + 1} configs`}
+                    value={selectedPredictorPresetId()}
+                    options={[
+                      { value: "custom", label: "Custom forecast parameters", keywords: "manual editable" },
+                      ...modelPredictorPresets().map((preset) => predictorPresetOption(preset, catalog())),
+                    ]}
+                    onInput={applyPredictorPreset}
+                  />
+                  <DurationInput label="Drift estimate half-life" value={handcraftedParameters().driftEstimateHalfLifeMs} onInput={(value) => updateHandcraftedParameter("driftEstimateHalfLifeMs", value)} />
+                  <DurationInput label="Drift forecast half-life" value={handcraftedParameters().driftForecastHalfLifeMs} onInput={(value) => updateHandcraftedParameter("driftForecastHalfLifeMs", value)} />
+                  <InspectorNumber label="Drift scale" value={handcraftedParameters().driftScale} min={0} step={0.01} onInput={(value) => updateHandcraftedParameter("driftScale", value)} />
+                  <DurationInput label="Variance estimate half-life" value={handcraftedParameters().varianceEstimateHalfLifeMs} onInput={(value) => updateHandcraftedParameter("varianceEstimateHalfLifeMs", value)} />
+                  <DurationInput label="Long-run variance half-life" value={handcraftedParameters().longRunVarianceHalfLifeMs} onInput={(value) => updateHandcraftedParameter("longRunVarianceHalfLifeMs", value)} />
+                  <DurationInput label="Variance forecast half-life" value={handcraftedParameters().varianceForecastHalfLifeMs} onInput={(value) => updateHandcraftedParameter("varianceForecastHalfLifeMs", value)} />
+                  <div class="flex items-end">
+                    <button class="btn w-full" type="button" onClick={() => {
+                      const preset = globalPredictorPreset();
+                      setSelectedPredictorPresetId(preset?.id ?? "custom");
+                      setHandcraftedParameters({
+                        ...(preset?.parameters ?? DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS),
+                      } as HandcraftedIndicatorPredictorParameters);
+                    }}>
+                      <RefreshCw size={15} /> Reset forecast
+                    </button>
+                  </div>
+                  <Show when={selectedPredictorPreset()}>
+                    {(preset) => (
+                      <div class="text-xs text-ink-400 md:col-span-2">
+                        {preset().source} · fitted mean decision regret {formatQuote(preset().loss, 6)}
+                        <Show when={preset().diagnosticCrossEntropy !== undefined}>
+                          {` · diagnostic CE ${formatQuote(preset().diagnosticCrossEntropy!, 5)}`}
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
+                </Show>
+                <Show when={predictorModel() === "direct-indicator"}>
+                  <InspectorSearchSelect
+                    label={`Direct-model preset · ${modelPredictorPresets().length + 1} configs`}
+                    value={selectedPredictorPresetId()}
+                    options={[
+                      { value: "custom", label: "Custom direct parameters", keywords: "manual editable" },
+                      ...modelPredictorPresets().map((preset) => predictorPresetOption(preset, catalog())),
+                    ]}
+                    onInput={applyPredictorPreset}
+                  />
+                  <DurationInput label="Drift estimate half-life" value={directIndicatorParameters().driftEstimateHalfLifeMs} onInput={(value) => updateDirectIndicatorParameter("driftEstimateHalfLifeMs", value)} />
+                  <DurationInput label="Drift forecast half-life" value={directIndicatorParameters().driftForecastHalfLifeMs} onInput={(value) => updateDirectIndicatorParameter("driftForecastHalfLifeMs", value)} />
+                  <InspectorNumber label="Drift scale" value={directIndicatorParameters().driftScale} min={0} step={0.01} onInput={(value) => updateDirectIndicatorParameter("driftScale", value)} />
+                  <DurationInput label="Variance estimate half-life" value={directIndicatorParameters().varianceEstimateHalfLifeMs} onInput={(value) => updateDirectIndicatorParameter("varianceEstimateHalfLifeMs", value)} />
+                  <DurationInput label="Long-run variance half-life" value={directIndicatorParameters().longRunVarianceHalfLifeMs} onInput={(value) => updateDirectIndicatorParameter("longRunVarianceHalfLifeMs", value)} />
+                  <DurationInput label="Variance forecast half-life" value={directIndicatorParameters().varianceForecastHalfLifeMs} onInput={(value) => updateDirectIndicatorParameter("varianceForecastHalfLifeMs", value)} />
+                  <InspectorNumber label="Unresolved transition width (grid cells)" value={directIndicatorParameters().transitionWidthGridCells} min={0.1} step={0.1} onInput={(value) => updateDirectIndicatorParameter("transitionWidthGridCells", value)} />
+                  <div class="flex items-end">
+                    <button class="btn w-full" type="button" onClick={() => {
+                      const preset = globalPredictorPreset();
+                      setSelectedPredictorPresetId(preset?.id ?? "custom");
+                      setDirectIndicatorParameters({
+                        ...(preset?.parameters ?? DEFAULT_DIRECT_INDICATOR_PARAMETERS),
+                      } as DirectIndicatorPredictorParameters);
+                    }}>
+                      <RefreshCw size={15} /> Reset direct model
+                    </button>
+                  </div>
+                  <Show when={selectedPredictorPreset()}>
+                    {(preset) => (
+                      <div class="text-xs text-ink-400 md:col-span-2">
+                        {preset().source} · fitted mean conditional decision regret {formatQuote(preset().loss, 6)}
+                        <Show when={preset().diagnosticCrossEntropy !== undefined}>
+                          {` · conditional CE ${formatQuote(preset().diagnosticCrossEntropy!, 5)}`}
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
+                  <div class="text-xs text-ink-400 md:col-span-2">
+                    The six causal forecast constants are calibrated. H, T, fees, maintenance, constraints, and both exposure grids come directly from the oracle. The extra width is the documented grid convention for unresolved analytic kinks; support widths and sharpness remain fixed latent-design settings.
+                  </div>
+                </Show>
+                <Show when={predictorModel() === "legacy"}>
+                  <InspectorNumber label="Base temperature" value={parameters().strategyTemperature ?? 0.001} min={0.000001} step={0.0001} onInput={(value) => update("strategyTemperature", value)} />
+                  <InspectorNumber label="Quadratic scale" value={parameters().strategyQuadraticScale ?? 0} step={0.1} onInput={(value) => update("strategyQuadraticScale", value)} />
+                  <DurationInput label="Quadratic volatility window" value={parameters().strategyQuadraticVolatilityMs ?? 60 * 60_000} onInput={(value) => update("strategyQuadraticVolatilityMs", value)} />
+                  <InspectorNumber label="Target-normal mixture" value={parameters().strategyNormalMixture ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("strategyNormalMixture", value)} />
+                  <InspectorNumber label="Target-normal sigma" value={parameters().strategyNormalSigma ?? 25} min={0.000001} step={1} onInput={(value) => update("strategyNormalSigma", value)} />
+                  <InspectorSelect
+                    label="Temperature scaling"
+                    value={valueConfig().strategyVolatilityScaling ? "volatility" : "fixed"}
+                    options={[
+                      { value: "fixed", label: "Fixed temperature" },
+                      { value: "volatility", label: "Scale by realized volatility" },
+                    ]}
+                    onInput={(value) => setValueConfig((current) => ({
+                      ...current,
+                      strategyVolatilityScaling: value === "volatility",
+                    }))}
+                  />
+                  <div class="text-xs text-ink-400 md:col-span-2">
+                    Legacy mode maps the current KAMA rate into a linear/quadratic exposure distribution, optionally mixed with a normal target centered on the VW-KAMA candidate exposure.
+                  </div>
+                </Show>
               </div>
             </div>
+          </div>
+            <Show when={predictorModel() === "legacy"}>
+              <>
+            <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
             <InspectorSelect
               label="Signal rate"
               value={parameters().rateMode ?? "relative"}
@@ -1169,12 +1411,7 @@ export function KamaInspectorPage() {
                 onInput={(value) => update("thresholdInverseNoiseScaleBpsHour", value)}
               />
             </Show>
-            <InspectorNumber label="Candidate friction fraction" value={parameters().signalFrictionFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("signalFrictionFraction", value)} />
-            <InspectorNumber label="Base strategy temperature" value={parameters().strategyTemperature ?? 0.001} min={0.000001} step={0.0001} onInput={(value) => update("strategyTemperature", value)} />
-            <InspectorNumber label="Strategy quadratic scale b₂′" value={parameters().strategyQuadraticScale ?? 0} min={0} step={1} onInput={(value) => update("strategyQuadraticScale", value)} />
-            <DurationInput label="Quadratic volatility window" value={parameters().strategyQuadraticVolatilityMs ?? 60 * 60_000} onInput={(value) => update("strategyQuadraticVolatilityMs", value)} />
-            <InspectorNumber label="Target-normal mixture" value={parameters().strategyNormalMixture ?? 0} min={0} max={1} step={0.05} onInput={(value) => update("strategyNormalMixture", value)} />
-            <InspectorNumber label="Target-normal sigma (exposure)" value={parameters().strategyNormalSigma ?? 25} min={0.000001} step={1} onInput={(value) => update("strategyNormalSigma", value)} />
+            <InspectorNumber label="KAMA signal friction fraction" value={parameters().signalFrictionFraction ?? 1} min={0} max={1} step={0.05} onInput={(value) => update("signalFrictionFraction", value)} />
             <DurationInput label="Efficiency" value={parameters().efficiencyMs} onInput={(value) => update("efficiencyMs", value)} />
             <DurationInput label="ER volume EMA" value={parameters().efficiencyVolumeEmaMs ?? parameters().volumeMs} onInput={(value) => update("efficiencyVolumeEmaMs", value)} />
             <InspectorNumber label="ER volume power" value={parameters().efficiencyVolumePower ?? 0} min={0} step={0.1} onInput={(value) => update("efficiencyVolumePower", value)} />
@@ -1234,14 +1471,39 @@ export function KamaInspectorPage() {
             <div class="mt-2 text-xs text-ink-400">
               Quality blends KAMA acceleration, price overextension, slow-EMA direction, RSI, and ADX-strength-weighted DMI direction. It scales the Gaussian strength; transitions below minimum quality are suppressed. A full EMA gate closes a countertrend position to flat and waits before entering the opposite side. Mix 0 and gate 0 disable confirmation exactly.
             </div>
-          </details>
+              </details>
+              </>
+            </Show>
           <details class="mt-3 rounded-2 border border-line bg-ink-800 p-3">
-            <summary class="cursor-pointer text-sm font-semibold text-ink-200">Scoring controls</summary>
+            <summary class="cursor-pointer text-sm font-semibold text-ink-200">Oracle and scoring controls</summary>
+            <div class="mt-3 rounded-2 border border-line bg-ink-900/30 p-3">
+              <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div class="text-sm font-medium">Scoring weights</div>
+                  <div class="mt-0.5 text-xs text-ink-400">
+                    Applied immediately to the displayed live score. Values are normalized to 100%; optimizer default is 20 / 60 / 20.
+                  </div>
+                </div>
+                <button class="btn px-2 py-1 text-xs" type="button" onClick={() => setScoreWeights({ ...defaultScoreWeights })}>
+                  Reset 20 / 60 / 20
+                </button>
+              </div>
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <InspectorNumber label="F1 weight (%)" value={round(scoreWeights().f1 * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("f1", value)} />
+                <InspectorNumber label="Agreement weight (%)" value={round(scoreWeights().agreement * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("agreement", value)} />
+                <InspectorNumber label="Cleanliness weight (%)" value={round(scoreWeights().cleanliness * 100, 3)} min={0} step={1} onInput={(value) => updateScoreWeight("cleanliness", value)} />
+              </div>
+              <div class="mt-2 text-xs tabular-nums text-ink-400">
+                Effective mix: {ratioPercent(normalizedScoreWeights().f1)} F1 · {ratioPercent(normalizedScoreWeights().agreement)} agreement · {ratioPercent(normalizedScoreWeights().cleanliness)} cleanliness
+              </div>
+            </div>
             <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <InspectorNumber label="Oracle friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
-              <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
-              <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
-              <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
+              <Show when={predictorModel() === "legacy"}>
+                <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
+                <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
+                <InspectorNumber label="Warmup multiple" value={warmupMultiple()} min={1} step={0.25} onInput={setWarmupMultiple} />
+              </Show>
               <InspectorNumber
                 label="Value grid points"
                 value={valueConfig().gridSize}
@@ -1274,7 +1536,6 @@ export function KamaInspectorPage() {
               <Show when={valueConfig().oracleMutualInformationMode === "precise"}>
                 <InspectorNumber label="Mutual-information bins" value={valueConfig().mutualInformationBins} min={2} max={Math.min(32, valueConfig().gridSize)} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, mutualInformationBins: Math.round(value) }))} />
               </Show>
-              <InspectorSelect label="Volatility temperature scaling" value={valueConfig().strategyVolatilityScaling ? "enabled" : "disabled"} options={[{ value: "disabled", label: "Disabled" }, { value: "enabled", label: "Trailing-H log-return stddev" }]} onInput={(value) => setValueConfig((current) => ({ ...current, strategyVolatilityScaling: value === "enabled" }))} />
               <InspectorNumber label="Minimum exposure" value={valueConfig().minExposure} max={-0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, minExposure: value }))} />
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
               <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
@@ -1284,7 +1545,17 @@ export function KamaInspectorPage() {
               <InspectorNumber label="Asset borrow maintenance / hour" value={valueConfig().assetBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, assetBorrowRate: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-                        The displayed oracle return is exp(Q₀(initial exposure))−1 for one coherent policy ending at the selected terminal candle, where exposure is forcibly closed to zero. Rolling targets default to T−t=1h and H=60s; either duration remains configurable, and H can instead be resolved per continuous segment as half the average interval between consecutive executable oracle trades. Each action rebalances once, then lets quote and asset quantities drift untouched for H candles while maintenance continues; at the next decision, keeping the exact drifted exposure is compared with every grid rebalance after friction. Price and maintenance drift may reach the separate effective-exposure limit before liquidation. The strategy curve is exp(b₁a + b₂a²), where b₁ is signed H-return divided by temperature and b₂ = −b₂′v² from the configured nonnegative scale and causal log-return standard deviation over the separate quadratic volatility window. Temperature scales by √(H/dt); optional temperature-volatility scaling continues to use trailing-H volatility. Loss terms with λ=0 are skipped. Precise oracle MI retains the soft oracle distribution and uses an additional binned GPU pass; approximate mode uses fused moment accumulators.
+              The displayed oracle return is exp(Q₀(initial exposure))−1 for one coherent policy ending at the selected terminal candle, where exposure is forcibly closed to zero. Rolling targets default to T−t=1h and H=60s.
+              <Show when={predictorModel() === "handcrafted"}>
+                <> The handcrafted predictor estimates causal EWMA drift and variance, forecasts them over T, and runs a friction-aware Bellman recursion directly on the exposure grid. Its plotted prediction is raw forecast regret; local presets and per-candle fitting are explicitly hindsight diagnostics.</>
+              </Show>
+              <Show when={predictorModel() === "direct-indicator"}>
+                <> The direct indicator model computes only F(a), solves its two no-trade boundaries with the oracle’s exact fee and maintenance semantics, decodes the 17 analytic parameters, and evaluates the conditional four-segment distribution without constructing or fitting a regret surface.</>
+              </Show>
+              <Show when={predictorModel() === "legacy"}>
+                <> The legacy predictor maps the causal KAMA rate into its configured linear/quadratic and target-normal exposure distribution.</>
+              </Show>
+              {" Accuracy metrics use at most 2,000 evenly spaced causal samples per continuous segment so long 1-second windows remain interactive. Loss terms with λ=0 are skipped."}
             </div>
           </details>
         </section>
@@ -1320,7 +1591,7 @@ export function KamaInspectorPage() {
                 <Show when={analysis().metrics.valueDistillation}>
                   {(value) => (
                     <>
-                      <ScoreCard label="Distillation CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
+                      <ScoreCard label="Forecast CE" value={formatQuote(value().crossEntropy, 5)} description={metricHelp.distillation} />
                       <ScoreCard label="Mean avg regret" value={formatQuote(value().meanAverageRegret, 6)} description={metricHelp.averageRegret} />
                       <ScoreCard label="Mixed loss" value={formatQuote(value().mixedLoss, 5)} description={metricHelp.mixedLoss} />
                       <ScoreCard label="Entropy gap" value={formatQuote(value().entropyGap, 5)} description={metricHelp.entropyGap} />
@@ -1336,9 +1607,9 @@ export function KamaInspectorPage() {
                           : "Full selected window"}
                         description={metricHelp.valueHorizon}
                       />
-                      <ScoreCard label="Strategy return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
+                      <ScoreCard label="Forecast return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
                       <ScoreCard label="Oracle exp(Q₀)−1" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
-                      <ScoreCard label="Strategy drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
+                      <ScoreCard label="Forecast drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
                     </>
                   )}
                 </Show>
@@ -1460,15 +1731,19 @@ export function KamaInspectorPage() {
                               : "Latest chart point"}</div>
                         </div>
                         <div class="text-xs tabular-nums text-ink-300">
-                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · strategy mode {signedExposure(distributionMode(point().values, "strategyProbability"))} / target {signedExposure(point().candidateExposure)} · rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ v {formatQuote(point().strategyQuadraticVolatility, 8)} · b₂′ {formatQuote(point().strategyQuadraticScale, 4)} · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · normal mix {ratioPercent(point().strategyNormalMixture)} / σ {formatQuote(point().strategyNormalSigma, 3)} · effective strategy τ {formatQuote(point().strategyTemperature, 6)} · conditional CE {formatQuote(point().crossEntropy, 5)} · avg regret {formatQuote(point().averageRegret, 6)}
+                          {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · forecast mode {signedExposure(distributionMode(point().values, "strategyProbability"))}
+                          <Show when={point().predictor} fallback={<> · legacy rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · normal {ratioPercent(point().strategyNormalMixture)} / σ {formatQuote(point().strategyNormalSigma, 3)} · τ {formatQuote(point().strategyTemperature, 6)}</>}>
+                            {(predictor) => <> · handcrafted optimum {signedExposure(predictor().optimalExposure)} · μ {formatCoefficient(predictor().drift)} · σ² {formatCoefficient(predictor().variance)}</>}
+                          </Show>
+                          {` · conditional CE ${formatQuote(point().crossEntropy, 5)} · avg regret ${formatQuote(point().averageRegret, 6)}`}
                         </div>
                       </div>
-                      <TransitionPolicyDiagnostics point={point()} />
+                      <TransitionPolicyDiagnostics point={point()} request={resultRequest()} />
                       <div class="mt-5 border-t border-line pt-4">
                         <h3 class="mb-2 text-sm font-semibold">Oracle and predicted exposure distributions</h3>
                         <ExposureDistributionChart point={point()} />
                         <div class="mt-2 text-xs text-ink-400">
-                          These post-action target preferences set current exposure equal to target, so transition cost is zero. Hover the price chart to preview another rendered candle, click to pin it across charts, or double-click to resume following hover.
+                          These post-action target preferences set current exposure equal to target, so transition cost is zero. This chart retains the selected causal model; the optional per-candle hindsight fit applies to the transition diagnostics above. Hover the price chart to preview another rendered candle, click to pin it across charts, or double-click to resume following hover.
                         </div>
                       </div>
                     </div>
@@ -1631,6 +1906,8 @@ function ExposureDistributionChart(props: {
     ...(visibleSeries().prediction ? predictedProbabilities() : []),
   );
   const strategyMode = () => distributionMode(props.point.values, "strategyProbability");
+  const predictionTarget = () => props.point.predictor?.optimalExposure
+    ?? props.point.candidateExposure;
   const markerPosition = (exposure: number) => distributionMarkerPosition(
     props.point.values.map((value) => value.exposure),
     exposure,
@@ -1639,11 +1916,13 @@ function ExposureDistributionChart(props: {
     <div>
       <div class="mb-2 flex flex-wrap gap-4 text-xs tabular-nums text-ink-300">
         <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-cyan-400" />Oracle mode <strong class="text-cyan-200">{signedExposure(props.point.oracleModalExposure)}</strong> · path <strong class="text-cyan-100">{signedExposure(props.point.oraclePathExposure)}</strong> · mean {signedExposure(props.point.oracleMeanExposure)}</span>
-        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Strategy mode <strong class="text-violet-200">{signedExposure(strategyMode())}</strong> · target <strong class="text-violet-100">{signedExposure(props.point.candidateExposure)}</strong> · mean {signedExposure(props.point.strategyMeanExposure)}</span>
+        <span><span class="mr-1 inline-block h-2.5 w-2.5 rounded-sm bg-violet-400" />Forecast mode <strong class="text-violet-200">{signedExposure(strategyMode())}</strong> · optimum <strong class="text-violet-100">{signedExposure(predictionTarget())}</strong> · mean {signedExposure(props.point.strategyMeanExposure)}</span>
         <span>Oracle entropy {formatQuote(props.point.oracleEntropy, 4)}</span>
         <span>Post-action CE {formatQuote(props.point.postActionCrossEntropy, 5)}</span>
         <span class="text-cyan-200">Oracle probability-MSE fit {formatQuadraticFit(oracleFit())}</span>
-        <span class="text-violet-200">Prediction exact b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)} · normal {ratioPercent(props.point.strategyNormalMixture)} @ target, σ {formatQuote(props.point.strategyNormalSigma, 3)}</span>
+        <Show when={props.point.predictor} fallback={<span class="text-violet-200">Legacy prediction exact b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)}</span>}>
+          {(predictor) => <span class="text-violet-200">{predictor().model === "direct-indicator" ? "Direct indicator → 17 parameters" : "Handcrafted forecast"} · μ {formatCoefficient(predictor().drift)} · σ² {formatCoefficient(predictor().variance)} · long σ² {formatCoefficient(predictor().longRunVariance)}</span>}
+        </Show>
       </div>
       <div class="relative h-52 pl-11" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and path ${signedExposure(props.point.oraclePathExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(props.point.candidateExposure)}`}>
         <ProbabilityScaleLabels maximum={maximum()} />
@@ -1680,7 +1959,7 @@ function ExposureDistributionChart(props: {
             <Show when={visibleSeries().prediction}>
               <div
                 class="absolute inset-y-0 translate-x-px border-l-2 border-dashed border-violet-100/90"
-                style={{ left: markerPosition(props.point.candidateExposure) }}
+                style={{ left: markerPosition(predictionTarget()) }}
               />
             </Show>
           </div>
@@ -1692,7 +1971,7 @@ function ExposureDistributionChart(props: {
       <div class="mt-1 flex flex-wrap items-center justify-center gap-1.5">
         <ChartSeriesToggle label="Oracle samples + path" color="#22d3ee" points active={visibleSeries().oracle} onClick={() => toggleSeries("oracle")} />
         <ChartSeriesToggle label="Oracle probability-MSE fit" color="#a5f3fc" active={visibleSeries().oracleFit} onClick={() => toggleSeries("oracleFit")} />
-        <ChartSeriesToggle label="Exact prediction + target" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
+        <ChartSeriesToggle label="Forecast-regret prediction" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
       </div>
     </div>
   );
@@ -1733,6 +2012,7 @@ type TransitionHeatmapMarkings = Record<TransitionHeatmapMarking, boolean>;
 
 function TransitionPolicyDiagnostics(props: {
   point: VwKamaValueDistributionPoint;
+  request?: VwKamaInspectorRequest;
 }) {
   const [visibleHeatmaps, setVisibleHeatmaps] = createSignal<Record<TransitionHeatmapPanel, boolean>>({
     oracle: true,
@@ -1748,6 +2028,49 @@ function TransitionPolicyDiagnostics(props: {
   const visibleHeatmapCount = () => Object.values(visibleHeatmaps())
     .filter(Boolean)
     .length;
+  const [refineConditionalFit, setRefineConditionalFit] = createSignal(true);
+  const [fitForecastAtCandle, setFitForecastAtCandle] = createSignal(false);
+  const [perCandleFit, setPerCandleFit] = createSignal<VwKamaPredictorFitResponse>();
+  const [perCandleFitLoading, setPerCandleFitLoading] = createSignal(false);
+  const [perCandleFitError, setPerCandleFitError] = createSignal<string>();
+  createEffect(() => {
+    props.point.time;
+    setFitForecastAtCandle(false);
+    setPerCandleFit();
+    setPerCandleFitError();
+  });
+  createEffect(() => {
+    const enabled = fitForecastAtCandle();
+    const request = props.request;
+    const time = props.point.time;
+    if (!enabled || !request || request.predictor?.model !== "handcrafted") {
+      setPerCandleFitLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setPerCandleFitLoading(true);
+    setPerCandleFitError();
+    void fetch(`${apiBase}/api/kama-inspector/predictor-fit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...request, time }),
+      signal: controller.signal,
+    }).then(async (response) => {
+      const payload = await response.json() as unknown;
+      if (!response.ok) throw new Error(errorMessage(payload, "Per-candle forecast fit failed"));
+      if (!controller.signal.aborted) setPerCandleFit(payload as VwKamaPredictorFitResponse);
+    }).catch((error) => {
+      if (!controller.signal.aborted) {
+        setPerCandleFitError(error instanceof Error ? error.message : "Per-candle forecast fit failed");
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setPerCandleFitLoading(false);
+    });
+    onCleanup(() => controller.abort());
+  });
+  const activePoint = createMemo(() => fitForecastAtCandle() && perCandleFit()?.time === props.point.time
+    ? perCandleFit()!.point
+    : props.point);
   const [visibleHeatmapMarkings, setVisibleHeatmapMarkings] = createSignal<TransitionHeatmapMarkings>({
     oracleMode: true,
     oracleMean: true,
@@ -1784,12 +2107,11 @@ function TransitionPolicyDiagnostics(props: {
     setSelectedHeatmapCells({});
   });
   const matrices = createMemo(() => transitionHeatmaps(
-    props.point,
-    props.point.oracleTemperature,
-    props.point.friction,
-    props.point.frictionFraction,
+    activePoint(),
+    activePoint().oracleTemperature,
+    activePoint().friction,
   ));
-  const targetExposures = createMemo(() => props.point.values.map((value) => value.exposure));
+  const targetExposures = createMemo(() => activePoint().values.map((value) => value.exposure));
   const exposureGrid = createMemo(() => Float64Array.from(targetExposures()));
   const currentExposures = createMemo(() => currentExposureGrid(props.point));
   const conditionalModelFit = createMemo(() => fitConditionalFourSegmentPolicy(
@@ -1801,6 +2123,7 @@ function TransitionPolicyDiagnostics(props: {
       latentUpper: props.point.currentExposureMaximum,
       visibleLower: targetExposures()[0]!,
       visibleUpper: targetExposures().at(-1)!,
+      refineProjectedFit: refineConditionalFit(),
     },
   ));
   const fittedPolicy = createMemo(() => conditionalFourSegmentPolicyMatrix(
@@ -1925,14 +2248,14 @@ function TransitionPolicyDiagnostics(props: {
     props.point.oracleTemperature,
     1,
   ));
-  const predictionTransitionScale = () => props.point.frictionFraction
-    / props.point.strategyTemperature;
+  const predictionTransitionScale = () => activePoint().frictionFraction
+    / activePoint().strategyTemperature;
   const fitOptions = () => ({
-    friction: props.point.friction,
+    friction: activePoint().friction,
     transitionLogScale: predictionTransitionScale(),
     objective: "probability-mse" as const,
-    initialLinearCoefficient: props.point.strategyLinearCoefficient,
-    initialQuadraticCoefficient: props.point.strategyQuadraticCoefficient,
+    initialLinearCoefficient: activePoint().strategyLinearCoefficient,
+    initialQuadraticCoefficient: activePoint().strategyQuadraticCoefficient,
   });
   const oraclePathFit = createMemo(() => fitConditionalQuadraticPolicy(
     exposureGrid(),
@@ -1965,12 +2288,9 @@ function TransitionPolicyDiagnostics(props: {
     props.point.candidateExposure,
     conditionalModelFit().parameters,
   ));
-  const exactPredictionCurve = createMemo(() => conditionalExposureProbabilities(
-    Float64Array.from(props.point.values, (value) => value.strategyProbability),
-    exposureGrid(),
+  const exactPredictionCurve = createMemo(() => predictedConditionalExposureSlice(
+    activePoint(),
     props.point.candidateExposure,
-    props.point.friction,
-    predictionTransitionScale(),
   ));
   return (
     <div class="mt-5 border-t border-line pt-4">
@@ -1982,7 +2302,7 @@ function TransitionPolicyDiagnostics(props: {
           </div>
         </div>
         <div class="text-xs tabular-nums text-ink-300">
-          uniform input-state prior · oracle policy mean {signedExposure(props.point.oraclePolicyMeanExposure)} · prediction mean {signedExposure(props.point.strategyPolicyMeanExposure)} · entropy {formatQuote(props.point.oraclePolicyEntropy, 4)} / {formatQuote(props.point.strategyPolicyEntropy, 4)}
+          uniform input-state prior · oracle policy mean {signedExposure(activePoint().oraclePolicyMeanExposure)} · prediction mean {signedExposure(activePoint().strategyPolicyMeanExposure)} · entropy {formatQuote(activePoint().oraclePolicyEntropy, 4)} / {formatQuote(activePoint().strategyPolicyEntropy, 4)}
         </div>
       </div>
       <div class="mb-2 flex flex-wrap items-center justify-center gap-1.5">
@@ -1991,7 +2311,20 @@ function TransitionPolicyDiagnostics(props: {
         <ChartSeriesToggle label="Difference heatmap" color="#fb7185" secondaryColor="#22d3ee" heatmap active={visibleHeatmaps().difference} onClick={() => toggleHeatmap("difference")} />
         <ChartSeriesToggle label="Fitted model heatmap" color="#fbbf24" heatmap active={visibleHeatmaps().fit} onClick={() => toggleHeatmap("fit")} />
         <ChartSeriesToggle label="Fit difference heatmap" color="#fb7185" secondaryColor="#fbbf24" heatmap active={visibleHeatmaps().fitDifference} onClick={() => toggleHeatmap("fitDifference")} />
+        <ChartSeriesToggle label="Joint fit refinement" color="#fbbf24" active={refineConditionalFit()} onClick={() => setRefineConditionalFit((active) => !active)} />
+        <Show when={props.point.predictor && props.request?.predictor?.model === "handcrafted"}>
+          <ChartSeriesToggle label="Hindsight-fit this candle" color="#c4b5fd" active={fitForecastAtCandle()} onClick={() => setFitForecastAtCandle((active) => !active)} />
+        </Show>
       </div>
+      <Show when={fitForecastAtCandle()}>
+        <div class="mb-2 text-center text-[11px] tabular-nums text-violet-200">
+          <Show when={!perCandleFitLoading()} fallback={<>Searching six forecast parameters against this candle’s realized oracle…</>}>
+            <Show when={perCandleFit()} fallback={<span class="text-loss">{perCandleFitError() ?? "No fitted result."}</span>}>
+              {(fit) => <>Hindsight diagnostic only · conditional CE {formatQuote(fit().baselineCrossEntropy, 5)} → {formatQuote(fit().fittedCrossEntropy, 5)} · {fit().iterations} trials · {formatComputeTime(fit().elapsedMs)}</>}
+            </Show>
+          </Show>
+        </div>
+      </Show>
       <Show
         when={visibleHeatmapCount() > 0}
         fallback={<div class="rounded-xl border border-dashed border-line py-8 text-center text-xs text-ink-500">All heatmaps hidden.</div>}
@@ -2028,7 +2361,9 @@ function TransitionPolicyDiagnostics(props: {
           </Show>
           <Show when={visibleHeatmaps().prediction}>
             <TransitionHeatmapCanvas
-              title="Prediction s(a | x)"
+              title={fitForecastAtCandle() && perCandleFit()
+                ? "Per-candle hindsight fit s(a | x)"
+                : "Prediction s(a | x)"}
               matrix={matrices().strategy}
               targetExposures={targetExposures()}
               currentExposures={currentExposures()}
@@ -2126,13 +2461,17 @@ function TransitionPolicyDiagnostics(props: {
       <div class="mt-4">
         <div class="mb-2 text-xs font-medium text-ink-300">Conditional slices across exposure</div>
         <div class="mb-2 text-[11px] text-ink-400">
-          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap initializes the documented order-independent three-transition surface by direct score fitting, then jointly refines all parameters against truncated conditional cross-entropy over the whole oracle map. Hover an oracle, prediction, or fitted-model cell to add its row and column here. Click once to pin one point independently on each heatmap; double-click a heatmap to release only its point. The x + a = 0 and inspected-column cross-sections keep raw conditional cell probabilities and are not renormalized.
+          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap initializes the documented order-independent three-transition surface by direct score fitting. Joint fit refinement optionally continues against truncated conditional cross-entropy over the whole oracle map; disable it to inspect the projected parameters directly. The per-candle forecast fit is a deterministic 97-trial search inside the calibration bounds: a good result demonstrates an attainable hindsight fit, while a miss does not prove that no parameter set exists. Hover an oracle, prediction, or fitted-model cell to add its row and column here. Click once to pin one point independently on each heatmap; double-click a heatmap to release only its point. The x + a = 0 and inspected-column cross-sections keep raw conditional cell probabilities and are not renormalized.
         </div>
         <div class="mb-2 grid gap-1 text-[11px] tabular-nums text-ink-300 md:grid-cols-2 xl:grid-cols-4">
           <span class="text-cyan-200">Oracle @ path · {formatQuadraticFit(oraclePathFit())}</span>
           <span class="text-emerald-200">Oracle @ candidate · {formatQuadraticFit(oracleCandidateFit())}</span>
-          <span class="text-amber-200">Four-segment projected + joint fit · {formatConditionalFit(conditionalModelFit())}</span>
-          <span class="text-violet-200">Prediction exact mixture · b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)} · normal {ratioPercent(props.point.strategyNormalMixture)}, σ {formatQuote(props.point.strategyNormalSigma, 3)}</span>
+          <span class="text-amber-200">Four-segment {refineConditionalFit() ? "projected + joint fit" : "projected fit"} · {formatConditionalFit(conditionalModelFit())}</span>
+          <span class="text-violet-200">{activePoint().predictor
+            ? activePoint().predictor?.model === "direct-indicator"
+              ? "Direct causal 17-parameter conditional policy"
+              : fitForecastAtCandle() && perCandleFit() ? "Handcrafted per-candle hindsight fit" : "Handcrafted causal forecast-regret policy"
+            : "Legacy exact-mixture prediction"}</span>
         </div>
         <div class="mb-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[10px] leading-relaxed tabular-nums text-ink-300">
           <div class="font-medium uppercase tracking-wider text-amber-200">Fitted conditional-distribution parameters</div>
@@ -2140,8 +2479,17 @@ function TransitionPolicyDiagnostics(props: {
           <div class="text-amber-100">At inspected fitted row x {signedExposure(fittedInspection().currentExposure)} · {formatConditionalSliceParameters(fittedInspectionParameters())}</div>
           <div class="text-amber-100">Effective ∂a log q · V− {formatCoefficient(fittedInspectionSlopes().left)} · a {signedExposure(fittedInspection().targetExposure)} {formatCoefficient(fittedInspectionSlopes().selected)} · V+ {formatCoefficient(fittedInspectionSlopes().right)}</div>
         </div>
+        <Show when={activePoint().predictor?.directMetadata}>
+          {(metadata) => (
+            <div class="mb-3 rounded-lg border border-violet-400/20 bg-violet-400/5 px-3 py-2 text-[10px] leading-relaxed tabular-nums text-ink-300">
+              <div class="font-medium uppercase tracking-wider text-violet-200">Direct decoder · computed 17 parameters</div>
+              <div>{formatDirectParameterVector(metadata().parameterVector17)}</div>
+              <div class="text-violet-100">F secants [{metadata().backgroundSecantSlopes.map(formatCoefficient).join(", ")}] · q sell/buy [{formatCoefficient(metadata().effectiveSellCostSlope)}, {formatCoefficient(metadata().effectiveBuyCostSlope)}] · widths [{metadata().transitionWidths10To90.map(formatCoefficient).join(", ")}] ({metadata().transitionWidthSources.join(" / ")})</div>
+            </div>
+          )}
+        </Show>
         <ConditionalPolicyCurveChart
-          values={props.point.values}
+          values={activePoint().values}
           oraclePath={oraclePathSlice()}
           oracleCandidate={oracleCandidateSlice()}
           oraclePathFit={oraclePathFitCurve()}
@@ -2494,7 +2842,7 @@ function ConditionalPolicyCurveChart(props: {
         <ChartSeriesToggle label="Oracle @ candidate" color="#34d399" points active={visibleSeries().oracleCandidate} onClick={() => toggleSeries("oracleCandidate")} />
         <ChartSeriesToggle label="Candidate fit" color="#6ee7b7" active={visibleSeries().oracleCandidateFit} onClick={() => toggleSeries("oracleCandidateFit")} />
         <ChartSeriesToggle label="Four-segment fit @ candidate" color="#fcd34d" dashed active={visibleSeries().wholePolicyCandidateFit} onClick={() => toggleSeries("wholePolicyCandidateFit")} />
-        <ChartSeriesToggle label="Exact prediction" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
+        <ChartSeriesToggle label="Forecast-regret prediction" color="#c4b5fd" active={visibleSeries().prediction} onClick={() => toggleSeries("prediction")} />
         <ChartSeriesToggle label="Oracle x + a = 0" color="#fb923c" points active={visibleSeries().oracleOppositeExposure} onClick={() => toggleSeries("oracleOppositeExposure")} />
         <ChartSeriesToggle label="Prediction x + a = 0" color="#f472b6" dashed active={visibleSeries().predictionOppositeExposure} onClick={() => toggleSeries("predictionOppositeExposure")} />
         <Show when={props.inspectedSlices.length > 0}>
@@ -2739,6 +3087,17 @@ function formatConditionalGlobalParameters(fit: ConditionalFourSegmentPolicyFit)
     + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`;
 }
 
+function formatDirectParameterVector(parameters: DirectIndicatorParameterVector17): string {
+  return `c₁ ${signedExposure(parameters.c1)} · c₂ ${signedExposure(parameters.c2)}`
+    + ` · b [${formatCoefficient(parameters.b0)}, ${formatCoefficient(parameters.b1)}]`
+    + ` · βc₁ [${formatCoefficient(parameters.betaC1_0)}, ${formatCoefficient(parameters.betaC1_1)}]`
+    + ` · βx [${formatCoefficient(parameters.betaX_0)}, ${formatCoefficient(parameters.betaX_1)}]`
+    + ` · βc₂ [${formatCoefficient(parameters.betaC2_0)}, ${formatCoefficient(parameters.betaC2_1)}]`
+    + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`
+    + ` · w [${formatCoefficient(parameters.wL)}, ${formatCoefficient(parameters.wR)}]`
+    + ` · ρ [${formatCoefficient(parameters.rhoL)}, ${formatCoefficient(parameters.rhoR)}]`;
+}
+
 function formatLinearConditionalParameter(
   label: string,
   coefficients: readonly [number, number],
@@ -2773,7 +3132,6 @@ function transitionHeatmaps(
   point: VwKamaValueDistributionPoint,
   oracleTemperature: number,
   friction: number,
-  frictionFraction: number,
 ): TransitionHeatmaps {
   const targetSize = point.values.length;
   const currentGrid = currentExposureGrid(point);
@@ -2790,14 +3148,7 @@ function transitionHeatmaps(
       oracleTemperature,
       1,
     );
-    const strategyRow = conditionalExposureSlice(
-      point.values,
-      "strategyProbability",
-      current,
-      friction,
-      point.strategyTemperature,
-      frictionFraction,
-    );
+    const strategyRow = predictedConditionalExposureSlice(point, current);
     for (let targetIndex = 0; targetIndex < targetSize; targetIndex += 1) {
       const offset = stateIndex * targetSize + targetIndex;
       oracle[offset] = oracleRow[targetIndex]!;
@@ -2832,6 +3183,28 @@ function conditionalExposureSlice(
     currentExposure,
     friction,
     frictionScale / temperature,
+  );
+}
+
+function predictedConditionalExposureSlice(
+  point: VwKamaValueDistributionPoint,
+  currentExposure: number,
+): Float64Array {
+  const directParameters = point.predictor?.conditionalParameters;
+  if (directParameters) {
+    return conditionalFourSegmentExposureProbabilities(
+      point.values.map((value) => value.exposure),
+      currentExposure,
+      directParameters,
+    );
+  }
+  return conditionalExposureSlice(
+    point.values,
+    "strategyProbability",
+    currentExposure,
+    point.friction,
+    point.strategyTemperature,
+    point.frictionFraction,
   );
 }
 
@@ -3419,6 +3792,21 @@ function presetOption(preset: VwKamaPreset): SearchableOption {
   };
 }
 
+function predictorPresetOption(
+  preset: VwKamaPredictorPreset,
+  catalog: VwKamaInspectorCatalog | undefined,
+): SearchableOption {
+  const window = preset.windowId
+    ? catalog?.windows.find((item) => item.id === preset.windowId)?.label ?? preset.windowId
+    : "all static windows";
+  const scale = preset.intervalMs ? ` · ${formatDuration(preset.intervalMs)}` : "";
+  return {
+    value: preset.id,
+    label: `${preset.scope === "global" ? "Global fit" : `Local fit · ${window}`}${scale} · regret ${formatQuote(preset.loss, 6)}`,
+    keywords: `${preset.scope} ${preset.windowId ?? "global"} ${preset.source}`,
+  };
+}
+
 function presetScoreLabel(preset: VwKamaPreset, value: number): string {
   return preset.optimization?.objective === "value-distillation"
     ? `CE ${formatQuote(-value, 5)}`
@@ -3513,6 +3901,14 @@ function formatDateRange(start: number, end: number): string {
   if (!start || !end) return "-";
   const endTime = end % 86_400_000 === 0 ? end - 1 : end;
   return `${new Date(start).toISOString().slice(0, 10)} – ${new Date(endTime).toISOString().slice(0, 10)} UTC`;
+}
+
+function latestHistoryLabel(days: number, endTime: number): string {
+  const startTime = endTime - days * 86_400_000;
+  const range = Number.isFinite(startTime) && !Number.isNaN(new Date(startTime).getTime())
+    ? ` · ${formatDateRange(startTime, endTime)}`
+    : "";
+  return `Latest history · last ${days} day${days === 1 ? "" : "s"}${range}`;
 }
 
 function formatUtcRange(start: number, end: number): string {

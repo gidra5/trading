@@ -1710,6 +1710,418 @@ export function observeExposureValueDistillation(
   accumulator.sampleCount += 1;
 }
 
+/**
+ * Observes an arbitrary causal post-action exposure distribution against the
+ * same transition-aware oracle target used by value distillation.
+ */
+export function observeExposureProbabilityDistillation(
+  accumulator: ExposureValueDistillationAccumulator,
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+  baseProbabilities: ArrayLike<number>,
+  transitionLogScale: number,
+): void {
+  if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) return;
+  if (baseProbabilities.length !== oracle.grid.length
+    || !(Number.isFinite(transitionLogScale) && transitionLogScale >= 0)) {
+    throw new Error("Exposure probability distillation input does not match the oracle.");
+  }
+  if (!oracle.probabilities) {
+    throw new Error("Exposure probability distillation requires retained oracle probabilities.");
+  }
+  const state = distillationStates.get(accumulator);
+  if (!state) throw new Error("Value-distillation accumulator was not initialized.");
+  if (state.gridSize === Number.MAX_SAFE_INTEGER) state.gridSize = oracle.grid.length;
+  if (state.gridSize !== oracle.grid.length) {
+    throw new Error("Value-distillation accumulator grid does not match its oracle.");
+  }
+  state.transitionScratch ??= createTransitionDistributionScratch(oracle.grid.length);
+  const scratch = state.transitionScratch;
+  for (let index = 0; index < oracle.grid.length; index += 1) {
+    const probability = baseProbabilities[index]!;
+    scratch.baseLogits[index] = probability > 0 && Number.isFinite(probability)
+      ? Math.log(probability)
+      : Number.NEGATIVE_INFINITY;
+  }
+  const statistics = transitionDistributionStatistics(
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+    transitionLogScale,
+    scratch,
+  );
+  const probabilityOffset = candleIndex * oracle.grid.length;
+  const targetBaseLogit = transitionCrossExpectation(
+    oracle.probabilities.subarray(probabilityOffset, probabilityOffset + oracle.grid.length),
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+    1 / oracle.temperature,
+    scratch,
+  );
+  const crossEntropy = Math.max(
+    0,
+    statistics.logNormalizer
+      - targetBaseLogit
+      - transitionLogScale * oracle.policyMeanLogRebalances[candleIndex]!,
+  );
+  const weight = oracle.weights[candleIndex]!;
+  const oracleMean = oracle.policyMeans[candleIndex]!;
+  const oracleSecondMoment = oracle.policySecondMoments[candleIndex]!;
+  const lossEnabled = state.config.entropyGapLambda > 0
+    || state.config.stateMutualInformationLambda > 0
+    || state.config.oracleMutualInformationLambda > 0;
+  accumulator.weightedCrossEntropy += weight * crossEntropy;
+  accumulator.weightedOracleEntropy += weight * oracle.policyEntropies[candleIndex]!;
+  if (lossEnabled) {
+    const oracleEntropy = oracle.policyEntropies[candleIndex]!;
+    const normalizedExcessEntropy = Math.max(0, statistics.entropy - oracleEntropy)
+      / Math.log(oracle.grid.length);
+    accumulator.weightedStrategyEntropy += weight * statistics.entropy;
+    accumulator.weightedEntropyGap += weight * normalizedExcessEntropy * normalizedExcessEntropy;
+    state.weightedStrategyMean += weight * statistics.mean;
+    state.weightedStrategySecondMoment += weight * statistics.secondMoment;
+    state.weightedStrategyVariance += weight * Math.max(
+      0,
+      statistics.secondMoment - statistics.mean * statistics.mean,
+    );
+    state.weightedOracleMean += weight * oracleMean;
+    state.weightedOracleSecondMoment += weight * oracleSecondMoment;
+    state.weightedOracleStrategyMeanProduct += weight * oracleMean * statistics.mean;
+    if (state.config.oracleMutualInformationLambda > 0
+      && state.config.oracleMutualInformationMode === "precise") {
+      const bins = state.config.mutualInformationBins;
+      state.preciseJoint ??= new Float64Array(bins * bins);
+      state.preciseOracleBins ??= new Float64Array(bins);
+      state.preciseStrategyBins ??= new Float64Array(bins);
+      state.conditionalBinScratch ??= createExposureConditionalBinScratch(
+        oracle.grid.length,
+        bins,
+      );
+      state.preciseOracleBins.fill(0);
+      state.preciseStrategyBins.fill(0);
+      binnedConditionalExposureProbabilities(
+        oracle.probabilities.subarray(probabilityOffset, probabilityOffset + oracle.grid.length),
+        oracle.grid,
+        oracle.currentGrid,
+        oracle.execution.friction,
+        1 / oracle.temperature,
+        bins,
+        state.preciseOracleBins,
+        state.conditionalBinScratch,
+      );
+      binnedConditionalExposureProbabilities(
+        Float64Array.from(baseProbabilities),
+        oracle.grid,
+        oracle.currentGrid,
+        oracle.execution.friction,
+        transitionLogScale,
+        bins,
+        state.preciseStrategyBins,
+        state.conditionalBinScratch,
+      );
+      for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
+        for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
+          state.preciseJoint[oracleBin * bins + strategyBin] += weight
+            * state.preciseOracleBins[oracleBin]!
+            * state.preciseStrategyBins[strategyBin]!;
+        }
+      }
+    }
+  }
+  accumulator.weightSum += weight;
+  accumulator.opportunitySum += oracle.opportunities[candleIndex]!;
+  accumulator.averageRegretSum += oracle.averageRegrets[candleIndex]!;
+  accumulator.sampleCount += 1;
+}
+
+/**
+ * Observes a complete p(target | current) policy that already includes its
+ * transition-cost structure. Rows follow oracle.currentGrid and columns follow
+ * oracle.grid; no second transition adjustment is applied.
+ */
+export function observeExposureConditionalProbabilityDistillation(
+  accumulator: ExposureValueDistillationAccumulator,
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+  conditionalProbabilities: ArrayLike<number>,
+): void {
+  if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) return;
+  if (!oracle.probabilities) {
+    throw new Error("Conditional probability distillation requires retained oracle probabilities.");
+  }
+  const state = distillationStates.get(accumulator);
+  if (!state) throw new Error("Value-distillation accumulator was not initialized.");
+  if (state.gridSize === Number.MAX_SAFE_INTEGER) state.gridSize = oracle.grid.length;
+  if (state.gridSize !== oracle.grid.length) {
+    throw new Error("Value-distillation accumulator grid does not match its oracle.");
+  }
+  const diagnostics = conditionalPolicyDiagnostics(
+    conditionalProbabilities,
+    oracle,
+    candleIndex,
+  );
+  const weight = oracle.weights[candleIndex]!;
+  const oracleMean = oracle.policyMeans[candleIndex]!;
+  const oracleSecondMoment = oracle.policySecondMoments[candleIndex]!;
+  const lossEnabled = state.config.entropyGapLambda > 0
+    || state.config.stateMutualInformationLambda > 0
+    || state.config.oracleMutualInformationLambda > 0;
+  accumulator.weightedCrossEntropy += weight * diagnostics.crossEntropy;
+  accumulator.weightedOracleEntropy += weight * oracle.policyEntropies[candleIndex]!;
+  if (lossEnabled) {
+    const oracleEntropy = oracle.policyEntropies[candleIndex]!;
+    const normalizedExcessEntropy = Math.max(0, diagnostics.statistics.entropy - oracleEntropy)
+      / Math.log(oracle.grid.length);
+    accumulator.weightedStrategyEntropy += weight * diagnostics.statistics.entropy;
+    accumulator.weightedEntropyGap += weight * normalizedExcessEntropy * normalizedExcessEntropy;
+    state.weightedStrategyMean += weight * diagnostics.statistics.mean;
+    state.weightedStrategySecondMoment += weight * diagnostics.statistics.secondMoment;
+    state.weightedStrategyVariance += weight * Math.max(
+      0,
+      diagnostics.statistics.secondMoment
+        - diagnostics.statistics.mean * diagnostics.statistics.mean,
+    );
+    state.weightedOracleMean += weight * oracleMean;
+    state.weightedOracleSecondMoment += weight * oracleSecondMoment;
+    state.weightedOracleStrategyMeanProduct += weight * oracleMean * diagnostics.statistics.mean;
+    if (state.config.oracleMutualInformationLambda > 0
+      && state.config.oracleMutualInformationMode === "precise") {
+      const bins = state.config.mutualInformationBins;
+      state.preciseJoint ??= new Float64Array(bins * bins);
+      state.preciseOracleBins ??= new Float64Array(bins);
+      state.preciseStrategyBins ??= new Float64Array(bins);
+      state.conditionalBinScratch ??= createExposureConditionalBinScratch(
+        oracle.grid.length,
+        bins,
+      );
+      binnedConditionalExposureProbabilities(
+        oracle.probabilities.subarray(
+          candleIndex * oracle.grid.length,
+          (candleIndex + 1) * oracle.grid.length,
+        ),
+        oracle.grid,
+        oracle.currentGrid,
+        oracle.execution.friction,
+        1 / oracle.temperature,
+        bins,
+        state.preciseOracleBins,
+        state.conditionalBinScratch,
+      );
+      state.preciseStrategyBins.fill(0);
+      for (let row = 0; row < oracle.currentGrid.length; row += 1) {
+        for (let action = 0; action < oracle.grid.length; action += 1) {
+          const bin = Math.min(bins - 1, Math.floor(action * bins / oracle.grid.length));
+          state.preciseStrategyBins[bin] += conditionalProbabilities[
+            row * oracle.grid.length + action
+          ]! / oracle.currentGrid.length;
+        }
+      }
+      for (let oracleBin = 0; oracleBin < bins; oracleBin += 1) {
+        for (let strategyBin = 0; strategyBin < bins; strategyBin += 1) {
+          state.preciseJoint[oracleBin * bins + strategyBin] += weight
+            * state.preciseOracleBins[oracleBin]!
+            * state.preciseStrategyBins[strategyBin]!;
+        }
+      }
+    }
+  }
+  accumulator.weightSum += weight;
+  accumulator.opportunitySum += oracle.opportunities[candleIndex]!;
+  accumulator.averageRegretSum += oracle.averageRegrets[candleIndex]!;
+  accumulator.sampleCount += 1;
+}
+
+export function exposureConditionalProbabilityStatistics(
+  conditionalProbabilities: ArrayLike<number>,
+  grid: Float64Array,
+  currentGrid: Float64Array,
+  friction = 0,
+): ExposureTransitionPolicyStatistics {
+  return conditionalPolicyStatistics(conditionalProbabilities, grid, currentGrid, friction);
+}
+
+export function exposureConditionalProbabilityCrossEntropy(
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+  conditionalProbabilities: ArrayLike<number>,
+): number {
+  return conditionalPolicyDiagnostics(conditionalProbabilities, oracle, candleIndex).crossEntropy;
+}
+
+function conditionalPolicyDiagnostics(
+  conditionalProbabilities: ArrayLike<number>,
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+): { statistics: ExposureTransitionPolicyStatistics; crossEntropy: number } {
+  if (!oracle.probabilities) {
+    throw new Error("Conditional probability diagnostics require retained oracle probabilities.");
+  }
+  if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) {
+    throw new Error("Conditional probability diagnostic candle is outside the oracle score range.");
+  }
+  const statistics = conditionalPolicyStatistics(
+    conditionalProbabilities,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+  );
+  const target = oracle.probabilities.subarray(
+    candleIndex * oracle.grid.length,
+    (candleIndex + 1) * oracle.grid.length,
+  );
+  const targetRow = new Float64Array(oracle.grid.length);
+  let crossEntropy = 0;
+  for (let row = 0; row < oracle.currentGrid.length; row += 1) {
+    conditionalExposureProbabilities(
+      target,
+      oracle.grid,
+      oracle.currentGrid[row]!,
+      oracle.execution.friction,
+      1 / oracle.temperature,
+      targetRow,
+    );
+    const offset = row * oracle.grid.length;
+    const total = probabilityRowTotal(conditionalProbabilities, offset, oracle.grid.length);
+    for (let action = 0; action < oracle.grid.length; action += 1) {
+      const targetProbability = targetRow[action]!;
+      if (targetProbability > 0) {
+        const predicted = conditionalProbabilities[offset + action]! / total;
+        crossEntropy -= targetProbability * Math.log(Math.max(1e-300, predicted))
+          / oracle.currentGrid.length;
+      }
+    }
+  }
+  return { statistics, crossEntropy };
+}
+
+function conditionalPolicyStatistics(
+  conditionalProbabilities: ArrayLike<number>,
+  grid: Float64Array,
+  currentGrid: Float64Array,
+  friction: number,
+): ExposureTransitionPolicyStatistics {
+  if (conditionalProbabilities.length !== grid.length * currentGrid.length) {
+    throw new Error("Conditional probability policy dimensions do not match its grids.");
+  }
+  let mean = 0;
+  let secondMoment = 0;
+  let meanLogRebalance = 0;
+  let entropy = 0;
+  for (let row = 0; row < currentGrid.length; row += 1) {
+    const offset = row * grid.length;
+    const total = probabilityRowTotal(conditionalProbabilities, offset, grid.length);
+    for (let action = 0; action < grid.length; action += 1) {
+      const probability = conditionalProbabilities[offset + action]! / total;
+      const exposure = grid[action]!;
+      mean += probability * exposure / currentGrid.length;
+      secondMoment += probability * exposure * exposure / currentGrid.length;
+      if (probability > 0) {
+        entropy -= probability * Math.log(probability) / currentGrid.length;
+        const factor = rebalanceEquityFactor(currentGrid[row]!, exposure, friction);
+        if (factor > 0) meanLogRebalance += probability * Math.log(factor) / currentGrid.length;
+      }
+    }
+  }
+  return { logNormalizer: 0, mean, secondMoment, meanLogRebalance, entropy };
+}
+
+function probabilityRowTotal(
+  probabilities: ArrayLike<number>,
+  offset: number,
+  length: number,
+): number {
+  let total = 0;
+  for (let index = 0; index < length; index += 1) {
+    const probability = probabilities[offset + index]!;
+    if (!Number.isFinite(probability) || probability < 0) {
+      throw new Error("Conditional probability policy must be finite and non-negative.");
+    }
+    total += probability;
+  }
+  if (!(total > 0)) throw new Error("Conditional probability policy row has no mass.");
+  return total;
+}
+
+export function exposureProbabilityTransitionStatistics(
+  baseProbabilities: ArrayLike<number>,
+  grid: ArrayLike<number>,
+  currentGrid: ArrayLike<number>,
+  friction: number,
+  transitionLogScale: number,
+): ExposureTransitionPolicyStatistics {
+  if (baseProbabilities.length !== grid.length || grid.length < 2 || currentGrid.length < 1) {
+    throw new Error("Exposure transition statistics require matching non-empty grids.");
+  }
+  const scratch = createTransitionDistributionScratch(grid.length);
+  for (let index = 0; index < grid.length; index += 1) {
+    const probability = baseProbabilities[index]!;
+    scratch.baseLogits[index] = probability > 0 && Number.isFinite(probability)
+      ? Math.log(probability)
+      : Number.NEGATIVE_INFINITY;
+  }
+  return transitionDistributionStatistics(
+    scratch.baseLogits,
+    Float64Array.from(grid),
+    Float64Array.from(currentGrid),
+    friction,
+    transitionLogScale,
+    scratch,
+  );
+}
+
+/** Transition-aware cross-entropy for an arbitrary post-action distribution at one candle. */
+export function exposureProbabilityTransitionCrossEntropy(
+  oracle: ExposureValueOracle,
+  candleIndex: number,
+  baseProbabilities: ArrayLike<number>,
+  transitionLogScale: number,
+): number {
+  if (candleIndex < oracle.scoreStartIndex || candleIndex >= oracle.means.length) {
+    throw new Error("Exposure probability cross-entropy candle is outside the oracle score range.");
+  }
+  if (baseProbabilities.length !== oracle.grid.length
+    || !(Number.isFinite(transitionLogScale) && transitionLogScale >= 0)) {
+    throw new Error("Exposure probability cross-entropy input does not match the oracle.");
+  }
+  if (!oracle.probabilities) {
+    throw new Error("Exposure probability cross-entropy requires retained oracle probabilities.");
+  }
+  const scratch = createTransitionDistributionScratch(oracle.grid.length);
+  for (let index = 0; index < oracle.grid.length; index += 1) {
+    const probability = baseProbabilities[index]!;
+    scratch.baseLogits[index] = probability > 0 && Number.isFinite(probability)
+      ? Math.log(probability)
+      : Number.NEGATIVE_INFINITY;
+  }
+  const statistics = transitionDistributionStatistics(
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+    transitionLogScale,
+    scratch,
+  );
+  const probabilityOffset = candleIndex * oracle.grid.length;
+  const targetBaseLogit = transitionCrossExpectation(
+    oracle.probabilities.subarray(probabilityOffset, probabilityOffset + oracle.grid.length),
+    scratch.baseLogits,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+    1 / oracle.temperature,
+    scratch,
+  );
+  return Math.max(
+    0,
+    statistics.logNormalizer
+      - targetBaseLogit
+      - transitionLogScale * oracle.policyMeanLogRebalances[candleIndex]!,
+  );
+}
+
 /** Bins the conditional target marginal after uniformly averaging current grid states. */
 export function binnedConditionalExposureProbabilities(
   baseProbabilities: ArrayLike<number>,

@@ -29,6 +29,18 @@
       "development": "./src/parameter-fit.ts",
       "import": "./dist/parameter-fit.js",
       "default": "./src/parameter-fit.ts"
+    },
+    "./handcrafted-indicator-predictor": {
+      "types": "./src/handcrafted-indicator-predictor.ts",
+      "development": "./src/handcrafted-indicator-predictor.ts",
+      "import": "./dist/handcrafted-indicator-predictor.js",
+      "default": "./src/handcrafted-indicator-predictor.ts"
+    },
+    "./direct-indicator-conditional-predictor": {
+      "types": "./src/direct-indicator-conditional-predictor.ts",
+      "development": "./src/direct-indicator-conditional-predictor.ts",
+      "import": "./dist/direct-indicator-conditional-predictor.js",
+      "default": "./src/direct-indicator-conditional-predictor.ts"
     }
   },
   "scripts": {

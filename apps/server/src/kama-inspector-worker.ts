@@ -2,6 +2,7 @@ import { parentPort } from "node:worker_threads";
 import type {
   VwKamaCandleRangeRequest,
   VwKamaInspectorRequest,
+  VwKamaPredictorFitRequest,
 } from "@trading/bot-algo";
 import { KamaInspectorEngine } from "./kama-inspector.js";
 
@@ -13,7 +14,8 @@ let engine: KamaInspectorEngine | null = null;
 type InspectorWorkerRequest =
   | { type: "init"; dataDir: string }
   | { type: "analyze"; id: number; input: VwKamaInspectorRequest }
-  | { type: "candles"; id: number; input: VwKamaCandleRangeRequest };
+  | { type: "candles"; id: number; input: VwKamaCandleRangeRequest }
+  | { type: "fit-predictor"; id: number; input: VwKamaPredictorFitRequest };
 
 port.on("message", async (message: InspectorWorkerRequest) => {
   if (message.type === "init") {
@@ -25,7 +27,9 @@ port.on("message", async (message: InspectorWorkerRequest) => {
   try {
     const result = message.type === "analyze"
       ? await engine.analyze(message.input)
-      : await engine.candles(message.input);
+      : message.type === "candles"
+        ? await engine.candles(message.input)
+        : await engine.fitPredictor(message.input);
     port.postMessage({ id: message.id, result });
   } catch (error) {
     port.postMessage({

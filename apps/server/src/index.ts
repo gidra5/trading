@@ -10,6 +10,7 @@ import type {
   PartialStrategyConfig,
   VwKamaCandleRangeRequest,
   VwKamaInspectorRequest,
+  VwKamaPredictorFitRequest,
 } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
@@ -429,6 +430,15 @@ server.post("/api/kama-inspector/analyze", async (request, reply) => {
     return await kamaInspector.analyze((request.body ?? {}) as VwKamaInspectorRequest);
   } catch (error) {
     const message = error instanceof Error ? error.message : "VW-KAMA inspection failed";
+    return reply.code(400).send({ error: message });
+  }
+});
+
+server.post("/api/kama-inspector/predictor-fit", async (request, reply) => {
+  try {
+    return await kamaInspector.fitPredictor((request.body ?? {}) as VwKamaPredictorFitRequest);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "VW-KAMA predictor fit failed";
     return reply.code(400).send({ error: message });
   }
 });

@@ -15,6 +15,8 @@ export * from "./perfect-margin-oracle.js";
 export * from "./exposure-value-distillation.js";
 export * from "./conditional-exposure-distribution.js";
 export * from "./parameter-fit.js";
+export * from "./handcrafted-indicator-predictor.js";
+export * from "./direct-indicator-conditional-predictor.js";
 export * from "./kama-signal-evaluator.js";
 export * from "./vw-kama-cuda.js";
 export * from "./signal-memory.js";

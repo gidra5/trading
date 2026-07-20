@@ -303,12 +303,37 @@ test("policy fit refines the variable-projection initializer used by client heat
   );
   const initialCrossEntropy = target.reduce((sum, probability, index) =>
     sum - probability * Math.log(Math.max(1e-300, initialPolicy[index]!)) / currents.length, 0);
+  const projectedOnly = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    ...sharedOptions,
+    maxIterations: 80,
+    refineProjectedFit: false,
+  });
   const refined = fitConditionalFourSegmentPolicy(actions, target, currents, {
     ...sharedOptions,
     maxIterations: 80,
+    refineProjectedFit: true,
   });
 
+  assert.equal(projectedOnly.refined, false);
+  assert.ok(Math.abs(projectedOnly.crossEntropy - initialCrossEntropy) < 1e-10, {
+    initialCrossEntropy,
+    projectedOnly,
+  });
+  for (const key of ["c1", "c2", "kappaC1", "kappaX", "kappaC2"] as const) {
+    assert.ok(
+      Math.abs(projectedOnly.parameters[key] - initializer.parameters[key]) < 1e-6,
+      { key, projectedOnly, initializer },
+    );
+  }
+  for (const key of ["baseSlope", "betaC1", "betaX", "betaC2"] as const) {
+    assert.ok(
+      projectedOnly.parameters[key].every((value, index) =>
+        Math.abs(value - initializer.parameters[key][index]!) < 1e-8),
+      { key, projectedOnly, initializer },
+    );
+  }
   assert.equal(refined.restarts, 1);
+  assert.equal(refined.refined, true);
   assert.ok(refined.crossEntropy <= initialCrossEntropy + 1e-10, JSON.stringify({
     initialCrossEntropy,
     refined,

@@ -24,6 +24,8 @@
     "verify:risk": "tsx scripts/verify-bot-risk-paths.ts",
     "backtest:pathologies": "tsx scripts/collect-pathological-backtests.ts",
     "experiment:loop": "tsx scripts/experiment-agent-loop.ts",
+    "calibrate:indicator-predictor": "tsx scripts/calibrate-handcrafted-indicator-predictor.ts",
+    "calibrate:direct-indicator-predictor": "tsx scripts/calibrate-direct-indicator-predictor.ts",
     "start": "npm run start -w @trading/server"
   },
   "devDependencies": {

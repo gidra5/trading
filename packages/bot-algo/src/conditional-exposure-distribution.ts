@@ -1,4 +1,7 @@
-import { fitConditionalFourSegmentScores } from "./parameter-fit.js";
+import {
+  fitConditionalFourSegmentScores,
+  type ConditionalFourSegmentScoreFit,
+} from "./parameter-fit.js";
 
 export interface ConditionalFourSegmentModelOptions {
   latentLower: number;
@@ -21,6 +24,8 @@ export interface ConditionalFourSegmentModelOptions {
   sampleStates?: number;
   sampleActions?: number;
   tolerance?: number;
+  /** Jointly refine the projected score fit against conditional cross-entropy. Defaults to true. */
+  refineProjectedFit?: boolean;
 }
 
 export interface ConditionalFourSegmentParameters {
@@ -70,6 +75,7 @@ export interface ConditionalFourSegmentPolicyFit {
   restarts: number;
   termination: ConditionalFourSegmentFitTermination;
   converged: boolean;
+  refined: boolean;
 }
 
 interface FixedParameters {
@@ -162,6 +168,29 @@ export function fitConditionalFourSegmentPolicy(
     stateIndices,
     actionIndices,
   );
+  const projectedFit = variableProjectionInitialFit(
+    sampledActions,
+    sampledTargets,
+    sampledStates,
+    fixed,
+    options,
+  );
+  if (options.refineProjectedFit === false) {
+    return {
+      parameters: projectedFit.parameters,
+      ...fitDiagnostics(
+        actionGrid,
+        targetProbabilities,
+        currentExposures,
+        projectedFit.parameters,
+      ),
+      iterations: projectedFit.iterations,
+      restarts: projectedFit.restarts,
+      termination: projectedFit.termination,
+      converged: projectedFit.converged,
+      refined: false,
+    };
+  }
   const objective = (raw: Float64Array) => conditionalCrossEntropyWithGradient(
     sampledActions,
     sampledTargets,
@@ -176,13 +205,7 @@ export function fitConditionalFourSegmentPolicy(
     fixed,
     options,
   );
-  const projectedInitial = variableProjectionInitialRaw(
-    sampledActions,
-    sampledTargets,
-    sampledStates,
-    fixed,
-    options,
-  );
+  const projectedInitial = rawFromParameters(projectedFit.parameters, fixed);
   const initialValues = [projectedInitial, ...empiricalValues];
   const restartCount = Math.max(1, Math.min(
     initialValues.length,
@@ -226,6 +249,7 @@ export function fitConditionalFourSegmentPolicy(
     restarts: restartCount,
     termination: best.termination,
     converged: best.converged,
+    refined: true,
   };
 }
 
@@ -234,13 +258,13 @@ export function fitConditionalFourSegmentPolicy(
  * absorbed by the projected slice offsets, so this provides the documented
  * direct-value estimate before the probability objective jointly refines it.
  */
-function variableProjectionInitialRaw(
+function variableProjectionInitialFit(
   actions: Float64Array,
   targets: Float64Array,
   states: Float64Array,
   fixed: FixedParameters,
   options: ConditionalFourSegmentModelOptions,
-): Float64Array {
+): ConditionalFourSegmentScoreFit {
   const scores = new Float64Array(targets.length);
   for (let row = 0; row < states.length; row += 1) {
     scores.set(
@@ -251,7 +275,7 @@ function variableProjectionInitialRaw(
   const supportWidths = initialSupportWidths(fixed, options);
   const fitsLeftBoundary = actions[0]! < fixed.latentLower + supportWidths[0];
   const fitsRightBoundary = actions.at(-1)! > fixed.latentUpper - supportWidths[1];
-  const projected = fitConditionalFourSegmentScores(actions, scores, states, {
+  return fitConditionalFourSegmentScores(actions, scores, states, {
     ...options,
     latentLower: fixed.latentLower,
     latentUpper: fixed.latentUpper,
@@ -267,7 +291,6 @@ function variableProjectionInitialRaw(
     restartCount: Math.min(3, Math.max(1, Math.floor(options.restartCount ?? 3))),
     tolerance: Math.min(options.tolerance ?? 1e-6, 1e-7),
   });
-  return rawFromParameters(projected.parameters, fixed);
 }
 
 function maskedObjective(
