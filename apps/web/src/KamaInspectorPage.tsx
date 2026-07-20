@@ -2126,12 +2126,12 @@ function TransitionPolicyDiagnostics(props: {
       <div class="mt-4">
         <div class="mb-2 text-xs font-medium text-ink-300">Conditional slices across exposure</div>
         <div class="mb-2 text-[11px] text-ink-400">
-          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap uses the documented order-independent three-transition surface and minimizes truncated conditional cross-entropy over the whole oracle map. Hover an oracle, prediction, or fitted-model cell to add its row and column here. Click once to pin one point independently on each heatmap; double-click a heatmap to release only its point. The x + a = 0 and inspected-column cross-sections keep raw conditional cell probabilities and are not renormalized.
+          The two local quadratic curves minimize pointwise probability MSE. The global fitted heatmap initializes the documented order-independent three-transition surface by direct score fitting, then jointly refines all parameters against truncated conditional cross-entropy over the whole oracle map. Hover an oracle, prediction, or fitted-model cell to add its row and column here. Click once to pin one point independently on each heatmap; double-click a heatmap to release only its point. The x + a = 0 and inspected-column cross-sections keep raw conditional cell probabilities and are not renormalized.
         </div>
         <div class="mb-2 grid gap-1 text-[11px] tabular-nums text-ink-300 md:grid-cols-2 xl:grid-cols-4">
           <span class="text-cyan-200">Oracle @ path · {formatQuadraticFit(oraclePathFit())}</span>
           <span class="text-emerald-200">Oracle @ candidate · {formatQuadraticFit(oracleCandidateFit())}</span>
-          <span class="text-amber-200">Four-segment whole-map fit · {formatConditionalFit(conditionalModelFit())}</span>
+          <span class="text-amber-200">Four-segment projected + joint fit · {formatConditionalFit(conditionalModelFit())}</span>
           <span class="text-violet-200">Prediction exact mixture · b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)} · normal {ratioPercent(props.point.strategyNormalMixture)}, σ {formatQuote(props.point.strategyNormalSigma, 3)}</span>
         </div>
         <div class="mb-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[10px] leading-relaxed tabular-nums text-ink-300">

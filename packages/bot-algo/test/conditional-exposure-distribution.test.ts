@@ -7,6 +7,7 @@ import {
   fitConditionalFourSegmentPolicy,
   type ConditionalFourSegmentParameters,
 } from "../src/conditional-exposure-distribution.js";
+import { fitConditionalFourSegmentScores } from "../src/parameter-fit.js";
 
 const parameters: ConditionalFourSegmentParameters = {
   latentLower: -250,
@@ -266,4 +267,51 @@ test("moving slope changes are not clipped at the former beta limit", () => {
 
   assert.ok(fit.parameters.betaX[0] < -0.3, JSON.stringify(fit));
   assert.ok(fit.meanSquaredError < 1e-8, JSON.stringify(fit));
+});
+
+test("policy fit refines the variable-projection initializer used by client heatmaps", () => {
+  const actions = Float64Array.from({ length: 41 }, (_, index) => -100 + index * 5);
+  const currents = Float64Array.from({ length: 13 }, (_, index) => -90 + index * 15);
+  const target = conditionalFourSegmentPolicyMatrix(actions, currents, parameters);
+  const scores = Float64Array.from(target, (probability) => Math.log(probability));
+  const sharedOptions = {
+    latentLower: -250,
+    latentUpper: 250,
+    visibleLower: -100,
+    visibleUpper: 100,
+    initialC1: -15,
+    initialC2: 20,
+    initialLeftSupportWidth: 75,
+    initialRightSupportWidth: 75,
+    leftSupportSharpness: 1,
+    rightSupportSharpness: 1,
+    initialKappaC1: 0.1,
+    initialKappaX: 0.1,
+    initialKappaC2: 0.1,
+    restartCount: 1,
+  } as const;
+  const initializer = fitConditionalFourSegmentScores(actions, scores, currents, {
+    ...sharedOptions,
+    ridge: 1e-2,
+    maxIterations: 40,
+    tolerance: 1e-7,
+  });
+  const initialPolicy = conditionalFourSegmentPolicyMatrix(
+    actions,
+    currents,
+    initializer.parameters,
+  );
+  const initialCrossEntropy = target.reduce((sum, probability, index) =>
+    sum - probability * Math.log(Math.max(1e-300, initialPolicy[index]!)) / currents.length, 0);
+  const refined = fitConditionalFourSegmentPolicy(actions, target, currents, {
+    ...sharedOptions,
+    maxIterations: 80,
+  });
+
+  assert.equal(refined.restarts, 1);
+  assert.ok(refined.crossEntropy <= initialCrossEntropy + 1e-10, JSON.stringify({
+    initialCrossEntropy,
+    refined,
+  }));
+  assert.ok(refined.meanSquaredError < 1e-8, refined);
 });

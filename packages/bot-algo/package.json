@@ -23,6 +23,12 @@
       "development": "./src/conditional-exposure-distribution.ts",
       "import": "./dist/conditional-exposure-distribution.js",
       "default": "./src/conditional-exposure-distribution.ts"
+    },
+    "./parameter-fit": {
+      "types": "./src/parameter-fit.ts",
+      "development": "./src/parameter-fit.ts",
+      "import": "./dist/parameter-fit.js",
+      "default": "./src/parameter-fit.ts"
     }
   },
   "scripts": {

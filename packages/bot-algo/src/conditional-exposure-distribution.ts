@@ -1,3 +1,5 @@
+import { fitConditionalFourSegmentScores } from "./parameter-fit.js";
+
 export interface ConditionalFourSegmentModelOptions {
   latentLower: number;
   latentUpper: number;
@@ -167,13 +169,21 @@ export function fitConditionalFourSegmentPolicy(
     raw,
     fixed,
   );
-  const initialValues = empiricalInitialValues(
+  const empiricalValues = empiricalInitialValues(
     sampledActions,
     sampledTargets,
     sampledStates,
     fixed,
     options,
   );
+  const projectedInitial = variableProjectionInitialRaw(
+    sampledActions,
+    sampledTargets,
+    sampledStates,
+    fixed,
+    options,
+  );
+  const initialValues = [projectedInitial, ...empiricalValues];
   const restartCount = Math.max(1, Math.min(
     initialValues.length,
     Math.floor(options.restartCount ?? initialValues.length),
@@ -217,6 +227,47 @@ export function fitConditionalFourSegmentPolicy(
     termination: best.termination,
     converged: best.converged,
   };
+}
+
+/**
+ * Fits log probabilities as score values first. Conditional normalization is
+ * absorbed by the projected slice offsets, so this provides the documented
+ * direct-value estimate before the probability objective jointly refines it.
+ */
+function variableProjectionInitialRaw(
+  actions: Float64Array,
+  targets: Float64Array,
+  states: Float64Array,
+  fixed: FixedParameters,
+  options: ConditionalFourSegmentModelOptions,
+): Float64Array {
+  const scores = new Float64Array(targets.length);
+  for (let row = 0; row < states.length; row += 1) {
+    scores.set(
+      stableLogProbabilities(targets.subarray(row * actions.length, (row + 1) * actions.length)),
+      row * actions.length,
+    );
+  }
+  const supportWidths = initialSupportWidths(fixed, options);
+  const fitsLeftBoundary = actions[0]! < fixed.latentLower + supportWidths[0];
+  const fitsRightBoundary = actions.at(-1)! > fixed.latentUpper - supportWidths[1];
+  const projected = fitConditionalFourSegmentScores(actions, scores, states, {
+    ...options,
+    latentLower: fixed.latentLower,
+    latentUpper: fixed.latentUpper,
+    visibleLower: fixed.visibleLower,
+    visibleUpper: fixed.visibleUpper,
+    initialLeftSupportWidth: supportWidths[0],
+    initialRightSupportWidth: supportWidths[1],
+    minimumKappa: fixed.minimumKappa,
+    minimumSupportSharpness: fixed.minimumSupportSharpness,
+    fitSupport: fitsLeftBoundary || fitsRightBoundary,
+    ridge: 1e-2,
+    maxIterations: Math.min(40, Math.max(12, Math.floor((options.maxIterations ?? 100) / 2))),
+    restartCount: Math.min(3, Math.max(1, Math.floor(options.restartCount ?? 3))),
+    tolerance: Math.min(options.tolerance ?? 1e-6, 1e-7),
+  });
+  return rawFromParameters(projected.parameters, fixed);
 }
 
 function maskedObjective(
@@ -424,7 +475,16 @@ function conditionalCrossEntropyWithGradient(
       }
     }
   }
-  const variationPenalty = 1e-4;
+  const slopeMagnitudePenalty = 1e-9;
+  const unpenalizedSlopeMagnitude = 100;
+  for (const parameter of LINEAR_PARAMETER_INDICES) {
+    const magnitude = Math.abs(raw[parameter]!);
+    const excess = Math.max(0, magnitude - unpenalizedSlopeMagnitude);
+    loss += slopeMagnitudePenalty * excess ** 2;
+    gradient[parameter] += 2 * slopeMagnitudePenalty * excess
+      * Math.sign(raw[parameter]!);
+  }
+  const variationPenalty = 1e-8;
   for (const parameter of [BASE_1, BETA_C1_1, BETA_X_1, BETA_C2_1]) {
     loss += variationPenalty * raw[parameter]! ** 2;
     gradient[parameter] += 2 * variationPenalty * raw[parameter]!;
@@ -784,6 +844,42 @@ function parametersFromRaw(
     kappaX: mapped.kappaX,
     kappaC2: mapped.kappaC2,
   };
+}
+
+function rawFromParameters(
+  parameters: ConditionalFourSegmentParameters,
+  fixed: FixedParameters,
+): Float64Array {
+  const raw = new Float64Array(PARAMETER_COUNT);
+  [raw[C1_RAW], raw[C2_RAW]] = rawBreakpoints(parameters.c1, parameters.c2, fixed);
+  setSlopeCoefficients(raw, BASE_0, parameters.baseSlope, fixed.slopeScale);
+  setSlopeCoefficients(raw, BETA_C1_0, parameters.betaC1, fixed.slopeScale);
+  setSlopeCoefficients(raw, BETA_X_0, parameters.betaX, fixed.slopeScale);
+  setSlopeCoefficients(raw, BETA_C2_0, parameters.betaC2, fixed.slopeScale);
+  raw[KAPPA_C1_RAW] = inverseSoftplus(
+    Math.max(1e-12, parameters.kappaC1 - fixed.minimumKappa),
+  );
+  raw[KAPPA_X_RAW] = inverseSoftplus(
+    Math.max(1e-12, parameters.kappaX - fixed.minimumKappa),
+  );
+  raw[KAPPA_C2_RAW] = inverseSoftplus(
+    Math.max(1e-12, parameters.kappaC2 - fixed.minimumKappa),
+  );
+  [raw[LEFT_WIDTH_RAW], raw[RIGHT_WIDTH_RAW]] = rawSupportWidths(
+    parameters.leftSupportWidth,
+    parameters.rightSupportWidth,
+    fixed,
+  );
+  raw[LEFT_SHARPNESS_RAW] = inverseSoftplus(Math.max(
+    1e-12,
+    parameters.leftSupportSharpness - fixed.minimumSupportSharpness,
+  ));
+  raw[RIGHT_SHARPNESS_RAW] = inverseSoftplus(Math.max(
+    1e-12,
+    parameters.rightSupportSharpness - fixed.minimumSupportSharpness,
+  ));
+  boundUnconstrainedParameters(raw);
+  return raw;
 }
 
 function compactEnvelopeLogValue(
