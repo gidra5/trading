@@ -31,6 +31,11 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(raw.kamaSeries.points.length, raw.candles.length);
     assert.equal(raw.indicatorPoints.length, raw.candles.length);
     assert.equal(raw.valueDistributions.length, raw.candles.length);
+    assert.equal(raw.valueCandidatePath.length, raw.candles.length);
+    assert.ok(raw.valueCandidatePath.every((point) =>
+      Number.isFinite(point.exposure)
+      && Number.isFinite(point.equity)
+      && point.equity >= 0));
     assert.ok(raw.valueDistributions.every((point) =>
       Math.abs(point.values.reduce((sum, value) => sum + value.oracleProbability, 0) - 1) < 1e-6
       && Math.abs(point.values.reduce((sum, value) => sum + value.strategyProbability, 0) - 1) < 1e-9
@@ -178,6 +183,20 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     }
     assert.ok(compared > 50);
 
+    const rescoringRequest = {
+      ...analysisRequest(),
+      matchWindowMs: 7_000,
+      timingHalfLifeMs: 2_500,
+    };
+    const cachedRescore = await engine.analyze(rescoringRequest);
+    const freshRescore = await new KamaInspectorEngine(dataDir, { now: () => FIXED_NOW })
+      .analyze(rescoringRequest);
+    assert.deepEqual(
+      { ...cachedRescore, elapsedMs: 0 },
+      { ...freshRescore, elapsedMs: 0 },
+      "timing-only rescoring must exactly match a cold full evaluation",
+    );
+
     const fastValueConfig = {
       ...engine.catalog().defaults.valueDistillation!,
       gridSize: 11,
@@ -207,6 +226,34 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.ok(fit.point.predictor);
     assert.ok(fit.fittedCrossEntropy <= fit.baselineCrossEntropy + 1e-9);
     assert.equal(fit.iterations, 97);
+
+    const historical = await engine.historicalAverages({
+      ...analysisRequest(),
+      valueDistillation: fastValueConfig,
+      time: START + 1_000_999,
+      lookbackMs: 30_000,
+      holdingPeriodMs: 1_000,
+      valueHorizonMs: 5_000,
+    });
+    assert.equal(historical.holdingPeriodMs, 1_000);
+    assert.equal(historical.valueHorizonMs, 5_000);
+    assert.equal(historical.sampleCount, 30);
+    assert.ok(historical.averageMaximumReturn >= 0);
+    assert.equal(
+      historical.regretProbabilities.length,
+      historical.targetExposures.length * historical.currentExposures.length,
+    );
+    for (const probabilities of [
+      historical.regretProbabilities,
+      historical.maximumReturnGapProbabilities,
+    ]) {
+      for (let row = 0; row < historical.currentExposures.length; row += 1) {
+        const start = row * historical.targetExposures.length;
+        const total = probabilities.slice(start, start + historical.targetExposures.length)
+          .reduce((sum, probability) => sum + probability, 0);
+        assert.ok(Math.abs(total - 1) < 1e-9);
+      }
+    }
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -235,6 +282,40 @@ test("latest inspector days have no configured ceiling and missing history is fe
     assert.equal(attempted.length, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("historical oracle averages do not observe prices after the selected candle", async () => {
+  const baselineDir = await fixture();
+  const shockedDir = await fixture(1_000);
+  try {
+    const baselineEngine = new KamaInspectorEngine(baselineDir, { now: () => FIXED_NOW });
+    const shockedEngine = new KamaInspectorEngine(shockedDir, { now: () => FIXED_NOW });
+    const valueDistillation = {
+      ...baselineEngine.catalog().defaults.valueDistillation!,
+      gridSize: 11,
+      holdingPeriodMode: "fixed" as const,
+      holdingPeriodMs: 10_000,
+      valueHorizonMode: "fixed" as const,
+      valueHorizonMs: 10_000,
+    };
+    const request = {
+      ...analysisRequest(),
+      valueDistillation,
+      time: START + 1_000_999,
+      lookbackMs: 30_000,
+      holdingPeriodMs: 1_000,
+      valueHorizonMs: 5_000,
+    };
+    assert.deepEqual(
+      await shockedEngine.historicalAverages(request),
+      await baselineEngine.historicalAverages(request),
+    );
+  } finally {
+    await Promise.all([
+      rm(baselineDir, { recursive: true, force: true }),
+      rm(shockedDir, { recursive: true, force: true }),
+    ]);
   }
 });
 
@@ -354,7 +435,7 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
   }
 });
 
-async function fixture(): Promise<string> {
+async function fixture(futureShockAfterIndex?: number): Promise<string> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "kama-inspector-"));
   const root = path.join(dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
   await mkdir(root, { recursive: true });
@@ -362,7 +443,12 @@ async function fixture(): Promise<string> {
   const byDate = new Map(dates.map((date) => [date, [] as Candle[]]));
   byDate.get("2024-02-23")!.push(candle(-1));
   for (let index = 0; index < 2_400; index += 1) {
-    if (index !== 120) byDate.get("2024-02-24")!.push(candle(index));
+    if (index !== 120) {
+      byDate.get("2024-02-24")!.push(candle(
+        index,
+        futureShockAfterIndex !== undefined && index > futureShockAfterIndex ? 1_000_000 : 0,
+      ));
+    }
   }
   await Promise.all(dates.map((date, index) => {
     const content = byDate.get(date)!.map((value) => JSON.stringify(value)).join("\n");
@@ -373,8 +459,8 @@ async function fixture(): Promise<string> {
   return dataDir;
 }
 
-function candle(index: number): Candle {
-  const price = 100 + index;
+function candle(index: number, priceOffset = 0): Candle {
+  const price = 100 + index + priceOffset;
   const openTime = START + index * 1_000;
   return {
     symbol: "BTCUSDT",

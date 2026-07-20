@@ -4,6 +4,8 @@ import {
   alignVwKamaTransitions,
   averageVwKamaOracleTradeIntervalMs,
   columnarVwKamaCandles,
+  DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+  DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
   createPeakValleyStrategyConfig,
   evaluateVwKamaOracle,
@@ -167,6 +169,7 @@ function transition(
     dmi: 0,
     adx: 0,
     meanDistance: 0,
+    targetProbability: null,
     matchedTime: null,
     lagMs: null,
     timingCredit: 0,
@@ -319,12 +322,23 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
     timingHalfLifeMs: 1_000,
     warmupMultiple: 1,
     maxPoints: 10,
+    maxDistributionPoints: 2,
     valueDistillation: {
       oracle: valueOracle,
       strategyVolatilityScaling: false,
       lossConfig: { ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS },
     },
   });
+  assert.equal(result.valueDistributions.length, 2);
+  assert.ok(result.valueDistributions.every((point) =>
+    point.oracleHoldingPeriodMs === 1_000 && point.oracleValueHorizonMs === 1_000));
+  assert.equal(result.valueCandidatePath.length, result.kamaSeries.points.length);
+  assert.ok(result.valueCandidatePath.every((point) =>
+    Number.isFinite(point.time)
+    && Number.isFinite(point.exposure)
+    && Number.isFinite(point.equity)
+    && point.equity >= 0));
+  assert.equal(result.valueCandidatePath[0]!.equity, 1);
   const point = result.valueDistributions.at(-1)!;
   assert.equal(point.currentExposureMinimum, -valueOracle.execution.maxEffectiveExposure);
   assert.equal(point.currentExposureMaximum, valueOracle.execution.maxEffectiveExposure);
@@ -345,6 +359,89 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
       ? transition.sizeFraction * 20
       : transition.state === "short" ? transition.sizeFraction * -10 : 0;
     assert.ok(Math.abs(transition.exposure - expected) < 1e-12);
+  }
+});
+
+test("forecast transitions trade to the conditional modal cell without rebalancing inside it", () => {
+  const closes = [100, 110, 120, 130, 140];
+  const candles = closes.map((close, index): Candle => ({
+    symbol: "BTCUSDT",
+    interval: "1s",
+    openTime: index * 1_000,
+    closeTime: index * 1_000 + 999,
+    open: index === 0 ? close : closes[index - 1]!,
+    high: Math.max(close, index === 0 ? close : closes[index - 1]!),
+    low: Math.min(close, index === 0 ? close : closes[index - 1]!),
+    close,
+    volume: 1,
+    closed: true,
+  }));
+  const oracle = prepareExposureValueOracle(closes, {
+    scoreStartIndex: 1,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 1,
+    friction: 0.001,
+    gridSize: 5,
+    minExposure: -0.5,
+    maxExposure: 0.5,
+    maxEffectiveExposure: 1,
+    temperature: 0.01,
+    includeProbabilities: true,
+  });
+  const states = closes.map(() => ({
+    drift: 0.2,
+    variance: 1e-8,
+    longRunVariance: 1e-8,
+  }));
+  const predictors = [
+    {
+      handcraftedPredictor: {
+        parameters: { ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS },
+        states,
+      },
+    },
+    {
+      directIndicatorPredictor: {
+        parameters: { ...DEFAULT_DIRECT_INDICATOR_PARAMETERS },
+        states,
+      },
+    },
+  ];
+  for (const predictor of predictors) {
+    const result = evaluateVwKamaOracle(candles, {
+      intervalMs: 1_000,
+      scoreStartTime: candles[1]!.openTime,
+      parameters: {
+        efficiencyMs: 1_000,
+        fastMs: 1_000,
+        slowMs: 1_000,
+        power: 1,
+        volumeMs: 1_000,
+        volumeCap: 1,
+        volumePower: 0,
+        deadbandBpsHour: 1e12,
+        deadbandMode: "hold",
+      },
+      oracleFriction: 0.001,
+      matchWindowMs: 10_000,
+      timingHalfLifeMs: 1_000,
+      warmupMultiple: 1,
+      maxPoints: 10,
+      valueDistillation: {
+        oracle,
+        strategyVolatilityScaling: false,
+        lossConfig: { ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS },
+        ...predictor,
+      },
+    });
+
+    assert.equal(result.candidateTransitions.length, 1);
+    assert.equal(result.candidateTransitions[0]!.fromExposure, 0);
+    assert.equal(result.candidateTransitions[0]!.exposure, 0.5);
+    assert.ok((result.candidateTransitions[0]!.targetProbability ?? 0) > 0);
+    assert.ok(result.valueCandidatePath.some((point) => point.exposure > 0.5));
+    assert.equal(result.metrics.valueDistillation?.returns.strategy.rebalanceCount, 1);
+    assert.ok(result.valueDistributions.every((point) => point.predictor?.optimalExposure === 0.5));
   }
 });
 
@@ -1233,5 +1330,6 @@ test("VW-KAMA evaluator can omit visualization data during parameter search", ()
   assert.equal(result.annotations.length, 0);
   assert.equal(result.candidatePath.points.length, 0);
   assert.equal(result.statePoints.length, 0);
+  assert.equal(result.valueCandidatePath.length, 0);
   assert.ok(result.metrics.signalCount >= 0);
 });

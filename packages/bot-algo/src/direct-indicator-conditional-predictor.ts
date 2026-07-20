@@ -7,6 +7,7 @@ import {
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS,
   forecastHandcraftedIndicatorBackground,
+  prepareHandcraftedIndicatorForecast,
   type HandcraftedIndicatorPredictionOptions,
   type HandcraftedIndicatorPredictorParameters,
   type HandcraftedIndicatorState,
@@ -64,6 +65,13 @@ export interface DirectIndicatorConditionalPrediction {
   backgroundValues: Float64Array;
 }
 
+export interface PreparedDirectIndicatorConditionalPredictor {
+  predict(
+    currentExposure: number,
+    state: HandcraftedIndicatorState,
+  ): DirectIndicatorConditionalPrediction;
+}
+
 export const DEFAULT_DIRECT_INDICATOR_PARAMETERS: Readonly<DirectIndicatorPredictorParameters> = {
   ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   transitionWidthGridCells: 2,
@@ -95,6 +103,33 @@ export function decodeDirectIndicatorConditionalParameters(
   validateDirectInputs(actionGridInput, backgroundGridInput, parameters, options);
   const actionGrid = Float64Array.from(actionGridInput);
   const backgroundGrid = Float64Array.from(backgroundGridInput);
+  const backgroundValues = forecastHandcraftedIndicatorBackground(
+    backgroundGrid,
+    actionGrid,
+    state,
+    parameters,
+    { ...options, exactMaintenanceUtility: true },
+  ).values;
+  return decodeDirectIndicatorConditionalParametersFromBackground(
+    actionGrid,
+    backgroundGrid,
+    backgroundValues,
+    parameters,
+    options,
+  );
+}
+
+function decodeDirectIndicatorConditionalParametersFromBackground(
+  actionGrid: Float64Array,
+  backgroundGrid: Float64Array,
+  backgroundValues: Float64Array,
+  parameters: DirectIndicatorPredictorParameters,
+  options: HandcraftedIndicatorPredictionOptions,
+): {
+  parameters: ConditionalFourSegmentParameters;
+  metadata: DirectIndicatorConditionalMetadata;
+  backgroundValues: Float64Array;
+} {
   const latentLower = backgroundGrid[0]!;
   const latentUpper = backgroundGrid.at(-1)!;
   const visibleLower = actionGrid[0]!;
@@ -104,17 +139,10 @@ export function decodeDirectIndicatorConditionalParameters(
   const rightSupportWidth = SUPPORT_WIDTH_FRACTION * latentSpan;
   const supportLower = latentLower + leftSupportWidth;
   const supportUpper = latentUpper - rightSupportWidth;
-  const background = forecastHandcraftedIndicatorBackground(
-    backgroundGrid,
-    actionGrid,
-    state,
-    parameters,
-    { ...options, exactMaintenanceUtility: true },
-  );
-  if (!background.values.every(Number.isFinite)) {
+  if (!backgroundValues.every(Number.isFinite)) {
     throw new Error("Direct indicator forecast background is infeasible under maintenance constraints.");
   }
-  const derivatives = finiteDifferenceDerivatives(backgroundGrid, background.values);
+  const derivatives = finiteDifferenceDerivatives(backgroundGrid, backgroundValues);
   const spacing = medianSpacing(actionGrid);
   const minimumSeparation = Math.max(spacing, latentSpan * 1e-6);
   const c1Residual = Float64Array.from(backgroundGrid, (exposure, index) =>
@@ -131,10 +159,10 @@ export function decodeDirectIndicatorConditionalParameters(
     c2 = center + minimumSeparation / 2;
   }
 
-  const fLower = interpolate(backgroundGrid, background.values, supportLower);
-  const fC1 = interpolate(backgroundGrid, background.values, c1);
-  const fC2 = interpolate(backgroundGrid, background.values, c2);
-  const fUpper = interpolate(backgroundGrid, background.values, supportUpper);
+  const fLower = interpolate(backgroundGrid, backgroundValues, supportLower);
+  const fC1 = interpolate(backgroundGrid, backgroundValues, c1);
+  const fC2 = interpolate(backgroundGrid, backgroundValues, c2);
+  const fUpper = interpolate(backgroundGrid, backgroundValues, supportUpper);
   const s0 = (fC1 - fLower) / (c1 - supportLower);
   const s1 = (fC2 - fC1) / (c2 - c1);
   const s2 = (fUpper - fC2) / (supportUpper - c2);
@@ -225,7 +253,7 @@ export function decodeDirectIndicatorConditionalParameters(
       ],
       supportInterior: [supportLower, supportUpper],
     },
-    backgroundValues: background.values,
+    backgroundValues,
   };
 }
 
@@ -245,6 +273,42 @@ export function predictDirectIndicatorConditionalDistribution(
     options,
   );
   const actionGrid = Float64Array.from(actionGridInput);
+  return directPredictionFromDecoded(actionGrid, currentExposure, decoded);
+}
+
+/** Compiles the expensive horizon forecast terms for sequential direct-model predictions. */
+export function prepareDirectIndicatorConditionalPredictor(
+  actionGridInput: ArrayLike<number>,
+  backgroundGridInput: ArrayLike<number>,
+  parameters: DirectIndicatorPredictorParameters,
+  options: HandcraftedIndicatorPredictionOptions,
+): PreparedDirectIndicatorConditionalPredictor {
+  validateDirectInputs(actionGridInput, backgroundGridInput, parameters, options);
+  const actionGrid = Float64Array.from(actionGridInput);
+  const backgroundGrid = Float64Array.from(backgroundGridInput);
+  const forecast = prepareHandcraftedIndicatorForecast(
+    backgroundGrid,
+    actionGrid,
+    parameters,
+    { ...options, exactMaintenanceUtility: true },
+  );
+  return { predict: (currentExposure, state) => {
+    const decoded = decodeDirectIndicatorConditionalParametersFromBackground(
+      actionGrid,
+      backgroundGrid,
+      forecast.forecast(state).values,
+      parameters,
+      options,
+    );
+    return directPredictionFromDecoded(actionGrid, currentExposure, decoded);
+  } };
+}
+
+function directPredictionFromDecoded(
+  actionGrid: Float64Array,
+  currentExposure: number,
+  decoded: ReturnType<typeof decodeDirectIndicatorConditionalParameters>,
+): DirectIndicatorConditionalPrediction {
   const probabilities = conditionalFourSegmentExposureProbabilities(
     actionGrid,
     currentExposure,

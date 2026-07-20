@@ -12,7 +12,9 @@ import {
   fitConditionalQuadraticPolicy,
   observeExposureReturn,
   observeExposureValueDistillation,
+  populateSparseExposureValueOracle,
   prepareExposureValueOracle,
+  prepareSparseExposureValueOracle,
   quadraticExponentialLogNormalizer,
   rebalanceEquityFactor,
   shareExposureValueOracle,
@@ -137,6 +139,39 @@ test("probability-MSE quadratic fit minimizes pointwise distribution error", () 
   }
 });
 
+test("exposure-value oracle can retain absolute post-action log returns", () => {
+  const temperature = 0.01;
+  const oracle = prepareExposureValueOracle([100, 110], {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    friction: 0,
+    gridSize: 3,
+    minExposure: -1,
+    maxExposure: 1,
+    temperature,
+    includeProbabilities: true,
+    includeActionValues: true,
+  });
+  assert.ok(oracle.actionValues);
+  const firstRow = oracle.actionValues.subarray(0, oracle.grid.length);
+  const expected = [Math.log(0.9), 0, Math.log(1.1)];
+  for (let index = 0; index < expected.length; index += 1) {
+    assert.ok(Math.abs(firstRow[index]! - expected[index]!) < 1e-12);
+  }
+  const maximum = Math.max(...firstRow);
+  const weights = Array.from(firstRow, (value) => Math.exp((value - maximum) / temperature));
+  const total = weights.reduce((sum, value) => sum + value, 0);
+  const probabilities = exposureValueOracleProbabilities(oracle, 0);
+  for (let index = 0; index < probabilities.length; index += 1) {
+    assert.ok(Math.abs(probabilities[index]! - weights[index]! / total) < 1e-7);
+  }
+  assert.deepEqual(
+    Array.from(shareExposureValueOracle(oracle).actionValues ?? []),
+    Array.from(oracle.actionValues),
+  );
+  assert.equal(truncateExposureValueOracle(oracle, 1).actionValues?.length, oracle.grid.length);
+});
+
 test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (context) => {
   const status = await vwKamaCudaStatus();
   if (!status.available) {
@@ -160,6 +195,7 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
       quoteBorrowRate: 0.000002,
       assetBorrowRate: 0.000003,
       includeProbabilities: true,
+      includeActionValues: true,
     };
     const cpu = prepareExposureValueOracle(prices, options);
     const { oracle: gpu } = await prepareExposureValueOracleCuda(prices, options);
@@ -176,6 +212,7 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
       "weights",
       "opportunities",
       "probabilities",
+      "actionValues",
     ] as const) {
       const expected = cpu[key]!;
       const actual = gpu[key]!;
@@ -981,4 +1018,57 @@ test("tradable exposure may drift beyond its target bound up to the effective li
   observeExposureReturn(returns, 100, 100, 99.5, execution);
   assert.equal(returns.liquidationCount, 1);
   assert.equal(returns.exposure, 0);
+});
+
+test("sparse rolling-horizon oracle rows and later population match the dense oracle", () => {
+  const prices = Array.from({ length: 36 }, (_, index) =>
+    100 * Math.exp(Math.sin(index * 0.7) * 0.004 + index * 0.0002));
+  const options = {
+    scoreStartIndex: 3,
+    holdingPeriodSteps: 2,
+    valueHorizonSteps: 8,
+    friction: 0.00175,
+    gridSize: 11,
+    minExposure: -10,
+    maxExposure: 10,
+    maxEffectiveExposure: 25,
+    temperature: 0.01,
+    terminalIndex: 30,
+    includeProbabilities: true,
+    includeActionValues: true,
+  };
+  const dense = prepareExposureValueOracle(prices, options);
+  const sparse = prepareSparseExposureValueOracle(prices, options, [3, 9, 17]);
+  const compareRow = (index: number): void => {
+    for (const key of [
+      "means",
+      "secondMoments",
+      "modalExposures",
+      "entropies",
+      "policyMeans",
+      "policySecondMoments",
+      "policyMeanLogRebalances",
+      "policyEntropies",
+      "averageRegrets",
+      "weights",
+      "opportunities",
+    ] as const) {
+      assert.ok(Math.abs(dense[key][index]! - sparse[key][index]!) < 2e-5, key);
+    }
+    const denseProbabilities = exposureValueOracleProbabilities(dense, index);
+    const sparseProbabilities = exposureValueOracleProbabilities(sparse, index);
+    for (let cell = 0; cell < denseProbabilities.length; cell += 1) {
+      assert.ok(Math.abs(denseProbabilities[cell]! - sparseProbabilities[cell]!) < 2e-5);
+      const offset = index * dense.grid.length + cell;
+      assert.ok(Math.abs(dense.actionValues![offset]! - sparse.actionValues![offset]!) < 1e-10);
+    }
+  };
+  compareRow(3);
+  compareRow(9);
+  compareRow(17);
+  populateSparseExposureValueOracle(prices, options, sparse, [24]);
+  compareRow(24);
+  assert.ok(Math.abs(dense.path.logReturn - sparse.path.logReturn) < 1e-10);
+  assert.deepEqual(sparse.path.exposures, dense.path.exposures);
+  assert.deepEqual(sparse.path.equities, dense.path.equities);
 });

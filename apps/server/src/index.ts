@@ -9,6 +9,7 @@ import type {
   ManualTradeInput,
   PartialStrategyConfig,
   VwKamaCandleRangeRequest,
+  VwKamaHistoricalAveragesRequest,
   VwKamaInspectorRequest,
   VwKamaPredictorFitRequest,
 } from "@trading/bot-algo";
@@ -417,29 +418,70 @@ server.post("/api/backtest/stop", async () => {
 server.get("/api/kama-inspector/windows", async () => kamaInspector.catalog());
 
 server.post("/api/kama-inspector/candles", async (request, reply) => {
+  const cancellation = new AbortController();
+  const cancelClosedRequest = () => cancellation.abort();
+  reply.raw.once("close", cancelClosedRequest);
   try {
-    return await kamaInspector.candles((request.body ?? {}) as VwKamaCandleRangeRequest);
+    return await kamaInspector.candles(
+      (request.body ?? {}) as VwKamaCandleRangeRequest,
+      cancellation.signal,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "VW-KAMA candle range failed";
     return reply.code(400).send({ error: message });
+  } finally {
+    reply.raw.off("close", cancelClosedRequest);
   }
 });
 
 server.post("/api/kama-inspector/analyze", async (request, reply) => {
+  const cancellation = new AbortController();
+  const cancelClosedRequest = () => cancellation.abort();
+  reply.raw.once("close", cancelClosedRequest);
   try {
-    return await kamaInspector.analyze((request.body ?? {}) as VwKamaInspectorRequest);
+    return await kamaInspector.analyze(
+      (request.body ?? {}) as VwKamaInspectorRequest,
+      cancellation.signal,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "VW-KAMA inspection failed";
     return reply.code(400).send({ error: message });
+  } finally {
+    reply.raw.off("close", cancelClosedRequest);
   }
 });
 
 server.post("/api/kama-inspector/predictor-fit", async (request, reply) => {
+  const cancellation = new AbortController();
+  const cancelClosedRequest = () => cancellation.abort();
+  reply.raw.once("close", cancelClosedRequest);
   try {
-    return await kamaInspector.fitPredictor((request.body ?? {}) as VwKamaPredictorFitRequest);
+    return await kamaInspector.fitPredictor(
+      (request.body ?? {}) as VwKamaPredictorFitRequest,
+      cancellation.signal,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "VW-KAMA predictor fit failed";
     return reply.code(400).send({ error: message });
+  } finally {
+    reply.raw.off("close", cancelClosedRequest);
+  }
+});
+
+server.post("/api/kama-inspector/historical-averages", async (request, reply) => {
+  const cancellation = new AbortController();
+  const cancelClosedRequest = () => cancellation.abort();
+  reply.raw.once("close", cancelClosedRequest);
+  try {
+    return await kamaInspector.historicalAverages(
+      (request.body ?? {}) as VwKamaHistoricalAveragesRequest,
+      cancellation.signal,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "VW-KAMA historical averages failed";
+    return reply.code(400).send({ error: message });
+  } finally {
+    reply.raw.off("close", cancelClosedRequest);
   }
 });
 

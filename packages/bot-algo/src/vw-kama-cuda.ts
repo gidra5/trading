@@ -113,6 +113,7 @@ interface NativeCuda {
     weights: Float32Array,
     opportunities: Float32Array,
     probabilities: Float32Array | null,
+    actionValues: Float64Array | null,
     pathExposures: Float32Array,
     pathEquities: Float64Array,
     pathMetrics: Float64Array,
@@ -600,6 +601,7 @@ export async function prepareExposureValueOracleCuda(
     oracle.weights,
     oracle.opportunities,
     oracle.probabilities ?? null,
+    oracle.actionValues ?? null,
     oracle.path.exposures,
     oracle.path.equities,
     pathMetrics,
@@ -668,13 +670,13 @@ async function loadNative(): Promise<NativeCuda> {
         "double vw_kama_cuda_fitness_case_device_bytes(uint64_t)",
       ),
       destroyFitnessCase: library.func("int vw_kama_cuda_destroy_fitness_case(uint64_t)"),
-      prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle", "int", [
+      prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle_v2", "int", [
         pointer, "int", "int", "int", "int", "int",
         "double", "double", "double", "double", "double", "double", "double", "double", "double",
         "double", "int",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer, pointer,
-        pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer,
       ]),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,

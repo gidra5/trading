@@ -3663,7 +3663,7 @@ extern "C" int vw_kama_cuda_result_size() {
   return sizeof(VwKamaResult);
 }
 
-extern "C" int vw_kama_cuda_prepare_value_oracle(
+extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
   const double* prices,
   int price_count,
   int score_start,
@@ -3693,6 +3693,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
   float* weights,
   float* opportunities,
   float* probabilities,
+  double* action_values,
   float* path_exposures,
   double* path_equities,
   double* path_metrics,
@@ -3732,7 +3733,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     size_t total_device_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_device_bytes, &total_device_bytes), "query oracle CUDA memory");
     const size_t required_cell_bytes = oracle_cells
-      * (4 * sizeof(double) + sizeof(uint16_t));
+      * (4 * sizeof(double) + sizeof(uint16_t) + (action_values ? sizeof(double) : 0));
     if (required_cell_bytes > free_device_bytes * 4 / 5) {
       throw std::runtime_error("Exposure-value CUDA oracle grid exceeds the device-memory admission limit");
     }
@@ -3767,6 +3768,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
     DeviceBuffer<float> device_probabilities(
       probabilities ? static_cast<size_t>(price_count) * grid_size : 0
     );
+    DeviceBuffer<double> device_action_values(action_values ? oracle_cells : 0);
     DeviceBuffer<float> device_path_exposures(price_count);
     DeviceBuffer<double> device_path_equities(price_count);
     DeviceBuffer<double> device_path_metrics(5);
@@ -3910,7 +3912,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
         device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
         device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
-        separable_rebalance_costs ? holding_values.get() : nullptr,
+        action_values
+          ? device_action_values.get()
+          : (separable_rebalance_costs ? holding_values.get() : nullptr),
         false, false, !separable_rebalance_costs, false
       );
       if (separable_rebalance_costs) {
@@ -3926,7 +3930,8 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
           minimum_exposure, maximum_exposure,
           state_grid_size, -maximum_effective_exposure, maximum_effective_exposure,
           temperature, friction, opportunity_epsilon,
-          holding_values.get(), continuations.get(), sell_logs.get(), buy_logs.get(),
+          action_values ? device_action_values.get() : holding_values.get(),
+          continuations.get(), sell_logs.get(), buy_logs.get(),
           device_means.get(), device_second_moments.get(), device_modal_exposures.get(),
           device_entropies.get(), device_policy_means.get(), device_policy_second_moments.get(),
           device_policy_mean_log_rebalances.get(), device_policy_entropies.get(),
@@ -3964,7 +3969,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
           device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
           device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
           device_opportunities.get(), probabilities ? device_probabilities.get() : nullptr,
-          separable_rebalance_costs && level == 0 ? holding_values.get() : nullptr,
+          level == 0
+            ? (action_values
+                ? device_action_values.get()
+                : (separable_rebalance_costs ? holding_values.get() : nullptr))
+            : nullptr,
           true, prior != nullptr, !separable_rebalance_costs && level == 0, false
         );
         prior = current;
@@ -3983,7 +3992,8 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
           minimum_exposure, maximum_exposure,
           state_grid_size, -maximum_effective_exposure, maximum_effective_exposure,
           temperature, friction, opportunity_epsilon,
-          holding_values.get(), prior, sell_logs.get(), buy_logs.get(),
+          action_values ? device_action_values.get() : holding_values.get(),
+          prior, sell_logs.get(), buy_logs.get(),
           device_means.get(), device_second_moments.get(), device_modal_exposures.get(),
           device_entropies.get(), device_policy_means.get(), device_policy_second_moments.get(),
           device_policy_mean_log_rebalances.get(), device_policy_entropies.get(),
@@ -4095,6 +4105,14 @@ extern "C" int vw_kama_cuda_prepare_value_oracle(
         static_cast<size_t>(price_count) * grid_size * sizeof(float),
         cudaMemcpyDeviceToHost
       ), "copy oracle probabilities");
+    }
+    if (action_values) {
+      cuda_check(cudaMemcpy(
+        action_values + static_cast<size_t>(score_start) * grid_size,
+        device_action_values.get(),
+        oracle_cells * sizeof(double),
+        cudaMemcpyDeviceToHost
+      ), "copy oracle action values");
     }
     last_error.clear();
     return 0;

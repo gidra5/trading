@@ -7,9 +7,12 @@ import {
   createExposureValueDistillationAccumulator,
   decodeDirectIndicatorConditionalParameters,
   DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+  exposureConditionalProbabilityStatistics,
   predictDirectIndicatorConditionalDistribution,
   finalizeExposureValueDistillation,
   observeExposureConditionalProbabilityDistillation,
+  observeExposureFourSegmentProbabilityDistillation,
+  prepareDirectIndicatorConditionalPredictor,
   prepareExposureValueOracle,
 } from "../src/index.js";
 
@@ -95,6 +98,29 @@ test("direct indicator conditional rows normalize throughout latent current supp
   }
 });
 
+test("prepared direct predictions match the standalone forecast exactly", () => {
+  const prepared = prepareDirectIndicatorConditionalPredictor(
+    actionGrid,
+    latentGrid,
+    DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+    options,
+  );
+  const expected = predictDirectIndicatorConditionalDistribution(
+    actionGrid,
+    latentGrid,
+    -17,
+    state,
+    DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+    options,
+  );
+  const actual = prepared.predict(-17, state);
+  assert.ok(Math.abs(actual.meanExposure - expected.meanExposure) < 1e-12);
+  assert.ok(actual.probabilities.every((value, index) =>
+    Math.abs(value - expected.probabilities[index]!) < 1e-13));
+  assert.ok(actual.backgroundValues.every((value, index) =>
+    Math.abs(value - expected.backgroundValues[index]!) < 1e-13));
+});
+
 test("direct runtime source has no regret fitter or two-dimensional regret path", () => {
   const source = readFileSync(
     new URL("../src/direct-indicator-conditional-predictor.ts", import.meta.url),
@@ -135,7 +161,26 @@ test("direct conditional policy uses the shared distillation metrics without a s
   const accumulator = createExposureValueDistillationAccumulator({}, oracle.grid.length);
   observeExposureConditionalProbabilityDistillation(accumulator, oracle, 0, policy);
   const metrics = finalizeExposureValueDistillation(accumulator);
+  const directAccumulator = createExposureValueDistillationAccumulator({}, oracle.grid.length);
+  const observation = observeExposureFourSegmentProbabilityDistillation(
+    directAccumulator,
+    oracle,
+    0,
+    prediction.conditionalParameters,
+    true,
+  );
+  const directMetrics = finalizeExposureValueDistillation(directAccumulator);
+  const expectedStatistics = exposureConditionalProbabilityStatistics(
+    policy,
+    oracle.grid,
+    oracle.currentGrid,
+    oracle.execution.friction,
+  );
   assert.equal(metrics.sampleCount, 1);
   assert.ok(Number.isFinite(metrics.crossEntropy) && metrics.crossEntropy > 0, metrics);
   assert.ok(metrics.score > 0 && metrics.score <= 1, metrics);
+  assert.ok(Math.abs(directMetrics.crossEntropy - metrics.crossEntropy) < 1e-12);
+  for (const key of ["mean", "secondMoment", "meanLogRebalance", "entropy"] as const) {
+    assert.ok(Math.abs(observation!.statistics[key] - expectedStatistics[key]) < 1e-10, key);
+  }
 });

@@ -203,3 +203,25 @@ we need to adjust the oracle evaluation:
 
 8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
 9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
+
+ML model:
+1. Historic inputs:
+   1. normalize into log returns
+   2. standardized candle shape
+      1. open-close return
+      2. max deviation up from middle
+      3. max deviation down from middle
+      4. relative log volume over slow volume EMA 
+   3. 64 1s candles
+   4. 64 1m candles
+   5. 32 1h candles
+   6. 32 1d candles
+   7. 16 1M candles
+   8. 16 3M candles
+2. trading and state inputs
+   1.  current exposure
+   2.  fee rate
+   3.  spread
+   4.  min, max usable leverage
+   5.  min, max effective leverage
+   6.  maintenance costs

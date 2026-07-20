@@ -1,6 +1,7 @@
 import { parentPort } from "node:worker_threads";
 import type {
   VwKamaCandleRangeRequest,
+  VwKamaHistoricalAveragesRequest,
   VwKamaInspectorRequest,
   VwKamaPredictorFitRequest,
 } from "@trading/bot-algo";
@@ -13,9 +14,10 @@ let engine: KamaInspectorEngine | null = null;
 
 type InspectorWorkerRequest =
   | { type: "init"; dataDir: string }
-  | { type: "analyze"; id: number; input: VwKamaInspectorRequest }
-  | { type: "candles"; id: number; input: VwKamaCandleRangeRequest }
-  | { type: "fit-predictor"; id: number; input: VwKamaPredictorFitRequest };
+  | { type: "analyze"; id: number; input: VwKamaInspectorRequest; cancelFlag?: Int32Array }
+  | { type: "candles"; id: number; input: VwKamaCandleRangeRequest; cancelFlag?: Int32Array }
+  | { type: "fit-predictor"; id: number; input: VwKamaPredictorFitRequest; cancelFlag?: Int32Array }
+  | { type: "historical-averages"; id: number; input: VwKamaHistoricalAveragesRequest; cancelFlag?: Int32Array };
 
 port.on("message", async (message: InspectorWorkerRequest) => {
   if (message.type === "init") {
@@ -26,10 +28,12 @@ port.on("message", async (message: InspectorWorkerRequest) => {
   if (!engine) return;
   try {
     const result = message.type === "analyze"
-      ? await engine.analyze(message.input)
+      ? await engine.analyze(message.input, message.cancelFlag)
       : message.type === "candles"
-        ? await engine.candles(message.input)
-        : await engine.fitPredictor(message.input);
+        ? await engine.candles(message.input, message.cancelFlag)
+        : message.type === "fit-predictor"
+          ? await engine.fitPredictor(message.input, message.cancelFlag)
+          : await engine.historicalAverages(message.input, message.cancelFlag);
     port.postMessage({ id: message.id, result });
   } catch (error) {
     port.postMessage({
