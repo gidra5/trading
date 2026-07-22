@@ -11,6 +11,7 @@ import {
   prepareHandcraftedIndicatorStates,
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS,
+  MLP_OUTPUT_PARAMETER_COUNT,
   DEFAULT_DIRECT_INDICATOR_PARAMETERS,
   exposureProbabilityTransitionCrossEntropy,
   predictHandcraftedIndicatorRegret,
@@ -45,15 +46,19 @@ import {
   type VwKamaPreset,
   type VwKamaPredictorFitRequest,
   type VwKamaPredictorFitResponse,
+  type VwKamaTimestampPredictionRequest,
+  type VwKamaTimestampPredictionResponse,
   type VwKamaTransition,
   type ExposureReturnMetrics,
   type ExposureValueOracle,
   type HandcraftedIndicatorPredictorParameters,
   type DirectIndicatorPredictorParameters,
+  type MlpExposureStateInputs,
 } from "@trading/bot-algo";
 import { fetchBinanceSpotDailyShard } from "./binance-history-cache.js";
 import { HANDCRAFTED_PREDICTOR_PRESETS } from "./handcrafted-predictor-presets.js";
 import { DIRECT_INDICATOR_PREDICTOR_PRESETS } from "./direct-indicator-predictor-presets.js";
+import { MlpModelRuntime, mlpModelSummaries } from "./mlp-model-runtime.js";
 
 const DAY_MS = 86_400_000;
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -164,6 +169,7 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     model: "handcrafted",
     handcraftedParameters: { ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS },
     directIndicatorParameters: { ...DEFAULT_DIRECT_INDICATOR_PARAMETERS },
+    mlpModelId: "",
   },
   oracleFriction: 0.00175,
   matchWindowMs: 2 * 3_600_000,
@@ -311,6 +317,7 @@ export interface KamaInspectorEngineOptions {
 type InspectorResult = VwKamaInspectorResponse
   | VwKamaCandleRangeResponse
   | VwKamaPredictorFitResponse
+  | VwKamaTimestampPredictionResponse
   | VwKamaHistoricalAveragesResponse;
 
 interface PendingRequest {
@@ -348,6 +355,13 @@ export class KamaInspector {
     return this.request("fit-predictor", input, signal);
   }
 
+  predict(
+    input: VwKamaTimestampPredictionRequest,
+    signal?: AbortSignal,
+  ): Promise<VwKamaTimestampPredictionResponse> {
+    return this.request("predict", input, signal);
+  }
+
   historicalAverages(
     input: VwKamaHistoricalAveragesRequest,
     signal?: AbortSignal,
@@ -356,10 +370,11 @@ export class KamaInspector {
   }
 
   private request<T extends InspectorResult>(
-    type: "analyze" | "candles" | "fit-predictor" | "historical-averages",
+    type: "analyze" | "candles" | "fit-predictor" | "predict" | "historical-averages",
     input: VwKamaInspectorRequest
       | VwKamaCandleRangeRequest
       | VwKamaPredictorFitRequest
+      | VwKamaTimestampPredictionRequest
       | VwKamaHistoricalAveragesRequest,
     signal?: AbortSignal,
   ): Promise<T> {
@@ -445,6 +460,7 @@ export class KamaInspectorEngine {
   private readonly pendingShardFetches = new Map<string, Promise<void>>();
   private readonly now: () => number;
   private readonly fetchDailyShard: (request: MissingDailyShardRequest) => Promise<void>;
+  private readonly mlpRuntime: MlpModelRuntime;
 
   constructor(
     private readonly dataDir: string,
@@ -452,6 +468,7 @@ export class KamaInspectorEngine {
   ) {
     this.now = options.now ?? Date.now;
     this.fetchDailyShard = options.fetchDailyShard ?? fetchBinanceSpotDailyShard;
+    this.mlpRuntime = new MlpModelRuntime(dataDir);
   }
 
   catalog(): VwKamaInspectorCatalog {
@@ -517,7 +534,13 @@ export class KamaInspectorEngine {
                 oracle: valueOracle,
                 strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
                 lossConfig: request.valueDistillation!,
-                ...handcraftedPredictorOptions(request, candles),
+                ...await this.predictorOptions(
+                  request,
+                  candles,
+                  await cached.source,
+                  cancelFlag,
+                  scoreStartIndex,
+                ),
               },
             }),
           });
@@ -611,7 +634,13 @@ export class KamaInspectorEngine {
           score: false,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
           lossConfig: request.valueDistillation!,
-          ...handcraftedPredictorOptions(request, candles),
+          ...await this.predictorOptions(
+            request,
+            candles,
+            await cached.source,
+            cancelFlag,
+            scoreStartIndex,
+          ),
         },
       });
       indicatorPoints.push(...evaluation.indicatorPoints);
@@ -746,6 +775,85 @@ export class KamaInspectorEngine {
     throw new Error("Historical oracle candle is not present in the selected continuous history.");
   }
 
+  async predict(
+    input: VwKamaTimestampPredictionRequest,
+    cancelFlag?: Int32Array,
+  ): Promise<VwKamaTimestampPredictionResponse> {
+    throwIfInspectorCancelled(cancelFlag);
+    const startedAt = performance.now();
+    const request = normalizeRequest(input);
+    if (request.predictor?.model !== "mlp") {
+      throw new Error("Timestamp prediction endpoint requires the MLP predictor model.");
+    }
+    if (!Number.isFinite(input.time)) throw new Error("MLP prediction time must be finite.");
+    const selected = resolveInspectorWindow(request.windowId, request.latestDays, this.now());
+    validateWindowScale(selected, request.intervalMs);
+    const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
+      && request.valueDistillation!.horizonEndMode === "extend"
+      ? request.valueDistillation!.valueHorizonMs
+      : 0);
+    const cached = this.cachedWindow(selected, sourceEndTime);
+    const segments = await this.scaledSegments(cached, request.intervalMs);
+    const warmupMs = candidateWarmupMs(request);
+    for (const [segmentIndex, segment] of segments.entries()) {
+      const candleIndex = segment.findIndex((candle) => candle.closeTime === input.time);
+      if (candleIndex < 0) continue;
+      const scoreEndIndex = candleLowerBound(segment, selected.endTime);
+      const scoreStart = Math.max(
+        selected.startTime,
+        segment[0]!.openTime + (segmentIndex > 0 ? warmupMs : 0),
+      );
+      const scoreStartIndex = candleLowerBound(segment, scoreStart);
+      if (candleIndex < scoreStartIndex || candleIndex >= scoreEndIndex) {
+        throw new Error("MLP prediction candle is outside the scored inspector range.");
+      }
+      const candles = segment.slice(0, candleIndex + 1);
+      const oracle = await this.oracle(cached, request, segment);
+      const valueOracle = await this.exposureOracle(
+        cached,
+        request,
+        segment,
+        scoreStartIndex,
+        scoreEndIndex,
+        oracle.stateCodes,
+        [candleIndex],
+        cancelFlag,
+      );
+      const evaluation = evaluateVwKamaOracle(candles, {
+        ...request,
+        scoreStartTime: scoreStart,
+        scoreStartIndex,
+        maxPoints: 1,
+        maxDistributionPoints: 1,
+        traceTimes: [input.time],
+        cancelFlag,
+        oracleResult: oracle,
+        valueDistillation: {
+          oracle: valueOracle,
+          score: false,
+          strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
+          lossConfig: request.valueDistillation!,
+          ...await this.predictorOptions(
+            request,
+            candles,
+            await cached.source,
+            cancelFlag,
+            scoreStartIndex,
+          ),
+        },
+      });
+      const point = evaluation.valueDistributions.find((value) => value.time === input.time);
+      if (!point) throw new Error("MLP inference did not produce the requested candle distribution.");
+      return {
+        time: input.time,
+        modelId: request.predictor.mlpModelId,
+        point,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      };
+    }
+    throw new Error("MLP prediction candle is not present in the selected continuous history.");
+  }
+
   async fitPredictor(input: VwKamaPredictorFitRequest, cancelFlag?: Int32Array): Promise<VwKamaPredictorFitResponse> {
     throwIfInspectorCancelled(cancelFlag);
     const startedAt = performance.now();
@@ -826,6 +934,56 @@ export class KamaInspectorEngine {
       };
     }
     throw new Error("Predictor fit candle is not present in the selected continuous history.");
+  }
+
+  private async predictorOptions(
+    request: VwKamaInspectorRequest,
+    candles: Candle[],
+    oneSecondCandles: Candle[],
+    cancelFlag?: Int32Array,
+    predictionStartIndex = 0,
+  ): Promise<ReturnType<typeof handcraftedPredictorOptions> & {
+    mlpPredictor?: {
+      modelId: string;
+      rawParameters: Float32Array[];
+    };
+  }> {
+    if (request.predictor?.model !== "mlp") return handcraftedPredictorOptions(request, candles);
+    const config = request.valueDistillation!;
+    const state: MlpExposureStateInputs = {
+      feeRate: request.oracleFriction,
+      minimumUsableExposure: config.minExposure,
+      maximumUsableExposure: config.maxExposure,
+      minimumEffectiveExposure: -config.maxEffectiveExposure,
+      maximumEffectiveExposure: config.maxEffectiveExposure,
+      quoteLendRate: config.quoteLendRate,
+      quoteBorrowRate: config.quoteBorrowRate,
+      assetBorrowRate: config.assetBorrowRate,
+    };
+    if (!Number.isInteger(predictionStartIndex)
+      || predictionStartIndex < 0
+      || predictionStartIndex >= candles.length) {
+      throw new Error("MLP prediction start index is outside the candle series.");
+    }
+    const rawParameters = await this.mlpRuntime.predict(
+      request.predictor.mlpModelId,
+      oneSecondCandles,
+      candles.slice(predictionStartIndex).map((candle) => candle.closeTime),
+      state,
+      cancelFlag,
+    );
+    return {
+      mlpPredictor: {
+        modelId: request.predictor.mlpModelId,
+        rawParameters: [
+          ...Array.from(
+            { length: predictionStartIndex },
+            () => new Float32Array(MLP_OUTPUT_PARAMETER_COUNT),
+          ),
+          ...rawParameters,
+        ],
+      },
+    };
   }
 
   private cachedWindow(selected: VwKamaInspectorWindow, sourceEndTime: number): CachedWindow {
@@ -1104,6 +1262,7 @@ function inspectorCatalog(dataDir: string, now = Date.now()): VwKamaInspectorCat
       ...HANDCRAFTED_PREDICTOR_PRESETS,
       ...DIRECT_INDICATOR_PREDICTOR_PRESETS,
     ].map((preset) => structuredClone(preset)),
+    mlpModels: mlpModelSummaries(dataDir),
   };
 }
 
@@ -1673,11 +1832,16 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
       ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
       ...request.predictor?.directIndicatorParameters,
     },
+    mlpModelId: request.predictor?.mlpModelId ?? "",
   };
   if (request.predictor.model !== "legacy"
     && request.predictor.model !== "handcrafted"
-    && request.predictor.model !== "direct-indicator") {
-    throw new Error("VW-KAMA predictor model must be legacy, handcrafted, or direct-indicator.");
+    && request.predictor.model !== "direct-indicator"
+    && request.predictor.model !== "mlp") {
+    throw new Error("VW-KAMA predictor model must be legacy, handcrafted, direct-indicator, or mlp.");
+  }
+  if (request.predictor.model === "mlp" && !request.predictor.mlpModelId) {
+    throw new Error("VW-KAMA MLP predictor requires a selected trained model artifact.");
   }
   request.valueDistillation = {
     ...DEFAULT_REQUEST.valueDistillation!,

@@ -185,11 +185,13 @@ we need to adjust the oracle evaluation:
    1. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
 5. we compute objective as oracle value distillation over all example windows
    1. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
-   2. w_t=W_t/sum(W_t)
-   3. W_t=eps+R_t(a_t)/median_a(R_t(a)) 
-   4. or W_t=max_A(Q_t(a))-min_A(Q_t(a))
+   2. w_t=W_t/mean_batch(W_t)
+   3. B_t(x)=E[a-x|x]/(E[abs(a-x)|x]+eps), using the visible-range oracle policy.
+   4. W_t=eps+abs(mean_x(B_t(x))) over visible states in the deterministic current-exposure grid.
+      1. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
+      2. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
    5. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
-      1. entropyGap is the opportunity-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
+      1. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
       2. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
       3. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
       4. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
@@ -204,7 +206,7 @@ we need to adjust the oracle evaluation:
 8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
 9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
 
-ML model:
+ML model based on MLP:
 1. Historic inputs:
    1. normalize into log returns
    2. standardized candle shape
@@ -212,16 +214,42 @@ ML model:
       2. max deviation up from middle
       3. max deviation down from middle
       4. relative log volume over slow volume EMA 
-   3. 64 1s candles
-   4. 64 1m candles
-   5. 32 1h candles
-   6. 32 1d candles
-   7. 16 1M candles
-   8. 16 3M candles
+   3. for each candle size last candle is the latest candle that may be partially complete
+   4. last 64 1s candles
+   5. no last 1s candle fill fraction, assume its the finest granularity
+   6. last 64 1m candles
+   7. last 1m candle fill fraction
+   8. last 32 1h candles
+   9. last 1h candle fill fraction
+   10. last 32 1d candles
+   11. last 1d candle fill fraction
+   12. last 16 1M candles
+   13. last 1M candle fill fraction
+   14. last 16 3M candles
+   15. last 3M candle fill fraction
 2. trading and state inputs
-   1.  current exposure
-   2.  fee rate
-   3.  spread
-   4.  min, max usable leverage
-   5.  min, max effective leverage
-   6.  maintenance costs
+   1.  fee rate
+   2.  optional spread
+   3.  min, max usable leverage
+   4.  min, max effective leverage
+   5.  maintenance costs
+3.  Architecture:
+    1.  accept historic and state inputs
+    2.  network depth 16
+    3.  per layer 1024 neurons
+    4.  predict the eight raw parameters of the quadratic exposure distribution:
+        `c1`, `c2`, `b`, `lambda`, `betaC1`, `betaC2`, and the exact lower/upper
+        mandatory-hold survival cutoffs. Fit the score over the full effective
+        range and truncate it to usable leverage only at execution time.
+4.  Optimize the loss function against the revised fitted oracle policy. All
+    distribution objectives use the visible current/target exposure surface:
+    cross entropy + probability MSE + parameter MSE, with excess entropy,
+    state MI, and oracle MI as separately reported 0.1-weight objectives.
+5.  Examples are every candle in inspector windows
+6.  Validation/testing on last 1M worth of 1s candles.
+
+
+Alternatives:
+1.  PatchTST
+2.  Decision Transformer
+3.  iTransformer

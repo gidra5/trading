@@ -3,7 +3,7 @@ import type { VwKamaPredictorPreset } from "@trading/bot-algo";
 export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   {
     "id": "direct-indicator-global-2026-07-20",
-    "label": "Direct indicator → 17 parameters · global fit",
+    "label": "Direct indicator → 6 quadratic parameters · global fit",
     "model": "direct-indicator",
     "scope": "global",
     "windowId": null,
@@ -24,7 +24,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-fit-full-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · fit-full · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · fit-full · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "fit-full",
@@ -45,7 +45,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-fit-1-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · fit-1 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · fit-1 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "fit-1",
@@ -66,7 +66,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-fit-2-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · fit-2 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · fit-2 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "fit-2",
@@ -87,7 +87,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-fit-3-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · fit-3 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · fit-3 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "fit-3",
@@ -108,7 +108,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-fit-4-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · fit-4 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · fit-4 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "fit-4",
@@ -129,7 +129,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sideways-churn-2022-07-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sideways-churn-2022-07 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sideways-churn-2022-07 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sideways-churn-2022-07",
@@ -150,7 +150,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sideways-churn-2022-05-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sideways-churn-2022-05 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sideways-churn-2022-05 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sideways-churn-2022-05",
@@ -171,7 +171,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sideways-churn-2021-12-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sideways-churn-2021-12 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sideways-churn-2021-12 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sideways-churn-2021-12",
@@ -192,7 +192,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sideways-churn-2021-09-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sideways-churn-2021-09 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sideways-churn-2021-09 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sideways-churn-2021-09",
@@ -213,7 +213,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sideways-churn-2023-03-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sideways-churn-2023-03 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sideways-churn-2023-03 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sideways-churn-2023-03",
@@ -234,7 +234,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-regime-up-2023-03-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · regime-up-2023-03 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · regime-up-2023-03 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "regime-up-2023-03",
@@ -255,7 +255,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-regime-flat-2026-04-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · regime-flat-2026-04 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · regime-flat-2026-04 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "regime-flat-2026-04",
@@ -276,7 +276,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-regime-down-2022-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · regime-down-2022-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · regime-down-2022-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "regime-down-2022-06",
@@ -297,7 +297,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-up-low-2024-02-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-up-low-2024-02 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-up-low-2024-02 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-up-low-2024-02",
@@ -318,7 +318,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-up-high-2022-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-up-high-2022-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-up-high-2022-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-up-high-2022-06",
@@ -339,7 +339,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-down-low-2023-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-down-low-2023-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-down-low-2023-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-down-low-2023-06",
@@ -360,7 +360,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-down-high-2022-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-down-high-2022-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-down-high-2022-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-down-high-2022-06",
@@ -381,7 +381,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-high-bias-2021-10-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-high-bias-2021-10 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-high-bias-2021-10 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-high-bias-2021-10",
@@ -402,7 +402,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-high-bias-low-2025-02-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-high-bias-low-2025-02 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-high-bias-low-2025-02 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-high-bias-low-2025-02",
@@ -423,7 +423,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-low-bias-2024-07-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-low-bias-2024-07 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-low-bias-2024-07 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-low-bias-2024-07",
@@ -444,7 +444,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-low-bias-low-2025-07-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-low-bias-low-2025-07 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-low-bias-low-2025-07 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-low-bias-low-2025-07",
@@ -465,7 +465,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-mid-bias-2024-01-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-mid-bias-2024-01 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-mid-bias-2024-01 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-mid-bias-2024-01",
@@ -486,7 +486,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-shape-flat-mid-bias-low-2023-09-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · shape-flat-mid-bias-low-2023-09 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · shape-flat-mid-bias-low-2023-09 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "shape-flat-mid-bias-low-2023-09",
@@ -507,7 +507,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-up-3d-2024-11-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-up-3d-2024-11 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-up-3d-2024-11 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-up-3d-2024-11",
@@ -528,7 +528,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-up-3d-2023-12-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-up-3d-2023-12 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-up-3d-2023-12 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-up-3d-2023-12",
@@ -549,7 +549,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-down-3d-2026-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-down-3d-2026-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-down-3d-2026-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-down-3d-2026-06",
@@ -570,7 +570,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-down-3d-2023-03-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-down-3d-2023-03 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-down-3d-2023-03 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-down-3d-2023-03",
@@ -591,7 +591,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-up-7d-2023-12-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-up-7d-2023-12 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-up-7d-2023-12 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-up-7d-2023-12",
@@ -612,7 +612,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-up-7d-2024-11-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-up-7d-2024-11 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-up-7d-2024-11 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-up-7d-2024-11",
@@ -633,7 +633,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-down-7d-2023-03-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-down-7d-2023-03 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-down-7d-2023-03 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-down-7d-2023-03",
@@ -654,7 +654,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-sharpe-down-7d-2026-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · sharpe-down-7d-2026-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · sharpe-down-7d-2026-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "sharpe-down-7d-2026-06",
@@ -675,7 +675,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-failure-down-3d-2022-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · failure-down-3d-2022-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · failure-down-3d-2022-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "failure-down-3d-2022-06",
@@ -696,7 +696,7 @@ export const DIRECT_INDICATOR_PREDICTOR_PRESETS = [
   },
   {
     "id": "direct-indicator-local-failure-down-7d-2022-06-1m-2026-07-20",
-    "label": "Direct indicator → 17 parameters · local fit · failure-down-7d-2022-06 · 1m",
+    "label": "Direct indicator → 6 quadratic parameters · local fit · failure-down-7d-2022-06 · 1m",
     "model": "direct-indicator",
     "scope": "window",
     "windowId": "failure-down-7d-2022-06",

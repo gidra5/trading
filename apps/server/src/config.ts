@@ -26,6 +26,7 @@ const market = createConfiguredMarketListing({
 const legacyValleyPeakEnv = parseLegacyValleyPeakEnv();
 
 export const appConfig = {
+  repoRoot,
   environment: environment ?? "local",
   host: process.env.HOST ?? "0.0.0.0",
   port: Number(process.env.PORT ?? 3001),
@@ -50,6 +51,9 @@ export const appConfig = {
   },
   dataDir: resolveDataDir(environment),
   webDistDir: path.join(repoRoot, "apps/web/dist"),
+  mlpTrainingPlanFile: path.resolve(
+    process.env.TRADING_MLP_TRAINING_PLAN ?? path.join(repoRoot, "ml/training-plan.json"),
+  ),
   historicalCache: {
     maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 1024 * 1024 * 1024),
     minFreeBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MIN_FREE_BYTES, 1024 * 1024 * 1024),

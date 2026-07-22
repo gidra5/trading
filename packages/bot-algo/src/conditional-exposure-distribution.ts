@@ -1,30 +1,29 @@
-import {
-  fitConditionalFourSegmentScores,
-  type ConditionalFourSegmentScoreFit,
-} from "./parameter-fit.js";
-
 export interface ConditionalFourSegmentModelOptions {
   latentLower: number;
   latentUpper: number;
   visibleLower?: number;
   visibleUpper?: number;
+  /** Action interval used only for CE, KL, and probability MSE. */
+  metricVisibleLower?: number;
+  metricVisibleUpper?: number;
+  /** Optional separate current-exposure interval for diagnostics. */
+  metricCurrentLower?: number;
+  metricCurrentUpper?: number;
+  /** One-way execution friction as a decimal rate. It determines beta_x. */
+  friction?: number;
+  /** Oracle policy temperature. It determines beta_x. */
+  temperature?: number;
   initialC1?: number;
   initialC2?: number;
-  initialLeftSupportWidth?: number;
-  initialRightSupportWidth?: number;
-  initialKappaC1?: number;
-  initialKappaX?: number;
-  initialKappaC2?: number;
-  leftSupportSharpness?: number;
-  rightSupportSharpness?: number;
-  minimumKappa?: number;
-  minimumSupportSharpness?: number;
+  /** Exact feasible holding interval; defaults to the complete effective range. */
+  cutoffLower?: number;
+  cutoffUpper?: number;
   maxIterations?: number;
   restartCount?: number;
   sampleStates?: number;
   sampleActions?: number;
   tolerance?: number;
-  /** Jointly refine the projected score fit against conditional cross-entropy. Defaults to true. */
+  /** Jointly refine the weighted score projection against cross-entropy. */
   refineProjectedFit?: boolean;
 }
 
@@ -33,32 +32,52 @@ export interface ConditionalFourSegmentParameters {
   latentUpper: number;
   visibleLower: number;
   visibleUpper: number;
+  /** Hard survival bounds learned from the mandatory holding path. */
+  cutoffLower: number;
+  cutoffUpper: number;
+  /** Center used by the fitted quadratic basis (the effective-range center for new models). */
+  basisCenter: number;
   c1: number;
   c2: number;
-  leftSupportWidth: number;
-  rightSupportWidth: number;
-  leftSupportSharpness: number;
-  rightSupportSharpness: number;
-  baseSlope: readonly [number, number];
-  betaC1: readonly [number, number];
-  betaX: readonly [number, number];
-  betaC2: readonly [number, number];
+  /** Linear score coefficient b. */
+  baseSlope: number;
+  /** Signed score curvature lambda in -lambda (a-a_center)^2 / 2. */
+  quadraticPrecision: number;
+  betaC1: number;
+  /** Fee-derived moving transition coefficient; not learned. */
+  betaX: number;
+  betaC2: number;
+  /** Fixed breakpoint sharpnesses calibrated for the fitted effective span. */
   kappaC1: number;
   kappaX: number;
   kappaC2: number;
 }
 
 export interface ConditionalFourSegmentSliceParameters {
-  xi: number;
   baseSlope: number;
+  quadraticPrecision: number;
   betaC1: number;
   betaX: number;
   betaC2: number;
   kappaC1: number;
   kappaX: number;
   kappaC2: number;
-  segmentSlopes: readonly [number, number, number, number];
+  /** Piecewise slope offsets before the smooth -lambda(a-a_center) contribution. */
+  segmentSlopeOffsets: readonly [number, number, number, number];
 }
+
+export interface ConditionalFourSegmentRawParameterOptions {
+  latentLower: number;
+  latentUpper: number;
+  visibleLower: number;
+  visibleUpper: number;
+  friction?: number;
+  temperature?: number;
+}
+
+/** [c1, c2, b, lambda, beta_c1, beta_c2, cutoff_lower, cutoff_upper]. */
+export const CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT = 8;
+export const LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT = 6;
 
 export type ConditionalFourSegmentFitTermination =
   | "gradient"
@@ -68,6 +87,8 @@ export type ConditionalFourSegmentFitTermination =
 
 export interface ConditionalFourSegmentPolicyFit {
   parameters: ConditionalFourSegmentParameters;
+  /** Canonical [c1, c2, b, lambda, beta_c1, beta_c2, cutoff_lower, cutoff_upper] representation. */
+  rawParameters: Float64Array;
   crossEntropy: number;
   klDivergence: number;
   meanSquaredError: number;
@@ -83,9 +104,31 @@ interface FixedParameters {
   latentUpper: number;
   visibleLower: number;
   visibleUpper: number;
-  minimumKappa: number;
-  minimumSupportSharpness: number;
+  visibleCenter: number;
+  visibleSpan: number;
+  basisCenter: number;
+  basisSpan: number;
+  halfBasisSpan: number;
   slopeScale: number;
+  precisionScale: number;
+  betaX: number;
+  kappaC1: number;
+  kappaX: number;
+  kappaC2: number;
+}
+
+interface MappedParameters {
+  c1: number;
+  c2: number;
+  c1Derivative: number;
+  c2C1Derivative: number;
+  c2Derivative: number;
+  baseSlope: number;
+  quadraticPrecision: number;
+  betaC1: number;
+  betaC2: number;
+  cutoffLower: number;
+  cutoffUpper: number;
 }
 
 interface ObjectiveValue {
@@ -100,36 +143,70 @@ interface OptimizationResult extends ObjectiveValue {
   converged: boolean;
 }
 
-const PARAMETER_COUNT = 17;
+const PARAMETER_COUNT = CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT;
 const C1_RAW = 0;
 const C2_RAW = 1;
-const BASE_0 = 2;
-const BASE_1 = 3;
-const BETA_C1_0 = 4;
-const BETA_C1_1 = 5;
-const BETA_X_0 = 6;
-const BETA_X_1 = 7;
-const BETA_C2_0 = 8;
-const BETA_C2_1 = 9;
-const KAPPA_C1_RAW = 10;
-const KAPPA_X_RAW = 11;
-const KAPPA_C2_RAW = 12;
-const LEFT_WIDTH_RAW = 13;
-const RIGHT_WIDTH_RAW = 14;
-const LEFT_SHARPNESS_RAW = 15;
-const RIGHT_SHARPNESS_RAW = 16;
-const LINEAR_PARAMETER_INDICES = [
-  BASE_0,
-  BASE_1,
-  BETA_C1_0,
-  BETA_C1_1,
-  BETA_X_0,
-  BETA_X_1,
-  BETA_C2_0,
-  BETA_C2_1,
-] as const;
+const BASE_RAW = 2;
+const PRECISION_RAW = 3;
+const BETA_C1_RAW = 4;
+const BETA_C2_RAW = 5;
+const CUTOFF_LOWER_RAW = 6;
+const CUTOFF_UPPER_RAW = 7;
+const LINEAR_PARAMETER_INDICES = [BASE_RAW, PRECISION_RAW, BETA_C1_RAW, BETA_C2_RAW] as const;
+const FIXED_KAPPA_C_VISIBLE_PRODUCT = 82;
+const FIXED_KAPPA_X_VISIBLE_PRODUCT = 678;
 
-/** Fits the documented order-independent conditional four-segment surface. */
+/**
+ * Decode the learned coordinates. New eight-coordinate models fit and scale on
+ * the complete effective range, then apply the usable range only as an
+ * execution-time truncation. Six-coordinate artifacts retain their original
+ * visible-range scaling and receive effective-range cutoff defaults.
+ */
+export function conditionalFourSegmentParametersFromRaw(
+  rawInput: ArrayLike<number>,
+  options: ConditionalFourSegmentRawParameterOptions,
+): ConditionalFourSegmentParameters {
+  const legacy = rawInput.length === LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT;
+  if (!legacy && rawInput.length !== PARAMETER_COUNT) {
+    throw new Error(
+      `Conditional four-segment raw output must contain ${LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT} or ${PARAMETER_COUNT} values.`,
+    );
+  }
+  const fixed = createFixedParameters(options, legacy);
+  const raw = new Float64Array(PARAMETER_COUNT);
+  raw.set(rawInput);
+  if (legacy) {
+    raw[CUTOFF_LOWER_RAW] = -14;
+    raw[CUTOFF_UPPER_RAW] = 14;
+  }
+  if (!raw.every(Number.isFinite)) {
+    throw new Error("Conditional four-segment raw output must be finite.");
+  }
+  boundRaw(raw);
+  return parametersFromRaw(raw, fixed);
+}
+
+/** Encode an exact feasible interval into the two bounded MLP coordinates. */
+export function conditionalCutoffRawParameters(
+  cutoffLower: number,
+  cutoffUpper: number,
+  support: Pick<ConditionalFourSegmentRawParameterOptions, "latentLower" | "latentUpper">,
+): readonly [number, number] {
+  if (!(Number.isFinite(cutoffLower) && Number.isFinite(cutoffUpper))
+    || !(support.latentLower < 0 && support.latentUpper > 0)
+    || cutoffLower < support.latentLower || cutoffLower > 0
+    || cutoffUpper < 0 || cutoffUpper > support.latentUpper) {
+    throw new Error("Conditional hard cutoffs must form a finite interval around zero inside effective support.");
+  }
+  const lowerFraction = (cutoffLower - support.latentLower) / -support.latentLower;
+  const upperFraction = cutoffUpper / support.latentUpper;
+  return [
+    lowerFraction <= 0 ? -14 : lowerFraction >= 1 ? 14 : clamp(logit(lowerFraction), -14, 14),
+    upperFraction <= 0 ? -14 : upperFraction >= 1 ? 14 : clamp(logit(upperFraction), -14, 14),
+  ];
+}
+
+/** Fit the shared score surface while keeping exact hard cutoffs fixed. */
 export function fitConditionalFourSegmentPolicy(
   actionGrid: ArrayLike<number>,
   targetProbabilities: ArrayLike<number>,
@@ -139,101 +216,84 @@ export function fitConditionalFourSegmentPolicy(
   validateInputs(actionGrid, targetProbabilities, currentExposures, options);
   const visibleLower = options.visibleLower ?? actionGrid[0]!;
   const visibleUpper = options.visibleUpper ?? actionGrid[actionGrid.length - 1]!;
-  const visibleSpan = visibleUpper - visibleLower;
-  const latentSpan = options.latentUpper - options.latentLower;
-  const fixed: FixedParameters = {
-    latentLower: options.latentLower,
-    latentUpper: options.latentUpper,
+  const metricVisibleLower = options.metricVisibleLower ?? visibleLower;
+  const metricVisibleUpper = options.metricVisibleUpper ?? visibleUpper;
+  const metricCurrentLower = options.metricCurrentLower ?? metricVisibleLower;
+  const metricCurrentUpper = options.metricCurrentUpper ?? metricVisibleUpper;
+  const metricActionCount = Array.from(actionGrid).filter((value) =>
+    value >= metricVisibleLower && value <= metricVisibleUpper).length;
+  const metricStateCount = Array.from(currentExposures).filter((value) =>
+    value >= metricCurrentLower && value <= metricCurrentUpper).length;
+  if (!Number.isFinite(metricVisibleLower) || !Number.isFinite(metricVisibleUpper)
+    || metricVisibleLower < visibleLower || metricVisibleUpper > visibleUpper
+    || !(metricVisibleLower < metricVisibleUpper)
+    || !Number.isFinite(metricCurrentLower) || !Number.isFinite(metricCurrentUpper)
+    || metricCurrentLower < options.latentLower || metricCurrentUpper > options.latentUpper
+    || !(metricCurrentLower < metricCurrentUpper)
+    || metricActionCount < 5 || metricStateCount < 3) {
+    throw new Error("Conditional four-segment metric range must be a complete subset of visible support.");
+  }
+  const fixed = createFixedParameters({
+    ...options,
     visibleLower,
     visibleUpper,
-    minimumKappa: options.minimumKappa ?? 4.394 / latentSpan,
-    minimumSupportSharpness: options.minimumSupportSharpness ?? 1e-5,
-    slopeScale: 1 / visibleSpan,
-  };
-  validateFixed(fixed);
-
+  });
   const stateIndices = sampledIndices(
     currentExposures.length,
     Math.max(3, Math.floor(options.sampleStates ?? 31)),
   );
   const actionIndices = sampledIndices(
     actionGrid.length,
-    Math.max(5, Math.floor(options.sampleActions ?? 41)),
+    Math.max(5, Math.floor(options.sampleActions ?? 51)),
   );
-  const sampledActions = Float64Array.from(actionIndices, (index) => actionGrid[index]!);
-  const sampledStates = Float64Array.from(stateIndices, (index) => currentExposures[index]!);
-  const sampledTargets = normalizedSampledTargets(
+  const actions = Float64Array.from(actionIndices, (index) => actionGrid[index]!);
+  const states = Float64Array.from(stateIndices, (index) => currentExposures[index]!);
+  const targets = normalizedSampledTargets(
     actionGrid.length,
     targetProbabilities,
     stateIndices,
     actionIndices,
   );
-  const projectedFit = variableProjectionInitialFit(
-    sampledActions,
-    sampledTargets,
-    sampledStates,
-    fixed,
-    options,
-  );
-  if (options.refineProjectedFit === false) {
-    return {
-      parameters: projectedFit.parameters,
-      ...fitDiagnostics(
-        actionGrid,
-        targetProbabilities,
-        currentExposures,
-        projectedFit.parameters,
-      ),
-      iterations: projectedFit.iterations,
-      restarts: projectedFit.restarts,
-      termination: projectedFit.termination,
-      converged: projectedFit.converged,
-      refined: false,
-    };
-  }
+  const starts = projectedInitialValues(actions, targets, states, fixed, options);
+  const restartCount = Math.max(1, Math.min(
+    starts.length,
+    Math.floor(options.restartCount ?? starts.length),
+  ));
   const objective = (raw: Float64Array) => conditionalCrossEntropyWithGradient(
-    sampledActions,
-    sampledTargets,
-    sampledStates,
+    actions,
+    targets,
+    states,
     raw,
     fixed,
   );
-  const empiricalValues = empiricalInitialValues(
-    sampledActions,
-    sampledTargets,
-    sampledStates,
-    fixed,
-    options,
-  );
-  const projectedInitial = rawFromParameters(projectedFit.parameters, fixed);
-  const initialValues = [projectedInitial, ...empiricalValues];
-  const restartCount = Math.max(1, Math.min(
-    initialValues.length,
-    Math.floor(options.restartCount ?? initialValues.length),
-  ));
-  const maximumIterations = Math.max(1, Math.floor(options.maxIterations ?? 100));
+  starts.sort((left, right) => objective(left).loss - objective(right).loss);
+  const refine = options.refineProjectedFit !== false;
+  const maximumIterations = refine ? Math.max(1, Math.floor(options.maxIterations ?? 100)) : 0;
   const tolerance = Math.max(Number.EPSILON, options.tolerance ?? 1e-6);
   let best: OptimizationResult | undefined;
   for (let restart = 0; restart < restartCount; restart += 1) {
+    const initial = starts[restart]!;
     let candidate: OptimizationResult;
-    if (maximumIterations === 1) {
-      candidate = optimizeBfgs(initialValues[restart]!, objective, 1, tolerance);
+    if (maximumIterations === 0) {
+      candidate = {
+        ...objective(initial),
+        raw: initial,
+        iterations: 0,
+        termination: "iteration-limit",
+        converged: false,
+      };
     } else {
-      const warmupIterations = Math.min(
-        30,
-        maximumIterations - 1,
-        Math.max(1, Math.floor(maximumIterations / 4)),
-      );
+      const linearIterations = Math.min(20, Math.max(0, maximumIterations - 1));
       const warmup = optimizeBfgs(
-        initialValues[restart]!,
+        initial,
         maskedObjective(objective, LINEAR_PARAMETER_INDICES),
-        warmupIterations,
+        linearIterations,
         tolerance,
       );
       candidate = optimizeBfgs(
         warmup.raw,
         objective,
-        maximumIterations - warmup.iterations,
+        maximumIterations - linearIterations,
         tolerance,
       );
       candidate.iterations += warmup.iterations;
@@ -244,70 +304,26 @@ export function fitConditionalFourSegmentPolicy(
   const parameters = parametersFromRaw(best.raw, fixed);
   return {
     parameters,
-    ...fitDiagnostics(actionGrid, targetProbabilities, currentExposures, parameters),
+    rawParameters: Float64Array.from(best.raw),
+    ...fitDiagnostics(
+      actionGrid,
+      targetProbabilities,
+      currentExposures,
+      parameters,
+      metricVisibleLower,
+      metricVisibleUpper,
+      metricCurrentLower,
+      metricCurrentUpper,
+    ),
     iterations: best.iterations,
     restarts: restartCount,
     termination: best.termination,
     converged: best.converged,
-    refined: true,
+    refined: refine,
   };
 }
 
-/**
- * Fits log probabilities as score values first. Conditional normalization is
- * absorbed by the projected slice offsets, so this provides the documented
- * direct-value estimate before the probability objective jointly refines it.
- */
-function variableProjectionInitialFit(
-  actions: Float64Array,
-  targets: Float64Array,
-  states: Float64Array,
-  fixed: FixedParameters,
-  options: ConditionalFourSegmentModelOptions,
-): ConditionalFourSegmentScoreFit {
-  const scores = new Float64Array(targets.length);
-  for (let row = 0; row < states.length; row += 1) {
-    scores.set(
-      stableLogProbabilities(targets.subarray(row * actions.length, (row + 1) * actions.length)),
-      row * actions.length,
-    );
-  }
-  const supportWidths = initialSupportWidths(fixed, options);
-  const fitsLeftBoundary = actions[0]! < fixed.latentLower + supportWidths[0];
-  const fitsRightBoundary = actions.at(-1)! > fixed.latentUpper - supportWidths[1];
-  return fitConditionalFourSegmentScores(actions, scores, states, {
-    ...options,
-    latentLower: fixed.latentLower,
-    latentUpper: fixed.latentUpper,
-    visibleLower: fixed.visibleLower,
-    visibleUpper: fixed.visibleUpper,
-    initialLeftSupportWidth: supportWidths[0],
-    initialRightSupportWidth: supportWidths[1],
-    minimumKappa: fixed.minimumKappa,
-    minimumSupportSharpness: fixed.minimumSupportSharpness,
-    fitSupport: fitsLeftBoundary || fitsRightBoundary,
-    ridge: 1e-2,
-    maxIterations: Math.min(40, Math.max(12, Math.floor((options.maxIterations ?? 100) / 2))),
-    restartCount: Math.min(3, Math.max(1, Math.floor(options.restartCount ?? 3))),
-    tolerance: Math.min(options.tolerance ?? 1e-6, 1e-7),
-  });
-}
-
-function maskedObjective(
-  objective: (raw: Float64Array) => ObjectiveValue,
-  activeParameters: readonly number[],
-): (raw: Float64Array) => ObjectiveValue {
-  const active = new Set(activeParameters);
-  return (raw) => {
-    const value = objective(raw);
-    for (let parameter = 0; parameter < value.gradient.length; parameter += 1) {
-      if (!active.has(parameter)) value.gradient[parameter] = 0;
-    }
-    return value;
-  };
-}
-
-/** Evaluates one hard-truncated visible row of the fitted model. */
+/** Evaluate one hard-truncated visible row of the fitted model. */
 export function conditionalFourSegmentExposureProbabilities(
   actionGrid: ArrayLike<number>,
   currentExposure: number,
@@ -317,12 +333,11 @@ export function conditionalFourSegmentExposureProbabilities(
   if (result.length !== actionGrid.length) {
     throw new Error("Conditional four-segment result does not match its action grid.");
   }
-  const slice = conditionalFourSegmentParametersAt(currentExposure, parameters);
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < actionGrid.length; index += 1) {
     const action = actionGrid[index]!;
     const value = action >= parameters.visibleLower && action <= parameters.visibleUpper
-      ? logKernel(action, currentExposure, slice, parameters)
+      ? conditionalFourSegmentLogKernel(action, currentExposure, parameters)
       : Number.NEGATIVE_INFINITY;
     result[index] = value;
     maximum = Math.max(maximum, value);
@@ -359,62 +374,190 @@ export function conditionalFourSegmentParametersAt(
   currentExposure: number,
   parameters: ConditionalFourSegmentParameters,
 ): ConditionalFourSegmentSliceParameters {
-  const xi = scaledCurrentExposure(currentExposure, parameters.latentLower, parameters.latentUpper);
-  const baseSlope = linear(parameters.baseSlope, xi);
-  const betaC1 = linear(parameters.betaC1, xi);
-  const betaX = linear(parameters.betaX, xi);
-  const betaC2 = linear(parameters.betaC2, xi);
   const orderedChanges = [
-    { location: parameters.c1, change: betaC1 },
-    { location: currentExposure, change: betaX },
-    { location: parameters.c2, change: betaC2 },
+    { location: parameters.c1, change: parameters.betaC1 },
+    { location: currentExposure, change: parameters.betaX },
+    { location: parameters.c2, change: parameters.betaC2 },
   ].sort((left, right) => left.location - right.location);
-  const slopes = [baseSlope];
-  for (const transition of orderedChanges) slopes.push(slopes.at(-1)! + transition.change);
+  const offsets = [parameters.baseSlope];
+  for (const transition of orderedChanges) offsets.push(offsets.at(-1)! + transition.change);
   return {
-    xi,
-    baseSlope,
-    betaC1,
-    betaX,
-    betaC2,
+    baseSlope: parameters.baseSlope,
+    quadraticPrecision: parameters.quadraticPrecision,
+    betaC1: parameters.betaC1,
+    betaX: parameters.betaX,
+    betaC2: parameters.betaC2,
     kappaC1: parameters.kappaC1,
     kappaX: parameters.kappaX,
     kappaC2: parameters.kappaC2,
-    segmentSlopes: slopes as [number, number, number, number],
+    segmentSlopeOffsets: offsets as [number, number, number, number],
   };
 }
 
-/** Effective action derivative of the normalized row's log density. */
+/** Effective action derivative of a normalized row's log density. */
 export function conditionalFourSegmentLogSlope(
   action: number,
   currentExposure: number,
   parameters: ConditionalFourSegmentParameters,
 ): number {
-  if (!(action > parameters.latentLower && action < parameters.latentUpper)) {
-    return Number.NaN;
-  }
-  const slice = conditionalFourSegmentParametersAt(currentExposure, parameters);
-  return slice.baseSlope
-    + slice.betaC1 * sigmoid(slice.kappaC1 * (action - parameters.c1))
-    + slice.betaX * sigmoid(slice.kappaX * (action - currentExposure))
-    + slice.betaC2 * sigmoid(slice.kappaC2 * (action - parameters.c2))
-    + compactEnvelopeLogSlope(action, parameters);
+  if (action < parameters.latentLower || action > parameters.latentUpper
+    || action < parameters.cutoffLower || action > parameters.cutoffUpper) return Number.NaN;
+  const center = parameters.basisCenter;
+  return parameters.baseSlope
+    - parameters.quadraticPrecision * (action - center)
+    + parameters.betaC1 * sigmoid(parameters.kappaC1 * (action - parameters.c1))
+    + parameters.betaX * sigmoid(parameters.kappaX * (action - currentExposure))
+    + parameters.betaC2 * sigmoid(parameters.kappaC2 * (action - parameters.c2));
 }
 
-function logKernel(
+/** Unnormalized conditional score; row-wise additive constants are immaterial. */
+export function conditionalFourSegmentLogKernel(
   action: number,
-  current: number,
-  slice: ConditionalFourSegmentSliceParameters,
+  currentExposure: number,
   parameters: ConditionalFourSegmentParameters,
 ): number {
-  if (!(action > parameters.latentLower && action < parameters.latentUpper)) {
+  if (action < parameters.latentLower || action > parameters.latentUpper
+    || action < parameters.cutoffLower || action > parameters.cutoffUpper) {
     return Number.NEGATIVE_INFINITY;
   }
-  return slice.baseSlope * (action - parameters.latentLower)
-    + slice.betaC1 * scaledSoftplus(action - parameters.c1, slice.kappaC1)
-    + slice.betaX * scaledSoftplus(action - current, slice.kappaX)
-    + slice.betaC2 * scaledSoftplus(action - parameters.c2, slice.kappaC2)
-    + compactEnvelopeLogValue(action, parameters);
+  const center = parameters.basisCenter;
+  return parameters.baseSlope * (action - parameters.latentLower)
+    - 0.5 * parameters.quadraticPrecision * (action - center) ** 2
+    + parameters.betaC1 * scaledSoftplus(action - parameters.c1, parameters.kappaC1)
+    + parameters.betaX * scaledSoftplus(action - currentExposure, parameters.kappaX)
+    + parameters.betaC2 * scaledSoftplus(action - parameters.c2, parameters.kappaC2);
+}
+
+function projectedInitialValues(
+  actions: Float64Array,
+  targets: Float64Array,
+  states: Float64Array,
+  fixed: FixedParameters,
+  options: ConditionalFourSegmentModelOptions,
+): Float64Array[] {
+  const span = fixed.visibleSpan;
+  const [cutoffLowerRaw, cutoffUpperRaw] = conditionalCutoffRawParameters(
+    options.cutoffLower ?? fixed.latentLower,
+    options.cutoffUpper ?? fixed.latentUpper,
+    fixed,
+  );
+  const outsideC1 = clamp(
+    options.initialC1 ?? (fixed.latentLower + fixed.visibleLower) / 2,
+    fixed.latentLower + 1e-6,
+    fixed.latentUpper - 2e-6,
+  );
+  const outsideC2 = clamp(
+    options.initialC2 ?? (fixed.visibleUpper + fixed.latentUpper) / 2,
+    outsideC1 + 1e-6,
+    fixed.latentUpper - 1e-6,
+  );
+  const detected = empiricalFixedBreakpointLocations(actions, targets, states);
+  const locations: Array<readonly [number, number]> = [
+    ...(detected ? [detected] : []),
+    [outsideC1, outsideC2],
+    [fixed.visibleLower + span / 3, fixed.visibleUpper - span / 3],
+    [
+      Math.max(fixed.latentLower + 1e-6, fixed.visibleLower - span / 8),
+      Math.min(fixed.latentUpper - 1e-6, fixed.visibleUpper + span / 8),
+    ],
+    [fixed.visibleLower + span / 5, fixed.visibleUpper - span / 5],
+  ];
+  const unique = new Map<string, Float64Array>();
+  for (const [inputC1, inputC2] of locations) {
+    const c1 = clamp(inputC1, fixed.latentLower + 1e-6, fixed.latentUpper - 2e-6);
+    const c2 = clamp(inputC2, c1 + 1e-6, fixed.latentUpper - 1e-6);
+    const raw = projectedLinearRaw(actions, targets, states, c1, c2, fixed);
+    raw[CUTOFF_LOWER_RAW] = cutoffLowerRaw;
+    raw[CUTOFF_UPPER_RAW] = cutoffUpperRaw;
+    unique.set(`${raw[C1_RAW]!.toFixed(7)}:${raw[C2_RAW]!.toFixed(7)}`, raw);
+  }
+  return [...unique.values()];
+}
+
+/**
+ * Weighted variable projection from the screenshot derivation. The nuisance
+ * alpha(x) is eliminated by centering each row, leaving the linear design
+ * [a, -a^2/2, H_c1(a), H_c2(a)] after subtracting the fixed fee transition.
+ */
+function projectedLinearRaw(
+  actions: Float64Array,
+  targets: Float64Array,
+  states: Float64Array,
+  c1: number,
+  c2: number,
+  fixed: FixedParameters,
+): Float64Array {
+  const featureCount = 4;
+  const normal = new Float64Array(featureCount * featureCount);
+  const right = new Float64Array(featureCount);
+  const rowFeatures = new Float64Array(actions.length * featureCount);
+  const rowResidual = new Float64Array(actions.length);
+  const means = new Float64Array(featureCount);
+  for (let row = 0; row < states.length; row += 1) {
+    means.fill(0);
+    let residualMean = 0;
+    let totalWeight = 0;
+    let maximumProbability = 0;
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      maximumProbability = Math.max(
+        maximumProbability,
+        targets[row * actions.length + actionIndex]!,
+      );
+    }
+    const probabilityFloor = Math.max(1e-300, maximumProbability * 1e-6);
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const action = actions[actionIndex]!;
+      const target = targets[row * actions.length + actionIndex]!;
+      const weight = Math.max(target, maximumProbability * 1e-3);
+      const z = (action - fixed.basisCenter) / fixed.halfBasisSpan;
+      const featureOffset = actionIndex * featureCount;
+      rowFeatures[featureOffset] = (action - fixed.latentLower) / fixed.basisSpan;
+      rowFeatures[featureOffset + 1] = -0.5 * z * z;
+      rowFeatures[featureOffset + 2]
+        = scaledSoftplus(action - c1, fixed.kappaC1) / fixed.basisSpan;
+      rowFeatures[featureOffset + 3]
+        = scaledSoftplus(action - c2, fixed.kappaC2) / fixed.basisSpan;
+      rowResidual[actionIndex] = Math.log(Math.max(probabilityFloor, target))
+        - fixed.betaX * scaledSoftplus(action - states[row]!, fixed.kappaX);
+      totalWeight += weight;
+      residualMean += weight * rowResidual[actionIndex]!;
+      for (let feature = 0; feature < featureCount; feature += 1) {
+        means[feature] += weight * rowFeatures[featureOffset + feature]!;
+      }
+    }
+    residualMean /= totalWeight;
+    for (let feature = 0; feature < featureCount; feature += 1) means[feature] /= totalWeight;
+    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+      const target = targets[row * actions.length + actionIndex]!;
+      const weight = Math.max(target, maximumProbability * 1e-3);
+      const featureOffset = actionIndex * featureCount;
+      const centeredResidual = rowResidual[actionIndex]! - residualMean;
+      for (let left = 0; left < featureCount; left += 1) {
+        const centeredLeft = rowFeatures[featureOffset + left]! - means[left]!;
+        right[left] += weight * centeredLeft * centeredResidual;
+        for (let column = 0; column <= left; column += 1) {
+          normal[left * featureCount + column] += weight * centeredLeft
+            * (rowFeatures[featureOffset + column]! - means[column]!);
+        }
+      }
+    }
+  }
+  for (let row = 0; row < featureCount; row += 1) {
+    for (let column = 0; column < row; column += 1) {
+      normal[column * featureCount + row] = normal[row * featureCount + column]!;
+    }
+    normal[row * featureCount + row] += 1e-7;
+  }
+  const coefficients = solveLinearSystem(normal, right, featureCount)
+    ?? new Float64Array(featureCount);
+  const raw = new Float64Array(PARAMETER_COUNT);
+  [raw[C1_RAW], raw[C2_RAW]] = rawBreakpoints(c1, c2, fixed);
+  raw[BASE_RAW] = coefficients[0]!;
+  raw[PRECISION_RAW] = coefficients[1]!;
+  raw[BETA_C1_RAW] = coefficients[2]!;
+  raw[BETA_C2_RAW] = coefficients[3]!;
+  boundRaw(raw);
+  return raw;
 }
 
 function conditionalCrossEntropyWithGradient(
@@ -431,61 +574,39 @@ function conditionalCrossEntropyWithGradient(
   let loss = 0;
   for (let row = 0; row < states.length; row += 1) {
     const current = states[row]!;
-    const xi = scaledCurrentExposure(current, fixed.latentLower, fixed.latentUpper);
-    const baseSlope = mapped.base0 + mapped.base1 * xi;
-    const betaC1 = mapped.betaC10 + mapped.betaC11 * xi;
-    const betaX = mapped.betaX0 + mapped.betaX1 * xi;
-    const betaC2 = mapped.betaC20 + mapped.betaC21 * xi;
     let maximum = Number.NEGATIVE_INFINITY;
     for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
       const action = actions[actionIndex]!;
       const c1Offset = action - mapped.c1;
-      const xOffset = action - current;
       const c2Offset = action - mapped.c2;
-      const spC1 = scaledSoftplus(c1Offset, mapped.kappaC1);
-      const spX = scaledSoftplus(xOffset, mapped.kappaX);
-      const spC2 = scaledSoftplus(c2Offset, mapped.kappaC2);
-      const gate = compactEnvelopeLogValueMapped(action, mapped, fixed);
-      const logit = baseSlope * (action - fixed.latentLower)
-        + betaC1 * spC1 + betaX * spX + betaC2 * spC2 + gate.value;
+      const spC1 = scaledSoftplus(c1Offset, fixed.kappaC1);
+      const spC2 = scaledSoftplus(c2Offset, fixed.kappaC2);
+      const z = (action - fixed.basisCenter) / fixed.halfBasisSpan;
+      const feasible = action >= mapped.cutoffLower && action <= mapped.cutoffUpper;
+      const logit = feasible ? mapped.baseSlope * (action - fixed.latentLower)
+        - 0.5 * mapped.quadraticPrecision * (action - fixed.basisCenter) ** 2
+        + mapped.betaC1 * spC1
+        + fixed.betaX * scaledSoftplus(action - current, fixed.kappaX)
+        + mapped.betaC2 * spC2 : Number.NEGATIVE_INFINITY;
       logits[actionIndex] = logit;
       maximum = Math.max(maximum, logit);
       const derivativeOffset = actionIndex * PARAMETER_COUNT;
-      const sigmoidC1 = sigmoid(mapped.kappaC1 * c1Offset);
-      const sigmoidC2 = sigmoid(mapped.kappaC2 * c2Offset);
-      derivatives[derivativeOffset + C1_RAW] = -betaC1 * sigmoidC1 * mapped.c1Derivative
-        - betaC2 * sigmoidC2 * mapped.c2C1Derivative;
-      derivatives[derivativeOffset + C2_RAW] = -betaC2 * sigmoidC2 * mapped.c2Derivative;
-      derivatives[derivativeOffset + BASE_0] = fixed.slopeScale * (action - fixed.latentLower);
-      derivatives[derivativeOffset + BASE_1] = fixed.slopeScale * xi
-        * (action - fixed.latentLower);
-      derivatives[derivativeOffset + BETA_C1_0] = fixed.slopeScale * spC1;
-      derivatives[derivativeOffset + BETA_C1_1] = fixed.slopeScale * xi * spC1;
-      derivatives[derivativeOffset + BETA_X_0] = fixed.slopeScale * spX;
-      derivatives[derivativeOffset + BETA_X_1] = fixed.slopeScale * xi * spX;
-      derivatives[derivativeOffset + BETA_C2_0] = fixed.slopeScale * spC2;
-      derivatives[derivativeOffset + BETA_C2_1] = fixed.slopeScale * xi * spC2;
-      derivatives[derivativeOffset + KAPPA_C1_RAW] = betaC1
-        * scaledSoftplusKappaDerivative(c1Offset, mapped.kappaC1)
-        * mapped.kappaC1Derivative;
-      derivatives[derivativeOffset + KAPPA_X_RAW] = betaX
-        * scaledSoftplusKappaDerivative(xOffset, mapped.kappaX)
-        * mapped.kappaXDerivative;
-      derivatives[derivativeOffset + KAPPA_C2_RAW] = betaC2
-        * scaledSoftplusKappaDerivative(c2Offset, mapped.kappaC2)
-        * mapped.kappaC2Derivative;
-      derivatives[derivativeOffset + LEFT_WIDTH_RAW] = gate.leftWidthDerivative
-        * mapped.leftWidthDerivative
-        + gate.rightWidthDerivative * mapped.rightLeftWidthDerivative;
-      derivatives[derivativeOffset + RIGHT_WIDTH_RAW] = gate.rightWidthDerivative
-        * mapped.rightWidthDerivative;
-      derivatives[derivativeOffset + LEFT_SHARPNESS_RAW] = gate.leftDerivative;
-      derivatives[derivativeOffset + RIGHT_SHARPNESS_RAW] = gate.rightDerivative;
+      const sigmoidC1 = sigmoid(fixed.kappaC1 * c1Offset);
+      const sigmoidC2 = sigmoid(fixed.kappaC2 * c2Offset);
+      derivatives[derivativeOffset + C1_RAW]
+        = -mapped.betaC1 * sigmoidC1 * mapped.c1Derivative
+          - mapped.betaC2 * sigmoidC2 * mapped.c2C1Derivative;
+      derivatives[derivativeOffset + C2_RAW]
+        = -mapped.betaC2 * sigmoidC2 * mapped.c2Derivative;
+      derivatives[derivativeOffset + BASE_RAW]
+        = fixed.slopeScale * (action - fixed.latentLower);
+      derivatives[derivativeOffset + PRECISION_RAW] = -0.5 * z * z;
+      derivatives[derivativeOffset + BETA_C1_RAW] = fixed.slopeScale * spC1;
+      derivatives[derivativeOffset + BETA_C2_RAW] = fixed.slopeScale * spC2;
+      if (!feasible) derivatives.fill(0, derivativeOffset, derivativeOffset + PARAMETER_COUNT);
     }
     let normalizer = 0;
-    for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
-      normalizer += Math.exp(logits[actionIndex]! - maximum);
-    }
+    for (const logit of logits) normalizer += Math.exp(logit - maximum);
     const logNormalizer = maximum + Math.log(normalizer);
     for (let actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
       const target = targets[row * actions.length + actionIndex]!;
@@ -498,32 +619,12 @@ function conditionalCrossEntropyWithGradient(
       }
     }
   }
-  const slopeMagnitudePenalty = 1e-9;
-  const unpenalizedSlopeMagnitude = 100;
+  const magnitudePenalty = 1e-9;
   for (const parameter of LINEAR_PARAMETER_INDICES) {
-    const magnitude = Math.abs(raw[parameter]!);
-    const excess = Math.max(0, magnitude - unpenalizedSlopeMagnitude);
-    loss += slopeMagnitudePenalty * excess ** 2;
-    gradient[parameter] += 2 * slopeMagnitudePenalty * excess
-      * Math.sign(raw[parameter]!);
+    const excess = Math.max(0, Math.abs(raw[parameter]!) - 100);
+    loss += magnitudePenalty * excess ** 2;
+    gradient[parameter] += 2 * magnitudePenalty * excess * Math.sign(raw[parameter]!);
   }
-  const variationPenalty = 1e-8;
-  for (const parameter of [BASE_1, BETA_C1_1, BETA_X_1, BETA_C2_1]) {
-    loss += variationPenalty * raw[parameter]! ** 2;
-    gradient[parameter] += 2 * variationPenalty * raw[parameter]!;
-  }
-  const visibleSpan = fixed.visibleUpper - fixed.visibleLower;
-  const leftPlateauLimit = fixed.visibleLower - fixed.latentLower;
-  const rightPlateauLimit = fixed.latentUpper - fixed.visibleUpper;
-  const leftOverlap = Math.max(0, mapped.leftSupportWidth - leftPlateauLimit);
-  const rightOverlap = Math.max(0, mapped.rightSupportWidth - rightPlateauLimit);
-  const overlapPenalty = 5e-3 / (visibleSpan * visibleSpan);
-  loss += overlapPenalty * (leftOverlap * leftOverlap + rightOverlap * rightOverlap);
-  const leftWidthPenaltyDerivative = 2 * overlapPenalty * leftOverlap;
-  const rightWidthPenaltyDerivative = 2 * overlapPenalty * rightOverlap;
-  gradient[LEFT_WIDTH_RAW] += leftWidthPenaltyDerivative * mapped.leftWidthDerivative
-    + rightWidthPenaltyDerivative * mapped.rightLeftWidthDerivative;
-  gradient[RIGHT_WIDTH_RAW] += rightWidthPenaltyDerivative * mapped.rightWidthDerivative;
   return { loss, gradient };
 }
 
@@ -561,7 +662,7 @@ function optimizeBfgs(
     for (let search = 0; search < 24; search += 1) {
       const candidate = Float64Array.from(raw, (parameter, index) =>
         parameter + step * direction[index]!);
-      boundUnconstrainedParameters(candidate);
+      boundRaw(candidate);
       const candidateValue = objective(candidate);
       if (Number.isFinite(candidateValue.loss)
         && candidateValue.loss <= value.loss + 1e-4 * step * directionalDerivative) {
@@ -572,23 +673,18 @@ function optimizeBfgs(
       step *= 0.5;
     }
     if (!nextRaw || !nextValue) {
-      return {
-        ...value,
-        raw,
-        iterations: iteration,
-        termination: "line-search",
-        converged: false,
-      };
+      return { ...value, raw, iterations: iteration, termination: "line-search", converged: false };
     }
     const relativeImprovement = (value.loss - nextValue.loss) / Math.max(1, Math.abs(value.loss));
     stableIterations = relativeImprovement <= tolerance ? stableIterations + 1 : 0;
-    const parameterDelta = subtract(nextRaw, raw);
-    const gradientDelta = subtract(nextValue.gradient, value.gradient);
-    inverseHessian = updateInverseHessian(inverseHessian, parameterDelta, gradientDelta);
+    inverseHessian = updateInverseHessian(
+      inverseHessian,
+      subtract(nextRaw, raw),
+      subtract(nextValue.gradient, value.gradient),
+    );
     raw = nextRaw;
     value = nextValue;
-    if (stableIterations >= 4
-      && maximumAbsolute(value.gradient) <= Math.max(tolerance * 10, 1e-5)) {
+    if (stableIterations >= 4 && maximumAbsolute(value.gradient) <= Math.max(1e-5, tolerance * 10)) {
       return {
         ...value,
         raw,
@@ -607,239 +703,41 @@ function optimizeBfgs(
   };
 }
 
-function empiricalInitialValues(
-  actions: Float64Array,
-  targets: Float64Array,
-  states: Float64Array,
-  fixed: FixedParameters,
-  options: ConditionalFourSegmentModelOptions,
-): Float64Array[] {
-  const visibleSpan = fixed.visibleUpper - fixed.visibleLower;
-  const outsideC1 = clamp(
-    options.initialC1 ?? (fixed.latentLower + fixed.visibleLower) / 2,
-    fixed.latentLower + 1e-6,
-    fixed.latentUpper - 2e-6,
-  );
-  const outsideC2 = clamp(
-    options.initialC2 ?? (fixed.visibleUpper + fixed.latentUpper) / 2,
-    outsideC1 + 1e-6,
-    fixed.latentUpper - 1e-6,
-  );
-  const detected = empiricalFixedBreakpointLocations(actions, targets, states);
-  const locations: Array<readonly [number, number, boolean]> = [
-    ...(detected ? [[detected[0], detected[1], true] as const] : []),
-    [outsideC1, outsideC2, false],
-    [fixed.visibleLower + visibleSpan / 3, fixed.visibleUpper - visibleSpan / 3, true],
-    [
-      Math.max(fixed.latentLower + 1e-6, fixed.visibleLower - visibleSpan / 8),
-      Math.min(fixed.latentUpper - 1e-6, fixed.visibleUpper + visibleSpan / 8),
-      true,
-    ],
-  ];
-  const baselineWidths = initialSupportWidths(fixed, options);
-  const overlappingWidths = overlappingSupportWidths(fixed, baselineWidths);
-  return locations.map(([c1, c2, seedTransitions], index) => empiricalInitialRaw(
-    actions,
-    targets,
-    states,
-    c1,
-    c2,
-    seedTransitions,
-    fixed,
-    options,
-    index === 0 ? baselineWidths : overlappingWidths,
-  ));
+function maskedObjective(
+  objective: (raw: Float64Array) => ObjectiveValue,
+  activeParameters: readonly number[],
+): (raw: Float64Array) => ObjectiveValue {
+  const active = new Set(activeParameters);
+  return (raw) => {
+    const value = objective(raw);
+    for (let parameter = 0; parameter < value.gradient.length; parameter += 1) {
+      if (!active.has(parameter)) value.gradient[parameter] = 0;
+    }
+    return value;
+  };
 }
 
-function empiricalFixedBreakpointLocations(
-  actions: Float64Array,
-  targets: Float64Array,
-  states: Float64Array,
-): readonly [number, number] | undefined {
-  const actionSpan = actions.at(-1)! - actions[0]!;
-  const typicalStep = actionSpan / (actions.length - 1);
-  const movingExclusion = Math.max(typicalStep * 3, actionSpan / 12);
-  const scores = new Float64Array(actions.length);
-  for (let actionIndex = 1; actionIndex < actions.length - 1; actionIndex += 1) {
-    const location = actions[actionIndex]!;
-    let signedChange = 0;
-    let absoluteChange = 0;
-    let contributingRows = 0;
-    for (let row = 0; row < states.length; row += 1) {
-      if (Math.abs(states[row]! - location) <= movingExclusion) continue;
-      const probabilities = targets.subarray(row * actions.length, (row + 1) * actions.length);
-      const maximum = probabilities.reduce((best, value) => Math.max(best, value), 0);
-      if (probabilities[actionIndex]! < maximum * 1e-6) continue;
-      const logProbabilities = stableLogProbabilities(probabilities);
-      const leftSlope = (logProbabilities[actionIndex]! - logProbabilities[actionIndex - 1]!)
-        / (actions[actionIndex]! - actions[actionIndex - 1]!);
-      const rightSlope = (logProbabilities[actionIndex + 1]! - logProbabilities[actionIndex]!)
-        / (actions[actionIndex + 1]! - actions[actionIndex]!);
-      const change = rightSlope - leftSlope;
-      signedChange += change;
-      absoluteChange += Math.abs(change);
-      contributingRows += 1;
-    }
-    if (contributingRows > 0) {
-      const meanChange = signedChange / contributingRows;
-      const meanAbsoluteChange = absoluteChange / contributingRows;
-      scores[actionIndex] = Math.abs(meanChange) + meanAbsoluteChange * 0.15;
-    }
-  }
-  const smoothed = new Float64Array(scores.length);
-  for (let index = 1; index < scores.length - 1; index += 1) {
-    let weightedScore = 0;
-    let totalWeight = 0;
-    for (let offset = -2; offset <= 2; offset += 1) {
-      const neighbor = index + offset;
-      if (neighbor <= 0 || neighbor >= scores.length - 1) continue;
-      const weight = 3 - Math.abs(offset);
-      weightedScore += scores[neighbor]! * weight;
-      totalWeight += weight;
-    }
-    smoothed[index] = totalWeight > 0 ? weightedScore / totalWeight : 0;
-  }
-  const minimumSeparation = Math.max(typicalStep * 3, actionSpan / 10);
-  const candidates = Array.from(
-    { length: actions.length - 2 },
-    (_, offset) => offset + 1,
-  ).filter((index) => smoothed[index]! > 1e-9)
-    .sort((left, right) => smoothed[right]! - smoothed[left]!);
-  const selected: number[] = [];
-  for (const index of candidates) {
-    const location = actions[index]!;
-    if (selected.every((selectedLocation) =>
-      Math.abs(selectedLocation - location) >= minimumSeparation)) {
-      selected.push(location);
-      if (selected.length === 2) break;
-    }
-  }
-  return selected.length === 2
-    ? selected.sort((left, right) => left - right) as [number, number]
-    : undefined;
-}
-
-function empiricalInitialRaw(
-  actions: Float64Array,
-  targets: Float64Array,
-  states: Float64Array,
-  c1: number,
-  c2: number,
-  seedTransitions: boolean,
-  fixed: FixedParameters,
-  options: ConditionalFourSegmentModelOptions,
-  supportWidths: readonly [number, number],
-): Float64Array {
-  const xi = Float64Array.from(states, (state) =>
-    scaledCurrentExposure(state, fixed.latentLower, fixed.latentUpper));
-  const rowSlopes = new Float64Array(states.length);
-  const c1Changes = new Float64Array(states.length);
-  const xChanges = new Float64Array(states.length);
-  const c2Changes = new Float64Array(states.length);
-  for (let row = 0; row < states.length; row += 1) {
-    const probabilities = targets.subarray(row * actions.length, (row + 1) * actions.length);
-    const logProbabilities = stableLogProbabilities(probabilities);
-    rowSlopes[row] = empiricalLogSlope(actions, logProbabilities, probabilities);
-    if (seedTransitions) {
-      c1Changes[row] = empiricalSlopeChange(actions, logProbabilities, c1);
-      xChanges[row] = empiricalSlopeChange(actions, logProbabilities, states[row]!);
-      c2Changes[row] = empiricalSlopeChange(actions, logProbabilities, c2);
-    }
-  }
-  const base = linearRegression(xi, rowSlopes);
-  const betaC1 = seedTransitions ? linearRegression(xi, c1Changes) : [0, 0] as const;
-  const betaX = seedTransitions ? linearRegression(xi, xChanges) : [0, 0] as const;
-  const betaC2 = seedTransitions ? linearRegression(xi, c2Changes) : [0, 0] as const;
-  const initialKappa = 4.394 / Math.max(1e-6, (fixed.visibleUpper - fixed.visibleLower) / 4);
-  const raw = new Float64Array(PARAMETER_COUNT);
-  [raw[C1_RAW], raw[C2_RAW]] = rawBreakpoints(c1, c2, fixed);
-  setSlopeCoefficients(raw, BASE_0, base, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_C1_0, betaC1, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_X_0, betaX, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_C2_0, betaC2, fixed.slopeScale);
-  raw[KAPPA_C1_RAW] = inverseSoftplus(
-    Math.max(fixed.minimumKappa * 2, options.initialKappaC1 ?? initialKappa)
-      - fixed.minimumKappa,
-  );
-  raw[KAPPA_X_RAW] = inverseSoftplus(
-    Math.max(fixed.minimumKappa * 2, options.initialKappaX ?? initialKappa)
-      - fixed.minimumKappa,
-  );
-  raw[KAPPA_C2_RAW] = inverseSoftplus(
-    Math.max(fixed.minimumKappa * 2, options.initialKappaC2 ?? initialKappa)
-      - fixed.minimumKappa,
-  );
-  [raw[LEFT_WIDTH_RAW], raw[RIGHT_WIDTH_RAW]] = rawSupportWidths(
-    supportWidths[0],
-    supportWidths[1],
-    fixed,
-  );
-  raw[LEFT_SHARPNESS_RAW] = inverseSoftplus(
-    Math.max(fixed.minimumSupportSharpness * 2, options.leftSupportSharpness ?? 1)
-      - fixed.minimumSupportSharpness,
-  );
-  raw[RIGHT_SHARPNESS_RAW] = inverseSoftplus(
-    Math.max(fixed.minimumSupportSharpness * 2, options.rightSupportSharpness ?? 1)
-      - fixed.minimumSupportSharpness,
-  );
-  boundUnconstrainedParameters(raw);
-  return raw;
-}
-
-function mappedRawParameters(raw: Float64Array, fixed: FixedParameters) {
-  const latentSpan = fixed.latentUpper - fixed.latentLower;
+function mappedRawParameters(raw: Float64Array, fixed: FixedParameters): MappedParameters {
   const firstFraction = sigmoid(raw[C1_RAW]!);
   const c1 = fixed.latentLower + (fixed.latentUpper - fixed.latentLower) * firstFraction;
   const secondFraction = sigmoid(raw[C2_RAW]!);
   const c2 = c1 + (fixed.latentUpper - c1) * secondFraction;
   const c1Derivative = (fixed.latentUpper - fixed.latentLower)
     * firstFraction * (1 - firstFraction);
-  const c2C1Derivative = c1Derivative * (1 - secondFraction);
-  const c2Derivative = (fixed.latentUpper - c1) * secondFraction * (1 - secondFraction);
-  const kappaC1 = fixed.minimumKappa + softplus(raw[KAPPA_C1_RAW]!);
-  const kappaX = fixed.minimumKappa + softplus(raw[KAPPA_X_RAW]!);
-  const kappaC2 = fixed.minimumKappa + softplus(raw[KAPPA_C2_RAW]!);
-  const leftWidthFraction = sigmoid(raw[LEFT_WIDTH_RAW]!);
-  const leftSupportWidth = latentSpan * leftWidthFraction;
-  const rightWidthFraction = sigmoid(raw[RIGHT_WIDTH_RAW]!);
-  const remainingWidth = latentSpan - leftSupportWidth;
-  const rightSupportWidth = remainingWidth * rightWidthFraction;
-  const leftWidthDerivative = latentSpan * leftWidthFraction * (1 - leftWidthFraction);
-  const rightLeftWidthDerivative = -leftWidthDerivative * rightWidthFraction;
-  const rightWidthDerivative = remainingWidth * rightWidthFraction * (1 - rightWidthFraction);
-  const leftSupportSharpness = fixed.minimumSupportSharpness
-    + softplus(raw[LEFT_SHARPNESS_RAW]!);
-  const rightSupportSharpness = fixed.minimumSupportSharpness
-    + softplus(raw[RIGHT_SHARPNESS_RAW]!);
+  const cutoffLower = decodeLowerCutoff(raw[CUTOFF_LOWER_RAW]!, fixed);
+  const cutoffUpper = decodeUpperCutoff(raw[CUTOFF_UPPER_RAW]!, fixed);
   return {
     c1,
     c2,
     c1Derivative,
-    c2C1Derivative,
-    c2Derivative,
-    base0: raw[BASE_0]! * fixed.slopeScale,
-    base1: raw[BASE_1]! * fixed.slopeScale,
-    betaC10: raw[BETA_C1_0]! * fixed.slopeScale,
-    betaC11: raw[BETA_C1_1]! * fixed.slopeScale,
-    betaX0: raw[BETA_X_0]! * fixed.slopeScale,
-    betaX1: raw[BETA_X_1]! * fixed.slopeScale,
-    betaC20: raw[BETA_C2_0]! * fixed.slopeScale,
-    betaC21: raw[BETA_C2_1]! * fixed.slopeScale,
-    kappaC1,
-    kappaX,
-    kappaC2,
-    kappaC1Derivative: sigmoid(raw[KAPPA_C1_RAW]!),
-    kappaXDerivative: sigmoid(raw[KAPPA_X_RAW]!),
-    kappaC2Derivative: sigmoid(raw[KAPPA_C2_RAW]!),
-    leftSupportWidth,
-    rightSupportWidth,
-    leftWidthDerivative,
-    rightLeftWidthDerivative,
-    rightWidthDerivative,
-    leftSupportSharpness,
-    rightSupportSharpness,
-    leftSupportSharpnessDerivative: sigmoid(raw[LEFT_SHARPNESS_RAW]!),
-    rightSupportSharpnessDerivative: sigmoid(raw[RIGHT_SHARPNESS_RAW]!),
+    c2C1Derivative: c1Derivative * (1 - secondFraction),
+    c2Derivative: (fixed.latentUpper - c1) * secondFraction * (1 - secondFraction),
+    baseSlope: raw[BASE_RAW]! * fixed.slopeScale,
+    quadraticPrecision: raw[PRECISION_RAW]! * fixed.precisionScale,
+    betaC1: raw[BETA_C1_RAW]! * fixed.slopeScale,
+    betaC2: raw[BETA_C2_RAW]! * fixed.slopeScale,
+    cutoffLower,
+    cutoffUpper,
   };
 }
 
@@ -853,137 +751,114 @@ function parametersFromRaw(
     latentUpper: fixed.latentUpper,
     visibleLower: fixed.visibleLower,
     visibleUpper: fixed.visibleUpper,
+    cutoffLower: mapped.cutoffLower,
+    cutoffUpper: mapped.cutoffUpper,
+    basisCenter: fixed.basisCenter,
     c1: mapped.c1,
     c2: mapped.c2,
-    leftSupportWidth: mapped.leftSupportWidth,
-    rightSupportWidth: mapped.rightSupportWidth,
-    leftSupportSharpness: mapped.leftSupportSharpness,
-    rightSupportSharpness: mapped.rightSupportSharpness,
-    baseSlope: [mapped.base0, mapped.base1],
-    betaC1: [mapped.betaC10, mapped.betaC11],
-    betaX: [mapped.betaX0, mapped.betaX1],
-    betaC2: [mapped.betaC20, mapped.betaC21],
-    kappaC1: mapped.kappaC1,
-    kappaX: mapped.kappaX,
-    kappaC2: mapped.kappaC2,
+    baseSlope: mapped.baseSlope,
+    quadraticPrecision: mapped.quadraticPrecision,
+    betaC1: mapped.betaC1,
+    betaX: fixed.betaX,
+    betaC2: mapped.betaC2,
+    kappaC1: fixed.kappaC1,
+    kappaX: fixed.kappaX,
+    kappaC2: fixed.kappaC2,
   };
 }
 
-function rawFromParameters(
-  parameters: ConditionalFourSegmentParameters,
-  fixed: FixedParameters,
-): Float64Array {
-  const raw = new Float64Array(PARAMETER_COUNT);
-  [raw[C1_RAW], raw[C2_RAW]] = rawBreakpoints(parameters.c1, parameters.c2, fixed);
-  setSlopeCoefficients(raw, BASE_0, parameters.baseSlope, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_C1_0, parameters.betaC1, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_X_0, parameters.betaX, fixed.slopeScale);
-  setSlopeCoefficients(raw, BETA_C2_0, parameters.betaC2, fixed.slopeScale);
-  raw[KAPPA_C1_RAW] = inverseSoftplus(
-    Math.max(1e-12, parameters.kappaC1 - fixed.minimumKappa),
-  );
-  raw[KAPPA_X_RAW] = inverseSoftplus(
-    Math.max(1e-12, parameters.kappaX - fixed.minimumKappa),
-  );
-  raw[KAPPA_C2_RAW] = inverseSoftplus(
-    Math.max(1e-12, parameters.kappaC2 - fixed.minimumKappa),
-  );
-  [raw[LEFT_WIDTH_RAW], raw[RIGHT_WIDTH_RAW]] = rawSupportWidths(
-    parameters.leftSupportWidth,
-    parameters.rightSupportWidth,
-    fixed,
-  );
-  raw[LEFT_SHARPNESS_RAW] = inverseSoftplus(Math.max(
-    1e-12,
-    parameters.leftSupportSharpness - fixed.minimumSupportSharpness,
-  ));
-  raw[RIGHT_SHARPNESS_RAW] = inverseSoftplus(Math.max(
-    1e-12,
-    parameters.rightSupportSharpness - fixed.minimumSupportSharpness,
-  ));
-  boundUnconstrainedParameters(raw);
-  return raw;
-}
-
-function compactEnvelopeLogValue(
-  action: number,
-  parameters: ConditionalFourSegmentParameters,
-): number {
-  return logCompactStep(
-    (action - parameters.latentLower) / parameters.leftSupportWidth,
-    parameters.leftSupportSharpness,
-  ) + logCompactStep(
-    (parameters.latentUpper - action) / parameters.rightSupportWidth,
-    parameters.rightSupportSharpness,
-  );
-}
-
-function compactEnvelopeLogSlope(
-  action: number,
-  parameters: ConditionalFourSegmentParameters,
-): number {
-  const left = logCompactStepWithDerivative(
-    (action - parameters.latentLower) / parameters.leftSupportWidth,
-    parameters.leftSupportSharpness,
-  );
-  const right = logCompactStepWithDerivative(
-    (parameters.latentUpper - action) / parameters.rightSupportWidth,
-    parameters.rightSupportSharpness,
-  );
-  return left.coordinateDerivative / parameters.leftSupportWidth
-    - right.coordinateDerivative / parameters.rightSupportWidth;
-}
-
-function compactEnvelopeLogValueMapped(
-  action: number,
-  mapped: ReturnType<typeof mappedRawParameters>,
-  fixed: FixedParameters,
-): {
-  value: number;
-  leftWidthDerivative: number;
-  rightWidthDerivative: number;
-  leftDerivative: number;
-  rightDerivative: number;
-} {
-  const left = logCompactStepWithDerivative(
-    (action - fixed.latentLower) / mapped.leftSupportWidth,
-    mapped.leftSupportSharpness,
-  );
-  const right = logCompactStepWithDerivative(
-    (fixed.latentUpper - action) / mapped.rightSupportWidth,
-    mapped.rightSupportSharpness,
-  );
-  return {
-    value: left.value + right.value,
-    leftWidthDerivative: left.coordinateDerivative
-      * -(action - fixed.latentLower) / (mapped.leftSupportWidth ** 2),
-    rightWidthDerivative: right.coordinateDerivative
-      * -(fixed.latentUpper - action) / (mapped.rightSupportWidth ** 2),
-    leftDerivative: left.sharpnessDerivative * mapped.leftSupportSharpnessDerivative,
-    rightDerivative: right.sharpnessDerivative * mapped.rightSupportSharpnessDerivative,
-  };
-}
-
-function logCompactStepWithDerivative(
-  t: number,
-  sharpness: number,
-): { value: number; coordinateDerivative: number; sharpnessDerivative: number } {
-  if (t <= 0) {
-    return { value: Number.NEGATIVE_INFINITY, coordinateDerivative: 0, sharpnessDerivative: 0 };
+function createFixedParameters(
+  options: ConditionalFourSegmentRawParameterOptions,
+  legacyVisibleBasis = false,
+): FixedParameters {
+  const values = [options.latentLower, options.latentUpper, options.visibleLower, options.visibleUpper];
+  if (!values.every(Number.isFinite)
+    || !(options.latentLower <= options.visibleLower)
+    || !(options.visibleLower < options.visibleUpper)
+    || !(options.visibleUpper <= options.latentUpper)) {
+    throw new Error("Conditional four-segment support must be ordered and finite.");
   }
-  if (t >= 1) return { value: 0, coordinateDerivative: 0, sharpnessDerivative: 0 };
-  const shape = 1 / (1 - t) - 1 / t;
-  const argument = sharpness * shape;
-  const argumentDerivative = sharpness * (1 / ((1 - t) ** 2) + 1 / (t * t));
+  const friction = options.friction ?? 0;
+  const temperature = options.temperature ?? 0.01;
+  if (!(Number.isFinite(friction) && friction >= 0 && friction < 1)
+    || !(Number.isFinite(temperature) && temperature > 0)) {
+    throw new Error("Conditional four-segment friction and temperature are invalid.");
+  }
+  const latentSpan = options.latentUpper - options.latentLower;
+  const visibleSpan = options.visibleUpper - options.visibleLower;
+  const basisSpan = legacyVisibleBasis ? visibleSpan : latentSpan;
+  const basisCenter = legacyVisibleBasis
+    ? (options.visibleLower + options.visibleUpper) / 2
+    : (options.latentLower + options.latentUpper) / 2;
+  const halfBasisSpan = basisSpan / 2;
+  const buySlopeAtZero = friction > 0 ? friction / (1 - friction) : 0;
+  const sellSlopeAtZero = friction;
   return {
-    value: -softplus(-argument),
-    coordinateDerivative: sigmoid(-argument) * argumentDerivative,
-    sharpnessDerivative: shape * sigmoid(-argument),
+    latentLower: options.latentLower,
+    latentUpper: options.latentUpper,
+    visibleLower: options.visibleLower,
+    visibleUpper: options.visibleUpper,
+    visibleCenter: (options.visibleLower + options.visibleUpper) / 2,
+    visibleSpan,
+    basisCenter,
+    basisSpan,
+    halfBasisSpan,
+    slopeScale: 1 / basisSpan,
+    precisionScale: 1 / (halfBasisSpan * halfBasisSpan),
+    betaX: -(buySlopeAtZero + sellSlopeAtZero) / temperature,
+    kappaC1: FIXED_KAPPA_C_VISIBLE_PRODUCT / basisSpan,
+    kappaX: FIXED_KAPPA_X_VISIBLE_PRODUCT / basisSpan,
+    kappaC2: FIXED_KAPPA_C_VISIBLE_PRODUCT / basisSpan,
   };
 }
 
-function logCompactStep(t: number, sharpness: number): number {
-  return logCompactStepWithDerivative(t, sharpness).value;
+function empiricalFixedBreakpointLocations(
+  actions: Float64Array,
+  targets: Float64Array,
+  states: Float64Array,
+): readonly [number, number] | undefined {
+  const actionSpan = actions.at(-1)! - actions[0]!;
+  const step = actionSpan / (actions.length - 1);
+  const movingExclusion = Math.max(step * 3, actionSpan / 12);
+  const curvature = new Float64Array(actions.length);
+  for (let actionIndex = 1; actionIndex < actions.length - 1; actionIndex += 1) {
+    const location = actions[actionIndex]!;
+    let signed = 0;
+    let absolute = 0;
+    let count = 0;
+    for (let row = 0; row < states.length; row += 1) {
+      if (Math.abs(states[row]! - location) <= movingExclusion) continue;
+      const offset = row * actions.length;
+      const maximum = targets.subarray(offset, offset + actions.length)
+        .reduce((best, value) => Math.max(best, value), 0);
+      if (targets[offset + actionIndex]! < maximum * 1e-6) continue;
+      const left = (Math.log(Math.max(maximum * 1e-6, targets[offset + actionIndex]!))
+          - Math.log(Math.max(maximum * 1e-6, targets[offset + actionIndex - 1]!)))
+        / (actions[actionIndex]! - actions[actionIndex - 1]!);
+      const right = (Math.log(Math.max(maximum * 1e-6, targets[offset + actionIndex + 1]!))
+          - Math.log(Math.max(maximum * 1e-6, targets[offset + actionIndex]!)))
+        / (actions[actionIndex + 1]! - actions[actionIndex]!);
+      const change = right - left;
+      signed += change;
+      absolute += Math.abs(change);
+      count += 1;
+    }
+    if (count > 0) curvature[actionIndex] = Math.abs(signed / count) + 0.15 * absolute / count;
+  }
+  const candidates = Array.from({ length: actions.length - 2 }, (_, index) => index + 1)
+    .sort((left, right) => curvature[right]! - curvature[left]!);
+  const selected: number[] = [];
+  for (const index of candidates) {
+    const location = actions[index]!;
+    if (curvature[index]! <= 1e-9) break;
+    if (selected.every((value) => Math.abs(value - location) >= Math.max(step * 3, actionSpan / 10))) {
+      selected.push(location);
+      if (selected.length === 2) break;
+    }
+  }
+  return selected.length === 2
+    ? selected.sort((left, right) => left - right) as [number, number]
+    : undefined;
 }
 
 function fitDiagnostics(
@@ -991,24 +866,41 @@ function fitDiagnostics(
   targets: ArrayLike<number>,
   states: ArrayLike<number>,
   parameters: ConditionalFourSegmentParameters,
+  metricVisibleLower: number,
+  metricVisibleUpper: number,
+  metricCurrentLower: number,
+  metricCurrentUpper: number,
 ): Pick<ConditionalFourSegmentPolicyFit, "crossEntropy" | "klDivergence" | "meanSquaredError"> {
   const model = new Float64Array(actions.length);
+  const metricActions = Array.from({ length: actions.length }, (_, index) => index)
+    .filter((index) => actions[index]! >= metricVisibleLower
+      && actions[index]! <= metricVisibleUpper);
+  const metricStates = Array.from({ length: states.length }, (_, index) => index)
+    .filter((index) => states[index]! >= metricCurrentLower
+      && states[index]! <= metricCurrentUpper);
   let crossEntropy = 0;
   let targetEntropy = 0;
   let meanSquaredError = 0;
-  for (let row = 0; row < states.length; row += 1) {
+  for (const row of metricStates) {
     conditionalFourSegmentExposureProbabilities(actions, states[row]!, parameters, model);
     let targetTotal = 0;
-    for (let action = 0; action < actions.length; action += 1) {
+    let modelTotal = 0;
+    for (const action of metricActions) {
       targetTotal += targets[row * actions.length + action]!;
+      modelTotal += model[action]!;
     }
-    for (let action = 0; action < actions.length; action += 1) {
+    if (!(targetTotal > 0) || !(modelTotal > 0)) {
+      throw new Error("Conditional four-segment metric rows need visible probability mass.");
+    }
+    for (const action of metricActions) {
       const target = targets[row * actions.length + action]! / targetTotal;
+      const predicted = model[action]! / modelTotal;
       if (target > 0) {
-        crossEntropy -= target * Math.log(Math.max(1e-300, model[action]!)) / states.length;
-        targetEntropy -= target * Math.log(target) / states.length;
+        crossEntropy -= target * Math.log(Math.max(1e-300, predicted)) / metricStates.length;
+        targetEntropy -= target * Math.log(target) / metricStates.length;
       }
-      meanSquaredError += (model[action]! - target) ** 2 / (states.length * actions.length);
+      meanSquaredError += (predicted - target) ** 2
+        / (metricStates.length * metricActions.length);
     }
   }
   return {
@@ -1040,83 +932,13 @@ function normalizedSampledTargets(
   return sampled;
 }
 
-function stableLogProbabilities(probabilities: Float64Array): Float64Array {
-  const maximum = probabilities.reduce((best, value) => Math.max(best, value), 0);
-  const floor = Math.max(1e-300, maximum * 1e-6);
-  return Float64Array.from(probabilities, (probability) => Math.log(Math.max(floor, probability)));
-}
-
-function empiricalLogSlope(
-  actions: Float64Array,
-  logProbabilities: Float64Array,
-  probabilities: Float64Array,
-): number {
-  const maximum = probabilities.reduce((best, value) => Math.max(best, value), 0);
-  const threshold = maximum * 1e-5;
-  let count = 0;
-  let meanAction = 0;
-  let meanLogProbability = 0;
-  for (let index = 0; index < actions.length; index += 1) {
-    if (probabilities[index]! < threshold) continue;
-    count += 1;
-    meanAction += actions[index]!;
-    meanLogProbability += logProbabilities[index]!;
+function sampledIndices(length: number, requested: number): number[] {
+  if (requested >= length) return Array.from({ length }, (_, index) => index);
+  const selected = new Set<number>();
+  for (let index = 0; index < requested; index += 1) {
+    selected.add(Math.round(index * (length - 1) / (requested - 1)));
   }
-  if (count < 2) return 0;
-  meanAction /= count;
-  meanLogProbability /= count;
-  let numerator = 0;
-  let denominator = 0;
-  for (let index = 0; index < actions.length; index += 1) {
-    if (probabilities[index]! < threshold) continue;
-    const centeredAction = actions[index]! - meanAction;
-    numerator += centeredAction * (logProbabilities[index]! - meanLogProbability);
-    denominator += centeredAction * centeredAction;
-  }
-  return denominator > 0 ? numerator / denominator : 0;
-}
-
-function empiricalSlopeChange(
-  actions: Float64Array,
-  logProbabilities: Float64Array,
-  location: number,
-): number {
-  if (location <= actions[1]! || location >= actions.at(-2)!) return 0;
-  const slopes = new Float64Array(actions.length - 1);
-  const midpoints = new Float64Array(actions.length - 1);
-  for (let index = 0; index < slopes.length; index += 1) {
-    slopes[index] = (logProbabilities[index + 1]! - logProbabilities[index]!)
-      / (actions[index + 1]! - actions[index]!);
-    midpoints[index] = (actions[index + 1]! + actions[index]!) / 2;
-  }
-  const nearest = (side: "left" | "right") => Array.from(slopes, (slope, index) => ({
-    slope,
-    distance: Math.abs(midpoints[index]! - location),
-    side: midpoints[index]! < location ? "left" : "right",
-  })).filter((candidate) => candidate.side === side)
-    .sort((left, right) => left.distance - right.distance)
-    .slice(0, 3);
-  const left = nearest("left");
-  const right = nearest("right");
-  if (left.length === 0 || right.length === 0) return 0;
-  return average(right.map((candidate) => candidate.slope))
-    - average(left.map((candidate) => candidate.slope));
-}
-
-function linearRegression(
-  x: Float64Array,
-  y: Float64Array,
-): readonly [number, number] {
-  const meanX = x.reduce((sum, value) => sum + value, 0) / x.length;
-  const meanY = y.reduce((sum, value) => sum + value, 0) / y.length;
-  let numerator = 0;
-  let denominator = 0;
-  for (let index = 0; index < x.length; index += 1) {
-    numerator += (x[index]! - meanX) * (y[index]! - meanY);
-    denominator += (x[index]! - meanX) ** 2;
-  }
-  const slope = denominator > 0 ? numerator / denominator : 0;
-  return [meanY - slope * meanX, slope];
+  return [...selected].sort((left, right) => left - right);
 }
 
 function rawBreakpoints(
@@ -1137,63 +959,44 @@ function rawBreakpoints(
   return [logit(firstFraction), logit(secondFraction)];
 }
 
-function initialSupportWidths(
-  fixed: FixedParameters,
-  options: ConditionalFourSegmentModelOptions,
-): readonly [number, number] {
-  const latentSpan = fixed.latentUpper - fixed.latentLower;
-  const left = options.initialLeftSupportWidth
-    ?? Math.max(1, Math.min(latentSpan / 4, (fixed.visibleLower - fixed.latentLower) / 2));
-  const right = options.initialRightSupportWidth
-    ?? Math.max(1, Math.min(latentSpan / 4, (fixed.latentUpper - fixed.visibleUpper) / 2));
-  if (!(left > 0 && right > 0 && left + right < latentSpan)) {
-    throw new Error("Initial compact-envelope widths must be positive and leave an interior plateau.");
+function solveLinearSystem(
+  matrixInput: Float64Array,
+  vectorInput: Float64Array,
+  size: number,
+): Float64Array | undefined {
+  const matrix = matrixInput.slice();
+  const vector = vectorInput.slice();
+  for (let pivot = 0; pivot < size; pivot += 1) {
+    let best = pivot;
+    for (let row = pivot + 1; row < size; row += 1) {
+      if (Math.abs(matrix[row * size + pivot]!) > Math.abs(matrix[best * size + pivot]!)) best = row;
+    }
+    if (Math.abs(matrix[best * size + pivot]!) < 1e-14) return undefined;
+    if (best !== pivot) {
+      for (let column = pivot; column < size; column += 1) {
+        [matrix[pivot * size + column], matrix[best * size + column]]
+          = [matrix[best * size + column]!, matrix[pivot * size + column]!];
+      }
+      [vector[pivot], vector[best]] = [vector[best]!, vector[pivot]!];
+    }
+    const diagonal = matrix[pivot * size + pivot]!;
+    for (let row = pivot + 1; row < size; row += 1) {
+      const factor = matrix[row * size + pivot]! / diagonal;
+      for (let column = pivot; column < size; column += 1) {
+        matrix[row * size + column] -= factor * matrix[pivot * size + column]!;
+      }
+      vector[row] -= factor * vector[pivot]!;
+    }
   }
-  return [left, right];
-}
-
-function rawSupportWidths(
-  left: number,
-  right: number,
-  fixed: FixedParameters,
-): readonly [number, number] {
-  const latentSpan = fixed.latentUpper - fixed.latentLower;
-  const leftFraction = clamp(left / latentSpan, 1e-6, 1 - 1e-6);
-  const rightFraction = clamp(right / (latentSpan - left), 1e-6, 1 - 1e-6);
-  return [logit(leftFraction), logit(rightFraction)];
-}
-
-function overlappingSupportWidths(
-  fixed: FixedParameters,
-  baseline: readonly [number, number],
-): readonly [number, number] {
-  const latentSpan = fixed.latentUpper - fixed.latentLower;
-  const visibleSpan = fixed.visibleUpper - fixed.visibleLower;
-  let left = Math.max(
-    baseline[0],
-    fixed.visibleLower - fixed.latentLower + visibleSpan / 4,
-  );
-  let right = Math.max(
-    baseline[1],
-    fixed.latentUpper - fixed.visibleUpper + visibleSpan / 4,
-  );
-  const maximumCombinedWidth = latentSpan * 0.9;
-  if (left + right > maximumCombinedWidth) {
-    const scale = maximumCombinedWidth / (left + right);
-    left *= scale;
-    right *= scale;
+  const result = new Float64Array(size);
+  for (let row = size - 1; row >= 0; row -= 1) {
+    let value = vector[row]!;
+    for (let column = row + 1; column < size; column += 1) {
+      value -= matrix[row * size + column]! * result[column]!;
+    }
+    result[row] = value / matrix[row * size + row]!;
   }
-  return [left, right];
-}
-
-function setSlopeCoefficients(
-  raw: Float64Array,
-  offset: number,
-  coefficients: readonly [number, number],
-  scale: number,
-): void {
-  raw[offset] = coefficients[0] / scale;
-  raw[offset + 1] = coefficients[1] / scale;
+  return result;
 }
 
 function updateInverseHessian(
@@ -1202,11 +1005,8 @@ function updateInverseHessian(
   gradientDelta: Float64Array,
 ): Float64Array {
   const curvature = dot(gradientDelta, parameterDelta);
-  const curvatureScale = Math.sqrt(dot(parameterDelta, parameterDelta)
-    * dot(gradientDelta, gradientDelta));
-  if (!(curvature > 1e-10 * Math.max(1, curvatureScale))) {
-    return identityMatrix(PARAMETER_COUNT);
-  }
+  const curvatureScale = Math.sqrt(dot(parameterDelta, parameterDelta) * dot(gradientDelta, gradientDelta));
+  if (!(curvature > 1e-10 * Math.max(1, curvatureScale))) return identityMatrix(PARAMETER_COUNT);
   const hessianGradient = matrixVectorProduct(inverseHessian, gradientDelta);
   const gradientHessianGradient = dot(gradientDelta, hessianGradient);
   const result = inverseHessian.slice();
@@ -1238,6 +1038,88 @@ function matrixVectorProduct(matrix: Float64Array, vector: Float64Array): Float6
   return result;
 }
 
+function validateInputs(
+  actions: ArrayLike<number>,
+  targets: ArrayLike<number>,
+  states: ArrayLike<number>,
+  options: ConditionalFourSegmentModelOptions,
+): void {
+  if (actions.length < 5 || states.length < 3 || targets.length !== actions.length * states.length
+    || !(options.latentLower <= actions[0]!)
+    || !(options.latentUpper >= actions[actions.length - 1]!)) {
+    throw new Error("Conditional four-segment fit requires complete rows inside latent support.");
+  }
+  for (let index = 1; index < actions.length; index += 1) {
+    if (!(actions[index]! > actions[index - 1]!)) {
+      throw new Error("Conditional four-segment action grid must be strictly ordered.");
+    }
+  }
+  for (const state of Array.from(states)) {
+    if (!Number.isFinite(state)) throw new Error("Conditional four-segment states must be finite.");
+  }
+  for (const target of Array.from(targets)) {
+    if (!Number.isFinite(target) || target < 0) {
+      throw new Error("Conditional four-segment targets must be finite and non-negative.");
+    }
+  }
+  for (let row = 0; row < states.length; row += 1) {
+    let total = 0;
+    for (let action = 0; action < actions.length; action += 1) {
+      total += targets[row * actions.length + action]!;
+    }
+    if (!(total > 0)) throw new Error("Conditional four-segment target rows must have mass.");
+  }
+}
+
+function boundRaw(raw: Float64Array): void {
+  raw[C1_RAW] = clamp(raw[C1_RAW]!, -14, 14);
+  raw[C2_RAW] = clamp(raw[C2_RAW]!, -14, 14);
+  raw[CUTOFF_LOWER_RAW] = clamp(raw[CUTOFF_LOWER_RAW]!, -14, 14);
+  raw[CUTOFF_UPPER_RAW] = clamp(raw[CUTOFF_UPPER_RAW]!, -14, 14);
+  for (let index = BASE_RAW; index <= BETA_C2_RAW; index += 1) {
+    raw[index] = clamp(raw[index]!, -1e4, 1e4);
+  }
+}
+
+function decodeLowerCutoff(raw: number, fixed: FixedParameters): number {
+  if (raw <= -13.999999) return fixed.latentLower;
+  if (raw >= 13.999999) return 0;
+  return fixed.latentLower + -fixed.latentLower * sigmoid(raw);
+}
+
+function decodeUpperCutoff(raw: number, fixed: FixedParameters): number {
+  if (raw <= -13.999999) return 0;
+  if (raw >= 13.999999) return fixed.latentUpper;
+  return fixed.latentUpper * sigmoid(raw);
+}
+
+function scaledSoftplus(value: number, kappa: number): number {
+  return softplus(kappa * value) / kappa;
+}
+
+function softplus(value: number): number {
+  if (value > 35) return value;
+  if (value < -35) return Math.exp(value);
+  return Math.log1p(Math.exp(value));
+}
+
+function sigmoid(value: number): number {
+  if (value >= 0) {
+    const exponential = Math.exp(-value);
+    return 1 / (1 + exponential);
+  }
+  const exponential = Math.exp(value);
+  return exponential / (1 + exponential);
+}
+
+function logit(value: number): number {
+  return Math.log(value / (1 - value));
+}
+
+function clamp(value: number, lower: number, upper: number): number {
+  return Math.max(lower, Math.min(upper, value));
+}
+
 function subtract(left: Float64Array, right: Float64Array): Float64Array {
   return Float64Array.from(left, (value, index) => value - right[index]!);
 }
@@ -1248,117 +1130,4 @@ function dot(left: Float64Array, right: Float64Array): number {
 
 function maximumAbsolute(values: Float64Array): number {
   return values.reduce((maximum, value) => Math.max(maximum, Math.abs(value)), 0);
-}
-
-function boundUnconstrainedParameters(raw: Float64Array): void {
-  raw[C1_RAW] = clamp(raw[C1_RAW]!, -14, 14);
-  raw[C2_RAW] = clamp(raw[C2_RAW]!, -14, 14);
-  for (let index = KAPPA_C1_RAW; index <= RIGHT_SHARPNESS_RAW; index += 1) {
-    raw[index] = clamp(raw[index]!, -16, 12);
-  }
-}
-
-function validateInputs(
-  actions: ArrayLike<number>,
-  targets: ArrayLike<number>,
-  states: ArrayLike<number>,
-  options: ConditionalFourSegmentModelOptions,
-): void {
-  if (actions.length < 5 || states.length < 3 || targets.length !== actions.length * states.length
-    || !(options.latentLower < actions[0]!)
-    || !(options.latentUpper > actions[actions.length - 1]!)) {
-    throw new Error("Conditional four-segment fit requires complete rows inside latent support.");
-  }
-  for (let index = 1; index < actions.length; index += 1) {
-    if (!(actions[index]! > actions[index - 1]!)) {
-      throw new Error("Conditional four-segment action grid must be strictly ordered.");
-    }
-  }
-  for (let index = 0; index < states.length; index += 1) {
-    if (!Number.isFinite(states[index]!)) {
-      throw new Error("Conditional four-segment current exposures must be finite.");
-    }
-  }
-  for (let index = 0; index < targets.length; index += 1) {
-    if (!Number.isFinite(targets[index]!) || targets[index]! < 0) {
-      throw new Error("Conditional four-segment targets must be finite and non-negative.");
-    }
-  }
-  for (let row = 0; row < states.length; row += 1) {
-    let total = 0;
-    for (let action = 0; action < actions.length; action += 1) {
-      total += targets[row * actions.length + action]!;
-    }
-    if (!(total > 0)) {
-      throw new Error("Conditional four-segment targets must have positive row mass.");
-    }
-  }
-}
-
-function validateFixed(parameters: FixedParameters): void {
-  if (!(parameters.latentLower < parameters.visibleLower
-      && parameters.visibleLower < parameters.visibleUpper
-      && parameters.visibleUpper < parameters.latentUpper)
-    || !(parameters.minimumKappa > 0)
-    || !(parameters.minimumSupportSharpness > 0)) {
-    throw new Error("Conditional four-segment support is invalid.");
-  }
-}
-
-function scaledSoftplus(value: number, kappa: number): number {
-  return softplus(kappa * value) / kappa;
-}
-
-function scaledSoftplusKappaDerivative(value: number, kappa: number): number {
-  const scaled = kappa * value;
-  return (scaled * sigmoid(scaled) - softplus(scaled)) / (kappa * kappa);
-}
-
-function softplus(value: number): number {
-  if (value > 35) return value;
-  if (value < -35) return Math.exp(value);
-  return Math.log1p(Math.exp(value));
-}
-
-function inverseSoftplus(value: number): number {
-  if (value > 35) return value;
-  return Math.log(Math.expm1(Math.max(1e-12, value)));
-}
-
-function sigmoid(value: number): number {
-  if (value >= 0) {
-    const inverse = Math.exp(-value);
-    return 1 / (1 + inverse);
-  }
-  const exponential = Math.exp(value);
-  return exponential / (1 + exponential);
-}
-
-function logit(value: number): number {
-  return Math.log(value / (1 - value));
-}
-
-function linear(coefficients: readonly [number, number], value: number): number {
-  return coefficients[0] + coefficients[1] * value;
-}
-
-function scaledCurrentExposure(current: number, lower: number, upper: number): number {
-  return clamp((2 * current - lower - upper) / (upper - lower), -1, 1);
-}
-
-function sampledIndices(length: number, maximumCount: number): number[] {
-  if (length <= maximumCount) return Array.from({ length }, (_, index) => index);
-  const result = new Set<number>();
-  for (let index = 0; index < maximumCount; index += 1) {
-    result.add(Math.round(index / (maximumCount - 1) * (length - 1)));
-  }
-  return [...result].sort((left, right) => left - right);
-}
-
-function average(values: number[]): number {
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
 }

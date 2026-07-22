@@ -25,7 +25,7 @@ import type {
   ConditionalFourSegmentSliceParameters,
   ConditionalQuadraticPolicyFit,
   DirectIndicatorPredictorParameters,
-  DirectIndicatorParameterVector17,
+  DirectIndicatorParameterVector6,
   HandcraftedIndicatorPredictorParameters,
   VwKamaCandleRangeResponse,
   VwKamaInspectorCatalog,
@@ -38,6 +38,7 @@ import type {
   VwKamaPredictorFitResponse,
   VwKamaPredictorModel,
   VwKamaPredictorPreset,
+  VwKamaTimestampPredictionResponse,
   VwKamaTransition,
   VwKamaValueDistillationConfig,
   VwKamaValueDistributionPoint,
@@ -61,6 +62,8 @@ const debounceMs = 150;
 const detailDebounceMs = 120;
 const detailMaxCandles = 5_000;
 const detailTriggerCandles = detailMaxCandles * 4;
+const hoverPredictionThrottleMs = 300;
+const hoverPredictionCacheSize = 64;
 const defaultValueDistillation: VwKamaValueDistillationConfig = {
   gridSize: 151,
   minExposure: -100,
@@ -240,6 +243,7 @@ export function KamaInspectorPage() {
   const [directIndicatorParameters, setDirectIndicatorParameters] = createSignal<DirectIndicatorPredictorParameters>({
     ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
   });
+  const [mlpModelId, setMlpModelId] = createSignal("");
   const [selectedPredictorPresetId, setSelectedPredictorPresetId] = createSignal("custom");
   const [rankedPair, setRankedPair] = createSignal<"current" | "best" | "worst">("current");
   const [oracleFriction, setOracleFriction] = createSignal(0.00175);
@@ -271,15 +275,23 @@ export function KamaInspectorPage() {
   const [detail, setDetail] = createSignal<VwKamaCandleRangeResponse>();
   const [detailLoading, setDetailLoading] = createSignal(false);
   const [detailError, setDetailError] = createSignal<string>();
+  const [predictionError, setPredictionError] = createSignal<string>();
   const [hoveredOracle, setHoveredOracle] = createSignal<BacktestOraclePoint>();
   const [cursorTime, setCursorTime] = createSignal<number>();
   const [selectedTime, setSelectedTime] = createSignal<number>();
+  const [timestampPredictions, setTimestampPredictions] = createSignal(
+    new Map<number, VwKamaTimestampPredictionResponse>(),
+  );
   let analysisTimer: number | undefined;
   let analysisController: AbortController | undefined;
   let detailTimer: number | undefined;
   let detailController: AbortController | undefined;
   let requestSequence = 0;
   let detailSequence = 0;
+  let predictionTimer: number | undefined;
+  let predictionController: AbortController | undefined;
+  let predictionLastStartedAt = 0;
+  let predictionSequence = 0;
   let viewportWindowId = "";
 
   const selectedWindow = createMemo(() =>
@@ -292,6 +304,8 @@ export function KamaInspectorPage() {
     catalog()?.presets.find((preset) => preset.scope === "global"));
   const selectedPredictorPreset = createMemo(() =>
     catalog()?.predictorPresets.find((preset) => preset.id === selectedPredictorPresetId()));
+  const selectedMlpModel = createMemo(() =>
+    catalog()?.mlpModels.find((model) => model.id === mlpModelId()));
   const modelPredictorPresets = createMemo(() => (catalog()?.predictorPresets ?? [])
     .filter((preset) => preset.model === predictorModel()));
   const globalPredictorPreset = createMemo(() =>
@@ -562,11 +576,21 @@ export function KamaInspectorPage() {
     result()?.intervalMs ?? intervalMs(),
     result()?.renderIntervalMs,
   ));
-  const valueDistributions = createMemo(() => mergeDetailValueDistributions(
-    result()?.valueDistributions ?? [],
-    detail(),
-    result(),
-  ));
+  const valueDistributions = createMemo(() => {
+    const merged = mergeDetailValueDistributions(
+      result()?.valueDistributions ?? [],
+      detail(),
+      result(),
+    );
+    const request = resultRequest();
+    if (request?.predictor?.model !== "mlp") return merged;
+    const exact = [...timestampPredictions().values()]
+      .filter((prediction) => prediction.modelId === request.predictor!.mlpModelId)
+      .map((prediction) => prediction.point);
+    const exactTimes = new Set(exact.map((point) => point.time));
+    return [...merged.filter((point) => !exactTimes.has(point.time)), ...exact]
+      .sort((left, right) => left.time - right.time);
+  });
   const inspectedTime = () => selectedTime() ?? cursorTime();
   const selectedDistribution = createMemo(() => nearestValueDistribution(
     valueDistributions(),
@@ -630,6 +654,7 @@ export function KamaInspectorPage() {
     const model = predictorModel();
     const forecastParameters = handcraftedParameters();
     const directParameters = directIndicatorParameters();
+    const selectedMlpModel = mlpModelId();
     const friction = oracleFriction();
     const matchWindow = matchWindowMs();
     const timingHalfLife = timingHalfLifeMs();
@@ -651,6 +676,7 @@ export function KamaInspectorPage() {
           model,
           handcraftedParameters: { ...forecastParameters },
           directIndicatorParameters: { ...directParameters },
+          mlpModelId: selectedMlpModel,
         },
         oracleFriction: friction,
         matchWindowMs: matchWindow,
@@ -677,6 +703,7 @@ export function KamaInspectorPage() {
       return current && current.start === next.start && current.end === next.end ? current : next;
     });
     setDetail(undefined);
+    setTimestampPredictions(new Map());
     const distributions = analysis.valueDistributions;
     setSelectedTime(undefined);
     if (distributions.length > 0) {
@@ -719,10 +746,73 @@ export function KamaInspectorPage() {
     }, detailDebounceMs);
   });
 
+  createEffect(() => {
+    const request = resultRequest();
+    const analysis = result();
+    const time = inspectedTime();
+    if (predictionTimer !== undefined) window.clearTimeout(predictionTimer);
+    predictionTimer = undefined;
+    const sequence = ++predictionSequence;
+    if (!request || !analysis || request.predictor?.model !== "mlp" || time === undefined) {
+      predictionController?.abort();
+      predictionController = undefined;
+      setPredictionError(undefined);
+      return;
+    }
+    const existing = [
+      ...analysis.valueDistributions,
+      ...(detail()?.valueDistributions ?? []),
+    ].some((point) => point.time === time);
+    if (existing || timestampPredictions().has(time)) {
+      predictionController?.abort();
+      predictionController = undefined;
+      setPredictionError(undefined);
+      return;
+    }
+    const delay = Math.max(0, hoverPredictionThrottleMs - (performance.now() - predictionLastStartedAt));
+    predictionTimer = window.setTimeout(() => {
+      predictionTimer = undefined;
+      predictionLastStartedAt = performance.now();
+      predictionController?.abort();
+      const controller = new AbortController();
+      predictionController = controller;
+      setPredictionError(undefined);
+      void fetch(`${apiBase}/api/kama-inspector/predict`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...request, time }),
+        signal: controller.signal,
+      }).then(async (response) => {
+        const payload = await response.json() as unknown;
+        if (!response.ok) throw new Error(errorMessage(payload, "MLP timestamp prediction failed"));
+        if (!controller.signal.aborted && sequence === predictionSequence) {
+          const prediction = payload as VwKamaTimestampPredictionResponse;
+          setTimestampPredictions((current) => {
+            const next = new Map(current);
+            next.delete(prediction.time);
+            next.set(prediction.time, prediction);
+            while (next.size > hoverPredictionCacheSize) {
+              const oldest = next.keys().next().value as number | undefined;
+              if (oldest === undefined) break;
+              next.delete(oldest);
+            }
+            return next;
+          });
+        }
+      }).catch((error) => {
+        if (!controller.signal.aborted && sequence === predictionSequence) {
+          setPredictionError(error instanceof Error ? error.message : "MLP timestamp prediction failed");
+        }
+      });
+    }, delay);
+  });
+
   onCleanup(() => {
     if (analysisTimer !== undefined) window.clearTimeout(analysisTimer);
     analysisController?.abort();
     cancelDetailRequest();
+    if (predictionTimer !== undefined) window.clearTimeout(predictionTimer);
+    predictionController?.abort();
   });
 
   async function loadCatalog(): Promise<void> {
@@ -751,6 +841,7 @@ export function KamaInspectorPage() {
         ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
         ...predictor?.directIndicatorParameters,
       });
+      setMlpModelId(predictor?.mlpModelId || next.mlpModels[0]?.id || "");
       setSelectedPredictorPresetId(
         next.predictorPresets.find((preset) => preset.scope === "global"
           && preset.model === (predictor?.model ?? "handcrafted"))?.id ?? "custom",
@@ -873,8 +964,9 @@ export function KamaInspectorPage() {
 
   const choosePredictorModel = (model: VwKamaPredictorModel) => batch(() => {
     setPredictorModel(model);
-    if (model === "legacy") {
+    if (model === "legacy" || model === "mlp") {
       setSelectedPredictorPresetId("custom");
+      if (model === "mlp" && !mlpModelId()) setMlpModelId(catalog()?.mlpModels[0]?.id ?? "");
       return;
     }
     const preset = (catalog()?.predictorPresets ?? []).find((item) =>
@@ -884,7 +976,7 @@ export function KamaInspectorPage() {
       setHandcraftedParameters({
         ...(preset?.parameters ?? DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS),
       } as HandcraftedIndicatorPredictorParameters);
-    } else {
+    } else if (model === "direct-indicator") {
       setDirectIndicatorParameters({
         ...(preset?.parameters ?? DEFAULT_DIRECT_INDICATOR_PARAMETERS),
       } as DirectIndicatorPredictorParameters);
@@ -1000,9 +1092,14 @@ export function KamaInspectorPage() {
               Compare causal KAMA state changes with the close-only perfect-margin oracle. Editing a field reruns the selected cached window.
             </p>
           </div>
-          <a class="btn" href="#/">
-            <ArrowLeft size={16} /> Dashboard
-          </a>
+          <div class="flex flex-wrap gap-2">
+            <a class="btn" href="#/mlp-training">
+              <Activity size={16} /> MLP Training
+            </a>
+            <a class="btn" href="#/">
+              <ArrowLeft size={16} /> Dashboard
+            </a>
+          </div>
         </header>
 
         <Show when={catalogError()}>
@@ -1215,7 +1312,8 @@ export function KamaInspectorPage() {
                   value={predictorModel()}
                   options={[
                     { value: "handcrafted", label: "Handcrafted drift/variance forecast" },
-                    { value: "direct-indicator", label: "Direct indicator → 17-parameter distribution" },
+                    { value: "direct-indicator", label: "Direct indicator → 6-parameter quadratic distribution" },
+                    { value: "mlp", label: "MLP · 8-parameter quadratic + hard-cutoff distribution" },
                     { value: "legacy", label: "Legacy KAMA-rate distribution" },
                   ]}
                   onInput={(value) => choosePredictorModel(value as VwKamaPredictorModel)}
@@ -1299,6 +1397,66 @@ export function KamaInspectorPage() {
                   <div class="text-xs text-ink-400 md:col-span-2">
                     The six causal forecast constants are calibrated. H, T, fees, maintenance, constraints, and both exposure grids come directly from the oracle. The extra width is the documented grid convention for unresolved analytic kinks; support widths and sharpness remain fixed latent-design settings.
                   </div>
+                </Show>
+                <Show when={predictorModel() === "mlp"}>
+                  <InspectorSelect
+                    label="Trained MLP artifact"
+                    value={mlpModelId()}
+                    options={(catalog()?.mlpModels.length ?? 0) > 0
+                      ? catalog()!.mlpModels.map((model) => ({
+                          value: model.id,
+                          label: `${model.label} · ${model.executionProvider.toUpperCase()}`,
+                        }))
+                      : [{ value: "", label: "No trained model · run npm run mlp:train" }]}
+                    onInput={setMlpModelId}
+                  />
+                  <Show when={selectedMlpModel()} fallback={(
+                    <div class="text-xs text-amber-300 md:col-span-2">
+                      Build an oracle dataset and train an artifact before running the MLP predictor.
+                    </div>
+                  )}>
+                    {(model) => (
+                      <div class="text-xs text-ink-400 md:col-span-2">
+                        {model().id} · verified {model().executionProvider.toUpperCase()}
+                        <Show when={model().training}>
+                          {(training) => <>
+                            {' '}· train / validation / test {training().trainExamples.toLocaleString()} / {training().validationExamples.toLocaleString()} / {training().testExamples.toLocaleString()}
+                            {' '}· validation loss {formatQuote(training().bestValidationLoss, 5)} · test loss {formatQuote(training().testLoss, 5)}
+                            <Show when={training().finalizedEarly}>{' '}· finalized early</Show>
+                            <Show when={training().testMetrics}>
+                              {(metrics) => <>
+                                {' '}· test CE {formatQuote(metrics().crossEntropy, 5)}
+                                {' '}· probability MSE {formatQuote(metrics().probabilityMse, 7)}
+                                {' '}· parameter MSE {formatQuote(metrics().parameterMse, 5)}
+                                {' '}· excess entropy {formatQuote(metrics().excessEntropy, 5)}
+                                {' '}· State MI {formatQuote(metrics().stateMutualInformation, 5)}
+                                {' '}· Oracle MI {formatQuote(metrics().oracleMutualInformation, 5)}
+                                <Show when={metrics().distanceImbalanceWeight}>
+                                  {(value) => <>{' '}· mean persistent advice weight {formatQuote(value(), 5)}</>}
+                                </Show>
+                                <Show when={metrics().timeWeightEffectiveSampleRatio}>
+                                  {(value) => <>{' '}· time-weight ESS {ratioPercent(value())}</>}
+                                </Show>
+                              </>}
+                            </Show>
+                            <Show when={training().bestValidationMetrics}>
+                              {(metrics) => <>
+                                {' '}· validation CE {formatQuote(metrics().crossEntropy, 5)}
+                                {' '}· validation parameter MSE {formatQuote(metrics().parameterMse, 5)}
+                              </>}
+                            </Show>
+                            <Show when={training().teacherFitMetrics}>
+                              {(metrics) => <>
+                                {' '}· revised-fitter oracle CE {formatQuote(metrics().crossEntropy, 5)}
+                                {' '}· revised-fitter oracle MSE {formatQuote(metrics().meanSquaredError, 7)}
+                                {' '}· fitter convergence {ratioPercent(metrics().converged)}
+                              </>}
+                            </Show>
+                          </>}
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
                 </Show>
                 <Show when={predictorModel() === "legacy"}>
                   <InspectorNumber label="Base temperature" value={parameters().strategyTemperature ?? 0.001} min={0.000001} step={0.0001} onInput={(value) => update("strategyTemperature", value)} />
@@ -1590,6 +1748,9 @@ export function KamaInspectorPage() {
               <Show when={predictorModel() === "direct-indicator"}>
                 <> The direct indicator model computes only F(a), solves its two no-trade boundaries with the oracle’s exact fee and maintenance semantics, decodes the 17 analytic parameters, and evaluates the conditional four-segment distribution without constructing or fitting a regret surface.</>
               </Show>
+              <Show when={predictorModel() === "mlp"}>
+                <> The MLP reads causal standardized OHLCV histories at 1s, 1m, 1h, 1d, 1M, and 3M plus execution state, then predicts six quadratic score coordinates and two exact survival cutoffs. Full-window metrics and paths use batched backend inference; unsampled hover timestamps use the throttled timestamp API.</>
+              </Show>
               <Show when={predictorModel() === "legacy"}>
                 <> The legacy predictor maps the causal KAMA rate into its configured linear/quadratic and target-normal exposure distribution.</>
               </Show>
@@ -1599,6 +1760,9 @@ export function KamaInspectorPage() {
         </section>
 
         <Show when={analysisError()}>
+          {(message) => <ErrorNotice message={message()} />}
+        </Show>
+        <Show when={predictionError()}>
           {(message) => <ErrorNotice message={message()} />}
         </Show>
 
@@ -1793,7 +1957,9 @@ export function KamaInspectorPage() {
                         <div class="text-xs tabular-nums text-ink-300">
                           {formatDateTime(point().time)} · oracle mode {signedExposure(point().oracleModalExposure)} / path {signedExposure(point().oraclePathExposure)} · forecast target {signedExposure(point().predictor?.optimalExposure ?? distributionMode(point().values, "strategyProbability"))}
                           <Show when={point().predictor} fallback={<> · legacy rate {formatQuote(point().strategyRateBpsHour, 2)} bps/h · b₂ {formatQuote(point().strategyQuadraticCoefficient, 8)} · normal {ratioPercent(point().strategyNormalMixture)} / σ {formatQuote(point().strategyNormalSigma, 3)} · τ {formatQuote(point().strategyTemperature, 6)}</>}>
-                            {(predictor) => <> · {predictor().model} policy · μ {formatCoefficient(predictor().drift)} · σ² {formatCoefficient(predictor().variance)}</>}
+                            {(predictor) => predictor().model === "mlp"
+                              ? <> · MLP {predictor().modelId} policy</>
+                              : <> · {predictor().model} policy · μ {formatCoefficient(predictor().drift!)} · σ² {formatCoefficient(predictor().variance!)}</>}
                           </Show>
                           {` · conditional CE ${formatQuote(point().crossEntropy, 5)} · avg regret ${formatQuote(point().averageRegret, 6)}`}
                         </div>
@@ -1994,7 +2160,9 @@ function ExposureDistributionChart(props: {
         <span>Post-action CE {formatQuote(props.point.postActionCrossEntropy, 5)}</span>
         <span class="text-cyan-200">Oracle probability-MSE fit {formatQuadraticFit(oracleFit())}</span>
         <Show when={props.point.predictor} fallback={<span class="text-violet-200">Legacy prediction exact b₁ {formatCoefficient(props.point.strategyLinearCoefficient)} · b₂ {formatCoefficient(props.point.strategyQuadraticCoefficient)}</span>}>
-          {(predictor) => <span class="text-violet-200">{predictor().model === "direct-indicator" ? "Direct indicator → 17 parameters" : "Handcrafted forecast"} · μ {formatCoefficient(predictor().drift)} · σ² {formatCoefficient(predictor().variance)} · long σ² {formatCoefficient(predictor().longRunVariance)}</span>}
+          {(predictor) => <span class="text-violet-200">{predictor().model === "mlp"
+            ? `MLP ${predictor().modelId ?? "model"} → 6 quadratic parameters`
+            : `${predictor().model === "direct-indicator" ? "Direct indicator → 6 quadratic parameters" : "Handcrafted forecast"} · μ ${formatCoefficient(predictor().drift!)} · σ² ${formatCoefficient(predictor().variance!)} · long σ² ${formatCoefficient(predictor().longRunVariance!)}`}</span>}
         </Show>
       </div>
       <div class="relative h-52 pl-11" role="img" aria-label={`Oracle mode ${signedExposure(props.point.oracleModalExposure)} and path ${signedExposure(props.point.oraclePathExposure)}; strategy mode ${signedExposure(strategyMode())} and target ${signedExposure(predictionTarget())}`}>
@@ -2390,6 +2558,14 @@ function TransitionPolicyDiagnostics(props: {
           latentUpper: props.point.currentExposureMaximum,
           visibleLower: targetExposures()[0]!,
           visibleUpper: targetExposures().at(-1)!,
+          metricCurrentLower: heatmapExposureMode() === "custom"
+            ? currentExposures()[0]!
+            : targetExposures()[0]!,
+          metricCurrentUpper: heatmapExposureMode() === "custom"
+            ? currentExposures().at(-1)!
+            : targetExposures().at(-1)!,
+          friction: activePoint().friction,
+          temperature: activePoint().oracleTemperature,
           refineProjectedFit: refineConditionalFit(),
         },
       )
@@ -2968,7 +3144,9 @@ function TransitionPolicyDiagnostics(props: {
           )}</Show>
           <span class="text-violet-200">{activePoint().predictor
             ? activePoint().predictor?.model === "direct-indicator"
-              ? "Direct causal 17-parameter conditional policy"
+              ? "Direct causal 6-parameter quadratic conditional policy"
+              : activePoint().predictor?.model === "mlp"
+                ? `MLP ${activePoint().predictor?.modelId ?? "model"} conditional policy`
               : fitForecastAtCandle() && perCandleFit() ? "Handcrafted per-candle hindsight fit" : "Handcrafted causal forecast-regret policy"
             : "Legacy exact-mixture prediction"}</span>
         </div>
@@ -2987,8 +3165,8 @@ function TransitionPolicyDiagnostics(props: {
         <Show when={activePoint().predictor?.directMetadata}>
           {(metadata) => (
             <div class="mb-3 rounded-lg border border-violet-400/20 bg-violet-400/5 px-3 py-2 text-[10px] leading-relaxed tabular-nums text-ink-300">
-              <div class="font-medium uppercase tracking-wider text-violet-200">Direct decoder · computed 17 parameters</div>
-              <div>{formatDirectParameterVector(metadata().parameterVector17)}</div>
+              <div class="font-medium uppercase tracking-wider text-violet-200">Direct decoder · computed 6 quadratic parameters</div>
+              <div>{formatDirectParameterVector(metadata().parameterVector6)}</div>
               <div class="text-violet-100">F secants [{metadata().backgroundSecantSlopes.map(formatCoefficient).join(", ")}] · q sell/buy [{formatCoefficient(metadata().effectiveSellCostSlope)}, {formatCoefficient(metadata().effectiveBuyCostSlope)}] · widths [{metadata().transitionWidths10To90.map(formatCoefficient).join(", ")}] ({metadata().transitionWidthSources.join(" / ")})</div>
             </div>
           )}
@@ -3573,51 +3751,39 @@ function formatQuadraticFit(fit: ConditionalQuadraticPolicyFit): string {
 function formatConditionalFit(fit: ConditionalFourSegmentPolicyFit): string {
   return `${fit.converged ? "converged" : "stopped"} by ${fit.termination}`
     + ` · ${fit.restarts} starts · ${fit.iterations} best-start iterations`
-    + ` · CE ${formatQuote(fit.crossEntropy, 6)}`
-    + ` · KL(p∥q) ${formatQuote(fit.klDivergence, 6)}`
-    + ` · MSE ${formatCoefficient(fit.meanSquaredError)}`;
+    + ` · visible CE ${formatQuote(fit.crossEntropy, 6)}`
+    + ` · visible KL(p∥q) ${formatQuote(fit.klDivergence, 6)}`
+    + ` · visible MSE ${formatCoefficient(fit.meanSquaredError)}`;
 }
 
 function formatConditionalGlobalParameters(fit: ConditionalFourSegmentPolicyFit): string {
   const parameters = fit.parameters;
   return `latent [${signedExposure(parameters.latentLower)}, ${signedExposure(parameters.latentUpper)}]`
     + ` · visible [${signedExposure(parameters.visibleLower)}, ${signedExposure(parameters.visibleUpper)}]`
-    + ` · gate w [${formatQuote(parameters.leftSupportWidth, 3)}, ${formatQuote(parameters.rightSupportWidth, 3)}]`
-    + ` · gate ρ [${formatCoefficient(parameters.leftSupportSharpness)}, ${formatCoefficient(parameters.rightSupportSharpness)}]`
+    + ` · survival [${signedExposure(parameters.cutoffLower)}, ${signedExposure(parameters.cutoffUpper)}]`
     + ` · c₁ ${signedExposure(parameters.c1)} · c₂ ${signedExposure(parameters.c2)}`
-    + ` · ${formatLinearConditionalParameter("b", parameters.baseSlope)}`
-    + ` · ${formatLinearConditionalParameter("βc₁", parameters.betaC1)}`
-    + ` · ${formatLinearConditionalParameter("βx", parameters.betaX)}`
-    + ` · ${formatLinearConditionalParameter("βc₂", parameters.betaC2)}`
+    + ` · b ${formatCoefficient(parameters.baseSlope)}`
+    + ` · λ ${formatCoefficient(parameters.quadraticPrecision)}`
+    + ` · βc₁ ${formatCoefficient(parameters.betaC1)}`
+    + ` · βx(fee) ${formatCoefficient(parameters.betaX)}`
+    + ` · βc₂ ${formatCoefficient(parameters.betaC2)}`
     + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`;
 }
 
-function formatDirectParameterVector(parameters: DirectIndicatorParameterVector17): string {
+function formatDirectParameterVector(parameters: DirectIndicatorParameterVector6): string {
   return `c₁ ${signedExposure(parameters.c1)} · c₂ ${signedExposure(parameters.c2)}`
-    + ` · b [${formatCoefficient(parameters.b0)}, ${formatCoefficient(parameters.b1)}]`
-    + ` · βc₁ [${formatCoefficient(parameters.betaC1_0)}, ${formatCoefficient(parameters.betaC1_1)}]`
-    + ` · βx [${formatCoefficient(parameters.betaX_0)}, ${formatCoefficient(parameters.betaX_1)}]`
-    + ` · βc₂ [${formatCoefficient(parameters.betaC2_0)}, ${formatCoefficient(parameters.betaC2_1)}]`
-    + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`
-    + ` · w [${formatCoefficient(parameters.wL)}, ${formatCoefficient(parameters.wR)}]`
-    + ` · ρ [${formatCoefficient(parameters.rhoL)}, ${formatCoefficient(parameters.rhoR)}]`;
-}
-
-function formatLinearConditionalParameter(
-  label: string,
-  coefficients: readonly [number, number],
-): string {
-  const slope = coefficients[1];
-  return `${label}(ξ)=${formatCoefficient(coefficients[0])}`
-    + `${slope < 0 ? "−" : "+"}${formatCoefficient(Math.abs(slope))}ξ`;
+    + ` · b ${formatCoefficient(parameters.b)}`
+    + ` · λ ${formatCoefficient(parameters.lambda)}`
+    + ` · βc₁ ${formatCoefficient(parameters.betaC1)}`
+    + ` · βc₂ ${formatCoefficient(parameters.betaC2)}`;
 }
 
 function formatConditionalSliceParameters(parameters: ConditionalFourSegmentSliceParameters): string {
-  return `ξ ${formatQuote(parameters.xi, 4)}`
-    + ` · b ${formatCoefficient(parameters.baseSlope)}`
+  return `b ${formatCoefficient(parameters.baseSlope)}`
+    + ` · λ ${formatCoefficient(parameters.quadraticPrecision)}`
     + ` · β [${formatCoefficient(parameters.betaC1)}, ${formatCoefficient(parameters.betaX)}, ${formatCoefficient(parameters.betaC2)}]`
     + ` · κ [${formatCoefficient(parameters.kappaC1)}, ${formatCoefficient(parameters.kappaX)}, ${formatCoefficient(parameters.kappaC2)}]`
-    + ` · asymptotic ordered slopes [${parameters.segmentSlopes.map(formatCoefficient).join(", ")}]`;
+    + ` · ordered slope offsets [${parameters.segmentSlopeOffsets.map(formatCoefficient).join(", ")}]`;
 }
 
 function DistributionExposureAxis(props: { values: VwKamaValueDistributionPoint["values"] }) {

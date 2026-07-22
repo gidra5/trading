@@ -21,6 +21,7 @@ if (args.includes("--help")) {
   --ranges START..END,...          Sparse UTC date ranges; ends are inclusive
   --warmup-days 0                  Prepend this many days to every range
   --compression none|gzip         Store daily shards as JSONL or JSONL.GZ
+  --fill-gaps                     Fill no-trade intervals with zero-volume carry candles
   --quiet                          Only print the final total
   --data-dir data`);
   process.exit(0);
@@ -32,6 +33,7 @@ const value = (name: string): string | undefined => {
 const symbol = (value("--symbol") ?? "BTCUSDT").toUpperCase();
 const interval = value("--interval") ?? "1s";
 const compression = value("--compression") ?? "none";
+const fillGaps = args.includes("--fill-gaps");
 const quiet = args.includes("--quiet");
 const days = Number(value("--days") ?? 30);
 const warmupDays = Number(value("--warmup-days") ?? 0);
@@ -74,11 +76,20 @@ async function main(): Promise<void> {
     const target = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? ".gz" : ""}`);
     const alternate = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? "" : ".gz"}`);
     const expected = DAY_MS / intervalMs;
-    const cached = await validatedCount(target, day, expected)
-      || await validatedCount(alternate, day, expected);
+    let cachedFile = target;
+    let cached = await validatedCount(target, day, expected);
+    if (cached === 0) {
+      cachedFile = alternate;
+      cached = await validatedCount(alternate, day, expected);
+    }
     if (cached > 0) {
+      if (fillGaps && cached < expected) {
+        cached = await fillCachedGaps(cachedFile, day, expected);
+      }
       total += cached;
-      if (!quiet) console.log(`${date}: cached (${cached.toLocaleString()} candles)`);
+      if (!quiet) console.log(
+        `${date}: cached (${cached.toLocaleString()} candles${fillGaps ? "; dense" : ""})`,
+      );
       continue;
     }
 
@@ -143,17 +154,26 @@ async function main(): Promise<void> {
       const ordered = [...candles.values()].sort((a, b) => a.openTime - b.openTime);
       const output = compression === "gzip" ? createGzip({ level: 6 }) : new PassThrough();
       const outputDone = pipeline(output, createWriteStream(temporary));
+      let previous: Candle | undefined;
       for (const candle of ordered) {
         gaps += (candle.openTime - previousTime) / intervalMs - 1;
+        if (fillGaps && previous) {
+          for (let time = previous.openTime + intervalMs; time < candle.openTime; time += intervalMs) {
+            const filled = carryCandle(previous, time);
+            if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+            previous = filled;
+          }
+        }
         if (!output.write(`${JSON.stringify(candle)}\n`)) {
           await once(output, "drain");
         }
+        previous = candle;
         previousTime = candle.openTime;
       }
       output.end();
       await outputDone;
       gaps += (day + DAY_MS - intervalMs - previousTime) / intervalMs;
-      const count = ordered.length;
+      const count = fillGaps ? expected : ordered.length;
       if (count === 0 || count + gaps !== expected) throw new Error(`${date}: invalid archive coverage`);
       await fs.rename(temporary, target);
       total += count;
@@ -166,6 +186,67 @@ async function main(): Promise<void> {
   }
 
   console.log(`Stored ${total.toLocaleString()} candles in ${outputDir}`);
+}
+
+async function fillCachedGaps(file: string, day: number, expected: number): Promise<number> {
+  const temporary = `${file}.fill-${process.pid}.tmp`;
+  const source = createReadStream(file);
+  const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  const output = file.endsWith(".gz") ? createGzip({ level: 6 }) : new PassThrough();
+  const outputDone = pipeline(output, createWriteStream(temporary));
+  let previous: Candle | undefined;
+  let count = 0;
+  try {
+    for await (const line of lines) {
+      if (!line) continue;
+      const candle = JSON.parse(line) as Candle;
+      if (!validCandle(candle, day)) throw new Error(`${file}: invalid cached candle`);
+      if (!previous && candle.openTime !== day) {
+        throw new Error(`${file}: cannot fill a missing leading interval without a prior close`);
+      }
+      if (previous && candle.openTime <= previous.openTime) {
+        throw new Error(`${file}: cached candles are duplicated or out of order`);
+      }
+      if (previous) {
+        for (let time = previous.openTime + intervalMs; time < candle.openTime; time += intervalMs) {
+          const filled = carryCandle(previous, time);
+          if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+          previous = filled;
+          count += 1;
+        }
+      }
+      if (!output.write(`${JSON.stringify(candle)}\n`)) await once(output, "drain");
+      previous = candle;
+      count += 1;
+    }
+    output.end();
+    await outputDone;
+    if (count !== expected || previous?.openTime !== day + DAY_MS - intervalMs) {
+      throw new Error(`${file}: gap filling did not produce a complete UTC day`);
+    }
+    await fs.rename(temporary, file);
+    return count;
+  } catch (error) {
+    output.destroy();
+    await Promise.allSettled([outputDone, fs.rm(temporary, { force: true })]);
+    throw error;
+  }
+}
+
+function carryCandle(previous: Candle, openTime: number): Candle {
+  return {
+    symbol,
+    interval,
+    openTime,
+    open: previous.close,
+    high: previous.close,
+    low: previous.close,
+    close: previous.close,
+    volume: 0,
+    closeTime: openTime + intervalMs - 1,
+    closed: true,
+  };
 }
 
 function parseDay(day: string): number {

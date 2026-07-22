@@ -73,6 +73,11 @@ import {
   conditionalFourSegmentPolicyMatrix,
   type ConditionalFourSegmentParameters,
 } from "./conditional-exposure-distribution.js";
+import {
+  predictMlpConditionalDistribution,
+  type MlpConditionalPrediction,
+  type MlpTrainingMetrics,
+} from "./mlp-exposure-predictor.js";
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -88,12 +93,13 @@ export type VwKamaThresholdResponse = "proportional" | "inverse";
 export type VwKamaHoldingPeriodMode = "fixed" | "oracle-half-average-trade";
 export type VwKamaValueHorizonEndMode = "truncate" | "extend";
 export type VwKamaValueHorizonMode = "full-window" | "fixed";
-export type VwKamaPredictorModel = "legacy" | "handcrafted" | "direct-indicator";
+export type VwKamaPredictorModel = "legacy" | "handcrafted" | "direct-indicator" | "mlp";
 
 export interface VwKamaPredictorConfig {
   model: VwKamaPredictorModel;
   handcraftedParameters: HandcraftedIndicatorPredictorParameters;
   directIndicatorParameters: DirectIndicatorPredictorParameters;
+  mlpModelId: string;
 }
 
 export interface VwKamaParameters {
@@ -304,6 +310,23 @@ export interface VwKamaInspectorCatalog {
   defaults: VwKamaInspectorRequest;
   presets: VwKamaPreset[];
   predictorPresets: VwKamaPredictorPreset[];
+  mlpModels: Array<{
+    id: string;
+    label: string;
+    createdAt: string;
+    executionProvider: "cuda" | "cpu" | "unavailable";
+    training?: {
+      trainExamples: number;
+      validationExamples: number;
+      testExamples: number;
+      bestValidationLoss: number;
+      testLoss: number;
+      bestValidationMetrics?: MlpTrainingMetrics;
+      testMetrics?: MlpTrainingMetrics;
+      teacherFitMetrics?: Record<string, number>;
+      finalizedEarly?: boolean;
+    };
+  }>;
 }
 
 export interface VwKamaPredictorPreset {
@@ -330,6 +353,17 @@ export interface VwKamaPredictorFitResponse {
   baselineCrossEntropy: number;
   fittedCrossEntropy: number;
   iterations: number;
+  elapsedMs: number;
+}
+
+export interface VwKamaTimestampPredictionRequest extends VwKamaInspectorRequest {
+  time: number;
+}
+
+export interface VwKamaTimestampPredictionResponse {
+  time: number;
+  modelId: string;
+  point: VwKamaValueDistributionPoint;
   elapsedMs: number;
 }
 
@@ -500,12 +534,14 @@ export interface VwKamaValueDistributionPoint {
   crossEntropy: number;
   postActionCrossEntropy: number;
   predictor?: {
-    model: "handcrafted" | "direct-indicator";
-    drift: number;
-    variance: number;
-    longRunVariance: number;
+    model: "handcrafted" | "direct-indicator" | "mlp";
+    drift?: number;
+    variance?: number;
+    longRunVariance?: number;
     optimalExposure: number;
-    parameters: HandcraftedIndicatorPredictorParameters | DirectIndicatorPredictorParameters;
+    parameters?: HandcraftedIndicatorPredictorParameters | DirectIndicatorPredictorParameters;
+    modelId?: string;
+    rawParameters?: number[];
     conditionalParameters?: ConditionalFourSegmentParameters;
     directMetadata?: DirectIndicatorConditionalMetadata;
   };
@@ -576,6 +612,10 @@ export interface EvaluateVwKamaOptions extends Omit<VwKamaInspectorRequest, "win
     directIndicatorPredictor?: {
       parameters: DirectIndicatorPredictorParameters;
       states: readonly HandcraftedIndicatorState[];
+    };
+    mlpPredictor?: {
+      modelId: string;
+      rawParameters: readonly ArrayLike<number>[];
     };
   };
 }
@@ -938,11 +978,16 @@ export function evaluateVwKamaOracle(
     && options.valueDistillation.directIndicatorPredictor.states.length < candles.length) {
     throw new Error("Direct indicator forecast state does not cover the candle series.");
   }
+  if (options.valueDistillation?.mlpPredictor
+    && options.valueDistillation.mlpPredictor.rawParameters.length < candles.length) {
+    throw new Error("MLP prediction output does not cover the candle series.");
+  }
   const signalFriction = options.oracleFriction
     * Math.max(0, options.parameters.signalFrictionFraction ?? 1);
   const handcraftedPredictor = options.valueDistillation?.handcraftedPredictor;
   const directPredictor = options.valueDistillation?.directIndicatorPredictor;
-  const predictor = handcraftedPredictor ?? directPredictor;
+  const mlpPredictor = options.valueDistillation?.mlpPredictor;
+  const predictor = handcraftedPredictor ?? directPredictor ?? mlpPredictor;
   const predictionOptions = options.valueDistillation
     ? {
         intervalMs: options.intervalMs,
@@ -1178,10 +1223,24 @@ export function evaluateVwKamaOracle(
       && options.valueDistillation && predictionOptions
       ? handcraftedPredictor
         ? preparedHandcraftedPredictor!.predict(handcraftedPredictor.states[index]!)
-        : preparedDirectPredictor!.predict(
+        : directPredictor
+          ? preparedDirectPredictor!.predict(
             forecastCurrentExposure,
-            directPredictor!.states[index]!,
+            directPredictor.states[index]!,
           )
+          : predictMlpConditionalDistribution(
+              options.valueDistillation.oracle.grid,
+              forecastCurrentExposure,
+              mlpPredictor!.rawParameters[index]!,
+              {
+                latentLower: -options.valueDistillation.oracle.execution.maxEffectiveExposure,
+                latentUpper: options.valueDistillation.oracle.execution.maxEffectiveExposure,
+                visibleLower: options.valueDistillation.oracle.execution.minExposure,
+                visibleUpper: options.valueDistillation.oracle.execution.maxExposure,
+                friction: options.valueDistillation.oracle.execution.friction,
+                temperature: options.valueDistillation.oracle.temperature,
+              },
+            )
       : undefined;
     const forecastDecision = forecastPrediction && options.valueDistillation
       ? forecastPolicyDecision(
@@ -1241,7 +1300,7 @@ export function evaluateVwKamaOracle(
               1 / options.valueDistillation.oracle.temperature,
             );
           }
-        } else if (directPredictor) {
+        } else if (directPredictor || mlpPredictor) {
           if (forecastPrediction && tracePoint && "conditionalParameters" in forecastPrediction) {
             forecastObservation = observeExposureFourSegmentProbabilityDistillation(
               valueDistillation,
@@ -1368,9 +1427,17 @@ export function evaluateVwKamaOracle(
           forecastPrediction,
           forecastObservation,
           forecastDecision?.targetExposure,
-          predictor?.states[index],
-          predictor?.parameters,
-          directPredictor ? "direct-indicator" : handcraftedPredictor ? "handcrafted" : undefined,
+          handcraftedPredictor?.states[index] ?? directPredictor?.states[index],
+          handcraftedPredictor?.parameters ?? directPredictor?.parameters,
+          directPredictor
+            ? "direct-indicator"
+            : handcraftedPredictor
+              ? "handcrafted"
+              : mlpPredictor
+                ? "mlp"
+                : undefined,
+          mlpPredictor?.modelId,
+          mlpPredictor?.rawParameters[index],
         ));
       }
       if (points.at(-1)?.time !== candle.closeTime) {
@@ -1595,12 +1662,14 @@ function valueDistributionPoint(
   frictionFraction: number,
   strategyNormalMixture: number,
   strategyNormalSigma: number,
-  forecastPrediction?: HandcraftedIndicatorPrediction | DirectIndicatorConditionalPrediction,
+  forecastPrediction?: HandcraftedIndicatorPrediction | DirectIndicatorConditionalPrediction | MlpConditionalPrediction,
   forecastObservation?: ExposureProbabilityDistillationObservation,
   forecastTargetExposure?: number,
   forecastState?: HandcraftedIndicatorState,
   forecastParameters?: HandcraftedIndicatorPredictorParameters | DirectIndicatorPredictorParameters,
-  forecastModel?: "handcrafted" | "direct-indicator",
+  forecastModel?: "handcrafted" | "direct-indicator" | "mlp",
+  forecastModelId?: string,
+  forecastRawParameters?: ArrayLike<number>,
 ): VwKamaValueDistributionPoint {
   const strategyQuadraticCoefficient = strategyExposureQuadraticCoefficient(
     strategyQuadraticScale,
@@ -1730,18 +1799,26 @@ function valueDistributionPoint(
     averageRegret: oracle.averageRegrets[candleIndex]!,
     crossEntropy,
     postActionCrossEntropy,
-    ...(forecastPrediction && forecastState && forecastParameters && forecastModel
+    ...(forecastPrediction && forecastModel
       ? { predictor: {
           model: forecastModel,
-          drift: forecastState.drift,
-          variance: forecastState.variance,
-          longRunVariance: forecastState.longRunVariance,
           optimalExposure: forecastTargetExposure ?? forecastPrediction.optimalExposure,
-          parameters: forecastParameters,
+          ...(forecastState ? {
+            drift: forecastState.drift,
+            variance: forecastState.variance,
+            longRunVariance: forecastState.longRunVariance,
+          } : {}),
+          ...(forecastParameters ? { parameters: forecastParameters } : {}),
+          ...(forecastModelId ? { modelId: forecastModelId } : {}),
+          ...(forecastRawParameters
+            ? { rawParameters: Array.from(forecastRawParameters) }
+            : {}),
           ...("conditionalParameters" in forecastPrediction
             ? {
                 conditionalParameters: forecastPrediction.conditionalParameters,
-                directMetadata: forecastPrediction.metadata,
+                ...(forecastModel === "direct-indicator"
+                  ? { directMetadata: (forecastPrediction as DirectIndicatorConditionalPrediction).metadata }
+                  : {}),
               }
             : {}),
         } }
@@ -1961,7 +2038,7 @@ interface ForecastPolicyDecision {
 }
 
 function forecastPolicyDecision(
-  prediction: HandcraftedIndicatorPrediction | DirectIndicatorConditionalPrediction,
+  prediction: HandcraftedIndicatorPrediction | DirectIndicatorConditionalPrediction | MlpConditionalPrediction,
   grid: Float64Array,
   currentExposure: number,
   friction: number,

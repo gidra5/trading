@@ -4,6 +4,7 @@ import type {
   VwKamaHistoricalAveragesRequest,
   VwKamaInspectorRequest,
   VwKamaPredictorFitRequest,
+  VwKamaTimestampPredictionRequest,
 } from "@trading/bot-algo";
 import { KamaInspectorEngine } from "./kama-inspector.js";
 
@@ -17,6 +18,7 @@ type InspectorWorkerRequest =
   | { type: "analyze"; id: number; input: VwKamaInspectorRequest; cancelFlag?: Int32Array }
   | { type: "candles"; id: number; input: VwKamaCandleRangeRequest; cancelFlag?: Int32Array }
   | { type: "fit-predictor"; id: number; input: VwKamaPredictorFitRequest; cancelFlag?: Int32Array }
+  | { type: "predict"; id: number; input: VwKamaTimestampPredictionRequest; cancelFlag?: Int32Array }
   | { type: "historical-averages"; id: number; input: VwKamaHistoricalAveragesRequest; cancelFlag?: Int32Array };
 
 port.on("message", async (message: InspectorWorkerRequest) => {
@@ -33,6 +35,8 @@ port.on("message", async (message: InspectorWorkerRequest) => {
         ? await engine.candles(message.input, message.cancelFlag)
         : message.type === "fit-predictor"
           ? await engine.fitPredictor(message.input, message.cancelFlag)
+          : message.type === "predict"
+            ? await engine.predict(message.input, message.cancelFlag)
           : await engine.historicalAverages(message.input, message.cancelFlag);
     port.postMessage({ id: message.id, result });
   } catch (error) {

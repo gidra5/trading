@@ -5,6 +5,7 @@ import { createSignal, onCleanup, onMount } from "solid-js";
 import { render } from "solid-js/web";
 import { App } from "./App";
 import { KamaInspectorPage } from "./KamaInspectorPage";
+import { MlpTrainingPage } from "./MlpTrainingPage";
 
 const root = document.getElementById("root");
 
@@ -17,7 +18,9 @@ function Root() {
   const update = () => setHash(window.location.hash);
   onMount(() => window.addEventListener("hashchange", update));
   onCleanup(() => window.removeEventListener("hashchange", update));
-  return hash().startsWith("#/kama-inspector") ? <KamaInspectorPage /> : <App />;
+  if (hash().startsWith("#/mlp-training")) return <MlpTrainingPage />;
+  if (hash().startsWith("#/kama-inspector")) return <KamaInspectorPage />;
+  return <App />;
 }
 
 render(() => <Root />, root);

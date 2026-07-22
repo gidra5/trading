@@ -712,6 +712,10 @@ export function App() {
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
+            <a class={buttonPanelClass} href="#/mlp-training">
+              <Activity size={16} />
+              MLP Training
+            </a>
             <a class={buttonPanelClass} href="#/kama-inspector">
               <Search size={16} />
               KAMA Inspector

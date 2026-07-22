@@ -47,6 +47,7 @@ Backtesting behavior and current performance debt are tracked in [docs/backtesti
 Strategy research notes and benchmark observations are tracked in [docs/strategy-research.md](docs/strategy-research.md).
 The current experiment plan and latest run results are recorded in [docs/experiment-plan.md](docs/experiment-plan.md).
 The trading model and spreadsheet-derived position ledger formulas are documented in [docs/position-ledger.md](docs/position-ledger.md).
+The causal MLP predictor, training workflow, artifact contract, and GPU inference settings are documented in [docs/mlp-exposure-predictor.md](docs/mlp-exposure-predictor.md).
 Automated position management is documented in [docs/automated-position-management.md](docs/automated-position-management.md).
 UI-driven manual fill workflows are documented in [docs/manual-position-management.md](docs/manual-position-management.md).
 
@@ -64,6 +65,9 @@ TRADING_BINANCE_EXCHANGE_MODE=auto
 TRADING_DATA_DIR=/path/to/data
 TRADING_HISTORY_CACHE_MAX_BYTES=512mb
 TRADING_HISTORY_CACHE_MIN_FREE_BYTES=512mb
+TRADING_MLP_EXECUTION_PROVIDER=auto
+TRADING_MLP_BATCH_SIZE=1024
+TRADING_MLP_CUDNN_DIR=
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
 ```

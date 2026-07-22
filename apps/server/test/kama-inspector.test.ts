@@ -71,7 +71,7 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
       point.predictor?.model === "direct-indicator"
       && point.predictor.conditionalParameters !== undefined
       && point.predictor.directMetadata !== undefined
-      && Object.keys(point.predictor.directMetadata.parameterVector17).length === 17
+      && Object.keys(point.predictor.directMetadata.parameterVector6).length === 6
       && Math.abs(point.values.reduce(
         (sum, value) => sum + value.strategyProbability,
         0,
@@ -382,11 +382,56 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
         hindsight: true,
       },
     }]));
+    const modelDirectory = path.join(dataDir, "models", "mlp", "catalog-test");
+    await mkdir(modelDirectory, { recursive: true });
+    await writeFile(path.join(modelDirectory, "model.onnx"), "catalog-only fixture");
+    await writeFile(path.join(modelDirectory, "manifest.json"), JSON.stringify({
+      id: "catalog-test",
+      label: "Catalog test MLP",
+      createdAt: "2026-07-20T00:00:00.000Z",
+      featureSchemaVersion: 4,
+      inputFeatureCount: 909,
+      outputParameterCount: 6,
+      hiddenLayerCount: 16,
+      hiddenWidth: 1_024,
+      modelFile: "model.onnx",
+      training: {
+        trainExamples: 100,
+        validationExamples: 20,
+        testExamples: 20,
+        validationStartTime: 1,
+        testStartTime: 2,
+        bestEpoch: 3,
+        bestValidationLoss: 0.5,
+        testLoss: 0.6,
+        seed: 1337,
+        device: "cuda",
+      },
+      verification: {
+        executionProvider: "cuda",
+        maxAbsolutePyTorchError: 1e-6,
+        maxAbsoluteProviderError: 1e-4,
+        verifiedAt: "2026-07-20T00:01:00.000Z",
+      },
+    }));
     const engine = new KamaInspectorEngine(dataDir, { now: () => FIXED_NOW });
     const catalog = engine.catalog();
     assert.equal(catalog.windows.some((window) => window.id === "latest"), true);
     assert.equal(catalog.predictorPresets.length, 68);
     assert.equal(catalog.defaults.predictor?.model, "handcrafted");
+    assert.deepEqual(catalog.mlpModels, [{
+      id: "catalog-test",
+      label: "Catalog test MLP",
+      createdAt: "2026-07-20T00:00:00.000Z",
+      executionProvider: "cuda",
+      training: {
+        trainExamples: 100,
+        validationExamples: 20,
+        testExamples: 20,
+        bestValidationLoss: 0.5,
+        testLoss: 0.6,
+      },
+    }]);
     for (const model of ["handcrafted", "direct-indicator"] as const) {
       const presets = catalog.predictorPresets.filter((preset) => preset.model === model);
       assert.equal(presets.length, 34);

@@ -6,6 +6,7 @@ import {
   conditionalQuadraticExposureProbabilities,
   createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
+  exposureHoldingFeasibleInterval,
   exposureValueOracleProbabilities,
   finalizeExposureReturn,
   finalizeExposureValueDistillation,
@@ -170,6 +171,36 @@ test("exposure-value oracle can retain absolute post-action log returns", () => 
     Array.from(oracle.actionValues),
   );
   assert.equal(truncateExposureValueOracle(oracle, 1).actionValues?.length, oracle.grid.length);
+});
+
+test("mandatory-hold survival cutoffs reject any action that liquidates", () => {
+  const prices = [100, 50, 150];
+  const execution = {
+    friction: 0.001,
+    minExposure: -100,
+    maxExposure: 100,
+    maxEffectiveExposure: 250,
+    quoteLendRate: 0,
+    quoteBorrowRate: 0,
+    assetBorrowRate: 0,
+  };
+  const cutoff = exposureHoldingFeasibleInterval(prices, 0, 2, execution);
+  assert.ok(cutoff.lower > -250 && cutoff.lower < 0, cutoff);
+  assert.ok(cutoff.upper > 0 && cutoff.upper < 250, cutoff);
+  const oracle = prepareExposureValueOracle(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 2,
+    friction: execution.friction,
+    gridSize: 5,
+    minExposure: -250,
+    maxExposure: 250,
+    maxEffectiveExposure: 250,
+    temperature: 0.01,
+    includeActionValues: true,
+  });
+  assert.equal(oracle.actionValues?.[0], Number.NEGATIVE_INFINITY);
+  assert.equal(oracle.actionValues?.[4], Number.NEGATIVE_INFINITY);
+  assert.equal(oracle.actionValues?.[2], 0);
 });
 
 test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (context) => {

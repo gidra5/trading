@@ -1,0 +1,255 @@
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const planArgument = argument("plan") ?? "ml/training-plan.json";
+const trainingOnly = process.argv.includes("--training-only");
+const planFile = path.resolve(repoRoot, planArgument);
+const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
+const runDir = path.resolve(repoRoot, plan.runDir);
+const datasetDir = path.resolve(repoRoot, plan.datasetDir);
+const artifactDir = path.resolve(repoRoot, plan.artifactDir);
+const initializeFromCheckpoint = plan.training?.initializeFromCheckpoint
+  ? path.resolve(repoRoot, plan.training.initializeFromCheckpoint)
+  : undefined;
+if (initializeFromCheckpoint && !fs.existsSync(initializeFromCheckpoint)) {
+  throw new Error(`MLP initialization checkpoint is missing: ${initializeFromCheckpoint}`);
+}
+const statusFile = path.join(runDir, "status.json");
+const logFile = path.join(runDir, "training.log");
+const finalizeFile = path.join(runDir, "FINALIZE");
+fs.mkdirSync(runDir, { recursive: true });
+
+const previous = readJson(statusFile);
+if (previous?.pid && processIsAlive(previous.pid)
+  && !["complete", "failed", "paused"].includes(previous.stage)) {
+  throw new Error(`MLP training is already running as PID ${previous.pid}.`);
+}
+fs.rmSync(finalizeFile, { force: true });
+
+let activeChild;
+let interruptionSignal;
+let status = {
+  planId: plan.id,
+  pid: process.pid,
+  stage: "starting",
+  startedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  datasetDir,
+  artifactDir,
+  logFile,
+  ...(initializeFromCheckpoint ? { initializeFromCheckpoint } : {}),
+};
+writeStatus();
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    interruptionSignal ??= signal;
+    if (activeChild && !activeChild.killed) activeChild.kill(signal);
+  });
+}
+
+try {
+  if (!trainingOnly) {
+    await runStage("cuda-build", process.execPath, [
+      path.join(repoRoot, "scripts/build-vw-kama-cuda.mjs"),
+    ]);
+    await runStage("dataset", process.execPath, [
+      path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+      path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+      "--plan", planFile,
+    ]);
+    if ((plan.teacherFit?.adaptiveRounds ?? 0) > 0) {
+      await runStage("dataset-refinement", process.execPath, [
+        path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+        path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+        "--plan", planFile,
+        "--refinement-pass", "1",
+      ]);
+    }
+    await runStage("dataset-features", process.execPath, [
+      path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+      path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+      "--plan", planFile,
+      "--refresh-features", "true",
+    ]);
+  }
+  const training = plan.training;
+  const python = path.join(repoRoot, ".venv-ml/bin/python");
+  if (!fs.existsSync(python)) {
+    throw new Error("ML environment is missing. Run `npm run mlp:bootstrap` first.");
+  }
+  await runStage("training", python, [
+    path.join(repoRoot, "ml/train_mlp.py"),
+    "--dataset", datasetDir,
+    "--output", artifactDir,
+    "--model-id", plan.id,
+    "--label", plan.label,
+    "--plan", planFile,
+    "--epochs", String(training.epochs),
+    "--batch-size", String(training.batchSize),
+    "--accumulate", String(training.gradientAccumulation),
+    "--learning-rate", String(training.learningRate),
+    "--weight-decay", String(training.weightDecay),
+    "--dropout", String(training.dropout),
+    "--states-per-example", String(training.statesPerExample),
+    "--patience", String(training.patience),
+    "--workers", String(training.workers),
+    "--seed", String(training.seed),
+    "--device", training.device,
+    "--log-every-steps", String(training.logEverySteps),
+    "--loss-weights-json", JSON.stringify(training.lossWeights),
+    "--time-weighting-json", JSON.stringify(training.timeWeighting),
+    "--finalize-file", finalizeFile,
+    "--resume",
+    ...(initializeFromCheckpoint
+      ? ["--initialize-from-checkpoint", initializeFromCheckpoint]
+      : []),
+  ]);
+  await runStage("verification", process.execPath, [
+    path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
+    path.join(repoRoot, "scripts/verify-mlp-model.mjs"),
+    artifactDir,
+  ]);
+  status = {
+    ...status,
+    stage: "complete",
+    completedAt: new Date().toISOString(),
+    message: "Verified model artifact is available to the backend and UI.",
+  };
+  writeStatus();
+} catch (error) {
+  if (interruptionSignal) {
+    status = {
+      ...status,
+      stage: "paused",
+      pausedAt: new Date().toISOString(),
+      message: `Paused by ${interruptionSignal}; completed shards and checkpoints are resumable.`,
+    };
+    writeStatus();
+  } else {
+    status = {
+      ...status,
+      stage: "failed",
+      failedAt: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+    };
+    writeStatus();
+    throw error;
+  }
+}
+
+async function runStage(stage, command, args) {
+  status = { ...status, stage, stageStartedAt: new Date().toISOString() };
+  writeStatus();
+  appendLog(`\n[${new Date().toISOString()}] ${stage}: ${command} ${args.join(" ")}\n`);
+  const child = spawn(command, args, {
+    cwd: repoRoot,
+    env: { ...process.env, TMPDIR: "/tmp" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  activeChild = child;
+  consume(child.stdout, false);
+  consume(child.stderr, true);
+  const exitCode = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve(code ?? (signal ? 128 : 1)));
+  });
+  activeChild = undefined;
+  if (interruptionSignal) {
+    throw new Error(`${stage} interrupted by ${interruptionSignal}.`);
+  }
+  if (exitCode !== 0) throw new Error(`${stage} exited with code ${exitCode}.`);
+}
+
+function consume(stream, stderr) {
+  const lines = readline.createInterface({ input: stream });
+  lines.on("line", (line) => {
+    appendLog(`${line}\n`);
+    (stderr ? process.stderr : process.stdout).write(`${line}\n`);
+    try {
+      const event = JSON.parse(line);
+      status = { ...status, latest: event };
+      if (event.event === "epoch") {
+        status = {
+          ...status,
+          epoch: event.epoch,
+          epochs: event.epochs,
+          globalStep: event.globalStep,
+          train: event.train,
+          validation: event.validation,
+          bestValidation: event.bestValidation,
+          bestEpoch: event.bestEpoch,
+        };
+      } else if (event.event === "train-step") {
+        status = {
+          ...status,
+          epoch: event.epoch,
+          epochs: event.epochs,
+          globalStep: event.globalStep,
+          latestStep: event,
+        };
+      } else if (event.event === "training-complete") {
+        status = { ...status, finalMetrics: event };
+      } else if (event.event === "dataset-source-rejected") {
+        status = {
+          ...status,
+          sourceRejections: {
+            count: event.rejectedDays,
+            latestDate: event.date,
+            latestDetail: event.detail,
+            queue: path.join(datasetDir, "source-rejection-queue.json"),
+          },
+        };
+      } else if (event.event === "dataset-source-recovered") {
+        status = {
+          ...status,
+          sourceRejections: {
+            ...status.sourceRejections,
+            count: event.remainingRejectedDays,
+          },
+        };
+      }
+      writeStatus();
+    } catch {
+      // Human-readable verifier output is still retained in the log.
+    }
+  });
+}
+
+function writeStatus() {
+  status.updatedAt = new Date().toISOString();
+  const temporary = `${statusFile}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(status, null, 2)}\n`);
+  fs.renameSync(temporary, statusFile);
+}
+
+function appendLog(value) {
+  fs.appendFileSync(logFile, value);
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function argument(name) {
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}

@@ -41,6 +41,12 @@
       "development": "./src/direct-indicator-conditional-predictor.ts",
       "import": "./dist/direct-indicator-conditional-predictor.js",
       "default": "./src/direct-indicator-conditional-predictor.ts"
+    },
+    "./mlp-exposure-predictor": {
+      "types": "./src/mlp-exposure-predictor.ts",
+      "development": "./src/mlp-exposure-predictor.ts",
+      "import": "./dist/mlp-exposure-predictor.js",
+      "default": "./src/mlp-exposure-predictor.ts"
     }
   },
   "scripts": {

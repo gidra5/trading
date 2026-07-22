@@ -77,6 +77,79 @@ export interface ExposureExecutionOptions {
   assetBorrowRate: number;
 }
 
+export interface ExposureHoldingFeasibleInterval {
+  lower: number;
+  upper: number;
+}
+
+/**
+ * Exact mandatory-hold survival interval for a normalized post-rebalance
+ * portfolio. Zero exposure is the known feasible anchor; each boundary is
+ * refined continuously instead of being quantized to the oracle action grid.
+ */
+export function exposureHoldingFeasibleInterval(
+  prices: ArrayLike<number>,
+  startIndex: number,
+  holdingPeriodSteps: number,
+  execution: ExposureExecutionOptions,
+  bisectionIterations = 32,
+): ExposureHoldingFeasibleInterval {
+  if (!Number.isInteger(startIndex) || startIndex < 0 || startIndex >= prices.length
+    || !Number.isInteger(holdingPeriodSteps) || holdingPeriodSteps < 1
+    || !Number.isInteger(bisectionIterations) || bisectionIterations < 1
+    || !(execution.maxEffectiveExposure > 0)) {
+    throw new Error("Exposure holding cutoff derivation received invalid bounds or indexes.");
+  }
+  const endIndex = Math.min(prices.length - 1, startIndex + holdingPeriodSteps);
+  const startPrice = prices[startIndex]!;
+  if (!(Number.isFinite(startPrice) && startPrice > 0)) {
+    throw new Error("Exposure holding cutoff derivation requires positive finite prices.");
+  }
+  const survives = (action: number): boolean => {
+    let quote = 1 - action;
+    let asset = action / startPrice;
+    for (let time = startIndex; time < endIndex; time += 1) {
+      quote *= quote >= 0 ? 1 + execution.quoteLendRate : 1 + execution.quoteBorrowRate;
+      if (asset < 0) asset *= 1 + execution.assetBorrowRate;
+      const assetValue = asset * prices[time + 1]!;
+      const markedEquity = quote + assetValue;
+      const liquidatedAssetValue = assetValue >= 0
+        ? assetValue * (1 - execution.friction)
+        : assetValue / Math.max(Number.EPSILON, 1 - execution.friction);
+      const liquidationEquity = quote + liquidatedAssetValue;
+      if (!(liquidationEquity > 0) || !Number.isFinite(liquidationEquity)
+        || Math.abs(liquidatedAssetValue / liquidationEquity) > execution.maxEffectiveExposure
+        || !(markedEquity > 0) || !Number.isFinite(markedEquity)) return false;
+    }
+    return true;
+  };
+  if (!survives(0)) throw new Error("Zero exposure must survive the mandatory holding path.");
+  const effective = execution.maxEffectiveExposure;
+  let lower = -effective;
+  if (!survives(lower)) {
+    let infeasible = lower;
+    let feasible = 0;
+    for (let iteration = 0; iteration < bisectionIterations; iteration += 1) {
+      const middle = (infeasible + feasible) / 2;
+      if (survives(middle)) feasible = middle;
+      else infeasible = middle;
+    }
+    lower = feasible;
+  }
+  let upper = effective;
+  if (!survives(upper)) {
+    let feasible = 0;
+    let infeasible = upper;
+    for (let iteration = 0; iteration < bisectionIterations; iteration += 1) {
+      const middle = (feasible + infeasible) / 2;
+      if (survives(middle)) feasible = middle;
+      else infeasible = middle;
+    }
+    upper = feasible;
+  }
+  return { lower, upper };
+}
+
 export interface ExposureReturnAccumulator {
   equity: number;
   exposure: number;
@@ -985,19 +1058,7 @@ function unmaintainedHoldingBlockOutcome(
       exposure: endpoint.exposure,
     };
   }
-  let liquidation = adverse;
-  for (let cursor = start + 1; cursor <= end; cursor += 1) {
-    const outcome = holdingOutcome(initialExposure, startPrice, prices[cursor]!, execution);
-    if (!outcome.liquidated) continue;
-    liquidation = outcome;
-    break;
-  }
-  return {
-    logReturn: liquidation.equityFactor > 0
-      ? Math.log(liquidation.equityFactor)
-      : Number.NEGATIVE_INFINITY,
-    exposure: 0,
-  };
+  return { logReturn: Number.NEGATIVE_INFINITY, exposure: 0 };
 }
 
 function futurePriceExtrema(
@@ -4199,7 +4260,7 @@ function holdingBlockOutcome(
   let exposure = initialExposure;
   for (let time = start; time < end; time += 1) {
     const outcome = holdingOutcome(exposure, prices[time]!, prices[time + 1]!, options);
-    if (!(outcome.equityFactor > 0)) {
+    if (outcome.liquidated || !(outcome.equityFactor > 0)) {
       return { logReturn: Number.NEGATIVE_INFINITY, exposure: 0 };
     }
     logReturn += Math.log(outcome.equityFactor);

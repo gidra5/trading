@@ -26,6 +26,19 @@
     "experiment:loop": "tsx scripts/experiment-agent-loop.ts",
     "calibrate:indicator-predictor": "tsx scripts/calibrate-handcrafted-indicator-predictor.ts",
     "calibrate:direct-indicator-predictor": "tsx scripts/calibrate-direct-indicator-predictor.ts",
+    "mlp:bootstrap": "uv venv --python python3 .venv-ml && uv pip sync --python .venv-ml/bin/python ml/requirements.txt",
+    "mlp:dataset": "TMPDIR=/tmp node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/build-mlp-dataset.ts --plan ml/training-plan.json",
+    "mlp:features": "TMPDIR=/tmp node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/build-mlp-dataset.ts --plan ml/training-plan.json --refresh-features true",
+    "mlp:refine": "TMPDIR=/tmp node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/build-mlp-dataset.ts --plan ml/training-plan.json --refinement-pass 1",
+    "mlp:train": ".venv-ml/bin/python ml/train_mlp.py",
+    "mlp:test": "PYTHONPATH=ml .venv-ml/bin/python -m unittest discover -s ml -p 'test_*.py'",
+    "mlp:verify": "node scripts/run-node-with-ml-libs.mjs scripts/verify-mlp-model.mjs",
+    "mlp:run": "node scripts/run-node-with-ml-libs.mjs scripts/run-mlp-training.mjs",
+    "mlp:resume": "node scripts/run-node-with-ml-libs.mjs scripts/run-mlp-training.mjs --training-only",
+    "mlp:status": "node scripts/run-node-with-ml-libs.mjs scripts/mlp-training-control.mjs status",
+    "mlp:finalize": "node scripts/run-node-with-ml-libs.mjs scripts/mlp-training-control.mjs finalize",
+    "mlp:benchmark:fitter": "PYTHONPATH=ml TRADING_MLP_TEACHER_COMPILE=0 .venv-ml/bin/python ml/benchmark_teacher_fitter.py",
+    "mlp:benchmark:oracle": "TMPDIR=/tmp node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/profile-exposure-value-oracle-cuda.ts",
     "start": "npm run start -w @trading/server"
   },
   "devDependencies": {
@@ -36,5 +49,8 @@
   "engines": {
     "node": ">=22.0.0",
     "npm": ">=10.0.0"
+  },
+  "overrides": {
+    "adm-zip": "0.6.0"
   }
 }

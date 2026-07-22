@@ -44,6 +44,24 @@ table {
   border-radius: 8px;
 }
 
+.training-chart-grid {
+  stroke: #2b303b;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.training-chart-axis-line {
+  stroke: #4a5263;
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.training-chart-axis {
+  fill: #aeb6c8;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
 .kama-inspector-workspace {
   display: flex;
   min-width: 0;

@@ -1,13 +1,11 @@
 # Handcrafted Indicator-Based Prediction of the Conditional Regret Model
 
-This document describes a deterministic alternative to machine learning for predicting the conditional regret distribution and its 17 fitted parameters.
+This document describes a deterministic alternative to machine learning for predicting the conditional regret distribution and its 13 fitted parameters.
 
-> Inspector implementation note: the original forecast-regret projection described here remains available as the handcrafted model. The separate [direct indicator to 17-parameter predictor](./direct-indicator-17-parameter-predictor.md) skips the two-dimensional regret surface and computes the analytic parameters from the one-dimensional forecast background.
+> Inspector implementation note: the original forecast-regret projection described here remains available as the handcrafted model. The separate [direct indicator to six-parameter quadratic predictor](./direct-indicator-6-parameter-predictor.md) skips the two-dimensional regret surface and computes the analytic parameters from the one-dimensional forecast background.
 
-It builds on:
-
-- [Conditional Four-Segment Exponential Model with Log-Slope-Change Parameters](./conditional-four-segment-compact-support.md); and
-- [Deriving and Fitting the 17-Parameter Conditional Regret Model](./regret-to-17-parameter-fit.md).
+It builds on the [conditional exposure distribution](./conditional-exposure-distribution.md)
+and its [base distribution model](./base-distribution-model.md).
 
 The proposed pipeline is
 
@@ -21,7 +19,7 @@ The proposed pipeline is
 \longrightarrow
 \widehat R(x,a)
 \longrightarrow
-\text{17-parameter projection}.
+\text{13-parameter projection}.
 }
 \]
 
@@ -335,9 +333,9 @@ If only \([V_-,V_+]\) is visible, form the hard-truncated conditional density
 
 for \(a\in[V_-,V_+]\), and zero outside the visible interval as an observed density. No smoothing is applied at \(V_-\) or \(V_+\).
 
-The indicator-based regret surface and distribution can be used directly. Projection into 17 parameters is necessary only when a compact analytic representation is required.
+The indicator-based regret surface and distribution can be used directly. Projection into 13 parameters is necessary only when a compact analytic representation is required.
 
-## 7. Projection into the 17-parameter model
+## 7. Projection into the 13-parameter model
 
 Fit the score
 
@@ -362,7 +360,10 @@ with
 \end{aligned}
 \]
 
-For fixed breakpoints, transition sharpnesses, and support gates, solve the eight \(b,\beta\) coefficients and the nuisance slice offsets by weighted linear least squares. Optimize the nonlinear parameters in an outer loop as described in the 17-parameter fitting guide.
+For fixed breakpoints and transition sharpnesses, solve the eight \(b,\beta\)
+coefficients and the nuisance slice offsets by weighted linear least squares.
+Optimize the two breakpoints and three transition sharpnesses in the outer loop.
+The four support-gate values are fixed decoder geometry, not fitted coordinates.
 
 Because \(\widehat R\) is deterministic, this projection requires no parameter-prediction model.
 
@@ -627,7 +628,7 @@ At runtime:
 2. retrieve neighboring stored surfaces;
 3. interpolate between regime cells;
 4. replace their fee and maintenance contributions with the current exact values;
-5. project the resulting score onto the 17-parameter model.
+5. project the resulting score onto the 13-parameter model.
 
 This is transparent but becomes data-hungry when many indicators and regimes are used. Averaging regret surfaces is generally more stable than averaging fitted parameters.
 
@@ -683,7 +684,7 @@ Use the following minimal version:
 6. Run the one-dimensional backward dynamic program for \(T\) steps.
 7. Add the initial transition cost and \(H\)-step hold value.
 8. Construct \(\widehat R(x,a)\) and the corresponding conditional distribution.
-9. Use the predicted regret surface directly or project it into the 17 parameters.
+9. Use the predicted regret surface directly or project it into the 13 parameters.
 10. Fix all four latent support-taper parameters.
 11. Initialize transition widths from grid resolution or indicator sensitivity.
 12. Calibrate only the small set of indicator constants by walk-forward decision regret.
@@ -737,12 +738,12 @@ for x in A:
         regret[x, a] = best - J[x, a]
 
 optional:
-    fit the 17-parameter score model to -regret / tau
+    fit the 13-parameter score model to -regret / tau
 
 output:
     predicted regret surface
     predicted conditional distribution
-    optional 17-parameter representation
+    optional 13-parameter representation
 ```
 
 ## 16. What this method can and cannot do
@@ -753,7 +754,7 @@ It can:
 - produce a complete counterfactual regret surface;
 - preserve the dynamic structure of the perfect oracle;
 - remain transparent and debuggable;
-- provide all 17 parameters through deterministic projection;
+- provide all 13 learned parameters through deterministic projection;
 - generate scenario-based uncertainty without a learned model.
 
 It cannot:

@@ -12,6 +12,7 @@ import type {
   VwKamaHistoricalAveragesRequest,
   VwKamaInspectorRequest,
   VwKamaPredictorFitRequest,
+  VwKamaTimestampPredictionRequest,
 } from "@trading/bot-algo";
 import { appConfig } from "./config.js";
 import { BinanceMarketStream } from "./binance-stream.js";
@@ -34,6 +35,7 @@ import {
   type BinanceExchangeCancelOrderInput,
   type BinanceExchangePlaceOrderInput,
 } from "./binance-exchange.js";
+import { MlpTrainingMetricsReader } from "./mlp-training-metrics.js";
 
 const server = Fastify({
   logger: {
@@ -104,6 +106,7 @@ const correlationService = new CorrelationService({
   },
 });
 const kamaInspector = new KamaInspector(appConfig.dataDir);
+const mlpTrainingMetrics = new MlpTrainingMetricsReader(appConfig.mlpTrainingPlanFile);
 server.addHook("onClose", async () => kamaInspector.close());
 
 server.get("/health", async () => ({
@@ -115,6 +118,15 @@ server.get("/health", async () => ({
 }));
 
 server.get("/api/diagnostics", async () => diagnosticsSnapshot());
+
+server.get("/api/mlp-training/metrics", async (request, reply) => {
+  const query = request.query as { cursor?: string };
+  const cursor = Number(query.cursor ?? 0);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) {
+    return reply.code(400).send({ error: "cursor must be a non-negative safe integer." });
+  }
+  return mlpTrainingMetrics.read(cursor);
+});
 
 server.get("/api/state", async () => publicSnapshot());
 
@@ -462,6 +474,23 @@ server.post("/api/kama-inspector/predictor-fit", async (request, reply) => {
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "VW-KAMA predictor fit failed";
+    return reply.code(400).send({ error: message });
+  } finally {
+    reply.raw.off("close", cancelClosedRequest);
+  }
+});
+
+server.post("/api/kama-inspector/predict", async (request, reply) => {
+  const cancellation = new AbortController();
+  const cancelClosedRequest = () => cancellation.abort();
+  reply.raw.once("close", cancelClosedRequest);
+  try {
+    return await kamaInspector.predict(
+      (request.body ?? {}) as VwKamaTimestampPredictionRequest,
+      cancellation.signal,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "VW-KAMA MLP prediction failed";
     return reply.code(400).send({ error: message });
   } finally {
     reply.raw.off("close", cancelClosedRequest);

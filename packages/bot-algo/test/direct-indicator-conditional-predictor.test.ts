@@ -60,21 +60,17 @@ test("direct indicator decoder applies the analytic coefficients and yields vali
   assert.ok(Math.abs(parameters.kappaC1 * metadata.transitionWidths10To90[0] - 4.394) < 1e-10);
   assert.ok(Math.abs(parameters.kappaX * metadata.transitionWidths10To90[1] - 4.394) < 1e-10);
   assert.ok(Math.abs(parameters.kappaC2 * metadata.transitionWidths10To90[2] - 4.394) < 1e-10);
-  assert.ok(parameters.leftSupportWidth > 0);
-  assert.ok(parameters.rightSupportWidth > 0);
+  assert.equal(parameters.cutoffLower, parameters.latentLower);
+  assert.equal(parameters.cutoffUpper, parameters.latentUpper);
   assert.equal(decoded.backgroundValues.length, latentGrid.length);
-  assert.equal(parameters.baseSlope[1], 0);
-  assert.equal(parameters.betaC1[1], 0);
-  assert.equal(parameters.betaX[1], 0);
-  assert.equal(parameters.betaC2[1], 0);
-  assert.ok(Math.abs(parameters.baseSlope[0]
-    - (s0 + metadata.effectiveSellCostSlope) / options.temperature) < 1e-12);
-  assert.ok(Math.abs(parameters.betaC1[0] - (s1 - s0) / options.temperature) < 1e-12);
-  assert.ok(Math.abs(parameters.betaX[0]
+  assert.ok(Number.isFinite(parameters.baseSlope));
+  assert.ok(Number.isFinite(parameters.quadraticPrecision));
+  assert.ok(Number.isFinite(parameters.betaC1));
+  assert.ok(Number.isFinite(parameters.betaC2));
+  assert.ok(Math.abs(parameters.betaX
     + (metadata.effectiveBuyCostSlope + metadata.effectiveSellCostSlope)
       / options.temperature) < 1e-12);
-  assert.ok(Math.abs(parameters.betaC2[0] - (s2 - s1) / options.temperature) < 1e-12);
-  assert.equal(Object.keys(metadata.parameterVector17).length, 17);
+  assert.equal(Object.keys(metadata.parameterVector6).length, 6);
 });
 
 test("direct indicator conditional rows normalize throughout latent current support", () => {

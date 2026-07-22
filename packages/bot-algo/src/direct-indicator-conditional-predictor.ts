@@ -15,7 +15,6 @@ import {
 
 const LOGISTIC_TEN_TO_NINETY = 4.394;
 const SUPPORT_WIDTH_FRACTION = 0.2;
-const SUPPORT_SHARPNESS = 1;
 
 export interface DirectIndicatorPredictorParameters
   extends HandcraftedIndicatorPredictorParameters {
@@ -23,28 +22,17 @@ export interface DirectIndicatorPredictorParameters
   transitionWidthGridCells: number;
 }
 
-export interface DirectIndicatorParameterVector17 {
+export interface DirectIndicatorParameterVector6 {
   c1: number;
   c2: number;
-  b0: number;
-  b1: number;
-  betaC1_0: number;
-  betaC1_1: number;
-  betaX_0: number;
-  betaX_1: number;
-  betaC2_0: number;
-  betaC2_1: number;
-  kappaC1: number;
-  kappaX: number;
-  kappaC2: number;
-  wL: number;
-  wR: number;
-  rhoL: number;
-  rhoR: number;
+  b: number;
+  lambda: number;
+  betaC1: number;
+  betaC2: number;
 }
 
 export interface DirectIndicatorConditionalMetadata {
-  parameterVector17: DirectIndicatorParameterVector17;
+  parameterVector6: DirectIndicatorParameterVector6;
   backgroundSecantSlopes: readonly [number, number, number];
   effectiveSellCostSlope: number;
   effectiveBuyCostSlope: number;
@@ -195,51 +183,52 @@ function decodeDirectIndicatorConditionalParametersFromBackground(
   const kappaX = LOGISTIC_TEN_TO_NINETY / fallbackWidth;
   const kappaC2 = LOGISTIC_TEN_TO_NINETY / c2Width;
 
-  // The exact project fee has target-dependent action slopes but its current
-  // exposure appears only in a per-row additive constant. Hence all xi terms
-  // are exactly zero rather than being inferred from a regret surface.
+  // Fit the screenshot's linear design after fixing c/kappa and subtracting
+  // the moving fee transition. This estimates smooth curvature independently
+  // from the localized beta transitions instead of making the betas absorb it.
+  const coefficients = fitQuadraticBackgroundCoefficients(
+    backgroundGrid,
+    backgroundValues,
+    supportLower,
+    supportUpper,
+    c1,
+    c2,
+    kappaC1,
+    kappaC2,
+    qSell,
+    inverseTemperature,
+  );
   const conditionalParameters: ConditionalFourSegmentParameters = {
     latentLower,
     latentUpper,
     visibleLower,
     visibleUpper,
+    cutoffLower: latentLower,
+    cutoffUpper: latentUpper,
+    basisCenter: (supportLower + supportUpper) / 2,
     c1,
     c2,
-    leftSupportWidth,
-    rightSupportWidth,
-    leftSupportSharpness: SUPPORT_SHARPNESS,
-    rightSupportSharpness: SUPPORT_SHARPNESS,
-    baseSlope: [(s0 + qSell) * inverseTemperature, 0],
-    betaC1: [(s1 - s0) * inverseTemperature, 0],
-    betaX: [-(qBuy + qSell) * inverseTemperature, 0],
-    betaC2: [(s2 - s1) * inverseTemperature, 0],
+    baseSlope: coefficients.baseSlope,
+    quadraticPrecision: coefficients.quadraticPrecision,
+    betaC1: coefficients.betaC1,
+    betaX: -(qBuy + qSell) * inverseTemperature,
+    betaC2: coefficients.betaC2,
     kappaC1,
     kappaX,
     kappaC2,
   };
-  const parameterVector17: DirectIndicatorParameterVector17 = {
+  const parameterVector6: DirectIndicatorParameterVector6 = {
     c1,
     c2,
-    b0: conditionalParameters.baseSlope[0],
-    b1: conditionalParameters.baseSlope[1],
-    betaC1_0: conditionalParameters.betaC1[0],
-    betaC1_1: conditionalParameters.betaC1[1],
-    betaX_0: conditionalParameters.betaX[0],
-    betaX_1: conditionalParameters.betaX[1],
-    betaC2_0: conditionalParameters.betaC2[0],
-    betaC2_1: conditionalParameters.betaC2[1],
-    kappaC1,
-    kappaX,
-    kappaC2,
-    wL: leftSupportWidth,
-    wR: rightSupportWidth,
-    rhoL: SUPPORT_SHARPNESS,
-    rhoR: SUPPORT_SHARPNESS,
+    b: conditionalParameters.baseSlope,
+    lambda: conditionalParameters.quadraticPrecision,
+    betaC1: conditionalParameters.betaC1,
+    betaC2: conditionalParameters.betaC2,
   };
   return {
     parameters: conditionalParameters,
     metadata: {
-      parameterVector17,
+      parameterVector6,
       backgroundSecantSlopes: [s0, s1, s2],
       effectiveSellCostSlope: qSell,
       effectiveBuyCostSlope: qBuy,
@@ -353,6 +342,107 @@ function effectiveBuyCostSlope(lower: number, upper: number, friction: number): 
   return (Math.log(1 - friction + friction * upper)
       - Math.log(1 - friction + friction * lower))
     / (upper - lower);
+}
+
+function fitQuadraticBackgroundCoefficients(
+  grid: Float64Array,
+  values: Float64Array,
+  lower: number,
+  upper: number,
+  c1: number,
+  c2: number,
+  kappaC1: number,
+  kappaC2: number,
+  sellCostSlope: number,
+  inverseTemperature: number,
+): {
+  baseSlope: number;
+  quadraticPrecision: number;
+  betaC1: number;
+  betaC2: number;
+} {
+  const size = 5;
+  const center = (lower + upper) / 2;
+  const normal = new Float64Array(size * size);
+  const right = new Float64Array(size);
+  for (let index = 0; index < grid.length; index += 1) {
+    const action = grid[index]!;
+    if (action < lower || action > upper) continue;
+    const edgeDistance = Math.min(action - lower, upper - action);
+    const weight = Math.max(0.05, Math.min(1, edgeDistance / Math.max(1e-12, (upper - lower) / 8)));
+    const features = [
+      1,
+      action - lower,
+      -0.5 * (action - center) ** 2,
+      scaledSoftplus(action - c1, kappaC1),
+      scaledSoftplus(action - c2, kappaC2),
+    ];
+    const target = (values[index]! + sellCostSlope * (action - lower)) * inverseTemperature;
+    for (let row = 0; row < size; row += 1) {
+      right[row] += weight * features[row]! * target;
+      for (let column = 0; column < size; column += 1) {
+        normal[row * size + column] += weight * features[row]! * features[column]!;
+      }
+    }
+  }
+  for (let index = 0; index < size; index += 1) normal[index * size + index] += 1e-10;
+  const fitted = solveLinearSystem(normal, right, size);
+  return {
+    baseSlope: fitted[1]!,
+    quadraticPrecision: fitted[2]!,
+    betaC1: fitted[3]!,
+    betaC2: fitted[4]!,
+  };
+}
+
+function solveLinearSystem(
+  matrixInput: Float64Array,
+  vectorInput: Float64Array,
+  size: number,
+): Float64Array {
+  const matrix = matrixInput.slice();
+  const vector = vectorInput.slice();
+  for (let pivot = 0; pivot < size; pivot += 1) {
+    let best = pivot;
+    for (let row = pivot + 1; row < size; row += 1) {
+      if (Math.abs(matrix[row * size + pivot]!) > Math.abs(matrix[best * size + pivot]!)) best = row;
+    }
+    if (best !== pivot) {
+      for (let column = pivot; column < size; column += 1) {
+        [matrix[pivot * size + column], matrix[best * size + column]]
+          = [matrix[best * size + column]!, matrix[pivot * size + column]!];
+      }
+      [vector[pivot], vector[best]] = [vector[best]!, vector[pivot]!];
+    }
+    const diagonal = matrix[pivot * size + pivot]!;
+    if (Math.abs(diagonal) < 1e-18) continue;
+    for (let row = pivot + 1; row < size; row += 1) {
+      const factor = matrix[row * size + pivot]! / diagonal;
+      for (let column = pivot; column < size; column += 1) {
+        matrix[row * size + column] -= factor * matrix[pivot * size + column]!;
+      }
+      vector[row] -= factor * vector[pivot]!;
+    }
+  }
+  const result = new Float64Array(size);
+  for (let row = size - 1; row >= 0; row -= 1) {
+    let value = vector[row]!;
+    for (let column = row + 1; column < size; column += 1) {
+      value -= matrix[row * size + column]! * result[column]!;
+    }
+    result[row] = value / matrix[row * size + row]!;
+  }
+  return result;
+}
+
+function scaledSoftplus(offset: number, kappa: number): number {
+  const scaled = kappa * offset;
+  const value = scaled > 35
+    ? scaled
+    : scaled < -35
+      ? Math.exp(scaled)
+      : Math.log1p(Math.exp(scaled));
+  return value / kappa;
 }
 
 function finiteDifferenceDerivatives(grid: Float64Array, values: Float64Array): Float64Array {

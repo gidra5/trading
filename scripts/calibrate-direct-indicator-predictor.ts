@@ -391,7 +391,7 @@ function writePresets(
 ): void {
   const presets = [{
     id: "direct-indicator-global-2026-07-20",
-    label: "Direct indicator → 17 parameters · global fit",
+    label: "Direct indicator → 6 quadratic parameters · global fit",
     model: "direct-indicator",
     scope: "global",
     windowId: null,
@@ -403,7 +403,7 @@ function writePresets(
     generatedAt,
   }, ...locals.map((fit) => ({
     id: `direct-indicator-local-${fit.windowId}-1m-2026-07-20`,
-    label: `Direct indicator → 17 parameters · local fit · ${fit.windowId} · 1m`,
+    label: `Direct indicator → 6 quadratic parameters · local fit · ${fit.windowId} · 1m`,
     model: "direct-indicator",
     scope: "window",
     windowId: fit.windowId,

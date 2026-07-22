@@ -1,6 +1,6 @@
-# Deriving and Fitting the 17-Parameter Conditional Regret Model
+# Deriving and Fitting the 13-Parameter Conditional Regret Model
 
-This document accompanies [Conditional Four-Segment Exponential Model with Log-Slope-Change Parameters](./conditional-four-segment-compact-support.md). It gives a direct procedure for deriving or estimating every trained scalar from the underlying regret surface, while allowing the regret to contain kinks.
+This document accompanies the [conditional exposure distribution](../../../docs/conditional-exposure-distribution.md). It gives a direct procedure for deriving or estimating every trained scalar from the underlying regret surface, while allowing the regret to contain kinks.
 
 ## 1. Oracle value, regret, and probability
 
@@ -51,7 +51,7 @@ Y(x,a)
 
 for some slice-dependent constant \(K(x)\). Conditional normalization also changes only that constant. All shape parameters can therefore be fitted from \(Y\) without knowing \(K(x)\).
 
-## 2. The 17 trained parameters
+## 2. The 13 trained parameters
 
 Scale current exposure to
 
@@ -70,7 +70,7 @@ b(\xi)&=b_0+b_1\xi,\\
 \end{aligned}
 \]
 
-The 17 trained scalars are:
+The 13 trained scalars are:
 
 | Group | Scalars | Count |
 |---|---|---:|
@@ -80,11 +80,11 @@ The 17 trained scalars are:
 | Moving jump | \(\beta_{x,0},\beta_{x,1}\) | 2 |
 | Second fixed jump | \(\beta_{c_2,0},\beta_{c_2,1}\) | 2 |
 | Transition sharpness | \(\kappa_{c_1},\kappa_x,\kappa_{c_2}\) | 3 |
-| Support taper widths | \(w_L,w_R\) | 2 |
-| Support taper sharpness | \(\rho_L,\rho_R\) | 2 |
-| **Total** |  | **17** |
+| **Total** |  | **13** |
 
-The first eight coefficients are linear once the remaining nine shape parameters are fixed.
+The first eight coefficients are linear once the remaining five shape parameters
+are fixed. The support taper widths and sharpnesses are fixed decoder geometry,
+not fitted coordinates.
 
 ## 3. Complete score model
 
@@ -112,7 +112,7 @@ Y_\theta(x,a)={}&\alpha(x)
 \end{aligned}
 \]
 
-The nuisance offset \(\alpha(x)\) is not one of the 17 model parameters. It absorbs the arbitrary score offset for each conditional slice and disappears after normalization.
+The nuisance offset \(\alpha(x)\) is not one of the 13 model parameters. It absorbs the arbitrary score offset for each conditional slice and disappears after normalization.
 
 The visible interval, such as \([-100,100]\), is a hard observational truncation. It is not used in \(G_L\) or \(G_R\). The gates belong only to the full latent interval, such as \([-250,250]\).
 
@@ -560,9 +560,13 @@ R_{\mathrm{gate}}(a)
 }
 \]
 
-The support parameters are derivable from regret only if this boundary barrier is actually present in the oracle score or if the oracle regret is evaluated throughout the latent boundary layers.
+The support geometry is derivable from regret only if this boundary barrier is
+actually present in the oracle score or if the oracle regret is evaluated
+throughout the latent boundary layers. The following two sections document a
+possible separate geometry-calibration experiment; they are not part of the
+current 13-coordinate teacher fit.
 
-## 15. Parameters 14–15: taper widths \(w_L,w_R\)
+## 15. Fixed decoder geometry: taper widths \(w_L,w_R\)
 
 After fitting the interior score, define the residual
 
@@ -598,7 +602,8 @@ Similarly, if \(a_{R,1/2}\) is the right half-gate point,
 w_R=2(A_+-a_{R,1/2}).
 }
 
-These are initial values. Refine them with the full score objective under
+If endpoint observations are available, these can be geometry-calibration values
+under
 
 \[
 w_L>0,
@@ -608,7 +613,7 @@ w_R>0,
 w_L+w_R<A_+-A_-.
 \]
 
-## 16. Parameters 16–17: taper shapes \(\rho_L,\rho_R\)
+## 16. Fixed decoder geometry: taper shapes \(\rho_L,\rho_R\)
 
 For the left gate, let
 
@@ -662,7 +667,8 @@ and fit
 }
 \]
 
-Again, these are initial estimates followed by joint nonlinear refinement.
+Again, these are optional geometry-calibration estimates, not coordinates in the
+current nonlinear refinement.
 
 ## 17. What is and is not identifiable from visible data
 
@@ -683,6 +689,11 @@ They must be:
 - derived from an explicit exposure-limit penalty;
 - or fixed as modeling choices.
 
+The current decoder takes the final option: each sharpness is `1`; each width is
+the smaller of one quarter of the latent span and one half of the gap from its
+latent endpoint to the corresponding visible endpoint. This keeps both gates on
+their unit plateau throughout the visible action interval.
+
 Even complete latent data do not determine these parameters if the oracle merely declares \(a\notin[A_-,A_+]\) infeasible while keeping regret finite up to the boundary. In that case the smooth taper is not produced by the economic regret and should not be described as market-derived.
 
 ## 18. Separating the effects of \(H\) and \(T\)
@@ -701,7 +712,7 @@ The marginal score is
 }
 \]
 
-This suggests fitting the 17-parameter model over a grid of \((H,T)\):
+This suggests fitting the 13-parameter learned model over a grid of \((H,T)\):
 
 - the immediate transition-cost contribution is paid once and should not scale with \(H\);
 - per-step maintenance contributions to a fixed jump should scale approximately linearly with \(H\);
@@ -732,7 +743,7 @@ For each trial value of these parameters:
 3. evaluate the weighted residual loss;
 4. update only the nine nonlinear parameters in the outer optimizer.
 
-This is a variable-projection fit. It is more stable than asking one optimizer to learn all 17 parameters simultaneously without exploiting the model's linear structure.
+This is a variable-projection fit. It is more stable than asking one optimizer to learn all 13 parameters simultaneously without exploiting the model's linear structure.
 
 Use transformed unconstrained variables to maintain validity:
 
@@ -754,7 +765,7 @@ If the oracle output contains only
 a^*(x)=\arg\min_aR(x,a),
 \]
 
-then it supplies only the first-order or subgradient condition at the optimum. It does not determine the regret away from that optimum and cannot identify 17 shape parameters.
+then it supplies only the first-order or subgradient condition at the optimum. It does not determine the regret away from that optimum and cannot identify 13 shape parameters.
 
 The full counterfactual regret grid—or at least a sufficiently broad collection of regret differences—is required. This is precisely the information that distinguishes alternative target exposures that the oracle did not select.
 

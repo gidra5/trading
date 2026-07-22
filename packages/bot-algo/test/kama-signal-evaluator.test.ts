@@ -7,6 +7,7 @@ import {
   DEFAULT_DIRECT_INDICATOR_PARAMETERS,
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+  MLP_OUTPUT_PARAMETER_COUNT,
   createPeakValleyStrategyConfig,
   evaluateVwKamaOracle,
   PeakValleyStrategy,
@@ -406,6 +407,16 @@ test("forecast transitions trade to the conditional modal cell without rebalanci
         states,
       },
     },
+    {
+      mlpPredictor: {
+        modelId: "test-mlp",
+        rawParameters: closes.map(() => {
+          const raw = new Float32Array(MLP_OUTPUT_PARAMETER_COUNT);
+          raw[2] = 48;
+          return raw;
+        }),
+      },
+    },
   ];
   for (const predictor of predictors) {
     const result = evaluateVwKamaOracle(candles, {
@@ -442,6 +453,12 @@ test("forecast transitions trade to the conditional modal cell without rebalanci
     assert.ok(result.valueCandidatePath.some((point) => point.exposure > 0.5));
     assert.equal(result.metrics.valueDistillation?.returns.strategy.rebalanceCount, 1);
     assert.ok(result.valueDistributions.every((point) => point.predictor?.optimalExposure === 0.5));
+    if ("mlpPredictor" in predictor) {
+      assert.ok(result.valueDistributions.every((point) =>
+        point.predictor?.model === "mlp"
+        && point.predictor.modelId === "test-mlp"
+        && point.predictor.rawParameters?.length === 8));
+    }
   }
 });
 
