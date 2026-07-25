@@ -7,7 +7,7 @@ import {
   DEFAULT_DIRECT_INDICATOR_PARAMETERS,
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
-  MLP_OUTPUT_PARAMETER_COUNT,
+  MLP_OUTPUT_ACTION_COUNT,
   createPeakValleyStrategyConfig,
   evaluateVwKamaOracle,
   PeakValleyStrategy,
@@ -410,11 +410,17 @@ test("forecast transitions trade to the conditional modal cell without rebalanci
     {
       mlpPredictor: {
         modelId: "test-mlp",
-        rawParameters: closes.map(() => {
-          const raw = new Float32Array(MLP_OUTPUT_PARAMETER_COUNT);
-          raw[2] = 48;
-          return raw;
-        }),
+        modelActionGrid: Array.from(
+          { length: MLP_OUTPUT_ACTION_COUNT },
+          (_, index) => -1 + index * 2 / (MLP_OUTPUT_ACTION_COUNT - 1),
+        ),
+        actionLogits: closes.map(() => Float32Array.from(
+          { length: MLP_OUTPUT_ACTION_COUNT },
+          (_, index) => {
+            const action = -1 + index * 2 / (MLP_OUTPUT_ACTION_COUNT - 1);
+            return -1_000 * (action - 0.5) ** 2;
+          },
+        )),
       },
     },
   ];
@@ -457,7 +463,7 @@ test("forecast transitions trade to the conditional modal cell without rebalanci
       assert.ok(result.valueDistributions.every((point) =>
         point.predictor?.model === "mlp"
         && point.predictor.modelId === "test-mlp"
-        && point.predictor.rawParameters?.length === 8));
+        && point.predictor.actionLogits?.length === MLP_OUTPUT_ACTION_COUNT));
     }
   }
 });

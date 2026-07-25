@@ -475,7 +475,7 @@ test("current-state grid spans the effective exposure boundary independently of 
   const oracle = prepareExposureValueOracle([100, 101], {
     scoreStartIndex: 0,
     friction: 0.00175,
-    gridSize: 151,
+    gridSize: 255,
     minExposure: -100,
     maxExposure: 100,
     maxEffectiveExposure: 250,
@@ -556,6 +556,7 @@ test("value horizon T caps final equity independently from holding period H", ()
 test("a scored oracle prefix can keep values from post-window candles", () => {
   const options = {
     scoreStartIndex: 0,
+    terminalIndex: 1,
     holdingPeriodSteps: 1,
     valueHorizonSteps: 3,
     friction: 0.1,
@@ -568,6 +569,7 @@ test("a scored oracle prefix can keep values from post-window candles", () => {
   );
   const truncated = prepareExposureValueOracle([100, 90], {
     ...options,
+    terminalIndex: 1,
     valueHorizonSteps: 1,
   });
 

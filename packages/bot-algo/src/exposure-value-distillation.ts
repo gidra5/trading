@@ -3,6 +3,9 @@ import {
   type ConditionalFourSegmentParameters,
 } from "./conditional-exposure-distribution.js";
 
+/** Odd, warp-friendly default that keeps zero at the exact grid center. */
+export const DEFAULT_EXPOSURE_VALUE_GRID_SIZE = 255;
+
 export interface ExposureValueOracleOptions {
   scoreStartIndex: number;
   holdingPeriodSteps?: number;

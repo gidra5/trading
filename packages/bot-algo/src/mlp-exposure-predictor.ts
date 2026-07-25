@@ -1,13 +1,7 @@
-import {
-  conditionalFourSegmentExposureProbabilities,
-  conditionalFourSegmentParametersFromRaw,
-  type ConditionalFourSegmentParameters,
-} from "./conditional-exposure-distribution.js";
 import type { Candle } from "./legacy/types.js";
 
-export const MLP_FEATURE_SCHEMA_VERSION = 4;
-export const MLP_OUTPUT_PARAMETER_COUNT = 8;
-export const MLP_SUPPORTED_OUTPUT_PARAMETER_COUNTS = [6, MLP_OUTPUT_PARAMETER_COUNT] as const;
+export const MLP_FEATURE_SCHEMA_VERSION = 5;
+export const MLP_OUTPUT_ACTION_COUNT = 255;
 export const MLP_CANDLE_FEATURE_COUNT = 4;
 export const MLP_VOLUME_EMA_WARMUP_MULTIPLE = 4;
 
@@ -20,17 +14,6 @@ export const MLP_CANDLE_WINDOWS = [
   { id: "3M", intervalMs: "calendar-quarter", candleCount: 16 },
 ] as const;
 
-export const MLP_STATE_FEATURES = [
-  "feeRate",
-  "minimumUsableExposure",
-  "maximumUsableExposure",
-  "minimumEffectiveExposure",
-  "maximumEffectiveExposure",
-  "quoteLendRate",
-  "quoteBorrowRate",
-  "assetBorrowRate",
-] as const;
-
 export const MLP_CANDLE_INPUT_COUNT = MLP_CANDLE_WINDOWS.reduce(
   (sum, window) => sum + window.candleCount,
   0,
@@ -38,19 +21,7 @@ export const MLP_CANDLE_INPUT_COUNT = MLP_CANDLE_WINDOWS.reduce(
 export const MLP_CANDLE_FILL_FRACTION_COUNT = MLP_CANDLE_WINDOWS.length - 1;
 export const MLP_HISTORIC_INPUT_COUNT = MLP_CANDLE_INPUT_COUNT * MLP_CANDLE_FEATURE_COUNT
   + MLP_CANDLE_FILL_FRACTION_COUNT;
-export const MLP_INPUT_FEATURE_COUNT = MLP_HISTORIC_INPUT_COUNT
-  + MLP_STATE_FEATURES.length;
-
-export interface MlpExposureStateInputs {
-  feeRate: number;
-  minimumUsableExposure: number;
-  maximumUsableExposure: number;
-  minimumEffectiveExposure: number;
-  maximumEffectiveExposure: number;
-  quoteLendRate: number;
-  quoteBorrowRate: number;
-  assetBorrowRate: number;
-}
+export const MLP_INPUT_FEATURE_COUNT = MLP_HISTORIC_INPUT_COUNT;
 
 export interface MlpModelManifest {
   id: string;
@@ -58,9 +29,12 @@ export interface MlpModelManifest {
   createdAt: string;
   featureSchemaVersion: number;
   inputFeatureCount: number;
-  outputParameterCount: number;
+  outputRepresentation: "base-action-logits";
+  outputActionCount: number;
+  actionGrid: number[];
   hiddenLayerCount: number;
   hiddenWidth: number;
+  predictionDelayMs: number;
   modelFile: string;
   checkpointFile?: string;
   verificationFixture?: {
@@ -76,6 +50,7 @@ export interface MlpModelManifest {
   };
   training?: {
     datasetPlanId?: string;
+    targetRepresentation?: "rawOracleProbabilities" | "minuteOracleProbabilities";
     trainExamples: number;
     validationExamples: number;
     testExamples: number;
@@ -86,6 +61,27 @@ export interface MlpModelManifest {
     testMetrics?: MlpTrainingMetrics;
     teacherFitMetrics?: Record<string, number>;
     lossWeights?: Record<string, number>;
+    selectionMetric?: "loss" | "klDivergence";
+    policyMetricDefinitions?: {
+      klDivergence: string;
+      klDivergenceVariance?: string;
+      baseKlDivergence: string;
+      probabilityMse?: string;
+      probabilityMseVariance?: string;
+    };
+    predictionDelayMs?: number;
+    curriculum?: {
+      version: number;
+      stage: number;
+      delayMs: number;
+      parentKey: string;
+      weightProfile: string;
+      lineage: Array<{
+        stage: number;
+        delayMs: number;
+        weights: Record<string, number>;
+      }>;
+    };
     finalizedEarly?: boolean;
     seed: number;
     device: string;
@@ -94,25 +90,29 @@ export interface MlpModelManifest {
 
 export interface MlpTrainingMetrics {
   loss: number;
-  crossEntropy: number;
+  klDivergence: number;
+  klDivergenceVariance?: number;
+  klDivergenceStdDev?: number;
+  baseKlDivergence: number;
   probabilityMse: number;
-  parameterMse: number;
+  probabilityMseVariance?: number;
+  probabilityMseStdDev?: number;
   excessEntropy: number;
-  stateMutualInformation: number;
+  temporalMutualInformation: number;
+  targetTemporalMutualInformation: number;
+  temporalMutualInformationReward: number;
   oracleMutualInformation: number;
   targetEntropy: number;
   predictedEntropy: number;
-  rawParameterMae: number;
   distanceImbalanceWeight?: number;
   timeWeightEffectiveSampleRatio?: number;
 }
 
-export interface MlpConditionalPrediction {
+export interface MlpDistributionPrediction {
   probabilities: Float64Array;
   optimalExposure: number;
   meanExposure: number;
-  conditionalParameters: ConditionalFourSegmentParameters;
-  rawParameters: Float64Array;
+  actionLogits: Float64Array;
 }
 
 /**
@@ -159,58 +159,43 @@ export function encodeMlpCandleWindow(
   return output;
 }
 
-export function encodeMlpStateInputs(
-  state: MlpExposureStateInputs,
-  output = new Float32Array(MLP_STATE_FEATURES.length),
-  outputOffset = 0,
-): Float32Array {
-  if (outputOffset < 0 || outputOffset + MLP_STATE_FEATURES.length > output.length) {
-    throw new Error("MLP state encoding output storage is too small.");
-  }
-  for (let index = 0; index < MLP_STATE_FEATURES.length; index += 1) {
-    const value = state[MLP_STATE_FEATURES[index]!];
-    if (!Number.isFinite(value)) throw new Error("MLP state inputs must be finite.");
-    output[outputOffset + index] = value;
-  }
-  return output;
-}
-
-export function predictMlpConditionalDistribution(
+export function predictMlpDistribution(
   actionGridInput: ArrayLike<number>,
-  currentExposure: number,
-  rawParameterInput: ArrayLike<number>,
-  support: {
-    latentLower: number;
-    latentUpper: number;
-    visibleLower?: number;
-    visibleUpper?: number;
-    friction: number;
-    temperature: number;
-  },
-): MlpConditionalPrediction {
-  if (actionGridInput.length < 5 || !Number.isFinite(currentExposure)) {
-    throw new Error("MLP exposure prediction requires an action grid and finite current exposure.");
+  actionLogitInput: ArrayLike<number>,
+  modelActionGridInput: ArrayLike<number>,
+): MlpDistributionPrediction {
+  if (actionGridInput.length < 5
+    || actionLogitInput.length !== MLP_OUTPUT_ACTION_COUNT
+    || modelActionGridInput.length !== MLP_OUTPUT_ACTION_COUNT) {
+    throw new Error("MLP exposure prediction requires compatible runtime and model action grids.");
   }
   const actionGrid = Float64Array.from(actionGridInput);
-  const visibleLower = support.visibleLower ?? actionGrid[0]!;
-  const visibleUpper = support.visibleUpper ?? actionGrid[actionGrid.length - 1]!;
-  const rawParameters = Float64Array.from(rawParameterInput);
-  const conditionalParameters = conditionalFourSegmentParametersFromRaw(rawParameters, {
-    latentLower: support.latentLower,
-    latentUpper: support.latentUpper,
-    visibleLower,
-    visibleUpper,
-    friction: support.friction,
-    temperature: support.temperature,
-  });
-  const probabilities = conditionalFourSegmentExposureProbabilities(
+  const modelActionGrid = Float64Array.from(modelActionGridInput);
+  const actionLogits = Float64Array.from(actionLogitInput);
+  validateStrictlyIncreasingGrid(actionGrid, "runtime");
+  validateStrictlyIncreasingGrid(modelActionGrid, "model");
+  if (![...actionLogits].every(Number.isFinite)
+    || actionGrid[0]! < modelActionGrid[0]!
+    || actionGrid[actionGrid.length - 1]! > modelActionGrid[modelActionGrid.length - 1]!) {
+    throw new Error("MLP action logits or runtime action-grid range are invalid.");
+  }
+  const interpolatedLogits = interpolateActionLogits(
     actionGrid,
-    currentExposure,
-    conditionalParameters,
+    modelActionGrid,
+    actionLogits,
   );
+  const maximum = Math.max(...interpolatedLogits);
+  const probabilities = new Float64Array(actionGrid.length);
+  let total = 0;
+  for (let index = 0; index < probabilities.length; index += 1) {
+    const probability = Math.exp(interpolatedLogits[index]! - maximum);
+    probabilities[index] = probability;
+    total += probability;
+  }
   let optimalIndex = 0;
   let meanExposure = 0;
   for (let index = 0; index < actionGrid.length; index += 1) {
+    probabilities[index] /= total;
     if (probabilities[index]! > probabilities[optimalIndex]!) optimalIndex = index;
     meanExposure += probabilities[index]! * actionGrid[index]!;
   }
@@ -218,8 +203,7 @@ export function predictMlpConditionalDistribution(
     probabilities,
     optimalExposure: actionGrid[optimalIndex]!,
     meanExposure,
-    conditionalParameters,
-    rawParameters,
+    actionLogits,
   };
 }
 
@@ -228,13 +212,19 @@ export function validateMlpModelManifest(manifest: MlpModelManifest): void {
     || !Number.isFinite(Date.parse(manifest.createdAt))
     || manifest.featureSchemaVersion !== MLP_FEATURE_SCHEMA_VERSION
     || manifest.inputFeatureCount !== MLP_INPUT_FEATURE_COUNT
-    || !MLP_SUPPORTED_OUTPUT_PARAMETER_COUNTS.includes(
-      manifest.outputParameterCount as typeof MLP_SUPPORTED_OUTPUT_PARAMETER_COUNTS[number],
-    )
+    || manifest.outputRepresentation !== "base-action-logits"
+    || manifest.outputActionCount !== MLP_OUTPUT_ACTION_COUNT
+    || !Array.isArray(manifest.actionGrid)
+    || manifest.actionGrid.length !== MLP_OUTPUT_ACTION_COUNT
     || manifest.hiddenLayerCount !== 16
-    || manifest.hiddenWidth !== 1_024) {
-    throw new Error("MLP model manifest is incompatible with the current 16x1024 feature contract.");
+    || manifest.hiddenWidth !== 1_024
+    || !Number.isInteger(manifest.predictionDelayMs)
+    || manifest.predictionDelayMs < 0) {
+    throw new Error(
+      "MLP model manifest is incompatible with the current 901 -> 16x1024 -> 255 contract.",
+    );
   }
+  validateStrictlyIncreasingGrid(manifest.actionGrid, "manifest");
   const fixture = manifest.verificationFixture;
   if (fixture && (!Number.isInteger(fixture.batchSize) || fixture.batchSize <= 0
     || !fixture.inputFile || !fixture.outputFile)) {
@@ -251,7 +241,16 @@ export function validateMlpModelManifest(manifest: MlpModelManifest): void {
     ].every(Number.isFinite)
     || !training.device
     || !validTrainingMetrics(training.bestValidationMetrics)
-    || !validTrainingMetrics(training.testMetrics))) {
+    || !validTrainingMetrics(training.testMetrics)
+    || (training.targetRepresentation !== undefined
+      && training.targetRepresentation !== "rawOracleProbabilities"
+      && training.targetRepresentation !== "minuteOracleProbabilities")
+    || (training.selectionMetric !== undefined
+      && training.selectionMetric !== "loss"
+      && training.selectionMetric !== "klDivergence")
+    || (training.lossWeights !== undefined
+      && !Object.values(training.lossWeights).every((value) =>
+        Number.isFinite(value) && value >= 0)))) {
     throw new Error("MLP model manifest has invalid training metadata.");
   }
   const verification = manifest.verification;
@@ -268,6 +267,47 @@ export function validateMlpModelManifest(manifest: MlpModelManifest): void {
 
 function validTrainingMetrics(metrics: MlpTrainingMetrics | undefined): boolean {
   return metrics === undefined || Object.values(metrics).every(Number.isFinite);
+}
+
+function interpolateActionLogits(
+  targetGrid: Float64Array,
+  sourceGrid: Float64Array,
+  sourceLogits: Float64Array,
+): Float64Array {
+  const result = new Float64Array(targetGrid.length);
+  let source = 0;
+  while (source < sourceGrid.length - 1 && sourceGrid[source]! < targetGrid[0]!) {
+    source += 1;
+  }
+  let sourceEnd = sourceGrid.length - 1;
+  while (sourceEnd > source && sourceGrid[sourceEnd]! > targetGrid[targetGrid.length - 1]!) {
+    sourceEnd -= 1;
+  }
+  for (let target = 0; target < targetGrid.length; target += 1) {
+    const action = targetGrid[target]!;
+    while (source + 1 <= sourceEnd && sourceGrid[source + 1]! < action) source += 1;
+    const next = Math.min(source + 1, sourceEnd);
+    const lower = sourceGrid[source]!;
+    const upper = sourceGrid[next]!;
+    const fraction = upper > lower
+      ? Math.max(0, Math.min(1, (action - lower) / (upper - lower)))
+      : 0;
+    result[target] = sourceLogits[source]!
+      + fraction * (sourceLogits[next]! - sourceLogits[source]!);
+  }
+  return result;
+}
+
+function validateStrictlyIncreasingGrid(
+  grid: ArrayLike<number>,
+  name: string,
+): void {
+  for (let index = 0; index < grid.length; index += 1) {
+    if (!Number.isFinite(grid[index])
+      || (index > 0 && grid[index]! <= grid[index - 1]!)) {
+      throw new Error(`MLP ${name} action grid must be finite and strictly increasing.`);
+    }
+  }
 }
 
 function validateMlpCandle(

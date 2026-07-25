@@ -28,14 +28,17 @@ import {
 import { TradingRuntime } from "./runtime.js";
 import { TradingStorage } from "./storage.js";
 import type { HistoricalBacktestMarket } from "./historical-backtest.js";
-import { CorrelationService } from "./correlation-service.js";
 import { KamaInspector } from "./kama-inspector.js";
 import {
   BinanceExchangeTrading,
   type BinanceExchangeCancelOrderInput,
   type BinanceExchangePlaceOrderInput,
 } from "./binance-exchange.js";
-import { MlpTrainingMetricsReader } from "./mlp-training-metrics.js";
+import {
+  MlpTrainingMetricsReader,
+  MlpTrainingRunNotFoundError,
+} from "./mlp-training-metrics.js";
+import { PortfolioIndexResultsReader } from "./portfolio-index-results.js";
 
 const server = Fastify({
   logger: {
@@ -95,18 +98,14 @@ const runtime = new TradingRuntime(
   },
 );
 await runtime.init();
-const correlationService = new CorrelationService({
-  dataDir: appConfig.dataDir,
-  interval: appConfig.interval,
-  lookbackMs: appConfig.correlations.lookbackDays * 24 * 60 * 60 * 1000,
-  maxMarkets: appConfig.correlations.maxMarkets,
-  historicalCache: {
-    maxBytes: appConfig.historicalCache.maxBytes,
-    minFreeBytes: appConfig.historicalCache.minFreeBytes,
-  },
-});
 const kamaInspector = new KamaInspector(appConfig.dataDir);
-const mlpTrainingMetrics = new MlpTrainingMetricsReader(appConfig.mlpTrainingPlanFile);
+const mlpTrainingMetrics = new MlpTrainingMetricsReader(
+  appConfig.mlpTrainingPlanFile,
+  appConfig.repoRoot,
+);
+const portfolioIndexResults = new PortfolioIndexResultsReader(
+  appConfig.portfolioIndexDir,
+);
 server.addHook("onClose", async () => kamaInspector.close());
 
 server.get("/health", async () => ({
@@ -120,12 +119,49 @@ server.get("/health", async () => ({
 server.get("/api/diagnostics", async () => diagnosticsSnapshot());
 
 server.get("/api/mlp-training/metrics", async (request, reply) => {
-  const query = request.query as { cursor?: string };
+  const query = request.query as { cursor?: string; run?: string };
   const cursor = Number(query.cursor ?? 0);
   if (!Number.isSafeInteger(cursor) || cursor < 0) {
     return reply.code(400).send({ error: "cursor must be a non-negative safe integer." });
   }
-  return mlpTrainingMetrics.read(cursor);
+  if (query.run !== undefined && (query.run.length === 0 || query.run.length > 512)) {
+    return reply.code(400).send({ error: "run must identify an available training plan." });
+  }
+  try {
+    return await mlpTrainingMetrics.read(cursor, query.run);
+  } catch (error) {
+    if (error instanceof MlpTrainingRunNotFoundError) {
+      return reply.code(400).send({ error: error.message });
+    }
+    throw error;
+  }
+});
+
+server.get("/api/portfolio-index/overview", async () => {
+  return portfolioIndexResults.overview();
+});
+
+server.get("/api/portfolio-index/series", async (request, reply) => {
+  const query = request.query as {
+    from?: string;
+    to?: string;
+    maxPoints?: string;
+  };
+  try {
+    return await portfolioIndexResults.series({
+      from: parseOptionalTimestamp(query.from),
+      to: parseOptionalTimestamp(query.to),
+      maxPoints: query.maxPoints ? Number(query.maxPoints) : undefined,
+    });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code === "ENOENT" ? 404 : 400;
+    return reply.code(code).send({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Portfolio index series request failed.",
+    });
+  }
 });
 
 server.get("/api/state", async () => publicSnapshot());
@@ -322,24 +358,6 @@ server.post("/api/exchange/leverage", async (request, reply) => {
     return publicSnapshot();
   } catch (error) {
     const message = error instanceof Error ? error.message : "Binance exchange leverage update failed";
-    return reply.code(400).send({ error: message });
-  }
-});
-
-server.post("/api/correlations", async (request, reply) => {
-  try {
-    const body = (request.body ?? {}) as { refresh?: boolean };
-    const markets = await selectCorrelationMarkets(activeMarket, body.refresh === true);
-    correlationService.startVector(
-      activeMarket,
-      markets,
-      broadcastState,
-      body.refresh === true,
-    );
-    broadcastState();
-    return publicSnapshot();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Correlation computation failed";
     return reply.code(400).send({ error: message });
   }
 });
@@ -559,8 +577,7 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
           return;
         }
         const events = await runtime.handleCandle(candle);
-        const correlationChanged = correlationService.handleCandle(candle);
-        if (events.length > 0 || correlationChanged) {
+        if (events.length > 0) {
           broadcastState();
         } else {
           scheduleBroadcast();
@@ -692,41 +709,6 @@ async function selectRandomBacktestMarkets(
   }
 
   return selected.map(toHistoricalBacktestMarket);
-}
-
-async function selectCorrelationMarkets(
-  market: BinanceMarketListing,
-  forceRefresh = false,
-): Promise<BinanceMarketListing[]> {
-  if (!market.supportsHistoricalCandles || !isStreamVenue(market.venue)) {
-    throw new Error(`${market.displaySymbol} does not support candle correlations.`);
-  }
-
-  const catalog = await marketCatalog.list(forceRefresh);
-  const candidates = catalog.markets.filter(
-    (item) =>
-      item.quoteAsset === market.quoteAsset &&
-      item.supportsHistoricalCandles &&
-      item.supportsLiveStream &&
-      isStreamVenue(item.venue) &&
-      isCorrelationMarketGroup(item.group),
-  );
-
-  if (!candidates.some((item) => item.id === market.id)) {
-    candidates.unshift(market);
-  }
-
-  return candidates;
-}
-
-function isCorrelationMarketGroup(group: BinanceMarketListing["group"]): boolean {
-  return (
-    group === "spot" ||
-    group === "bstocks" ||
-    group === "futures" ||
-    group === "tradfi" ||
-    group === "options"
-  );
 }
 
 function toHistoricalBacktestMarket(
@@ -914,8 +896,6 @@ const heartbeatLogTimer =
             eventLoopDelayMaxMs: diagnostics.eventLoopDelayMs.max,
             eventLoopDelayP99Ms: diagnostics.eventLoopDelayMs.p99,
             rssBytes: diagnostics.memory.rss,
-            correlationStatus: diagnostics.correlations.status,
-            correlationMessage: diagnostics.correlations.message,
           },
           "Trading server heartbeat",
         );
@@ -1063,7 +1043,6 @@ function publicSnapshot() {
     snapshotSource,
     snapshotSeq,
     snapshotAt: Date.now(),
-    correlations: correlationService.snapshotForMarket(snapshot.market.id),
   };
 }
 
@@ -1096,7 +1075,6 @@ function diagnosticsSnapshot() {
       lastBroadcastAt: lastBroadcastAt || undefined,
       snapshotSeq,
     },
-    correlations: correlationService.snapshotForMarket(activeMarket.id),
   };
 }
 
@@ -1138,6 +1116,21 @@ function countSocketStates(): Record<string, number> {
   return counts;
 }
 
+function parseOptionalTimestamp(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") {
+    return undefined;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isFinite(parsed)) {
+    return parsed;
+  }
+  throw new Error(`Invalid timestamp: ${value}`);
+}
+
 function clampInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) {
     return min;
@@ -1153,8 +1146,6 @@ async function shutdown(): Promise<void> {
   }
   clearInterval(dashboardSocketHeartbeat);
   stream.stop();
-  await correlationService.flush();
-  correlationService.stop();
   await runtime.flushState();
   await server.close();
 }

@@ -389,11 +389,14 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
       id: "catalog-test",
       label: "Catalog test MLP",
       createdAt: "2026-07-20T00:00:00.000Z",
-      featureSchemaVersion: 4,
-      inputFeatureCount: 909,
-      outputParameterCount: 6,
+      featureSchemaVersion: 5,
+      inputFeatureCount: 901,
+      outputRepresentation: "base-action-logits",
+      outputActionCount: 255,
+      actionGrid: Array.from({ length: 255 }, (_, index) => -250 + index * 500 / 254),
       hiddenLayerCount: 16,
       hiddenWidth: 1_024,
+      predictionDelayMs: 60_000,
       modelFile: "model.onnx",
       training: {
         trainExamples: 100,
@@ -419,10 +422,12 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
     assert.equal(catalog.windows.some((window) => window.id === "latest"), true);
     assert.equal(catalog.predictorPresets.length, 68);
     assert.equal(catalog.defaults.predictor?.model, "handcrafted");
+    assert.equal(catalog.defaults.predictor?.mlpOracleAlignment, "model-target");
     assert.deepEqual(catalog.mlpModels, [{
       id: "catalog-test",
       label: "Catalog test MLP",
       createdAt: "2026-07-20T00:00:00.000Z",
+      predictionDelayMs: 60_000,
       executionProvider: "cuda",
       training: {
         trainExamples: 100,
@@ -430,7 +435,8 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
         testExamples: 20,
         bestValidationLoss: 0.5,
         testLoss: 0.6,
-      },
+        bestEpoch: 3,
+        },
     }]);
     for (const model of ["handcrafted", "direct-indicator"] as const) {
       const presets = catalog.predictorPresets.filter((preset) => preset.model === model);

@@ -1,16 +1,22 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
-import { Activity, ArrowLeft, Search } from "lucide-solid";
+import { Activity, ArrowLeft, BarChart3, Search } from "lucide-solid";
 
 const apiBase = "/backend";
 const POLL_MS = 2_000;
 
 interface MetricValues {
   loss?: number;
-  crossEntropy?: number;
+  klDivergence?: number;
+  klDivergenceVariance?: number;
+  klDivergenceStdDev?: number;
+  baseKlDivergence?: number;
   probabilityMse?: number;
-  parameterMse?: number;
+  probabilityMseVariance?: number;
+  probabilityMseStdDev?: number;
   excessEntropy?: number;
-  stateMutualInformation?: number;
+  temporalMutualInformation?: number;
+  targetTemporalMutualInformation?: number;
+  temporalMutualInformationReward?: number;
   oracleMutualInformation?: number;
   distanceImbalanceWeight?: number;
   timeWeightEffectiveSampleRatio?: number;
@@ -31,12 +37,40 @@ interface TrainingStatus {
   [key: string]: unknown;
 }
 
+interface TimeWeightingPlan {
+  mode: "distanceImbalance";
+  distanceEpsilon: number;
+  minimumWeight: number;
+  stateAggregation: "globalDistanceRatio";
+  minimumAdviceMagnitude: number;
+  memoryHalfLifeSteps: number;
+  growthPerPriorAdvice: number;
+  maximumMultiplier: number;
+  resetAfterGapSteps: number;
+  resolutionDivergenceMultiplier: number;
+}
+
 interface MetricsResponse {
+  runs: Array<{
+    key: string;
+    id: string;
+    label: string;
+    running: boolean;
+    stage?: string;
+    updatedAt?: string;
+    epochs?: number;
+    patience?: number;
+  }>;
+  selectedRunKey: string;
   plan: {
     id: string;
     label: string;
     epochs?: number;
+    patience?: number;
+    samplingIntervalMs?: number;
+    predictionDelayMs?: number;
     lossWeights?: Record<string, number>;
+    timeWeighting?: TimeWeightingPlan;
   };
   status?: TrainingStatus;
   running: boolean;
@@ -46,6 +80,8 @@ interface MetricsResponse {
     totalShards?: number;
     remainingTeacherFits?: number;
     sourceRejectedDays?: number;
+    featureComponents?: number;
+    oracleComponents?: number;
   };
   cursor: number;
   reset: boolean;
@@ -105,6 +141,8 @@ interface PlotSeries {
 
 export function MlpTrainingPage() {
   const [snapshot, setSnapshot] = createSignal<MetricsResponse>();
+  const [runs, setRuns] = createSignal<MetricsResponse["runs"]>([]);
+  const [selectedRunKey, setSelectedRunKey] = createSignal<string>();
   const [datasetPoints, setDatasetPoints] = createSignal<DatasetPoint[]>([]);
   const [currentDataset, setCurrentDataset] = createSignal<DatasetPoint>();
   const [trainSteps, setTrainSteps] = createSignal<TrainStepPoint[]>([]);
@@ -119,6 +157,7 @@ export function MlpTrainingPage() {
   let pollTimer: number | undefined;
   let clockTimer: number | undefined;
   let disposed = false;
+  let requestGeneration = 0;
 
   const clearSeries = () => {
     datasetByKey.clear();
@@ -154,7 +193,7 @@ export function MlpTrainingPage() {
         }
       } else if (event.event === "dataset-progress") {
         const date = textValue(event.date);
-        const split = textValue(event.split) ?? "unknown";
+        const split = textValue(event.split) ?? textValue(event.component) ?? "unknown";
         const x = numberValue(event.day);
         if (!date || x === undefined) continue;
         const key = `${date}:${split}`;
@@ -178,7 +217,7 @@ export function MlpTrainingPage() {
         setCurrentDataset(point);
       } else if (event.event === "dataset-stage-timing") {
         const date = textValue(event.date);
-        const split = textValue(event.split) ?? "unknown";
+        const split = textValue(event.split) ?? textValue(event.component) ?? "unknown";
         if (!date) continue;
         const key = `${date}:${split}`;
         const existing = datasetByKey.get(key);
@@ -223,22 +262,48 @@ export function MlpTrainingPage() {
   };
 
   const load = async () => {
+    const generation = ++requestGeneration;
+    const requestedRunKey = selectedRunKey();
+    const search = new URLSearchParams({ cursor: String(cursor) });
+    if (requestedRunKey) search.set("run", requestedRunKey);
     try {
-      const response = await fetch(`${apiBase}/api/mlp-training/metrics?cursor=${cursor}`, {
+      const response = await fetch(`${apiBase}/api/mlp-training/metrics?${search}`, {
         cache: "no-store",
       });
       const payload = await response.json() as MetricsResponse & { error?: string };
       if (!response.ok) throw new Error(payload.error ?? `Training metrics request failed: ${response.status}`);
-      if (payload.reset) clearSeries();
+      if (disposed || generation !== requestGeneration) return;
+      const previous = snapshot();
+      const runChanged = previous !== undefined
+        && (previous.selectedRunKey !== payload.selectedRunKey
+          || previous.plan.id !== payload.plan.id);
+      if (payload.reset || runChanged) clearSeries();
       cursor = payload.cursor;
       applyEvents(payload.events);
+      setRuns(payload.runs);
+      setSelectedRunKey(payload.selectedRunKey);
       setSnapshot(payload);
       setError(undefined);
     } catch (reason) {
+      if (disposed || generation !== requestGeneration) return;
       setError(reason instanceof Error ? reason.message : "Training metrics request failed.");
     } finally {
-      if (!disposed) pollTimer = window.setTimeout(() => void load(), POLL_MS);
+      if (!disposed && generation === requestGeneration) {
+        pollTimer = window.setTimeout(() => void load(), POLL_MS);
+      }
     }
+  };
+
+  const selectRun = (runKey: string) => {
+    if (!runKey || runKey === selectedRunKey()) return;
+    requestGeneration += 1;
+    if (pollTimer !== undefined) window.clearTimeout(pollTimer);
+    cursor = 0;
+    clearSeries();
+    setSnapshot(undefined);
+    setSelectedRunKey(runKey);
+    setError(undefined);
+    void load();
   };
 
   onMount(() => {
@@ -287,9 +352,32 @@ export function MlpTrainingPage() {
               {snapshot()?.plan.label ?? "Loading the active training plan…"}
             </p>
           </div>
-          <div class="flex flex-wrap gap-2">
-            <a class="btn" href="#/kama-inspector"><Search size={16} /> KAMA Inspector</a>
-            <a class="btn" href="#/"><ArrowLeft size={16} /> Dashboard</a>
+          <div class="flex min-w-0 flex-col gap-2 lg:items-end">
+            <label class="flex min-w-0 flex-col gap-1">
+              <span class="muted-label">Training run</span>
+              <select
+                class="min-w-64 max-w-full rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                value={selectedRunKey() ?? ""}
+                disabled={runs().length === 0}
+                onChange={(event) => selectRun(event.currentTarget.value)}
+              >
+                <Show when={runs().length === 0}>
+                  <option value="">Loading runs…</option>
+                </Show>
+                <For each={runs()}>
+                  {(run) => (
+                    <option value={run.key}>
+                      {run.running ? "LIVE · " : ""}{run.label} · {stageLabel(run.stage ?? "idle")}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+            <div class="flex flex-wrap gap-2">
+              <a class="btn" href="#/portfolio-index"><BarChart3 size={16} /> Basis Index</a>
+              <a class="btn" href="#/kama-inspector"><Search size={16} /> KAMA Inspector</a>
+              <a class="btn" href="#/"><ArrowLeft size={16} /> Dashboard</a>
+            </div>
           </div>
         </header>
 
@@ -320,11 +408,142 @@ export function MlpTrainingPage() {
           </div>
           <div class="flex flex-wrap justify-between gap-2 text-xs text-ink-300">
             <span>{progressLabel(stage(), latestDataset(), latestStep(), snapshot()?.plan.epochs)}</span>
+            <Show when={snapshot()?.plan.patience !== undefined}>
+              <span>Early-stop patience: {snapshot()?.plan.patience} epochs</span>
+            </Show>
             <Show when={snapshot()?.finalizeRequested}><span class="text-warn">Finalize requested</span></Show>
           </div>
         </section>
 
+        <section class="flex flex-col gap-3">
+          <SectionHeading
+            title="Network optimization"
+            subtitle={stage() === "training"
+              ? `${trainSteps().length} logged updates · updating live`
+              : trainSteps().length > 0
+                ? `${trainSteps().length} updates from the most recent training attempt; live updates resume after refinement`
+                : "Plots will populate when refinement hands off to weight training"}
+          />
+          <Show when={trainSteps().length > 0 || epochs().length > 0} fallback={<WaitingForTraining stage={stage()} />}>
+            <div class="grid min-w-0 gap-3 xl:grid-cols-2">
+              <MetricChart title="Latest batch loss" scale="log" xLabel="global step" series={[
+                metricPlot("Total", "#38bdf8", trainSteps(), "loss"),
+              ]} />
+              <MetricChart title="Epoch loss" scale="log" xLabel="epoch" series={[
+                epochPlot("Train", "#38bdf8", epochs(), "train", "loss"),
+                epochPlot("Validation", "#f5b84b", epochs(), "validation", "loss"),
+                directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
+              ]} />
+              <MetricChart title="Distribution losses" scale="log" xLabel="global step" series={[
+                metricPlot("Conditional KL", "#38bdf8", trainSteps(), "klDivergence"),
+                metricPlot("Base-action KL", "#22c55e", trainSteps(), "baseKlDivergence"),
+                metricPlot("Probability MSE", "#f05252", trainSteps(), "probabilityMse"),
+              ]} />
+              <MetricChart title="Validation conditional KL" subtitle="Actual fee-conditioned distribution on the visible range" scale="log" xLabel="epoch" series={[
+                epochPlot("Mean conditional KL", "#38bdf8", epochs(), "validation", "klDivergence"),
+                epochPlot("Conditional KL standard deviation", "#f5b84b", epochs(), "validation", "klDivergenceStdDev"),
+                epochPlot("Conditional KL variance", "#a78bfa", epochs(), "validation", "klDivergenceVariance"),
+              ]} />
+              <MetricChart title="Validation base-action KL" subtitle="Stored raw oracle factor versus the direct 255-logit head" scale="log" xLabel="epoch" series={[
+                epochPlot("Mean base-action KL", "#22c55e", epochs(), "validation", "baseKlDivergence"),
+              ]} />
+              <MetricChart title="Validation probability MSE" subtitle="Per-example visible-range surface error" scale="log" xLabel="epoch" series={[
+                epochPlot("Mean pMSE", "#f05252", epochs(), "validation", "probabilityMse"),
+                epochPlot("pMSE standard deviation", "#f5b84b", epochs(), "validation", "probabilityMseStdDev"),
+                epochPlot("pMSE variance", "#a78bfa", epochs(), "validation", "probabilityMseVariance"),
+              ]} />
+              <MetricChart title="Excess entropy" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.excessEntropy)} xLabel="global step" series={[
+                metricPlot("Excess entropy", "#a78bfa", trainSteps(), "excessEntropy"),
+              ]} />
+              <MetricChart title="Temporal mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.temporalMutualInformation)} xLabel="global step" series={[
+                metricPlot("Predicted MI", "#38bdf8", trainSteps(), "temporalMutualInformation"),
+                metricPlot("Capped reward", "#a78bfa", trainSteps(), "temporalMutualInformationReward"),
+                metricPlot("Teacher MI", "#f5b84b", trainSteps(), "targetTemporalMutualInformation"),
+              ]} />
+              <MetricChart title="Oracle mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.oracleMutualInformation)} xLabel="global step" series={[
+                metricPlot("Oracle MI", "#22c55e", trainSteps(), "oracleMutualInformation"),
+              ]} />
+              <MetricChart title="Distance-imbalance time weighting" unit="ratio" yDomain={[0, 1]} xLabel="global step" series={[
+                metricPlot("Mean weight", "#38bdf8", trainSteps(), "distanceImbalanceWeight"),
+                metricPlot("Effective sample ratio", "#f5b84b", trainSteps(), "timeWeightEffectiveSampleRatio"),
+              ]} />
+              <MetricChart title="Learning rate" scale="log" xLabel="global step" series={[
+                directStepPlot("Learning rate", "#38bdf8", trainSteps(), "learningRate"),
+              ]} />
+              <MetricChart title="Gradient norm" scale="log" xLabel="global step" series={[
+                directStepPlot("Gradient norm", "#f5b84b", trainSteps(), "gradientNorm"),
+              ]} />
+              <MetricChart title="Training throughput" unit="examples/s" xLabel="global step" series={[
+                directStepPlot("Throughput", "#22c55e", trainSteps(), "examplesPerSecond"),
+              ]} />
+              <MetricChart title="Training GPU memory" unit="MiB" xLabel="global step" series={[
+                directStepPlot("Allocated", "#a78bfa", trainSteps(), "gpuMemoryMiB"),
+              ]} />
+            </div>
+          </Show>
+        </section>
+
+        <Show when={snapshot()?.plan.timeWeighting}>
+          {(weighting) => (
+            <section class="panel flex flex-col gap-3">
+              <SectionHeading
+                title="Persistent same-side example weighting"
+                subtitle="Active training-plan values. Dₜ and Wₜ are each one scalar for the complete timestamp example; training only normalizes Wₜ by the current batch mean."
+              />
+              <div class="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-9">
+                <MetricCard
+                  label="Signal aggregation"
+                  value={weighting().stateAggregation === "globalDistanceRatio"
+                    ? "Global distance ratio"
+                    : weighting().stateAggregation}
+                />
+                <MetricCard
+                  label="Advice threshold"
+                  value={`|Dₜ| ≥ ${formatMetric(weighting().minimumAdviceMagnitude)}`}
+                />
+                <MetricCard
+                  label="Evidence half-life"
+                  value={stepDuration(
+                    weighting().memoryHalfLifeSteps,
+                    snapshot()?.plan.samplingIntervalMs,
+                  )}
+                />
+                <MetricCard
+                  label="Growth / prior advice"
+                  value={`+${formatMetric(weighting().growthPerPriorAdvice)}×`}
+                />
+                <MetricCard
+                  label="Multiplier cap"
+                  value={`${formatMetric(weighting().maximumMultiplier)}×`}
+                />
+                <MetricCard
+                  label="Gap reset"
+                  value={`>${stepDuration(
+                    weighting().resetAfterGapSteps,
+                    snapshot()?.plan.samplingIntervalMs,
+                  )}`}
+                />
+                <MetricCard
+                  label="Distance epsilon"
+                  value={formatMetric(weighting().distanceEpsilon)}
+                />
+                <MetricCard
+                  label="Minimum weight"
+                  value={formatMetric(weighting().minimumWeight)}
+                />
+                <MetricCard
+                  label="Resolution JSD boost"
+                  value={`1 + ${formatMetric(weighting().resolutionDivergenceMultiplier)}×JSD`}
+                />
+              </div>
+            </section>
+          )}
+        </Show>
+
         <section class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+          <MetricCard label="Prediction delay" value={formatDurationMs(snapshot()?.plan.predictionDelayMs)} />
+          <MetricCard label="Input days" value={integer(snapshot()?.progress.featureComponents)} />
+          <MetricCard label="Oracle days" value={integer(snapshot()?.progress.oracleComponents)} />
           <MetricCard label="Teacher rate" value={formatUnit(latestDataset()?.examplesPerSecond, " fits/s")} />
           <MetricCard label="Teacher GPU" value={formatUnit(latestDataset()?.gpuMemoryMiB, " MiB", 1)} />
           <MetricCard label="Fit KL" value={formatMetric(latestDataset()?.kl)} />
@@ -374,59 +593,6 @@ export function MlpTrainingPage() {
           </section>
         </Show>
 
-        <section class="flex flex-col gap-3">
-          <SectionHeading
-            title="Network optimization"
-            subtitle={stage() === "training"
-              ? `${trainSteps().length} logged updates · updating live`
-              : trainSteps().length > 0
-                ? `${trainSteps().length} updates from the most recent training attempt; live updates resume after refinement`
-                : "Plots will populate when refinement hands off to weight training"}
-          />
-          <Show when={trainSteps().length > 0 || epochs().length > 0} fallback={<WaitingForTraining stage={stage()} />}>
-            <div class="grid min-w-0 gap-3 xl:grid-cols-2">
-              <MetricChart title="Latest batch loss" scale="log" xLabel="global step" series={[
-                metricPlot("Total", "#38bdf8", trainSteps(), "loss"),
-              ]} />
-              <MetricChart title="Epoch loss" scale="log" xLabel="epoch" series={[
-                epochPlot("Train", "#38bdf8", epochs(), "train", "loss"),
-                epochPlot("Validation", "#f5b84b", epochs(), "validation", "loss"),
-                directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
-              ]} />
-              <MetricChart title="Distribution losses" scale="log" xLabel="global step" series={[
-                metricPlot("Cross entropy", "#38bdf8", trainSteps(), "crossEntropy"),
-                metricPlot("Probability MSE", "#f05252", trainSteps(), "probabilityMse"),
-                metricPlot("Parameter MSE", "#f5b84b", trainSteps(), "parameterMse"),
-              ]} />
-              <MetricChart title="Excess entropy" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.excessEntropy)} xLabel="global step" series={[
-                metricPlot("Excess entropy", "#a78bfa", trainSteps(), "excessEntropy"),
-              ]} />
-              <MetricChart title="State mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.stateMutualInformation)} xLabel="global step" series={[
-                metricPlot("State MI", "#38bdf8", trainSteps(), "stateMutualInformation"),
-              ]} />
-              <MetricChart title="Oracle mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.oracleMutualInformation)} xLabel="global step" series={[
-                metricPlot("Oracle MI", "#22c55e", trainSteps(), "oracleMutualInformation"),
-              ]} />
-              <MetricChart title="Distance-imbalance time weighting" unit="ratio" yDomain={[0, 1]} xLabel="global step" series={[
-                metricPlot("Mean weight", "#38bdf8", trainSteps(), "distanceImbalanceWeight"),
-                metricPlot("Effective sample ratio", "#f5b84b", trainSteps(), "timeWeightEffectiveSampleRatio"),
-              ]} />
-              <MetricChart title="Learning rate" scale="log" xLabel="global step" series={[
-                directStepPlot("Learning rate", "#38bdf8", trainSteps(), "learningRate"),
-              ]} />
-              <MetricChart title="Gradient norm" scale="log" xLabel="global step" series={[
-                directStepPlot("Gradient norm", "#f5b84b", trainSteps(), "gradientNorm"),
-              ]} />
-              <MetricChart title="Training throughput" unit="examples/s" xLabel="global step" series={[
-                directStepPlot("Throughput", "#22c55e", trainSteps(), "examplesPerSecond"),
-              ]} />
-              <MetricChart title="Training GPU memory" unit="MiB" xLabel="global step" series={[
-                directStepPlot("Allocated", "#a78bfa", trainSteps(), "gpuMemoryMiB"),
-              ]} />
-            </div>
-          </Show>
-        </section>
-
         <Show when={epochs().length > 0}>
           <section class="panel overflow-x-auto">
             <div class="mb-3"><SectionHeading title="Recent epochs" subtitle="Validation checkpoints and early-stopping state" /></div>
@@ -434,12 +600,18 @@ export function MlpTrainingPage() {
               <thead><tr>
                 <th class="table-head">Epoch</th><th class="table-head">Step</th>
                 <th class="table-head">Train loss</th><th class="table-head">Validation loss</th>
+                <th class="table-head">Conditional KL</th><th class="table-head">Base KL</th>
+                <th class="table-head">pMSE mean</th><th class="table-head">pMSE variance</th>
                 <th class="table-head">Best</th><th class="table-head">Stale</th>
               </tr></thead>
               <tbody><For each={epochs().slice(-12).reverse()}>{(item) => <tr>
                 <td class="td-cell">{item.epoch + 1}</td><td class="td-cell">{item.globalStep}</td>
                 <td class="td-cell">{formatMetric(item.train.loss)}</td>
                 <td class="td-cell">{formatMetric(item.validation.loss)}</td>
+                <td class="td-cell">{formatMetric(item.validation.klDivergence)}</td>
+                <td class="td-cell">{formatMetric(item.validation.baseKlDivergence)}</td>
+                <td class="td-cell">{formatMetric(item.validation.probabilityMse)}</td>
+                <td class="td-cell">{formatMetric(item.validation.probabilityMseVariance)}</td>
                 <td class="td-cell text-gain">{formatMetric(item.bestValidation)}</td>
                 <td class="td-cell">{integer(item.staleEpochs)}</td>
               </tr>}</For></tbody>
@@ -609,9 +781,16 @@ function metricValues(value: unknown): MetricValues {
   if (!value || typeof value !== "object") return {};
   const record = value as Record<string, unknown>;
   return {
-    loss: numberValue(record.loss), crossEntropy: numberValue(record.crossEntropy),
-    probabilityMse: numberValue(record.probabilityMse), parameterMse: numberValue(record.parameterMse),
-    excessEntropy: numberValue(record.excessEntropy), stateMutualInformation: numberValue(record.stateMutualInformation),
+    loss: numberValue(record.loss), klDivergence: numberValue(record.klDivergence),
+    klDivergenceVariance: numberValue(record.klDivergenceVariance),
+    klDivergenceStdDev: numberValue(record.klDivergenceStdDev),
+    baseKlDivergence: numberValue(record.baseKlDivergence),
+    probabilityMse: numberValue(record.probabilityMse),
+    probabilityMseVariance: numberValue(record.probabilityMseVariance),
+    probabilityMseStdDev: numberValue(record.probabilityMseStdDev),
+    excessEntropy: numberValue(record.excessEntropy), temporalMutualInformation: numberValue(record.temporalMutualInformation),
+    targetTemporalMutualInformation: numberValue(record.targetTemporalMutualInformation),
+    temporalMutualInformationReward: numberValue(record.temporalMutualInformationReward),
     oracleMutualInformation: numberValue(record.oracleMutualInformation),
     distanceImbalanceWeight: numberValue(record.distanceImbalanceWeight),
     timeWeightEffectiveSampleRatio: numberValue(record.timeWeightEffectiveSampleRatio),
@@ -679,6 +858,20 @@ function integer(value: number | undefined): string {
 
 function ratio(value: number | undefined, total: number | undefined): string {
   return value === undefined || total === undefined ? "—" : `${value.toLocaleString()} / ${total.toLocaleString()}`;
+}
+
+function formatDurationMs(value: number | undefined): string {
+  if (value === undefined) return "—";
+  if (value % 60_000 === 0) return `${value / 60_000}m`;
+  if (value % 1_000 === 0) return `${value / 1_000}s`;
+  return `${value}ms`;
+}
+
+function stepDuration(steps: number, samplingIntervalMs: number | undefined): string {
+  const stepLabel = `${formatMetric(steps)} step${steps === 1 ? "" : "s"}`;
+  if (samplingIntervalMs === undefined) return stepLabel;
+  const seconds = steps * samplingIntervalMs / 1_000;
+  return `${stepLabel} · ${formatMetric(seconds)}s`;
 }
 
 function stageLabel(stage: string): string {

@@ -16,7 +16,7 @@ import {
 
 const DAY_MS = 86_400_000;
 const PARAMETER_COUNT = 8;
-const METRIC_COUNT = 6;
+const METRIC_COUNT = 7;
 
 interface SourceCase {
   split: "train" | "validation" | "test";
@@ -292,6 +292,9 @@ function fitCases(
       quality_fallback_iterations: deep
         ? Math.max(plan.teacherFit.qualityFallbackIterations, plan.teacherFit.adaptiveIterations)
         : plan.teacherFit.qualityFallbackIterations,
+      visible_sample_fraction: plan.teacherFit.visibleSampleFraction,
+      score_hinge_span: plan.teacherFit.scoreHingeSpan,
+      compact_visible_initialization: plan.teacherFit.compactVisibleInitialization,
       input_row_stride: rowStride,
       input_queue_batches: 1,
       pipelined_refinement: false,
@@ -332,6 +335,7 @@ function evaluateCase(
     latentUpper: plan.execution.maximumEffectiveExposure,
     visibleLower: plan.execution.minimumEffectiveExposure,
     visibleUpper: plan.execution.maximumEffectiveExposure,
+    hingeSpan: plan.teacherFit.scoreHingeSpan,
     friction: plan.execution.feeBps / 10_000,
     temperature: plan.execution.temperature,
   });

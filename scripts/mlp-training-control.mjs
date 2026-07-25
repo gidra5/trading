@@ -47,7 +47,8 @@ function format(status) {
   const lines = [
     `${status.planId} · ${status.stage} · updated ${status.updatedAt}`,
   ];
-  const datasetStage = typeof status.stage === "string" && status.stage.startsWith("dataset");
+  const datasetStage = typeof status.stage === "string"
+    && (status.stage.startsWith("dataset") || status.stage.startsWith("frozen-study"));
   const datasetProgress = status.latest?.event === "dataset-progress"
     ? status.latest
     : datasetStage
@@ -70,7 +71,7 @@ function format(status) {
   if (datasetProgress) {
     const value = datasetProgress;
     lines.push(
-      `Dataset ${value.day}/${value.days} days · ${value.date} ${value.split}`,
+      `Dataset ${value.day}/${value.days} days · ${value.date} ${value.split ?? value.component ?? ""}`.trim(),
       `Teacher fits ${value.examplesCompleted}/${value.examplesTotal}`,
     );
     if (Number.isFinite(value.examplesPerSecond)) {
@@ -116,9 +117,15 @@ function format(status) {
   }
   if (status.sourceRejections?.count > 0) {
     lines.push(
-      `Skipped source days ${status.sourceRejections.count}`
+      `Unrecovered source days ${status.sourceRejections.count}`
       + ` · latest ${status.sourceRejections.latestDate ?? "—"}`,
       `Source refinement queue: ${status.sourceRejections.queue}`,
+    );
+  }
+  if (status.sourceRecovery?.active) {
+    lines.push(
+      `Recovering source day ${status.sourceRecovery.date ?? "—"}`,
+      status.sourceRecovery.detail ?? "Downloading and validating the complete daily shard",
     );
   }
   const step = status.latestStep;
@@ -153,9 +160,17 @@ function readOptionalJson(file) {
 }
 
 function metricLine(label, metrics) {
-  return `${label}: loss ${number(metrics.loss)} · CE ${number(metrics.crossEntropy)}`
-    + ` · pMSE ${number(metrics.probabilityMse)} · paramMSE ${number(metrics.parameterMse)}`
-    + ` · excess H ${number(metrics.excessEntropy)} · State MI ${number(metrics.stateMutualInformation)}`
+  return `${label}: loss ${number(metrics.loss)} · KL ${number(metrics.klDivergence)}`
+    + ` ± ${number(metrics.klDivergenceStdDev)}`
+    + ` (var ${number(metrics.klDivergenceVariance)})`
+    + ` · deployment KL ${number(metrics.deploymentKlDivergence)}`
+    + ` ± ${number(metrics.deploymentKlDivergenceStdDev)}`
+    + ` · pMSE ${number(metrics.probabilityMse)}`
+    + ` ± ${number(metrics.probabilityMseStdDev)}`
+    + ` (var ${number(metrics.probabilityMseVariance)})`
+    + ` · paramMSE ${number(metrics.parameterMse)}`
+    + ` · excess H ${number(metrics.excessEntropy)} · Temporal MI ${number(metrics.temporalMutualInformation)}`
+    + ` · Temporal reward ${number(metrics.temporalMutualInformationReward)}`
     + ` · Oracle MI ${number(metrics.oracleMutualInformation)}`;
 }
 

@@ -23,12 +23,26 @@ The dev server writes live state and saved market data under `data/`.
 ```bash
 npm run benchmark:strategies
 npm run experiment:loop
+npm run basis:binance
+npm run basis:compare-scales
 ```
 
 `benchmark:strategies` defaults to random-length BTCUSDT samples across the available
 five-year cycle instead of a recent 30-day window. `experiment:loop` repeatedly runs
 that benchmark, prompts a Codex agent to review and improve the master adaptive
 strategy, runs typecheck, and writes iteration logs under `data/experiments/agent-loop`.
+
+`basis:binance` discovers economic underlyings across Binance products and selects
+a near-orthogonal subset from aligned returns. It supports exact sample counts,
+such as `--candles 360 --interval 4h`, and prefers the largest mean absolute
+candle return among near-equivalent orthogonality pivots at that interval.
+Methodology and options are documented in
+[docs/binance-portfolio-basis.md](docs/binance-portfolio-basis.md).
+`basis:compare-scales` compares independently selected 360-return bases at 1d,
+4h, 1h, 15m, and 1m without mixing return amplitudes across intervals. It also
+produces a 5%-capped, liquidity-size-weighted index for every scale and an
+equal-weight aggregate of the five scale sleeves; see
+[docs/binance-multiscale-basis.md](docs/binance-multiscale-basis.md).
 
 ## Build
 

@@ -71,13 +71,14 @@ export interface ConditionalFourSegmentRawParameterOptions {
   latentUpper: number;
   visibleLower: number;
   visibleUpper: number;
+  /** Exposure span used to calibrate all fixed hinge widths. */
+  hingeSpan?: number;
   friction?: number;
   temperature?: number;
 }
 
 /** [c1, c2, b, lambda, beta_c1, beta_c2, cutoff_lower, cutoff_upper]. */
 export const CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT = 8;
-export const LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT = 6;
 
 export type ConditionalFourSegmentFitTermination =
   | "gradient"
@@ -157,28 +158,18 @@ const FIXED_KAPPA_C_VISIBLE_PRODUCT = 82;
 const FIXED_KAPPA_X_VISIBLE_PRODUCT = 678;
 
 /**
- * Decode the learned coordinates. New eight-coordinate models fit and scale on
- * the complete effective range, then apply the usable range only as an
- * execution-time truncation. Six-coordinate artifacts retain their original
- * visible-range scaling and receive effective-range cutoff defaults.
+ * Decode the eight learned coordinates on the complete effective range, then
+ * apply the usable range only as an execution-time truncation.
  */
 export function conditionalFourSegmentParametersFromRaw(
   rawInput: ArrayLike<number>,
   options: ConditionalFourSegmentRawParameterOptions,
 ): ConditionalFourSegmentParameters {
-  const legacy = rawInput.length === LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT;
-  if (!legacy && rawInput.length !== PARAMETER_COUNT) {
-    throw new Error(
-      `Conditional four-segment raw output must contain ${LEGACY_CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT} or ${PARAMETER_COUNT} values.`,
-    );
+  if (rawInput.length !== PARAMETER_COUNT) {
+    throw new Error(`Conditional four-segment raw output must contain ${PARAMETER_COUNT} values.`);
   }
-  const fixed = createFixedParameters(options, legacy);
-  const raw = new Float64Array(PARAMETER_COUNT);
-  raw.set(rawInput);
-  if (legacy) {
-    raw[CUTOFF_LOWER_RAW] = -14;
-    raw[CUTOFF_UPPER_RAW] = 14;
-  }
+  const fixed = createFixedParameters(options);
+  const raw = Float64Array.from(rawInput);
   if (!raw.every(Number.isFinite)) {
     throw new Error("Conditional four-segment raw output must be finite.");
   }
@@ -244,7 +235,7 @@ export function fitConditionalFourSegmentPolicy(
   );
   const actionIndices = sampledIndices(
     actionGrid.length,
-    Math.max(5, Math.floor(options.sampleActions ?? 51)),
+    Math.max(5, Math.floor(options.sampleActions ?? 63)),
   );
   const actions = Float64Array.from(actionIndices, (index) => actionGrid[index]!);
   const states = Float64Array.from(stateIndices, (index) => currentExposures[index]!);
@@ -769,7 +760,6 @@ function parametersFromRaw(
 
 function createFixedParameters(
   options: ConditionalFourSegmentRawParameterOptions,
-  legacyVisibleBasis = false,
 ): FixedParameters {
   const values = [options.latentLower, options.latentUpper, options.visibleLower, options.visibleUpper];
   if (!values.every(Number.isFinite)
@@ -786,10 +776,12 @@ function createFixedParameters(
   }
   const latentSpan = options.latentUpper - options.latentLower;
   const visibleSpan = options.visibleUpper - options.visibleLower;
-  const basisSpan = legacyVisibleBasis ? visibleSpan : latentSpan;
-  const basisCenter = legacyVisibleBasis
-    ? (options.visibleLower + options.visibleUpper) / 2
-    : (options.latentLower + options.latentUpper) / 2;
+  const hingeSpan = options.hingeSpan ?? latentSpan;
+  if (!(Number.isFinite(hingeSpan) && hingeSpan > 0)) {
+    throw new Error("Conditional four-segment hinge span must be positive and finite.");
+  }
+  const basisSpan = latentSpan;
+  const basisCenter = (options.latentLower + options.latentUpper) / 2;
   const halfBasisSpan = basisSpan / 2;
   const buySlopeAtZero = friction > 0 ? friction / (1 - friction) : 0;
   const sellSlopeAtZero = friction;
@@ -806,9 +798,9 @@ function createFixedParameters(
     slopeScale: 1 / basisSpan,
     precisionScale: 1 / (halfBasisSpan * halfBasisSpan),
     betaX: -(buySlopeAtZero + sellSlopeAtZero) / temperature,
-    kappaC1: FIXED_KAPPA_C_VISIBLE_PRODUCT / basisSpan,
-    kappaX: FIXED_KAPPA_X_VISIBLE_PRODUCT / basisSpan,
-    kappaC2: FIXED_KAPPA_C_VISIBLE_PRODUCT / basisSpan,
+    kappaC1: FIXED_KAPPA_C_VISIBLE_PRODUCT / hingeSpan,
+    kappaX: FIXED_KAPPA_X_VISIBLE_PRODUCT / hingeSpan,
+    kappaC2: FIXED_KAPPA_C_VISIBLE_PRODUCT / hingeSpan,
   };
 }
 

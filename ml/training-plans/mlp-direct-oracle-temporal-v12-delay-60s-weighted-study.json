@@ -1,0 +1,3405 @@
+{
+  "version": 4,
+  "id": "mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
+  "label": "Direct 255-action MLP v12 · one-minute oracle learnability · 60-second policy delay · 1-second examples · one-minute oracle · frozen production-wide sample",
+  "dataDir": "data",
+  "componentStoreId": "mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s",
+  "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-weighted-study",
+  "componentSeedDatasetDirs": [
+    "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
+    "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset"
+  ],
+  "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
+  "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
+  "oraclePreparation": {
+    "backend": "cuda"
+  },
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 60000,
+  "latestTestDays": 30,
+  "excludedAggregateWindows": [
+    "fit-full"
+  ],
+  "windows": [
+    {
+      "id": "fit-full",
+      "start": "2025-03-19",
+      "end": "2025-11-13"
+    },
+    {
+      "id": "fit-1",
+      "start": "2025-03-19",
+      "end": "2025-05-17"
+    },
+    {
+      "id": "fit-2",
+      "start": "2025-05-18",
+      "end": "2025-07-16"
+    },
+    {
+      "id": "fit-3",
+      "start": "2025-07-17",
+      "end": "2025-09-14"
+    },
+    {
+      "id": "fit-4",
+      "start": "2025-09-15",
+      "end": "2025-11-13"
+    },
+    {
+      "id": "sideways-churn-2022-07",
+      "start": "2022-07-28",
+      "end": "2022-08-03"
+    },
+    {
+      "id": "sideways-churn-2022-05",
+      "start": "2022-05-14",
+      "end": "2022-05-20"
+    },
+    {
+      "id": "sideways-churn-2021-12",
+      "start": "2021-12-14",
+      "end": "2021-12-20"
+    },
+    {
+      "id": "sideways-churn-2021-09",
+      "start": "2021-09-08",
+      "end": "2021-09-14"
+    },
+    {
+      "id": "sideways-churn-2023-03",
+      "start": "2023-03-18",
+      "end": "2023-03-24"
+    },
+    {
+      "id": "regime-up-2023-03",
+      "start": "2023-03-11",
+      "end": "2023-03-17"
+    },
+    {
+      "id": "regime-flat-2026-04",
+      "start": "2026-04-22",
+      "end": "2026-04-28"
+    },
+    {
+      "id": "regime-down-2022-06",
+      "start": "2022-06-12",
+      "end": "2022-06-18"
+    },
+    {
+      "id": "shape-up-low-2024-02",
+      "start": "2024-02-24",
+      "end": "2024-02-26"
+    },
+    {
+      "id": "shape-up-high-2022-06",
+      "start": "2022-06-19",
+      "end": "2022-06-21"
+    },
+    {
+      "id": "shape-down-low-2023-06",
+      "start": "2023-06-03",
+      "end": "2023-06-05"
+    },
+    {
+      "id": "shape-down-high-2022-06",
+      "start": "2022-06-13",
+      "end": "2022-06-15"
+    },
+    {
+      "id": "shape-flat-high-bias-2021-10",
+      "start": "2021-10-19",
+      "end": "2021-10-21"
+    },
+    {
+      "id": "shape-flat-high-bias-low-2025-02",
+      "start": "2025-02-14",
+      "end": "2025-02-16"
+    },
+    {
+      "id": "shape-flat-low-bias-2024-07",
+      "start": "2024-07-07",
+      "end": "2024-07-09"
+    },
+    {
+      "id": "shape-flat-low-bias-low-2025-07",
+      "start": "2025-07-04",
+      "end": "2025-07-06"
+    },
+    {
+      "id": "shape-flat-mid-bias-2024-01",
+      "start": "2024-01-02",
+      "end": "2024-01-04"
+    },
+    {
+      "id": "shape-flat-mid-bias-low-2023-09",
+      "start": "2023-09-15",
+      "end": "2023-09-17"
+    },
+    {
+      "id": "sharpe-up-3d-2024-11",
+      "start": "2024-11-09",
+      "end": "2024-11-11"
+    },
+    {
+      "id": "sharpe-up-3d-2023-12",
+      "start": "2023-12-03",
+      "end": "2023-12-05"
+    },
+    {
+      "id": "sharpe-down-3d-2026-06",
+      "start": "2026-06-01",
+      "end": "2026-06-03"
+    },
+    {
+      "id": "sharpe-down-3d-2023-03",
+      "start": "2023-03-07",
+      "end": "2023-03-09"
+    },
+    {
+      "id": "sharpe-up-7d-2023-12",
+      "start": "2023-11-29",
+      "end": "2023-12-05"
+    },
+    {
+      "id": "sharpe-up-7d-2024-11",
+      "start": "2024-11-05",
+      "end": "2024-11-11"
+    },
+    {
+      "id": "sharpe-down-7d-2023-03",
+      "start": "2023-03-03",
+      "end": "2023-03-09"
+    },
+    {
+      "id": "sharpe-down-7d-2026-06",
+      "start": "2026-05-27",
+      "end": "2026-06-02"
+    },
+    {
+      "id": "failure-down-3d-2022-06",
+      "start": "2022-06-11",
+      "end": "2022-06-13"
+    },
+    {
+      "id": "failure-down-7d-2022-06",
+      "start": "2022-06-07",
+      "end": "2022-06-13"
+    }
+  ],
+  "execution": {
+    "feeBps": 17.5,
+    "minimumUsableExposure": -100,
+    "maximumUsableExposure": 100,
+    "minimumEffectiveExposure": -250,
+    "maximumEffectiveExposure": 250,
+    "maintenanceBpsHour": {
+      "quoteLend": 10,
+      "quoteBorrow": 10,
+      "assetBorrow": 10
+    },
+    "gridSize": 255,
+    "temperature": 0.01,
+    "holdingPeriodSteps": 60,
+    "valueHorizonSteps": 3600,
+    "horizonEndMode": "extend"
+  },
+  "teacherFit": {
+    "representation": "direct-diagnostics",
+    "backend": "cuda",
+    "device": "cuda",
+    "batchSize": 4096,
+    "projectionIterations": 32,
+    "maxIterations": 30,
+    "adaptiveIterations": 250,
+    "adaptiveRounds": 1,
+    "restartCount": 3,
+    "sampleStates": 31,
+    "sampleActions": 63,
+    "tolerance": 1e-8,
+    "maxMeanKlDivergence": 0.003,
+    "maxMeanSquaredError": 0.0000011,
+    "lineSearchCandidates": 8,
+    "temporalRefinementRounds": 2,
+    "temporalIterations": 20,
+    "temporalFollowupIterations": 8,
+    "temporalEquivalentLossAbsolute": 0.00005,
+    "temporalEquivalentLossRelative": 0.00002,
+    "optimizerBackend": "triton-queued",
+    "optimizerHostCheckInterval": 32,
+    "qualityFallbackIterations": 96,
+    "visibleSampleFraction": 0.75,
+    "scoreHingeSpan": 200,
+    "compactVisibleInitialization": true,
+    "inputAlignmentFloats": 32,
+    "inputQueueBatches": 4,
+    "pipelinedRefinement": true,
+    "workerJobsBeforeRecycle": 1
+  },
+  "training": {
+    "targetRepresentation": "minuteOracleProbabilities",
+    "epochs": 256,
+    "batchSize": 4096,
+    "evaluationBatchSize": 4096,
+    "validationFraction": 1,
+    "trainingFraction": 1,
+    "weightedTrainingSample": false,
+    "gradientAccumulation": 1,
+    "learningRate": 0.0001,
+    "weightDecay": 0.01,
+    "dropout": 0.05,
+    "statesPerExample": 31,
+    "patience": 64,
+    "workers": 4,
+    "seed": 1337,
+    "device": "cuda",
+    "logEverySteps": 100,
+    "compile": true,
+    "timeWeighting": {
+      "mode": "distanceImbalance",
+      "distanceEpsilon": 0.000001,
+      "minimumWeight": 0.000001,
+      "stateAggregation": "globalDistanceRatio",
+      "minimumAdviceMagnitude": 0.25,
+      "memoryHalfLifeSteps": 15,
+      "growthPerPriorAdvice": 0.25,
+      "maximumMultiplier": 4,
+      "resetAfterGapSteps": 60,
+      "resolutionDivergenceMultiplier": 1
+    },
+    "lossWeights": {
+      "crossEntropy": 1,
+      "probabilityMse": 1,
+      "excessEntropy": 0,
+      "temporalMutualInformation": 0,
+      "oracleMutualInformation": 0
+    }
+  },
+  "lossWeightStudy": {
+    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-joint-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "dataset": {
+      "selection": "one-per-disjoint-regime-then-maximin",
+      "calendarDays": {
+        "train": 32,
+        "validation": 25,
+        "test": 7
+      },
+      "utcBlocks": [
+        [
+          0,
+          90
+        ],
+        [
+          360,
+          450
+        ],
+        [
+          720,
+          810
+        ],
+        [
+          1080,
+          1170
+        ]
+      ],
+      "reuseCompletedProductionComponents": true
+    },
+    "promotion": {
+      "mode": "manual-review",
+      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-full-days",
+      "finalistsPerDelay": 2,
+      "productionFinalists": 2
+    },
+    "epochs": 6,
+    "patience": 2,
+    "resumeProductionPreparationAfterPriority": false,
+    "screeningValidationFraction": 0.25,
+    "selectionMetric": "klDivergence",
+    "design": "resolution-vi-half-factorial",
+    "lowScale": 0.25,
+    "centerScale": 1,
+    "highScale": 4,
+    "predictionDelayMinutes": [
+      0,
+      1,
+      30,
+      60
+    ],
+    "terms": [
+      "crossEntropy",
+      "probabilityMse",
+      "parameterMse",
+      "excessEntropy",
+      "temporalMutualInformation",
+      "oracleMutualInformation"
+    ]
+  },
+  "exhaustiveLossWeightStudy": {
+    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "dataset": {
+      "selection": "one-per-disjoint-regime-then-maximin",
+      "calendarDays": {
+        "train": 32,
+        "validation": 25,
+        "test": 7
+      },
+      "utcBlocks": [
+        [
+          0,
+          90
+        ],
+        [
+          360,
+          450
+        ],
+        [
+          720,
+          810
+        ],
+        [
+          1080,
+          1170
+        ]
+      ],
+      "reuseCompletedProductionComponents": true
+    },
+    "promotion": {
+      "mode": "manual-review",
+      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-full-days",
+      "finalistsPerDelay": 1,
+      "productionFinalists": 1
+    },
+    "epochs": 6,
+    "patience": 2,
+    "resumeProductionPreparationAfterPriority": false,
+    "screeningValidationFraction": 0.25,
+    "selectionMetric": "klDivergence",
+    "design": "full-grid",
+    "weightScales": [
+      0,
+      0.25,
+      1,
+      4
+    ],
+    "predictionDelayMinutes": [
+      0,
+      0.5,
+      1,
+      30,
+      60
+    ],
+    "reviewAfterDelayMinutes": [
+      0
+    ],
+    "artifactRetention": "best-per-delay",
+    "reuseResultsFrom": "lossWeightStudy",
+    "retireReusedArtifacts": true,
+    "trainingPopulationSize": 4,
+    "populationWorkers": 4,
+    "terms": [
+      "crossEntropy",
+      "probabilityMse",
+      "parameterMse",
+      "excessEntropy",
+      "temporalMutualInformation",
+      "oracleMutualInformation"
+    ]
+  },
+  "dynamicCurriculumStudy": {
+    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-dynamic-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "initialDelayMinutes": 60,
+    "delayScheduleMinutes": [
+      30,
+      30,
+      1,
+      1,
+      0,
+      0
+    ],
+    "initialParentCount": 2,
+    "beamWidth": 4,
+    "epochsPerTransition": 1,
+    "patience": 1,
+    "populationSize": 4,
+    "workers": 4,
+    "validationFraction": 0.25,
+    "maxBatchesPerEpoch": 256,
+    "finalModelsPerDelay": 1,
+    "equivalence": {
+      "absoluteKl": 0.02,
+      "relativeKl": 0.01,
+      "maximumPolicyJsd": 0.0001
+    },
+    "equivalenceSignature": {
+      "examples": 16,
+      "currentStates": 15,
+      "actionStates": 31
+    }
+  },
+  "adaptiveCurriculumStudy": {
+    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "initialDelaySeconds": 3600,
+    "minimumDelaySeconds": 1,
+    "initialStepSeconds": 1800,
+    "maximumRounds": 48,
+    "absoluteWeightLevels": [
+      0,
+      0.25,
+      1,
+      4
+    ],
+    "canonicalizeGlobalScale": true,
+    "initialParentCount": 2,
+    "beamWidth": 4,
+    "populationSize": 4,
+    "workers": 4,
+    "compile": true,
+    "compileMinimumGroupBatches": 512,
+    "projection": {
+      "batchSize": 8,
+      "initialProbeCount": 48,
+      "adaptiveProbeCount": 16,
+      "exploitationFraction": 0.5,
+      "randomFraction": 0.2,
+      "gpExploration": 1.5,
+      "maximumGradientNorm": 1
+    },
+    "fidelities": [
+      {
+        "key": "screen",
+        "additionalBatches": 32,
+        "validationFraction": 0.00390625,
+        "promote": 16
+      },
+      {
+        "key": "promote",
+        "additionalBatches": 96,
+        "validationFraction": 0.03125,
+        "promote": 8
+      },
+      {
+        "key": "full",
+        "additionalBatches": 128,
+        "validationFraction": 0.25,
+        "promote": 4
+      }
+    ],
+    "dwell": {
+      "maximumEpochs": 8,
+      "patience": 2,
+      "minimumImprovement": 0.01,
+      "absoluteReferenceTolerance": 0.02,
+      "relativeReferenceTolerance": 0.05
+    },
+    "finalModelsPerAcceptedDelay": 1,
+    "equivalence": {
+      "absoluteKl": 0.02,
+      "relativeKl": 0.01,
+      "maximumPolicyJsd": 0.0001
+    },
+    "equivalenceSignature": {
+      "examples": 16,
+      "currentStates": 15,
+      "actionStates": 31
+    }
+  },
+  "adaptiveCurriculumStudyNoEntropy": {
+    "extends": "adaptiveCurriculumStudy",
+    "initialStepSeconds": 1,
+    "stepGrowthFactor": 1.5,
+    "initialWeightVariants": [
+      "factorial-04",
+      "factorial-06"
+    ],
+    "trainInitialParentsUntilPlateau": true,
+    "initialParentApplyFixedLossWeights": false,
+    "projection": {
+      "initialProbeCount": 32,
+      "adaptiveProbeCount": 8
+    },
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy-study",
+    "fixedLossWeights": {
+      "excessEntropy": 0
+    },
+    "termWeightLevels": {
+      "crossEntropy": [
+        0.25,
+        1,
+        4
+      ]
+    },
+    "neighborhoodExpansion": {
+      "enabled": true,
+      "seedCountPerParent": 1,
+      "minimumValidationKlImprovement": 0.001,
+      "maximumRounds": 16
+    },
+    "fidelities": [
+      {
+        "key": "screen",
+        "additionalBatches": 32,
+        "validationFraction": 0.00390625,
+        "promote": 160
+      },
+      {
+        "key": "full",
+        "trainUntilPlateau": true,
+        "maximumEpochs": 64,
+        "patience": 6,
+        "minimumImprovement": 0.001,
+        "validationFraction": 0.25,
+        "promote": 4
+      }
+    ]
+  },
+  "futureParameterSweeps": {
+    "predictionDelayMinutes": [
+      0,
+      1,
+      30,
+      60
+    ],
+    "feeBps": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7.5,
+      10,
+      12.5,
+      15,
+      17.5
+    ],
+    "leverageBounds": [
+      [
+        0,
+        1
+      ],
+      [
+        -1,
+        1
+      ],
+      [
+        -5,
+        5
+      ],
+      [
+        -10,
+        10
+      ],
+      [
+        -20,
+        20
+      ],
+      [
+        -50,
+        50
+      ],
+      [
+        -80,
+        80
+      ],
+      [
+        -100,
+        100
+      ],
+      [
+        -150,
+        150
+      ],
+      [
+        -200,
+        200
+      ],
+      [
+        -250,
+        250
+      ]
+    ],
+    "maximumEffectiveLeverageBounds": [
+      [
+        0,
+        1
+      ],
+      [
+        -1,
+        1
+      ],
+      [
+        -5,
+        5
+      ],
+      [
+        -10,
+        10
+      ],
+      [
+        -20,
+        20
+      ],
+      [
+        -50,
+        50
+      ],
+      [
+        -80,
+        80
+      ],
+      [
+        -100,
+        100
+      ],
+      [
+        -150,
+        150
+      ],
+      [
+        -200,
+        200
+      ],
+      [
+        -250,
+        250
+      ]
+    ],
+    "maximumEffectiveLeverageEligibility": "Both effective bounds must contain, or be wider than, the selected usable leverage bounds.",
+    "maintenanceBpsHour": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7.5,
+      10
+    ],
+    "spread": "removed"
+  },
+  "exampleSelection": {
+    "mode": "frozen-weighted-time-blocks",
+    "blocks": [
+      {
+        "date": "2021-09-09",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.7215647235631737
+      },
+      {
+        "date": "2021-09-10",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.183882232145742
+      },
+      {
+        "date": "2021-09-10",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.325598928635542
+      },
+      {
+        "date": "2021-09-10",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.2459762320979237
+      },
+      {
+        "date": "2021-09-11",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.698772446302214
+      },
+      {
+        "date": "2021-09-11",
+        "split": "validation",
+        "startMinute": 1140,
+        "endMinute": 1200,
+        "sourceMeanWeight": 3.4606991762711683
+      },
+      {
+        "date": "2021-10-19",
+        "split": "train",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.7743663952210693
+      },
+      {
+        "date": "2021-10-21",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 3.6718449077440365
+      },
+      {
+        "date": "2021-12-14",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.09817918591288
+      },
+      {
+        "date": "2022-05-14",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.880944565439535
+      },
+      {
+        "date": "2022-05-14",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.2607505395023813
+      },
+      {
+        "date": "2022-05-15",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 2.9756691818809164
+      },
+      {
+        "date": "2022-05-18",
+        "split": "validation",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.373294305812904
+      },
+      {
+        "date": "2022-06-07",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.391065542923631
+      },
+      {
+        "date": "2022-06-10",
+        "split": "validation",
+        "startMinute": 1200,
+        "endMinute": 1260,
+        "sourceMeanWeight": 2.8173400303386735
+      },
+      {
+        "date": "2022-06-12",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.100528544405291
+      },
+      {
+        "date": "2022-06-13",
+        "split": "validation",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.4737643533251683
+      },
+      {
+        "date": "2022-06-14",
+        "split": "validation",
+        "startMinute": 840,
+        "endMinute": 900,
+        "sourceMeanWeight": 3.582084355660192
+      },
+      {
+        "date": "2022-06-15",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.744960143857946
+      },
+      {
+        "date": "2022-06-15",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.463698275898908
+      },
+      {
+        "date": "2022-06-17",
+        "split": "validation",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 3.4333828844358343
+      },
+      {
+        "date": "2022-06-17",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.9691136073003306
+      },
+      {
+        "date": "2022-06-19",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.9934673925269455
+      },
+      {
+        "date": "2022-06-19",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.4614014952558825
+      },
+      {
+        "date": "2022-06-20",
+        "split": "validation",
+        "startMinute": 840,
+        "endMinute": 900,
+        "sourceMeanWeight": 3.2044666407577136
+      },
+      {
+        "date": "2022-06-20",
+        "split": "validation",
+        "startMinute": 1380,
+        "endMinute": 1440,
+        "sourceMeanWeight": 3.4327260936068424
+      },
+      {
+        "date": "2022-06-21",
+        "split": "validation",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.82267691395559
+      },
+      {
+        "date": "2022-07-28",
+        "split": "train",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.3451650064255873
+      },
+      {
+        "date": "2022-07-28",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.9842363290156935
+      },
+      {
+        "date": "2022-07-28",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.8591666210113584
+      },
+      {
+        "date": "2022-07-31",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.6658097129241733
+      },
+      {
+        "date": "2022-07-31",
+        "split": "validation",
+        "startMinute": 1080,
+        "endMinute": 1140,
+        "sourceMeanWeight": 3.8347634815889697
+      },
+      {
+        "date": "2022-08-01",
+        "split": "validation",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.9813146384819347
+      },
+      {
+        "date": "2022-08-01",
+        "split": "validation",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.493716355409931
+      },
+      {
+        "date": "2022-08-02",
+        "split": "validation",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.656574197717197
+      },
+      {
+        "date": "2022-08-02",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.9998748018560097
+      },
+      {
+        "date": "2022-08-03",
+        "split": "validation",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.74689694959832
+      },
+      {
+        "date": "2022-08-03",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.3981983403124225
+      },
+      {
+        "date": "2022-08-03",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.955554430329232
+      },
+      {
+        "date": "2023-03-04",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.970267195602424
+      },
+      {
+        "date": "2023-03-05",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.377448227586477
+      },
+      {
+        "date": "2023-03-05",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.035580244542054
+      },
+      {
+        "date": "2023-03-07",
+        "split": "validation",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.8512321203947066
+      },
+      {
+        "date": "2023-03-07",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.312899028163859
+      },
+      {
+        "date": "2023-03-09",
+        "split": "validation",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.329325991111998
+      },
+      {
+        "date": "2023-03-09",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.353221626867857
+      },
+      {
+        "date": "2023-03-12",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.9902241331763797
+      },
+      {
+        "date": "2023-03-13",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.2178838544130164
+      },
+      {
+        "date": "2023-03-13",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.5582040149593217
+      },
+      {
+        "date": "2023-03-14",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.1438333232037743
+      },
+      {
+        "date": "2023-03-14",
+        "split": "validation",
+        "startMinute": 960,
+        "endMinute": 1020,
+        "sourceMeanWeight": 3.3782536973964468
+      },
+      {
+        "date": "2023-03-16",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 2.92280805630803
+      },
+      {
+        "date": "2023-03-20",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.2460873648073254
+      },
+      {
+        "date": "2023-03-21",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.412083035422426
+      },
+      {
+        "date": "2023-03-22",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.395362465608713
+      },
+      {
+        "date": "2023-03-24",
+        "split": "validation",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.195491751016978
+      },
+      {
+        "date": "2023-06-03",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.2099283431356564
+      },
+      {
+        "date": "2023-06-04",
+        "split": "train",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.2528905776505255
+      },
+      {
+        "date": "2023-06-05",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.4325788589869948
+      },
+      {
+        "date": "2023-09-15",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.3746228388762876
+      },
+      {
+        "date": "2023-09-15",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.1866771237250133
+      },
+      {
+        "date": "2023-09-17",
+        "split": "validation",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 2.882914233093745
+      },
+      {
+        "date": "2023-11-30",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.98351661763749
+      },
+      {
+        "date": "2023-11-30",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.5197206740151805
+      },
+      {
+        "date": "2023-11-30",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.8755942978688918
+      },
+      {
+        "date": "2023-11-30",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.8167139909438426
+      },
+      {
+        "date": "2023-11-30",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.6026143826416877
+      },
+      {
+        "date": "2023-12-01",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.1977382492282613
+      },
+      {
+        "date": "2023-12-05",
+        "split": "validation",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 2.896979597912343
+      },
+      {
+        "date": "2023-12-05",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.916187444786289
+      },
+      {
+        "date": "2023-12-05",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.5691982309896653
+      },
+      {
+        "date": "2024-01-02",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.51701680227587
+      },
+      {
+        "date": "2024-01-02",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.2922240971172383
+      },
+      {
+        "date": "2024-01-02",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.1205009061114026
+      },
+      {
+        "date": "2024-01-03",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.0788795805393927
+      },
+      {
+        "date": "2024-01-04",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.145370294281226
+      },
+      {
+        "date": "2024-02-25",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.006629436514874
+      },
+      {
+        "date": "2024-07-07",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.955657100827771
+      },
+      {
+        "date": "2024-07-08",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.2331014528736706
+      },
+      {
+        "date": "2024-11-05",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.659770990228152
+      },
+      {
+        "date": "2024-11-06",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.4965493388826467
+      },
+      {
+        "date": "2024-11-07",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.235759633336436
+      },
+      {
+        "date": "2024-11-07",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.213625202641415
+      },
+      {
+        "date": "2024-11-08",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.905853615047203
+      },
+      {
+        "date": "2024-11-09",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 1.8355191706423406
+      },
+      {
+        "date": "2024-11-11",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.8291937816368833
+      },
+      {
+        "date": "2025-02-14",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.295379809418486
+      },
+      {
+        "date": "2025-02-15",
+        "split": "validation",
+        "startMinute": 1320,
+        "endMinute": 1380,
+        "sourceMeanWeight": 2.7827678093932464
+      },
+      {
+        "date": "2025-02-16",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.167775731408555
+      },
+      {
+        "date": "2025-02-16",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.744890872036081
+      },
+      {
+        "date": "2025-02-16",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.9883414717125967
+      },
+      {
+        "date": "2025-03-20",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.933791760785615
+      },
+      {
+        "date": "2025-03-20",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.2456439929192533
+      },
+      {
+        "date": "2025-03-21",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.134562538308835
+      },
+      {
+        "date": "2025-03-21",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.2013541171555535
+      },
+      {
+        "date": "2025-03-21",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.010241732185338
+      },
+      {
+        "date": "2025-03-22",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.4729084582854477
+      },
+      {
+        "date": "2025-03-22",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.8671422225899166
+      },
+      {
+        "date": "2025-03-23",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.5209144399170245
+      },
+      {
+        "date": "2025-03-23",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.9019061116106664
+      },
+      {
+        "date": "2025-03-24",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.9586746211748123
+      },
+      {
+        "date": "2025-03-24",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.080374851733634
+      },
+      {
+        "date": "2025-03-25",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.9902762332583532
+      },
+      {
+        "date": "2025-03-26",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.995256609564595
+      },
+      {
+        "date": "2025-03-27",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 1.9449599890814473
+      },
+      {
+        "date": "2025-03-27",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.205107672563536
+      },
+      {
+        "date": "2025-03-27",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.0079699897672336
+      },
+      {
+        "date": "2025-03-28",
+        "split": "train",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 3.1490085404927957
+      },
+      {
+        "date": "2025-03-28",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.416915455233668
+      },
+      {
+        "date": "2025-03-31",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.9963936112215097
+      },
+      {
+        "date": "2025-03-31",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.14402925114516
+      },
+      {
+        "date": "2025-03-31",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.3710055181219163
+      },
+      {
+        "date": "2025-04-01",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.5118143485604216
+      },
+      {
+        "date": "2025-04-01",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.7352362889807087
+      },
+      {
+        "date": "2025-04-04",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.9344800903349983
+      },
+      {
+        "date": "2025-04-06",
+        "split": "train",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.6755995413350564
+      },
+      {
+        "date": "2025-04-06",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.3992185369812717
+      },
+      {
+        "date": "2025-04-07",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.2764429112433127
+      },
+      {
+        "date": "2025-04-08",
+        "split": "train",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.2054562727744793
+      },
+      {
+        "date": "2025-04-08",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.323740714363533
+      },
+      {
+        "date": "2025-04-09",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.731854295380617
+      },
+      {
+        "date": "2025-04-10",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.943072155632609
+      },
+      {
+        "date": "2025-04-11",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.106295824338344
+      },
+      {
+        "date": "2025-04-11",
+        "split": "train",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 3.1336027090665692
+      },
+      {
+        "date": "2025-04-11",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.2340888383213637
+      },
+      {
+        "date": "2025-04-12",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.1096437971713993
+      },
+      {
+        "date": "2025-04-13",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.2394864100947354
+      },
+      {
+        "date": "2025-04-13",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.387691705361358
+      },
+      {
+        "date": "2025-04-14",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.9429475826082974
+      },
+      {
+        "date": "2025-04-15",
+        "split": "train",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.7493540624035977
+      },
+      {
+        "date": "2025-04-15",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.948479702598706
+      },
+      {
+        "date": "2025-04-16",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.6447706280972567
+      },
+      {
+        "date": "2025-04-17",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.6125767545145897
+      },
+      {
+        "date": "2025-04-20",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.878725985813196
+      },
+      {
+        "date": "2025-04-20",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.2609086915502523
+      },
+      {
+        "date": "2025-04-21",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.007259273728834
+      },
+      {
+        "date": "2025-04-22",
+        "split": "validation",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.9705890432689133
+      },
+      {
+        "date": "2025-04-23",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.9983579484102987
+      },
+      {
+        "date": "2025-04-23",
+        "split": "validation",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.3562374186399313
+      },
+      {
+        "date": "2025-04-26",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.9683973137681057
+      },
+      {
+        "date": "2025-04-26",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.3655542850074807
+      },
+      {
+        "date": "2025-04-27",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.7969814391103056
+      },
+      {
+        "date": "2025-04-29",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 3.305761327921031
+      },
+      {
+        "date": "2025-05-02",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.337268115447732
+      },
+      {
+        "date": "2025-05-03",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 1.9009789026424793
+      },
+      {
+        "date": "2025-05-03",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.8134539781676398
+      },
+      {
+        "date": "2025-05-04",
+        "split": "validation",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.0836274041587766
+      },
+      {
+        "date": "2025-05-05",
+        "split": "validation",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.890169805463746
+      },
+      {
+        "date": "2025-05-06",
+        "split": "validation",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.9229792455432473
+      },
+      {
+        "date": "2025-05-07",
+        "split": "validation",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.251136499487653
+      },
+      {
+        "date": "2025-05-08",
+        "split": "validation",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.6293675017453886
+      },
+      {
+        "date": "2025-05-08",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.3931973214168103
+      },
+      {
+        "date": "2025-05-09",
+        "split": "validation",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.3560351737180545
+      },
+      {
+        "date": "2025-05-10",
+        "split": "validation",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 3.32323336016833
+      },
+      {
+        "date": "2025-05-12",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.741522241056373
+      },
+      {
+        "date": "2025-05-14",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.5033658867225594
+      },
+      {
+        "date": "2025-05-16",
+        "split": "validation",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.1964797382104817
+      },
+      {
+        "date": "2025-05-17",
+        "split": "validation",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.155411354591035
+      },
+      {
+        "date": "2025-05-18",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.258790382215391
+      },
+      {
+        "date": "2025-05-19",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.3450160488787484
+      },
+      {
+        "date": "2025-05-20",
+        "split": "train",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 2.6828080315125407
+      },
+      {
+        "date": "2025-05-20",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.7667323776180597
+      },
+      {
+        "date": "2025-05-22",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.7140485733646913
+      },
+      {
+        "date": "2025-05-22",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.8960348491426946
+      },
+      {
+        "date": "2025-05-23",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.502949971227596
+      },
+      {
+        "date": "2025-05-24",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.0017894193941417
+      },
+      {
+        "date": "2025-05-27",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.168005181990676
+      },
+      {
+        "date": "2025-05-29",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.5957135199413943
+      },
+      {
+        "date": "2025-05-30",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.834818687692443
+      },
+      {
+        "date": "2025-05-30",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.8842716293556925
+      },
+      {
+        "date": "2025-05-31",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 3.753310071627299
+      },
+      {
+        "date": "2025-05-31",
+        "split": "train",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 3.6345763774381745
+      },
+      {
+        "date": "2025-06-01",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 1.7292480465998556
+      },
+      {
+        "date": "2025-06-02",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.7392465504018277
+      },
+      {
+        "date": "2025-06-04",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.3088978273415868
+      },
+      {
+        "date": "2025-06-06",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.2793343691063477
+      },
+      {
+        "date": "2025-06-07",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.446640397521389
+      },
+      {
+        "date": "2025-06-09",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.5457022860841727
+      },
+      {
+        "date": "2025-06-10",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.772195126434785
+      },
+      {
+        "date": "2025-06-11",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 1.8267271037404387
+      },
+      {
+        "date": "2025-06-12",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.592845240510069
+      },
+      {
+        "date": "2025-06-12",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.6191346334086525
+      },
+      {
+        "date": "2025-06-12",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.7390857443139085
+      },
+      {
+        "date": "2025-06-13",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.9284500207139517
+      },
+      {
+        "date": "2025-06-13",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.5863196059141087
+      },
+      {
+        "date": "2025-06-13",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.241759612082711
+      },
+      {
+        "date": "2025-06-13",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.413656770027139
+      },
+      {
+        "date": "2025-06-13",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.066794676257608
+      },
+      {
+        "date": "2025-06-14",
+        "split": "train",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.8081491235891978
+      },
+      {
+        "date": "2025-06-15",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.9058801655041884
+      },
+      {
+        "date": "2025-06-15",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.57134775663933
+      },
+      {
+        "date": "2025-06-15",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.024780227863553
+      },
+      {
+        "date": "2025-06-16",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 1.8720821919627109
+      },
+      {
+        "date": "2025-06-17",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.965293733017113
+      },
+      {
+        "date": "2025-06-17",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.675606647390151
+      },
+      {
+        "date": "2025-06-19",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.660322163303693
+      },
+      {
+        "date": "2025-06-20",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.241786023554146
+      },
+      {
+        "date": "2025-06-20",
+        "split": "validation",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.3726369915642316
+      },
+      {
+        "date": "2025-06-22",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.8316610090944576
+      },
+      {
+        "date": "2025-06-23",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.0427936665865127
+      },
+      {
+        "date": "2025-06-24",
+        "split": "validation",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.133726783111019
+      },
+      {
+        "date": "2025-06-24",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.1062171843821123
+      },
+      {
+        "date": "2025-06-26",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 1.5647570895472502
+      },
+      {
+        "date": "2025-06-28",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 1.3604902602941245
+      },
+      {
+        "date": "2025-06-30",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 1.5897943284340565
+      },
+      {
+        "date": "2025-06-30",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.113118163719385
+      },
+      {
+        "date": "2025-06-30",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.6990736311218564
+      },
+      {
+        "date": "2025-07-01",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.8970454012023077
+      },
+      {
+        "date": "2025-07-01",
+        "split": "validation",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.355512245078054
+      },
+      {
+        "date": "2025-07-01",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.2752588184379663
+      },
+      {
+        "date": "2025-07-02",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.0595781306205834
+      },
+      {
+        "date": "2025-07-02",
+        "split": "validation",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.123122590360969
+      },
+      {
+        "date": "2025-07-04",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.0390171640670287
+      },
+      {
+        "date": "2025-07-04",
+        "split": "validation",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.755758828090297
+      },
+      {
+        "date": "2025-07-06",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.389926708952472
+      },
+      {
+        "date": "2025-07-06",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.817767254523545
+      },
+      {
+        "date": "2025-07-07",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 2.933705164240285
+      },
+      {
+        "date": "2025-07-08",
+        "split": "validation",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 2.138337947917171
+      },
+      {
+        "date": "2025-07-10",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.1431051190843573
+      },
+      {
+        "date": "2025-07-11",
+        "split": "validation",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.72512271733828
+      },
+      {
+        "date": "2025-07-11",
+        "split": "validation",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.507661742136374
+      },
+      {
+        "date": "2025-07-11",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.240326265322801
+      },
+      {
+        "date": "2025-07-11",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.1086604392915937
+      },
+      {
+        "date": "2025-07-15",
+        "split": "validation",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.56131093909909
+      },
+      {
+        "date": "2025-07-16",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.176270905987088
+      },
+      {
+        "date": "2025-07-17",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.4055706736569604
+      },
+      {
+        "date": "2025-07-17",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.968192685913204
+      },
+      {
+        "date": "2025-07-17",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.282446205402957
+      },
+      {
+        "date": "2025-07-19",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.4147748907572995
+      },
+      {
+        "date": "2025-07-22",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.443860950197947
+      },
+      {
+        "date": "2025-07-22",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.3031444177769136
+      },
+      {
+        "date": "2025-07-23",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.9762110426280723
+      },
+      {
+        "date": "2025-07-23",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.6581968195772787
+      },
+      {
+        "date": "2025-07-24",
+        "split": "train",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 3.075167230255231
+      },
+      {
+        "date": "2025-07-24",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.618768160634144
+      },
+      {
+        "date": "2025-07-25",
+        "split": "train",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.612145483163996
+      },
+      {
+        "date": "2025-07-29",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.7108554620794245
+      },
+      {
+        "date": "2025-07-30",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.058856793295579
+      },
+      {
+        "date": "2025-07-30",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.40796512757525
+      },
+      {
+        "date": "2025-07-31",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.7009464276002513
+      },
+      {
+        "date": "2025-07-31",
+        "split": "train",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.915119332023702
+      },
+      {
+        "date": "2025-08-01",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.5719517577989284
+      },
+      {
+        "date": "2025-08-02",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 3.2821272193852606
+      },
+      {
+        "date": "2025-08-02",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.856716674235132
+      },
+      {
+        "date": "2025-08-02",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.18693607203145
+      },
+      {
+        "date": "2025-08-03",
+        "split": "train",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.3887823074323955
+      },
+      {
+        "date": "2025-08-05",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.338502833899046
+      },
+      {
+        "date": "2025-08-05",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.3447478876313026
+      },
+      {
+        "date": "2025-08-05",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.1317962838366333
+      },
+      {
+        "date": "2025-08-06",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.9230893763698016
+      },
+      {
+        "date": "2025-08-08",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.143400714705543
+      },
+      {
+        "date": "2025-08-09",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.344606225233244
+      },
+      {
+        "date": "2025-08-09",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.2940430502663367
+      },
+      {
+        "date": "2025-08-12",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.6871756462218603
+      },
+      {
+        "date": "2025-08-13",
+        "split": "train",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.968285138425043
+      },
+      {
+        "date": "2025-08-14",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.805815278170113
+      },
+      {
+        "date": "2025-08-14",
+        "split": "train",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 3.7257968083536253
+      },
+      {
+        "date": "2025-08-16",
+        "split": "validation",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 3.068109148384796
+      },
+      {
+        "date": "2025-08-16",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.3263205249399856
+      },
+      {
+        "date": "2025-08-17",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 1.7091270967086731
+      },
+      {
+        "date": "2025-08-18",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.687199149134766
+      },
+      {
+        "date": "2025-08-22",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.253832850051557
+      },
+      {
+        "date": "2025-08-22",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.699337476138559
+      },
+      {
+        "date": "2025-08-23",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.782197333053385
+      },
+      {
+        "date": "2025-08-25",
+        "split": "validation",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.5050857802091437
+      },
+      {
+        "date": "2025-08-27",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.704497550143541
+      },
+      {
+        "date": "2025-08-30",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.1033619595845083
+      },
+      {
+        "date": "2025-09-02",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 2.1869183018215055
+      },
+      {
+        "date": "2025-09-03",
+        "split": "validation",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 3.446185968545162
+      },
+      {
+        "date": "2025-09-03",
+        "split": "validation",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.535665594645256
+      },
+      {
+        "date": "2025-09-04",
+        "split": "validation",
+        "startMinute": 541,
+        "endMinute": 601,
+        "sourceMeanWeight": 2.714385170912784
+      },
+      {
+        "date": "2025-09-04",
+        "split": "validation",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.4991594046751398
+      },
+      {
+        "date": "2025-09-05",
+        "split": "validation",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.575550403548146
+      },
+      {
+        "date": "2025-09-05",
+        "split": "validation",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.798152399758498
+      },
+      {
+        "date": "2025-09-06",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.556525688428147
+      },
+      {
+        "date": "2025-09-09",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.210462959799681
+      },
+      {
+        "date": "2025-09-10",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.3378178284163855
+      },
+      {
+        "date": "2025-09-13",
+        "split": "validation",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.3389335843564023
+      },
+      {
+        "date": "2025-09-15",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.645172943077491
+      },
+      {
+        "date": "2025-09-16",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.5926394010234315
+      },
+      {
+        "date": "2025-09-17",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.5331175178024243
+      },
+      {
+        "date": "2025-09-18",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.3117438236510175
+      },
+      {
+        "date": "2025-09-18",
+        "split": "train",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 1.979896199835744
+      },
+      {
+        "date": "2025-09-19",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.104327493815864
+      },
+      {
+        "date": "2025-09-19",
+        "split": "train",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 2.289499809755891
+      },
+      {
+        "date": "2025-09-21",
+        "split": "train",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.442061989841362
+      },
+      {
+        "date": "2025-09-22",
+        "split": "train",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.56228164288487
+      },
+      {
+        "date": "2025-09-23",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.3201665860414376
+      },
+      {
+        "date": "2025-09-26",
+        "split": "train",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.8382236853701355
+      },
+      {
+        "date": "2025-09-28",
+        "split": "train",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.318408300207876
+      },
+      {
+        "date": "2025-09-29",
+        "split": "train",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 3.7261702564027575
+      },
+      {
+        "date": "2025-09-30",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.1196291973308283
+      },
+      {
+        "date": "2025-10-01",
+        "split": "train",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 3.0814788536444637
+      },
+      {
+        "date": "2025-10-01",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.33170259904848
+      },
+      {
+        "date": "2025-10-02",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.982459942435477
+      },
+      {
+        "date": "2025-10-05",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.15184840616437
+      },
+      {
+        "date": "2025-10-06",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 3.071261965572129
+      },
+      {
+        "date": "2025-10-07",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.1158208410470816
+      },
+      {
+        "date": "2025-10-07",
+        "split": "train",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.0637321504698773
+      },
+      {
+        "date": "2025-10-08",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.851368733525111
+      },
+      {
+        "date": "2025-10-08",
+        "split": "train",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.9586298130038067
+      },
+      {
+        "date": "2025-10-08",
+        "split": "train",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.6379536191126225
+      },
+      {
+        "date": "2025-10-09",
+        "split": "train",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 3.0839015422610747
+      },
+      {
+        "date": "2025-10-13",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 1.6234486514481574
+      },
+      {
+        "date": "2025-10-13",
+        "split": "train",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.8821579585902835
+      },
+      {
+        "date": "2025-10-13",
+        "split": "train",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.5066079313557648
+      },
+      {
+        "date": "2025-10-15",
+        "split": "validation",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 3.139204798501871
+      },
+      {
+        "date": "2025-10-19",
+        "split": "validation",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 3.2413654986526104
+      },
+      {
+        "date": "2025-10-21",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.300384359814996
+      },
+      {
+        "date": "2025-10-22",
+        "split": "validation",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.4022375426453073
+      },
+      {
+        "date": "2025-10-22",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.7419703008239837
+      },
+      {
+        "date": "2025-10-22",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.2519082179973418
+      },
+      {
+        "date": "2025-10-23",
+        "split": "validation",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.6329935965436095
+      },
+      {
+        "date": "2025-10-24",
+        "split": "validation",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.9057043065609953
+      },
+      {
+        "date": "2025-10-24",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.491145708027341
+      },
+      {
+        "date": "2025-10-26",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.7748534959908446
+      },
+      {
+        "date": "2025-10-29",
+        "split": "validation",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.246974615929066
+      },
+      {
+        "date": "2025-10-29",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.3927407503382225
+      },
+      {
+        "date": "2025-10-29",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.988948106720345
+      },
+      {
+        "date": "2025-10-29",
+        "split": "validation",
+        "startMinute": 1321,
+        "endMinute": 1381,
+        "sourceMeanWeight": 3.7238389264379577
+      },
+      {
+        "date": "2025-10-30",
+        "split": "validation",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 3.4754669538675
+      },
+      {
+        "date": "2025-10-30",
+        "split": "validation",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.1185317491228335
+      },
+      {
+        "date": "2025-10-31",
+        "split": "validation",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.211341463208341
+      },
+      {
+        "date": "2025-11-02",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.36331381934876
+      },
+      {
+        "date": "2025-11-02",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 1.9994738655373092
+      },
+      {
+        "date": "2025-11-02",
+        "split": "validation",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.517248564594322
+      },
+      {
+        "date": "2025-11-10",
+        "split": "validation",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.948962692503022
+      },
+      {
+        "date": "2025-11-11",
+        "split": "validation",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 2.9978556544362074
+      },
+      {
+        "date": "2025-11-12",
+        "split": "validation",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.2845069939581055
+      },
+      {
+        "date": "2025-11-12",
+        "split": "validation",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.4011933606044233
+      },
+      {
+        "date": "2025-11-13",
+        "split": "validation",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.483937051086169
+      },
+      {
+        "date": "2025-11-13",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 2.857425569892148
+      },
+      {
+        "date": "2026-04-22",
+        "split": "train",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.556309173952072
+      },
+      {
+        "date": "2026-04-22",
+        "split": "train",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.08929011115485
+      },
+      {
+        "date": "2026-04-23",
+        "split": "train",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.94702238933794
+      },
+      {
+        "date": "2026-05-27",
+        "split": "train",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 3.704484789727463
+      },
+      {
+        "date": "2026-05-29",
+        "split": "train",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 2.8133026710303968
+      },
+      {
+        "date": "2026-05-30",
+        "split": "train",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 3.9042588086922962
+      },
+      {
+        "date": "2026-05-30",
+        "split": "validation",
+        "startMinute": 960,
+        "endMinute": 1020,
+        "sourceMeanWeight": 2.217746804010045
+      },
+      {
+        "date": "2026-06-01",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.513539095397545
+      },
+      {
+        "date": "2026-06-01",
+        "split": "validation",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.7374902684892812
+      },
+      {
+        "date": "2026-06-03",
+        "split": "validation",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 2.751398744984015
+      },
+      {
+        "date": "2026-06-13",
+        "split": "test",
+        "startMinute": 481,
+        "endMinute": 541,
+        "sourceMeanWeight": 2.333269918580845
+      },
+      {
+        "date": "2026-06-13",
+        "split": "test",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.4875667052071204
+      },
+      {
+        "date": "2026-06-14",
+        "split": "test",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 3.311324113850844
+      },
+      {
+        "date": "2026-06-14",
+        "split": "test",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.772216218243557
+      },
+      {
+        "date": "2026-06-14",
+        "split": "test",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.7522433827117654
+      },
+      {
+        "date": "2026-06-15",
+        "split": "test",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.973397999313824
+      },
+      {
+        "date": "2026-06-15",
+        "split": "test",
+        "startMinute": 241,
+        "endMinute": 301,
+        "sourceMeanWeight": 2.584310132947972
+      },
+      {
+        "date": "2026-06-18",
+        "split": "test",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 2.7946442027983722
+      },
+      {
+        "date": "2026-06-19",
+        "split": "test",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.3609102777015263
+      },
+      {
+        "date": "2026-06-19",
+        "split": "test",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.2573183351479624
+      },
+      {
+        "date": "2026-06-20",
+        "split": "test",
+        "startMinute": 661,
+        "endMinute": 721,
+        "sourceMeanWeight": 2.3933553606643625
+      },
+      {
+        "date": "2026-06-21",
+        "split": "test",
+        "startMinute": 1141,
+        "endMinute": 1201,
+        "sourceMeanWeight": 3.43964032335983
+      },
+      {
+        "date": "2026-06-23",
+        "split": "test",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.0982511361929452
+      },
+      {
+        "date": "2026-06-25",
+        "split": "test",
+        "startMinute": 61,
+        "endMinute": 121,
+        "sourceMeanWeight": 2.335061642487692
+      },
+      {
+        "date": "2026-06-25",
+        "split": "test",
+        "startMinute": 181,
+        "endMinute": 241,
+        "sourceMeanWeight": 2.2925563536755607
+      },
+      {
+        "date": "2026-06-25",
+        "split": "test",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 2.574378123201879
+      },
+      {
+        "date": "2026-06-25",
+        "split": "test",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 2.626108121251422
+      },
+      {
+        "date": "2026-06-26",
+        "split": "test",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 3.0646839047457455
+      },
+      {
+        "date": "2026-06-27",
+        "split": "test",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.590814802646637
+      },
+      {
+        "date": "2026-06-29",
+        "split": "test",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 2.927553807425397
+      },
+      {
+        "date": "2026-06-30",
+        "split": "test",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 2.40664887985082
+      },
+      {
+        "date": "2026-06-30",
+        "split": "test",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.8908540333646995
+      },
+      {
+        "date": "2026-07-01",
+        "split": "test",
+        "startMinute": 601,
+        "endMinute": 661,
+        "sourceMeanWeight": 3.150560370034978
+      },
+      {
+        "date": "2026-07-01",
+        "split": "test",
+        "startMinute": 1201,
+        "endMinute": 1261,
+        "sourceMeanWeight": 3.3125563238697295
+      },
+      {
+        "date": "2026-07-03",
+        "split": "test",
+        "startMinute": 961,
+        "endMinute": 1021,
+        "sourceMeanWeight": 3.416535418958843
+      },
+      {
+        "date": "2026-07-05",
+        "split": "test",
+        "startMinute": 421,
+        "endMinute": 481,
+        "sourceMeanWeight": 3.0829935198285643
+      },
+      {
+        "date": "2026-07-05",
+        "split": "test",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 3.006773635791291
+      },
+      {
+        "date": "2026-07-05",
+        "split": "test",
+        "startMinute": 1021,
+        "endMinute": 1081,
+        "sourceMeanWeight": 2.207572735147114
+      },
+      {
+        "date": "2026-07-06",
+        "split": "test",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 3.1894399516878273
+      },
+      {
+        "date": "2026-07-07",
+        "split": "test",
+        "startMinute": 1081,
+        "endMinute": 1141,
+        "sourceMeanWeight": 2.2289558454635943
+      },
+      {
+        "date": "2026-07-08",
+        "split": "test",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.952526891642289
+      },
+      {
+        "date": "2026-07-08",
+        "split": "test",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 2.447840848499198
+      },
+      {
+        "date": "2026-07-09",
+        "split": "test",
+        "startMinute": 121,
+        "endMinute": 181,
+        "sourceMeanWeight": 3.1514405072808827
+      },
+      {
+        "date": "2026-07-11",
+        "split": "test",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.5989637621734034
+      },
+      {
+        "date": "2026-07-11",
+        "split": "test",
+        "startMinute": 301,
+        "endMinute": 361,
+        "sourceMeanWeight": 1.1341287757476999
+      },
+      {
+        "date": "2026-07-11",
+        "split": "test",
+        "startMinute": 361,
+        "endMinute": 421,
+        "sourceMeanWeight": 2.667764241793644
+      },
+      {
+        "date": "2026-07-11",
+        "split": "test",
+        "startMinute": 1261,
+        "endMinute": 1321,
+        "sourceMeanWeight": 3.475124976854875
+      },
+      {
+        "date": "2026-07-12",
+        "split": "test",
+        "startMinute": 1,
+        "endMinute": 61,
+        "sourceMeanWeight": 2.74438329301477
+      },
+      {
+        "date": "2026-07-12",
+        "split": "test",
+        "startMinute": 721,
+        "endMinute": 781,
+        "sourceMeanWeight": 2.252849942137125
+      },
+      {
+        "date": "2026-07-12",
+        "split": "test",
+        "startMinute": 781,
+        "endMinute": 841,
+        "sourceMeanWeight": 2.699055172843251
+      },
+      {
+        "date": "2026-07-12",
+        "split": "test",
+        "startMinute": 841,
+        "endMinute": 901,
+        "sourceMeanWeight": 3.3521689604809053
+      },
+      {
+        "date": "2026-07-12",
+        "split": "test",
+        "startMinute": 901,
+        "endMinute": 961,
+        "sourceMeanWeight": 2.987709944738696
+      }
+    ],
+    "componentCoveragePredictionDelaysMs": [
+      60000
+    ],
+    "sourceDatasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
+    "seed": 1337,
+    "blockExamples": 3600,
+    "sourceCounts": {
+      "train": 15076800,
+      "validation": 15508800,
+      "test": 2592000
+    },
+    "selectedCounts": {
+      "train": 691200,
+      "validation": 540000,
+      "test": 151200
+    },
+    "weightedSplits": [
+      "train"
+    ]
+  }
+}

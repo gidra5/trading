@@ -175,6 +175,8 @@ we need to adjust the oracle evaluation:
       2. H is the forced holding period for a; T-t is the independently configured value horizon.
       3. In truncate mode, T=min(t+valueHorizon, segmentEnd).
       4. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
+      5. MLP dataset preparation must always use extend mode so every timestamp,
+         including timestamps at a UTC shard boundary, receives the full future horizon.
    8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
    9. bellman equation???
 2. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
@@ -186,10 +188,19 @@ we need to adjust the oracle evaluation:
 5. we compute objective as oracle value distillation over all example windows
    1. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
    2. w_t=W_t/mean_batch(W_t)
-   3. B_t(x)=E[a-x|x]/(E[abs(a-x)|x]+eps), using the visible-range oracle policy.
-   4. W_t=eps+abs(mean_x(B_t(x))) over visible states in the deterministic current-exposure grid.
+   3. D_t=sum_x E[a-x|x] / (sum_x E[abs(a-x)|x]+eps), computed once per complete timestamp example from the exact cutoff-applied raw oracle map over every visible current-exposure/action cell and stored as aligned dataset metadata.
+   4. Build p_1m from completed UTC one-minute closes only. At second 59 it is
+      exactly aligned; otherwise use the latest completed minute (a conservative
+      1-59 second shift) so a 60-minute-delay target contains no hidden
+      within-minute ordering.
+   5. W_t=(eps+abs(D_t)*persistenceMultiplier)*(1+lambda_resolution*JSD(p_1s,p_1m)).
+      The completed-minute target and its visible-range JSD are stored
+      separately so lambda_resolution can change without rebuilding either
+      oracle.
+      This is a ratio of the global signed and absolute displacement integrals, not a mean of separately normalized rows, so each row contributes in proportion to its expected actionable distance.
       1. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
       2. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
+      3. Persist the resulting causal unnormalized whole-example W_t in the dataset; training may only normalize it by the current batch mean and must not reconstruct it from fitted parameters.
    5. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
       1. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
       2. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
@@ -227,25 +238,67 @@ ML model based on MLP:
    13. last 1M candle fill fraction
    14. last 16 3M candles
    15. last 3M candle fill fraction
-2. trading and state inputs
-   1.  fee rate
-   2.  optional spread
-   3.  min, max usable leverage
-   4.  min, max effective leverage
-   5.  maintenance costs
+2. teacher and execution configuration, fixed for the current model and not
+   included in its network inputs:
+   1. fee rate
+   2. min/max usable leverage
+   3. min/max effective leverage
+   4. maintenance costs
 3.  Architecture:
-    1.  accept historic and state inputs
+    1.  accept the 901 historic market inputs only
     2.  network depth 16
     3.  per layer 1024 neurons
-    4.  predict the eight raw parameters of the quadratic exposure distribution:
-        `c1`, `c2`, `b`, `lambda`, `betaC1`, `betaC2`, and the exact lower/upper
-        mandatory-hold survival cutoffs. Fit the score over the full effective
-        range and truncate it to usable leverage only at execution time.
-4.  Optimize the loss function against the revised fitted oracle policy. All
+    4. predict 255 raw base-action logits on the stored effective-range grid.
+       Normalize and score them on visible leverage, then apply the exact
+       deterministic fee/current-exposure transition used by the oracle. Keep
+       the eight-parameter quadratic fitter only as a diagnostic.
+4.  Optimize the loss function directly against the stored raw oracle policy. All
     distribution objectives use the visible current/target exposure surface:
-    cross entropy + probability MSE + parameter MSE, with excess entropy,
-    state MI, and oracle MI as separately reported 0.1-weight objectives.
+    cross entropy + probability MSE, with excess entropy,
+    teacher-capped conditional Gaussian temporal MI, and oracle MI as separately
+    reported objectives. CE and both MI terms have weight 1; probability MSE
+    has weight 0.1 and excess entropy is currently disabled. There is no
+    parameter-MSE term for the direct output. At each current exposure, temporal MI uses
+    action first/second moments and a total-versus-within variance decomposition
+    over the complete contiguous minibatch time axis, then averages uniformly
+    across current exposures. It cannot earn more reward than the teacher's MI.
+    Oracle MI likewise computes predicted/teacher Gaussian correlation over
+    batch time independently at each current exposure before averaging states.
+    Measure weight sensitivity with the configured resolution-VI joint screen:
+    32 simultaneous low/high combinations plus the production-weight center,
+    crossed with every configured delay. Report all main effects and 15
+    pairwise weight interactions independently at each delay so delay × weight
+    dependence is measured rather than assumed away.
+    After the response screen, run the resumable one-epoch curriculum pilot:
+    start from the best 60-minute models, search every 33-way next-weight step
+    along `[30, 30, 1, 1, 0, 0]` minutes, collapse empirically
+    policy-equivalent states, and retain a KL-mean/KL-standard-deviation Pareto
+    beam. Persist every branch metric and lineage while exporting only selected
+    delay finalists.
+    Replace the pilot for the final study with the adaptive absolute-weight
+    curriculum. Enumerate every six-way direction from absolute levels
+    `[0, 0.25, 1, 4]`, require at least one of CE/probability-MSE/parameter-MSE
+    to remain nonzero, and do not multiply candidates by production base
+    weights. Rank the complete canonical space with per-loss gradients and a
+    projected validation-KL Hessian, calibrate it with measured Gaussian-process
+    residual probes, and promote only from actual multi-fidelity validation.
+    Continue from 60 minutes to one second at arbitrary integer-second delay
+    steps, dwelling to restore delay-specific accuracy and backtracking to the
+    last accepted model when a transition plateaus.
 5.  Examples are every candle in inspector windows
+    1. Pair each prediction-time input with the oracle target at
+       `predictionTime - predictionDelayMs`; the current experiment uses a
+       configurable 60-second delay/hindsight window.
+    2. Assign train/validation/test by prediction time. Persist complete
+       timestamp-keyed input days and oracle days independently, then represent
+       a delay with lightweight row-offset/stride pairings so completed
+       components can be reused across delay experiments.
+    3. Screen prediction delays `[0, 1, 30, 60]` minutes at every one of the 33
+       loss-weight design points (132 combinations), with identical seeds and
+       training settings. At 60 minutes the complete
+       one-hour teacher value horizon is historical; treat its remaining error
+       as feature compression + model/optimization + teacher-fit error, rather
+       than claiming it is model approximation alone.
 6.  Validation/testing on last 1M worth of 1s candles.
 
 
@@ -253,3 +306,17 @@ Alternatives:
 1.  PatchTST
 2.  Decision Transformer
 3.  iTransformer
+4.  encoder(-decoder)s
+
+launch a fresh training run for the distribution model version of the arch.
+Insufficient margin trades should not happen
+
+
+Timestamp (UTC)	Usable-range KL after deep fitting	Action-mean RMSE
+2022-06-15 06:39:59	0.147	6.98×
+2022-06-16 16:58:59	0.045	3.01×
+2022-06-16 16:59:59	0.032	2.04×
+2025-06-05 02:11:59	0.058	5.89×
+2025-11-05 16:16:59	0.072	3.24×
+
+We have found these bad oracle fit cases. search for other cases where the fit is bad over all the available windows on 1s accuracy. We can skip known good cases from the dataset values

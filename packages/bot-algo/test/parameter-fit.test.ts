@@ -19,7 +19,7 @@ const options = {
   temperature: 0.01,
 };
 const parameters = conditionalFourSegmentParametersFromRaw(
-  Float64Array.of(-0.8, -0.15, 1.7, -0.45, 4.1, -2.8),
+  Float64Array.of(-0.8, -0.15, 1.7, -0.45, 4.1, -2.8, -14, 14),
   options,
 );
 

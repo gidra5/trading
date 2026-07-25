@@ -6,6 +6,7 @@ import { render } from "solid-js/web";
 import { App } from "./App";
 import { KamaInspectorPage } from "./KamaInspectorPage";
 import { MlpTrainingPage } from "./MlpTrainingPage";
+import { PortfolioIndexPage } from "./PortfolioIndexPage";
 
 const root = document.getElementById("root");
 
@@ -20,6 +21,7 @@ function Root() {
   onCleanup(() => window.removeEventListener("hashchange", update));
   if (hash().startsWith("#/mlp-training")) return <MlpTrainingPage />;
   if (hash().startsWith("#/kama-inspector")) return <KamaInspectorPage />;
+  if (hash().startsWith("#/portfolio-index")) return <PortfolioIndexPage />;
   return <App />;
 }
 

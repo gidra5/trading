@@ -1,0 +1,704 @@
+{
+  "version": 4,
+  "id": "mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
+  "label": "Direct 255-action MLP v12 · 60-minute full hindsight · CE+pMSE+0.5 Oracle MI · fresh initialization",
+  "dataDir": "data",
+  "componentStoreId": "mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s",
+  "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "componentSeedDatasetDirs": [
+    "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-3600s-production-components",
+    "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-full-minute-oracle",
+    "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset"
+  ],
+  "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
+  "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
+  "oraclePreparation": {
+    "backend": "cuda"
+  },
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 3600000,
+  "splitAnchorDate": "2026-07-13",
+  "latestTestDays": 30,
+  "excludedAggregateWindows": [
+    "fit-full"
+  ],
+  "windows": [
+    {
+      "id": "fit-full",
+      "start": "2025-03-19",
+      "end": "2025-11-13"
+    },
+    {
+      "id": "fit-1",
+      "start": "2025-03-19",
+      "end": "2025-05-17"
+    },
+    {
+      "id": "fit-2",
+      "start": "2025-05-18",
+      "end": "2025-07-16"
+    },
+    {
+      "id": "fit-3",
+      "start": "2025-07-17",
+      "end": "2025-09-14"
+    },
+    {
+      "id": "fit-4",
+      "start": "2025-09-15",
+      "end": "2025-11-13"
+    },
+    {
+      "id": "sideways-churn-2022-07",
+      "start": "2022-07-28",
+      "end": "2022-08-03"
+    },
+    {
+      "id": "sideways-churn-2022-05",
+      "start": "2022-05-14",
+      "end": "2022-05-20"
+    },
+    {
+      "id": "sideways-churn-2021-12",
+      "start": "2021-12-14",
+      "end": "2021-12-20"
+    },
+    {
+      "id": "sideways-churn-2021-09",
+      "start": "2021-09-08",
+      "end": "2021-09-14"
+    },
+    {
+      "id": "sideways-churn-2023-03",
+      "start": "2023-03-18",
+      "end": "2023-03-24"
+    },
+    {
+      "id": "regime-up-2023-03",
+      "start": "2023-03-11",
+      "end": "2023-03-17"
+    },
+    {
+      "id": "regime-flat-2026-04",
+      "start": "2026-04-22",
+      "end": "2026-04-28"
+    },
+    {
+      "id": "regime-down-2022-06",
+      "start": "2022-06-12",
+      "end": "2022-06-18"
+    },
+    {
+      "id": "shape-up-low-2024-02",
+      "start": "2024-02-24",
+      "end": "2024-02-26"
+    },
+    {
+      "id": "shape-up-high-2022-06",
+      "start": "2022-06-19",
+      "end": "2022-06-21"
+    },
+    {
+      "id": "shape-down-low-2023-06",
+      "start": "2023-06-03",
+      "end": "2023-06-05"
+    },
+    {
+      "id": "shape-down-high-2022-06",
+      "start": "2022-06-13",
+      "end": "2022-06-15"
+    },
+    {
+      "id": "shape-flat-high-bias-2021-10",
+      "start": "2021-10-19",
+      "end": "2021-10-21"
+    },
+    {
+      "id": "shape-flat-high-bias-low-2025-02",
+      "start": "2025-02-14",
+      "end": "2025-02-16"
+    },
+    {
+      "id": "shape-flat-low-bias-2024-07",
+      "start": "2024-07-07",
+      "end": "2024-07-09"
+    },
+    {
+      "id": "shape-flat-low-bias-low-2025-07",
+      "start": "2025-07-04",
+      "end": "2025-07-06"
+    },
+    {
+      "id": "shape-flat-mid-bias-2024-01",
+      "start": "2024-01-02",
+      "end": "2024-01-04"
+    },
+    {
+      "id": "shape-flat-mid-bias-low-2023-09",
+      "start": "2023-09-15",
+      "end": "2023-09-17"
+    },
+    {
+      "id": "sharpe-up-3d-2024-11",
+      "start": "2024-11-09",
+      "end": "2024-11-11"
+    },
+    {
+      "id": "sharpe-up-3d-2023-12",
+      "start": "2023-12-03",
+      "end": "2023-12-05"
+    },
+    {
+      "id": "sharpe-down-3d-2026-06",
+      "start": "2026-06-01",
+      "end": "2026-06-03"
+    },
+    {
+      "id": "sharpe-down-3d-2023-03",
+      "start": "2023-03-07",
+      "end": "2023-03-09"
+    },
+    {
+      "id": "sharpe-up-7d-2023-12",
+      "start": "2023-11-29",
+      "end": "2023-12-05"
+    },
+    {
+      "id": "sharpe-up-7d-2024-11",
+      "start": "2024-11-05",
+      "end": "2024-11-11"
+    },
+    {
+      "id": "sharpe-down-7d-2023-03",
+      "start": "2023-03-03",
+      "end": "2023-03-09"
+    },
+    {
+      "id": "sharpe-down-7d-2026-06",
+      "start": "2026-05-27",
+      "end": "2026-06-02"
+    },
+    {
+      "id": "failure-down-3d-2022-06",
+      "start": "2022-06-11",
+      "end": "2022-06-13"
+    },
+    {
+      "id": "failure-down-7d-2022-06",
+      "start": "2022-06-07",
+      "end": "2022-06-13"
+    }
+  ],
+  "execution": {
+    "feeBps": 17.5,
+    "minimumUsableExposure": -100,
+    "maximumUsableExposure": 100,
+    "minimumEffectiveExposure": -250,
+    "maximumEffectiveExposure": 250,
+    "maintenanceBpsHour": {
+      "quoteLend": 10,
+      "quoteBorrow": 10,
+      "assetBorrow": 10
+    },
+    "gridSize": 255,
+    "temperature": 0.01,
+    "holdingPeriodSteps": 60,
+    "valueHorizonSteps": 3600,
+    "horizonEndMode": "extend"
+  },
+  "teacherFit": {
+    "representation": "direct-diagnostics",
+    "backend": "cuda",
+    "device": "cuda",
+    "batchSize": 4096,
+    "projectionIterations": 32,
+    "maxIterations": 30,
+    "adaptiveIterations": 250,
+    "adaptiveRounds": 1,
+    "restartCount": 3,
+    "sampleStates": 31,
+    "sampleActions": 63,
+    "tolerance": 1e-8,
+    "maxMeanKlDivergence": 0.003,
+    "maxMeanSquaredError": 0.0000011,
+    "lineSearchCandidates": 8,
+    "temporalRefinementRounds": 2,
+    "temporalIterations": 20,
+    "temporalFollowupIterations": 8,
+    "temporalEquivalentLossAbsolute": 0.00005,
+    "temporalEquivalentLossRelative": 0.00002,
+    "optimizerBackend": "triton-queued",
+    "optimizerHostCheckInterval": 32,
+    "qualityFallbackIterations": 96,
+    "visibleSampleFraction": 0.75,
+    "scoreHingeSpan": 200,
+    "compactVisibleInitialization": true,
+    "inputAlignmentFloats": 32,
+    "inputQueueBatches": 4,
+    "pipelinedRefinement": true,
+    "workerJobsBeforeRecycle": 1
+  },
+  "training": {
+    "targetRepresentation": "minuteOracleProbabilities",
+    "epochs": 64,
+    "batchSize": 4096,
+    "evaluationBatchSize": 4096,
+    "validationFraction": 1,
+    "trainingFraction": 1,
+    "weightedTrainingSample": false,
+    "gradientAccumulation": 1,
+    "learningRate": 0.0001,
+    "weightDecay": 0.01,
+    "dropout": 0.05,
+    "statesPerExample": 31,
+    "patience": 8,
+    "workers": 4,
+    "seed": 1337,
+    "device": "cuda",
+    "logEverySteps": 100,
+    "compile": true,
+    "selectionMetric": "klDivergence",
+    "targetValidation": {
+      "klDivergence": 0.1
+    },
+    "timeWeighting": {
+      "mode": "distanceImbalance",
+      "distanceEpsilon": 0.000001,
+      "minimumWeight": 0.000001,
+      "stateAggregation": "globalDistanceRatio",
+      "minimumAdviceMagnitude": 0.25,
+      "memoryHalfLifeSteps": 15,
+      "growthPerPriorAdvice": 0.25,
+      "maximumMultiplier": 4,
+      "resetAfterGapSteps": 60,
+      "resolutionDivergenceMultiplier": 1
+    },
+    "lossWeights": {
+      "crossEntropy": 1,
+      "probabilityMse": 1,
+      "excessEntropy": 0,
+      "temporalMutualInformation": 0,
+      "oracleMutualInformation": 0.5
+    }
+  },
+  "lossWeightStudy": {
+    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-joint-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "dataset": {
+      "selection": "one-per-disjoint-regime-then-maximin",
+      "calendarDays": {
+        "train": 32,
+        "validation": 25,
+        "test": 7
+      },
+      "utcBlocks": [
+        [
+          0,
+          90
+        ],
+        [
+          360,
+          450
+        ],
+        [
+          720,
+          810
+        ],
+        [
+          1080,
+          1170
+        ]
+      ],
+      "reuseCompletedProductionComponents": true
+    },
+    "promotion": {
+      "mode": "manual-review",
+      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-full-days",
+      "finalistsPerDelay": 2,
+      "productionFinalists": 2
+    },
+    "epochs": 6,
+    "patience": 2,
+    "resumeProductionPreparationAfterPriority": false,
+    "screeningValidationFraction": 0.25,
+    "selectionMetric": "klDivergence",
+    "design": "resolution-vi-half-factorial",
+    "lowScale": 0.25,
+    "centerScale": 1,
+    "highScale": 4,
+    "predictionDelayMinutes": [
+      0,
+      1,
+      30,
+      60
+    ],
+    "terms": [
+      "crossEntropy",
+      "probabilityMse",
+      "parameterMse",
+      "excessEntropy",
+      "temporalMutualInformation",
+      "oracleMutualInformation"
+    ]
+  },
+  "exhaustiveLossWeightStudy": {
+    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "dataset": {
+      "selection": "one-per-disjoint-regime-then-maximin",
+      "calendarDays": {
+        "train": 32,
+        "validation": 25,
+        "test": 7
+      },
+      "utcBlocks": [
+        [
+          0,
+          90
+        ],
+        [
+          360,
+          450
+        ],
+        [
+          720,
+          810
+        ],
+        [
+          1080,
+          1170
+        ]
+      ],
+      "reuseCompletedProductionComponents": true
+    },
+    "promotion": {
+      "mode": "manual-review",
+      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-full-days",
+      "finalistsPerDelay": 1,
+      "productionFinalists": 1
+    },
+    "epochs": 6,
+    "patience": 2,
+    "resumeProductionPreparationAfterPriority": false,
+    "screeningValidationFraction": 0.25,
+    "selectionMetric": "klDivergence",
+    "design": "full-grid",
+    "weightScales": [
+      0,
+      0.25,
+      1,
+      4
+    ],
+    "predictionDelayMinutes": [
+      0,
+      0.5,
+      1,
+      30,
+      60
+    ],
+    "reviewAfterDelayMinutes": [
+      0
+    ],
+    "artifactRetention": "best-per-delay",
+    "reuseResultsFrom": "lossWeightStudy",
+    "retireReusedArtifacts": true,
+    "trainingPopulationSize": 4,
+    "populationWorkers": 4,
+    "terms": [
+      "crossEntropy",
+      "probabilityMse",
+      "parameterMse",
+      "excessEntropy",
+      "temporalMutualInformation",
+      "oracleMutualInformation"
+    ]
+  },
+  "dynamicCurriculumStudy": {
+    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-dynamic-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "initialDelayMinutes": 60,
+    "delayScheduleMinutes": [
+      30,
+      30,
+      1,
+      1,
+      0,
+      0
+    ],
+    "initialParentCount": 2,
+    "beamWidth": 4,
+    "epochsPerTransition": 1,
+    "patience": 1,
+    "populationSize": 4,
+    "workers": 4,
+    "validationFraction": 0.25,
+    "maxBatchesPerEpoch": 256,
+    "finalModelsPerDelay": 1,
+    "equivalence": {
+      "absoluteKl": 0.02,
+      "relativeKl": 0.01,
+      "maximumPolicyJsd": 0.0001
+    },
+    "equivalenceSignature": {
+      "examples": 16,
+      "currentStates": 15,
+      "actionStates": 31
+    }
+  },
+  "adaptiveCurriculumStudy": {
+    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-study",
+    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "initialDelaySeconds": 3600,
+    "minimumDelaySeconds": 1,
+    "initialStepSeconds": 1800,
+    "maximumRounds": 48,
+    "absoluteWeightLevels": [
+      0,
+      0.25,
+      1,
+      4
+    ],
+    "canonicalizeGlobalScale": true,
+    "initialParentCount": 2,
+    "beamWidth": 4,
+    "populationSize": 4,
+    "workers": 4,
+    "compile": true,
+    "compileMinimumGroupBatches": 512,
+    "projection": {
+      "batchSize": 8,
+      "initialProbeCount": 48,
+      "adaptiveProbeCount": 16,
+      "exploitationFraction": 0.5,
+      "randomFraction": 0.2,
+      "gpExploration": 1.5,
+      "maximumGradientNorm": 1
+    },
+    "fidelities": [
+      {
+        "key": "screen",
+        "additionalBatches": 32,
+        "validationFraction": 0.00390625,
+        "promote": 16
+      },
+      {
+        "key": "promote",
+        "additionalBatches": 96,
+        "validationFraction": 0.03125,
+        "promote": 8
+      },
+      {
+        "key": "full",
+        "additionalBatches": 128,
+        "validationFraction": 0.25,
+        "promote": 4
+      }
+    ],
+    "dwell": {
+      "maximumEpochs": 8,
+      "patience": 2,
+      "minimumImprovement": 0.01,
+      "absoluteReferenceTolerance": 0.02,
+      "relativeReferenceTolerance": 0.05
+    },
+    "finalModelsPerAcceptedDelay": 1,
+    "equivalence": {
+      "absoluteKl": 0.02,
+      "relativeKl": 0.01,
+      "maximumPolicyJsd": 0.0001
+    },
+    "equivalenceSignature": {
+      "examples": 16,
+      "currentStates": 15,
+      "actionStates": 31
+    }
+  },
+  "adaptiveCurriculumStudyNoEntropy": {
+    "extends": "adaptiveCurriculumStudy",
+    "initialStepSeconds": 1,
+    "stepGrowthFactor": 1.5,
+    "initialWeightVariants": [
+      "factorial-04",
+      "factorial-06"
+    ],
+    "trainInitialParentsUntilPlateau": true,
+    "initialParentApplyFixedLossWeights": false,
+    "projection": {
+      "initialProbeCount": 32,
+      "adaptiveProbeCount": 8
+    },
+    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy",
+    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy-study",
+    "fixedLossWeights": {
+      "excessEntropy": 0
+    },
+    "termWeightLevels": {
+      "crossEntropy": [
+        0.25,
+        1,
+        4
+      ]
+    },
+    "neighborhoodExpansion": {
+      "enabled": true,
+      "seedCountPerParent": 1,
+      "minimumValidationKlImprovement": 0.001,
+      "maximumRounds": 16
+    },
+    "fidelities": [
+      {
+        "key": "screen",
+        "additionalBatches": 32,
+        "validationFraction": 0.00390625,
+        "promote": 160
+      },
+      {
+        "key": "full",
+        "trainUntilPlateau": true,
+        "maximumEpochs": 64,
+        "patience": 6,
+        "minimumImprovement": 0.001,
+        "validationFraction": 0.25,
+        "promote": 4
+      }
+    ]
+  },
+  "futureParameterSweeps": {
+    "predictionDelayMinutes": [
+      0,
+      1,
+      30,
+      60
+    ],
+    "feeBps": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7.5,
+      10,
+      12.5,
+      15,
+      17.5
+    ],
+    "leverageBounds": [
+      [
+        0,
+        1
+      ],
+      [
+        -1,
+        1
+      ],
+      [
+        -5,
+        5
+      ],
+      [
+        -10,
+        10
+      ],
+      [
+        -20,
+        20
+      ],
+      [
+        -50,
+        50
+      ],
+      [
+        -80,
+        80
+      ],
+      [
+        -100,
+        100
+      ],
+      [
+        -150,
+        150
+      ],
+      [
+        -200,
+        200
+      ],
+      [
+        -250,
+        250
+      ]
+    ],
+    "maximumEffectiveLeverageBounds": [
+      [
+        0,
+        1
+      ],
+      [
+        -1,
+        1
+      ],
+      [
+        -5,
+        5
+      ],
+      [
+        -10,
+        10
+      ],
+      [
+        -20,
+        20
+      ],
+      [
+        -50,
+        50
+      ],
+      [
+        -80,
+        80
+      ],
+      [
+        -100,
+        100
+      ],
+      [
+        -150,
+        150
+      ],
+      [
+        -200,
+        200
+      ],
+      [
+        -250,
+        250
+      ]
+    ],
+    "maximumEffectiveLeverageEligibility": "Both effective bounds must contain, or be wider than, the selected usable leverage bounds.",
+    "maintenanceBpsHour": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      7.5,
+      10
+    ],
+    "spread": "removed"
+  },
+  "componentCompression": {
+    "features": "zstd"
+  },
+  "featurePreparationWorkers": 3,
+  "runtimeMinuteOracleTargets": true
+}

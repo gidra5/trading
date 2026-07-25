@@ -6,6 +6,7 @@ import {
   type VwKamaParameters,
 } from "../packages/bot-algo/src/kama-signal-evaluator.js";
 import {
+  DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
   prepareExposureValueOracle,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
@@ -28,7 +29,10 @@ void run().catch((error) => {
 async function run(): Promise<void> {
   const candidateCount = positiveInteger(process.argv[2] ?? "384", "candidate count");
   const candleCount = positiveInteger(process.argv[3] ?? "20000", "candle count");
-  const gridSize = positiveInteger(process.argv[4] ?? "101", "grid size");
+  const gridSize = positiveInteger(
+    process.argv[4] ?? String(DEFAULT_EXPOSURE_VALUE_GRID_SIZE),
+    "grid size",
+  );
   const holdingPeriodSteps = positiveInteger(process.argv[5] ?? "60", "holding-period steps");
   const valueHorizonSteps = positiveInteger(
     process.argv[6] ?? "3600",

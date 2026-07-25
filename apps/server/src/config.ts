@@ -54,13 +54,13 @@ export const appConfig = {
   mlpTrainingPlanFile: path.resolve(
     process.env.TRADING_MLP_TRAINING_PLAN ?? path.join(repoRoot, "ml/training-plan.json"),
   ),
+  portfolioIndexDir: path.resolve(
+    process.env.TRADING_PORTFOLIO_INDEX_DIR ??
+      path.join(repoRoot, "data", "portfolio-basis"),
+  ),
   historicalCache: {
     maxBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MAX_BYTES, 1024 * 1024 * 1024),
     minFreeBytes: parseBytes(process.env.TRADING_HISTORY_CACHE_MIN_FREE_BYTES, 1024 * 1024 * 1024),
-  },
-  correlations: {
-    lookbackDays: parseNumber(process.env.TRADING_CORRELATION_LOOKBACK_DAYS, 14),
-    maxMarkets: Math.max(2, Math.round(parseNumber(process.env.TRADING_CORRELATION_MAX_MARKETS, 60))),
   },
   exchangeAccountGuard: {
     hardStop: parseBoolean(process.env.TRADING_EXCHANGE_ACCOUNT_GUARD_HARD_STOP, false),

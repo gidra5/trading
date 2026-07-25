@@ -6,7 +6,6 @@ import {
   MLP_INPUT_FEATURE_COUNT,
   validateMlpModelManifest,
   type Candle,
-  type MlpExposureStateInputs,
   type MlpModelManifest,
   type MlpTrainingMetrics,
 } from "@trading/bot-algo";
@@ -29,6 +28,7 @@ export interface MlpModelSummary {
   id: string;
   label: string;
   createdAt: string;
+  predictionDelayMs: number;
   executionProvider: "cuda" | "cpu" | "unavailable";
   training?: {
     trainExamples: number;
@@ -39,27 +39,40 @@ export interface MlpModelSummary {
     bestValidationMetrics?: MlpTrainingMetrics;
     testMetrics?: MlpTrainingMetrics;
     teacherFitMetrics?: Record<string, number>;
+    lossWeights?: Record<string, number>;
+    bestEpoch?: number;
+    selectionMetric?: "loss" | "klDivergence";
+    curriculum?: NonNullable<MlpModelManifest["training"]>["curriculum"];
     finalizedEarly?: boolean;
   };
 }
 
+export interface MlpModelPrediction {
+  actionLogits: Float32Array[];
+  modelActionGrid: number[];
+  predictionDelayMs: number;
+}
+
+export function mlpInferenceTimes(
+  oracleTimes: readonly number[],
+  predictionDelayMs: number,
+  alignToModelTarget: boolean,
+): readonly number[] {
+  return alignToModelTarget && predictionDelayMs > 0
+    ? oracleTimes.map((time) => time + predictionDelayMs)
+    : oracleTimes;
+}
+
 export function discoverMlpModels(dataDir: string): DiscoveredMlpModel[] {
   const result = new Map<string, DiscoveredMlpModel>();
-  const roots = [
-    path.join(REPO_ROOT, "models", "mlp"),
-    path.join(dataDir, "models", "mlp"),
+  const roots: Array<{ directory: string; depth: number }> = [
+    { directory: path.join(REPO_ROOT, "models", "mlp"), depth: 1 },
+    { directory: path.join(dataDir, "models", "mlp"), depth: 1 },
+    { directory: path.join(dataDir, "ml-joint-studies"), depth: 5 },
+    { directory: path.join(dataDir, "ml-dynamic-studies"), depth: 5 },
   ];
   for (const root of roots) {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(root, { withFileTypes: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      throw error;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const directory = path.join(root, entry.name);
+    for (const directory of artifactDirectories(root.directory, root.depth)) {
       try {
         const manifest = JSON.parse(
           fs.readFileSync(path.join(directory, "manifest.json"), "utf8"),
@@ -70,7 +83,10 @@ export function discoverMlpModels(dataDir: string): DiscoveredMlpModel[] {
           || !fs.statSync(modelFile).isFile()) {
           throw new Error("MLP manifest modelFile must resolve to a file inside its artifact directory.");
         }
-        result.set(manifest.id, { manifest, directory });
+        const existing = result.get(manifest.id);
+        if (!existing || Date.parse(manifest.createdAt) > Date.parse(existing.manifest.createdAt)) {
+          result.set(manifest.id, { manifest, directory });
+        }
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         console.error(`Ignoring invalid MLP model artifact ${directory}: ${reason}`);
@@ -81,11 +97,37 @@ export function discoverMlpModels(dataDir: string): DiscoveredMlpModel[] {
     Date.parse(right.manifest.createdAt) - Date.parse(left.manifest.createdAt));
 }
 
+function artifactDirectories(root: string, maximumDepth: number): string[] {
+  const result: string[] = [];
+  const visit = (directory: string, depth: number): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (entries.some((entry) => entry.isFile() && entry.name === "manifest.json")) {
+      result.push(directory);
+      return;
+    }
+    if (depth >= maximumDepth) return;
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        visit(path.join(directory, entry.name), depth + 1);
+      }
+    }
+  };
+  visit(root, 0);
+  return result;
+}
+
 export function mlpModelSummaries(dataDir: string): MlpModelSummary[] {
   return discoverMlpModels(dataDir).map(({ manifest }) => ({
     id: manifest.id,
     label: manifest.label,
     createdAt: manifest.createdAt,
+    predictionDelayMs: manifest.predictionDelayMs,
     executionProvider: manifest.verification?.executionProvider ?? "unavailable",
     ...(manifest.training ? { training: {
       trainExamples: manifest.training.trainExamples,
@@ -93,12 +135,20 @@ export function mlpModelSummaries(dataDir: string): MlpModelSummary[] {
       testExamples: manifest.training.testExamples,
       bestValidationLoss: manifest.training.bestValidationLoss,
       testLoss: manifest.training.testLoss,
+      bestEpoch: manifest.training.bestEpoch,
       ...(manifest.training.bestValidationMetrics
         ? { bestValidationMetrics: manifest.training.bestValidationMetrics }
         : {}),
       ...(manifest.training.testMetrics ? { testMetrics: manifest.training.testMetrics } : {}),
       ...(manifest.training.teacherFitMetrics
         ? { teacherFitMetrics: manifest.training.teacherFitMetrics }
+        : {}),
+      ...(manifest.training.lossWeights ? { lossWeights: manifest.training.lossWeights } : {}),
+      ...(manifest.training.selectionMetric
+        ? { selectionMetric: manifest.training.selectionMetric }
+        : {}),
+      ...(manifest.training.curriculum
+        ? { curriculum: manifest.training.curriculum }
         : {}),
       ...(manifest.training.finalizedEarly ? { finalizedEarly: true } : {}),
     } } : {}),
@@ -111,7 +161,6 @@ export class MlpModelRuntime {
   private predictionCache: {
     modelId: string;
     oneSecondCandles: readonly Candle[];
-    stateKey: string;
     times: readonly number[];
     outputs: Float32Array[];
   } | undefined;
@@ -128,56 +177,73 @@ export class MlpModelRuntime {
     modelId: string,
     oneSecondCandles: readonly Candle[],
     times: readonly number[],
-    state: MlpExposureStateInputs,
     cancelFlag?: Int32Array,
-  ): Promise<Float32Array[]> {
+    alignToModelTarget = false,
+  ): Promise<MlpModelPrediction> {
     if (!modelId) throw new Error("MLP prediction requires a selected model artifact.");
-    const stateKey = JSON.stringify(state);
+    const model = await this.model(modelId);
+    const featureTimes = mlpInferenceTimes(
+      times,
+      model.manifest.predictionDelayMs,
+      alignToModelTarget,
+    );
+    const featureCount = MLP_INPUT_FEATURE_COUNT;
     const cached = this.predictionCache;
     if (cached
       && cached.modelId === modelId
       && cached.oneSecondCandles === oneSecondCandles
-      && cached.stateKey === stateKey
-      && cached.times.length >= times.length
-      && cached.times[0] === times[0]
-      && cached.times[times.length - 1] === times[times.length - 1]) {
-      return cached.outputs.slice(0, times.length);
+      && cached.times.length >= featureTimes.length
+      && cached.times[0] === featureTimes[0]
+      && cached.times[featureTimes.length - 1] === featureTimes[featureTimes.length - 1]) {
+      return {
+        actionLogits: cached.outputs.slice(0, featureTimes.length),
+        modelActionGrid: model.manifest.actionGrid,
+        predictionDelayMs: model.manifest.predictionDelayMs,
+      };
     }
-    const model = await this.model(modelId);
-    const features = await this.featureStore.prepare(oneSecondCandles, times, state);
-    const outputs: Float32Array[] = new Array(times.length);
+    const features = await this.featureStore.prepare(oneSecondCandles, featureTimes);
+    const outputs: Float32Array[] = new Array(featureTimes.length);
     const requestedBatch = Number(process.env.TRADING_MLP_BATCH_SIZE ?? DEFAULT_BATCH_SIZE);
     const batchSize = Number.isFinite(requestedBatch) && requestedBatch > 0
       ? Math.max(1, Math.floor(requestedBatch))
       : DEFAULT_BATCH_SIZE;
-    for (let start = 0; start < times.length; start += batchSize) {
+    for (let start = 0; start < featureTimes.length; start += batchSize) {
       throwIfCancelled(cancelFlag);
-      const end = Math.min(times.length, start + batchSize);
-      const input = new Float32Array((end - start) * MLP_INPUT_FEATURE_COUNT);
+      const end = Math.min(featureTimes.length, start + batchSize);
+      const input = new Float32Array((end - start) * featureCount);
       for (let index = start; index < end; index += 1) {
-        features.encode(times[index]!, input, (index - start) * MLP_INPUT_FEATURE_COUNT);
+        features.encode(featureTimes[index]!, input, (index - start) * featureCount);
       }
-      const tensor = new ort.Tensor("float32", input, [end - start, MLP_INPUT_FEATURE_COUNT]);
-      const result = await model.session.run({ features: tensor }, ["raw_parameters"]);
-      const output = result.raw_parameters;
+      const tensor = new ort.Tensor("float32", input, [end - start, featureCount]);
+      const result = await model.session.run({ features: tensor }, ["action_logits"]);
+      const output = result.action_logits;
       if (!output || output.type !== "float32"
         || output.dims.length !== 2
         || output.dims[0] !== end - start
-        || output.dims[1] !== model.manifest.outputParameterCount
+        || output.dims[1] !== model.manifest.outputActionCount
         || !(output.data instanceof Float32Array)) {
         throw new Error(
-          `MLP ONNX output does not match [batch, ${model.manifest.outputParameterCount}] float32 contract.`,
+          `MLP ONNX output does not match [batch, ${model.manifest.outputActionCount}] float32 contract.`,
         );
       }
       for (let row = 0; row < end - start; row += 1) {
         outputs[start + row] = output.data.slice(
-          row * model.manifest.outputParameterCount,
-          (row + 1) * model.manifest.outputParameterCount,
+          row * model.manifest.outputActionCount,
+          (row + 1) * model.manifest.outputActionCount,
         );
       }
     }
-    this.predictionCache = { modelId, oneSecondCandles, stateKey, times, outputs };
-    return outputs;
+    this.predictionCache = { modelId, oneSecondCandles, times: featureTimes, outputs };
+    return {
+      actionLogits: outputs,
+      modelActionGrid: model.manifest.actionGrid,
+      predictionDelayMs: model.manifest.predictionDelayMs,
+    };
+  }
+
+  async predictionDelayMs(modelId: string): Promise<number> {
+    if (!modelId) throw new Error("MLP prediction requires a selected model artifact.");
+    return (await this.model(modelId)).manifest.predictionDelayMs;
   }
 
   private model(modelId: string): Promise<LoadedMlpModel> {
@@ -239,8 +305,8 @@ export class MlpModelRuntime {
 
 function validateSession(session: ort.InferenceSession): void {
   if (session.inputNames.length !== 1 || session.inputNames[0] !== "features"
-    || session.outputNames.length !== 1 || session.outputNames[0] !== "raw_parameters") {
-    throw new Error("MLP ONNX graph must expose features -> raw_parameters only.");
+    || session.outputNames.length !== 1 || session.outputNames[0] !== "action_logits") {
+    throw new Error("MLP ONNX graph must expose features -> action_logits only.");
   }
 }
 

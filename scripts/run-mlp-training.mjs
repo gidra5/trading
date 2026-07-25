@@ -7,17 +7,33 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const planArgument = argument("plan") ?? "ml/training-plan.json";
 const trainingOnly = process.argv.includes("--training-only");
+const datasetOnly = process.argv.includes("--dataset-only");
+const frozenStudyOnly = process.argv.includes("--frozen-study-only");
+const productionMinuteOnly = process.argv.includes("--production-minute");
+const derivedTrainingOnly = frozenStudyOnly || productionMinuteOnly;
+if ([trainingOnly, datasetOnly, frozenStudyOnly, productionMinuteOnly]
+  .filter(Boolean).length > 1) {
+  throw new Error(
+    "Choose only one of --training-only, --dataset-only, "
+    + "--frozen-study-only, or --production-minute.",
+  );
+}
 const planFile = path.resolve(repoRoot, planArgument);
 const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
 const runDir = path.resolve(repoRoot, plan.runDir);
-const datasetDir = path.resolve(repoRoot, plan.datasetDir);
+const datasetDir = path.resolve(
+  repoRoot,
+  productionMinuteOnly
+    ? plan.productionTraining?.outputDatasetDir ?? plan.datasetDir
+    : frozenStudyOnly
+    ? plan.frozenStudySampling?.outputDatasetDir ?? plan.datasetDir
+    : plan.datasetDir,
+);
 const artifactDir = path.resolve(repoRoot, plan.artifactDir);
-const initializeFromCheckpoint = plan.training?.initializeFromCheckpoint
-  ? path.resolve(repoRoot, plan.training.initializeFromCheckpoint)
-  : undefined;
-if (initializeFromCheckpoint && !fs.existsSync(initializeFromCheckpoint)) {
-  throw new Error(`MLP initialization checkpoint is missing: ${initializeFromCheckpoint}`);
-}
+let trainingPlan = plan;
+let trainingPlanFile = planFile;
+let trainingDatasetDir = datasetDir;
+let trainingArtifactDir = artifactDir;
 const statusFile = path.join(runDir, "status.json");
 const logFile = path.join(runDir, "training.log");
 const finalizeFile = path.join(runDir, "FINALIZE");
@@ -41,7 +57,6 @@ let status = {
   datasetDir,
   artifactDir,
   logFile,
-  ...(initializeFromCheckpoint ? { initializeFromCheckpoint } : {}),
 };
 writeStatus();
 
@@ -53,16 +68,74 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 try {
+  await runStage("feature-contract-build", process.execPath, [
+    path.join(repoRoot, "node_modules/typescript/bin/tsc"),
+    "-p", path.join(repoRoot, "packages/bot-algo/tsconfig.json"),
+  ]);
   if (!trainingOnly) {
     await runStage("cuda-build", process.execPath, [
       path.join(repoRoot, "scripts/build-vw-kama-cuda.mjs"),
     ]);
-    await runStage("dataset", process.execPath, [
-      path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
-      path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
-      "--plan", planFile,
-    ]);
-    if ((plan.teacherFit?.adaptiveRounds ?? 0) > 0) {
+    if (derivedTrainingOnly) {
+      if (productionMinuteOnly && !plan.productionTraining) {
+        throw new Error(
+          "--production-minute requires productionTraining in the plan.",
+        );
+      }
+      if (frozenStudyOnly && !plan.frozenStudySampling) {
+        throw new Error(
+          "--frozen-study-only requires frozenStudySampling in the plan.",
+        );
+      }
+      await runStage(
+        productionMinuteOnly ? "production-training-source" : "frozen-study-source",
+        process.execPath,
+        [
+        path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+        path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+        "--plan", planFile,
+        "--preparation-mode", "frozen-study-source",
+        ],
+      );
+      const frozenPlanFile = path.resolve(
+        repoRoot,
+        productionMinuteOnly
+          ? plan.productionTraining.outputPlanFile
+          : plan.frozenStudySampling.outputPlanFile,
+      );
+      await runStage(
+        productionMinuteOnly
+          ? "production-training-materialization"
+          : "frozen-study-materialization",
+        process.execPath,
+        [
+        path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+        path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+        "--plan", frozenPlanFile,
+        ],
+      );
+      trainingPlanFile = frozenPlanFile;
+      trainingPlan = JSON.parse(fs.readFileSync(trainingPlanFile, "utf8"));
+      trainingDatasetDir = path.resolve(repoRoot, trainingPlan.datasetDir);
+      trainingArtifactDir = path.resolve(repoRoot, trainingPlan.artifactDir);
+      status = {
+        ...status,
+        planId: trainingPlan.id,
+        datasetDir: trainingDatasetDir,
+        artifactDir: trainingArtifactDir,
+        message: productionMinuteOnly
+          ? "Full production corpus is complete; starting one-minute-oracle training."
+          : "Frozen production-wide sample is complete; starting one-minute-oracle training.",
+      };
+      writeStatus();
+    } else {
+      await runStage("dataset", process.execPath, [
+        path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
+        path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
+        "--plan", planFile,
+      ]);
+    }
+    if (!derivedTrainingOnly && (plan.teacherFit?.adaptiveRounds ?? 0) > 0) {
       await runStage("dataset-refinement", process.execPath, [
         path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
         path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
@@ -70,27 +143,35 @@ try {
         "--refinement-pass", "1",
       ]);
     }
-    await runStage("dataset-features", process.execPath, [
-      path.join(repoRoot, "node_modules/tsx/dist/cli.mjs"),
-      path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
-      "--plan", planFile,
-      "--refresh-features", "true",
-    ]);
   }
-  const training = plan.training;
+  if (datasetOnly) {
+    status = {
+      ...status,
+      stage: "complete",
+      completedAt: new Date().toISOString(),
+      message: "Reusable input/oracle components and the delayed dataset pairing are complete.",
+    };
+    writeStatus();
+    process.exit(0);
+  }
+  const training = trainingPlan.training;
   const python = path.join(repoRoot, ".venv-ml/bin/python");
   if (!fs.existsSync(python)) {
     throw new Error("ML environment is missing. Run `npm run mlp:bootstrap` first.");
   }
   await runStage("training", python, [
     path.join(repoRoot, "ml/train_mlp.py"),
-    "--dataset", datasetDir,
-    "--output", artifactDir,
-    "--model-id", plan.id,
-    "--label", plan.label,
-    "--plan", planFile,
+    "--dataset", trainingDatasetDir,
+    "--output", trainingArtifactDir,
+    "--model-id", trainingPlan.id,
+    "--label", trainingPlan.label,
+    "--plan", trainingPlanFile,
+    "--target", training.targetRepresentation ?? "rawOracleProbabilities",
     "--epochs", String(training.epochs),
     "--batch-size", String(training.batchSize),
+    "--evaluation-batch-size", String(training.evaluationBatchSize ?? training.batchSize),
+    "--validation-fraction", String(training.validationFraction ?? 1),
+    "--training-fraction", String(training.trainingFraction ?? 1),
     "--accumulate", String(training.gradientAccumulation),
     "--learning-rate", String(training.learningRate),
     "--weight-decay", String(training.weightDecay),
@@ -101,24 +182,43 @@ try {
     "--seed", String(training.seed),
     "--device", training.device,
     "--log-every-steps", String(training.logEverySteps),
+    "--selection-metric", training.selectionMetric ?? "loss",
     "--loss-weights-json", JSON.stringify(training.lossWeights),
     "--time-weighting-json", JSON.stringify(training.timeWeighting),
+    "--feature-statistics-cache", path.join(runDir, "feature-statistics.npz"),
     "--finalize-file", finalizeFile,
     "--resume",
-    ...(initializeFromCheckpoint
-      ? ["--initialize-from-checkpoint", initializeFromCheckpoint]
+    ...(training.initializeFromCheckpoint
+      ? [
+          "--initialize-from-checkpoint",
+          path.resolve(repoRoot, training.initializeFromCheckpoint),
+        ]
       : []),
+    ...(Number.isInteger(training.inheritedBestEpoch)
+      ? ["--inherited-best-epoch", String(training.inheritedBestEpoch)]
+      : []),
+    ...(training.evaluationOnly ? ["--evaluation-only"] : []),
+    ...(Number.isFinite(training.targetValidation?.klDivergence)
+      ? ["--target-validation-kl", String(training.targetValidation.klDivergence)]
+      : []),
+    ...(Number.isFinite(training.targetValidation?.klDivergenceStdDev)
+      ? ["--target-validation-kl-stddev", String(training.targetValidation.klDivergenceStdDev)]
+      : []),
+    ...(training.weightedTrainingSample ? ["--weighted-training-sample"] : []),
+    ...(training.compile ? ["--compile"] : []),
   ]);
   await runStage("verification", process.execPath, [
     path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
     path.join(repoRoot, "scripts/verify-mlp-model.mjs"),
-    artifactDir,
+    trainingArtifactDir,
   ]);
   status = {
     ...status,
     stage: "complete",
     completedAt: new Date().toISOString(),
-    message: "Verified model artifact is available to the backend and UI.",
+    message: derivedTrainingOnly
+      ? "Verified one-minute-oracle model is available to the backend and UI."
+      : "Verified model artifact is available to the backend and UI.",
   };
   writeStatus();
 } catch (error) {
@@ -197,6 +297,9 @@ function consume(stream, stderr) {
       } else if (event.event === "dataset-source-rejected") {
         status = {
           ...status,
+          sourceRecovery: status.sourceRecovery
+            ? { ...status.sourceRecovery, active: false, failedAt: new Date().toISOString() }
+            : undefined,
           sourceRejections: {
             count: event.rejectedDays,
             latestDate: event.date,
@@ -210,6 +313,27 @@ function consume(stream, stderr) {
           sourceRejections: {
             ...status.sourceRejections,
             count: event.remainingRejectedDays,
+          },
+        };
+      } else if (event.event === "dataset-source-recovery-start") {
+        status = {
+          ...status,
+          sourceRecovery: {
+            active: true,
+            date: event.date,
+            detail: event.detail,
+            startedAt: new Date().toISOString(),
+          },
+        };
+      } else if (event.event === "dataset-source-recovery-complete") {
+        status = {
+          ...status,
+          sourceRecovery: {
+            active: false,
+            date: event.date,
+            candles: event.candles,
+            elapsedMs: event.elapsedMs,
+            completedAt: new Date().toISOString(),
           },
         };
       }

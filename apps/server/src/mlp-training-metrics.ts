@@ -4,12 +4,16 @@ import path from "node:path";
 const MAX_LOG_CHUNK_BYTES = 64 * 1024 * 1024;
 const METRIC_EVENTS = new Set([
   "dataset-complete",
+  "dataset-component",
+  "dataset-example-weighting",
   "dataset-feature-refresh-complete",
   "dataset-feature-refresh-progress",
   "dataset-oracle",
   "dataset-progress",
   "dataset-shard",
   "dataset-source-recovered",
+  "dataset-source-recovery-complete",
+  "dataset-source-recovery-start",
   "dataset-source-rejected",
   "dataset-stage-timing",
   "epoch",
@@ -25,10 +29,27 @@ interface TrainingPlan {
   label: string;
   runDir: string;
   datasetDir: string;
+  samplingIntervalMs?: number;
+  predictionDelayMs?: number;
   training?: {
     epochs?: number;
+    patience?: number;
     lossWeights?: Record<string, number>;
+    timeWeighting?: MlpTimeWeightingPlan;
   };
+}
+
+export interface MlpTimeWeightingPlan {
+  mode: "distanceImbalance";
+  distanceEpsilon: number;
+  minimumWeight: number;
+  stateAggregation: "globalDistanceRatio";
+  minimumAdviceMagnitude: number;
+  memoryHalfLifeSteps: number;
+  growthPerPriorAdvice: number;
+  maximumMultiplier: number;
+  resetAfterGapSteps: number;
+  resolutionDivergenceMultiplier: number;
 }
 
 interface TrainingStatus {
@@ -50,12 +71,29 @@ export interface MlpTrainingMetricEvent {
   [key: string]: unknown;
 }
 
+export interface MlpTrainingRunSummary {
+  key: string;
+  id: string;
+  label: string;
+  running: boolean;
+  stage?: string;
+  updatedAt?: string;
+  epochs?: number;
+  patience?: number;
+}
+
 export interface MlpTrainingMetricsResponse {
+  runs: MlpTrainingRunSummary[];
+  selectedRunKey: string;
   plan: {
     id: string;
     label: string;
     epochs?: number;
+    patience?: number;
+    samplingIntervalMs?: number;
+    predictionDelayMs?: number;
     lossWeights?: Record<string, number>;
+    timeWeighting?: MlpTimeWeightingPlan;
   };
   status?: TrainingStatus;
   running: boolean;
@@ -65,22 +103,63 @@ export interface MlpTrainingMetricsResponse {
     totalShards?: number;
     remainingTeacherFits?: number;
     sourceRejectedDays?: number;
+    featureComponents?: number;
+    oracleComponents?: number;
   };
   cursor: number;
   reset: boolean;
   events: MlpTrainingMetricEvent[];
 }
 
+export class MlpTrainingRunNotFoundError extends Error {
+  constructor(readonly runKey: string) {
+    super(`Unknown MLP training run: ${runKey}`);
+    this.name = "MlpTrainingRunNotFoundError";
+  }
+}
+
+interface LoadedTrainingPlan {
+  key: string;
+  plan: TrainingPlan;
+  runDir: string;
+  datasetDir: string;
+  statusFile: string;
+  logFile: string;
+  finalizeFile: string;
+  status?: TrainingStatus;
+  updatedAt?: string;
+  running: boolean;
+}
+
 /** Incrementally exposes the append-only MLP run log to the local dashboard. */
 export class MlpTrainingMetricsReader {
-  constructor(private readonly planFile: string) {}
+  private readonly repoRoot: string;
 
-  async read(cursor: number): Promise<MlpTrainingMetricsResponse> {
-    const files = await this.loadPlan();
-    const [status, log, progress, queue, sourceQueue, finalizeRequested] = await Promise.all([
-      readOptionalJson<TrainingStatus>(files.statusFile),
+  constructor(
+    private readonly planFile: string,
+    repoRoot = path.resolve(path.dirname(planFile), ".."),
+  ) {
+    this.repoRoot = path.resolve(repoRoot);
+  }
+
+  async read(
+    cursor: number,
+    requestedRunKey?: string,
+  ): Promise<MlpTrainingMetricsResponse> {
+    const availableRuns = await this.discoverRuns();
+    const files = requestedRunKey
+      ? availableRuns.find((candidate) => candidate.key === requestedRunKey)
+      : availableRuns[0];
+    if (!files) {
+      throw new MlpTrainingRunNotFoundError(requestedRunKey ?? "");
+    }
+    const [log, progress, queue, sourceQueue, finalizeRequested] = await Promise.all([
       readMetricLog(files.logFile, cursor),
-      readOptionalJson<{ shards?: Array<{ refinementPass?: number }> }>(
+      readOptionalJson<{
+        shards?: Array<{ refinementPass?: number }>;
+        featureComponents?: unknown[];
+        oracleComponents?: unknown[];
+      }>(
         path.join(files.datasetDir, "progress.json"),
       ),
       readOptionalJson<{ cases?: unknown[] }>(
@@ -93,18 +172,45 @@ export class MlpTrainingMetricsReader {
     ]);
     const shards = Array.isArray(progress?.shards) ? progress.shards : undefined;
     return {
+      runs: availableRuns.map((candidate) => ({
+        key: candidate.key,
+        id: candidate.plan.id,
+        label: candidate.plan.label,
+        running: candidate.running,
+        ...(candidate.status?.stage ? { stage: candidate.status.stage } : {}),
+        ...(candidate.updatedAt ? { updatedAt: candidate.updatedAt } : {}),
+        ...(candidate.plan.training?.epochs === undefined
+          ? {}
+          : { epochs: candidate.plan.training.epochs }),
+        ...(candidate.plan.training?.patience === undefined
+          ? {}
+          : { patience: candidate.plan.training.patience }),
+      })),
+      selectedRunKey: files.key,
       plan: {
         id: files.plan.id,
         label: files.plan.label,
         ...(files.plan.training?.epochs === undefined
           ? {}
           : { epochs: files.plan.training.epochs }),
+        ...(files.plan.training?.patience === undefined
+          ? {}
+          : { patience: files.plan.training.patience }),
+        ...(files.plan.samplingIntervalMs === undefined
+          ? {}
+          : { samplingIntervalMs: files.plan.samplingIntervalMs }),
+        ...(files.plan.predictionDelayMs === undefined
+          ? {}
+          : { predictionDelayMs: files.plan.predictionDelayMs }),
         ...(files.plan.training?.lossWeights
           ? { lossWeights: files.plan.training.lossWeights }
           : {}),
+        ...(files.plan.training?.timeWeighting
+          ? { timeWeighting: files.plan.training.timeWeighting }
+          : {}),
       },
-      ...(status ? { status } : {}),
-      running: processIsAlive(status?.pid),
+      ...(files.status ? { status: files.status } : {}),
+      running: files.running,
       finalizeRequested,
       progress: {
         ...(shards ? {
@@ -115,6 +221,12 @@ export class MlpTrainingMetricsReader {
         ...(Array.isArray(sourceQueue?.cases)
           ? { sourceRejectedDays: sourceQueue.cases.length }
           : {}),
+        ...(Array.isArray(progress?.featureComponents)
+          ? { featureComponents: progress.featureComponents.length }
+          : {}),
+        ...(Array.isArray(progress?.oracleComponents)
+          ? { oracleComponents: progress.oracleComponents.length }
+          : {}),
       },
       cursor: log.cursor,
       reset: log.reset,
@@ -122,23 +234,80 @@ export class MlpTrainingMetricsReader {
     };
   }
 
-  private async loadPlan() {
-    const plan = JSON.parse(await fs.readFile(this.planFile, "utf8")) as TrainingPlan;
-    if (!plan.id || !plan.label || !plan.runDir || !plan.datasetDir) {
-      throw new Error(`Invalid MLP training plan: ${this.planFile}`);
+  private async discoverRuns(): Promise<LoadedTrainingPlan[]> {
+    const planFiles = new Set<string>([path.resolve(this.planFile)]);
+    const planDirectory = path.join(this.repoRoot, "ml", "training-plans");
+    try {
+      for (const entry of await fs.readdir(planDirectory, { withFileTypes: true })) {
+        if (entry.isFile() && entry.name.endsWith(".json")) {
+          planFiles.add(path.join(planDirectory, entry.name));
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    const repoRoot = path.resolve(path.dirname(this.planFile), "..");
-    const runDir = path.resolve(repoRoot, plan.runDir);
-    const datasetDir = path.resolve(repoRoot, plan.datasetDir);
+    const loaded = await Promise.all([...planFiles].map(async (planFile) => {
+      try {
+        return await this.loadPlan(planFile);
+      } catch (error) {
+        if (path.resolve(planFile) === path.resolve(this.planFile)) throw error;
+        return undefined;
+      }
+    }));
+    return loaded
+      .filter((candidate): candidate is LoadedTrainingPlan => candidate !== undefined)
+      .sort(compareRuns);
+  }
+
+  private async loadPlan(planFile: string): Promise<LoadedTrainingPlan> {
+    const plan = JSON.parse(await fs.readFile(planFile, "utf8")) as TrainingPlan;
+    if (!plan.id || !plan.label || !plan.runDir || !plan.datasetDir) {
+      throw new Error(`Invalid MLP training plan: ${planFile}`);
+    }
+    const runDir = path.resolve(this.repoRoot, plan.runDir);
+    const datasetDir = path.resolve(this.repoRoot, plan.datasetDir);
+    const statusFile = path.join(runDir, "status.json");
+    const [status, planStat] = await Promise.all([
+      readOptionalJson<TrainingStatus>(statusFile),
+      fs.stat(planFile),
+    ]);
+    const updatedAt = validTimestamp(status?.updatedAt)
+      ?? validTimestamp(status?.completedAt)
+      ?? validTimestamp(status?.failedAt)
+      ?? validTimestamp(status?.pausedAt)
+      ?? planStat.mtime.toISOString();
     return {
+      key: path.relative(this.repoRoot, planFile).split(path.sep).join("/"),
       plan,
       runDir,
       datasetDir,
-      statusFile: path.join(runDir, "status.json"),
+      statusFile,
       logFile: path.join(runDir, "training.log"),
       finalizeFile: path.join(runDir, "FINALIZE"),
+      ...(status ? { status } : {}),
+      ...(updatedAt ? { updatedAt } : {}),
+      running: processIsAlive(status?.pid) && !isTerminalStage(status?.stage),
     };
   }
+}
+
+function compareRuns(left: LoadedTrainingPlan, right: LoadedTrainingPlan): number {
+  if (left.running !== right.running) return left.running ? -1 : 1;
+  const updatedDifference = Date.parse(right.updatedAt ?? "") - Date.parse(left.updatedAt ?? "");
+  if (Number.isFinite(updatedDifference) && updatedDifference !== 0) return updatedDifference;
+  return left.plan.label.localeCompare(right.plan.label);
+}
+
+function validTimestamp(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
+function isTerminalStage(stage: string | undefined): boolean {
+  return stage === "complete"
+    || stage === "failed"
+    || stage === "paused"
+    || stage === "cancelled";
 }
 
 async function readMetricLog(file: string, requestedCursor: number): Promise<{

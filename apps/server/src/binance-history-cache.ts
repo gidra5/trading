@@ -33,6 +33,9 @@ export async function fetchBinanceSpotDailyShard(
   const symbol = (request.symbol ?? "BTCUSDT").toUpperCase();
   const interval = request.interval ?? "1s";
   const intervalMs = request.intervalMs ?? 1_000;
+  if (!Number.isInteger(intervalMs) || intervalMs <= 0 || DAY_MS % intervalMs !== 0) {
+    throw new Error(`Daily shard interval must divide one UTC day exactly; received ${intervalMs}ms.`);
+  }
   const archiveRoot = request.archiveRoot ?? BINANCE_SPOT_ARCHIVE_ROOT;
   const outputDir = path.join(
     request.dataDir,
@@ -104,8 +107,8 @@ async function extractDailyShard(options: {
       if (!validCandle(candle, options.day, options.intervalMs)) {
         throw new Error(`${options.date}: invalid Binance candle at ${candle.openTime}`);
       }
-      if (previousTime !== undefined && candle.openTime <= previousTime) {
-        throw new Error(`${options.date}: Binance candles are duplicated or out of order`);
+      if (previousTime !== undefined && candle.openTime !== previousTime + options.intervalMs) {
+        throw new Error(`${options.date}: Binance candles are missing, duplicated, or out of order`);
       }
       firstTime ??= candle.openTime;
       previousTime = candle.openTime;
@@ -115,7 +118,8 @@ async function extractDailyShard(options: {
     gzip.end();
     await outputDone;
     const expectedLastTime = options.day + DAY_MS - options.intervalMs;
-    if (count === 0 || firstTime !== options.day || previousTime !== expectedLastTime) {
+    const expectedCount = DAY_MS / options.intervalMs;
+    if (count !== expectedCount || firstTime !== options.day || previousTime !== expectedLastTime) {
       throw new Error(`${options.date}: Binance archive does not cover the complete UTC day`);
     }
   } catch (error) {

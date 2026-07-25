@@ -12,6 +12,7 @@ import {
   workerData,
 } from "node:worker_threads";
 import {
+  DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   exposureValueOracleBytes,
   prepareExposureValueOracle,
   shareExposureValueOracle,
@@ -3553,7 +3554,11 @@ function parseArgs(argv: string[]): Args {
   if (oracleMutualInformationMode !== "approximate" && oracleMutualInformationMode !== "precise") {
     throw new Error("--oracle-mi-mode must be approximate or precise.");
   }
-  const exposureGridSize = integer(get("exposure-grid-size", "151"), "exposure-grid-size", 3);
+  const exposureGridSize = integer(
+    get("exposure-grid-size", String(DEFAULT_EXPOSURE_VALUE_GRID_SIZE)),
+    "exposure-grid-size",
+    3,
+  );
   const mutualInformationBins = integer(get("mi-bins", "15"), "mi-bins", 2);
   if (mutualInformationBins > Math.min(32, exposureGridSize)) {
     throw new Error("--mi-bins cannot exceed min(32, --exposure-grid-size).");
@@ -4108,7 +4113,7 @@ function help(): void {
   --workers 12                      Candidate shards for global search; window shards in per-window mode
   --accelerator auto                CUDA for every profitable-size batch (auto, cuda, or cpu)
   --objective signal                signal or value-distillation fitness
-  --exposure-grid-size 151 --exposure-min -100 --exposure-max 100
+  --exposure-grid-size 255 --exposure-min -100 --exposure-max 100
   --value-holding-period-mode fixed fixed or oracle-half-average-trade
   --value-holding-period 60s        Fixed H, or adaptive fallback
   --value-horizon 1h                Final-equity horizon T−t; must be at least H

@@ -54,6 +54,7 @@ def _objective_gradient(
     latent_upper,
     visible_lower,
     visible_upper,
+    hinge_span,
     friction,
     temperature,
     parameter_mask: tl.constexpr,
@@ -87,8 +88,14 @@ def _objective_gradient(
     dc2_raw0 = dc1_raw0 * (1.0 - second_fraction)
     dc2_raw1 = (latent_upper - c1) * second_fraction * (1.0 - second_fraction)
 
-    kappa_c = 82.0 / visible_span
-    kappa_x = 678.0 / visible_span
+    # The transition widths are calibrated on the usable score span, which
+    # can deliberately differ from the effective/visible support.  In
+    # particular, the production fitter optimizes on [-100, 100] and remaps
+    # the score to [-250, 250] without widening either hinge.  Keep the queued
+    # optimizer on that same objective so adaptive work does not need to be
+    # repaired by the PyTorch compatibility fallback.
+    kappa_c = 82.0 / hinge_span
+    kappa_x = 678.0 / hinge_span
     buy_slope = friction / (1.0 - friction)
     sell_slope = friction
     beta_x = -(buy_slope + sell_slope) / temperature
@@ -120,10 +127,16 @@ def _objective_gradient(
     )
     # Invalid state rows get a finite dummy softmax whose loss and gradient are
     # masked away. Invalid action lanes remain negative infinity.
+    # Match ``torch.finfo(torch.float32).min`` used by the shared policy
+    # decoder.  IEEE -inf makes the padded action's 0 * -inf loss contribution
+    # a NaN before masking on some Triton lowering paths; that used to
+    # deactivate every queued fit in the initializer and silently leave all
+    # useful recovery work to the much heavier compatibility fallback.
+    masked_logit = -3.4028234663852886e38
     logits = tl.where(
         valid_state,
-        tl.where(feasible_action, logits, -float("inf")),
-        tl.where(action_offset == 0, 0.0, -float("inf")),
+        tl.where(feasible_action, logits, masked_logit),
+        tl.where(action_offset == 0, 0.0, masked_logit),
     )
     maximum = tl.max(logits, axis=1)
     exponential = tl.exp(logits - maximum[:, None])
@@ -200,6 +213,7 @@ def _initialize_kernel(
     latent_upper,
     visible_lower,
     visible_upper,
+    hinge_span,
     friction,
     temperature,
     parameter_mask: tl.constexpr,
@@ -225,7 +239,7 @@ def _initialize_kernel(
         current_pointer,
         fit,
         raw0, raw1, raw2, raw3, raw4, raw5, raw6, raw7,
-        latent_lower, latent_upper, visible_lower, visible_upper,
+        latent_lower, latent_upper, visible_lower, visible_upper, hinge_span,
         friction, temperature,
         parameter_mask=parameter_mask,
         action_count=action_count,
@@ -274,6 +288,7 @@ def _step_kernel(
     latent_upper,
     visible_lower,
     visible_upper,
+    hinge_span,
     friction,
     temperature,
     tolerance,
@@ -354,7 +369,7 @@ def _step_kernel(
                     fit,
                     candidate0, candidate1, candidate2,
                     candidate3, candidate4, candidate5, r6, r7,
-                    latent_lower, latent_upper, visible_lower, visible_upper,
+                    latent_lower, latent_upper, visible_lower, visible_upper, hinge_span,
                     friction, temperature,
                     parameter_mask=parameter_mask,
                     action_count=action_count,
@@ -384,7 +399,7 @@ def _step_kernel(
                     current_pointer,
                     fit,
                     next0, next1, next2, next3, next4, next5, r6, r7,
-                    latent_lower, latent_upper, visible_lower, visible_upper,
+                    latent_lower, latent_upper, visible_lower, visible_upper, hinge_span,
                     friction, temperature,
                     parameter_mask=parameter_mask,
                     action_count=action_count,
@@ -489,7 +504,7 @@ def triton_bfgs(
     action_count = target.shape[2]
     # Each state's probability row starts on a 256-byte boundary. Besides
     # coalescing the 64-lane loads, this keeps different fit programs from
-    # sharing cache lines when the real grid has 61 sampled actions.
+    # sharing cache lines when the real grid has 63 sampled actions.
     if action_count < ACTION_BLOCK:
         aligned_target = torch.zeros(
             (target.shape[0], target.shape[1], ACTION_BLOCK),
@@ -517,11 +532,15 @@ def triton_bfgs(
     mask_bits = sum((1 << index) for index, value in enumerate(mask_values) if value != 0)
     if mask_bits not in (0b00111100, 0b00111111):
         raise ValueError("Triton BFGS optimizes the linear or complete six score parameters")
+    hinge_span = support.hinge_span
+    if hinge_span is None:
+        hinge_span = float(support.latent_upper) - float(support.latent_lower)
     common = dict(
         latent_lower=float(support.latent_lower),
         latent_upper=float(support.latent_upper),
         visible_lower=float(support.visible_lower),
         visible_upper=float(support.visible_upper),
+        hinge_span=float(hinge_span),
         friction=float(support.friction),
         temperature=float(support.temperature),
         parameter_mask=mask_bits,

@@ -14,7 +14,7 @@ from fit_teacher_cuda import (
     FitConfig,
     fit_batch,
     fit_target,
-    sampled_indices,
+    domain_sampled_indices,
 )
 from mlp_model import PolicySupport, conditional_policy_logits, scaled_softplus
 
@@ -79,6 +79,9 @@ def main() -> None:
         optimizer_host_check_interval=fit_plan["optimizerHostCheckInterval"],
         quality_fallback_iterations=fit_plan["qualityFallbackIterations"],
         input_queue_batches=fit_plan["inputQueueBatches"],
+        visible_sample_fraction=fit_plan["visibleSampleFraction"],
+        score_hinge_span=fit_plan["scoreHingeSpan"],
+        compact_visible_initialization=fit_plan["compactVisibleInitialization"],
     )
     support = PolicySupport(
         config.latent_lower,
@@ -87,9 +90,16 @@ def main() -> None:
         config.visible_upper,
         config.friction,
         1 / config.transition_log_scale,
+        config.score_hinge_span,
     )
-    state_indexes = sampled_indices(currents.numel(), config.sample_states, device)
-    action_indexes = sampled_indices(actions.numel(), config.sample_actions, device)
+    state_indexes = domain_sampled_indices(
+        currents, config.sample_states, config.metric_visible_lower,
+        config.metric_visible_upper, config.visible_sample_fraction,
+    )
+    action_indexes = domain_sampled_indices(
+        actions, config.sample_actions, config.metric_visible_lower,
+        config.metric_visible_upper, config.visible_sample_fraction,
+    )
     sampled_actions = actions[action_indexes]
     sampled_currents = currents[state_indexes]
     print(json.dumps({"event": "analysis-fit-baseline", "examples": count}), flush=True)

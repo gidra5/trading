@@ -11,8 +11,9 @@ import {
   prepareHandcraftedIndicatorStates,
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS,
-  MLP_OUTPUT_PARAMETER_COUNT,
+  MLP_OUTPUT_ACTION_COUNT,
   DEFAULT_DIRECT_INDICATOR_PARAMETERS,
+  DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   exposureProbabilityTransitionCrossEntropy,
   predictHandcraftedIndicatorRegret,
   prepareHandcraftedIndicatorStateAt,
@@ -53,7 +54,6 @@ import {
   type ExposureValueOracle,
   type HandcraftedIndicatorPredictorParameters,
   type DirectIndicatorPredictorParameters,
-  type MlpExposureStateInputs,
 } from "@trading/bot-algo";
 import { fetchBinanceSpotDailyShard } from "./binance-history-cache.js";
 import { HANDCRAFTED_PREDICTOR_PRESETS } from "./handcrafted-predictor-presets.js";
@@ -170,13 +170,14 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     handcraftedParameters: { ...DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS },
     directIndicatorParameters: { ...DEFAULT_DIRECT_INDICATOR_PARAMETERS },
     mlpModelId: "",
+    mlpOracleAlignment: "model-target",
   },
   oracleFriction: 0.00175,
   matchWindowMs: 2 * 3_600_000,
   timingHalfLifeMs: 10 * 60_000,
   warmupMultiple: 3,
   valueDistillation: {
-    gridSize: 151,
+    gridSize: DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
     minExposure: -100,
     maxExposure: 100,
     maxEffectiveExposure: 250,
@@ -481,6 +482,7 @@ export class KamaInspectorEngine {
     const request = normalizeRequest(input);
     const selected = resolveInspectorWindow(request.windowId, request.latestDays, this.now());
     validateWindowScale(selected, request.intervalMs);
+    const alignedPredictionDelayMs = await this.alignedMlpPredictionDelayMs(request);
     const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
       && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
@@ -495,7 +497,11 @@ export class KamaInspectorEngine {
         const evaluated: EvaluatedSegment[] = [];
         for (const [index, valueCandles] of segments.entries()) {
           throwIfInspectorCancelled(cancelFlag);
-          const scoreEndIndex = candleLowerBound(valueCandles, selected.endTime);
+          const oracleEndIndex = candleLowerBound(valueCandles, selected.endTime);
+          const scoreEndIndex = candleLowerBound(
+            valueCandles,
+            selected.endTime - alignedPredictionDelayMs,
+          );
           const candles = valueCandles.slice(0, scoreEndIndex);
           if (candles.length === 0) continue;
           const scoreStart = Math.max(
@@ -505,13 +511,17 @@ export class KamaInspectorEngine {
           if (scoreStart >= selected.endTime || candles.at(-1)!.openTime < scoreStart) continue;
           const scoreStartIndex = candleLowerBound(candles, scoreStart);
           const maxPoints = Math.max(100, Math.floor(MAX_CHART_CANDLES / segments.length));
-          const oracle = await this.oracle(cached, request, candles);
+          const oracle = await this.oracle(
+            cached,
+            request,
+            valueCandles.slice(0, oracleEndIndex),
+          );
           const valueOracle = await this.exposureOracle(
             cached,
             request,
             valueCandles,
             scoreStartIndex,
-            scoreEndIndex,
+            oracleEndIndex,
             oracle.stateCodes,
             sampledIndexes(candles.length, scoreStartIndex, maxPoints),
             cancelFlag,
@@ -575,6 +585,7 @@ export class KamaInspectorEngine {
   async candles(input: VwKamaCandleRangeRequest, cancelFlag?: Int32Array): Promise<VwKamaCandleRangeResponse> {
     throwIfInspectorCancelled(cancelFlag);
     const { request, selected } = normalizeCandleRangeRequest(input, this.now());
+    const alignedPredictionDelayMs = await this.alignedMlpPredictionDelayMs(request);
     const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
       && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
@@ -599,7 +610,10 @@ export class KamaInspectorEngine {
       const firstTime = segment[0]?.closeTime;
       const lastTime = segment.at(-1)?.closeTime;
       if (firstTime === undefined || lastTime === undefined) continue;
-      const traceTimes = renderedTimes.filter((time) => time >= firstTime && time <= lastTime);
+      const traceTimes = renderedTimes.filter((time) =>
+        time >= firstTime
+        && time <= lastTime
+        && time + alignedPredictionDelayMs < selected.endTime);
       if (traceTimes.length === 0) continue;
       const distributionTraceTimes = sampleEven(traceTimes, MAX_VALUE_DISTRIBUTIONS);
       const endIndex = candleLowerBound(segment, traceTimes.at(-1)! + 1);
@@ -788,6 +802,12 @@ export class KamaInspectorEngine {
     if (!Number.isFinite(input.time)) throw new Error("MLP prediction time must be finite.");
     const selected = resolveInspectorWindow(request.windowId, request.latestDays, this.now());
     validateWindowScale(selected, request.intervalMs);
+    const alignedPredictionDelayMs = await this.alignedMlpPredictionDelayMs(request);
+    if (input.time + alignedPredictionDelayMs >= selected.endTime) {
+      throw new Error(
+        `Aligned MLP prediction needs inputs ${alignedPredictionDelayMs} ms after the selected oracle timestamp.`,
+      );
+    }
     const sourceEndTime = selected.endTime + (request.valueDistillation!.valueHorizonMode === "fixed"
       && request.valueDistillation!.horizonEndMode === "extend"
       ? request.valueDistillation!.valueHorizonMs
@@ -945,45 +965,42 @@ export class KamaInspectorEngine {
   ): Promise<ReturnType<typeof handcraftedPredictorOptions> & {
     mlpPredictor?: {
       modelId: string;
-      rawParameters: Float32Array[];
+      actionLogits: Float32Array[];
+      modelActionGrid: number[];
     };
   }> {
     if (request.predictor?.model !== "mlp") return handcraftedPredictorOptions(request, candles);
-    const config = request.valueDistillation!;
-    const state: MlpExposureStateInputs = {
-      feeRate: request.oracleFriction,
-      minimumUsableExposure: config.minExposure,
-      maximumUsableExposure: config.maxExposure,
-      minimumEffectiveExposure: -config.maxEffectiveExposure,
-      maximumEffectiveExposure: config.maxEffectiveExposure,
-      quoteLendRate: config.quoteLendRate,
-      quoteBorrowRate: config.quoteBorrowRate,
-      assetBorrowRate: config.assetBorrowRate,
-    };
     if (!Number.isInteger(predictionStartIndex)
       || predictionStartIndex < 0
       || predictionStartIndex >= candles.length) {
       throw new Error("MLP prediction start index is outside the candle series.");
     }
-    const rawParameters = await this.mlpRuntime.predict(
+    const prediction = await this.mlpRuntime.predict(
       request.predictor.mlpModelId,
       oneSecondCandles,
       candles.slice(predictionStartIndex).map((candle) => candle.closeTime),
-      state,
       cancelFlag,
+      request.predictor.mlpOracleAlignment === "model-target",
     );
     return {
       mlpPredictor: {
         modelId: request.predictor.mlpModelId,
-        rawParameters: [
+        modelActionGrid: prediction.modelActionGrid,
+        actionLogits: [
           ...Array.from(
             { length: predictionStartIndex },
-            () => new Float32Array(MLP_OUTPUT_PARAMETER_COUNT),
+            () => new Float32Array(MLP_OUTPUT_ACTION_COUNT),
           ),
-          ...rawParameters,
+          ...prediction.actionLogits,
         ],
       },
     };
+  }
+
+  private async alignedMlpPredictionDelayMs(request: VwKamaInspectorRequest): Promise<number> {
+    if (request.predictor?.model !== "mlp"
+      || request.predictor.mlpOracleAlignment !== "model-target") return 0;
+    return this.mlpRuntime.predictionDelayMs(request.predictor.mlpModelId);
   }
 
   private cachedWindow(selected: VwKamaInspectorWindow, sourceEndTime: number): CachedWindow {
@@ -1021,7 +1038,7 @@ export class KamaInspectorEngine {
     request: VwKamaInspectorRequest,
     candles: Candle[],
   ): Promise<PerfectMarginOracleResult> {
-    const key = `${request.intervalMs}:${candles[0]!.openTime}:${request.oracleFriction}`;
+    const key = `${request.intervalMs}:${candles[0]!.openTime}:${candles.at(-1)!.closeTime}:${request.oracleFriction}`;
     const existing = cached.oracles.get(key);
     if (existing) return existing;
     const pending = Promise.resolve(perfectMarginOracle(candles, {
@@ -1833,6 +1850,7 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
       ...request.predictor?.directIndicatorParameters,
     },
     mlpModelId: request.predictor?.mlpModelId ?? "",
+    mlpOracleAlignment: request.predictor?.mlpOracleAlignment ?? "model-target",
   };
   if (request.predictor.model !== "legacy"
     && request.predictor.model !== "handcrafted"
@@ -1842,6 +1860,10 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   if (request.predictor.model === "mlp" && !request.predictor.mlpModelId) {
     throw new Error("VW-KAMA MLP predictor requires a selected trained model artifact.");
+  }
+  if (request.predictor.mlpOracleAlignment !== "model-target"
+    && request.predictor.mlpOracleAlignment !== "prediction-time") {
+    throw new Error("VW-KAMA MLP oracle alignment must be model-target or prediction-time.");
   }
   request.valueDistillation = {
     ...DEFAULT_REQUEST.valueDistillation!,

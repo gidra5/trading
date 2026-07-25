@@ -1,6 +1,7 @@
 import { For, Show, batch, createEffect, createMemo, createSignal, createUniqueId, onCleanup, onMount } from "solid-js";
-import { Activity, ArrowLeft, Info, RefreshCw } from "lucide-solid";
+import { Activity, ArrowLeft, BarChart3, Info, RefreshCw } from "lucide-solid";
 import {
+  DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   conditionalExposureProbabilities,
   conditionalQuadraticExposureProbabilities,
   fitConditionalQuadraticPolicy,
@@ -33,6 +34,7 @@ import type {
   VwKamaHistoricalAveragesResponse,
   VwKamaInspectorRequest,
   VwKamaInspectorResponse,
+  VwKamaMlpOracleAlignment,
   VwKamaParameters,
   VwKamaPreset,
   VwKamaPredictorFitResponse,
@@ -65,7 +67,7 @@ const detailTriggerCandles = detailMaxCandles * 4;
 const hoverPredictionThrottleMs = 300;
 const hoverPredictionCacheSize = 64;
 const defaultValueDistillation: VwKamaValueDistillationConfig = {
-  gridSize: 151,
+  gridSize: DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   minExposure: -100,
   maxExposure: 100,
   maxEffectiveExposure: 250,
@@ -244,6 +246,8 @@ export function KamaInspectorPage() {
     ...DEFAULT_DIRECT_INDICATOR_PARAMETERS,
   });
   const [mlpModelId, setMlpModelId] = createSignal("");
+  const [mlpOracleAlignment, setMlpOracleAlignment] =
+    createSignal<VwKamaMlpOracleAlignment>("model-target");
   const [selectedPredictorPresetId, setSelectedPredictorPresetId] = createSignal("custom");
   const [rankedPair, setRankedPair] = createSignal<"current" | "best" | "worst">("current");
   const [oracleFriction, setOracleFriction] = createSignal(0.00175);
@@ -592,10 +596,21 @@ export function KamaInspectorPage() {
       .sort((left, right) => left.time - right.time);
   });
   const inspectedTime = () => selectedTime() ?? cursorTime();
-  const selectedDistribution = createMemo(() => nearestValueDistribution(
-    valueDistributions(),
-    inspectedTime(),
-  ));
+  const alignedPredictionUnavailable = createMemo(() => {
+    const time = inspectedTime();
+    const analysis = result();
+    const model = selectedMlpModel();
+    return time !== undefined
+      && analysis !== undefined
+      && displayedPredictorModel() === "mlp"
+      && mlpOracleAlignment() === "model-target"
+      && model !== undefined
+      && time + model.predictionDelayMs >= analysis.window.endTime;
+  });
+  const selectedDistribution = createMemo(() => {
+    if (alignedPredictionUnavailable()) return undefined;
+    return nearestValueDistribution(valueDistributions(), inspectedTime());
+  });
   const comparisons = createMemo(() => compareTransitions(
     result()?.candidateTransitions ?? [],
     result()?.oracleTransitions ?? [],
@@ -655,6 +670,7 @@ export function KamaInspectorPage() {
     const forecastParameters = handcraftedParameters();
     const directParameters = directIndicatorParameters();
     const selectedMlpModel = mlpModelId();
+    const oracleAlignment = mlpOracleAlignment();
     const friction = oracleFriction();
     const matchWindow = matchWindowMs();
     const timingHalfLife = timingHalfLifeMs();
@@ -677,6 +693,7 @@ export function KamaInspectorPage() {
           handcraftedParameters: { ...forecastParameters },
           directIndicatorParameters: { ...directParameters },
           mlpModelId: selectedMlpModel,
+          mlpOracleAlignment: oracleAlignment,
         },
         oracleFriction: friction,
         matchWindowMs: matchWindow,
@@ -754,6 +771,15 @@ export function KamaInspectorPage() {
     predictionTimer = undefined;
     const sequence = ++predictionSequence;
     if (!request || !analysis || request.predictor?.model !== "mlp" || time === undefined) {
+      predictionController?.abort();
+      predictionController = undefined;
+      setPredictionError(undefined);
+      return;
+    }
+    const model = catalog()?.mlpModels.find((item) => item.id === request.predictor!.mlpModelId);
+    if (request.predictor.mlpOracleAlignment === "model-target"
+      && model
+      && time + model.predictionDelayMs >= analysis.window.endTime) {
       predictionController?.abort();
       predictionController = undefined;
       setPredictionError(undefined);
@@ -842,6 +868,7 @@ export function KamaInspectorPage() {
         ...predictor?.directIndicatorParameters,
       });
       setMlpModelId(predictor?.mlpModelId || next.mlpModels[0]?.id || "");
+      setMlpOracleAlignment(predictor?.mlpOracleAlignment ?? "model-target");
       setSelectedPredictorPresetId(
         next.predictorPresets.find((preset) => preset.scope === "global"
           && preset.model === (predictor?.model ?? "handcrafted"))?.id ?? "custom",
@@ -1093,6 +1120,9 @@ export function KamaInspectorPage() {
             </p>
           </div>
           <div class="flex flex-wrap gap-2">
+            <a class="btn" href="#/portfolio-index">
+              <BarChart3 size={16} /> Basis Index
+            </a>
             <a class="btn" href="#/mlp-training">
               <Activity size={16} /> MLP Training
             </a>
@@ -1313,7 +1343,7 @@ export function KamaInspectorPage() {
                   options={[
                     { value: "handcrafted", label: "Handcrafted drift/variance forecast" },
                     { value: "direct-indicator", label: "Direct indicator → 6-parameter quadratic distribution" },
-                    { value: "mlp", label: "MLP · 8-parameter quadratic + hard-cutoff distribution" },
+                    { value: "mlp", label: "MLP · direct 255-action distribution" },
                     { value: "legacy", label: "Legacy KAMA-rate distribution" },
                   ]}
                   onInput={(value) => choosePredictorModel(value as VwKamaPredictorModel)}
@@ -1410,6 +1440,21 @@ export function KamaInspectorPage() {
                       : [{ value: "", label: "No trained model · run npm run mlp:train" }]}
                     onInput={setMlpModelId}
                   />
+                  <InspectorSelect
+                    label="Oracle comparison timing"
+                    value={mlpOracleAlignment()}
+                    options={[
+                      {
+                        value: "model-target",
+                        label: "Aligned target time · prediction t + delay vs oracle t",
+                      },
+                      {
+                        value: "prediction-time",
+                        label: "Same timestamp · prediction t vs oracle t",
+                      },
+                    ]}
+                    onInput={(value) => setMlpOracleAlignment(value as VwKamaMlpOracleAlignment)}
+                  />
                   <Show when={selectedMlpModel()} fallback={(
                     <div class="text-xs text-amber-300 md:col-span-2">
                       Build an oracle dataset and train an artifact before running the MLP predictor.
@@ -1418,18 +1463,28 @@ export function KamaInspectorPage() {
                     {(model) => (
                       <div class="text-xs text-ink-400 md:col-span-2">
                         {model().id} · verified {model().executionProvider.toUpperCase()}
+                        {' '}· policy delay {formatDuration(model().predictionDelayMs)}
+                        {' '}· {mlpOracleAlignment() === "model-target"
+                          ? `aligned predictions are plotted ${formatDuration(model().predictionDelayMs)} earlier at their oracle target time`
+                          : "same-timestamp diagnostic; model delay is not applied to the comparison"}
                         <Show when={model().training}>
                           {(training) => <>
                             {' '}· train / validation / test {training().trainExamples.toLocaleString()} / {training().validationExamples.toLocaleString()} / {training().testExamples.toLocaleString()}
                             {' '}· validation loss {formatQuote(training().bestValidationLoss, 5)} · test loss {formatQuote(training().testLoss, 5)}
+                            <Show when={training().bestEpoch !== undefined}>
+                              {' '}· best epoch {(training().bestEpoch ?? 0) + 1}
+                            </Show>
                             <Show when={training().finalizedEarly}>{' '}· finalized early</Show>
                             <Show when={training().testMetrics}>
                               {(metrics) => <>
-                                {' '}· test CE {formatQuote(metrics().crossEntropy, 5)}
+                                {' '}· test KL {formatQuote(metrics().klDivergence, 5)}
+                                <Show when={metrics().klDivergenceStdDev !== undefined}>
+                                  {' '}± {formatQuote(metrics().klDivergenceStdDev ?? 0, 5)}
+                                </Show>
+                                {' '}· base KL {formatQuote(metrics().baseKlDivergence, 5)}
                                 {' '}· probability MSE {formatQuote(metrics().probabilityMse, 7)}
-                                {' '}· parameter MSE {formatQuote(metrics().parameterMse, 5)}
                                 {' '}· excess entropy {formatQuote(metrics().excessEntropy, 5)}
-                                {' '}· State MI {formatQuote(metrics().stateMutualInformation, 5)}
+                                {' '}· Temporal MI {formatQuote(metrics().temporalMutualInformation, 5)}
                                 {' '}· Oracle MI {formatQuote(metrics().oracleMutualInformation, 5)}
                                 <Show when={metrics().distanceImbalanceWeight}>
                                   {(value) => <>{' '}· mean persistent advice weight {formatQuote(value(), 5)}</>}
@@ -1441,8 +1496,18 @@ export function KamaInspectorPage() {
                             </Show>
                             <Show when={training().bestValidationMetrics}>
                               {(metrics) => <>
-                                {' '}· validation CE {formatQuote(metrics().crossEntropy, 5)}
-                                {' '}· validation parameter MSE {formatQuote(metrics().parameterMse, 5)}
+                                {' '}· validation KL {formatQuote(metrics().klDivergence, 5)}
+                                <Show when={metrics().klDivergenceStdDev !== undefined}>
+                                  {' '}± {formatQuote(metrics().klDivergenceStdDev ?? 0, 5)}
+                                </Show>
+                                {' '}· validation base KL {formatQuote(metrics().baseKlDivergence, 5)}
+                              </>}
+                            </Show>
+                            <Show when={training().curriculum}>
+                              {(curriculum) => <>
+                                {' '}· curriculum stage {curriculum().stage}
+                                {' '}· parent {curriculum().parentKey}
+                                {' '}· weight profile {curriculum().weightProfile}
                               </>}
                             </Show>
                             <Show when={training().teacherFitMetrics}>
@@ -1450,6 +1515,11 @@ export function KamaInspectorPage() {
                                 {' '}· revised-fitter oracle CE {formatQuote(metrics().crossEntropy, 5)}
                                 {' '}· revised-fitter oracle MSE {formatQuote(metrics().meanSquaredError, 7)}
                                 {' '}· fitter convergence {ratioPercent(metrics().converged)}
+                              </>}
+                            </Show>
+                            <Show when={training().lossWeights}>
+                              {(weights) => <>
+                                {' '}· weights {Object.entries(weights()).map(([name, value]) => `${name}=${formatQuote(value, 3)}`).join(', ')}
                               </>}
                             </Show>
                           </>}
@@ -1943,6 +2013,15 @@ export function KamaInspectorPage() {
                     emptyLabel="No analyzed candles"
                   />
                 </div>
+                <Show when={alignedPredictionUnavailable() && selectedMlpModel()}>
+                  {(model) => (
+                    <div class="mt-3 rounded-2 border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-200">
+                      This oracle timestamp has no aligned forecast yet: the selected model needs
+                      {' '}{formatDuration(model().predictionDelayMs)} of later input. Switch comparison
+                      timing to “Same timestamp” to inspect the unshifted diagnostic instead.
+                    </div>
+                  )}
+                </Show>
                 <Show when={selectedDistribution()}>
                   {(point) => (
                     <div class="mt-3 rounded-2 border border-line bg-ink-800/50 p-3">

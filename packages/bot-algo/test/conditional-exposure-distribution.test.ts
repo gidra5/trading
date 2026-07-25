@@ -26,6 +26,10 @@ const parameters = conditionalFourSegmentParametersFromRaw(raw, support);
 
 test("eight raw coordinates decode effective-range geometry and a quadratic score", () => {
   assert.equal(CONDITIONAL_FOUR_SEGMENT_PARAMETER_COUNT, 8);
+  assert.throws(
+    () => conditionalFourSegmentParametersFromRaw(raw.slice(0, 6), support),
+    /must contain 8 values/,
+  );
   assert.equal(parameters.kappaC1, 82 / 500);
   assert.equal(parameters.kappaX, 678 / 500);
   assert.equal(parameters.kappaC2, 82 / 500);
@@ -34,6 +38,16 @@ test("eight raw coordinates decode effective-range geometry and a quadratic scor
   assert.equal(parameters.quadraticPrecision, raw[3]! / 62_500);
   assert.equal(parameters.cutoffLower, -250);
   assert.equal(parameters.cutoffUpper, 250);
+});
+
+test("explicit usable-span calibration survives wider effective support", () => {
+  const compactSharpness = conditionalFourSegmentParametersFromRaw(raw, {
+    ...support,
+    hingeSpan: 200,
+  });
+  assert.equal(compactSharpness.kappaC1, 82 / 200);
+  assert.equal(compactSharpness.kappaX, 678 / 200);
+  assert.equal(compactSharpness.kappaC2, 82 / 200);
 });
 
 test("conditional rows use strict visible truncation and normalization", () => {

@@ -14,6 +14,8 @@ import {
   type Candle,
 } from "@trading/bot-algo";
 
+const TEACHER_METRIC_COUNT = 7;
+
 interface TrainingPlan {
   id: string;
   dataDir: string;
@@ -51,6 +53,9 @@ interface TrainingPlan {
     optimizerBackend: "pytorch-batched" | "triton-queued";
     optimizerHostCheckInterval: number;
     qualityFallbackIterations: number;
+    visibleSampleFraction: number;
+    scoreHingeSpan: number;
+    compactVisibleInitialization: boolean;
     inputAlignmentFloats: number;
     inputQueueBatches: number;
     pipelinedRefinement: boolean;
@@ -176,6 +181,7 @@ async function main(): Promise<void> {
     latentUpper: plan.execution.maximumEffectiveExposure,
     visibleLower: plan.execution.minimumEffectiveExposure,
     visibleUpper: plan.execution.maximumEffectiveExposure,
+    hingeSpan: plan.teacherFit.scoreHingeSpan,
     friction: feeRate,
     temperature: plan.execution.temperature,
   });
@@ -429,6 +435,9 @@ function fitSingleCase(
       optimizer_backend: plan.teacherFit.optimizerBackend,
       optimizer_host_check_interval: plan.teacherFit.optimizerHostCheckInterval,
       quality_fallback_iterations: plan.teacherFit.qualityFallbackIterations,
+      visible_sample_fraction: plan.teacherFit.visibleSampleFraction,
+      score_hinge_span: plan.teacherFit.scoreHingeSpan,
+      compact_visible_initialization: plan.teacherFit.compactVisibleInitialization,
       input_row_stride: rowStride,
       input_queue_batches: 1,
       pipelined_refinement: false,
@@ -466,18 +475,21 @@ function findWorstFit(dataset: string, shards: DatasetShard[]): WorstFit {
     const metrics = float32File(path.join(dataset, shard.teacherMetrics));
     const raw = float32File(path.join(dataset, shard.teacherParameters));
     const times = int64File(path.join(dataset, shard.times));
-    if (metrics.length !== shard.count * 6 || raw.length !== shard.count * 8
+    if (metrics.length !== shard.count * TEACHER_METRIC_COUNT || raw.length !== shard.count * 8
       || times.length !== shard.count) {
       throw new Error(`Shard ${shard.split}:${shard.date} has inconsistent array sizes.`);
     }
     for (let row = 0; row < shard.count; row += 1) {
-      const kl = metrics[row * 6 + 1]!;
+      const kl = metrics[row * TEACHER_METRIC_COUNT + 1]!;
       if (!Number.isFinite(kl) || worst && kl <= worst.metrics[1]!) continue;
       worst = {
         shard,
         row,
         time: Number(times[row]),
-        metrics: Array.from(metrics.slice(row * 6, row * 6 + 6)),
+        metrics: Array.from(metrics.slice(
+          row * TEACHER_METRIC_COUNT,
+          (row + 1) * TEACHER_METRIC_COUNT,
+        )),
         raw: Array.from(raw.slice(row * 8, row * 8 + 8)),
       };
     }

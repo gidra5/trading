@@ -2,8 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount }
 import { createStore, reconcile, unwrap } from "solid-js/store";
 import {
   Activity,
-  ChevronDown,
-  ChevronRight,
+  BarChart3,
   Check,
   MinusCircle,
   Play,
@@ -70,8 +69,6 @@ import type {
   BinanceExchangeSnapshot,
   BinanceMarketCatalog,
   BinanceMarketListing,
-  CorrelationEntry,
-  CorrelationSnapshot,
   MarketGroup,
   RuntimeSnapshot,
 } from "./types";
@@ -108,8 +105,6 @@ interface BacktestSettings {
   randomPairCount: number;
 }
 
-type CorrelationSortMode = "abs-desc" | "abs-asc" | "value-desc" | "value-asc";
-
 const defaultBacktestSettings: BacktestSettings = {
   extremaSmaWindowMinutes: 30,
   historicalDays: 30,
@@ -141,16 +136,12 @@ export function App() {
   const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog>();
   const [marketError, setMarketError] = createSignal<string>();
   const [switchingMarketId, setSwitchingMarketId] = createSignal<string>();
-  const [correlationSortMode, setCorrelationSortMode] =
-    createSignal<CorrelationSortMode>("abs-desc");
-  const [correlationError, setCorrelationError] = createSignal<string>();
   let socket: WebSocket | undefined;
   let reconnectTimer: number | undefined;
   let runClockTimer: number | undefined;
   let pendingSocketSnapshot: RuntimeSnapshot | undefined;
   let socketSnapshotTimer: number | undefined;
   let disposed = false;
-  let requestedCorrelationMarketId: string | undefined;
   let lastSnapshotSource: string | undefined;
   let lastSnapshotSeq = 0;
 
@@ -170,7 +161,6 @@ export function App() {
   );
   const events = createMemo(() => snapshot()?.recentEvents ?? []);
   const backtest = createMemo(() => snapshot()?.backtest);
-  const correlations = createMemo(() => snapshot()?.correlations);
   const exchange = createMemo(() => snapshot()?.exchange);
   const hasClosablePositions = createMemo(() => {
     return (bot()?.state.positions ?? []).some((position) => position.asset > 0.00000001);
@@ -423,34 +413,6 @@ export function App() {
 
     applySnapshot(payload as RuntimeSnapshot);
   };
-
-  const loadCorrelations = async (refresh = false) => {
-    setCorrelationError(undefined);
-    const response = await fetch(`${apiBase}/api/correlations`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ refresh }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setCorrelationError(payload.error ?? "Correlation request failed");
-      return;
-    }
-
-    applySnapshot(payload as RuntimeSnapshot);
-  };
-
-  createEffect(() => {
-    const marketId = market()?.id;
-    if (!marketId || requestedCorrelationMarketId === marketId) {
-      return;
-    }
-
-    requestedCorrelationMarketId = marketId;
-    void loadCorrelations();
-  });
 
   const applyConfig = async () => {
     const config = configDraft();
@@ -712,6 +674,10 @@ export function App() {
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
+            <a class={buttonPanelClass} href="#/portfolio-index">
+              <BarChart3 size={16} />
+              Basis Index
+            </a>
             <a class={buttonPanelClass} href="#/mlp-training">
               <Activity size={16} />
               MLP Training
@@ -823,14 +789,6 @@ export function App() {
             <OrderBookPanel snapshot={snapshot()} />
           </div>
         </section>
-
-        <CorrelationPanel
-          snapshot={correlations()}
-          sortMode={correlationSortMode()}
-          error={correlationError()}
-          onSortChange={setCorrelationSortMode}
-          onRefresh={(refresh) => void loadCorrelations(refresh)}
-        />
 
         <section class="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
           <div class="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-2">
@@ -2662,225 +2620,6 @@ function OrderBookPanel(props: { snapshot?: RuntimeSnapshot }) {
       </div>
     </div>
   );
-}
-
-function CorrelationPanel(props: {
-  snapshot?: CorrelationSnapshot;
-  sortMode: CorrelationSortMode;
-  error?: string;
-  onSortChange: (mode: CorrelationSortMode) => void;
-  onRefresh: (refresh: boolean) => void;
-}) {
-  const [isExpanded, setIsExpanded] = createSignal(false);
-  const snapshot = () => props.snapshot;
-  const entries = createMemo(() =>
-    sortCorrelationEntries(snapshot()?.entries ?? [], props.sortMode),
-  );
-  const isRunning = () => snapshot()?.status === "running";
-  const progress = () => {
-    const current = snapshot()?.calculatedPairs ?? 0;
-    const total = snapshot()?.expectedPairs ?? 0;
-    if (total <= 0) {
-      return isRunning() ? 0 : 100;
-    }
-    return Math.max(0, Math.min(100, (current / total) * 100));
-  };
-  const message = () =>
-    props.error ?? snapshot()?.error ?? snapshot()?.message ?? "Correlations have not been computed yet";
-
-  return (
-    <section class="panel min-w-0 overflow-hidden">
-      <div class="mb-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-        <div>
-          <div class="muted-label">Correlations</div>
-          <h2 class="text-lg font-semibold">
-            {snapshot()?.focalDisplaySymbol ?? "Asset"} vector
-          </h2>
-        </div>
-        <div class="flex flex-wrap items-center gap-2">
-          <Show when={isExpanded()}>
-            <For each={correlationSortModes}>
-              {(mode) => (
-                <button
-                  class="rounded-2 border px-2.5 py-1.5 text-xs font-semibold transition"
-                  classList={{
-                    "border-accent bg-accent text-ink-950": props.sortMode === mode.value,
-                    "border-line bg-ink-800 text-ink-300 hover:border-accent hover:text-ink-100":
-                      props.sortMode !== mode.value,
-                  }}
-                  onClick={() => props.onSortChange(mode.value)}
-                  type="button"
-                >
-                  {mode.label}
-                </button>
-              )}
-            </For>
-          </Show>
-          <button
-            class="btn px-2.5"
-            disabled={isRunning()}
-            onClick={() => props.onRefresh(true)}
-            type="button"
-          >
-            <RefreshCw size={16} class={isRunning() ? "animate-spin" : ""} />
-          </button>
-          <button
-            aria-controls="correlation-panel-content"
-            aria-expanded={isExpanded()}
-            aria-label={isExpanded() ? "Collapse correlations" : "Expand correlations"}
-            class="btn px-2.5"
-            onClick={() => setIsExpanded((value) => !value)}
-            title={isExpanded() ? "Collapse correlations" : "Expand correlations"}
-            type="button"
-          >
-            <Show when={isExpanded()} fallback={<ChevronRight size={16} />}>
-              <ChevronDown size={16} />
-            </Show>
-          </button>
-        </div>
-      </div>
-
-      <Show when={isExpanded()}>
-        <div id="correlation-panel-content">
-          <Show when={props.error ?? snapshot()?.error}>
-            {(error) => <div class="mb-3 rounded-2 bg-loss/12 p-3 text-sm text-loss">{error()}</div>}
-          </Show>
-
-          <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-6">
-            <SmallMetric
-              label="Pairs"
-              value={`${formatQuote(snapshot()?.calculatedPairs, 0)} / ${formatQuote(
-                snapshot()?.expectedPairs,
-                0,
-              )}`}
-            />
-            <SmallMetric label="Markets" value={formatQuote(snapshot()?.marketCount, 0)} />
-            <SmallMetric label="Lookback" value={formatDuration(snapshot()?.lookbackMs)} />
-            <SmallMetric label="Requests" value={formatQuote(snapshot()?.requests, 0)} />
-            <SmallMetric
-              label="Cache"
-              value={snapshot()?.cacheLoaded ? "Vector" : formatQuote(snapshot()?.cacheFetchedCandles, 0)}
-            />
-            <SmallMetric label="Stream" value={snapshot()?.streamConnected ? "Live" : "Idle"} />
-          </div>
-
-          <div class="mb-4 rounded-2 bg-ink-800 p-3">
-            <div class="mb-2 flex items-center justify-between gap-3">
-              <div class="min-w-0 truncate text-sm text-ink-100">
-                {message()}
-                <Show when={snapshot()?.truncated}>
-                  <span class="ml-2 text-warn">max {formatQuote(snapshot()?.marketCount, 0)} markets</span>
-                </Show>
-              </div>
-              <div class="shrink-0 text-sm tabular-nums text-ink-300">
-                {formatPercent(progress())}
-              </div>
-            </div>
-            <div class="h-2 overflow-hidden rounded-full bg-ink-700">
-              <div
-                class="h-full bg-accent transition-all"
-                style={{ width: `${progress()}%` }}
-              />
-            </div>
-          </div>
-
-          <div class="max-w-full overflow-x-auto">
-            <table class="w-full min-w-180">
-              <thead>
-                <tr>
-                  <th class="table-head pb-2">Asset</th>
-                  <th class="table-head pb-2">Correlation</th>
-                  <th class="table-head pb-2">Abs</th>
-                  <th class="table-head pb-2">Samples</th>
-                  <th class="table-head pb-2">Window</th>
-                  <th class="table-head pb-2">Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                <For each={entries()} fallback={<EmptyRow columns={6} label="No correlations yet" />}>
-                  {(entry) => (
-                    <tr>
-                      <td class="td-cell">
-                        <div class="font-semibold text-ink-100">{entry.displaySymbol}</div>
-                        <div class="mt-1 text-xs text-ink-300">{entry.symbol}</div>
-                      </td>
-                      <td
-                        class="td-cell font-semibold tabular-nums"
-                        classList={{
-                          "text-gain": (entry.correlation ?? 0) > 0,
-                          "text-loss": (entry.correlation ?? 0) < 0,
-                          "text-ink-300": entry.correlation === undefined,
-                        }}
-                      >
-                        {formatCorrelation(entry.correlation)}
-                      </td>
-                      <td class="td-cell tabular-nums">
-                        {formatCorrelation(
-                          entry.correlation === undefined ? undefined : Math.abs(entry.correlation),
-                        )}
-                      </td>
-                      <td class="td-cell tabular-nums">{formatQuote(entry.samples, 0)}</td>
-                      <td class="td-cell text-ink-300">
-                        {formatDateTime(entry.startTime)} - {formatDateTime(entry.endTime)}
-                      </td>
-                      <td class="td-cell text-ink-300">{formatTime(entry.updatedAt)}</td>
-                    </tr>
-                  )}
-                </For>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </Show>
-    </section>
-  );
-}
-
-const correlationSortModes: Array<{ value: CorrelationSortMode; label: string }> = [
-  { value: "abs-desc", label: "|r| desc" },
-  { value: "abs-asc", label: "|r| asc" },
-  { value: "value-desc", label: "r desc" },
-  { value: "value-asc", label: "r asc" },
-];
-
-function sortCorrelationEntries(
-  entries: CorrelationEntry[],
-  mode: CorrelationSortMode,
-): CorrelationEntry[] {
-  return [...entries].sort((a, b) => {
-    const aValue = sortableCorrelationValue(a, mode);
-    const bValue = sortableCorrelationValue(b, mode);
-    const aMissing = aValue === undefined;
-    const bMissing = bValue === undefined;
-    if (aMissing || bMissing) {
-      if (aMissing && bMissing) {
-        return a.displaySymbol.localeCompare(b.displaySymbol);
-      }
-      return aMissing ? 1 : -1;
-    }
-
-    const direction = mode === "abs-asc" || mode === "value-asc" ? 1 : -1;
-    return (aValue - bValue) * direction || a.displaySymbol.localeCompare(b.displaySymbol);
-  });
-}
-
-function sortableCorrelationValue(
-  entry: CorrelationEntry,
-  mode: CorrelationSortMode,
-): number | undefined {
-  if (!Number.isFinite(entry.correlation)) {
-    return undefined;
-  }
-
-  return mode.startsWith("abs") ? Math.abs(entry.correlation as number) : entry.correlation;
-}
-
-function formatCorrelation(value: number | undefined): string {
-  if (!Number.isFinite(value)) {
-    return "-";
-  }
-
-  return formatQuote(value, 3);
 }
 
 function OrdersPanel(props: { title: string; orders: readonly TradingOrderSnapshot[] }) {

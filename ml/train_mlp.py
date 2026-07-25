@@ -5,8 +5,14 @@ import json
 import math
 import os
 import random
+import struct
+import subprocess
+import tempfile
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -16,38 +22,109 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
+
+if os.name == "posix" and os.environ.get("TMPDIR", "").startswith("/mnt/"):
+    os.environ["TMPDIR"] = "/tmp"
+    tempfile.tempdir = "/tmp"
+
 from mlp_model import (
+    DirectLossWeights,
+    FEATURE_SCHEMA_VERSION,
     HIDDEN_LAYER_COUNT,
     HIDDEN_WIDTH,
     INPUT_FEATURE_COUNT,
-    OUTPUT_PARAMETER_COUNT,
+    OUTPUT_ACTION_COUNT,
+    TEACHER_PARAMETER_COUNT,
     ExposureMlp,
-    LossWeights,
     PolicySupport,
     TimeWeighting,
-    conditional_policy_logits,
-    distance_imbalance_advice,
-    fitted_teacher_loss,
+    direct_oracle_loss,
     parameter_count,
-    persistent_distance_imbalance_time_weights,
     validate_time_weighting,
 )
 
 
 METRIC_NAMES = (
     "loss",
-    "crossEntropy",
+    "klDivergence",
+    "klDivergenceVariance",
+    "klDivergenceStdDev",
+    "baseKlDivergence",
     "probabilityMse",
-    "parameterMse",
+    "probabilityMseVariance",
+    "probabilityMseStdDev",
     "excessEntropy",
-    "stateMutualInformation",
+    "temporalMutualInformation",
+    "targetTemporalMutualInformation",
+    "temporalMutualInformationReward",
     "oracleMutualInformation",
     "targetEntropy",
     "predictedEntropy",
-    "rawParameterMae",
     "distanceImbalanceWeight",
     "timeWeightEffectiveSampleRatio",
 )
+TRAIN_METRIC_NAMES = METRIC_NAMES
+KL_MOMENT_METRIC_NAMES = frozenset((
+    "klDivergence",
+    "klDivergenceVariance",
+    "klDivergenceStdDev",
+))
+PROBABILITY_MSE_MOMENT_METRIC_NAMES = frozenset((
+    "probabilityMse",
+    "probabilityMseVariance",
+    "probabilityMseStdDev",
+))
+TIME_BLOCK_METRIC_NAMES = frozenset((
+    "temporalMutualInformation",
+    "targetTemporalMutualInformation",
+    "temporalMutualInformationReward",
+    "oracleMutualInformation",
+))
+
+
+def merge_weighted_moments(
+    total_weight: Tensor,
+    total_mean: Tensor,
+    total_centered_square_sum: Tensor,
+    batch_weight: Tensor,
+    batch_mean: Tensor,
+    batch_centered_square_sum: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Merge weighted batch moments without losing precision to raw E[x²] sums."""
+    combined_weight = total_weight + batch_weight
+    safe_weight = combined_weight.clamp_min(1e-12)
+    delta = batch_mean - total_mean
+    combined_mean = total_mean + delta * batch_weight / safe_weight
+    combined_centered_square_sum = (
+        total_centered_square_sum
+        + batch_centered_square_sum
+        + delta.square() * total_weight * batch_weight / safe_weight
+    )
+    return combined_weight, combined_mean, combined_centered_square_sum
+
+
+def weighted_standard_deviation(
+    centered_square_sum: Tensor,
+    weight_sum: Tensor,
+) -> Tensor:
+    """Population standard deviation under the persisted example weights."""
+    return (
+        centered_square_sum / weight_sum.clamp_min(1e-12)
+    ).clamp_min(0).sqrt()
+
+
+def weighted_variance(
+    centered_square_sum: Tensor,
+    weight_sum: Tensor,
+) -> Tensor:
+    """Population variance under the persisted example weights."""
+    return (
+        centered_square_sum / weight_sum.clamp_min(1e-12)
+    ).clamp_min(0)
 
 
 @dataclass(frozen=True)
@@ -55,20 +132,98 @@ class Shard:
     root: Path
     count: int
     features: str
+    feature_row_offset: int
+    feature_row_stride: int
     teacher_parameters: str
     teacher_metrics: str
-    times: str
+    raw_oracle_probabilities: str
+    minute_oracle_probabilities: str
+    resolution_divergence: str
+    oracle_row_offset: int
+    oracle_row_stride: int
+    base_time_weights: str
+    time_weights: str
+    prediction_time_start: int
+    oracle_target_time_start: int
+
+
+class RuntimeMinuteOracleRows:
+    """A per-second view over one runtime-computed oracle row per completed minute."""
+
+    def __init__(
+        self,
+        probabilities_by_day: dict[int, np.ndarray],
+        shard: Shard,
+        action_count: int,
+    ) -> None:
+        self.probabilities_by_day = probabilities_by_day
+        self.day_start = shard.oracle_target_time_start // 86_400_000 * 86_400_000
+        self.row_offset = shard.oracle_row_offset
+        self.row_stride = shard.oracle_row_stride
+        self.count = shard.count
+        self.action_count = action_count
+        if self.day_start not in probabilities_by_day:
+            raise ValueError(
+                "runtime one-minute oracle is missing target day "
+                f"{utc_date(self.day_start)}"
+            )
+
+    def __getitem__(self, key) -> np.ndarray:
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.count)
+            local_rows = np.arange(start, stop, step, dtype=np.int64)
+            return self._rows(local_rows)
+        local_row = int(key)
+        if local_row < 0:
+            local_row += self.count
+        if local_row < 0 or local_row >= self.count:
+            raise IndexError(local_row)
+        return self._rows(np.asarray([local_row], dtype=np.int64))[0]
+
+    def _rows(self, local_rows: np.ndarray) -> np.ndarray:
+        oracle_rows = self.row_offset + local_rows * self.row_stride
+        coarse_rows = oracle_rows // 60 + (oracle_rows % 60 == 59)
+        source = self.probabilities_by_day[self.day_start]
+        if coarse_rows.size and (
+            int(coarse_rows.min()) < 0 or int(coarse_rows.max()) >= source.shape[0]
+        ):
+            raise IndexError("runtime one-minute oracle row is outside its UTC day")
+        return source[coarse_rows]
 
 
 class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]):
-    def __init__(self, manifest: dict, root: Path, split: str) -> None:
+    def __init__(
+        self,
+        manifest: dict,
+        root: Path,
+        split: str,
+        *,
+        target: str = "rawOracleProbabilities",
+        runtime_minute_oracles: dict[int, np.ndarray] | None = None,
+    ) -> None:
+        if target not in (
+            "rawOracleProbabilities",
+            "minuteOracleProbabilities",
+            "teacherParameters",
+        ):
+            raise ValueError("unknown MLP dataset target representation")
         self.split = split
+        self.target = target
         self.feature_count = int(manifest["featureCount"])
         self.parameter_count = int(manifest["teacherParameterCount"])
+        self.action_count = int(manifest["actionCount"])
         self.teacher_metric_count = int(manifest["teacherMetricCount"])
-        self.parts: list[tuple[Shard, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        self.manifest_sampling_interval_ms = int(manifest["samplingIntervalMs"])
+        self.parts: list[
+            tuple[Shard, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = []
         self.offsets: list[int] = []
+        self.temporal_runs: list[tuple[int, int]] = []
+        self.storage_runs: list[tuple[int, int, str]] = []
+        self.group_batches_by_storage = False
         total = 0
+        run_start = 0
+        previous_prediction_time: int | None = None
         for value in manifest["shards"]:
             if value["split"] != split:
                 continue
@@ -76,30 +231,83 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
                 root,
                 int(value["count"]),
                 value["features"],
+                int(value["featureRowOffset"]),
+                int(value["featureRowStride"]),
                 value["teacherParameters"],
                 value["teacherMetrics"],
-                value["times"],
+                value["rawOracleProbabilities"],
+                value["minuteOracleProbabilities"],
+                value["resolutionDivergence"],
+                int(value["oracleRowOffset"]),
+                int(value["oracleRowStride"]),
+                value["baseTimeWeights"],
+                value["timeWeights"],
+                int(value["predictionTimeStart"]),
+                int(value.get(
+                    "oracleTargetTimeStart",
+                    int(value["predictionTimeStart"])
+                    - int(manifest.get("predictionDelayMs", 0)),
+                )),
             )
-            features = np.memmap(
-                root / shard.features, mode="r", dtype="<f2", shape=(shard.count, self.feature_count)
+            if previous_prediction_time is not None \
+                    and shard.prediction_time_start != previous_prediction_time \
+                    + self.manifest_sampling_interval_ms:
+                self.temporal_runs.append((run_start, total))
+                run_start = total
+            features = component_rows(
+                root / shard.features, "<f2", self.feature_count,
+                shard.feature_row_offset, shard.feature_row_stride, shard.count,
             )
-            targets = np.memmap(
-                root / shard.teacher_parameters,
-                mode="r",
-                dtype="<f4",
-                shape=(shard.count, self.parameter_count),
+            teacher_parameters = component_rows(
+                root / shard.teacher_parameters, "<f4", self.parameter_count,
+                shard.oracle_row_offset, shard.oracle_row_stride, shard.count,
             )
-            teacher_metrics = np.memmap(
-                root / shard.teacher_metrics,
-                mode="r",
-                dtype="<f4",
-                shape=(shard.count, self.teacher_metric_count),
+            teacher_metrics = component_rows(
+                root / shard.teacher_metrics, "<f4", self.teacher_metric_count,
+                shard.oracle_row_offset, shard.oracle_row_stride, shard.count,
             )
-            times = np.memmap(root / shard.times, mode="r", dtype="<i8", shape=(shard.count,))
-            self.parts.append((shard, features, targets, teacher_metrics, times))
+            if target == "minuteOracleProbabilities":
+                if manifest.get("minuteOracleMap", {}).get("storage") \
+                        == "computed-directly-at-training-startup":
+                    if runtime_minute_oracles is None:
+                        raise ValueError(
+                            "runtime one-minute targets were not prepared"
+                        )
+                    direct_target_probabilities = RuntimeMinuteOracleRows(
+                        runtime_minute_oracles, shard, self.action_count
+                    )
+                else:
+                    direct_target_probabilities = np.memmap(
+                        root / shard.minute_oracle_probabilities,
+                        mode="r",
+                        dtype="<f4",
+                        shape=(shard.count, self.action_count),
+                    )
+            else:
+                direct_target_probabilities = component_rows(
+                    root / shard.raw_oracle_probabilities, "<f4", self.action_count,
+                    shard.oracle_row_offset, shard.oracle_row_stride, shard.count,
+                )
+            time_weights = np.memmap(
+                root / shard.time_weights, mode="r", dtype="<f4", shape=(shard.count,)
+            )
+            self.parts.append((
+                shard,
+                features,
+                teacher_parameters,
+                teacher_metrics,
+                direct_target_probabilities,
+                time_weights,
+            ))
             total += shard.count
             self.offsets.append(total)
-        self.time_weights = np.ones(total, dtype=np.float32)
+            self.storage_runs.append((total - shard.count, total, shard.features))
+            self.group_batches_by_storage = self.group_batches_by_storage \
+                or shard.features.endswith(".zst")
+            previous_prediction_time = shard.prediction_time_start \
+                + (shard.count - 1) * self.manifest_sampling_interval_ms
+        if total > run_start:
+            self.temporal_runs.append((run_start, total))
 
     def __len__(self) -> int:
         return self.offsets[-1] if self.offsets else 0
@@ -107,31 +315,318 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         part_index = int(np.searchsorted(self.offsets, index, side="right"))
         previous = self.offsets[part_index - 1] if part_index else 0
-        _, features, targets, teacher_metrics, times = self.parts[part_index]
+        shard, features, teacher_parameters, teacher_metrics, direct_target, time_weights = \
+            self.parts[part_index]
         row = index - previous
+        targets = teacher_parameters \
+            if self.target == "teacherParameters" else direct_target
         return (
             torch.from_numpy(np.array(features[row], dtype=np.float32, copy=True)),
             torch.from_numpy(np.array(targets[row], dtype=np.float32, copy=True)),
-            torch.tensor(float(self.time_weights[index]), dtype=torch.float32),
-            torch.tensor(int(times[row]), dtype=torch.int64),
+            torch.tensor(float(time_weights[row]), dtype=torch.float32),
+            torch.tensor(
+                shard.prediction_time_start + row * int(self.manifest_sampling_interval_ms),
+                dtype=torch.int64,
+            ),
             torch.from_numpy(np.array(teacher_metrics[row], dtype=np.float32, copy=True)),
         )
 
+    def __getitems__(
+        self, indices: list[int] | range
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Read one contiguous temporal batch with one copy per component."""
+        if not indices:
+            raise ValueError("cannot load an empty training batch")
+        start = int(indices[0])
+        stop = int(indices[-1]) + 1
+        if stop - start != len(indices) or any(
+            int(index) != start + offset for offset, index in enumerate(indices)
+        ):
+            raise ValueError("training batch indices must be contiguous")
+
+        feature_chunks: list[np.ndarray] = []
+        target_chunks: list[np.ndarray] = []
+        metric_chunks: list[np.ndarray] = []
+        weight_chunks: list[np.ndarray] = []
+        time_chunks: list[np.ndarray] = []
+        cursor = start
+        while cursor < stop:
+            part_index = int(np.searchsorted(self.offsets, cursor, side="right"))
+            previous = self.offsets[part_index - 1] if part_index else 0
+            shard, features, teacher_parameters, teacher_metrics, direct_target, time_weights = \
+                self.parts[part_index]
+            local_start = cursor - previous
+            count = min(stop - cursor, shard.count - local_start)
+            local_stop = local_start + count
+            feature_chunks.append(features[local_start:local_stop])
+            targets = teacher_parameters \
+                if self.target == "teacherParameters" else direct_target
+            target_chunks.append(targets[local_start:local_stop])
+            metric_chunks.append(teacher_metrics[local_start:local_stop])
+            weight_chunks.append(time_weights[local_start:local_stop])
+            time_chunks.append(
+                shard.prediction_time_start
+                + np.arange(local_start, local_stop, dtype=np.int64)
+                * self.manifest_sampling_interval_ms
+            )
+            cursor += count
+
+        return (
+            torch.from_numpy(copy_chunks(feature_chunks, np.float32)),
+            torch.from_numpy(copy_chunks(target_chunks, np.float32)),
+            torch.from_numpy(copy_chunks(weight_chunks, np.float32)),
+            torch.from_numpy(copy_chunks(time_chunks, np.int64)),
+            torch.from_numpy(copy_chunks(metric_chunks, np.float32)),
+        )
+
+    def mean_time_weight(self, block: range) -> float:
+        """Mean persisted weight for a contiguous block without materializing examples."""
+        if not block or block.step != 1:
+            raise ValueError("time-weight scoring requires a non-empty contiguous block")
+        cursor = block.start
+        total = 0.0
+        count = 0
+        while cursor < block.stop:
+            part_index = int(np.searchsorted(self.offsets, cursor, side="right"))
+            previous = self.offsets[part_index - 1] if part_index else 0
+            shard, _, _, _, _, time_weights = self.parts[part_index]
+            local_start = cursor - previous
+            take = min(block.stop - cursor, shard.count - local_start)
+            total += float(np.asarray(
+                time_weights[local_start:local_start + take],
+                dtype=np.float32,
+            ).sum(dtype=np.float64))
+            count += take
+            cursor += take
+        return total / count
+
+
+def copy_chunks(chunks: list[np.ndarray], dtype: np.dtype) -> np.ndarray:
+    if len(chunks) == 1:
+        return np.array(chunks[0], dtype=dtype, copy=True)
+    return np.concatenate(chunks).astype(dtype, copy=False)
+
+
+def passthrough_batch(batch):
+    return batch
+
+
+def component_rows(
+    file: Path,
+    dtype: str,
+    columns: int,
+    row_offset: int,
+    row_stride: int,
+    count: int,
+) -> np.ndarray:
+    if file.name.endswith(".zst"):
+        return CompressedComponentRows(
+            file, dtype, columns, row_offset, row_stride, count
+        )
+    item_size = np.dtype(dtype).itemsize
+    row_bytes = columns * item_size
+    file_bytes = file.stat().st_size
+    if row_bytes <= 0 or file_bytes % row_bytes != 0:
+        raise ValueError(f"component file is not row aligned: {file}")
+    component_count = file_bytes // row_bytes
+    final_row = row_offset + max(0, count - 1) * row_stride
+    if min(row_offset, row_stride, count) < 0 or row_stride < 1 or final_row >= component_count:
+        raise ValueError(f"component row view is outside {file}")
+    values = np.memmap(file, mode="r", dtype=dtype, shape=(component_count, columns))
+    return values[row_offset:row_offset + count * row_stride:row_stride]
+
+
+_COMPRESSED_COMPONENT_CACHE: OrderedDict[Path, np.ndarray] = OrderedDict()
+_COMPRESSED_COMPONENT_CACHE_DAYS = max(
+    1, int(os.environ.get("MLP_FEATURE_CACHE_DAYS", "2"))
+)
+
+
+class CompressedComponentRows:
+    """Lazy row-addressable view over a complete zstd-compressed UTC feature day."""
+
+    def __init__(
+        self,
+        file: Path,
+        dtype: str,
+        columns: int,
+        row_offset: int,
+        row_stride: int,
+        count: int,
+    ) -> None:
+        if dtype != "<f2":
+            raise ValueError(f"only float16 feature components may be compressed: {file}")
+        final_row = row_offset + max(0, count - 1) * row_stride
+        if min(row_offset, row_stride, count) < 0 or row_stride < 1 \
+                or final_row >= 86_400:
+            raise ValueError(f"compressed component row view is outside {file}")
+        self.file = file
+        self.dtype = dtype
+        self.columns = columns
+        self.row_offset = row_offset
+        self.row_stride = row_stride
+        self.count = count
+
+    def __getitem__(self, key) -> np.ndarray:
+        values = load_compressed_feature_day(
+            self.file, self.dtype, self.columns
+        )
+        rows = values[
+            self.row_offset:
+            self.row_offset + self.count * self.row_stride:
+            self.row_stride
+        ]
+        return rows[key]
+
+
+def load_compressed_feature_day(
+    file: Path,
+    dtype: str,
+    columns: int,
+) -> np.ndarray:
+    cached = _COMPRESSED_COMPONENT_CACHE.pop(file, None)
+    if cached is not None:
+        _COMPRESSED_COMPONENT_CACHE[file] = cached
+        return cached
+    if zstandard is None:
+        raise RuntimeError(
+            "zstandard is required for compressed production feature components; "
+            "run `npm run mlp:bootstrap`"
+        )
+    expected_bytes = 86_400 * columns * np.dtype(dtype).itemsize
+    decoded = zstandard.ZstdDecompressor().decompress(
+        file.read_bytes(), max_output_size=expected_bytes
+    )
+    if len(decoded) != expected_bytes:
+        raise ValueError(
+            f"compressed feature component has {len(decoded)} decoded bytes, "
+            f"expected {expected_bytes}: {file}"
+        )
+    values = np.frombuffer(decoded, dtype=dtype).reshape(86_400, columns)
+    _COMPRESSED_COMPONENT_CACHE[file] = values
+    while len(_COMPRESSED_COMPONENT_CACHE) > _COMPRESSED_COMPONENT_CACHE_DAYS:
+        _COMPRESSED_COMPONENT_CACHE.popitem(last=False)
+    return values
+
+
+class TemporalBlockBatchSampler:
+    """Shuffle contiguous time blocks without inheriting component boundaries."""
+
+    def __init__(
+        self,
+        dataset: FittedPolicyDataset,
+        batch_size: int,
+        shuffle: bool,
+        sample_fraction: float = 1.0,
+        weighted_sample: bool = False,
+        seed: int = 1337,
+    ) -> None:
+        self.blocks: list[range] = []
+        groups_by_storage: OrderedDict[str, list[range]] = OrderedDict()
+        source_runs = dataset.storage_runs \
+            if getattr(dataset, "group_batches_by_storage", False) \
+            else [
+                (start, end, f"temporal-{index}")
+                for index, (start, end) in enumerate(dataset.temporal_runs)
+            ]
+        for start, end, storage_key in source_runs:
+            all_run_blocks = [
+                range(block_start, min(end, block_start + batch_size))
+                for block_start in range(start, end, batch_size)
+            ]
+            if sample_fraction >= 1.0:
+                run_blocks = all_run_blocks
+            elif weighted_sample:
+                run_length = end - start
+                keep_examples = max(1, round(run_length * sample_fraction))
+                segment_count = math.ceil(keep_examples / batch_size)
+                base_size, extra = divmod(keep_examples, segment_count)
+                generator = random.Random(seed + start)
+                run_blocks = []
+                for segment in range(segment_count):
+                    segment_size = base_size + (1 if segment < extra else 0)
+                    stratum_start = start + segment * run_length // segment_count
+                    stratum_end = start + (segment + 1) * run_length // segment_count
+                    available = stratum_end - stratum_start - segment_size
+                    candidates = [
+                        stratum_start + available * candidate // 15
+                        for candidate in range(16)
+                    ] if available > 0 else [stratum_start]
+                    scores = [
+                        dataset.mean_time_weight(
+                            range(candidate, candidate + segment_size)
+                        )
+                        for candidate in candidates
+                    ]
+                    threshold = generator.random() * sum(scores)
+                    selected_start = candidates[-1]
+                    for candidate, score in zip(candidates, scores, strict=True):
+                        threshold -= score
+                        if threshold <= 0:
+                            selected_start = candidate
+                            break
+                    run_blocks.append(
+                        range(selected_start, selected_start + segment_size)
+                    )
+            else:
+                run_length = end - start
+                keep_examples = max(1, round(run_length * sample_fraction))
+                segment_count = math.ceil(keep_examples / batch_size)
+                base_size, extra = divmod(keep_examples, segment_count)
+                run_blocks = []
+                for segment in range(segment_count):
+                    segment_size = base_size + (1 if segment < extra else 0)
+                    stratum_start = start + segment * run_length // segment_count
+                    stratum_end = start + (segment + 1) * run_length // segment_count
+                    block_start = stratum_start + (stratum_end - stratum_start - segment_size) // 2
+                    run_blocks.append(range(block_start, block_start + segment_size))
+            self.blocks.extend(run_blocks)
+            groups_by_storage.setdefault(storage_key, []).extend(run_blocks)
+        self.groups = list(groups_by_storage.values())
+        self.shuffle = shuffle
+        self.example_count = sum(len(block) for block in self.blocks)
+
+    def __iter__(self):
+        if not self.shuffle:
+            yield from self.blocks
+            return
+        group_order = torch.randperm(len(self.groups)).tolist()
+        for group_index in group_order:
+            group = self.groups[group_index]
+            block_order = torch.randperm(len(group)).tolist()
+            for block_index in block_order:
+                yield group[block_index]
+
+    def __len__(self) -> int:
+        return len(self.blocks)
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the causal 16x1024 revised-fitter MLP.")
+    parser = argparse.ArgumentParser(
+        description="Train the causal 16x1024 direct oracle-distribution MLP."
+    )
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-id", required=True)
-    parser.add_argument("--label", default="Conservative revised-fitter MLP")
+    parser.add_argument("--label", default="Direct oracle-distribution MLP")
     parser.add_argument("--plan", type=Path)
+    parser.add_argument(
+        "--target",
+        choices=("rawOracleProbabilities", "minuteOracleProbabilities"),
+        default="rawOracleProbabilities",
+        help="Stored direct-distribution target to learn.",
+    )
     parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--evaluation-batch-size", type=int, default=0)
+    parser.add_argument("--validation-fraction", type=float, default=1.0)
+    parser.add_argument("--training-fraction", type=float, default=1.0)
+    parser.add_argument("--weighted-training-sample", action="store_true")
     parser.add_argument("--accumulate", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--dropout", type=float, default=0.05)
-    parser.add_argument("--states-per-example", type=int, default=17)
+    parser.add_argument("--states-per-example", type=int, default=31)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=1337)
@@ -139,11 +634,173 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-steps", type=int, default=25)
     parser.add_argument("--loss-weights-json", default="{}")
     parser.add_argument("--time-weighting-json", default="{}")
+    parser.add_argument("--selection-metric", choices=("loss", "klDivergence"), default="loss")
+    parser.add_argument("--target-validation-kl", type=float)
+    parser.add_argument("--target-validation-kl-stddev", type=float)
+    parser.add_argument("--study-file", type=Path)
+    parser.add_argument("--feature-statistics-cache", type=Path)
     parser.add_argument("--finalize-file", type=Path)
-    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--initialize-from-checkpoint", type=Path)
+    parser.add_argument("--inherited-best-epoch", type=int, default=-1)
+    parser.add_argument("--evaluation-only", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--skip-baseline", action="store_true")
     return parser.parse_args()
+
+
+def prepare_runtime_minute_oracles(
+    manifest: dict,
+    plan_file: Path,
+) -> dict[int, np.ndarray]:
+    """Compute each unique UTC target day once, before DataLoader workers fork."""
+    target_days = sorted({
+        int(shard["oracleTargetTimeStart"]) // 86_400_000 * 86_400_000
+        for shard in manifest["shards"]
+    })
+    if not target_days:
+        raise ValueError("runtime one-minute target set is empty")
+    worker_count = min(
+        len(target_days),
+        max(1, int(os.environ.get("MLP_MINUTE_ORACLE_WORKERS", "4"))),
+    )
+    emit({
+        "event": "runtime-minute-oracle-start",
+        "days": len(target_days),
+        "examples": sum(int(shard["count"]) for shard in manifest["shards"]),
+        "storage": "memory-only",
+        "backend": "deterministic-cpu",
+        "workers": worker_count,
+    })
+    result: dict[int, np.ndarray] = {}
+    day_groups = [
+        target_days[worker::worker_count]
+        for worker in range(worker_count)
+    ]
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="minute-oracle",
+    ) as executor:
+        futures = {
+            executor.submit(
+                load_runtime_minute_oracle_days,
+                manifest,
+                plan_file,
+                days,
+            ): worker
+            for worker, days in enumerate(day_groups)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            values = future.result()
+            result.update(values)
+            completed += len(values)
+            emit({
+                "event": "runtime-minute-oracle-progress",
+                "daysCompleted": completed,
+                "days": len(target_days),
+                "worker": futures[future],
+                "residentMiB": sum(
+                    value.nbytes for value in result.values()
+                ) / (1024 * 1024),
+            })
+    emit({
+        "event": "runtime-minute-oracle-complete",
+        "days": len(result),
+        "residentMiB": sum(value.nbytes for value in result.values())
+        / (1024 * 1024),
+    })
+    return result
+
+
+def load_runtime_minute_oracle_days(
+    manifest: dict,
+    plan_file: Path,
+    target_days: list[int],
+) -> dict[int, np.ndarray]:
+    repository = Path(__file__).resolve().parents[1]
+    bundled_node = repository / ".node-22/bin/node"
+    node = bundled_node if bundled_node.is_file() else Path("node")
+    process = subprocess.Popen(
+        [
+            str(node),
+            str(repository / "node_modules/tsx/dist/cli.mjs"),
+            str(repository / "scripts/stream-minute-oracle-targets.ts"),
+            "--plan",
+            str(plan_file.resolve()),
+        ],
+        cwd=repository,
+        env={**os.environ, "TMPDIR": "/tmp"},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        bufsize=0,
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RuntimeError("failed to open runtime minute-oracle provider pipes")
+    result: dict[int, np.ndarray] = {}
+    try:
+        process.stdin.write(
+            ("".join(f"{utc_date(day)}\n" for day in target_days)).encode()
+        )
+        process.stdin.close()
+        for day in target_days:
+            date = utc_date(day)
+            rows, actions = struct.unpack("<II", read_exact(process.stdout, 8))
+            if actions != int(manifest["actionCount"]) or rows < 1_441:
+                raise RuntimeError(
+                    f"runtime one-minute oracle shape for {date} is "
+                    f"{rows}x{actions}, expected at least "
+                    f"1441x{manifest['actionCount']}"
+                )
+            payload = read_exact(process.stdout, rows * actions * 4)
+            probabilities = np.frombuffer(payload, dtype="<f4").reshape(
+                rows, actions
+            ).copy()
+            if not np.isfinite(probabilities).all() \
+                    or np.any(probabilities < 0) \
+                    or not np.allclose(
+                        probabilities.sum(axis=1), 1, rtol=1e-4, atol=1e-5
+                    ):
+                raise RuntimeError(
+                    f"runtime one-minute oracle contains invalid probabilities for {date}"
+                )
+            result[day] = probabilities
+        exit_code = process.wait()
+        if exit_code != 0:
+            raise RuntimeError(
+                f"runtime one-minute oracle provider exited with code {exit_code}"
+            )
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+    return result
+
+
+def read_exact(stream, count: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError(
+                f"runtime one-minute oracle provider ended with "
+                f"{remaining}/{count} bytes unread"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def utc_date(time_ms: int) -> str:
+    return datetime.fromtimestamp(time_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
 
 
 def main() -> None:
@@ -151,47 +808,141 @@ def main() -> None:
     validate_args(args)
     set_determinism(args.seed)
     manifest = json.loads((args.dataset / "dataset.json").read_text())
-    validate_dataset_manifest(manifest)
-    train = FittedPolicyDataset(manifest, args.dataset, "train")
-    validation = FittedPolicyDataset(manifest, args.dataset, "validation")
-    test = FittedPolicyDataset(manifest, args.dataset, "test")
+    validate_dataset_manifest(manifest, args.dataset)
+    sampling_interval_ms = int(manifest["samplingIntervalMs"])
+    runtime_minute_oracles = None
+    if args.target == "minuteOracleProbabilities" \
+            and manifest.get("minuteOracleMap", {}).get("storage") \
+            == "computed-directly-at-training-startup":
+        if args.plan is None:
+            raise ValueError(
+                "--plan is required to compute runtime one-minute oracle targets"
+            )
+        runtime_minute_oracles = prepare_runtime_minute_oracles(
+            manifest, args.plan
+        )
+    train = FittedPolicyDataset(
+        manifest,
+        args.dataset,
+        "train",
+        target=args.target,
+        runtime_minute_oracles=runtime_minute_oracles,
+    )
+    validation = FittedPolicyDataset(
+        manifest,
+        args.dataset,
+        "validation",
+        target=args.target,
+        runtime_minute_oracles=runtime_minute_oracles,
+    )
+    test = FittedPolicyDataset(
+        manifest,
+        args.dataset,
+        "test",
+        target=args.target,
+        runtime_minute_oracles=runtime_minute_oracles,
+    )
     if min(len(train), len(validation), len(test)) == 0:
         raise RuntimeError("train, validation, and test datasets must all be non-empty")
 
     device = resolve_device(args.device)
-    feature_mean, feature_std = training_normalization(train)
-    parameter_scale = training_parameter_scale(train).to(device)
+    feature_mean, feature_std = cached_training_normalization(
+        train, args.feature_statistics_cache
+    )
     model = ExposureMlp(feature_mean, feature_std, args.dropout).to(device)
+    if args.initialize_from_checkpoint is not None:
+        parent = torch.load(
+            args.initialize_from_checkpoint,
+            map_location=device,
+            # Project checkpoints also contain NumPy RNG/optimizer metadata. PyTorch
+            # 2.6's weights-only unpickler rejects that trusted local metadata before
+            # we can select the model state below.
+            weights_only=False,
+        )
+        if isinstance(parent, dict) and isinstance(parent.get("model"), dict):
+            parent = parent["model"]
+        if not isinstance(parent, dict):
+            raise ValueError("warm-start checkpoint does not contain a model state")
+        model.load_state_dict(parent)
+        emit({
+            "event": "training-warm-start",
+            "checkpoint": str(args.initialize_from_checkpoint),
+            "semantics": "model weights inherited; optimizer, scheduler, and patience reset",
+        })
     execution_support = PolicySupport(**manifest["policySupport"])
-    # The teacher parameters retain the complete effective-range fit, while
-    # every distribution objective is evaluated on the executable surface.
     support = execution_support
-    actions = torch.linspace(
-        support.visible_lower,
-        support.visible_upper,
-        int(manifest["actionCount"]),
+    actions = torch.tensor(
+        manifest["grid"],
         dtype=torch.float32,
         device=device,
     )
     current = deterministic_current_states(args.states_per_example, support, device, visible=True)
     loss_weights = parse_loss_weights(args.loss_weights_json)
+    runtime_loss_weights = loss_weights_on_device(loss_weights, device)
     time_weighting = parse_time_weighting(args.time_weighting_json)
+    training_contract = {
+        "datasetPlanId": manifest["planId"],
+        "componentStoreId": manifest["componentLayout"].get(
+            "storeId", manifest["planId"]
+        ),
+        "datasetVersion": manifest["version"],
+        "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
+        "inputFeatureCount": INPUT_FEATURE_COUNT,
+        "outputRepresentation": "base-action-logits",
+        "targetRepresentation": args.target,
+        "outputActionCount": OUTPUT_ACTION_COUNT,
+        "samplingIntervalMs": sampling_interval_ms,
+        "predictionDelayMs": int(manifest["predictionDelayMs"]),
+        "statesPerExample": args.states_per_example,
+        "batchSize": args.batch_size,
+        "evaluationBatchSize": args.evaluation_batch_size,
+        "validationFraction": args.validation_fraction,
+        "trainingFraction": args.training_fraction,
+        "weightedTrainingSample": args.weighted_training_sample,
+        "gradientAccumulation": args.accumulate,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "learningRate": args.learning_rate,
+        "weightDecay": args.weight_decay,
+        "dropout": args.dropout,
+        "seed": args.seed,
+        "selectionMetric": args.selection_metric,
+        "targetValidationKl": args.target_validation_kl,
+        "targetValidationKlStdDev": args.target_validation_kl_stddev,
+        "initializeFromCheckpoint": checkpoint_identity(
+            args.initialize_from_checkpoint
+        ),
+        "evaluationOnly": args.evaluation_only,
+        "skipBaseline": args.skip_baseline,
+        "compile": args.compile,
+        "lossWeights": asdict(loss_weights),
+        "temporalObjective": "direct-conditional-gaussian-mi-v1",
+        "oracleObjective": "conditional-gaussian-time-correlation-mi-v1",
+    }
+    if manifest["exampleWeighting"]["timeWeighting"] != time_weighting_metadata(time_weighting):
+        raise ValueError("training time-weighting configuration does not match stored example weights")
     for dataset in (train, validation, test):
-        prepare_dataset_time_weights(
-            dataset,
-            actions,
-            current,
-            support,
-            int(manifest["samplingIntervalMs"]),
-            time_weighting,
-            device,
-        )
+        report_stored_example_weights(dataset)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
-    train_loader = loader(train, args, shuffle=True)
-    validation_loader = loader(validation, args, shuffle=False)
-    test_loader = loader(test, args, shuffle=False)
+    evaluation_batch_size = args.evaluation_batch_size or args.batch_size
+    train_loader = loader(
+        train,
+        args,
+        shuffle=True,
+        batch_size=args.batch_size,
+        sample_fraction=args.training_fraction,
+        weighted_sample=args.weighted_training_sample,
+    )
+    validation_loader = loader(
+        validation,
+        args,
+        shuffle=False,
+        batch_size=evaluation_batch_size,
+        sample_fraction=args.validation_fraction,
+    )
+    test_loader = loader(test, args, shuffle=False, batch_size=evaluation_batch_size)
     steps_per_epoch = math.ceil(len(train_loader) / args.accumulate)
     total_steps = max(1, steps_per_epoch * args.epochs)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -207,9 +958,10 @@ def main() -> None:
     best_validation = math.inf
     best_validation_metrics: dict[str, float] = {}
     stale_epochs = 0
-    initialization: dict[str, object] | None = None
     if args.resume and checkpoint_file.exists():
         checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
+        if checkpoint.get("trainingContract") != training_contract:
+            raise RuntimeError("checkpoint does not match the current temporal training contract")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -220,38 +972,48 @@ def main() -> None:
         best_validation = checkpoint["bestValidation"]
         best_validation_metrics = checkpoint.get("bestValidationMetrics", {"loss": best_validation})
         stale_epochs = checkpoint.get("staleEpochs", 0)
-        initialization = checkpoint.get("initialization")
         restore_rng(checkpoint["rng"])
-    elif args.initialize_from_checkpoint is not None:
-        checkpoint = torch.load(
-            args.initialize_from_checkpoint, map_location=device, weights_only=False
-        )
-        transferred = load_compatible_initialization(model, checkpoint["model"])
-        restore_rng(checkpoint["rng"])
-        for group in optimizer.param_groups:
-            group["lr"] = args.learning_rate
-            group["initial_lr"] = args.learning_rate
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda step: learning_rate_multiplier(step, total_steps)
-        )
-        initialization = {
-            "checkpoint": str(args.initialize_from_checkpoint),
-            "sourceEpoch": int(checkpoint["epoch"]),
-            "sourceGlobalStep": int(checkpoint.get("globalStep", 0)),
-            "transferredTensors": transferred,
-            "optimizer": "reset for the eight-parameter objective",
-        }
 
-    train_model = torch.compile(model) if args.compile else model
+    def objective():
+        def compute(features, targets, time_weights, times):
+            return direct_oracle_loss(
+                model(features), targets, actions,
+                current.expand(features.shape[0], -1), support,
+                runtime_loss_weights, time_weights, times,
+                sampling_interval_ms,
+            )
+        return compute
+
+    training_objective = objective()
+    evaluation_objective = objective()
+    if args.compile:
+        training_objective = torch.compile(
+            training_objective,
+            mode="reduce-overhead",
+            fullgraph=False,
+        )
+        evaluation_objective = torch.compile(
+            evaluation_objective,
+            mode="reduce-overhead",
+            fullgraph=False,
+        )
     emit({
         "event": "training-start",
         "device": str(device),
         "parameters": parameter_count(model),
         "trainExamples": len(train),
+        "selectedTrainingExamples": train_loader.batch_sampler.example_count,
         "validationExamples": len(validation),
+        "screeningValidationExamples": validation_loader.batch_sampler.example_count,
+        "batchSize": args.batch_size,
+        "evaluationBatchSize": evaluation_batch_size,
+        "validationFraction": args.validation_fraction,
+        "compiledObjective": args.compile,
         "testExamples": len(test),
+        "targetRepresentation": args.target,
         "lossWeights": asdict(loss_weights),
         "timeWeighting": time_weighting_metadata(time_weighting),
+        "predictionDelayMs": int(manifest["predictionDelayMs"]),
         "distributionLossRange": [
             execution_support.visible_lower,
             execution_support.visible_upper,
@@ -259,29 +1021,50 @@ def main() -> None:
         "currentStates": args.states_per_example,
         "startEpoch": start_epoch,
         "epochs": args.epochs,
-        **({"initializedFrom": initialization} if initialization else {}),
+        "evaluationOnly": args.evaluation_only,
+        "targetValidation": {
+            "klDivergence": args.target_validation_kl,
+            "klDivergenceStdDev": args.target_validation_kl_stddev,
+        },
     })
 
-    if not best_model_file.exists():
+    if not best_model_file.exists() and not args.skip_baseline:
         baseline = evaluate(
             model, validation_loader, actions, current, support,
-            parameter_scale, loss_weights, time_weighting, device
+            loss_weights, device, sampling_interval_ms,
+            objective=evaluation_objective,
         )
-        best_validation = baseline["loss"]
+        best_validation = baseline[args.selection_metric]
         best_validation_metrics = baseline
-        best_epoch = -1
+        best_epoch = args.inherited_best_epoch
         atomic_torch_save(model.state_dict(), best_model_file)
         emit({"event": "baseline", "validation": baseline})
+    elif not best_model_file.exists():
+        emit({
+            "event": "baseline-skipped",
+            "reason": "study variants select among trained epochs only",
+        })
 
     stopped = False
     interrupted = False
+    quality_target_reached = validation_target_reached(best_validation_metrics, args)
+    if quality_target_reached:
+        emit({
+            "event": "validation-target-reached",
+            "epoch": best_epoch,
+            "validation": best_validation_metrics,
+            "targetKlDivergence": args.target_validation_kl,
+            "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
+        })
     last_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, args.epochs):
+            if args.evaluation_only or quality_target_reached:
+                break
             last_epoch = epoch
             started = time.monotonic()
             train_metrics, global_step, stopped = train_epoch(
-                train_model,
+                model,
                 train_loader,
                 optimizer,
                 scheduler,
@@ -289,21 +1072,22 @@ def main() -> None:
                 actions,
                 current,
                 support,
-                parameter_scale,
                 loss_weights,
-                time_weighting,
                 args,
                 device,
                 epoch,
                 global_step,
+                sampling_interval_ms,
+                objective=training_objective,
             )
             validation_metrics = evaluate(
                 model, validation_loader, actions, current, support,
-                parameter_scale, loss_weights, time_weighting, device
+                loss_weights, device, sampling_interval_ms,
+                objective=evaluation_objective,
             )
-            improved = validation_metrics["loss"] < best_validation - 1e-6
+            improved = validation_metrics[args.selection_metric] < best_validation - 1e-6
             if improved:
-                best_validation = validation_metrics["loss"]
+                best_validation = validation_metrics[args.selection_metric]
                 best_validation_metrics = validation_metrics
                 best_epoch = epoch
                 stale_epochs = 0
@@ -322,8 +1106,9 @@ def main() -> None:
                 optimizer,
                 scheduler,
                 scaler,
-                initialization,
+                training_contract,
             )
+            quality_target_reached = validation_target_reached(validation_metrics, args)
             emit({
                 "event": "epoch",
                 "epoch": epoch,
@@ -334,20 +1119,31 @@ def main() -> None:
                 "validation": validation_metrics,
                 "bestEpoch": best_epoch,
                 "bestValidation": best_validation,
+                "bestValidationMetric": args.selection_metric,
                 "staleEpochs": stale_epochs,
                 "stopRequested": stopped,
+                "validationTargetReached": quality_target_reached,
             })
-            if stopped or stale_epochs >= args.patience:
+            if quality_target_reached:
+                emit({
+                    "event": "validation-target-reached",
+                    "epoch": epoch,
+                    "validation": validation_metrics,
+                    "targetKlDivergence": args.target_validation_kl,
+                    "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
+                })
+            if stopped or quality_target_reached or stale_epochs >= args.patience:
                 break
     except KeyboardInterrupt:
         interrupted = True
         emit({"event": "interrupt", "message": "Finalizing the best validated checkpoint."})
         validation_metrics = evaluate(
             model, validation_loader, actions, current, support,
-            parameter_scale, loss_weights, time_weighting, device
+            loss_weights, device, sampling_interval_ms,
+            objective=evaluation_objective,
         )
-        if validation_metrics["loss"] < best_validation - 1e-6:
-            best_validation = validation_metrics["loss"]
+        if validation_metrics[args.selection_metric] < best_validation - 1e-6:
+            best_validation = validation_metrics[args.selection_metric]
             best_validation_metrics = validation_metrics
             best_epoch = last_epoch
             atomic_torch_save(model.state_dict(), best_model_file)
@@ -363,13 +1159,69 @@ def main() -> None:
             optimizer,
             scheduler,
             scaler,
-            initialization,
+            training_contract,
         )
 
+    if not best_model_file.exists():
+        raise RuntimeError("training finished without a validated checkpoint")
     model.load_state_dict(torch.load(best_model_file, map_location=device, weights_only=True))
+    # Re-evaluate the materialized best state so persisted metrics always
+    # describe the actual checkpoint under the current metric definitions,
+    # including metrics added after a resumable checkpoint was written.
+    best_validation_metrics = evaluate(
+        model, validation_loader, actions, current, support,
+        loss_weights, device, sampling_interval_ms,
+        objective=evaluation_objective,
+    )
+    best_validation = best_validation_metrics[args.selection_metric]
+    if args.study_file is not None:
+        args.study_file.parent.mkdir(parents=True, exist_ok=True)
+        study = {
+            "modelId": args.model_id,
+            "datasetPlanId": manifest["planId"],
+            "componentStoreId": manifest["componentLayout"].get(
+                "storeId", manifest["planId"]
+            ),
+            "predictionDelayMs": int(manifest["predictionDelayMs"]),
+            "targetRepresentation": args.target,
+            "selectionMetric": args.selection_metric,
+            "policyMetricDefinitions": {
+                "klDivergence":
+                    "conditional KL(target || prediction) on the visible range",
+                "klDivergenceVariance":
+                    "weighted population variance of per-example visible-range conditional KL",
+                "baseKlDivergence":
+                    "KL between stored and predicted base-action distributions",
+                "probabilityMse":
+                    "weighted mean per-example probability MSE on the visible-range conditional surface",
+                "probabilityMseVariance":
+                    "weighted population variance of per-example visible-range probability MSE",
+            },
+            "bestEpoch": best_epoch,
+            "bestValidationScore": best_validation,
+            "bestValidationMetrics": best_validation_metrics,
+            "screeningBestValidationScore": best_validation,
+            "screeningBestValidationMetrics": best_validation_metrics,
+            "screeningValidationExamples": validation_loader.batch_sampler.example_count,
+            "validationFraction": args.validation_fraction,
+            "lossWeights": asdict(loss_weights),
+            "trainExamples": len(train),
+            "validationExamples": len(validation),
+            "epochs": args.epochs,
+            "patience": args.patience,
+            "seed": args.seed,
+            "device": str(device),
+            "finalizedEarly":
+                stopped or interrupted or quality_target_reached or args.evaluation_only,
+            "validationTargetReached": quality_target_reached,
+        }
+        atomic_json(study, args.study_file)
+        emit({"event": "training-study-complete", **study, "studyFile": str(args.study_file)})
+        return
     test_metrics = evaluate(
         model, test_loader, actions, current, support,
-        parameter_scale, loss_weights, time_weighting, device
+        loss_weights, device, sampling_interval_ms,
+        objective=evaluation_objective,
     )
     teacher_metrics = teacher_fit_summary(manifest, args.dataset)
     export_artifact(
@@ -386,8 +1238,7 @@ def main() -> None:
         loss_weights,
         time_weighting,
         device,
-        stopped or interrupted,
-        initialization,
+        stopped or interrupted or quality_target_reached or args.evaluation_only,
     )
     emit({
         "event": "training-complete",
@@ -395,7 +1246,9 @@ def main() -> None:
         "bestValidation": best_validation_metrics,
         "bestEpoch": best_epoch,
         "artifact": str(args.output / "model.onnx"),
-        "finalizedEarly": stopped or interrupted,
+        "finalizedEarly":
+            stopped or interrupted or quality_target_reached or args.evaluation_only,
+        "validationTargetReached": quality_target_reached,
     })
 
 
@@ -408,40 +1261,58 @@ def train_epoch(
     actions,
     current,
     support,
-    parameter_scale,
     loss_weights,
-    time_weighting,
     args,
     device,
     epoch,
     global_step,
+    sampling_interval_ms,
+    objective=None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    totals = {name: 0.0 for name in METRIC_NAMES}
+    totals = {
+        name: torch.zeros((), device=device)
+        for name in TRAIN_METRIC_NAMES
+    }
     total_examples = 0
-    time_weight_sum = 0.0
-    time_weight_square_sum = 0.0
+    time_weight_sum = torch.zeros((), device=device)
+    time_weight_square_sum = torch.zeros((), device=device)
+    kl_weight_sum = torch.zeros((), device=device)
+    kl_mean = torch.zeros((), device=device)
+    kl_centered_square_sum = torch.zeros((), device=device)
+    probability_mse_weight_sum = torch.zeros((), device=device)
+    probability_mse_mean = torch.zeros((), device=device)
+    probability_mse_centered_square_sum = torch.zeros((), device=device)
+    temporal_example_count = torch.zeros((), device=device)
     started = time.monotonic()
     stopped = False
-    for batch_step, (features, targets, time_weights, _, _) in enumerate(data):
+    for batch_step, (features, targets, time_weights, times, _) in enumerate(data):
         features = features.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         time_weights = time_weights.to(device, non_blocking=True)
+        times = times.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            raw = model(features)
-            batch_metrics = fitted_teacher_loss(
-                raw, targets, actions, current.expand(features.shape[0], -1), support,
-                parameter_scale, loss_weights, time_weighting, time_weights
+            batch_metrics = objective(features, targets, time_weights, times) if objective else (
+                direct_oracle_loss(
+                    model(features), targets, actions,
+                    current.expand(features.shape[0], -1), support,
+                    loss_weights, time_weights, times, sampling_interval_ms
+                )
             )
             loss = batch_metrics["loss"] / args.accumulate
-        if not torch.isfinite(loss):
+        if device.type == "cuda":
+            torch._assert_async(
+                torch.isfinite(loss),
+                f"non-finite training loss at epoch {epoch}, batch {batch_step}",
+            )
+        elif not bool(torch.isfinite(loss)):
             raise RuntimeError(f"non-finite training loss at epoch {epoch}, batch {batch_step}")
         scaler.scale(loss).backward()
         should_step = (batch_step + 1) % args.accumulate == 0 or batch_step + 1 == len(data)
         if should_step:
             scaler.unscale_(optimizer)
-            gradient_norm = float(clip_grad_norm_(model.parameters(), 1.0))
+            gradient_norm = clip_grad_norm_(model.parameters(), 1.0)
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
@@ -458,7 +1329,7 @@ def train_epoch(
                     "batches": len(data),
                     "globalStep": global_step,
                     "learningRate": optimizer.param_groups[0]["lr"],
-                    "gradientNorm": gradient_norm,
+                    "gradientNorm": float(gradient_norm),
                     "examplesPerSecond": round(total_examples / max(time.monotonic() - started, 1e-6), 1),
                     "gpuMemoryMiB": round(torch.cuda.max_memory_allocated() / 1_048_576, 1)
                     if device.type == "cuda" else 0,
@@ -468,124 +1339,205 @@ def train_epoch(
                 stopped = True
         count = features.shape[0]
         total_examples += count
-        time_weight_sum += float(batch_metrics["timeWeightSum"].detach())
-        time_weight_square_sum += float(batch_metrics["timeWeightSquareSum"].detach())
-        for name in METRIC_NAMES:
-            totals[name] += float(batch_metrics[name].detach()) * count
+        time_weight_sum += batch_metrics["timeWeightSum"].detach()
+        time_weight_square_sum += batch_metrics["timeWeightSquareSum"].detach()
+        kl_weight_sum, kl_mean, kl_centered_square_sum = merge_weighted_moments(
+            kl_weight_sum,
+            kl_mean,
+            kl_centered_square_sum,
+            batch_metrics["klWeightSum"].detach(),
+            batch_metrics["klDivergence"].detach(),
+            batch_metrics["klCenteredSquareSum"].detach(),
+        )
+        probability_mse_weight_sum, probability_mse_mean, \
+            probability_mse_centered_square_sum = merge_weighted_moments(
+                probability_mse_weight_sum,
+                probability_mse_mean,
+                probability_mse_centered_square_sum,
+                batch_metrics["probabilityMseWeightSum"].detach(),
+                batch_metrics["probabilityMse"].detach(),
+                batch_metrics["probabilityMseCenteredSquareSum"].detach(),
+            )
+        temporal_count = batch_metrics["temporalExampleCount"].detach()
+        temporal_example_count += temporal_count
+        for name in TRAIN_METRIC_NAMES:
+            if name in KL_MOMENT_METRIC_NAMES \
+                    or name in PROBABILITY_MSE_MOMENT_METRIC_NAMES:
+                continue
+            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            totals[name] += batch_metrics[name].detach() * metric_count
         if stopped:
             break
-    result = {name: value / max(1, total_examples) for name, value in totals.items()}
-    result["timeWeightEffectiveSampleRatio"] = (
+    temporal_count_value = max(1.0, float(temporal_example_count))
+    result = {
+        name: float(value) / (
+            temporal_count_value if name in TIME_BLOCK_METRIC_NAMES else max(1, total_examples)
+        ) for name, value in totals.items()
+    }
+    result["timeWeightEffectiveSampleRatio"] = float(
         time_weight_sum * time_weight_sum
         / max(1e-12, total_examples * time_weight_square_sum)
     )
+    result["klDivergence"] = float(kl_mean)
+    result["klDivergenceVariance"] = float(weighted_variance(
+        kl_centered_square_sum,
+        kl_weight_sum,
+    ))
+    result["klDivergenceStdDev"] = float(weighted_standard_deviation(
+        kl_centered_square_sum,
+        kl_weight_sum,
+    ))
+    result["probabilityMse"] = float(probability_mse_mean)
+    result["probabilityMseVariance"] = float(weighted_variance(
+        probability_mse_centered_square_sum,
+        probability_mse_weight_sum,
+    ))
+    result["probabilityMseStdDev"] = float(weighted_standard_deviation(
+        probability_mse_centered_square_sum,
+        probability_mse_weight_sum,
+    ))
     return result, global_step, stopped
 
 
 @torch.inference_mode()
 def evaluate(model, data, actions, current, support,
-             parameter_scale, loss_weights, time_weighting, device) -> dict[str, float]:
+             loss_weights, device, sampling_interval_ms,
+             objective=None) -> dict[str, float]:
     model.eval()
-    totals = {name: 0.0 for name in METRIC_NAMES}
+    totals = {name: torch.zeros((), device=device) for name in METRIC_NAMES}
     total_examples = 0
-    time_weight_sum = 0.0
-    time_weight_square_sum = 0.0
-    for features, targets, time_weights, _, _ in data:
+    time_weight_sum = torch.zeros((), device=device)
+    time_weight_square_sum = torch.zeros((), device=device)
+    kl_weight_sum = torch.zeros((), device=device)
+    kl_mean = torch.zeros((), device=device)
+    kl_centered_square_sum = torch.zeros((), device=device)
+    probability_mse_weight_sum = torch.zeros((), device=device)
+    probability_mse_mean = torch.zeros((), device=device)
+    probability_mse_centered_square_sum = torch.zeros((), device=device)
+    temporal_example_count = torch.zeros((), device=device)
+    for features, targets, time_weights, times, _ in data:
         features = features.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         time_weights = time_weights.to(device, non_blocking=True)
+        times = times.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            raw = model(features)
-        batch_metrics = fitted_teacher_loss(
-            raw, targets, actions, current.expand(features.shape[0], -1), support,
-            parameter_scale, loss_weights, time_weighting, time_weights
-        )
+            batch_metrics = objective(features, targets, time_weights, times) if objective else (
+                direct_oracle_loss(
+                    model(features), targets, actions,
+                    current.expand(features.shape[0], -1), support,
+                    loss_weights, time_weights, times, sampling_interval_ms
+                )
+            )
         count = features.shape[0]
         total_examples += count
-        time_weight_sum += float(batch_metrics["timeWeightSum"])
-        time_weight_square_sum += float(batch_metrics["timeWeightSquareSum"])
+        time_weight_sum += batch_metrics["timeWeightSum"]
+        time_weight_square_sum += batch_metrics["timeWeightSquareSum"]
+        kl_weight_sum, kl_mean, kl_centered_square_sum = merge_weighted_moments(
+            kl_weight_sum,
+            kl_mean,
+            kl_centered_square_sum,
+            batch_metrics["klWeightSum"],
+            batch_metrics["klDivergence"],
+            batch_metrics["klCenteredSquareSum"],
+        )
+        probability_mse_weight_sum, probability_mse_mean, \
+            probability_mse_centered_square_sum = merge_weighted_moments(
+                probability_mse_weight_sum,
+                probability_mse_mean,
+                probability_mse_centered_square_sum,
+                batch_metrics["probabilityMseWeightSum"],
+                batch_metrics["probabilityMse"],
+                batch_metrics["probabilityMseCenteredSquareSum"],
+            )
+        temporal_count = batch_metrics["temporalExampleCount"]
+        temporal_example_count += temporal_count
         for name in METRIC_NAMES:
-            totals[name] += float(batch_metrics[name]) * count
-    result = {name: value / max(1, total_examples) for name, value in totals.items()}
-    result["timeWeightEffectiveSampleRatio"] = (
+            if name in KL_MOMENT_METRIC_NAMES \
+                    or name in PROBABILITY_MSE_MOMENT_METRIC_NAMES:
+                continue
+            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            totals[name] += batch_metrics[name] * metric_count
+    temporal_count_value = max(1.0, float(temporal_example_count))
+    result = {
+        name: float(value) / (
+            temporal_count_value if name in TIME_BLOCK_METRIC_NAMES else max(1, total_examples)
+        ) for name, value in totals.items()
+    }
+    result["timeWeightEffectiveSampleRatio"] = float(
         time_weight_sum * time_weight_sum
         / max(1e-12, total_examples * time_weight_square_sum)
     )
+    result["klDivergence"] = float(kl_mean)
+    result["klDivergenceVariance"] = float(weighted_variance(
+        kl_centered_square_sum,
+        kl_weight_sum,
+    ))
+    result["klDivergenceStdDev"] = float(weighted_standard_deviation(
+        kl_centered_square_sum,
+        kl_weight_sum,
+    ))
+    result["probabilityMse"] = float(probability_mse_mean)
+    result["probabilityMseVariance"] = float(weighted_variance(
+        probability_mse_centered_square_sum,
+        probability_mse_weight_sum,
+    ))
+    result["probabilityMseStdDev"] = float(weighted_standard_deviation(
+        probability_mse_centered_square_sum,
+        probability_mse_weight_sum,
+    ))
     return result
 
 
-def loader(dataset: Dataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
+def loader(
+    dataset: FittedPolicyDataset,
+    args: argparse.Namespace,
+    shuffle: bool,
+    *,
+    batch_size: int,
+    sample_fraction: float = 1.0,
+    weighted_sample: bool = False,
+) -> DataLoader:
     return DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=shuffle,
+        batch_sampler=TemporalBlockBatchSampler(
+            dataset,
+            batch_size,
+            shuffle,
+            sample_fraction=sample_fraction,
+            weighted_sample=weighted_sample,
+            seed=args.seed,
+        ),
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=args.workers > 0,
-        drop_last=False,
+        collate_fn=passthrough_batch,
     )
 
 
-@torch.inference_mode()
-def prepare_dataset_time_weights(
-    dataset: FittedPolicyDataset,
-    actions: Tensor,
-    current: Tensor,
-    support: PolicySupport,
-    sampling_interval_ms: int,
-    weighting: TimeWeighting,
-    device: torch.device,
-) -> None:
-    """Decode teacher advice once, then apply causal persistence before shuffling."""
-    advice = np.empty(len(dataset), dtype=np.float32)
-    times = np.empty(len(dataset), dtype=np.int64)
-    offset = 0
-    preparation_batch = 8_192
-    for shard, _, targets, _, shard_times in dataset.parts:
-        for start in range(0, shard.count, preparation_batch):
-            end = min(shard.count, start + preparation_batch)
-            target = torch.from_numpy(
-                np.array(targets[start:end], dtype=np.float32, copy=True)
-            ).to(device=device, non_blocking=True)
-            target_rows = target[:, None, :].expand(-1, current.shape[-1], -1)
-            logits = conditional_policy_logits(
-                target_rows,
-                actions,
-                current.expand(target.shape[0], -1),
-                support,
-            )
-            probability = torch.softmax(logits, dim=-1)
-            block_advice = distance_imbalance_advice(
-                probability,
-                actions,
-                current.expand(target.shape[0], -1),
-                weighting.distance_epsilon,
-            )
-            advice[offset + start:offset + end] = block_advice.cpu().numpy()
-        times[offset:offset + shard.count] = np.asarray(shard_times, dtype=np.int64)
-        offset += shard.count
-
-    order = np.argsort(times, kind="stable")
-    ordered_times = times[order]
-    if ordered_times.size > 1 and np.any(ordered_times[1:] <= ordered_times[:-1]):
-        raise RuntimeError(f"{dataset.split} timestamps must be unique for persistence weighting")
-    ordered_weights = persistent_distance_imbalance_time_weights(
-        torch.from_numpy(advice[order]),
-        torch.from_numpy(ordered_times),
-        sampling_interval_ms,
-        weighting,
-    ).numpy()
-    dataset.time_weights[order] = ordered_weights
-    total = float(ordered_weights.sum(dtype=np.float64))
-    squared = float(np.square(ordered_weights, dtype=np.float64).sum(dtype=np.float64))
+def report_stored_example_weights(dataset: FittedPolicyDataset) -> None:
+    """Validate and summarize persisted whole-example weights without changing them."""
+    total = 0.0
+    squared = 0.0
+    maximum = 0.0
+    count = 0
+    for shard, _, _, _, _, time_weights in dataset.parts:
+        values = np.asarray(time_weights, dtype=np.float32)
+        if values.shape != (shard.count,) or not np.isfinite(values).all() \
+                or np.any(values <= 0):
+            raise RuntimeError(f"{dataset.split} contains invalid stored example weights")
+        total += float(values.sum(dtype=np.float64))
+        squared += float(np.square(values, dtype=np.float64).sum(dtype=np.float64))
+        maximum = max(maximum, float(values.max(initial=0)))
+        count += shard.count
     effective_ratio = total * total / max(1e-12, len(dataset) * squared)
     emit({
         "event": "time-weighting-ready",
         "split": dataset.split,
         "examples": len(dataset),
-        "meanAdviceMagnitude": float(np.abs(advice).mean(dtype=np.float64)),
-        "meanWeight": float(ordered_weights.mean(dtype=np.float64)),
-        "maximumWeight": float(ordered_weights.max()),
+        "source": "dataset",
+        "normalized": False,
+        "meanWeight": total / max(1, count),
+        "maximumWeight": maximum,
         "effectiveSampleRatio": effective_ratio,
     })
 
@@ -594,7 +1546,7 @@ def training_normalization(dataset: FittedPolicyDataset) -> tuple[Tensor, Tensor
     total = 0
     feature_sum = np.zeros(INPUT_FEATURE_COUNT, dtype=np.float64)
     square_sum = np.zeros(INPUT_FEATURE_COUNT, dtype=np.float64)
-    for shard, features, _, _, _ in dataset.parts:
+    for shard, features, _, _, _, _ in dataset.parts:
         for start in range(0, shard.count, 8192):
             block = np.asarray(features[start:start + 8192], dtype=np.float32)
             feature_sum += block.sum(axis=0, dtype=np.float64)
@@ -605,45 +1557,77 @@ def training_normalization(dataset: FittedPolicyDataset) -> tuple[Tensor, Tensor
     return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(np.sqrt(variance).astype(np.float32))
 
 
+def cached_training_normalization(
+    dataset: FittedPolicyDataset, cache_file: Path | None
+) -> tuple[Tensor, Tensor]:
+    if cache_file is not None and cache_file.exists():
+        with np.load(cache_file, allow_pickle=False) as cache:
+            mean = cache["mean"]
+            std = cache["std"]
+            count = int(cache["count"])
+        if count != len(dataset) or mean.shape != (INPUT_FEATURE_COUNT,) \
+                or std.shape != (INPUT_FEATURE_COUNT,) \
+                or not np.isfinite(mean).all() or not np.isfinite(std).all() \
+                or np.any(std <= 0):
+            raise ValueError(f"invalid cached feature statistics: {cache_file}")
+        emit({"event": "training-statistics-cache", "kind": "features", "hit": True,
+              "file": str(cache_file), "examples": count})
+        return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(std.astype(np.float32))
+    mean, std = training_normalization(dataset)
+    if cache_file is not None:
+        atomic_numpy_archive(
+            cache_file,
+            mean=mean.numpy(),
+            std=std.numpy(),
+            count=np.asarray(len(dataset), dtype=np.int64),
+        )
+    emit({"event": "training-statistics-cache", "kind": "features", "hit": False,
+          "file": str(cache_file) if cache_file is not None else None,
+          "examples": len(dataset)})
+    return mean, std
+
+
 def training_parameter_scale(dataset: FittedPolicyDataset) -> Tensor:
     total = 0
-    value_sum = np.zeros(OUTPUT_PARAMETER_COUNT, dtype=np.float64)
-    square_sum = np.zeros(OUTPUT_PARAMETER_COUNT, dtype=np.float64)
-    for shard, _, targets, _, _ in dataset.parts:
+    value_sum = np.zeros(TEACHER_PARAMETER_COUNT, dtype=np.float64)
+    square_sum = np.zeros(TEACHER_PARAMETER_COUNT, dtype=np.float64)
+    for shard, _, targets, _, _, _ in dataset.parts:
         for start in range(0, shard.count, 8192):
             block = np.asarray(targets[start:start + 8192], dtype=np.float32)
             value_sum += block.sum(axis=0, dtype=np.float64)
             square_sum += np.square(block, dtype=np.float64).sum(axis=0)
             total += block.shape[0]
     mean = value_sum / total
-    minimum_variance = np.full(OUTPUT_PARAMETER_COUNT, 1e-4, dtype=np.float64)
+    minimum_variance = np.full(TEACHER_PARAMETER_COUNT, 1e-4, dtype=np.float64)
     minimum_variance[6:8] = 0.25 ** 2
     variance = np.maximum(minimum_variance, square_sum / total - mean * mean)
     return torch.from_numpy(np.sqrt(variance).astype(np.float32))
 
 
-def load_compatible_initialization(model: ExposureMlp, source: dict[str, Tensor]) -> int:
-    """Transfer the shared six-coordinate network while retaining new normalization/cutoff rows."""
-    target = model.state_dict()
-    transferred = 0
-    for name, value in source.items():
-        if name in ("feature_mean", "feature_std") or name not in target:
-            continue
-        destination = target[name]
-        if value.shape == destination.shape:
-            destination.copy_(value.to(device=destination.device, dtype=destination.dtype))
-            transferred += 1
-            continue
-        if name in ("output.weight", "output.bias") \
-                and value.ndim == destination.ndim \
-                and value.shape[1:] == destination.shape[1:]:
-            rows = min(value.shape[0], destination.shape[0], 6)
-            destination[:rows].copy_(
-                value[:rows].to(device=destination.device, dtype=destination.dtype)
-            )
-            transferred += 1
-    model.load_state_dict(target)
-    return transferred
+def cached_training_parameter_scale(
+    dataset: FittedPolicyDataset, cache_file: Path | None
+) -> Tensor:
+    if cache_file is not None and cache_file.exists():
+        with np.load(cache_file, allow_pickle=False) as cache:
+            scale = cache["scale"]
+            count = int(cache["count"])
+        if count != len(dataset) or scale.shape != (TEACHER_PARAMETER_COUNT,) \
+                or not np.isfinite(scale).all() or np.any(scale <= 0):
+            raise ValueError(f"invalid cached target statistics: {cache_file}")
+        emit({"event": "training-statistics-cache", "kind": "targets", "hit": True,
+              "file": str(cache_file), "examples": count})
+        return torch.from_numpy(scale.astype(np.float32))
+    scale = training_parameter_scale(dataset)
+    if cache_file is not None:
+        atomic_numpy_archive(
+            cache_file,
+            scale=scale.numpy(),
+            count=np.asarray(len(dataset), dtype=np.int64),
+        )
+    emit({"event": "training-statistics-cache", "kind": "targets", "hit": False,
+          "file": str(cache_file) if cache_file is not None else None,
+          "examples": len(dataset)})
+    return scale
 
 
 def teacher_fit_summary(manifest: dict, root: Path) -> dict[str, float]:
@@ -652,8 +1636,9 @@ def teacher_fit_summary(manifest: dict, root: Path) -> dict[str, float]:
     count = 0
     for value in manifest["shards"]:
         row_count = int(value["count"])
-        metrics = np.memmap(
-            root / value["teacherMetrics"], mode="r", dtype="<f4", shape=(row_count, len(names))
+        metrics = component_rows(
+            root / value["teacherMetrics"], "<f4", len(names),
+            int(value["oracleRowOffset"]), int(value["oracleRowStride"]), row_count,
         )
         total += np.asarray(metrics, dtype=np.float64).sum(axis=0)
         count += row_count
@@ -672,24 +1657,37 @@ def deterministic_current_states(
     return torch.linspace(lower, upper, count, device=device).view(1, count)
 
 
-def parse_loss_weights(value: str) -> LossWeights:
+def parse_loss_weights(value: str) -> DirectLossWeights:
     parsed = json.loads(value)
-    return LossWeights(
+    if "parameterMse" in parsed:
+        raise ValueError(
+            "parameterMse is not part of the direct-distribution objective"
+        )
+    return DirectLossWeights(
         cross_entropy=float(parsed.get("crossEntropy", 1)),
-        probability_mse=float(parsed.get("probabilityMse", 1)),
-        parameter_mse=float(parsed.get("parameterMse", 1)),
-        excess_entropy=float(parsed.get("excessEntropy", 1)),
-        state_mutual_information=float(parsed.get("stateMutualInformation", 1)),
+        probability_mse=float(parsed.get("probabilityMse", 0.1)),
+        excess_entropy=float(parsed.get("excessEntropy", 0)),
+        temporal_mutual_information=float(parsed.get("temporalMutualInformation", 1)),
         oracle_mutual_information=float(parsed.get("oracleMutualInformation", 1)),
     )
+
+
+def loss_weights_on_device(
+    weights: DirectLossWeights,
+    device: torch.device,
+) -> DirectLossWeights:
+    return DirectLossWeights(**{
+        field: torch.tensor(value, dtype=torch.float32, device=device)
+        for field, value in asdict(weights).items()
+    })
 
 
 def parse_time_weighting(value: str) -> TimeWeighting:
     parsed = json.loads(value)
     if parsed.get("mode", "distanceImbalance") != "distanceImbalance":
         raise ValueError("time weighting mode must be distanceImbalance")
-    if parsed.get("stateAggregation", "absoluteMean") != "absoluteMean":
-        raise ValueError("distance imbalance state aggregation must be absoluteMean")
+    if parsed.get("stateAggregation", "globalDistanceRatio") != "globalDistanceRatio":
+        raise ValueError("distance imbalance state aggregation must be globalDistanceRatio")
     weighting = TimeWeighting(
         distance_epsilon=float(parsed.get("distanceEpsilon", 1e-6)),
         minimum_weight=float(parsed.get("minimumWeight", 1e-6)),
@@ -698,6 +1696,9 @@ def parse_time_weighting(value: str) -> TimeWeighting:
         growth_per_prior_advice=float(parsed.get("growthPerPriorAdvice", 0.25)),
         maximum_multiplier=float(parsed.get("maximumMultiplier", 4)),
         reset_after_gap_steps=float(parsed.get("resetAfterGapSteps", 60)),
+        resolution_divergence_multiplier=float(
+            parsed.get("resolutionDivergenceMultiplier", 0)
+        ),
     )
     validate_time_weighting(weighting)
     return weighting
@@ -708,12 +1709,14 @@ def time_weighting_metadata(weighting: TimeWeighting) -> dict[str, object]:
         "mode": "distanceImbalance",
         "distanceEpsilon": weighting.distance_epsilon,
         "minimumWeight": weighting.minimum_weight,
-        "stateAggregation": "absoluteMean",
+        "stateAggregation": "globalDistanceRatio",
         "minimumAdviceMagnitude": weighting.minimum_advice_magnitude,
         "memoryHalfLifeSteps": weighting.memory_half_life_steps,
         "growthPerPriorAdvice": weighting.growth_per_prior_advice,
         "maximumMultiplier": weighting.maximum_multiplier,
         "resetAfterGapSteps": weighting.reset_after_gap_steps,
+        "resolutionDivergenceMultiplier":
+            weighting.resolution_divergence_multiplier,
     }
 
 
@@ -726,8 +1729,8 @@ def learning_rate_multiplier(step: int, total: int) -> float:
 
 
 def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
-                    best_validation_metrics, stale_epochs, model, optimizer, scheduler, scaler,
-                    initialization) -> None:
+                    best_validation_metrics, stale_epochs, model, optimizer, scheduler,
+                    scaler, training_contract) -> None:
     atomic_torch_save({
         "epoch": epoch,
         "globalStep": global_step,
@@ -740,13 +1743,13 @@ def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "rng": capture_rng(),
-        "initialization": initialization,
+        "trainingContract": training_contract,
     }, file)
 
 
 def export_artifact(model, args, dataset_manifest, train_count, validation_count, test_count,
                     best_epoch, best_validation_metrics, test_metrics, teacher_metrics,
-                    loss_weights, time_weighting, device, finalized_early, initialization) -> None:
+                    loss_weights, time_weighting, device, finalized_early) -> None:
     model.eval().cpu()
     verification_batch_size = 7
     verification_features = (
@@ -764,7 +1767,7 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
         (torch.zeros(2, INPUT_FEATURE_COUNT, dtype=torch.float32),),
         temporary,
         input_names=["features"],
-        output_names=["raw_parameters"],
+        output_names=["action_logits"],
         dynamic_shapes={"features": {0: torch.export.Dim("batch", min=1)}},
         opset_version=18,
         dynamo=True,
@@ -777,13 +1780,16 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
         "id": args.model_id,
         "label": args.label,
         "createdAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-        "featureSchemaVersion": 4,
+        "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
         "inputFeatureCount": INPUT_FEATURE_COUNT,
-        "outputParameterCount": OUTPUT_PARAMETER_COUNT,
+        "outputRepresentation": "base-action-logits",
+        "outputActionCount": OUTPUT_ACTION_COUNT,
+        "actionGrid": dataset_manifest["grid"],
         "hiddenLayerCount": HIDDEN_LAYER_COUNT,
         "hiddenWidth": HIDDEN_WIDTH,
         "modelFile": "model.onnx",
-        "checkpointFile": "checkpoint.pt",
+        **({} if args.evaluation_only else {"checkpointFile": "checkpoint.pt"}),
+        "predictionDelayMs": int(dataset_manifest["predictionDelayMs"]),
         "verificationFixture": {
             "batchSize": verification_batch_size,
             "inputFile": "verification-input.f32",
@@ -792,6 +1798,7 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
         "policySupport": dataset_manifest["policySupport"],
         "training": {
             "datasetPlanId": dataset_manifest["planId"],
+            "targetRepresentation": args.target,
             "trainExamples": train_count,
             "validationExamples": validation_count,
             "testExamples": test_count,
@@ -802,7 +1809,31 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "testMetrics": test_metrics,
             "teacherFitMetrics": teacher_metrics,
             "lossWeights": asdict(loss_weights),
+            "selectionMetric": args.selection_metric,
+            "initializeFromCheckpoint": (
+                str(args.initialize_from_checkpoint)
+                if args.initialize_from_checkpoint is not None
+                else None
+            ),
+            "evaluationOnly": args.evaluation_only,
+            "targetValidation": {
+                "klDivergence": args.target_validation_kl,
+                "klDivergenceStdDev": args.target_validation_kl_stddev,
+            },
+            "policyMetricDefinitions": {
+                "klDivergence":
+                    "conditional KL(target || prediction) on the visible range",
+                "klDivergenceVariance":
+                    "weighted population variance of per-example visible-range conditional KL",
+                "baseKlDivergence":
+                    "KL between stored and predicted base-action distributions",
+                "probabilityMse":
+                    "weighted mean per-example probability MSE on the visible-range conditional surface",
+                "probabilityMseVariance":
+                    "weighted population variance of per-example visible-range probability MSE",
+            },
             "timeWeighting": time_weighting_metadata(time_weighting),
+            "predictionDelayMs": int(dataset_manifest["predictionDelayMs"]),
             "distributionLossRange": [
                 dataset_manifest["policySupport"]["visible_lower"],
                 dataset_manifest["policySupport"]["visible_upper"],
@@ -810,7 +1841,6 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "finalizedEarly": finalized_early,
             "seed": args.seed,
             "device": str(device),
-            **({"initializedFrom": initialization} if initialization else {}),
         },
     }
     if args.plan:
@@ -818,15 +1848,176 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
     atomic_json(manifest, args.output / "manifest.json")
 
 
-def validate_dataset_manifest(manifest: dict) -> None:
-    if manifest.get("version") != 4 or manifest.get("featureSchemaVersion") != 4:
+def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
+    if manifest.get("version") != 8 \
+            or manifest.get("featureSchemaVersion") != FEATURE_SCHEMA_VERSION:
         raise ValueError("unsupported MLP fitted-policy dataset schema")
     if manifest.get("featureCount") != INPUT_FEATURE_COUNT:
         raise ValueError("dataset feature count does not match model")
-    if manifest.get("teacherParameterCount") != OUTPUT_PARAMETER_COUNT:
-        raise ValueError("dataset teacher parameter count does not match model")
+    if manifest.get("teacherParameterCount") != TEACHER_PARAMETER_COUNT:
+        raise ValueError("dataset diagnostic teacher parameter count is invalid")
+    if manifest.get("actionCount") != OUTPUT_ACTION_COUNT:
+        raise ValueError("dataset action count does not match direct model output")
+    delay = manifest.get("predictionDelayMs")
+    pairing = manifest.get("timestampPairing", {})
+    component_layout = manifest.get("componentLayout", {})
+    if not isinstance(delay, int) or delay < 0 \
+            or pairing.get("oracleTargetTime") != "predictionTime - predictionDelayMs" \
+            or pairing.get("splitAssignment") != "predictionTime" \
+            or pairing.get("responseLagMs") != delay \
+            or component_layout.get("version") != 1 \
+            or ("storeId" in component_layout
+                and (not isinstance(component_layout["storeId"], str)
+                     or not component_layout["storeId"])):
+        raise ValueError("dataset delayed timestamp-pairing contract is invalid")
+    expected_teacher_metrics = [
+        "crossEntropy",
+        "klDivergence",
+        "meanSquaredError",
+        "iterations",
+        "restarts",
+        "converged",
+        "distanceImbalance",
+    ]
+    if manifest.get("teacherMetricCount") != len(expected_teacher_metrics) \
+            or manifest.get("teacherMetricNames") != expected_teacher_metrics:
+        raise ValueError("dataset teacher metric metadata is invalid")
     if len(manifest.get("grid", [])) != manifest.get("actionCount"):
         raise ValueError("dataset action grid is invalid")
+    if not is_centered_power_of_two_grid(manifest["actionCount"]):
+        raise ValueError("dataset action grid must contain 2^n-1 cells")
+    raw_oracle = manifest.get("rawOracleMap", {})
+    minute_oracle = manifest.get("minuteOracleMap", {})
+    expected_shape = [len(manifest.get("currentGrid", [])), manifest["actionCount"]]
+    if expected_shape != [manifest["actionCount"], manifest["actionCount"]] \
+            or raw_oracle.get("materializedDtype") != "float32" \
+            or raw_oracle.get("materializedLayout") \
+            != "row-major [example, currentExposure, targetExposure]" \
+            or raw_oracle.get("shape") != expected_shape \
+            or raw_oracle.get("currentExposureGrid") != "currentGrid" \
+            or raw_oracle.get("targetExposureGrid") != "grid" \
+            or raw_oracle.get("normalized") is not True \
+            or raw_oracle.get("losslessEncoding") \
+            != "base-probabilities-plus-deterministic-transaction-transition-v1" \
+            or raw_oracle.get("factorDtype") != "float32" \
+            or raw_oracle.get("factorLayout") \
+            != "row-major [example, targetExposure]" \
+            or raw_oracle.get("factorShape") != [manifest["actionCount"]] \
+            or raw_oracle.get("factorFileField") != "rawOracleProbabilities" \
+            or raw_oracle.get("optionalHardCutoffCoordinates") \
+            != "teacherParameters[6:8]" \
+            or any(not isinstance(shard.get("rawOracleProbabilities"), str)
+                   for shard in manifest.get("shards", [])):
+        raise ValueError("dataset raw oracle map contract is invalid")
+    resolution = minute_oracle.get("resolutionDivergence", {})
+    minute_storage = minute_oracle.get("storage", "persisted-per-example")
+    if minute_oracle.get("factorDtype") != "float32" \
+            or minute_oracle.get("factorLayout") \
+            != "row-major [example, targetExposure]" \
+            or minute_oracle.get("factorShape") != [manifest["actionCount"]] \
+            or minute_oracle.get("factorFileField") \
+            != "minuteOracleProbabilities" \
+            or minute_oracle.get("normalized") is not True \
+            or minute_storage not in (
+                "persisted-per-example",
+                "computed-directly-at-training-startup",
+            ) \
+            or resolution.get("metric") != "Jensen-Shannon divergence" \
+            or resolution.get("fileField") != "resolutionDivergence" \
+            or any(not isinstance(shard.get("minuteOracleProbabilities"), str)
+                   or not isinstance(shard.get("resolutionDivergence"), str)
+                   for shard in manifest.get("shards", [])):
+        raise ValueError("dataset one-minute oracle contract is invalid")
+    example_weighting = manifest.get("exampleWeighting", {})
+    if example_weighting.get("dtype") != "float32" \
+            or example_weighting.get("layout") != "row-major [example]" \
+            or example_weighting.get("fileField") != "timeWeights" \
+            or example_weighting.get("baseFileField") != "baseTimeWeights" \
+            or example_weighting.get("distanceImbalanceMetadataField") \
+            != "teacherMetrics.distanceImbalance" \
+            or example_weighting.get("storedWeights") \
+            != "causal unnormalized example weights" \
+            or example_weighting.get("trainingTransform") \
+            != "divide each batch by its mean only" \
+            or any(not isinstance(shard.get("timeWeights"), str)
+                   for shard in manifest.get("shards", [])):
+        raise ValueError("dataset example-weighting contract is invalid")
+    if root is not None:
+        expected_row_bytes = manifest["actionCount"] * np.dtype("<f4").itemsize
+        input_components = {
+            component["features"]: component
+            for component in component_layout.get("inputComponents", [])
+            if isinstance(component, dict)
+            and isinstance(component.get("features"), str)
+        }
+        for shard in manifest["shards"]:
+            count = int(shard["count"])
+            feature_offset = int(shard.get("featureRowOffset", -1))
+            feature_stride = int(shard.get("featureRowStride", 0))
+            oracle_offset = int(shard.get("oracleRowOffset", -1))
+            oracle_stride = int(shard.get("oracleRowStride", 0))
+            prediction_start = shard.get("predictionTimeStart")
+            oracle_start = shard.get("oracleTargetTimeStart")
+            if count < 1 or min(feature_offset, oracle_offset) < 0 \
+                    or min(feature_stride, oracle_stride) < 1 \
+                    or not isinstance(prediction_start, int) \
+                    or not isinstance(oracle_start, int) \
+                    or prediction_start - oracle_start != delay:
+                raise ValueError("dataset component row view is invalid")
+            file = root / shard["rawOracleProbabilities"]
+            minimum_oracle_rows = oracle_offset + (count - 1) * oracle_stride + 1
+            if not file.is_file() or file.stat().st_size % expected_row_bytes != 0 \
+                    or file.stat().st_size < minimum_oracle_rows * expected_row_bytes:
+                raise ValueError(
+                    f"dataset raw oracle grid file has an invalid size: {file}"
+                )
+            feature_file = root / shard["features"]
+            feature_row_bytes = manifest["featureCount"] * np.dtype("<f2").itemsize
+            minimum_feature_rows = feature_offset + (count - 1) * feature_stride + 1
+            feature_component = input_components.get(shard["features"], {})
+            if feature_component.get("featuresCompression") == "zstd" \
+                    or feature_file.name.endswith(".zst"):
+                expected_decoded_bytes = 86_400 * feature_row_bytes
+                if not feature_file.is_file() \
+                        or feature_file.stat().st_size < 1 \
+                        or feature_component.get("featuresCompression") != "zstd" \
+                        or feature_component.get("featuresUncompressedBytes") \
+                        != expected_decoded_bytes \
+                        or minimum_feature_rows > 86_400:
+                    raise ValueError(
+                        "dataset compressed input feature component is invalid: "
+                        f"{feature_file}"
+                    )
+            elif not feature_file.is_file() \
+                    or feature_file.stat().st_size % feature_row_bytes != 0 \
+                    or feature_file.stat().st_size \
+                    < minimum_feature_rows * feature_row_bytes:
+                raise ValueError(
+                    f"dataset input feature component has an invalid size: {feature_file}"
+                )
+            weight_file = root / shard["timeWeights"]
+            base_weight_file = root / shard["baseTimeWeights"]
+            expected_weight_bytes = count * np.dtype("<f4").itemsize
+            if not weight_file.is_file() \
+                    or weight_file.stat().st_size != expected_weight_bytes \
+                    or not base_weight_file.is_file() \
+                    or base_weight_file.stat().st_size != expected_weight_bytes:
+                raise ValueError(
+                    f"dataset example-weight file has an invalid size: {weight_file}"
+                )
+            minute_file = root / shard["minuteOracleProbabilities"]
+            resolution_file = root / shard["resolutionDivergence"]
+            if minute_storage == "persisted-per-example" \
+                    and (not minute_file.is_file()
+                         or minute_file.stat().st_size != count * expected_row_bytes):
+                raise ValueError(
+                    f"dataset one-minute oracle file has an invalid size: {minute_file}"
+                )
+            if not resolution_file.is_file() \
+                    or resolution_file.stat().st_size != count * np.dtype("<f4").itemsize:
+                raise ValueError(
+                    f"dataset resolution divergence file has an invalid size: {resolution_file}"
+                )
     if not isinstance(manifest.get("samplingIntervalMs"), int) \
             or manifest["samplingIntervalMs"] <= 0:
         raise ValueError("dataset sampling interval is invalid")
@@ -840,16 +2031,66 @@ def validate_args(args: argparse.Namespace) -> None:
     if min(args.epochs, args.batch_size, args.accumulate, args.states_per_example,
            args.patience, args.log_every_steps) < 1 or args.workers < 0:
         raise ValueError("training counts must be positive (workers may be zero)")
+    if args.evaluation_batch_size < 0:
+        raise ValueError("evaluation batch size must be non-negative")
+    if not 0 < args.validation_fraction <= 1 or not 0 < args.training_fraction <= 1:
+        raise ValueError("training and validation fractions must be in (0, 1]")
     if args.learning_rate <= 0 or args.weight_decay < 0 or not 0 <= args.dropout < 1:
         raise ValueError("invalid optimizer or dropout configuration")
-    if args.initialize_from_checkpoint is not None and not args.initialize_from_checkpoint.is_file():
-        raise ValueError(
-            f"initial checkpoint does not exist: {args.initialize_from_checkpoint}"
-        )
+    if args.target_validation_kl is not None and args.target_validation_kl <= 0:
+        raise ValueError("target validation KL must be positive")
+    if args.target_validation_kl_stddev is not None \
+            and args.target_validation_kl_stddev <= 0:
+        raise ValueError("target validation KL standard deviation must be positive")
+    if args.target_validation_kl_stddev is not None \
+            and args.target_validation_kl is None:
+        raise ValueError("target validation KL is required when its standard deviation is set")
+    if args.initialize_from_checkpoint is not None \
+            and not args.initialize_from_checkpoint.is_file():
+        raise ValueError("warm-start checkpoint does not exist")
+    if args.evaluation_only and args.initialize_from_checkpoint is None:
+        raise ValueError("evaluation-only export requires a warm-start checkpoint")
+    if args.inherited_best_epoch < -1:
+        raise ValueError("inherited best epoch must be -1 or non-negative")
+    if not is_centered_power_of_two_grid(args.states_per_example):
+        raise ValueError("training current-state grid must contain 2^n-1 cells")
+
+
+def validation_target_reached(
+    metrics: dict[str, float],
+    args: argparse.Namespace,
+) -> bool:
+    if args.target_validation_kl is None:
+        return False
+    if metrics.get("klDivergence", math.inf) > args.target_validation_kl:
+        return False
+    if args.target_validation_kl_stddev is not None \
+            and metrics.get("klDivergenceStdDev", math.inf) \
+            > args.target_validation_kl_stddev:
+        return False
+    return True
+
+
+def checkpoint_identity(file: Path | None) -> dict | None:
+    if file is None:
+        return None
+    resolved = file.resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": stat.st_size,
+        "modifiedNs": stat.st_mtime_ns,
+    }
+def is_centered_power_of_two_grid(count: int) -> bool:
+    return count >= 3 and (count & (count + 1)) == 0
 
 
 def detached_metrics(metrics: dict[str, Tensor]) -> dict[str, float]:
-    return {name: float(metrics[name].detach()) for name in METRIC_NAMES}
+    return {
+        name: float(metrics[name].detach())
+        for name in METRIC_NAMES
+        if name in metrics
+    }
 
 
 def emit(value: dict) -> None:
@@ -911,6 +2152,14 @@ def atomic_torch_save(value, target: Path) -> None:
 def atomic_json(value: dict, target: Path) -> None:
     temporary = target.with_suffix(target.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(target)
+
+
+def atomic_numpy_archive(target: Path, **values) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez(stream, **values)
     temporary.replace(target)
 
 

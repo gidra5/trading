@@ -284,6 +284,7 @@ export function CandleChart(props: CandleChartProps) {
         smaSeries,
         stateBands,
         canvasPlot.bottom,
+        plot.bottom,
       );
     }
   };
@@ -1689,6 +1690,7 @@ function drawSelectedCandle(
   smaSeries: BacktestChartSmaSeries[],
   stateBands: CandleChartStateBand[],
   lineBottom = plot.bottom,
+  timestampBottom = lineBottom,
 ): void {
   const markerTime = selectedTime ?? (candle.openTime + candle.closeTime) / 2;
   const x = clamp(timeToX(markerTime), plot.left, plot.right);
@@ -1719,11 +1721,11 @@ function drawSelectedCandle(
   const labelWidth = ctx.measureText(label).width + 12;
   const labelLeft = clamp(x - labelWidth / 2, plot.left, plot.right - labelWidth);
   ctx.fillStyle = "#252a35";
-  ctx.fillRect(labelLeft, lineBottom - 18, labelWidth, 18);
+  ctx.fillRect(labelLeft, timestampBottom - 18, labelWidth, 18);
   ctx.fillStyle = "#eef1f8";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(label, labelLeft + labelWidth / 2, lineBottom - 9);
+  ctx.fillText(label, labelLeft + labelWidth / 2, timestampBottom - 9);
 
   const values = [
     `O ${formatQuote(candle.open, 2)}  H ${formatQuote(candle.high, 2)}  L ${formatQuote(candle.low, 2)}  C ${formatQuote(candle.close, 2)}`,

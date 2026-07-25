@@ -5,18 +5,14 @@ import {
   MLP_CANDLE_FEATURE_COUNT,
   MLP_CANDLE_WINDOWS,
   MLP_INPUT_FEATURE_COUNT,
-  MLP_STATE_FEATURES,
   MLP_VOLUME_EMA_WARMUP_MULTIPLE,
   encodeMlpCandleWindow,
-  encodeMlpStateInputs,
   type Candle,
-  type MlpExposureStateInputs,
 } from "@trading/bot-algo";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
-
 interface MlpAggregateArchive {
   hour: Candle[];
   day: Candle[];
@@ -45,7 +41,6 @@ export class MlpFeatureStore {
   async prepare(
     oneSecondCandles: readonly Candle[],
     times: readonly number[],
-    state: MlpExposureStateInputs,
   ): Promise<PreparedMlpFeatures> {
     if (times.length === 0) throw new Error("MLP feature preparation requires at least one timestamp.");
     let firstTime = Number.POSITIVE_INFINITY;
@@ -55,20 +50,37 @@ export class MlpFeatureStore {
       firstTime = Math.min(firstTime, time);
       lastTime = Math.max(lastTime, time);
     }
-    const [minute, aggregate] = await Promise.all([
-      this.loadMinuteRange(firstTime - DAY_MS, lastTime + 1),
+    const [archivedMinute, aggregate] = await Promise.all([
+      this.loadMinuteRange(utcDay(firstTime) - DAY_MS, lastTime + 1),
       this.aggregates(),
     ]);
+    // Newly recovered one-second days can legitimately precede their archived
+    // one-minute shard. Reconstruct completed minutes from the authoritative
+    // seconds so current-hour features remain causal and preparation never
+    // waits for a second archive refresh.
+    const minute = mergeCandlesByOpenTime(
+      archivedMinute,
+      completedMinutesFromSeconds(oneSecondCandles),
+    );
+    const recentAggregate = aggregateMinuteCandles(minute);
+    const completeAggregate: MlpAggregateArchive = {
+      hour: mergeCandlesByOpenTime(aggregate.hour, recentAggregate.hour),
+      day: mergeCandlesByOpenTime(aggregate.day, recentAggregate.day),
+      month: mergeCandlesByOpenTime(aggregate.month, recentAggregate.month),
+      quarter: mergeCandlesByOpenTime(
+        aggregate.quarter,
+        recentAggregate.quarter,
+      ),
+    };
     const completeSeries = new Map<string, readonly Candle[]>([
       ["1m", minute],
-      ["1h", aggregate.hour],
-      ["1d", aggregate.day],
-      ["1M", aggregate.month],
-      ["3M", aggregate.quarter],
+      ["1h", completeAggregate.hour],
+      ["1d", completeAggregate.day],
+      ["1M", completeAggregate.month],
+      ["3M", completeAggregate.quarter],
     ]);
     const encodedCaches = new Map<string, Map<number, { values: Float32Array; fill?: number }>>();
     const partialCache = new Map<number, PartialCandleHierarchy>();
-    const stateVector = encodeMlpStateInputs(state);
     return {
       encode: (time, output, outputOffset) => {
         if (!Number.isFinite(time) || outputOffset < 0
@@ -96,7 +108,12 @@ export class MlpFeatureStore {
             } else {
               let partial = partialCache.get(time);
               if (!partial) {
-                partial = buildPartialCandleHierarchy(oneSecondCandles, minute, aggregate, time);
+                partial = buildPartialCandleHierarchy(
+                  oneSecondCandles,
+                  minute,
+                  completeAggregate,
+                  time,
+                );
                 partialCache.set(time, partial);
               }
               const current = partial[partialKey(window.id)];
@@ -117,13 +134,26 @@ export class MlpFeatureStore {
           cursor += window.candleCount * MLP_CANDLE_FEATURE_COUNT;
           if (window.id !== "1s") output[cursor++] = encoded.fill!;
         }
-        output.set(stateVector, cursor);
-        cursor += MLP_STATE_FEATURES.length;
         if (cursor !== outputOffset + MLP_INPUT_FEATURE_COUNT) {
           throw new Error("MLP feature encoder violated its manifest feature count.");
         }
       },
     };
+  }
+
+  async loadCompletedMinuteRange(
+    startTime: number,
+    endTime: number,
+  ): Promise<Candle[]> {
+    const archived = await this.loadMinuteRange(startTime, endTime);
+    const expected = Math.max(0, Math.ceil((endTime - startTime) / MINUTE_MS));
+    if (archived.length >= expected) return archived;
+    const seconds = await this.loadSecondRange(startTime, endTime);
+    return mergeCandlesByOpenTime(
+      archived,
+      completedMinutesFromSeconds(seconds),
+    ).filter((candle) =>
+      candle.openTime >= startTime && candle.openTime < endTime);
   }
 
   private aggregates(): Promise<MlpAggregateArchive> {
@@ -188,6 +218,32 @@ export class MlpFeatureStore {
     return result;
   }
 
+  async loadSecondRange(startTime: number, endTime: number): Promise<Candle[]> {
+    const root = path.join(
+      this.dataDir,
+      "historical",
+      "spot-btcusdt",
+      "btcusdt",
+      "1s",
+    );
+    const result: Candle[] = [];
+    for (let day = utcDay(startTime); day < endTime; day += DAY_MS) {
+      const date = new Date(day).toISOString().slice(0, 10);
+      let candles: Candle[];
+      try {
+        candles = await readCandleShard(path.join(root, `${date}.jsonl`));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        candles = await readCandleShard(path.join(root, `${date}.jsonl.gz`));
+      }
+      for (const candle of candles) {
+        if (candle.openTime >= startTime && candle.openTime < endTime) result.push(candle);
+      }
+    }
+    result.sort((left, right) => left.openTime - right.openTime);
+    return result;
+  }
+
   private minuteRoot(): string {
     return path.join(
       this.dataDir,
@@ -197,6 +253,75 @@ export class MlpFeatureStore {
       "1m",
     );
   }
+}
+
+function completedMinutesFromSeconds(seconds: readonly Candle[]): Candle[] {
+  const result: Candle[] = [];
+  let index = 0;
+  while (index < seconds.length) {
+    const start = minuteBounds(seconds[index]!.openTime)[0];
+    const end = start + MINUTE_MS;
+    const first = index;
+    while (index < seconds.length && seconds[index]!.openTime < end) index += 1;
+    if (index - first !== 60
+      || seconds[first]!.openTime !== start
+      || seconds[index - 1]!.openTime !== end - 1_000) continue;
+    let contiguous = true;
+    let high = seconds[first]!.high;
+    let low = seconds[first]!.low;
+    let volume = 0;
+    for (let child = first; child < index; child += 1) {
+      if (seconds[child]!.openTime !== start + (child - first) * 1_000) {
+        contiguous = false;
+        break;
+      }
+      high = Math.max(high, seconds[child]!.high);
+      low = Math.min(low, seconds[child]!.low);
+      volume += seconds[child]!.volume;
+    }
+    if (!contiguous) continue;
+    result.push({
+      symbol: seconds[first]!.symbol,
+      interval: "1m",
+      openTime: start,
+      closeTime: end - 1,
+      open: seconds[first]!.open,
+      high,
+      low,
+      close: seconds[index - 1]!.close,
+      volume,
+      closed: true,
+    });
+  }
+  return result;
+}
+
+function mergeCandlesByOpenTime(
+  archived: readonly Candle[],
+  reconstructed: readonly Candle[],
+): Candle[] {
+  const byOpenTime = new Map(archived.map((candle) => [candle.openTime, candle]));
+  for (const candle of reconstructed) byOpenTime.set(candle.openTime, candle);
+  return [...byOpenTime.values()].sort((left, right) => left.openTime - right.openTime);
+}
+
+function aggregateMinuteCandles(minutes: readonly Candle[]): MlpAggregateArchive {
+  const hour = new CompleteCandleAggregator(hourBounds, "1h");
+  const day = new CompleteCandleAggregator(dayBounds, "1d");
+  const month = new CompleteCandleAggregator(monthBounds, "1M");
+  const quarter = new CompleteCandleAggregator(quarterBounds, "3M");
+  for (const candle of minutes) {
+    hour.add(candle);
+    day.add(candle);
+    month.add(candle);
+    quarter.add(candle);
+  }
+  return {
+    hour: hour.finish(),
+    day: day.finish(),
+    month: month.finish(),
+    quarter: quarter.finish(),
+  };
 }
 
 function buildPartialCandleHierarchy(

@@ -7,8 +7,9 @@ import os
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import deque
 from pathlib import Path
 
@@ -16,12 +17,24 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from mlp_model import PolicySupport, conditional_policy_logits, scaled_softplus
+from mlp_model import (
+    PolicySupport,
+    conditional_policy_logits,
+    distance_imbalance_advice,
+    scaled_softplus,
+)
 
 
-METRIC_COUNT = 6
+METRIC_COUNT = 7
 PARAMETER_COUNT = 8
 SCORE_PARAMETER_COUNT = 6
+NVTX_ENABLED = os.environ.get("TRADING_MLP_TEACHER_NVTX", "0") == "1"
+
+
+def nvtx_range(name: str, value: Tensor):
+    if NVTX_ENABLED and value.is_cuda:
+        return torch.cuda.nvtx.range(name)
+    return nullcontext()
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,10 @@ class FitConfig:
     input_row_stride: int = 0
     input_queue_batches: int = 2
     pipelined_refinement: bool = False
+    distance_epsilon: float = 1e-6
+    visible_sample_fraction: float = 0.0
+    score_hinge_span: float = 0.0
+    compact_visible_initialization: bool = False
 
 
 @dataclass
@@ -78,6 +95,13 @@ class FitBatchState:
     config: FitConfig
 
 
+@dataclass(frozen=True)
+class ProjectionTargetStatistics:
+    weights: Tensor
+    weight_total: Tensor
+    centered_scores: Tensor
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batched CUDA conditional-policy teacher fitter.")
     parser.add_argument("--worker", action="store_true")
@@ -87,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parameters-output", type=Path)
     parser.add_argument("--metrics-output", type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--diagnostic-only", action="store_true")
     return parser.parse_args()
 
 
@@ -112,6 +137,7 @@ def worker_main(device: str) -> None:
                 parameters_output=Path(job["parametersOutput"]),
                 metrics_output=Path(job["metricsOutput"]),
                 device=device,
+                diagnostic_only=bool(job.get("diagnosticOnly", False)),
             ))
         except Exception as error:
             emit({
@@ -152,15 +178,36 @@ def run_job(args: argparse.Namespace) -> None:
     actions = torch.tensor(config.action_grid, dtype=torch.float32, device=device)
     currents = torch.tensor(config.current_grid, dtype=torch.float32, device=device)
     support = PolicySupport(
-        config.latent_lower,
-        config.latent_upper,
-        config.visible_lower,
-        config.visible_upper,
-        config.friction,
-        1 / config.transition_log_scale,
+        torch.tensor(config.latent_lower, dtype=torch.float32, device=device),
+        torch.tensor(config.latent_upper, dtype=torch.float32, device=device),
+        torch.tensor(config.visible_lower, dtype=torch.float32, device=device),
+        torch.tensor(config.visible_upper, dtype=torch.float32, device=device),
+        torch.tensor(config.friction, dtype=torch.float32, device=device),
+        torch.tensor(
+            1.0 / float(config.transition_log_scale),
+            dtype=torch.float32,
+            device=device,
+        ),
+        torch.tensor(
+            config.score_hinge_span or (config.latent_upper - config.latent_lower),
+            dtype=torch.float32,
+            device=device,
+        ),
     )
-    state_indexes = sampled_indices(currents.numel(), config.sample_states, device)
-    action_indexes = sampled_indices(actions.numel(), config.sample_actions, device)
+    state_indexes = domain_sampled_indices(
+        currents,
+        config.sample_states,
+        config.metric_visible_lower,
+        config.metric_visible_upper,
+        config.visible_sample_fraction,
+    )
+    action_indexes = domain_sampled_indices(
+        actions,
+        config.sample_actions,
+        config.metric_visible_lower,
+        config.metric_visible_upper,
+        config.visible_sample_fraction,
+    )
     sampled_actions = actions[action_indexes]
     sampled_currents = currents[state_indexes]
     metric_action_cells = int((
@@ -171,11 +218,28 @@ def run_job(args: argparse.Namespace) -> None:
         (currents >= config.metric_visible_lower)
         & (currents <= config.metric_visible_upper)
     ).sum())
+    if bool(getattr(args, "diagnostic_only", False)):
+        run_direct_diagnostics(
+            args,
+            config,
+            inputs,
+            parameters,
+            metrics,
+            actions,
+            currents,
+            metric_action_cells,
+            metric_current_cells,
+            device,
+        )
+        return
     started = time.monotonic()
     totals = torch.zeros(3, dtype=torch.float64)
     rejected_total = 0
     temporal_selected_total = 0
     temporal_candidate_total = 0
+    temporal_equivalent_total = 0
+    temporal_quality_accepted_total = 0
+    temporal_quality_better_total = 0
     temporal_examples_total = 0
     temporal_step_before = 0.0
     temporal_step_after = 0.0
@@ -212,6 +276,8 @@ def run_job(args: argparse.Namespace) -> None:
     ) -> None:
         nonlocal rejected_total
         nonlocal temporal_selected_total, temporal_candidate_total
+        nonlocal temporal_equivalent_total, temporal_quality_accepted_total
+        nonlocal temporal_quality_better_total
         nonlocal temporal_examples_total, temporal_step_before, temporal_step_after
         raw, diagnostic, iterations, converged, temporal = result
         parameters[start:end] = raw.cpu().numpy().astype("<f4", copy=False)
@@ -222,6 +288,7 @@ def run_job(args: argparse.Namespace) -> None:
             torch.full_like(diagnostic["crossEntropy"], float(iterations)),
             torch.full_like(diagnostic["crossEntropy"], float(config.restarts)),
             converged.float(),
+            diagnostic["distanceImbalance"],
         ), dim=-1)
         metrics[start:end] = batch_metrics.cpu().numpy().astype("<f4", copy=False)
         totals.add_(torch.tensor([
@@ -235,6 +302,9 @@ def run_job(args: argparse.Namespace) -> None:
         ).sum())
         temporal_selected_total += int(temporal["selectedCount"])
         temporal_candidate_total += int(temporal["candidateCount"])
+        temporal_equivalent_total += int(temporal["equivalentCount"])
+        temporal_quality_accepted_total += int(temporal["qualityAcceptedCount"])
+        temporal_quality_better_total += int(temporal["qualityBetterCount"])
         temporal_examples_total += end - start
         temporal_step_before += float(temporal["meanNormalizedStepBefore"]) * (end - start)
         temporal_step_after += float(temporal["meanNormalizedStepAfter"]) * (end - start)
@@ -253,6 +323,12 @@ def run_job(args: argparse.Namespace) -> None:
             "metricActionCells": metric_action_cells,
             "metricCurrentCells": metric_current_cells,
             "temporalWarmSelectedFraction": temporal_selected_total
+            / max(1, temporal_candidate_total),
+            "temporalWarmEquivalentFraction": temporal_equivalent_total
+            / max(1, temporal_candidate_total),
+            "temporalWarmQualityAcceptedFraction": temporal_quality_accepted_total
+            / max(1, temporal_candidate_total),
+            "temporalWarmQualityBetterFraction": temporal_quality_better_total
             / max(1, temporal_candidate_total),
             "temporalMeanNormalizedStepBefore": temporal_step_before
             / max(1, temporal_examples_total),
@@ -390,6 +466,12 @@ def run_job(args: argparse.Namespace) -> None:
         "qualityAccepted": rejected_total == 0,
         "temporalWarmSelectedFraction": temporal_selected_total
         / max(1, temporal_candidate_total),
+        "temporalWarmEquivalentFraction": temporal_equivalent_total
+        / max(1, temporal_candidate_total),
+        "temporalWarmQualityAcceptedFraction": temporal_quality_accepted_total
+        / max(1, temporal_candidate_total),
+        "temporalWarmQualityBetterFraction": temporal_quality_better_total
+        / max(1, temporal_candidate_total),
         "temporalMeanNormalizedStepBefore": temporal_step_before
         / max(1, temporal_examples_total),
         "temporalMeanNormalizedStepAfter": temporal_step_after
@@ -397,6 +479,122 @@ def run_job(args: argparse.Namespace) -> None:
         "pipelinedRefinement": pipeline_enabled,
         "pipelineWaitFraction": pipeline_wait_seconds
         / max(time.monotonic() - started, 1e-6),
+    })
+
+
+@torch.inference_mode()
+def run_direct_diagnostics(
+    args: argparse.Namespace,
+    config: FitConfig,
+    inputs: np.memmap,
+    parameters: np.memmap,
+    metrics: np.memmap,
+    actions: Tensor,
+    currents: Tensor,
+    metric_action_cells: int,
+    metric_current_cells: int,
+    device: torch.device,
+) -> None:
+    """Persist direct-oracle weights without running the obsolete parameter fit."""
+    started = time.monotonic()
+    action_count = len(config.action_grid)
+    input_row_stride = config.input_row_stride or action_count
+    visible_actions = (
+        (actions >= config.metric_visible_lower)
+        & (actions <= config.metric_visible_upper)
+    )
+    visible_currents = currents[
+        (currents >= config.metric_visible_lower)
+        & (currents <= config.metric_visible_upper)
+    ]
+    total_entropy = 0.0
+    for start in range(0, args.count, config.batch_size):
+        end = min(args.count, start + config.batch_size)
+        dense = torch.from_numpy(np.array(
+            inputs[start:end, :action_count + 2],
+            dtype=np.float32,
+            copy=True,
+        )).to(device, non_blocking=device.type == "cuda")
+        base = dense[:, :action_count][:, visible_actions]
+        visible_action_values = actions[visible_actions]
+        target, entropy = fit_target(
+            base,
+            visible_action_values,
+            visible_currents,
+            config,
+        )
+        advice = distance_imbalance_advice(
+            target,
+            visible_action_values,
+            visible_currents.view(1, -1).expand(end - start, -1),
+            config.distance_epsilon,
+        )
+        cutoff_raw = dense[:, action_count:action_count + 2].cpu().numpy()
+        entropy_values = entropy.cpu().numpy()
+        advice_values = advice.cpu().numpy()
+        parameters[start:end] = 0
+        parameters[start:end, SCORE_PARAMETER_COUNT:PARAMETER_COUNT] = cutoff_raw
+        metrics[start:end] = 0
+        # These rows intentionally contain only direct-target diagnostics. The
+        # fitted-parameter KL/MSE fields are neutral because no fitted
+        # distribution was produced; columns 6:8 still preserve hard cutoffs.
+        metrics[start:end, 0] = entropy_values
+        metrics[start:end, 5] = 1
+        metrics[start:end, 6] = advice_values
+        total_entropy += float(entropy_values.sum(dtype=np.float64))
+        elapsed = max(time.monotonic() - started, 1e-6)
+        emit({
+            "event": "gpu-teacher-progress",
+            "examplesCompleted": end,
+            "examplesTotal": args.count,
+            "examplesPerSecond": round(end / elapsed, 2),
+            "gpuMemoryMiB": round(torch.cuda.max_memory_allocated() / 1_048_576, 1)
+            if device.type == "cuda" else 0,
+            "meanKlDivergence": 0.0,
+            "meanSquaredError": 0.0,
+            "metricVisibleLower": config.metric_visible_lower,
+            "metricVisibleUpper": config.metric_visible_upper,
+            "metricActionCells": metric_action_cells,
+            "metricCurrentCells": metric_current_cells,
+            "temporalWarmSelectedFraction": 0.0,
+            "temporalWarmEquivalentFraction": 0.0,
+            "temporalWarmQualityAcceptedFraction": 0.0,
+            "temporalWarmQualityBetterFraction": 0.0,
+            "temporalMeanNormalizedStepBefore": 0.0,
+            "temporalMeanNormalizedStepAfter": 0.0,
+            "inputQueueBatches": 1,
+            "inputRowStrideFloats": input_row_stride,
+            "pipelinedRefinement": False,
+            "pipelineWaitFraction": 0.0,
+            "diagnosticOnly": True,
+        })
+    parameters.flush()
+    metrics.flush()
+    del parameters, metrics
+    temporary(args.parameters_output).replace(args.parameters_output)
+    temporary(args.metrics_output).replace(args.metrics_output)
+    emit({
+        "event": "gpu-teacher-complete",
+        "examples": args.count,
+        "seconds": round(time.monotonic() - started, 2),
+        "meanKlDivergence": 0.0,
+        "meanSquaredError": 0.0,
+        "meanTargetEntropy": total_entropy / max(1, args.count),
+        "metricVisibleLower": config.metric_visible_lower,
+        "metricVisibleUpper": config.metric_visible_upper,
+        "metricActionCells": metric_action_cells,
+        "metricCurrentCells": metric_current_cells,
+        "rejectedExamples": 0,
+        "qualityAccepted": True,
+        "temporalWarmSelectedFraction": 0.0,
+        "temporalWarmEquivalentFraction": 0.0,
+        "temporalWarmQualityAcceptedFraction": 0.0,
+        "temporalWarmQualityBetterFraction": 0.0,
+        "temporalMeanNormalizedStepBefore": 0.0,
+        "temporalMeanNormalizedStepAfter": 0.0,
+        "pipelinedRefinement": False,
+        "pipelineWaitFraction": 0.0,
+        "diagnosticOnly": True,
     })
 
 
@@ -438,27 +636,78 @@ def fit_batch_initial(
     base = packed[:, :action_count]
     cutoff_raw = packed[:, action_count:action_count + 2]
     batch = base.shape[0]
-    target_logits = transition_logits(
-        base[:, action_indexes], sampled_actions, sampled_currents,
-        config.friction, config.transition_log_scale
-    )
-    target = torch.softmax(target_logits, dim=-1)
-    raw = variable_projection_initial_parameters(
-        target_logits,
-        sampled_actions,
-        sampled_currents,
-        config,
-        cutoff_raw,
-    )
+    with nvtx_range("teacher.initial.target", base):
+        target_logits = transition_logits(
+            base[:, action_indexes], sampled_actions, sampled_currents,
+            config.friction, config.transition_log_scale
+        )
+        target = torch.softmax(target_logits, dim=-1)
+        if config.compact_visible_initialization:
+            initial_config = compact_visible_fit_config(config)
+            initial_state_indexes = domain_sampled_indices(
+                currents,
+                config.sample_states,
+                config.metric_visible_lower,
+                config.metric_visible_upper,
+                1.0,
+            )
+            initial_action_indexes = domain_sampled_indices(
+                actions,
+                config.sample_actions,
+                config.metric_visible_lower,
+                config.metric_visible_upper,
+                1.0,
+            )
+            initial_actions = actions[initial_action_indexes]
+            initial_currents = currents[initial_state_indexes]
+            initial_target_logits = transition_logits(
+                base[:, initial_action_indexes],
+                initial_actions,
+                initial_currents,
+                config.friction,
+                config.transition_log_scale,
+            )
+            initial_target = torch.softmax(initial_target_logits, dim=-1)
+            initial_support = PolicySupport(
+                base.new_tensor(initial_config.latent_lower),
+                base.new_tensor(initial_config.latent_upper),
+                base.new_tensor(initial_config.visible_lower),
+                base.new_tensor(initial_config.visible_upper),
+                support.friction,
+                support.temperature,
+                # Use the final model's transition widths in both stages. This
+                # is what makes the score-coordinate remap exact.
+                support.hinge_span,
+            )
+            initial_cutoff_raw = remap_cutoff_support(
+                cutoff_raw, config, initial_config
+            )
+        else:
+            initial_config = config
+            initial_actions = sampled_actions
+            initial_currents = sampled_currents
+            initial_target_logits = target_logits
+            initial_target = target
+            initial_support = support
+            initial_cutoff_raw = cutoff_raw
+    with nvtx_range("teacher.initial.variable_projection", base):
+        raw = variable_projection_initial_parameters(
+            initial_target_logits,
+            initial_actions,
+            initial_currents,
+            initial_config,
+            initial_cutoff_raw,
+        )
     # Variable projection is a much cheaper way to explore structural basins
     # than BFGS. Score every projected start once, then carry only the best
     # candidate for each example into the expensive second-order solve.
-    if raw.shape[1] > 1:
-        projected_cross_entropy = cross_entropy_objective(
-            raw, target, sampled_actions, sampled_currents, support
-        )
-        projected_winner = projected_cross_entropy.argmin(dim=1)
-        raw = raw[torch.arange(batch, device=base.device), projected_winner, None, :]
+    with nvtx_range("teacher.initial.select_projection", base):
+        if raw.shape[1] > 1:
+            projected_cross_entropy = cross_entropy_objective(
+                raw, initial_target, initial_actions, initial_currents, initial_support
+            )
+            projected_winner = projected_cross_entropy.argmin(dim=1)
+            raw = raw[torch.arange(batch, device=base.device), projected_winner, None, :]
     warmup_iterations = min(
         30,
         config.iterations - 1,
@@ -466,48 +715,58 @@ def fit_batch_initial(
     )
     linear_mask = torch.zeros(PARAMETER_COUNT, device=base.device)
     linear_mask[2:6] = 1
-    raw, _, _, warmup_used = batched_bfgs(
-        raw,
-        target,
-        sampled_actions,
-        sampled_currents,
-        support,
-        warmup_iterations,
-        config.tolerance,
-        linear_mask,
-        config.line_search_candidates,
-        config.optimizer_backend,
-        config.optimizer_host_check_interval,
-    )
-    raw, cross_entropy, converged_restarts, refine_used = batched_bfgs(
-        raw,
-        target,
-        sampled_actions,
-        sampled_currents,
-        support,
-        config.iterations - warmup_iterations,
-        config.tolerance,
-        score_parameter_mask(base.device),
-        config.line_search_candidates,
-        config.optimizer_backend,
-        config.optimizer_host_check_interval,
-    )
+    with nvtx_range("teacher.initial.bfgs_linear", base):
+        raw, _, _, warmup_used = batched_bfgs(
+            raw,
+            initial_target,
+            initial_actions,
+            initial_currents,
+            initial_support,
+            warmup_iterations,
+            config.tolerance,
+            linear_mask,
+            config.line_search_candidates,
+            config.optimizer_backend,
+            config.optimizer_host_check_interval,
+        )
+    with nvtx_range("teacher.initial.bfgs_full", base):
+        raw, cross_entropy, converged_restarts, refine_used = batched_bfgs(
+            raw,
+            initial_target,
+            initial_actions,
+            initial_currents,
+            initial_support,
+            config.iterations - warmup_iterations,
+            config.tolerance,
+            score_parameter_mask(base.device),
+            config.line_search_candidates,
+            config.optimizer_backend,
+            config.optimizer_host_check_interval,
+        )
+    if config.compact_visible_initialization:
+        raw = remap_score_support(raw, initial_config, config)
+        raw[..., 6:8] = cutoff_raw[:, None, :]
+        cross_entropy = cross_entropy_objective(
+            raw, target, sampled_actions, sampled_currents, support
+        )
+        converged_restarts = torch.zeros_like(cross_entropy, dtype=torch.bool)
     selected = cross_entropy.argmin(dim=1)
     final_raw = raw[torch.arange(batch, device=base.device), selected]
-    diagnostic_base, diagnostic_actions, diagnostic_currents = metric_surface(
-        base, actions, currents, config
-    )
-    diagnostic_target, diagnostic_entropy = fit_target(
-        diagnostic_base, diagnostic_actions, diagnostic_currents, config
-    )
-    diagnostic = fit_diagnostics(
-        diagnostic_target,
-        diagnostic_entropy,
-        final_raw,
-        diagnostic_actions,
-        diagnostic_currents,
-        support,
-    )
+    with nvtx_range("teacher.initial.diagnostics", base):
+        diagnostic_base, diagnostic_actions, diagnostic_currents = metric_surface(
+            base, actions, currents, config
+        )
+        diagnostic_target, diagnostic_entropy = fit_target(
+            diagnostic_base, diagnostic_actions, diagnostic_currents, config
+        )
+        diagnostic = fit_diagnostics(
+            diagnostic_target,
+            diagnostic_entropy,
+            final_raw,
+            diagnostic_actions,
+            diagnostic_currents,
+            support,
+        )
     converged = converged_restarts[
         torch.arange(batch, device=base.device), selected
     ]
@@ -547,55 +806,57 @@ def refine_fit_batch(
     support = state.support
     config = state.config
     device = final_raw.device
-    for _ in range(config.adaptive_rounds):
-        hard = (
-            (diagnostic["klDivergence"] > config.max_mean_kl)
-            | (diagnostic["meanSquaredError"] > config.max_mean_mse)
-        )
-        hard_indexes = hard.nonzero(as_tuple=False).squeeze(-1)
-        if hard_indexes.numel() == 0:
-            break
-        refined, _, refined_converged, iterations_used = batched_bfgs(
-            final_raw[hard_indexes, None, :],
-            target[hard_indexes],
-            sampled_actions,
-            sampled_currents,
-            support,
-            config.adaptive_iterations,
-            config.tolerance,
-            score_parameter_mask(device),
-            config.line_search_candidates,
-            config.optimizer_backend,
-            config.optimizer_host_check_interval,
-        )
-        refined_raw = refined[:, 0, :]
-        refined_diagnostic = fit_diagnostics(
-            diagnostic_target[hard_indexes],
-            diagnostic_entropy[hard_indexes],
-            refined_raw,
-            diagnostic_actions,
-            diagnostic_currents,
-            support,
-        )
-        improved = (
-            refined_diagnostic["klDivergence"]
-            < diagnostic["klDivergence"][hard_indexes]
-        )
-        improved_indexes = hard_indexes[improved]
-        if improved_indexes.numel() == 0:
-            break
-        final_raw = torch.index_copy(
-            final_raw, 0, improved_indexes, refined_raw[improved]
-        )
-        for name in diagnostic:
-            diagnostic[name] = torch.index_copy(
-                diagnostic[name], 0, improved_indexes,
-                refined_diagnostic[name][improved],
+    for round_index in range(config.adaptive_rounds):
+        with nvtx_range(f"teacher.refine.adaptive_{round_index + 1}", final_raw):
+            hard = (
+                (diagnostic["klDivergence"] > config.max_mean_kl)
+                | (diagnostic["meanSquaredError"] > config.max_mean_mse)
             )
-        converged = torch.index_copy(
-            converged, 0, improved_indexes, refined_converged[:, 0][improved]
-        )
-        total_iterations += iterations_used
+            hard_indexes = hard.nonzero(as_tuple=False).squeeze(-1)
+            if hard_indexes.numel() == 0:
+                break
+            refined, _, refined_converged, iterations_used = batched_bfgs(
+                final_raw[hard_indexes, None, :],
+                target[hard_indexes],
+                sampled_actions,
+                sampled_currents,
+                support,
+                config.adaptive_iterations,
+                config.tolerance,
+                score_parameter_mask(device),
+                config.line_search_candidates,
+                config.optimizer_backend,
+                config.optimizer_host_check_interval,
+            )
+            refined_raw = refined[:, 0, :]
+            refined_diagnostic = fit_diagnostics(
+                diagnostic_target[hard_indexes],
+                diagnostic_entropy[hard_indexes],
+                refined_raw,
+                diagnostic_actions,
+                diagnostic_currents,
+                support,
+            )
+            improved = fit_quality_score(refined_diagnostic, config) \
+                < fit_quality_score(
+                    {name: value[hard_indexes] for name, value in diagnostic.items()},
+                    config,
+                )
+            improved_indexes = hard_indexes[improved]
+            if improved_indexes.numel() == 0:
+                break
+            final_raw = torch.index_copy(
+                final_raw, 0, improved_indexes, refined_raw[improved]
+            )
+            for name in diagnostic:
+                diagnostic[name] = torch.index_copy(
+                    diagnostic[name], 0, improved_indexes,
+                    refined_diagnostic[name][improved],
+                )
+            converged = torch.index_copy(
+                converged, 0, improved_indexes, refined_converged[:, 0][improved]
+            )
+            total_iterations += iterations_used
     # Triton deliberately lets each fit stop independently, which removes the
     # synchronized-batch tail. Preserve the established fitter's recovery
     # behavior by handing only still-rejected examples to its autograd BFGS.
@@ -609,80 +870,98 @@ def refine_fit_batch(
         )
         hard_indexes = hard.nonzero(as_tuple=False).squeeze(-1)
         if hard_indexes.numel() > 0:
-            refined, _, refined_converged, iterations_used = batched_bfgs(
-                final_raw[hard_indexes, None, :],
-                target[hard_indexes],
-                sampled_actions,
-                sampled_currents,
-                support,
-                config.quality_fallback_iterations,
-                config.tolerance,
-                score_parameter_mask(device),
-                config.line_search_candidates,
-                "pytorch-batched",
-                config.optimizer_host_check_interval,
-            )
-            refined_raw = refined[:, 0, :]
-            refined_diagnostic = fit_diagnostics(
-                diagnostic_target[hard_indexes],
-                diagnostic_entropy[hard_indexes],
-                refined_raw,
-                diagnostic_actions,
-                diagnostic_currents,
-                support,
-            )
-            improved = (
-                refined_diagnostic["klDivergence"]
-                < diagnostic["klDivergence"][hard_indexes]
-            )
-            improved_indexes = hard_indexes[improved]
-            if improved_indexes.numel() > 0:
-                final_raw = torch.index_copy(
-                    final_raw, 0, improved_indexes, refined_raw[improved]
+            with nvtx_range("teacher.refine.compatibility_fallback", final_raw):
+                refined, _, refined_converged, iterations_used = batched_bfgs(
+                    final_raw[hard_indexes, None, :],
+                    target[hard_indexes],
+                    sampled_actions,
+                    sampled_currents,
+                    support,
+                    config.quality_fallback_iterations,
+                    config.tolerance,
+                    score_parameter_mask(device),
+                    config.line_search_candidates,
+                    "pytorch-batched",
+                    config.optimizer_host_check_interval,
                 )
-                for name in diagnostic:
-                    diagnostic[name] = torch.index_copy(
-                        diagnostic[name], 0, improved_indexes,
-                        refined_diagnostic[name][improved],
+                refined_raw = refined[:, 0, :]
+                refined_diagnostic = fit_diagnostics(
+                    diagnostic_target[hard_indexes],
+                    diagnostic_entropy[hard_indexes],
+                    refined_raw,
+                    diagnostic_actions,
+                    diagnostic_currents,
+                    support,
+                )
+                improved = fit_quality_score(refined_diagnostic, config) \
+                    < fit_quality_score(
+                        {name: value[hard_indexes] for name, value in diagnostic.items()},
+                        config,
                     )
-                converged = torch.index_copy(
-                    converged, 0, improved_indexes,
-                    refined_converged[:, 0][improved],
-                )
-            total_iterations += iterations_used
+                improved_indexes = hard_indexes[improved]
+                if improved_indexes.numel() > 0:
+                    final_raw = torch.index_copy(
+                        final_raw, 0, improved_indexes, refined_raw[improved]
+                    )
+                    for name in diagnostic:
+                        diagnostic[name] = torch.index_copy(
+                            diagnostic[name], 0, improved_indexes,
+                            refined_diagnostic[name][improved],
+                        )
+                    converged = torch.index_copy(
+                        converged, 0, improved_indexes,
+                        refined_converged[:, 0][improved],
+                    )
+                total_iterations += iterations_used
     temporal = {
         "selectedCount": 0.0,
         "candidateCount": 0.0,
         "selectedFraction": 0.0,
+        "equivalentCount": 0.0,
+        "equivalentFraction": 0.0,
+        "qualityAcceptedCount": 0.0,
+        "qualityAcceptedFraction": 0.0,
+        "qualityBetterCount": 0.0,
+        "qualityBetterFraction": 0.0,
         "meanNormalizedStepBefore": mean_normalized_parameter_step(final_raw),
         "meanNormalizedStepAfter": mean_normalized_parameter_step(final_raw),
         "medianNormalizedStepBefore": median_normalized_parameter_step(final_raw),
         "medianNormalizedStepAfter": median_normalized_parameter_step(final_raw),
     }
     if config.temporal_refinement_rounds > 0 and final_raw.shape[0] > 1:
-        final_raw, converged, temporal_iterations, temporal = temporal_warm_refinement(
-            final_raw,
-            converged,
-            target,
-            sampled_actions,
-            sampled_currents,
-            diagnostic_target,
-            diagnostic_actions,
-            diagnostic_currents,
-            diagnostic["crossEntropy"],
-            support,
-            config,
-            previous_raw,
-        )
-        total_iterations += temporal_iterations
-        diagnostic = fit_diagnostics(
-            diagnostic_target,
-            diagnostic_entropy,
-            final_raw,
-            diagnostic_actions,
-            diagnostic_currents,
-            support,
-        )
+        with nvtx_range("teacher.refine.temporal", final_raw):
+            final_raw, converged, temporal_iterations, temporal = temporal_warm_refinement(
+                final_raw,
+                converged,
+                target,
+                sampled_actions,
+                sampled_currents,
+                diagnostic_target,
+                diagnostic_actions,
+                diagnostic_currents,
+                diagnostic["crossEntropy"],
+                support,
+                config,
+                previous_raw,
+            )
+            total_iterations += temporal_iterations
+            diagnostic = fit_diagnostics(
+                diagnostic_target,
+                diagnostic_entropy,
+                final_raw,
+                diagnostic_actions,
+                diagnostic_currents,
+                support,
+            )
+    # This is one scalar for the complete timestamp example, not a separate
+    # weight for each current-exposure row. Both sums cover the exact
+    # cutoff-applied raw oracle surface on the visible metric support.
+    diagnostic["distanceImbalance"] = distance_imbalance_advice(
+        diagnostic_target,
+        diagnostic_actions,
+        diagnostic_currents.view(1, -1).expand(diagnostic_target.shape[0], -1),
+        config.distance_epsilon,
+    )
     return final_raw, diagnostic, total_iterations, converged, temporal
 
 
@@ -709,11 +988,14 @@ def temporal_warm_refinement(
     parameter_scale = robust_parameter_scale(selected)
     iterations_used = 0
     full_mask = score_parameter_mask(selected.device)
+    last_quality_equivalent = torch.zeros(0, dtype=torch.bool, device=selected.device)
+    last_quality_accepted = torch.zeros(0, dtype=torch.bool, device=selected.device)
+    last_quality_better = torch.zeros(0, dtype=torch.bool, device=selected.device)
     for round_index in range(config.temporal_refinement_rounds):
         previous_round = selected.clone()
         # A synchronous pass keeps all adjacent warm starts in one wide CUDA
         # batch. Repeating the pass propagates the selected trajectory forward
-        # without serializing 1,440 individual optimizations.
+        # without serializing 86,400 individual optimizations for a full day.
         first_index = 0 if initial_previous_raw is not None else 1
         indexes = torch.arange(first_index, selected.shape[0], device=selected.device)
         if indexes.numel() == 0:
@@ -743,13 +1025,22 @@ def temporal_warm_refinement(
         )
         iterations_used += used
         warm = warm[:, 0, :]
-        warm_cross_entropy = fit_cross_entropy(
-            diagnostic_target[indexes],
-            warm,
-            diagnostic_actions,
-            diagnostic_currents,
-            support,
+        warm_log_probability = fit_policy_log_probability(
+            warm, diagnostic_actions, diagnostic_currents, support
         )
+        warm_cross_entropy = -(
+            diagnostic_target[indexes] * warm_log_probability
+        ).sum(dim=-1).mean(dim=-1)
+        target_entropy = -(
+            diagnostic_target[indexes]
+            * diagnostic_target[indexes].clamp_min(
+                torch.finfo(diagnostic_target.dtype).tiny
+            ).log()
+        ).sum(dim=-1).mean(dim=-1)
+        warm_kl = (warm_cross_entropy - target_entropy).clamp_min(0)
+        warm_mse = (
+            diagnostic_target[indexes] - warm_log_probability.exp()
+        ).square().mean(dim=(-1, -2))
         existing_loss = selected_cross_entropy[indexes]
         warm_loss = warm_cross_entropy
         quality_reference = torch.minimum(
@@ -759,6 +1050,13 @@ def temporal_warm_refinement(
             + config.temporal_equivalent_loss_relative * quality_reference.abs()
         quality_better = warm_loss < quality_reference - tolerance
         quality_equivalent = warm_loss <= quality_reference + tolerance
+        quality_accepted = (
+            (warm_kl <= config.max_mean_kl)
+            & (warm_mse <= config.max_mean_mse)
+        )
+        last_quality_equivalent = quality_equivalent
+        last_quality_accepted = quality_accepted
+        last_quality_better = quality_better
         existing_distance = normalized_parameter_distance(
             existing, previous, parameter_scale
         )
@@ -785,10 +1083,19 @@ def temporal_warm_refinement(
     first_index = 0 if initial_previous_raw is not None else 1
     selected_count = int(changed[first_index:].sum())
     candidate_count = max(0, selected.shape[0] - first_index)
+    equivalent_count = int(last_quality_equivalent.sum())
+    quality_accepted_count = int(last_quality_accepted.sum())
+    quality_better_count = int(last_quality_better.sum())
     return selected, converged, iterations_used, {
         "selectedCount": float(selected_count),
         "candidateCount": float(candidate_count),
         "selectedFraction": selected_count / max(1, candidate_count),
+        "equivalentCount": float(equivalent_count),
+        "equivalentFraction": equivalent_count / max(1, candidate_count),
+        "qualityAcceptedCount": float(quality_accepted_count),
+        "qualityAcceptedFraction": quality_accepted_count / max(1, candidate_count),
+        "qualityBetterCount": float(quality_better_count),
+        "qualityBetterFraction": quality_better_count / max(1, candidate_count),
         "meanNormalizedStepBefore": before_mean,
         "meanNormalizedStepAfter": mean_normalized_parameter_step(selected),
         "medianNormalizedStepBefore": before_median,
@@ -913,13 +1220,19 @@ def batched_bfgs(
     converged = torch.zeros_like(active)
     stable_iterations = torch.zeros_like(loss, dtype=torch.int64)
     iterations_used = 0
+    host_check_interval = max(1, optimizer_host_check_interval)
     for iteration in range(maximum_iterations):
         iterations_used = iteration + 1
         gradient_maximum = gradient.abs().amax(dim=-1)
         newly_converged = active & (gradient_maximum <= tolerance)
         converged |= newly_converged
         active &= ~newly_converged
-        if not bool(active.any()):
+        should_check_host = (
+            iteration == 0
+            or (iteration + 1) % host_check_interval == 0
+            or iteration + 1 == maximum_iterations
+        )
+        if should_check_host and not bool(active.any()):
             break
 
         direction = -torch.einsum("brij,brj->bri", inverse_hessian, gradient)
@@ -1136,6 +1449,9 @@ def variable_projection_initial_parameters(
     target_probability = torch.softmax(target_logits, dim=-1)
     probability_floor = target_probability.amax(dim=-1, keepdim=True) * 1e-6
     target_scores = target_probability.clamp_min(probability_floor).log()
+    target_statistics = projection_target_statistics(
+        target_scores, actions, currents, config
+    )
     structural = structural_starts(target_scores, actions, currents, config)
     structural = structural.detach().requires_grad_(True)
     first_moment = torch.zeros_like(structural)
@@ -1150,12 +1466,18 @@ def variable_projection_initial_parameters(
         dtype=torch.float64,
     )
     best_structural = structural.detach().clone()
+    host_check_interval = max(1, config.optimizer_host_check_interval)
     for iteration in range(config.projection_iterations):
         projected_loss, _ = project_linear_parameters(
-            structural, target_scores, actions, currents, config
+            structural, actions, currents, config, target_statistics
         )
         loss = projected_loss.mean()
-        if not torch.isfinite(loss):
+        should_check_host = (
+            iteration == 0
+            or (iteration + 1) % host_check_interval == 0
+            or iteration + 1 == config.projection_iterations
+        )
+        if should_check_host and not torch.isfinite(loss):
             raise RuntimeError(
                 f"non-finite CUDA variable-projection objective at iteration {iteration}"
             )
@@ -1187,7 +1509,7 @@ def variable_projection_initial_parameters(
         )
 
     _, coefficients = project_linear_parameters(
-        best_structural, target_scores, actions, currents, config
+        best_structural, actions, currents, config, target_statistics
     )
     raw = torch.zeros(
         (batch, config.restarts, PARAMETER_COUNT),
@@ -1204,10 +1526,10 @@ def variable_projection_initial_parameters(
 
 def project_linear_parameters(
     structural: Tensor,
-    target_scores: Tensor,
     actions: Tensor,
     currents: Tensor,
     config: FitConfig,
+    target_statistics: ProjectionTargetStatistics,
 ) -> tuple[Tensor, Tensor]:
     visible_span = config.visible_upper - config.visible_lower
     half_visible_span = visible_span / 2
@@ -1215,17 +1537,10 @@ def project_linear_parameters(
     latent_span = config.latent_upper - config.latent_lower
     c1 = config.latent_lower + latent_span * torch.sigmoid(structural[..., 0])
     c2 = c1 + (config.latent_upper - c1) * torch.sigmoid(structural[..., 1])
-    kappa_c = 82.0 / visible_span
-    kappa_x = 678.0 / visible_span
-    beta_x = -(config.friction / (1 - config.friction) + config.friction) \
-        * config.transition_log_scale
+    kappa_c = 82.0 / (config.score_hinge_span or visible_span)
     action = actions.view(1, 1, 1, -1)
-    current = currents.view(1, 1, -1, 1)
     c1_feature = scaled_softplus(
         action - c1[..., None, None], torch.as_tensor(kappa_c, device=action.device)
-    )
-    moving_feature = scaled_softplus(
-        action - current, torch.as_tensor(kappa_x, device=action.device)
     )
     c2_feature = scaled_softplus(
         action - c2[..., None, None], torch.as_tensor(kappa_c, device=action.device)
@@ -1239,23 +1554,17 @@ def project_linear_parameters(
     c2_feature = c2_feature.expand(feature_shape)
     base_feature = base_feature.expand(feature_shape)
     precision_feature = precision_feature.expand(feature_shape)
-    moving_feature = moving_feature.expand(feature_shape)
     features = torch.stack((
         base_feature,
         precision_feature,
         c1_feature / visible_span,
         c2_feature / visible_span,
     ), dim=-1)
-    residual_scores = target_scores[:, None, :, :] - beta_x * moving_feature
-    weights = torch.softmax(target_scores, dim=-1)[:, None, :, :]
-    weight_total = weights.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+    weights = target_statistics.weights
     feature_mean = (features * weights[..., None]).sum(dim=-2, keepdim=True) \
-        / weight_total[..., None]
-    target_mean = (residual_scores * weights).sum(
-        dim=-1, keepdim=True
-    ) / weight_total
+        / target_statistics.weight_total[..., None]
     centered_features = features - feature_mean
-    centered_target = residual_scores - target_mean
+    centered_target = target_statistics.centered_scores
 
     # Keep the large feature grid and its reductions in CUDA-native float32.
     # Only the resulting 4x4 normal systems need float64 for the correlated
@@ -1279,6 +1588,34 @@ def project_linear_parameters(
         squared_error + ridge * coefficients.square().sum(dim=-1)
     ) / (actions.numel() * currents.numel())
     return loss, coefficients
+
+
+def projection_target_statistics(
+    target_scores: Tensor,
+    actions: Tensor,
+    currents: Tensor,
+    config: FitConfig,
+) -> ProjectionTargetStatistics:
+    visible_span = config.visible_upper - config.visible_lower
+    kappa_x = 678.0 / (config.score_hinge_span or visible_span)
+    beta_x = -(config.friction / (1 - config.friction) + config.friction) \
+        * config.transition_log_scale
+    action = actions.view(1, 1, 1, -1)
+    current = currents.view(1, 1, -1, 1)
+    moving_feature = scaled_softplus(
+        action - current, torch.as_tensor(kappa_x, device=action.device)
+    )
+    residual_scores = target_scores[:, None, :, :] - beta_x * moving_feature
+    weights = torch.softmax(target_scores, dim=-1)[:, None, :, :]
+    weight_total = weights.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+    target_mean = (residual_scores * weights).sum(
+        dim=-1, keepdim=True
+    ) / weight_total
+    return ProjectionTargetStatistics(
+        weights=weights,
+        weight_total=weight_total,
+        centered_scores=residual_scores - target_mean,
+    )
 
 
 def structural_starts(
@@ -1363,6 +1700,84 @@ def raw_breakpoints(left: Tensor, right: Tensor, config: FitConfig) -> tuple[Ten
     first = ((left - config.latent_lower) / span).clamp(1e-6, 1 - 1e-6)
     second = ((right - left) / (config.latent_upper - left)).clamp(1e-6, 1 - 1e-6)
     return torch.logit(first), torch.logit(second)
+
+
+def compact_visible_fit_config(config: FitConfig) -> FitConfig:
+    """The old useful-range fit, retaining the final model's hinge widths."""
+    return replace(
+        config,
+        latent_lower=config.metric_visible_lower,
+        latent_upper=config.metric_visible_upper,
+        visible_lower=config.metric_visible_lower,
+        visible_upper=config.metric_visible_upper,
+        score_hinge_span=config.score_hinge_span
+        or (config.latent_upper - config.latent_lower),
+    )
+
+
+def remap_score_support(
+    raw: Tensor,
+    source: FitConfig,
+    destination: FitConfig,
+) -> Tensor:
+    """Preserve a six-parameter score while changing its support coordinates.
+
+    The two scores may differ by an action-independent constant, which cancels
+    exactly under softmax. Fixed hinge widths must be identical in both
+    configurations; compact_visible_fit_config enforces that invariant.
+    """
+    source_span = source.latent_upper - source.latent_lower
+    destination_span = destination.latent_upper - destination.latent_lower
+    source_half = source_span / 2
+    destination_half = destination_span / 2
+    source_center = (source.latent_lower + source.latent_upper) / 2
+    destination_center = (destination.latent_lower + destination.latent_upper) / 2
+
+    mapped = raw.clone()
+    first_fraction = torch.sigmoid(raw[..., 0])
+    c1 = source.latent_lower + source_span * first_fraction
+    second_fraction = torch.sigmoid(raw[..., 1])
+    c2 = c1 + (source.latent_upper - c1) * second_fraction
+    mapped[..., 0], mapped[..., 1] = raw_breakpoints(c1, c2, destination)
+
+    precision = raw[..., 3] / (source_half * source_half)
+    base_slope = raw[..., 2] / source_span \
+        + precision * (source_center - destination_center)
+    mapped[..., 2] = base_slope * destination_span
+    mapped[..., 3] = precision * destination_half * destination_half
+    mapped[..., 4:6] = raw[..., 4:6] * (destination_span / source_span)
+    return bound_raw(mapped)
+
+
+def remap_cutoff_support(
+    raw: Tensor,
+    source: FitConfig,
+    destination: FitConfig,
+) -> Tensor:
+    """Clip physical cutoff locations into another support and re-encode them."""
+    lower = source.latent_lower + (-source.latent_lower) * torch.sigmoid(raw[..., 0])
+    upper = source.latent_upper * torch.sigmoid(raw[..., 1])
+    lower = torch.where(raw[..., 0] <= -13.999999, source.latent_lower, lower)
+    lower = torch.where(raw[..., 0] >= 13.999999, 0.0, lower)
+    upper = torch.where(raw[..., 1] <= -13.999999, 0.0, upper)
+    upper = torch.where(raw[..., 1] >= 13.999999, source.latent_upper, upper)
+    lower = lower.clamp(destination.latent_lower, 0.0)
+    upper = upper.clamp(0.0, destination.latent_upper)
+
+    lower_fraction = (
+        (lower - destination.latent_lower) / -destination.latent_lower
+    ).clamp(1e-6, 1 - 1e-6)
+    upper_fraction = (upper / destination.latent_upper).clamp(1e-6, 1 - 1e-6)
+    mapped = torch.stack((torch.logit(lower_fraction), torch.logit(upper_fraction)), -1)
+    mapped[..., 0] = torch.where(
+        lower <= destination.latent_lower, -14.0, mapped[..., 0]
+    )
+    mapped[..., 0] = torch.where(lower >= 0.0, 14.0, mapped[..., 0])
+    mapped[..., 1] = torch.where(upper <= 0.0, -14.0, mapped[..., 1])
+    mapped[..., 1] = torch.where(
+        upper >= destination.latent_upper, 14.0, mapped[..., 1]
+    )
+    return mapped
 
 
 def policy_logits_for_restarts(
@@ -1464,6 +1879,18 @@ def fit_diagnostics(
     }
 
 
+def fit_quality_score(
+    diagnostic: dict[str, Tensor],
+    config: FitConfig,
+) -> Tensor:
+    """Rank fits by their worst normalized rejection-gate violation."""
+    kl_ratio = diagnostic["klDivergence"] / config.max_mean_kl
+    mse_ratio = diagnostic["meanSquaredError"] / config.max_mean_mse
+    # The tiny tie-breaker avoids arbitrary choices where the worst gate is
+    # numerically equal while still keeping acceptance semantics dominant.
+    return torch.maximum(kl_ratio, mse_ratio) + 1e-4 * (kl_ratio + mse_ratio)
+
+
 def transition_logits(
     base: Tensor,
     actions: Tensor,
@@ -1507,6 +1934,40 @@ def sampled_indices(length: int, requested: int, device: torch.device) -> Tensor
     return torch.linspace(0, length - 1, count, device=device).round().long().unique()
 
 
+def domain_sampled_indices(
+    values: Tensor,
+    requested: int,
+    visible_lower: float,
+    visible_upper: float,
+    visible_fraction: float,
+) -> Tensor:
+    """Sample the useful inner domain densely while retaining outer anchors."""
+    if not 0 <= visible_fraction <= 1:
+        raise ValueError("visible sample fraction must be between zero and one")
+    if visible_fraction == 0:
+        return sampled_indices(values.numel(), requested, values.device)
+    count = min(values.numel(), max(1, requested))
+    indexes = torch.arange(values.numel(), device=values.device)
+    visible = indexes[(values >= visible_lower) & (values <= visible_upper)]
+    outer = indexes[(values < visible_lower) | (values > visible_upper)]
+    visible_count = min(visible.numel(), max(1, round(count * visible_fraction)))
+    outer_count = min(outer.numel(), count - visible_count)
+    visible_count = min(visible.numel(), count - outer_count)
+
+    def select(source: Tensor, selected_count: int) -> Tensor:
+        if selected_count <= 0:
+            return source[:0]
+        if selected_count >= source.numel():
+            return source
+        positions = torch.linspace(
+            0, source.numel() - 1, selected_count, device=values.device
+        ).round().long()
+        return source[positions]
+
+    selected = torch.cat((select(visible, visible_count), select(outer, outer_count)))
+    return selected.sort().values
+
+
 def temporary(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".tmp")
 
@@ -1522,7 +1983,10 @@ def validate(args: argparse.Namespace, config: FitConfig) -> None:
         config.batch_size,
     ) < 1 or config.adaptive_rounds < 0:
         raise ValueError("CUDA teacher fitting counts must be positive")
-    if config.transition_log_scale <= 0 or config.friction < 0:
+    if config.transition_log_scale <= 0 or config.friction < 0 \
+            or config.distance_epsilon < 0 \
+            or not 0 <= config.visible_sample_fraction <= 1 \
+            or config.score_hinge_span < 0:
         raise ValueError("CUDA teacher fitting rates are invalid")
     metric_actions = [
         value for value in config.action_grid
@@ -1540,6 +2004,12 @@ def validate(args: argparse.Namespace, config: FitConfig) -> None:
     ):
         raise ValueError(
             "CUDA teacher metric range must be a non-empty subset of fit support"
+        )
+    if config.compact_visible_initialization and not (
+        config.metric_visible_lower < 0 < config.metric_visible_upper
+    ):
+        raise ValueError(
+            "compact visible initialization requires usable support around zero"
         )
     if (
         config.line_search_candidates < 0
