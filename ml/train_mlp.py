@@ -42,6 +42,7 @@ from mlp_model import (
     ExposureMlp,
     PolicySupport,
     TimeWeighting,
+    conditional_transaction_transition,
     direct_oracle_loss,
     parameter_count,
     validate_time_weighting,
@@ -191,7 +192,63 @@ class RuntimeMinuteOracleRows:
         return source[coarse_rows]
 
 
-class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]):
+class PersistedMinuteOracleRows:
+    """A per-second view over one persisted distribution per completed minute."""
+
+    def __init__(
+        self,
+        probabilities: np.ndarray,
+        shard: Shard,
+        action_count: int,
+    ) -> None:
+        if probabilities.shape != (1_441, action_count):
+            raise ValueError("persisted one-minute oracle has an invalid shape")
+        self.probabilities = probabilities
+        self.row_offset = shard.oracle_row_offset
+        self.row_stride = shard.oracle_row_stride
+        self.count = shard.count
+
+    def __getitem__(self, key) -> np.ndarray:
+        if isinstance(key, slice):
+            start, stop, step = key.indices(self.count)
+            local_rows = np.arange(start, stop, step, dtype=np.int64)
+            return self._rows(local_rows)
+        local_row = int(key)
+        if local_row < 0:
+            local_row += self.count
+        if local_row < 0 or local_row >= self.count:
+            raise IndexError(local_row)
+        return self._rows(np.asarray([local_row], dtype=np.int64))[0]
+
+    def _rows(self, local_rows: np.ndarray) -> np.ndarray:
+        coarse_rows = self.row_indices(local_rows)
+        if coarse_rows.size and (
+            int(coarse_rows.min()) < 0
+            or int(coarse_rows.max()) >= self.probabilities.shape[0]
+        ):
+            raise IndexError("persisted one-minute oracle row is outside its UTC day")
+        return self.probabilities[coarse_rows]
+
+    def row_indices(self, local_rows: np.ndarray) -> np.ndarray:
+        oracle_rows = self.row_offset + local_rows * self.row_stride
+        return oracle_rows // 60 + (oracle_rows % 60 == 59)
+
+    def compact_rows(self, start: int, stop: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return unique consecutive minute targets and one row index per example."""
+        local_rows = np.arange(start, stop, dtype=np.int64)
+        coarse_rows = self.row_indices(local_rows)
+        unique_rows, inverse = np.unique(coarse_rows, return_inverse=True)
+        if unique_rows.size and (
+            int(unique_rows.min()) < 0
+            or int(unique_rows.max()) >= self.probabilities.shape[0]
+        ):
+            raise IndexError("persisted one-minute oracle row is outside its UTC day")
+        return self.probabilities[unique_rows], inverse
+
+
+class FittedPolicyDataset(
+    Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]
+):
     def __init__(
         self,
         manifest: dict,
@@ -200,6 +257,7 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
         *,
         target: str = "rawOracleProbabilities",
         runtime_minute_oracles: dict[int, np.ndarray] | None = None,
+        compact_minute_targets: bool = False,
     ) -> None:
         if target not in (
             "rawOracleProbabilities",
@@ -209,6 +267,8 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
             raise ValueError("unknown MLP dataset target representation")
         self.split = split
         self.target = target
+        self.compact_minute_targets = compact_minute_targets \
+            and target == "minuteOracleProbabilities"
         self.feature_count = int(manifest["featureCount"])
         self.parameter_count = int(manifest["teacherParameterCount"])
         self.action_count = int(manifest["actionCount"])
@@ -224,6 +284,7 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
         total = 0
         run_start = 0
         previous_prediction_time: int | None = None
+        minute_components: dict[Path, np.ndarray] = {}
         for value in manifest["shards"]:
             if value["split"] != split:
                 continue
@@ -267,7 +328,10 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
                 shard.oracle_row_offset, shard.oracle_row_stride, shard.count,
             )
             if target == "minuteOracleProbabilities":
-                if manifest.get("minuteOracleMap", {}).get("storage") \
+                minute_storage = manifest.get("minuteOracleMap", {}).get(
+                    "storage", "persisted-per-example"
+                )
+                if minute_storage \
                         == "computed-directly-at-training-startup":
                     if runtime_minute_oracles is None:
                         raise ValueError(
@@ -276,13 +340,50 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
                     direct_target_probabilities = RuntimeMinuteOracleRows(
                         runtime_minute_oracles, shard, self.action_count
                     )
-                else:
-                    direct_target_probabilities = np.memmap(
-                        root / shard.minute_oracle_probabilities,
-                        mode="r",
-                        dtype="<f4",
-                        shape=(shard.count, self.action_count),
+                elif minute_storage == "persisted-per-minute-day":
+                    minute_file = root / shard.minute_oracle_probabilities
+                    minute_component = minute_components.get(minute_file)
+                    if minute_component is None:
+                        minute_component = (
+                            load_compressed_component(
+                                minute_file,
+                                "<f4",
+                                self.action_count,
+                                1_441,
+                            )
+                            if minute_file.name.endswith(".zst")
+                            else np.memmap(
+                                minute_file,
+                                mode="r",
+                                dtype="<f4",
+                                shape=(1_441, self.action_count),
+                            )
+                        )
+                        minute_components[minute_file] = minute_component
+                    direct_target_probabilities = PersistedMinuteOracleRows(
+                        minute_component,
+                        shard,
+                        self.action_count,
                     )
+                else:
+                    minute_file = root / shard.minute_oracle_probabilities
+                    if minute_file.name.endswith(".zst"):
+                        direct_target_probabilities = CompressedComponentRows(
+                            minute_file,
+                            "<f4",
+                            self.action_count,
+                            0,
+                            1,
+                            shard.count,
+                            total_rows=shard.count,
+                        )
+                    else:
+                        direct_target_probabilities = np.memmap(
+                            minute_file,
+                            mode="r",
+                            dtype="<f4",
+                            shape=(shard.count, self.action_count),
+                        )
             else:
                 direct_target_probabilities = component_rows(
                     root / shard.raw_oracle_probabilities, "<f4", self.action_count,
@@ -303,7 +404,9 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
             self.offsets.append(total)
             self.storage_runs.append((total - shard.count, total, shard.features))
             self.group_batches_by_storage = self.group_batches_by_storage \
-                or shard.features.endswith(".zst")
+                or shard.features.endswith(".zst") \
+                or shard.raw_oracle_probabilities.endswith(".zst") \
+                or shard.minute_oracle_probabilities.endswith(".zst")
             previous_prediction_time = shard.prediction_time_start \
                 + (shard.count - 1) * self.manifest_sampling_interval_ms
         if total > run_start:
@@ -312,7 +415,10 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
     def __len__(self) -> int:
         return self.offsets[-1] if self.offsets else 0
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         part_index = int(np.searchsorted(self.offsets, index, side="right"))
         previous = self.offsets[part_index - 1] if part_index else 0
         shard, features, teacher_parameters, teacher_metrics, direct_target, time_weights = \
@@ -329,11 +435,14 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
                 dtype=torch.int64,
             ),
             torch.from_numpy(np.array(teacher_metrics[row], dtype=np.float32, copy=True)),
+            torch.tensor([0], dtype=torch.int64)
+            if self.compact_minute_targets
+            else torch.empty(0, dtype=torch.int64),
         )
 
     def __getitems__(
         self, indices: list[int] | range
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Read one contiguous temporal batch with one copy per component."""
         if not indices:
             raise ValueError("cannot load an empty training batch")
@@ -349,6 +458,9 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
         metric_chunks: list[np.ndarray] = []
         weight_chunks: list[np.ndarray] = []
         time_chunks: list[np.ndarray] = []
+        target_row_index_chunks: list[np.ndarray] = []
+        compact_target_rows = 0
+        compact_targets = self.compact_minute_targets
         cursor = start
         while cursor < stop:
             part_index = int(np.searchsorted(self.offsets, cursor, side="right"))
@@ -361,7 +473,22 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
             feature_chunks.append(features[local_start:local_stop])
             targets = teacher_parameters \
                 if self.target == "teacherParameters" else direct_target
-            target_chunks.append(targets[local_start:local_stop])
+            if compact_targets and isinstance(targets, PersistedMinuteOracleRows):
+                compact_rows, row_indices = targets.compact_rows(
+                    local_start,
+                    local_stop,
+                )
+                target_chunks.append(compact_rows)
+                target_row_index_chunks.append(
+                    row_indices + compact_target_rows
+                )
+                compact_target_rows += compact_rows.shape[0]
+            else:
+                if compact_targets:
+                    raise RuntimeError(
+                        "compact minute targets require persisted per-minute rows"
+                    )
+                target_chunks.append(targets[local_start:local_stop])
             metric_chunks.append(teacher_metrics[local_start:local_stop])
             weight_chunks.append(time_weights[local_start:local_stop])
             time_chunks.append(
@@ -371,12 +498,37 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
             )
             cursor += count
 
+        if compact_targets:
+            target_values = copy_chunks(target_chunks, np.float32)
+            examples_per_minute = 60_000 // self.manifest_sampling_interval_ms
+            maximum_rows = math.ceil(
+                (len(indices) + examples_per_minute - 1)
+                / examples_per_minute
+            )
+            if target_values.shape[0] > maximum_rows:
+                raise RuntimeError("compact minute target batch exceeded its row bound")
+            if target_values.shape[0] < maximum_rows:
+                padding = np.repeat(
+                    target_values[-1:],
+                    maximum_rows - target_values.shape[0],
+                    axis=0,
+                )
+                target_values = np.concatenate((target_values, padding))
+            target_row_indices = np.concatenate(target_row_index_chunks).astype(
+                np.int64,
+                copy=False,
+            )
+        else:
+            target_values = copy_chunks(target_chunks, np.float32)
+            target_row_indices = np.empty(0, dtype=np.int64)
+
         return (
             torch.from_numpy(copy_chunks(feature_chunks, np.float32)),
-            torch.from_numpy(copy_chunks(target_chunks, np.float32)),
+            torch.from_numpy(target_values),
             torch.from_numpy(copy_chunks(weight_chunks, np.float32)),
             torch.from_numpy(copy_chunks(time_chunks, np.int64)),
             torch.from_numpy(copy_chunks(metric_chunks, np.float32)),
+            torch.from_numpy(target_row_indices),
         )
 
     def mean_time_weight(self, block: range) -> float:
@@ -399,6 +551,27 @@ class FittedPolicyDataset(Dataset[tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]
             count += take
             cursor += take
         return total / count
+
+    def close(self) -> None:
+        """Release memory-mapped component files before deleting/moving a dataset."""
+        closed: set[int] = set()
+        for part in self.parts:
+            for component in part[1:]:
+                values = (
+                    component.probabilities
+                    if isinstance(component, PersistedMinuteOracleRows)
+                    else component
+                )
+                mapping = getattr(values, "_mmap", None)
+                if mapping is not None and id(mapping) not in closed:
+                    mapping.close()
+                    closed.add(id(mapping))
+
+    def __enter__(self) -> FittedPolicyDataset:
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
 
 
 def copy_chunks(chunks: list[np.ndarray], dtype: np.dtype) -> np.ndarray:
@@ -443,7 +616,7 @@ _COMPRESSED_COMPONENT_CACHE_DAYS = max(
 
 
 class CompressedComponentRows:
-    """Lazy row-addressable view over a complete zstd-compressed UTC feature day."""
+    """Lazy row-addressable view over one lossless zstd component chunk."""
 
     def __init__(
         self,
@@ -453,12 +626,12 @@ class CompressedComponentRows:
         row_offset: int,
         row_stride: int,
         count: int,
+        *,
+        total_rows: int = 86_400,
     ) -> None:
-        if dtype != "<f2":
-            raise ValueError(f"only float16 feature components may be compressed: {file}")
         final_row = row_offset + max(0, count - 1) * row_stride
         if min(row_offset, row_stride, count) < 0 or row_stride < 1 \
-                or final_row >= 86_400:
+                or total_rows < 1 or final_row >= total_rows:
             raise ValueError(f"compressed component row view is outside {file}")
         self.file = file
         self.dtype = dtype
@@ -466,10 +639,11 @@ class CompressedComponentRows:
         self.row_offset = row_offset
         self.row_stride = row_stride
         self.count = count
+        self.total_rows = total_rows
 
     def __getitem__(self, key) -> np.ndarray:
-        values = load_compressed_feature_day(
-            self.file, self.dtype, self.columns
+        values = load_compressed_component(
+            self.file, self.dtype, self.columns, self.total_rows
         )
         rows = values[
             self.row_offset:
@@ -479,10 +653,11 @@ class CompressedComponentRows:
         return rows[key]
 
 
-def load_compressed_feature_day(
+def load_compressed_component(
     file: Path,
     dtype: str,
     columns: int,
+    total_rows: int,
 ) -> np.ndarray:
     cached = _COMPRESSED_COMPONENT_CACHE.pop(file, None)
     if cached is not None:
@@ -490,19 +665,19 @@ def load_compressed_feature_day(
         return cached
     if zstandard is None:
         raise RuntimeError(
-            "zstandard is required for compressed production feature components; "
+            "zstandard is required for compressed training components; "
             "run `npm run mlp:bootstrap`"
         )
-    expected_bytes = 86_400 * columns * np.dtype(dtype).itemsize
+    expected_bytes = total_rows * columns * np.dtype(dtype).itemsize
     decoded = zstandard.ZstdDecompressor().decompress(
         file.read_bytes(), max_output_size=expected_bytes
     )
     if len(decoded) != expected_bytes:
         raise ValueError(
-            f"compressed feature component has {len(decoded)} decoded bytes, "
+            f"compressed component has {len(decoded)} decoded bytes, "
             f"expected {expected_bytes}: {file}"
         )
-    values = np.frombuffer(decoded, dtype=dtype).reshape(86_400, columns)
+    values = np.frombuffer(decoded, dtype=dtype).reshape(total_rows, columns)
     _COMPRESSED_COMPONENT_CACHE[file] = values
     while len(_COMPRESSED_COMPONENT_CACHE) > _COMPRESSED_COMPONENT_CACHE_DAYS:
         _COMPRESSED_COMPONENT_CACHE.popitem(last=False)
@@ -719,7 +894,9 @@ def load_runtime_minute_oracle_days(
     target_days: list[int],
 ) -> dict[int, np.ndarray]:
     repository = Path(__file__).resolve().parents[1]
-    bundled_node = repository / ".node-22/bin/node"
+    bundled_node = repository / (
+        ".node-22/node.exe" if os.name == "nt" else ".node-22/bin/node"
+    )
     node = bundled_node if bundled_node.is_file() else Path("node")
     process = subprocess.Popen(
         [
@@ -730,7 +907,7 @@ def load_runtime_minute_oracle_days(
             str(plan_file.resolve()),
         ],
         cwd=repository,
-        env={**os.environ, "TMPDIR": "/tmp"},
+        env=os.environ.copy(),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=None,
@@ -821,12 +998,19 @@ def main() -> None:
         runtime_minute_oracles = prepare_runtime_minute_oracles(
             manifest, args.plan
         )
+    compact_training_targets = (
+        args.target == "minuteOracleProbabilities"
+        and manifest.get("minuteOracleMap", {}).get("storage")
+        == "persisted-per-minute-day"
+        and 60_000 % sampling_interval_ms == 0
+    )
     train = FittedPolicyDataset(
         manifest,
         args.dataset,
         "train",
         target=args.target,
         runtime_minute_oracles=runtime_minute_oracles,
+        compact_minute_targets=compact_training_targets,
     )
     validation = FittedPolicyDataset(
         manifest,
@@ -877,6 +1061,11 @@ def main() -> None:
         device=device,
     )
     current = deterministic_current_states(args.states_per_example, support, device, visible=True)
+    transaction_transition = conditional_transaction_transition(
+        actions,
+        current,
+        support,
+    )
     loss_weights = parse_loss_weights(args.loss_weights_json)
     runtime_loss_weights = loss_weights_on_device(loss_weights, device)
     time_weighting = parse_time_weighting(args.time_weighting_json)
@@ -916,15 +1105,20 @@ def main() -> None:
         "skipBaseline": args.skip_baseline,
         "compile": args.compile,
         "lossWeights": asdict(loss_weights),
-        "temporalObjective": "direct-conditional-gaussian-mi-v1",
-        "oracleObjective": "conditional-gaussian-time-correlation-mi-v1",
+        "distributionObjective": "base-action-ce-pmse-v1",
+        "temporalObjective": "base-action-gaussian-mi-v1",
+        "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
     }
     if manifest["exampleWeighting"]["timeWeighting"] != time_weighting_metadata(time_weighting):
         raise ValueError("training time-weighting configuration does not match stored example weights")
     for dataset in (train, validation, test):
         report_stored_example_weights(dataset)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(0.9, 0.95)
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95),
+        fused=device.type == "cuda",
     )
     evaluation_batch_size = args.evaluation_batch_size or args.batch_size
     train_loader = loader(
@@ -945,25 +1139,87 @@ def main() -> None:
     test_loader = loader(test, args, shuffle=False, batch_size=evaluation_batch_size)
     steps_per_epoch = math.ceil(len(train_loader) / args.accumulate)
     total_steps = max(1, steps_per_epoch * args.epochs)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: learning_rate_multiplier(step, total_steps)
-    )
-    scaler = torch.amp.GradScaler("cuda", init_scale=256.0, enabled=device.type == "cuda")
     checkpoint_file = args.output / "checkpoint.pt"
     best_model_file = args.output / "best-model.pt"
     args.output.mkdir(parents=True, exist_ok=True)
+    checkpoint = (
+        torch.load(checkpoint_file, map_location=device, weights_only=False)
+        if args.resume and checkpoint_file.exists()
+        else None
+    )
+    resume_contract_extended = False
+    if checkpoint is not None:
+        checkpoint_contract = checkpoint.get("trainingContract")
+        if not isinstance(checkpoint_contract, dict):
+            raise RuntimeError("checkpoint does not contain a temporal training contract")
+        checkpoint_schedule = checkpoint_contract.get("learningRateSchedule")
+        if checkpoint_schedule is not None:
+            training_contract["learningRateSchedule"] = checkpoint_schedule
+        if checkpoint_contract != training_contract:
+            if not resume_contract_is_monotonic_extension(
+                checkpoint_contract,
+                training_contract,
+            ):
+                raise RuntimeError(
+                    "checkpoint does not match the current temporal training contract"
+                )
+            resume_contract_extended = True
+            scheduler_state = checkpoint.get("scheduler", {})
+            optimizer_groups = checkpoint.get("optimizer", {}).get(
+                "param_groups", []
+            )
+            if not optimizer_groups:
+                raise RuntimeError("checkpoint optimizer does not contain parameter groups")
+            schedule_start_step = int(
+                scheduler_state.get(
+                    "last_epoch",
+                    checkpoint.get("globalStep", 0),
+                )
+            )
+            start_multiplier = float(optimizer_groups[0]["lr"]) \
+                / args.learning_rate
+            training_contract["learningRateSchedule"] = {
+                "mode": "cosine-continuation",
+                "startStep": schedule_start_step,
+                "startMultiplier": start_multiplier,
+                "endMultiplier": min(0.05, start_multiplier),
+            }
+    schedule_contract = training_contract.get("learningRateSchedule")
+    if isinstance(schedule_contract, dict) \
+            and schedule_contract.get("mode") == "cosine-continuation":
+        scheduler_multiplier = lambda step: continuation_learning_rate_multiplier(
+            step,
+            total_steps,
+            int(schedule_contract["startStep"]),
+            float(schedule_contract["startMultiplier"]),
+            float(schedule_contract["endMultiplier"]),
+        )
+    else:
+        scheduler_multiplier = lambda step: learning_rate_multiplier(
+            step,
+            total_steps,
+        )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        scheduler_multiplier,
+    )
+    scaler = torch.amp.GradScaler("cuda", init_scale=256.0, enabled=device.type == "cuda")
     start_epoch = 0
     global_step = 0
     best_epoch = -1
     best_validation = math.inf
     best_validation_metrics: dict[str, float] = {}
     stale_epochs = 0
-    if args.resume and checkpoint_file.exists():
-        checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
-        if checkpoint.get("trainingContract") != training_contract:
-            raise RuntimeError("checkpoint does not match the current temporal training contract")
+    if checkpoint is not None:
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if device.type == "cuda":
+            # Optimizer state dictionaries include backend-selection fields.
+            # A checkpoint written before fused AdamW was enabled would
+            # otherwise silently replace the CUDA backend chosen above.
+            for group in optimizer.param_groups:
+                group["fused"] = True
+                group["foreach"] = None
         scheduler.load_state_dict(checkpoint["scheduler"])
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = checkpoint["epoch"] + 1
@@ -974,21 +1230,57 @@ def main() -> None:
         stale_epochs = checkpoint.get("staleEpochs", 0)
         restore_rng(checkpoint["rng"])
 
-    def objective():
-        def compute(features, targets, time_weights, times):
+    required_loss_terms = frozenset(
+        name for name, value in asdict(loss_weights).items() if value != 0
+    )
+
+    def objective(
+        *,
+        include_diagnostics: bool,
+        compact_targets: bool,
+        precompute_transition: bool,
+    ):
+        def compute(features, targets, time_weights, times, target_row_indices):
             return direct_oracle_loss(
                 model(features), targets, actions,
-                current.expand(features.shape[0], -1), support,
+                current
+                if precompute_transition
+                else current.expand(features.shape[0], -1),
+                support,
                 runtime_loss_weights, time_weights, times,
                 sampling_interval_ms,
+                include_diagnostics=include_diagnostics,
+                required_loss_terms=required_loss_terms,
+                target_row_indices=target_row_indices
+                if compact_targets else None,
+                transaction_transition=transaction_transition
+                if precompute_transition else None,
             )
         return compute
 
-    training_objective = objective()
-    evaluation_objective = objective()
+    training_objective = objective(
+        include_diagnostics=False,
+        compact_targets=compact_training_targets,
+        precompute_transition=True,
+    )
+    training_diagnostic_objective = objective(
+        include_diagnostics=True,
+        compact_targets=compact_training_targets,
+        precompute_transition=True,
+    )
+    evaluation_objective = objective(
+        include_diagnostics=True,
+        compact_targets=False,
+        precompute_transition=False,
+    )
     if args.compile:
         training_objective = torch.compile(
             training_objective,
+            mode="reduce-overhead",
+            fullgraph=False,
+        )
+        training_diagnostic_objective = torch.compile(
+            training_diagnostic_objective,
             mode="reduce-overhead",
             fullgraph=False,
         )
@@ -1012,6 +1304,9 @@ def main() -> None:
         "testExamples": len(test),
         "targetRepresentation": args.target,
         "lossWeights": asdict(loss_weights),
+        "distributionObjective": training_contract["distributionObjective"],
+        "temporalObjective": training_contract["temporalObjective"],
+        "oracleObjective": training_contract["oracleObjective"],
         "timeWeighting": time_weighting_metadata(time_weighting),
         "predictionDelayMs": int(manifest["predictionDelayMs"]),
         "distributionLossRange": [
@@ -1026,6 +1321,10 @@ def main() -> None:
             "klDivergence": args.target_validation_kl,
             "klDivergenceStdDev": args.target_validation_kl_stddev,
         },
+        "resumeContractExtended": resume_contract_extended,
+        "learningRateSchedule": training_contract.get("learningRateSchedule", {
+            "mode": "cosine",
+        }),
     })
 
     if not best_model_file.exists() and not args.skip_baseline:
@@ -1048,6 +1347,7 @@ def main() -> None:
     stopped = False
     interrupted = False
     quality_target_reached = validation_target_reached(best_validation_metrics, args)
+    patience_exhausted = stale_epochs >= args.patience
     if quality_target_reached:
         emit({
             "event": "validation-target-reached",
@@ -1056,10 +1356,18 @@ def main() -> None:
             "targetKlDivergence": args.target_validation_kl,
             "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
         })
+    if patience_exhausted:
+        emit({
+            "event": "training-patience-exhausted",
+            "bestEpoch": best_epoch,
+            "staleEpochs": stale_epochs,
+            "patience": args.patience,
+            "message": "Finalizing the saved best validated checkpoint.",
+        })
     last_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, args.epochs):
-            if args.evaluation_only or quality_target_reached:
+            if args.evaluation_only or quality_target_reached or patience_exhausted:
                 break
             last_epoch = epoch
             started = time.monotonic()
@@ -1079,6 +1387,7 @@ def main() -> None:
                 global_step,
                 sampling_interval_ms,
                 objective=training_objective,
+                diagnostic_objective=training_diagnostic_objective,
             )
             validation_metrics = evaluate(
                 model, validation_loader, actions, current, support,
@@ -1094,6 +1403,7 @@ def main() -> None:
                 atomic_torch_save(model.state_dict(), best_model_file)
             else:
                 stale_epochs += 1
+            patience_exhausted = stale_epochs >= args.patience
             save_checkpoint(
                 checkpoint_file,
                 epoch,
@@ -1132,7 +1442,7 @@ def main() -> None:
                     "targetKlDivergence": args.target_validation_kl,
                     "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
                 })
-            if stopped or quality_target_reached or stale_epochs >= args.patience:
+            if stopped or quality_target_reached or patience_exhausted:
                 break
     except KeyboardInterrupt:
         interrupted = True
@@ -1193,9 +1503,9 @@ def main() -> None:
                 "baseKlDivergence":
                     "KL between stored and predicted base-action distributions",
                 "probabilityMse":
-                    "weighted mean per-example probability MSE on the visible-range conditional surface",
+                    "weighted mean per-example probability MSE on the visible-range base-action distribution",
                 "probabilityMseVariance":
-                    "weighted population variance of per-example visible-range probability MSE",
+                    "weighted population variance of per-example visible-range base-action probability MSE",
             },
             "bestEpoch": best_epoch,
             "bestValidationScore": best_validation,
@@ -1205,6 +1515,8 @@ def main() -> None:
             "screeningValidationExamples": validation_loader.batch_sampler.example_count,
             "validationFraction": args.validation_fraction,
             "lossWeights": asdict(loss_weights),
+            "distributionObjective": "base-action-ce-pmse-v1",
+            "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "trainExamples": len(train),
             "validationExamples": len(validation),
             "epochs": args.epochs,
@@ -1212,7 +1524,8 @@ def main() -> None:
             "seed": args.seed,
             "device": str(device),
             "finalizedEarly":
-                stopped or interrupted or quality_target_reached or args.evaluation_only,
+                stopped or interrupted or quality_target_reached
+                or patience_exhausted or args.evaluation_only,
             "validationTargetReached": quality_target_reached,
         }
         atomic_json(study, args.study_file)
@@ -1238,7 +1551,8 @@ def main() -> None:
         loss_weights,
         time_weighting,
         device,
-        stopped or interrupted or quality_target_reached or args.evaluation_only,
+        stopped or interrupted or quality_target_reached
+        or patience_exhausted or args.evaluation_only,
     )
     emit({
         "event": "training-complete",
@@ -1247,7 +1561,8 @@ def main() -> None:
         "bestEpoch": best_epoch,
         "artifact": str(args.output / "model.onnx"),
         "finalizedEarly":
-            stopped or interrupted or quality_target_reached or args.evaluation_only,
+            stopped or interrupted or quality_target_reached
+            or patience_exhausted or args.evaluation_only,
         "validationTargetReached": quality_target_reached,
     })
 
@@ -1268,10 +1583,15 @@ def train_epoch(
     global_step,
     sampling_interval_ms,
     objective=None,
+    diagnostic_objective=None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
     totals = {
+        name: torch.zeros((), device=device)
+        for name in TRAIN_METRIC_NAMES
+    }
+    metric_counts = {
         name: torch.zeros((), device=device)
         for name in TRAIN_METRIC_NAMES
     }
@@ -1284,16 +1604,39 @@ def train_epoch(
     probability_mse_weight_sum = torch.zeros((), device=device)
     probability_mse_mean = torch.zeros((), device=device)
     probability_mse_centered_square_sum = torch.zeros((), device=device)
-    temporal_example_count = torch.zeros((), device=device)
     started = time.monotonic()
     stopped = False
-    for batch_step, (features, targets, time_weights, times, _) in enumerate(data):
-        features = features.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        time_weights = time_weights.to(device, non_blocking=True)
-        times = times.to(device, non_blocking=True)
+    for batch_step, (
+        features,
+        targets,
+        time_weights,
+        times,
+        _,
+        target_row_indices,
+    ) in enumerate(
+        device_batches(data, device)
+    ):
+        should_step = (batch_step + 1) % args.accumulate == 0 \
+            or batch_step + 1 == len(data)
+        next_global_step = global_step + int(should_step)
+        will_log = should_step and (
+            next_global_step == 1
+            or next_global_step % args.log_every_steps == 0
+        )
+        include_diagnostics = batch_step == 0 or will_log
+        selected_objective = (
+            diagnostic_objective
+            if include_diagnostics and diagnostic_objective is not None
+            else objective
+        )
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            batch_metrics = objective(features, targets, time_weights, times) if objective else (
+            batch_metrics = selected_objective(
+                features,
+                targets,
+                time_weights,
+                times,
+                target_row_indices,
+            ) if selected_objective else (
                 direct_oracle_loss(
                     model(features), targets, actions,
                     current.expand(features.shape[0], -1), support,
@@ -1309,18 +1652,23 @@ def train_epoch(
         elif not bool(torch.isfinite(loss)):
             raise RuntimeError(f"non-finite training loss at epoch {epoch}, batch {batch_step}")
         scaler.scale(loss).backward()
-        should_step = (batch_step + 1) % args.accumulate == 0 or batch_step + 1 == len(data)
         if should_step:
             scaler.unscale_(optimizer)
-            gradient_norm = clip_grad_norm_(model.parameters(), 1.0)
-            scale_before = scaler.get_scale()
+            gradient_norm = clip_grad_norm_(
+                model.parameters(),
+                1.0,
+                foreach=device.type == "cuda",
+            )
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-            if scaler.get_scale() >= scale_before:
-                scheduler.step()
+            # Global steps already count attempted updates. Advancing the
+            # step-based schedule here avoids two GradScaler.get_scale() calls,
+            # each of which synchronizes the CPU with CUDA. Fused AdamW consumes
+            # found_inf on-device and still skips an overflowing parameter update.
+            scheduler.step()
             global_step += 1
-            if global_step == 1 or global_step % args.log_every_steps == 0:
+            if will_log:
                 emit({
                     "event": "train-step",
                     "epoch": epoch,
@@ -1341,14 +1689,15 @@ def train_epoch(
         total_examples += count
         time_weight_sum += batch_metrics["timeWeightSum"].detach()
         time_weight_square_sum += batch_metrics["timeWeightSquareSum"].detach()
-        kl_weight_sum, kl_mean, kl_centered_square_sum = merge_weighted_moments(
-            kl_weight_sum,
-            kl_mean,
-            kl_centered_square_sum,
-            batch_metrics["klWeightSum"].detach(),
-            batch_metrics["klDivergence"].detach(),
-            batch_metrics["klCenteredSquareSum"].detach(),
-        )
+        if "klWeightSum" in batch_metrics:
+            kl_weight_sum, kl_mean, kl_centered_square_sum = merge_weighted_moments(
+                kl_weight_sum,
+                kl_mean,
+                kl_centered_square_sum,
+                batch_metrics["klWeightSum"].detach(),
+                batch_metrics["klDivergence"].detach(),
+                batch_metrics["klCenteredSquareSum"].detach(),
+            )
         probability_mse_weight_sum, probability_mse_mean, \
             probability_mse_centered_square_sum = merge_weighted_moments(
                 probability_mse_weight_sum,
@@ -1359,20 +1708,20 @@ def train_epoch(
                 batch_metrics["probabilityMseCenteredSquareSum"].detach(),
             )
         temporal_count = batch_metrics["temporalExampleCount"].detach()
-        temporal_example_count += temporal_count
         for name in TRAIN_METRIC_NAMES:
             if name in KL_MOMENT_METRIC_NAMES \
                     or name in PROBABILITY_MSE_MOMENT_METRIC_NAMES:
                 continue
+            if name not in batch_metrics:
+                continue
             metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
             totals[name] += batch_metrics[name].detach() * metric_count
+            metric_counts[name] += metric_count
         if stopped:
             break
-    temporal_count_value = max(1.0, float(temporal_example_count))
     result = {
-        name: float(value) / (
-            temporal_count_value if name in TIME_BLOCK_METRIC_NAMES else max(1, total_examples)
-        ) for name, value in totals.items()
+        name: float(value) / max(1.0, float(metric_counts[name]))
+        for name, value in totals.items()
     }
     result["timeWeightEffectiveSampleRatio"] = float(
         time_weight_sum * time_weight_sum
@@ -1415,13 +1764,22 @@ def evaluate(model, data, actions, current, support,
     probability_mse_mean = torch.zeros((), device=device)
     probability_mse_centered_square_sum = torch.zeros((), device=device)
     temporal_example_count = torch.zeros((), device=device)
-    for features, targets, time_weights, times, _ in data:
-        features = features.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        time_weights = time_weights.to(device, non_blocking=True)
-        times = times.to(device, non_blocking=True)
+    for (
+        features,
+        targets,
+        time_weights,
+        times,
+        _,
+        target_row_indices,
+    ) in device_batches(data, device):
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            batch_metrics = objective(features, targets, time_weights, times) if objective else (
+            batch_metrics = objective(
+                features,
+                targets,
+                time_weights,
+                times,
+                target_row_indices,
+            ) if objective else (
                 direct_oracle_loss(
                     model(features), targets, actions,
                     current.expand(features.shape[0], -1), support,
@@ -1510,8 +1868,56 @@ def loader(
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=args.workers > 0,
+        prefetch_factor=4 if args.workers > 0 else None,
         collate_fn=passthrough_batch,
     )
+
+
+def device_batches(data: DataLoader, device: torch.device):
+    """Overlap pinned host-to-device copies with the preceding CUDA batch."""
+    if device.type != "cuda":
+        yield from data
+        return
+
+    copy_stream = torch.cuda.Stream(device=device)
+    iterator = iter(data)
+
+    def copy(batch):
+        (
+            features,
+            targets,
+            time_weights,
+            times,
+            diagnostics,
+            target_row_indices,
+        ) = batch
+        with torch.cuda.stream(copy_stream):
+            return (
+                features.to(device, non_blocking=True),
+                targets.to(device, non_blocking=True),
+                time_weights.to(device, non_blocking=True),
+                times.to(device, non_blocking=True),
+                diagnostics,
+                target_row_indices.to(device, non_blocking=True),
+            )
+
+    try:
+        pending = copy(next(iterator))
+    except StopIteration:
+        return
+
+    while True:
+        torch.cuda.current_stream(device).wait_stream(copy_stream)
+        batch = pending
+        for value in (*batch[:4], batch[5]):
+            value.record_stream(torch.cuda.current_stream(device))
+        try:
+            pending = copy(next(iterator))
+        except StopIteration:
+            pending = None
+        yield batch
+        if pending is None:
+            break
 
 
 def report_stored_example_weights(dataset: FittedPolicyDataset) -> None:
@@ -1728,6 +2134,56 @@ def learning_rate_multiplier(step: int, total: int) -> float:
     return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
 
+def continuation_learning_rate_multiplier(
+    step: int,
+    total: int,
+    start_step: int,
+    start_multiplier: float,
+    end_multiplier: float = 0.05,
+) -> float:
+    """Continue a completed schedule without raising its saved learning rate."""
+    if total < 1 or start_step < 0 \
+            or start_multiplier <= 0 or end_multiplier <= 0 \
+            or end_multiplier > start_multiplier:
+        raise ValueError("invalid continuation learning-rate schedule")
+    if step <= start_step:
+        return start_multiplier
+    progress = (step - start_step) / max(1, total - start_step)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    return end_multiplier + (start_multiplier - end_multiplier) * cosine
+
+
+def resume_contract_is_monotonic_extension(
+    checkpoint_contract: dict,
+    requested_contract: dict,
+) -> bool:
+    """Allow only a larger epoch or patience horizon for an exact run contract."""
+    previous = dict(checkpoint_contract)
+    requested = dict(requested_contract)
+    previous_epochs = previous.pop("epochs", None)
+    requested_epochs = requested.pop("epochs", None)
+    previous_patience = previous.pop("patience", None)
+    requested_patience = requested.pop("patience", None)
+    previous.pop("learningRateSchedule", None)
+    requested.pop("learningRateSchedule", None)
+    if previous != requested \
+            or not all(isinstance(value, int) for value in (
+                previous_epochs,
+                requested_epochs,
+                previous_patience,
+                requested_patience,
+            )):
+        return False
+    return (
+        requested_epochs >= previous_epochs
+        and requested_patience >= previous_patience
+        and (
+            requested_epochs > previous_epochs
+            or requested_patience > previous_patience
+        )
+    )
+
+
 def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
                     best_validation_metrics, stale_epochs, model, optimizer, scheduler,
                     scaler, training_contract) -> None:
@@ -1809,6 +2265,8 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "testMetrics": test_metrics,
             "teacherFitMetrics": teacher_metrics,
             "lossWeights": asdict(loss_weights),
+            "distributionObjective": "base-action-ce-pmse-v1",
+            "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "selectionMetric": args.selection_metric,
             "initializeFromCheckpoint": (
                 str(args.initialize_from_checkpoint)
@@ -1828,9 +2286,9 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
                 "baseKlDivergence":
                     "KL between stored and predicted base-action distributions",
                 "probabilityMse":
-                    "weighted mean per-example probability MSE on the visible-range conditional surface",
+                    "weighted mean per-example probability MSE on the visible-range base-action distribution",
                 "probabilityMseVariance":
-                    "weighted population variance of per-example visible-range probability MSE",
+                    "weighted population variance of per-example visible-range base-action probability MSE",
             },
             "timeWeighting": time_weighting_metadata(time_weighting),
             "predictionDelayMs": int(dataset_manifest["predictionDelayMs"]),
@@ -1904,6 +2362,7 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
             != "row-major [example, targetExposure]" \
             or raw_oracle.get("factorShape") != [manifest["actionCount"]] \
             or raw_oracle.get("factorFileField") != "rawOracleProbabilities" \
+            or raw_oracle.get("factorCompression", "none") not in ("none", "zstd") \
             or raw_oracle.get("optionalHardCutoffCoordinates") \
             != "teacherParameters[6:8]" \
             or any(not isinstance(shard.get("rawOracleProbabilities"), str)
@@ -1917,11 +2376,16 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
             or minute_oracle.get("factorShape") != [manifest["actionCount"]] \
             or minute_oracle.get("factorFileField") \
             != "minuteOracleProbabilities" \
+            or minute_oracle.get("factorCompression", "none") \
+            not in ("none", "zstd") \
             or minute_oracle.get("normalized") is not True \
             or minute_storage not in (
                 "persisted-per-example",
+                "persisted-per-minute-day",
                 "computed-directly-at-training-startup",
             ) \
+            or (minute_storage == "persisted-per-minute-day"
+                and minute_oracle.get("storedRowsPerUtcDay") != 1_441) \
             or resolution.get("metric") != "Jensen-Shannon divergence" \
             or resolution.get("fileField") != "resolutionDivergence" \
             or any(not isinstance(shard.get("minuteOracleProbabilities"), str)
@@ -1950,6 +2414,12 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
             if isinstance(component, dict)
             and isinstance(component.get("features"), str)
         }
+        oracle_components = {
+            component["rawOracleProbabilities"]: component
+            for component in component_layout.get("oracleComponents", [])
+            if isinstance(component, dict)
+            and isinstance(component.get("rawOracleProbabilities"), str)
+        }
         for shard in manifest["shards"]:
             count = int(shard["count"])
             feature_offset = int(shard.get("featureRowOffset", -1))
@@ -1966,8 +2436,33 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
                 raise ValueError("dataset component row view is invalid")
             file = root / shard["rawOracleProbabilities"]
             minimum_oracle_rows = oracle_offset + (count - 1) * oracle_stride + 1
-            if not file.is_file() or file.stat().st_size % expected_row_bytes != 0 \
-                    or file.stat().st_size < minimum_oracle_rows * expected_row_bytes:
+            oracle_component = oracle_components.get(
+                shard["rawOracleProbabilities"], {}
+            )
+            if file.name.endswith(".zst") \
+                    or raw_oracle.get("factorCompression", "none") == "zstd":
+                expected_decoded_bytes = 86_400 * expected_row_bytes
+                invalid_raw_oracle = (
+                    not file.is_file()
+                    or file.stat().st_size < 1
+                    or not file.name.endswith(".zst")
+                    or raw_oracle.get("factorCompression") != "zstd"
+                    or oracle_component.get(
+                        "rawOracleProbabilitiesCompression"
+                    ) != "zstd"
+                    or oracle_component.get(
+                        "rawOracleProbabilitiesUncompressedBytes"
+                    ) != expected_decoded_bytes
+                    or minimum_oracle_rows > 86_400
+                )
+            else:
+                invalid_raw_oracle = (
+                    not file.is_file()
+                    or file.stat().st_size % expected_row_bytes != 0
+                    or file.stat().st_size
+                    < minimum_oracle_rows * expected_row_bytes
+                )
+            if invalid_raw_oracle:
                 raise ValueError(
                     f"dataset raw oracle grid file has an invalid size: {file}"
                 )
@@ -2007,9 +2502,30 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
                 )
             minute_file = root / shard["minuteOracleProbabilities"]
             resolution_file = root / shard["resolutionDivergence"]
-            if minute_storage == "persisted-per-example" \
-                    and (not minute_file.is_file()
-                         or minute_file.stat().st_size != count * expected_row_bytes):
+            minute_compression = minute_oracle.get("factorCompression", "none")
+            minute_persisted = minute_storage in (
+                "persisted-per-example",
+                "persisted-per-minute-day",
+            )
+            minute_rows = 1_441 \
+                if minute_storage == "persisted-per-minute-day" else count
+            if minute_persisted \
+                    and minute_compression == "zstd":
+                invalid_minute_oracle = (
+                    not minute_file.is_file()
+                    or minute_file.stat().st_size < 1
+                    or not minute_file.name.endswith(".zst")
+                )
+            else:
+                invalid_minute_oracle = (
+                    minute_persisted
+                    and (
+                        not minute_file.is_file()
+                        or minute_file.stat().st_size
+                        != minute_rows * expected_row_bytes
+                    )
+                )
+            if invalid_minute_oracle:
                 raise ValueError(
                     f"dataset one-minute oracle file has an invalid size: {minute_file}"
                 )

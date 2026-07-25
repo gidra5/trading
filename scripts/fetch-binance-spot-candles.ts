@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -6,9 +5,10 @@ import { createReadStream, createWriteStream } from "node:fs";
 import https from "node:https";
 import path from "node:path";
 import readline from "node:readline";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
+import AdmZip from "adm-zip";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const args = process.argv.slice(2);
@@ -105,49 +105,40 @@ async function main(): Promise<void> {
       await download(url, archive);
       await verifyChecksum(url, archive);
 
-      const unzip = spawn("unzip", ["-p", archive], { stdio: ["ignore", "pipe", "pipe"] });
-      const exited = new Promise<number | null>((resolve, reject) => {
-        unzip.once("error", reject);
-        unzip.once("close", resolve);
+      const zip = new AdmZip(archive);
+      const entries = zip.getEntries().filter((entry) => !entry.isDirectory);
+      if (entries.length !== 1) {
+        throw new Error(`${date}: expected one file in archive, found ${entries.length}`);
+      }
+      const lines = readline.createInterface({
+        input: Readable.from([entries[0]!.getData()]),
+        crlfDelay: Infinity,
       });
-      let stderr = "";
-      unzip.stderr.setEncoding("utf8");
-      unzip.stderr.on("data", (chunk: string) => stderr += chunk);
-
-      const lines = readline.createInterface({ input: unzip.stdout, crlfDelay: Infinity });
       const candles = new Map<number, Candle>();
       let duplicates = 0;
-      try {
-        for await (const line of lines) {
-          if (!line) continue;
-          const row = line.split(",");
-          const openTime = milliseconds(row[0]);
-          const closeTime = milliseconds(row[6]);
-          const candle = {
-            symbol,
-            interval,
-            openTime,
-            open: Number(row[1]),
-            high: Number(row[2]),
-            low: Number(row[3]),
-            close: Number(row[4]),
-            volume: Number(row[5]),
-            closeTime,
-            closed: true,
-          };
-          if (!validCandle(candle, day)) {
-            throw new Error(`${date}: invalid candle at ${openTime}`);
-          }
-          if (candles.has(openTime)) duplicates += 1;
-          candles.set(openTime, candle);
+      for await (const line of lines) {
+        if (!line) continue;
+        const row = line.split(",");
+        const openTime = milliseconds(row[0]);
+        const closeTime = milliseconds(row[6]);
+        const candle = {
+          symbol,
+          interval,
+          openTime,
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          volume: Number(row[5]),
+          closeTime,
+          closed: true,
+        };
+        if (!validCandle(candle, day)) {
+          throw new Error(`${date}: invalid candle at ${openTime}`);
         }
-      } catch (error) {
-        unzip.kill();
-        await exited.catch(() => undefined);
-        throw error;
+        if (candles.has(openTime)) duplicates += 1;
+        candles.set(openTime, candle);
       }
-      const exitCode = await exited;
-      if (exitCode !== 0) throw new Error(`unzip failed (${exitCode}): ${stderr.trim()}`);
 
       let gaps = 0;
       let previousTime = day - intervalMs;
@@ -155,26 +146,53 @@ async function main(): Promise<void> {
       const output = compression === "gzip" ? createGzip({ level: 6 }) : new PassThrough();
       const outputDone = pipeline(output, createWriteStream(temporary));
       let previous: Candle | undefined;
+      let written = 0;
+      if (fillGaps && ordered[0] && ordered[0].openTime > day) {
+        previous = await loadPreviousCandle(day);
+        if (!previous) {
+          throw new Error(`${date}: cannot fill leading no-trade seconds without the prior day`);
+        }
+      }
       for (const candle of ordered) {
         gaps += (candle.openTime - previousTime) / intervalMs - 1;
         if (fillGaps && previous) {
-          for (let time = previous.openTime + intervalMs; time < candle.openTime; time += intervalMs) {
+          for (
+            let time = Math.max(day, previous.openTime + intervalMs);
+            time < candle.openTime;
+            time += intervalMs
+          ) {
             const filled = carryCandle(previous, time);
             if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
             previous = filled;
+            written += 1;
           }
         }
         if (!output.write(`${JSON.stringify(candle)}\n`)) {
           await once(output, "drain");
         }
+        written += 1;
         previous = candle;
         previousTime = candle.openTime;
+      }
+      if (fillGaps && previous) {
+        for (
+          let time = Math.max(day, previous.openTime + intervalMs);
+          time < day + DAY_MS;
+          time += intervalMs
+        ) {
+          const filled = carryCandle(previous, time);
+          if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+          previous = filled;
+          written += 1;
+        }
       }
       output.end();
       await outputDone;
       gaps += (day + DAY_MS - intervalMs - previousTime) / intervalMs;
-      const count = fillGaps ? expected : ordered.length;
-      if (count === 0 || count + gaps !== expected) throw new Error(`${date}: invalid archive coverage`);
+      const count = fillGaps ? written : ordered.length;
+      if (count === 0 || ordered.length + gaps !== expected || (fillGaps && count !== expected)) {
+        throw new Error(`${date}: invalid archive coverage`);
+      }
       await fs.rename(temporary, target);
       total += count;
       const notes = [gaps && `${gaps.toLocaleString()} missing intervals`, duplicates && `${duplicates} duplicate rows`]
@@ -203,7 +221,10 @@ async function fillCachedGaps(file: string, day: number, expected: number): Prom
       const candle = JSON.parse(line) as Candle;
       if (!validCandle(candle, day)) throw new Error(`${file}: invalid cached candle`);
       if (!previous && candle.openTime !== day) {
-        throw new Error(`${file}: cannot fill a missing leading interval without a prior close`);
+        previous = await loadPreviousCandle(day);
+        if (!previous) {
+          throw new Error(`${file}: cannot fill a missing leading interval without a prior close`);
+        }
       }
       if (previous && candle.openTime <= previous.openTime) {
         throw new Error(`${file}: cached candles are duplicated or out of order`);
@@ -220,6 +241,18 @@ async function fillCachedGaps(file: string, day: number, expected: number): Prom
       previous = candle;
       count += 1;
     }
+    if (previous) {
+      for (
+        let time = Math.max(day, previous.openTime + intervalMs);
+        time < day + DAY_MS;
+        time += intervalMs
+      ) {
+        const filled = carryCandle(previous, time);
+        if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+        previous = filled;
+        count += 1;
+      }
+    }
     output.end();
     await outputDone;
     if (count !== expected || previous?.openTime !== day + DAY_MS - intervalMs) {
@@ -232,6 +265,30 @@ async function fillCachedGaps(file: string, day: number, expected: number): Prom
     await Promise.allSettled([outputDone, fs.rm(temporary, { force: true })]);
     throw error;
   }
+}
+
+async function loadPreviousCandle(day: number): Promise<Candle | undefined> {
+  const date = new Date(day - DAY_MS).toISOString().slice(0, 10);
+  for (const file of [
+    path.join(outputDir, `${date}.jsonl.gz`),
+    path.join(outputDir, `${date}.jsonl`),
+  ]) {
+    try {
+      await fs.access(file);
+      const source = createReadStream(file);
+      const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
+      const lines = readline.createInterface({ input, crlfDelay: Infinity });
+      let last: Candle | undefined;
+      for await (const line of lines) {
+        if (line) last = JSON.parse(line) as Candle;
+      }
+      if (last && validCandle(last, day - DAY_MS)
+        && last.openTime === day - intervalMs) return last;
+    } catch {
+      // Try the alternate compression.
+    }
+  }
+  return undefined;
 }
 
 function carryCandle(previous: Candle, openTime: number): Candle {

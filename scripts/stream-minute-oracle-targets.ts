@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { prepareExposureValueOracle } from "@trading/bot-algo";
+import { prepareExposureValueOracleCuda } from "@trading/bot-algo";
 import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 
 const MINUTE_MS = 60_000;
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
         + `${minutes.length}/${expectedMinutes} contiguous minutes.`,
       );
     }
-    const oracle = prepareExposureValueOracle(
+    const { oracle } = await prepareExposureValueOracleCuda(
       Float64Array.from(minutes, (candle) => candle.close),
       {
         scoreStartIndex: 0,
@@ -84,6 +84,8 @@ async function main(): Promise<void> {
         ),
         includeActionValues: false,
         includeProbabilities: true,
+        includePath: false,
+        distributionOnly: true,
       },
     );
     const probabilities = oracle.probabilities;

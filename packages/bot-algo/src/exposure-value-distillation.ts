@@ -25,6 +25,10 @@ export interface ExposureValueOracleOptions {
   includeProbabilities?: boolean;
   /** Retain the absolute post-action Bellman log return for every candle/target cell. */
   includeActionValues?: boolean;
+  /** Compute the realized optimal path in addition to the per-timestamp oracle distributions. */
+  includePath?: boolean;
+  /** Skip policy/path summary columns when only the raw action distribution is needed. */
+  distributionOnly?: boolean;
   cancelFlag?: Int32Array;
 }
 

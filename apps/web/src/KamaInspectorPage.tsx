@@ -59,7 +59,7 @@ import {
 } from "./components/IndicatorChart";
 import { formatDateTime, formatDuration, formatQuote } from "./format";
 
-const apiBase = "/backend";
+const apiBase = import.meta.env.DEV ? "/backend" : "";
 const debounceMs = 150;
 const detailDebounceMs = 120;
 const detailMaxCandles = 5_000;

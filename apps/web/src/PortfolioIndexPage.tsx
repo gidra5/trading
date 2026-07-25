@@ -15,7 +15,7 @@ import {
   Search,
 } from "lucide-solid";
 
-const apiBase = "/backend";
+const apiBase = import.meta.env.DEV ? "/backend" : "";
 const POLL_MS = 2_000;
 const DAY_MS = 86_400_000;
 

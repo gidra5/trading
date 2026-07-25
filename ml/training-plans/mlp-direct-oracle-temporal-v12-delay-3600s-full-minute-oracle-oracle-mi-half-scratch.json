@@ -1,7 +1,7 @@
 {
   "version": 4,
   "id": "mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
-  "label": "Direct 255-action MLP v12 · 60-minute full hindsight · CE+pMSE+0.5 Oracle MI · fresh initialization",
+  "label": "Direct 255-action MLP v12 · 60-minute full hindsight · base CE+pMSE+0.5 base Oracle MI · warm continuation",
   "dataDir": "data",
   "componentStoreId": "mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s",
   "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
@@ -13,7 +13,8 @@
   "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
   "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch",
   "oraclePreparation": {
-    "backend": "cuda"
+    "backend": "cuda",
+    "pipelineDepth": 3
   },
   "samplingIntervalMs": 1000,
   "predictionDelayMs": 3600000,
@@ -240,7 +241,7 @@
   },
   "training": {
     "targetRepresentation": "minuteOracleProbabilities",
-    "epochs": 64,
+    "epochs": 256,
     "batchSize": 4096,
     "evaluationBatchSize": 4096,
     "validationFraction": 1,
@@ -251,10 +252,11 @@
     "weightDecay": 0.01,
     "dropout": 0.05,
     "statesPerExample": 31,
-    "patience": 8,
+    "patience": 16,
     "workers": 4,
     "seed": 1337,
     "device": "cuda",
+    "initializeFromCheckpoint": "data/models/mlp/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch/warm-start-conditional-best-e51.pt",
     "logEverySteps": 100,
     "compile": true,
     "selectionMetric": "klDivergence",
@@ -697,8 +699,10 @@
     "spread": "removed"
   },
   "componentCompression": {
-    "features": "zstd"
+    "features": "zstd",
+    "rawOracleProbabilities": "zstd",
+    "minuteOracleProbabilities": "zstd"
   },
   "featurePreparationWorkers": 3,
-  "runtimeMinuteOracleTargets": true
+  "runtimeMinuteOracleTargets": false
 }

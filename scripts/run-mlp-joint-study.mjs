@@ -66,6 +66,11 @@ const METRIC_NAMES = [
   "oracleMutualInformation",
 ];
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const mlPython = path.join(
+  repoRoot,
+  ".venv-ml",
+  process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+);
 const planFile = path.resolve(repoRoot, argument("plan") ?? "ml/training-plan.json");
 const basePlan = readJsonRequired(planFile);
 const studyKey = argument("study") ?? "lossWeightStudy";
@@ -474,7 +479,7 @@ try {
       writeStatus();
       if (!validResult(existing, variant, delayMs, weightVariant.weights)) {
         fs.mkdirSync(directory, { recursive: true });
-        await runStage("training", path.join(repoRoot, ".venv-ml/bin/python"), [
+        await runStage("training", mlPython, [
           path.join(repoRoot, "ml/run_with_observability.py"),
           path.join(repoRoot, "ml/train_mlp.py"),
           ...trainingArguments({
@@ -650,7 +655,7 @@ async function runPopulationTrainingBatch(jobsFile) {
       writeStatus();
       await runStage(
         `exhaustive-population-${populationSize}-training`,
-        path.join(repoRoot, ".venv-ml/bin/python"),
+        mlPython,
         [
         path.join(repoRoot, "ml/run_with_observability.py"),
         path.join(repoRoot, "ml/train_mlp_population.py"),
@@ -701,7 +706,6 @@ async function runStageAttempt(stage, command, args, attempt, maxAttempts) {
     cwd: repoRoot,
     env: {
       ...process.env,
-      TMPDIR: "/tmp",
       ...(stage === "priority-dataset"
         ? { TRADING_MLP_WORKER_JOBS_BEFORE_RECYCLE: "2" }
         : {}),
@@ -930,7 +934,7 @@ async function ensureStudyArtifact({
     updatedAt: new Date().toISOString(),
   };
   writeStatus();
-  await runStage("artifact-export", path.join(repoRoot, ".venv-ml/bin/python"), [
+  await runStage("artifact-export", mlPython, [
     path.join(repoRoot, "ml/export_mlp_study_artifact.py"),
     "--dataset", dataset,
     "--output", directory,
@@ -1213,7 +1217,7 @@ function resumeProductionPreparation() {
     "--dataset-only",
   ], {
     cwd: repoRoot,
-    env: { ...process.env, TMPDIR: "/tmp" },
+    env: process.env,
     detached: true,
     stdio: "ignore",
   });
@@ -1494,7 +1498,7 @@ async function trainPromotion(
   const existing = readJson(resultFile);
   if (!validResult(existing, plan, plan.predictionDelayMs, weightVariant.weights)) {
     fs.mkdirSync(directory, { recursive: true });
-    await runStage(`${stage}-training`, path.join(repoRoot, ".venv-ml/bin/python"), [
+    await runStage(`${stage}-training`, mlPython, [
       path.join(repoRoot, "ml/run_with_observability.py"),
       path.join(repoRoot, "ml/train_mlp.py"),
       "--dataset", promotionDatasetDir,

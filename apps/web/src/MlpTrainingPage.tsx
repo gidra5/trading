@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { Activity, ArrowLeft, BarChart3, Search } from "lucide-solid";
 
-const apiBase = "/backend";
+const apiBase = import.meta.env.DEV ? "/backend" : "";
 const POLL_MS = 2_000;
 
 interface MetricValues {
@@ -94,6 +94,7 @@ interface DatasetPoint {
   date: string;
   split: string;
   days?: number;
+  preparationExamplesPerSecond?: number;
   examplesPerSecond?: number;
   gpuMemoryMiB?: number;
   kl?: number;
@@ -104,6 +105,10 @@ interface DatasetPoint {
   acceptedPct?: number;
   oracleKernelMs?: number;
   oracleWallMs?: number;
+  oraclePipelineWaitMs?: number;
+  directDiagnosticsKernelMs?: number;
+  directDiagnosticsCutoffKernelMs?: number;
+  directDiagnosticsWorkerWallMs?: number;
   teacherWallMs?: number;
   featureEncodingMs?: number;
   persistMs?: number;
@@ -180,23 +185,35 @@ export function MlpTrainingPage() {
     for (const event of events) {
       if (event.event === "dataset-oracle") {
         const date = textValue(event.date);
-        if (!date) continue;
-        oracleByDate.set(date, {
-          x: numberValue(event.day),
+        const x = numberValue(event.day);
+        if (!date || x === undefined) continue;
+        const oracle: Partial<DatasetPoint> = {
+          x,
           date,
           days: numberValue(event.days),
           oracleKernelMs: numberValue(event.kernelMs),
           oracleWallMs: numberValue(event.wallMs),
-        });
-        for (const [key, point] of datasetByKey) {
-          if (point.date === date) datasetByKey.set(key, { ...point, ...oracleByDate.get(date) });
-        }
+          oraclePipelineWaitMs: numberValue(event.pipelineWaitMs),
+        };
+        oracleByDate.set(date, oracle);
+        const key = `${date}:oracle`;
+        const point: DatasetPoint = {
+          ...datasetByKey.get(key),
+          ...oracle,
+          key,
+          x,
+          date,
+          split: "oracle",
+        };
+        datasetByKey.set(key, point);
+        if (!currentDataset() || x >= currentDataset()!.x) setCurrentDataset(point);
       } else if (event.event === "dataset-progress") {
         const date = textValue(event.date);
         const split = textValue(event.split) ?? textValue(event.component) ?? "unknown";
         const x = numberValue(event.day);
         if (!date || x === undefined) continue;
         const key = `${date}:${split}`;
+        const examplesPerSecond = numberValue(event.examplesPerSecond);
         const point: DatasetPoint = {
           ...datasetByKey.get(key),
           ...oracleByDate.get(date),
@@ -205,7 +222,8 @@ export function MlpTrainingPage() {
           date,
           split,
           days: numberValue(event.days),
-          examplesPerSecond: numberValue(event.examplesPerSecond),
+          preparationExamplesPerSecond: examplesPerSecond,
+          examplesPerSecond,
           gpuMemoryMiB: numberValue(event.gpuMemoryMiB),
           kl: numberValue(event.meanKlDivergence),
           probabilityMse: numberValue(event.meanSquaredError),
@@ -214,7 +232,7 @@ export function MlpTrainingPage() {
           temporalSelectedPct: percentValue(event.temporalWarmSelectedFraction),
         };
         datasetByKey.set(key, point);
-        setCurrentDataset(point);
+        if (!currentDataset() || x >= currentDataset()!.x) setCurrentDataset(point);
       } else if (event.event === "dataset-stage-timing") {
         const date = textValue(event.date);
         const split = textValue(event.split) ?? textValue(event.component) ?? "unknown";
@@ -224,15 +242,27 @@ export function MlpTrainingPage() {
         if (!existing) continue;
         const examples = numberValue(event.examples);
         const accepted = numberValue(event.acceptedExamples);
+        const directDiagnosticsWorkerWallMs = numberValue(
+          event.directDiagnosticsWorkerWallMs,
+        );
         const point: DatasetPoint = {
           ...existing,
+          preparationExamplesPerSecond: directDiagnosticsWorkerWallMs
+            && examples
+            ? examples * 1_000 / directDiagnosticsWorkerWallMs
+            : existing.preparationExamplesPerSecond,
           acceptedPct: examples && accepted !== undefined ? 100 * accepted / examples : undefined,
+          directDiagnosticsKernelMs: numberValue(event.directDiagnosticsKernelMs),
+          directDiagnosticsCutoffKernelMs: numberValue(
+            event.directDiagnosticsCutoffKernelMs,
+          ),
+          directDiagnosticsWorkerWallMs,
           teacherWallMs: numberValue(event.teacherWallMs),
           featureEncodingMs: numberValue(event.featureEncodingMs),
           persistMs: numberValue(event.persistMs),
         };
         datasetByKey.set(key, point);
-        if (currentDataset()?.key === key) setCurrentDataset(point);
+        if (!currentDataset() || point.x >= currentDataset()!.x) setCurrentDataset(point);
       } else if (event.event === "train-step") {
         const globalStep = numberValue(event.globalStep);
         if (globalStep === undefined) continue;
@@ -317,6 +347,13 @@ export function MlpTrainingPage() {
   });
 
   const latestDataset = createMemo(() => currentDataset());
+  const latestCompletedDataset = createMemo(() => {
+    const points = datasetPoints();
+    for (let index = points.length - 1; index >= 0; index -= 1) {
+      if (points[index]!.persistMs !== undefined) return points[index];
+    }
+    return latestDataset();
+  });
   const latestStep = createMemo(() => trainSteps().at(-1));
   const latestEpoch = createMemo(() => epochs().at(-1));
   const stage = createMemo(() => snapshot()?.status?.stage ?? "idle");
@@ -544,10 +581,14 @@ export function MlpTrainingPage() {
           <MetricCard label="Prediction delay" value={formatDurationMs(snapshot()?.plan.predictionDelayMs)} />
           <MetricCard label="Input days" value={integer(snapshot()?.progress.featureComponents)} />
           <MetricCard label="Oracle days" value={integer(snapshot()?.progress.oracleComponents)} />
-          <MetricCard label="Teacher rate" value={formatUnit(latestDataset()?.examplesPerSecond, " fits/s")} />
-          <MetricCard label="Teacher GPU" value={formatUnit(latestDataset()?.gpuMemoryMiB, " MiB", 1)} />
-          <MetricCard label="Fit KL" value={formatMetric(latestDataset()?.kl)} />
-          <MetricCard label="Fit pMSE" value={formatMetric(latestDataset()?.probabilityMse)} />
+          <MetricCard label="Preparation rate" value={formatUnit(latestCompletedDataset()?.preparationExamplesPerSecond, " ex/s")} />
+          <MetricCard label="Preparation GPU" value={formatUnit(latestCompletedDataset()?.gpuMemoryMiB, " MiB", 1)} />
+          <MetricCard label="Fit KL" value={formatMetric(latestCompletedDataset()?.kl)} />
+          <MetricCard label="Fit pMSE" value={formatMetric(latestCompletedDataset()?.probabilityMse)} />
+          <MetricCard label="Oracle kernel" value={formatUnit(latestDataset()?.oracleKernelMs, " ms", 1)} />
+          <MetricCard label="Feature encoding" value={formatUnit(latestCompletedDataset()?.featureEncodingMs, " ms", 1)} />
+          <MetricCard label="Persistence" value={formatUnit(latestCompletedDataset()?.persistMs, " ms", 1)} />
+          <MetricCard label="Pipeline wait" value={formatUnit(latestDataset()?.oraclePipelineWaitMs, " ms", 3)} />
           <MetricCard label="Refined shards" value={ratio(snapshot()?.progress.refinedShards, snapshot()?.progress.totalShards)} />
           <MetricCard label="Queued fits" value={integer(snapshot()?.progress.remainingTeacherFits)} />
           <MetricCard label="Last global step" value={integer(latestStep()?.globalStep)} />
@@ -560,10 +601,10 @@ export function MlpTrainingPage() {
 
         <Show when={datasetPoints().length > 0}>
           <section class="flex flex-col gap-3">
-            <SectionHeading title="Teacher fitting and refinement" subtitle={`${datasetPoints().length} completed day/split batches`} />
+            <SectionHeading title="Dataset preparation" subtitle={`${datasetPoints().length} completed day/component batches`} />
             <div class="grid min-w-0 gap-3 xl:grid-cols-2">
-              <MetricChart title="Teacher throughput" unit="fits/s" series={[
-                plot("Fits / second", "#38bdf8", datasetPoints(), "examplesPerSecond"),
+              <MetricChart title="Preparation throughput" unit="examples/s" series={[
+                plot("Examples / second", "#38bdf8", datasetPoints(), "preparationExamplesPerSecond"),
               ]} />
               <MetricChart title="Accepted examples" unit="%" yDomain={[0, 100]} series={[
                 plot("Accepted", "#22c55e", datasetPoints(), "acceptedPct"),
@@ -579,8 +620,10 @@ export function MlpTrainingPage() {
                 plot("After", "#38bdf8", datasetPoints(), "temporalAfter"),
               ]} />
               <MetricChart title="Daily pipeline time" unit="ms" scale="log" series={[
-                plot("Teacher", "#38bdf8", datasetPoints(), "teacherWallMs"),
+                plot("Teacher / CPU materialization", "#38bdf8", datasetPoints(), "teacherWallMs"),
                 plot("Oracle kernel", "#a78bfa", datasetPoints(), "oracleKernelMs"),
+                plot("Direct diagnostics", "#22c55e", datasetPoints(), "directDiagnosticsKernelMs"),
+                plot("Feature encoding", "#f05252", datasetPoints(), "featureEncodingMs"),
                 plot("Persist", "#f5b84b", datasetPoints(), "persistMs"),
               ]} />
               <MetricChart title="GPU memory" unit="MiB" series={[

@@ -9,6 +9,7 @@ __pycache__
 node_modules
 .venv-ml
 .node-22
+.tools
 dist
 apps/*/dist
 packages/*/dist

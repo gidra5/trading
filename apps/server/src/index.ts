@@ -794,9 +794,11 @@ function configureProcessReports(): void {
     fs.mkdirSync(appConfig.dataDir, { recursive: true });
     process.report.directory = appConfig.dataDir;
     process.report.reportOnFatalError = true;
-    process.report.reportOnSignal = true;
     process.report.reportOnUncaughtException = true;
-    process.report.signal = "SIGUSR2";
+    process.report.reportOnSignal = process.platform !== "win32";
+    if (process.platform !== "win32") {
+      process.report.signal = "SIGUSR2";
+    }
   } catch (error) {
     server.log.warn(
       {

@@ -8,7 +8,7 @@ from torch import Tensor, nn
 import torch.nn.functional as functional
 
 
-FEATURE_SCHEMA_VERSION = 5
+FEATURE_SCHEMA_VERSION = 6
 INPUT_FEATURE_COUNT = 901
 OUTPUT_ACTION_COUNT = 255
 TEACHER_PARAMETER_COUNT = 8
@@ -68,6 +68,33 @@ def policy_support_value(raw: Tensor, value: float | Tensor) -> Tensor:
     if isinstance(value, Tensor):
         return value.to(device=raw.device, dtype=raw.dtype)
     return raw.new_tensor(value)
+
+
+def conditional_transaction_transition(
+    actions: Tensor,
+    current: Tensor,
+    support: PolicySupport,
+) -> Tensor:
+    """Precompute the fixed transaction-cost logits for current/action states."""
+    if actions.ndim != 1:
+        raise ValueError("transaction transition actions must be one-dimensional")
+    if current.ndim != 2:
+        raise ValueError("transaction transition current states must be two-dimensional")
+    action = actions.float().view(1, 1, -1)
+    current_value = current.float()[:, :, None]
+    difference = action - current_value
+    friction = policy_support_value(actions, support.friction).float()
+    temperature = policy_support_value(actions, support.temperature).float()
+    buy_denominator = 1.0 - friction + friction * action
+    sell_denominator = 1.0 - friction * action
+    buy_factor = 1.0 - friction * difference / buy_denominator
+    sell_factor = 1.0 - friction * (-difference) / sell_denominator
+    factor = torch.where(
+        difference > 0,
+        buy_factor,
+        torch.where(difference < 0, sell_factor, torch.ones_like(difference)),
+    )
+    return factor.clamp_min(torch.finfo(torch.float32).tiny).log() / temperature
 
 
 class ExposureMlp(nn.Module):
@@ -317,15 +344,33 @@ def direct_oracle_loss(
     example_time_weights: Tensor,
     example_times_ms: Tensor,
     sampling_interval_ms: int,
+    *,
+    include_diagnostics: bool = True,
+    required_loss_terms: frozenset[str] | None = None,
+    target_row_indices: Tensor | None = None,
+    transaction_transition: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    """Score direct base-action logits through the deterministic fee transform."""
-    if predicted_base_logits.shape != target_base_probabilities.shape \
-            or predicted_base_logits.ndim != 2 \
+    """Train base-action probabilities and score deployment through the fee transform."""
+    if predicted_base_logits.ndim != 2 \
+            or target_base_probabilities.ndim != 2 \
             or predicted_base_logits.shape[1] != actions.numel():
         raise ValueError(
             "direct oracle logits and stored probabilities must match the action grid"
         )
-    if current.ndim != 2 or current.shape[0] != predicted_base_logits.shape[0]:
+    if target_base_probabilities.shape[1] != predicted_base_logits.shape[1]:
+        raise ValueError("stored direct oracle probabilities must match the action grid")
+    if target_row_indices is None \
+            and target_base_probabilities.shape[0] != predicted_base_logits.shape[0]:
+        raise ValueError("unindexed direct oracle targets must match the prediction batch")
+    if target_row_indices is not None and (
+        target_row_indices.ndim != 1
+        or target_row_indices.shape[0] != predicted_base_logits.shape[0]
+    ):
+        raise ValueError("direct oracle target row indices must match the prediction batch")
+    if current.ndim != 2 or current.shape[0] not in (
+        1,
+        predicted_base_logits.shape[0],
+    ):
         raise ValueError("current-exposure states must match the direct oracle batch")
     if example_time_weights.ndim != 1 \
             or example_time_weights.shape[0] != predicted_base_logits.shape[0]:
@@ -336,7 +381,6 @@ def direct_oracle_loss(
     if sampling_interval_ms <= 0:
         raise ValueError("sampling interval must be positive")
 
-    action = actions.float().view(1, 1, -1)
     visible = (
         (actions.float() >= support.visible_lower)
         & (actions.float() <= support.visible_upper)
@@ -359,34 +403,21 @@ def direct_oracle_loss(
         torch.full_like(target_base, minimum),
     )
 
-    current_value = current.float()[:, :, None]
-    difference = action - current_value
-    friction = policy_support_value(predicted_base_logits, support.friction).float()
-    temperature = policy_support_value(
-        predicted_base_logits,
-        support.temperature,
-    ).float()
-    buy_denominator = 1.0 - friction + friction * action
-    sell_denominator = 1.0 - friction * action
-    buy_factor = 1.0 - friction * difference / buy_denominator
-    sell_factor = 1.0 - friction * (-difference) / sell_denominator
-    factor = torch.where(
-        difference > 0,
-        buy_factor,
-        torch.where(difference < 0, sell_factor, torch.ones_like(difference)),
-    )
-    transition = factor.clamp_min(torch.finfo(torch.float32).tiny).log() \
-        / temperature
-    predicted_log = torch.log_softmax(
-        predicted_base_log[:, None, :] + transition,
-        dim=-1,
-    )
-    target_log = torch.log_softmax(
-        target_base_log[:, None, :] + transition,
-        dim=-1,
-    )
-    predicted = predicted_log.exp()
-    target = target_log.exp()
+    required = required_loss_terms
+    need_excess_entropy = include_diagnostics or required is None \
+        or "excess_entropy" in required
+    need_temporal_information = include_diagnostics or required is None \
+        or "temporal_mutual_information" in required
+    need_oracle_information = include_diagnostics or required is None \
+        or "oracle_mutual_information" in required
+    need_conditional_surface = include_diagnostics or need_excess_entropy
+    need_transition = need_conditional_surface
+
+    target_base_for_example = target_base
+    target_base_log_for_example = target_base_log
+    if target_row_indices is not None:
+        target_base_for_example = target_base[target_row_indices]
+        target_base_log_for_example = target_base_log[target_row_indices]
 
     time_weight = example_time_weights.float()
     effective_sample_ratio = (
@@ -399,91 +430,149 @@ def direct_oracle_loss(
     def weighted_mean(value: Tensor) -> Tensor:
         return (value * normalized_weight).sum() / denominator
 
-    cross_entropy_per_example = -(target * predicted_log).sum(
-        dim=-1,
-    ).mean(dim=-1)
-    kl_divergence_per_example = (
-        target * (target_log - predicted_log)
-    ).sum(dim=-1).mean(dim=-1).clamp_min(0)
-    base_kl_divergence_per_example = (
-        target_base
-        * (target_base_log - predicted_base_log)
-    ).sum(dim=-1).clamp_min(0)
-    probability_mse_per_example = surface_probability_mse_per_example(
-        predicted,
-        target,
-    )
-    predicted_entropy = -(predicted * predicted_log).sum(dim=-1).mean(dim=-1)
-    target_entropy = -(target * target_log).sum(dim=-1).mean(dim=-1)
-    excess_entropy_per_example = (
-        (predicted_entropy - target_entropy).clamp_min(0)
-        / math.log(action_count)
-    ).square()
-
-    predicted_state_mean = (predicted * action).sum(dim=-1)
-    predicted_state_second = (predicted * action.square()).sum(dim=-1)
-    target_state_mean = (target * action).sum(dim=-1)
-    target_state_second = (target * action.square()).sum(dim=-1)
-    temporal_mutual_information_reward, temporal_mutual_information, \
-        target_temporal_mutual_information, temporal_example_count = (
-            gaussian_temporal_mutual_information(
-                predicted_state_mean,
-                predicted_state_second,
-                target_state_mean,
-                target_state_second,
-                example_times_ms,
-                normalized_weight,
-                sampling_interval_ms,
-                action_count,
-            )
-        )
-    oracle_mutual_information = gaussian_oracle_mutual_information(
-        predicted_state_mean,
-        predicted_state_second,
-        target_state_mean,
-        target_state_second,
-        example_times_ms,
-        normalized_weight,
-        sampling_interval_ms,
-        action_count,
-    )
-
+    # The network directly represents the base distribution.  Every
+    # fee-conditioned policy is a deterministic, invertible reweighting of
+    # this same vector, so base CE and pMSE have the same unique perfect
+    # solution without repeating the objective for every current exposure.
+    predicted_base = predicted_base_log.exp()
+    cross_entropy_per_example = -(
+        target_base_for_example * predicted_base_log
+    ).sum(dim=-1)
+    probability_mse_per_example = (
+        target_base_for_example - predicted_base
+    ).square().mean(dim=-1)
     cross_entropy = weighted_mean(cross_entropy_per_example)
-    kl_divergence = weighted_mean(kl_divergence_per_example)
-    kl_weight_sum = time_weight.sum()
-    kl_centered_square_sum = (
-        time_weight
-        * (kl_divergence_per_example - kl_divergence).square()
-    ).sum()
     probability_mse = weighted_mean(probability_mse_per_example)
     probability_mse_weight_sum = time_weight.sum()
     probability_mse_centered_square_sum = (
         time_weight
         * (probability_mse_per_example - probability_mse).square()
     ).sum()
-    excess_entropy = weighted_mean(excess_entropy_per_example)
+
+    transition: Tensor | None = None
+    if need_transition:
+        transition = transaction_transition
+        if transition is None:
+            transition = conditional_transaction_transition(
+                actions,
+                current,
+                support,
+            )
+        if transition.ndim != 3 \
+                or transition.shape[0] not in (1, predicted_base_logits.shape[0]) \
+                or transition.shape[1] != current.shape[1] \
+                or transition.shape[2] != actions.numel():
+            raise ValueError("precomputed transaction transition has an invalid shape")
+        if target_row_indices is not None and transition.shape[0] != 1:
+            raise ValueError(
+                "indexed direct targets require a batch-invariant transaction transition"
+            )
+
+    predicted_log: Tensor | None = None
+    predicted: Tensor | None = None
+    target_log: Tensor | None = None
+    target: Tensor | None = None
+    predicted_entropy: Tensor | None = None
+    target_entropy: Tensor | None = None
+    if need_conditional_surface:
+        assert transition is not None
+        predicted_log = torch.log_softmax(
+            predicted_base_log[:, None, :] + transition,
+            dim=-1,
+        )
+        predicted = predicted_log.exp()
+        compact_target_log = torch.log_softmax(
+            target_base_log[:, None, :] + transition,
+            dim=-1,
+        )
+        compact_target = compact_target_log.exp()
+        if target_row_indices is not None:
+            target_log = compact_target_log[target_row_indices]
+            target = compact_target[target_row_indices]
+        else:
+            target_log = compact_target_log
+            target = compact_target
+        predicted_entropy = -(predicted * predicted_log).sum(dim=-1).mean(dim=-1)
+        target_entropy = -(target * target_log).sum(dim=-1).mean(dim=-1)
+
+    if need_excess_entropy:
+        assert predicted_entropy is not None and target_entropy is not None
+        excess_entropy_per_example = (
+            (predicted_entropy - target_entropy).clamp_min(0)
+            / math.log(action_count)
+        ).square()
+        excess_entropy = weighted_mean(excess_entropy_per_example)
+
+    target_state_mean: Tensor | None = None
+    target_state_second: Tensor | None = None
+    if need_temporal_information or need_oracle_information:
+        # MI measures the base action distribution the network actually emits.
+        # Fees deterministically condition that distribution at deployment, so
+        # repeating MI for every current exposure only reweights the same
+        # learned factor and can make its probability-domain partition unstable.
+        base_action = actions.float().view(1, -1)
+        predicted_state_mean = (
+            predicted_base * base_action
+        ).sum(dim=-1, keepdim=True)
+        predicted_state_second = (
+            predicted_base * base_action.square()
+        ).sum(dim=-1, keepdim=True)
+        target_state_mean = (
+            target_base_for_example * base_action
+        ).sum(dim=-1, keepdim=True)
+        target_state_second = (
+            target_base_for_example * base_action.square()
+        ).sum(dim=-1, keepdim=True)
+    if need_temporal_information:
+        assert target_state_mean is not None and target_state_second is not None
+        temporal_mutual_information_reward, temporal_mutual_information, \
+            target_temporal_mutual_information, temporal_example_count = (
+                gaussian_temporal_mutual_information(
+                    predicted_state_mean,
+                    predicted_state_second,
+                    target_state_mean,
+                    target_state_second,
+                    example_times_ms,
+                    normalized_weight,
+                    sampling_interval_ms,
+                    action_count,
+                )
+            )
+    else:
+        contiguous = (
+            (example_times_ms[1:] - example_times_ms[:-1])
+            == sampling_interval_ms
+        ).all().to(probability_mse.dtype)
+        temporal_example_count = probability_mse.new_tensor(
+            predicted_base_logits.shape[0]
+        ) * contiguous
+    if need_oracle_information:
+        assert target_state_mean is not None and target_state_second is not None
+        oracle_mutual_information = gaussian_oracle_mutual_information(
+            predicted_state_mean,
+            predicted_state_second,
+            target_state_mean,
+            target_state_second,
+            example_times_ms,
+            normalized_weight,
+            sampling_interval_ms,
+            action_count,
+        )
+
     loss = (
         weights.cross_entropy * cross_entropy
         + weights.probability_mse * probability_mse
-        + weights.excess_entropy * excess_entropy
-        - weights.temporal_mutual_information
-        * temporal_mutual_information_reward
-        - weights.oracle_mutual_information * oracle_mutual_information
     )
-    return {
+    if need_excess_entropy:
+        loss = loss + weights.excess_entropy * excess_entropy
+    if need_temporal_information:
+        loss = loss - weights.temporal_mutual_information \
+            * temporal_mutual_information_reward
+    if need_oracle_information:
+        loss = loss - weights.oracle_mutual_information * oracle_mutual_information
+
+    result = {
         "loss": loss,
-        "klDivergence": kl_divergence,
-        "klDivergenceVariance": (
-            kl_centered_square_sum / kl_weight_sum.clamp_min(1e-8)
-        ).clamp_min(0),
-        "klDivergenceStdDev": (
-            kl_centered_square_sum / kl_weight_sum.clamp_min(1e-8)
-        ).clamp_min(0).sqrt(),
-        "klWeightSum": kl_weight_sum,
-        "klCenteredSquareSum": kl_centered_square_sum,
-        "baseKlDivergence": weighted_mean(
-            base_kl_divergence_per_example
-        ),
         "probabilityMse": probability_mse,
         "probabilityMseVariance": (
             probability_mse_centered_square_sum
@@ -496,21 +585,58 @@ def direct_oracle_loss(
         "probabilityMseWeightSum": probability_mse_weight_sum,
         "probabilityMseCenteredSquareSum":
             probability_mse_centered_square_sum,
-        "excessEntropy": excess_entropy,
-        "temporalMutualInformation": temporal_mutual_information,
-        "targetTemporalMutualInformation":
-            target_temporal_mutual_information,
-        "temporalMutualInformationReward":
-            temporal_mutual_information_reward,
         "temporalExampleCount": temporal_example_count,
-        "oracleMutualInformation": oracle_mutual_information,
-        "targetEntropy": weighted_mean(target_entropy),
-        "predictedEntropy": weighted_mean(predicted_entropy),
         "distanceImbalanceWeight": time_weight.mean(),
         "timeWeightEffectiveSampleRatio": effective_sample_ratio,
         "timeWeightSum": time_weight.sum(),
         "timeWeightSquareSum": time_weight.square().sum(),
     }
+    if need_excess_entropy:
+        result["excessEntropy"] = excess_entropy
+    if need_temporal_information:
+        result.update({
+            "temporalMutualInformation": temporal_mutual_information,
+            "targetTemporalMutualInformation":
+                target_temporal_mutual_information,
+            "temporalMutualInformationReward":
+                temporal_mutual_information_reward,
+        })
+    if need_oracle_information:
+        result["oracleMutualInformation"] = oracle_mutual_information
+    if include_diagnostics:
+        assert predicted is not None and predicted_log is not None \
+            and target is not None and target_log is not None \
+            and predicted_entropy is not None and target_entropy is not None
+        kl_divergence_per_example = (
+            target * (target_log - predicted_log)
+        ).sum(dim=-1).mean(dim=-1).clamp_min(0)
+        base_kl_divergence_per_example = (
+            target_base_for_example
+            * (target_base_log_for_example - predicted_base_log)
+        ).sum(dim=-1).clamp_min(0)
+        kl_divergence = weighted_mean(kl_divergence_per_example)
+        kl_weight_sum = time_weight.sum()
+        kl_centered_square_sum = (
+            time_weight
+            * (kl_divergence_per_example - kl_divergence).square()
+        ).sum()
+        result.update({
+            "klDivergence": kl_divergence,
+            "klDivergenceVariance": (
+                kl_centered_square_sum / kl_weight_sum.clamp_min(1e-8)
+            ).clamp_min(0),
+            "klDivergenceStdDev": (
+                kl_centered_square_sum / kl_weight_sum.clamp_min(1e-8)
+            ).clamp_min(0).sqrt(),
+            "klWeightSum": kl_weight_sum,
+            "klCenteredSquareSum": kl_centered_square_sum,
+            "baseKlDivergence": weighted_mean(
+                base_kl_divergence_per_example
+            ),
+            "targetEntropy": weighted_mean(target_entropy),
+            "predictedEntropy": weighted_mean(predicted_entropy),
+        })
+    return result
 
 
 def fitted_teacher_loss(

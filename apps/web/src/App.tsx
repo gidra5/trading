@@ -73,7 +73,7 @@ import type {
   RuntimeSnapshot,
 } from "./types";
 
-const apiBase = "/backend";
+const apiBase = import.meta.env.DEV ? "/backend" : "";
 const wsUrl = websocketUrl(apiBase, "/ws");
 const SOCKET_SNAPSHOT_APPLY_MS = 500;
 const RELATIVE_RATE_TO_BPS_HOUR = 36_000_000;

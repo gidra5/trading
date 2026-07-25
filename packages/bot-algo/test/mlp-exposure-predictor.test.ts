@@ -11,7 +11,7 @@ import {
 } from "../src/mlp-exposure-predictor.js";
 
 test("MLP feature schema has the documented shape", () => {
-  assert.equal(MLP_FEATURE_SCHEMA_VERSION, 5);
+  assert.equal(MLP_FEATURE_SCHEMA_VERSION, 6);
   assert.equal(MLP_INPUT_FEATURE_COUNT, 901);
   assert.equal(MLP_OUTPUT_ACTION_COUNT, 255);
 });
@@ -60,7 +60,7 @@ test("MLP manifest validation rejects architecture drift", () => {
     id: "test",
     label: "Test",
     createdAt: new Date(0).toISOString(),
-    featureSchemaVersion: 5,
+    featureSchemaVersion: 6,
     inputFeatureCount: 901,
     outputRepresentation: "base-action-logits" as const,
     outputActionCount: 255,
@@ -74,7 +74,7 @@ test("MLP manifest validation rejects architecture drift", () => {
   assert.throws(() => validateMlpModelManifest({ ...manifest, outputActionCount: 127 }));
   assert.throws(() => validateMlpModelManifest({
     ...manifest,
-    featureSchemaVersion: 4,
+    featureSchemaVersion: 5,
     inputFeatureCount: 909,
   }));
   assert.throws(() => validateMlpModelManifest({ ...manifest, inputFeatureCount: 909 }));

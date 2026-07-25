@@ -1,12 +1,13 @@
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
+import AdmZip from "adm-zip";
 import type { Candle } from "@trading/bot-algo";
 
 const DAY_MS = 86_400_000;
@@ -84,16 +85,16 @@ async function extractDailyShard(options: {
   day: number;
   date: string;
 }): Promise<void> {
-  const unzip = spawn("unzip", ["-p", options.archive], { stdio: ["ignore", "pipe", "pipe"] });
-  const exited = new Promise<number | null>((resolve, reject) => {
-    unzip.once("error", reject);
-    unzip.once("close", resolve);
+  const entries = new AdmZip(options.archive)
+    .getEntries()
+    .filter((entry) => !entry.isDirectory);
+  if (entries.length !== 1) {
+    throw new Error(`${options.date}: expected one file in the Binance archive`);
+  }
+  const lines = readline.createInterface({
+    input: Readable.from([entries[0]!.getData()]),
+    crlfDelay: Infinity,
   });
-  let stderr = "";
-  unzip.stderr.setEncoding("utf8");
-  unzip.stderr.on("data", (chunk: string) => stderr += chunk);
-
-  const lines = readline.createInterface({ input: unzip.stdout, crlfDelay: Infinity });
   const gzip = createGzip({ level: 6 });
   const outputDone = pipeline(gzip, createWriteStream(options.temporary));
   let count = 0;
@@ -123,15 +124,9 @@ async function extractDailyShard(options: {
       throw new Error(`${options.date}: Binance archive does not cover the complete UTC day`);
     }
   } catch (error) {
-    unzip.kill();
     gzip.destroy();
-    await Promise.allSettled([exited, outputDone]);
+    await Promise.allSettled([outputDone]);
     throw error;
-  }
-
-  const exitCode = await exited;
-  if (exitCode !== 0) {
-    throw new Error(`unzip failed (${exitCode}): ${stderr.trim() || "no diagnostic output"}`);
   }
 }
 

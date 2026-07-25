@@ -8,13 +8,14 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const planArgument = argument("plan") ?? "ml/training-plan.json";
 const trainingOnly = process.argv.includes("--training-only");
 const datasetOnly = process.argv.includes("--dataset-only");
+const verificationOnly = process.argv.includes("--verification-only");
 const frozenStudyOnly = process.argv.includes("--frozen-study-only");
 const productionMinuteOnly = process.argv.includes("--production-minute");
 const derivedTrainingOnly = frozenStudyOnly || productionMinuteOnly;
-if ([trainingOnly, datasetOnly, frozenStudyOnly, productionMinuteOnly]
+if ([trainingOnly, datasetOnly, verificationOnly, frozenStudyOnly, productionMinuteOnly]
   .filter(Boolean).length > 1) {
   throw new Error(
-    "Choose only one of --training-only, --dataset-only, "
+    "Choose only one of --training-only, --dataset-only, --verification-only, "
     + "--frozen-study-only, or --production-minute.",
   );
 }
@@ -37,7 +38,20 @@ let trainingArtifactDir = artifactDir;
 const statusFile = path.join(runDir, "status.json");
 const logFile = path.join(runDir, "training.log");
 const finalizeFile = path.join(runDir, "FINALIZE");
+const runtimeRoot = path.join(repoRoot, "data", "runtime-cache");
+const temporaryDirectory = path.join(runtimeRoot, "tmp");
+const tritonCacheDirectory = path.join(runtimeRoot, "triton");
+const torchInductorCacheDirectory = path.join(runtimeRoot, "torchinductor");
+const cudaCacheDirectory = path.join(runtimeRoot, "cuda");
 fs.mkdirSync(runDir, { recursive: true });
+for (const directory of [
+  temporaryDirectory,
+  tritonCacheDirectory,
+  torchInductorCacheDirectory,
+  cudaCacheDirectory,
+]) {
+  fs.mkdirSync(directory, { recursive: true });
+}
 
 const previous = readJson(statusFile);
 if (previous?.pid && processIsAlive(previous.pid)
@@ -72,6 +86,21 @@ try {
     path.join(repoRoot, "node_modules/typescript/bin/tsc"),
     "-p", path.join(repoRoot, "packages/bot-algo/tsconfig.json"),
   ]);
+  if (verificationOnly) {
+    await runStage("verification", process.execPath, [
+      path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
+      path.join(repoRoot, "scripts/verify-mlp-model.mjs"),
+      artifactDir,
+    ]);
+    status = {
+      ...status,
+      stage: "complete",
+      completedAt: new Date().toISOString(),
+      message: "Verified model artifact is available to the backend and UI.",
+    };
+    writeStatus();
+    process.exit(0);
+  }
   if (!trainingOnly) {
     await runStage("cuda-build", process.execPath, [
       path.join(repoRoot, "scripts/build-vw-kama-cuda.mjs"),
@@ -155,7 +184,11 @@ try {
     process.exit(0);
   }
   const training = trainingPlan.training;
-  const python = path.join(repoRoot, ".venv-ml/bin/python");
+  const python = path.join(
+    repoRoot,
+    ".venv-ml",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+  );
   if (!fs.existsSync(python)) {
     throw new Error("ML environment is missing. Run `npm run mlp:bootstrap` first.");
   }
@@ -248,7 +281,18 @@ async function runStage(stage, command, args) {
   appendLog(`\n[${new Date().toISOString()}] ${stage}: ${command} ${args.join(" ")}\n`);
   const child = spawn(command, args, {
     cwd: repoRoot,
-    env: { ...process.env, TMPDIR: "/tmp" },
+    env: {
+      ...process.env,
+      PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+      PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
+      TMPDIR: process.env.TRADING_ML_TMP_DIR || temporaryDirectory,
+      TEMP: process.env.TRADING_ML_TMP_DIR || temporaryDirectory,
+      TMP: process.env.TRADING_ML_TMP_DIR || temporaryDirectory,
+      TRITON_CACHE_DIR: process.env.TRITON_CACHE_DIR || tritonCacheDirectory,
+      TORCHINDUCTOR_CACHE_DIR:
+        process.env.TORCHINDUCTOR_CACHE_DIR || torchInductorCacheDirectory,
+      CUDA_CACHE_PATH: process.env.CUDA_CACHE_PATH || cudaCacheDirectory,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   activeChild = child;

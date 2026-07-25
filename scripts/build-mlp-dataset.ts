@@ -5,17 +5,18 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import {
   constants as zlibConstants,
   gunzipSync,
   zstdCompressSync,
+  zstdDecompressSync,
 } from "node:zlib";
 import {
   conditionalCutoffRawParameters,
   exposureHoldingFeasibleInterval,
   MLP_FEATURE_SCHEMA_VERSION,
   MLP_INPUT_FEATURE_COUNT,
-  prepareExposureValueOracle,
   prepareExposureValueOracleCuda,
   type Candle,
 } from "@trading/bot-algo";
@@ -25,6 +26,7 @@ import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
 const SECOND_MS = 1_000;
+const RAW_ORACLE_SCHEMA_VERSION = 3;
 const TEACHER_PARAMETER_COUNT = 8;
 const TEACHER_METRIC_NAMES = [
   "crossEntropy",
@@ -76,7 +78,7 @@ interface TrainingPlan {
   artifactDir: string;
   runDir: string;
   componentSeedDatasetDirs?: string[];
-  oraclePreparation: { backend: "cuda" };
+  oraclePreparation: { backend: "cuda"; pipelineDepth?: 1 | 2 | 3 | 4 };
   samplingIntervalMs: number;
   predictionDelayMs: number;
   splitAnchorDate?: string;
@@ -100,6 +102,8 @@ interface TrainingPlan {
   };
   componentCompression?: {
     features?: "zstd";
+    rawOracleProbabilities?: "zstd";
+    minuteOracleProbabilities?: "zstd";
   };
   featurePreparationWorkers?: number;
   runtimeMinuteOracleTargets?: boolean;
@@ -233,6 +237,9 @@ interface OracleComponent {
   teacherParameters: string;
   teacherMetrics: string;
   rawOracleProbabilities: string;
+  rawOracleProbabilitiesCompression?: "zstd";
+  rawOracleProbabilitiesUncompressedBytes?: number;
+  rawOracleSchemaVersion?: number;
   times: string;
   rejectedCount?: number;
   refinementPass?: number;
@@ -333,6 +340,106 @@ interface GpuTeacherProgress {
   temporalMeanNormalizedStepAfter: number;
   pipelinedRefinement: boolean;
   pipelineWaitFraction: number;
+}
+
+type PreparedExposureValueOracle = Awaited<
+  ReturnType<typeof prepareExposureValueOracleCuda>
+> & {
+  workerWallMs?: number;
+  directDiagnostics?: {
+    cutoffLowers: Float64Array;
+    cutoffUppers: Float64Array;
+    entropies: Float32Array;
+    distanceImbalances: Float32Array;
+    kernelMs: number;
+    cutoffKernelMs: number;
+    wallMs: number;
+  };
+};
+
+interface DirectOracleWorkerDiagnostics {
+  exampleCount: number;
+  visibleLower: number;
+  visibleUpper: number;
+  distanceEpsilon: number;
+}
+
+interface PrefetchedOracleDay {
+  day: number;
+  source: Candle[];
+  oraclePrices: Float64Array;
+  reuseOracleFactor: boolean;
+  prepared: Promise<PreparedExposureValueOracle | undefined>;
+}
+
+class ExposureValueOracleWorker {
+  private readonly worker: Worker;
+  private readonly pending = new Map<number, {
+    id: number;
+    resolve: (value: PreparedExposureValueOracle) => void;
+    reject: (error: Error) => void;
+  }>();
+  private sequence = 0;
+  private closing = false;
+
+  constructor(repoRoot: string) {
+    this.worker = new Worker(
+      path.join(repoRoot, "scripts", "exposure-value-oracle-worker.mjs"),
+    );
+    this.worker.on("message", (message: {
+      type?: string;
+      id?: number;
+      prepared?: PreparedExposureValueOracle;
+      workerWallMs?: number;
+      message?: string;
+    }) => {
+      if (message.id === undefined) return;
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      this.pending.delete(message.id);
+      if (message.type === "complete" && message.prepared) {
+        pending.resolve({
+          ...message.prepared,
+          workerWallMs: message.workerWallMs,
+        });
+      } else {
+        pending.reject(new Error(
+          message.message ?? "Exposure-value oracle worker failed.",
+        ));
+      }
+    });
+    this.worker.on("error", (error) => {
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+    });
+    this.worker.on("exit", (code) => {
+      if (this.closing || code === 0) return;
+      const error = new Error(`Exposure-value oracle worker exited with code ${code}.`);
+      for (const pending of this.pending.values()) pending.reject(error);
+      this.pending.clear();
+    });
+  }
+
+  prepare(
+    prices: Float64Array,
+    options: Parameters<typeof prepareExposureValueOracleCuda>[1],
+    directDiagnostics?: DirectOracleWorkerDiagnostics,
+  ): Promise<PreparedExposureValueOracle> {
+    const id = this.sequence += 1;
+    const result = new Promise<PreparedExposureValueOracle>((resolve, reject) => {
+      this.pending.set(id, { id, resolve, reject });
+    });
+    this.worker.postMessage({ type: "prepare", id, prices, options, directDiagnostics });
+    return result;
+  }
+
+  async close(): Promise<void> {
+    this.closing = true;
+    const error = new Error("Exposure-value oracle worker closed.");
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    await this.worker.terminate();
+  }
 }
 
 async function main(): Promise<void> {
@@ -507,9 +614,146 @@ async function main(): Promise<void> {
   const featureStore = new MlpFeatureStore(dataDir);
   let teacherFitter: GpuTeacherFitter | undefined;
   let prefetchedSource: { day: number; promise: Promise<Candle[]> } | undefined;
+  const prefetchedOracleDays = new Map<number, PrefetchedOracleDay>();
   let expectedGrid: number[] | undefined = progress.grid ?? existingDataset?.grid;
   let expectedCurrentGrid: number[] | undefined = progress.currentGrid
     ?? existingDataset?.currentGrid;
+  const oraclePipelineDepth = plan.oraclePreparation.pipelineDepth ?? 1;
+  const oracleWorker = oraclePipelineDepth > 1
+    ? new ExposureValueOracleWorker(repoRoot)
+    : undefined;
+  const feeRate = plan.execution.feeBps / 10_000;
+  const oracleOptions = (
+    scoredCandleCount: number,
+  ): Parameters<typeof prepareExposureValueOracleCuda>[1] => ({
+    scoreStartIndex: 0,
+    holdingPeriodSteps: plan.execution.holdingPeriodSteps,
+    valueHorizonSteps: plan.execution.valueHorizonSteps,
+    friction: feeRate,
+    gridSize: plan.execution.gridSize,
+    // The direct target keeps the complete effective range so survival
+    // cutoffs remain identifiable outside usable leverage.
+    minExposure: plan.execution.minimumEffectiveExposure,
+    maxExposure: plan.execution.maximumEffectiveExposure,
+    maxEffectiveExposure: Math.max(
+      Math.abs(plan.execution.minimumEffectiveExposure),
+      Math.abs(plan.execution.maximumEffectiveExposure),
+    ),
+    // Values may use the future horizon, while the realized path stops at the
+    // scored UTC-day boundary.
+    terminalIndex: scoredCandleCount - 1,
+    temperature: plan.execution.temperature,
+    opportunityEpsilon: 0,
+    quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
+    quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
+    assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
+    includeActionValues: false,
+    includeProbabilities: true,
+    includePath: false,
+    distributionOnly: true,
+  });
+  const launchOracle = (
+    prices: Float64Array,
+    scoredCandleCount: number,
+  ): Promise<PreparedExposureValueOracle> => oracleWorker
+    ? oracleWorker.prepare(
+        prices,
+        oracleOptions(scoredCandleCount),
+        directDiagnostics
+          ? {
+              exampleCount: scoredCandleCount,
+              visibleLower: plan.execution.minimumUsableExposure,
+              visibleUpper: plan.execution.maximumUsableExposure,
+              distanceEpsilon: plan.training.timeWeighting.distanceEpsilon,
+            }
+          : undefined,
+      )
+    : prepareExposureValueOracleCuda(prices, oracleOptions(scoredCandleCount));
+
+  const schedulePrefetchedOracleDay = async (dayIndex: number): Promise<void> => {
+    if (!oracleWorker) return;
+    const day = selectedDays[dayIndex];
+    if (day === undefined || prefetchedOracleDays.has(day)) return;
+    let source: Candle[];
+    try {
+      const oracleEnd = day + DAY_MS
+        + plan.execution.valueHorizonSteps * SECOND_MS;
+      source = prefetchedSource?.day === day
+        ? await prefetchedSource.promise
+        : await oneSecondStore.loadRange(day - DAY_MS, oracleEnd);
+    } catch {
+      // The normal loop records a durable source rejection with split context.
+      return;
+    }
+    const date = isoDate(day);
+    const scored = source.filter((candle) =>
+      candle.openTime >= day && candle.openTime < day + DAY_MS);
+    const oracleEnd = day + DAY_MS + plan.execution.valueHorizonSteps * SECOND_MS;
+    const oracleCandles = source.filter((candle) =>
+      candle.openTime >= day && candle.openTime < oracleEnd);
+    if (inspectScoredDay(scored, day, date, [])
+      || inspectContinuousSourceRange(
+        oracleCandles,
+        day,
+        DAY_MS / SECOND_MS + plan.execution.valueHorizonSteps,
+        date,
+        [],
+        "pipelined scored day plus future value horizon",
+      )) {
+      return;
+    }
+    const requiredOracleSignature = rowSelectionSignature(
+      oracleRowsByDay.get(date) ?? [],
+    );
+    const existingComponent = progress.oracleComponents.find(
+      (item) => item.date === date,
+    );
+    const reuseOracleFactor = Boolean(existingComponent)
+      && expectedGrid && expectedCurrentGrid
+      && existingComponent?.rawOracleProbabilitiesCompression
+        === plan.componentCompression?.rawOracleProbabilities
+      && await rawOracleFactorComplete(
+        output,
+        existingComponent,
+        expectedGrid.length,
+        requiredOracleSignature,
+      );
+    const oraclePrices = Float64Array.from(
+      oracleCandles,
+      (candle) => candle.close,
+    );
+    const prepared = reuseOracleFactor
+      ? Promise.resolve(undefined)
+      : launchOracle(oraclePrices, scored.length);
+    prepared.catch(() => undefined);
+    prefetchedOracleDays.set(day, {
+      day,
+      source,
+      oraclePrices,
+      reuseOracleFactor: Boolean(reuseOracleFactor),
+      prepared,
+    });
+    if (prefetchedSource?.day === day) prefetchedSource = undefined;
+    process.stdout.write(`${JSON.stringify({
+      event: "dataset-oracle-prefetch",
+      date,
+      day: dayIndex + 1,
+      days: selectedDays.length,
+      pipelineDepth: oraclePipelineDepth,
+      backend: reuseOracleFactor ? "stored-raw-grid" : "cuda-worker",
+    })}\n`);
+  };
+  const fillOraclePipeline = async (firstDayIndex: number): Promise<void> => {
+    if (!oracleWorker) return;
+    for (
+      let dayIndex = firstDayIndex;
+      dayIndex < selectedDays.length
+        && dayIndex < firstDayIndex + oraclePipelineDepth - 1;
+      dayIndex += 1
+    ) {
+      await schedulePrefetchedOracleDay(dayIndex);
+    }
+  };
 
   process.stdout.write(`${JSON.stringify({
     event: "dataset-start",
@@ -527,6 +771,7 @@ async function main(): Promise<void> {
     completedOracleComponents: progress.oracleComponents.length,
     teacherBackend: plan.teacherFit.backend,
     oracleBackend: plan.oraclePreparation.backend,
+    oraclePipelineDepth,
     teacherBatchSize: plan.teacherFit.batchSize,
     refinementPass,
     latestTestRange: [new Date(testStart).toISOString(), new Date(testEnd).toISOString()],
@@ -570,14 +815,21 @@ async function main(): Promise<void> {
         && (existingComponent?.refinementPass ?? 0) < refinementPass;
       const fitOracleRows = refitForQuality ? requiredOracleRows : missingOracleRows;
       const shouldBuild = fitOracleRows.length > 0;
-      if (!shouldBuild) continue;
+      if (!shouldBuild) {
+        prefetchedOracleDays.delete(day);
+        continue;
+      }
 
       let source: Candle[];
+      const pipelinedOracle = prefetchedOracleDays.get(day);
       const oracleEnd = day + DAY_MS + plan.execution.valueHorizonSteps * SECOND_MS;
       try {
-        const sourcePromise = prefetchedSource?.day === day
-          ? prefetchedSource.promise
-          : oneSecondStore.loadRange(day - DAY_MS, oracleEnd);
+        const sourcePromise = pipelinedOracle
+          ? Promise.resolve(pipelinedOracle.source)
+          : prefetchedSource?.day === day
+            ? prefetchedSource.promise
+            : oneSecondStore.loadRange(day - DAY_MS, oracleEnd);
+        if (pipelinedOracle) prefetchedOracleDays.delete(day);
         prefetchedSource = undefined;
         source = await sourcePromise;
         const nextDay = selectedDays[dayIndex + 1];
@@ -642,48 +894,30 @@ async function main(): Promise<void> {
         );
         continue;
       }
-      const feeRate = plan.execution.feeBps / 10_000;
       const oracleStarted = performance.now();
-      const oraclePrices = Float64Array.from(oracleCandles, (candle) => candle.close);
-      const reuseOracleFactor = Boolean(existingComponent)
-        && expectedGrid && expectedCurrentGrid
-        && await rawOracleFactorComplete(
-          output, existingComponent, expectedGrid.length, requiredOracleSignature,
-        );
-      const preparedOracle = reuseOracleFactor ? undefined : await prepareExposureValueOracleCuda(
-        oraclePrices, {
-          scoreStartIndex: 0,
-          holdingPeriodSteps: plan.execution.holdingPeriodSteps,
-          valueHorizonSteps: plan.execution.valueHorizonSteps,
-          friction: feeRate,
-          gridSize: plan.execution.gridSize,
-          // The teacher sees the complete effective range so survival cutoffs
-          // remain identifiable even when they sit outside usable leverage.
-          minExposure: plan.execution.minimumEffectiveExposure,
-          maxExposure: plan.execution.maximumEffectiveExposure,
-          maxEffectiveExposure: Math.max(
-            Math.abs(plan.execution.minimumEffectiveExposure),
-            Math.abs(plan.execution.maximumEffectiveExposure),
-          ),
-          // The realized path stops at the shard boundary, but rolling value
-          // targets use oraclePrices through t + valueHorizonSteps.
-          terminalIndex: scored.length - 1,
-          temperature: plan.execution.temperature,
-          opportunityEpsilon: 0,
-          quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
-          quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
-          assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
-          includeActionValues: false,
-          includeProbabilities: true,
-        },
+      const oraclePrices = pipelinedOracle?.oraclePrices
+        ?? Float64Array.from(oracleCandles, (candle) => candle.close);
+      const reuseOracleFactor = pipelinedOracle?.reuseOracleFactor ?? (
+        Boolean(existingComponent)
+          && expectedGrid && expectedCurrentGrid
+          && existingComponent?.rawOracleProbabilitiesCompression
+            === plan.componentCompression?.rawOracleProbabilities
+          && await rawOracleFactorComplete(
+            output, existingComponent, expectedGrid.length, requiredOracleSignature,
+          )
       );
+      const preparedOracle = reuseOracleFactor
+        ? undefined
+        : await (pipelinedOracle?.prepared
+          ?? launchOracle(oraclePrices, scored.length));
       const oracle = preparedOracle?.oracle ?? {
         grid: Float64Array.from(expectedGrid!),
         currentGrid: Float64Array.from(expectedCurrentGrid!),
-        probabilities: bufferFloat32(await fs.readFile(path.join(
-          output,
-          existingComponent!.rawOracleProbabilities,
-        ))),
+        probabilities: await readFloat32Component(
+          path.join(output, existingComponent!.rawOracleProbabilities),
+          existingComponent!.count * expectedGrid!.length
+            * Float32Array.BYTES_PER_ELEMENT,
+        ),
       };
       process.stdout.write(`${JSON.stringify({
         event: "dataset-oracle",
@@ -692,7 +926,9 @@ async function main(): Promise<void> {
         days: selectedDays.length,
         backend: reuseOracleFactor ? "stored-raw-grid" : "cuda",
         kernelMs: preparedOracle?.kernelMs ?? 0,
-        wallMs: performance.now() - oracleStarted,
+        wallMs: preparedOracle?.workerWallMs ?? performance.now() - oracleStarted,
+        pipelineWaitMs: performance.now() - oracleStarted,
+        pipelined: Boolean(pipelinedOracle),
         candles: oracleCandles.length,
         scoredCandles: scored.length,
         futureCandles: plan.execution.valueHorizonSteps,
@@ -705,6 +941,16 @@ async function main(): Promise<void> {
       assertSameGrid(expectedCurrentGrid, oracle.currentGrid, "current-exposure");
       progress.grid = expectedGrid;
       progress.currentGrid = expectedCurrentGrid;
+      const minuteOracleComponent = plan.runtimeMinuteOracleTargets
+        ? undefined
+        : await persistMinuteOracleDay(
+            output,
+            plan,
+            source,
+            day,
+            date,
+            oracle.grid,
+          );
       teacherFitter ??= new GpuTeacherFitter(repoRoot, {
         actionGrid: expectedGrid,
         currentGrid: expectedCurrentGrid,
@@ -758,75 +1004,107 @@ async function main(): Promise<void> {
         const features = buildSameDayFeature
           ? await featureStore.prepare(source, times)
           : undefined;
-        const cutoffIntervals = rows.map(({ candleIndex }) => exposureHoldingFeasibleInterval(
-          oraclePrices,
-          candleIndex,
-          plan.execution.holdingPeriodSteps,
-          {
-            friction: feeRate,
-            minExposure: plan.execution.minimumUsableExposure,
-            maxExposure: plan.execution.maximumUsableExposure,
-            maxEffectiveExposure: Math.max(
-              Math.abs(plan.execution.minimumEffectiveExposure),
-              Math.abs(plan.execution.maximumEffectiveExposure),
-            ),
-            quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
-            quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
-            assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
-          },
-        ));
-        const teacherInputs = packTeacherInputs(
-          oracle.probabilities,
-          oracle.grid,
-          rows.map(({ candleIndex }) => candleIndex),
-          cutoffIntervals,
-          {
-            latentLower: plan.execution.minimumEffectiveExposure,
-            latentUpper: plan.execution.maximumEffectiveExposure,
-          },
-          plan.teacherFit.inputAlignmentFloats,
-        );
+        await fillOraclePipeline(dayIndex + 1);
+        const fusedDirectDiagnostics = preparedOracle?.directDiagnostics;
+        const cutoffIntervals = fusedDirectDiagnostics
+          ? rows.map(({ candleIndex }) => ({
+              lower: fusedDirectDiagnostics.cutoffLowers[candleIndex]!,
+              upper: fusedDirectDiagnostics.cutoffUppers[candleIndex]!,
+            }))
+          : rows.map(({ candleIndex }) => exposureHoldingFeasibleInterval(
+              oraclePrices,
+              candleIndex,
+              plan.execution.holdingPeriodSteps,
+              {
+                friction: feeRate,
+                minExposure: plan.execution.minimumUsableExposure,
+                maxExposure: plan.execution.maximumUsableExposure,
+                maxEffectiveExposure: Math.max(
+                  Math.abs(plan.execution.minimumEffectiveExposure),
+                  Math.abs(plan.execution.maximumEffectiveExposure),
+                ),
+                quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
+                quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
+                assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
+              },
+            ));
+        const teacherInputs = fusedDirectDiagnostics
+          ? undefined
+          : packTeacherInputs(
+              oracle.probabilities,
+              oracle.grid,
+              rows.map(({ candleIndex }) => candleIndex),
+              cutoffIntervals,
+              {
+                latentLower: plan.execution.minimumEffectiveExposure,
+                latentUpper: plan.execution.maximumEffectiveExposure,
+              },
+              plan.teacherFit.inputAlignmentFloats,
+            );
         let encodedFeatureRows: Buffer | undefined;
         let featureEncodingMs = 0;
-        const teacherStarted = performance.now();
-        const fittedTeacher = await teacherFitter.fit(teacherInputs, (event) => {
-          const done = event.examplesCompleted;
-          if (done === 1 || done % plan.teacherFit.batchSize === 0 || done === rows.length) {
-            process.stdout.write(`${JSON.stringify({
-              event: "dataset-progress",
-              date,
-              component: "oracle",
-              examplesCompleted: done,
-              examplesTotal: rows.length,
-              day: dayIndex + 1,
-              days: selectedDays.length,
-              examplesPerSecond: event.examplesPerSecond,
-              gpuMemoryMiB: event.gpuMemoryMiB,
-              meanKlDivergence: event.meanKlDivergence,
-              meanSquaredError: event.meanSquaredError,
-              metricVisibleLower: event.metricVisibleLower,
-              metricVisibleUpper: event.metricVisibleUpper,
-              metricActionCells: event.metricActionCells,
-              metricCurrentCells: event.metricCurrentCells,
-              temporalWarmSelectedFraction: event.temporalWarmSelectedFraction,
-              temporalWarmEquivalentFraction: event.temporalWarmEquivalentFraction,
-              temporalWarmQualityAcceptedFraction: event.temporalWarmQualityAcceptedFraction,
-              temporalWarmQualityBetterFraction: event.temporalWarmQualityBetterFraction,
-              temporalMeanNormalizedStepBefore: event.temporalMeanNormalizedStepBefore,
-              temporalMeanNormalizedStepAfter: event.temporalMeanNormalizedStepAfter,
-              pipelinedRefinement: event.pipelinedRefinement,
-              pipelineWaitFraction: event.pipelineWaitFraction,
-            })}\n`);
-          }
-        }, features ? () => {
+        if (features) {
           const started = performance.now();
           encodedFeatureRows = encodeFeatureRows(times, features);
           featureEncodingMs = performance.now() - started;
-        } : undefined);
-        if (features && !encodedFeatureRows) {
-          throw new Error("MLP feature encoding did not run with the CUDA fit.");
         }
+        const teacherStarted = performance.now();
+        const fittedTeacher = fusedDirectDiagnostics
+          ? directDiagnosticTeacherResults(
+              rows.map(({ candleIndex }) => candleIndex),
+              cutoffIntervals,
+              fusedDirectDiagnostics,
+              {
+                latentLower: plan.execution.minimumEffectiveExposure,
+                latentUpper: plan.execution.maximumEffectiveExposure,
+              },
+            )
+          : await teacherFitter.fit(teacherInputs!, (event) => {
+              const done = event.examplesCompleted;
+              if (done === 1 || done % plan.teacherFit.batchSize === 0 || done === rows.length) {
+                process.stdout.write(`${JSON.stringify({
+                  event: "dataset-progress",
+                  date,
+                  component: "oracle",
+                  examplesCompleted: done,
+                  examplesTotal: rows.length,
+                  day: dayIndex + 1,
+                  days: selectedDays.length,
+                  examplesPerSecond: event.examplesPerSecond,
+                  gpuMemoryMiB: event.gpuMemoryMiB,
+                  meanKlDivergence: event.meanKlDivergence,
+                  meanSquaredError: event.meanSquaredError,
+                  metricVisibleLower: event.metricVisibleLower,
+                  metricVisibleUpper: event.metricVisibleUpper,
+                  metricActionCells: event.metricActionCells,
+                  metricCurrentCells: event.metricCurrentCells,
+                  temporalWarmSelectedFraction: event.temporalWarmSelectedFraction,
+                  temporalWarmEquivalentFraction: event.temporalWarmEquivalentFraction,
+                  temporalWarmQualityAcceptedFraction: event.temporalWarmQualityAcceptedFraction,
+                  temporalWarmQualityBetterFraction: event.temporalWarmQualityBetterFraction,
+                  temporalMeanNormalizedStepBefore: event.temporalMeanNormalizedStepBefore,
+                  temporalMeanNormalizedStepAfter: event.temporalMeanNormalizedStepAfter,
+                  pipelinedRefinement: event.pipelinedRefinement,
+                  pipelineWaitFraction: event.pipelineWaitFraction,
+                })}\n`);
+              }
+            });
         const teacherWallMs = performance.now() - teacherStarted;
+        if (fusedDirectDiagnostics) {
+          process.stdout.write(`${JSON.stringify({
+            event: "dataset-direct-diagnostics",
+            date,
+            day: dayIndex + 1,
+            days: selectedDays.length,
+            backend: "cuda-fused-oracle-worker",
+            examples: rows.length,
+            cutoffKernelMs: fusedDirectDiagnostics.cutoffKernelMs,
+            kernelMs: fusedDirectDiagnostics.kernelMs,
+            workerWallMs: fusedDirectDiagnostics.wallMs,
+            materializationMs: teacherWallMs,
+            pipelined: true,
+          })}\n`);
+        }
         const persistedRows = requiredOracleRows;
         const persistedTimes = persistedRows.map((candleIndex) => scored[candleIndex]!.closeTime);
         const teacher = refitForQuality || existingRowsReusable.length === 0
@@ -876,6 +1154,9 @@ async function main(): Promise<void> {
           "oracle",
           `${date}${refinementPass > 0 ? `.refined-${refinementPass}` : ""}`,
         );
+        const rawOracleCompression = plan.componentCompression?.rawOracleProbabilities;
+        const rawOracleUncompressedBytes = (DAY_MS / SECOND_MS)
+          * oracle.grid.length * Float32Array.BYTES_PER_ELEMENT;
         const oracleComponent: OracleComponent = {
           date,
           count: DAY_MS / SECOND_MS,
@@ -884,7 +1165,30 @@ async function main(): Promise<void> {
           teacherMetrics: `${prefix}.teacher-metrics.f32`,
           rawOracleProbabilities: reuseOracleFactor
             ? existingComponent!.rawOracleProbabilities
-            : `${prefix}.raw-oracle-probabilities.f32`,
+            : `${prefix}.raw-oracle-probabilities.f32`
+              + (rawOracleCompression === "zstd" ? ".zst" : ""),
+          ...(reuseOracleFactor
+            ? {
+                ...(existingComponent!.rawOracleProbabilitiesCompression
+                  ? {
+                      rawOracleProbabilitiesCompression:
+                        existingComponent!.rawOracleProbabilitiesCompression,
+                    }
+                  : {}),
+                ...(existingComponent!.rawOracleProbabilitiesUncompressedBytes
+                  ? {
+                      rawOracleProbabilitiesUncompressedBytes:
+                        existingComponent!.rawOracleProbabilitiesUncompressedBytes,
+                    }
+                  : {}),
+              }
+            : rawOracleCompression === "zstd"
+              ? {
+                  rawOracleProbabilitiesCompression: "zstd" as const,
+                  rawOracleProbabilitiesUncompressedBytes: rawOracleUncompressedBytes,
+                }
+              : {}),
+          rawOracleSchemaVersion: RAW_ORACLE_SCHEMA_VERSION,
           times: reuseOracleFactor ? existingComponent!.times : `${prefix}.times.i64`,
           teacherMetricVisibleLower: plan.execution.minimumUsableExposure,
           teacherMetricVisibleUpper: plan.execution.maximumUsableExposure,
@@ -921,8 +1225,11 @@ async function main(): Promise<void> {
             path.join(output, oracleComponent.rawOracleProbabilities),
             oracle.probabilities,
             oracle.grid.length,
-            persistedIndexes.map((index) => persistedRows[index]!),
-            requiredOracleRows,
+            rawOracleCompression === "zstd"
+              ? Array.from({ length: DAY_MS / SECOND_MS }, (_, index) => index)
+              : persistedIndexes.map((index) => persistedRows[index]!),
+            rawOracleCompression === "zstd" ? undefined : requiredOracleRows,
+            oracleComponent.rawOracleProbabilitiesCompression,
           ),
           reuseOracleFactor
             ? Promise.resolve()
@@ -968,6 +1275,17 @@ async function main(): Promise<void> {
             ...featureComponent,
           })}\n`);
         }
+        if (minuteOracleComponent) {
+          process.stdout.write(`${JSON.stringify({
+            event: "dataset-component",
+            component: "oracle-minute",
+            date,
+            file: minuteOracleComponent,
+            rows: 1_441,
+            compression:
+              plan.componentCompression?.minuteOracleProbabilities ?? "none",
+          })}\n`);
+        }
         process.stdout.write(`${JSON.stringify({
           event: "dataset-stage-timing",
           date,
@@ -976,8 +1294,14 @@ async function main(): Promise<void> {
           fittedExamples: rows.length,
           acceptedExamples: acceptedIndexes.length,
           teacherWallMs,
+          directDiagnosticsFused: Boolean(fusedDirectDiagnostics),
+          directDiagnosticsKernelMs: fusedDirectDiagnostics?.kernelMs ?? 0,
+          directDiagnosticsCutoffKernelMs:
+            fusedDirectDiagnostics?.cutoffKernelMs ?? 0,
+          directDiagnosticsWorkerWallMs: fusedDirectDiagnostics?.wallMs ?? 0,
           featureEncodingMs,
           featureEncodingOverlapped: Boolean(featureComponent),
+          featureEncodingOracleOverlapped: Boolean(featureComponent && oracleWorker),
           rawOracleGridBytes: rows.length * oracle.grid.length * Float32Array.BYTES_PER_ELEMENT,
           persistMs: performance.now() - persistStarted,
         })}\n`);
@@ -1108,6 +1432,7 @@ async function main(): Promise<void> {
   } finally {
     await teacherFitter?.close();
     teacherFitter = undefined;
+    await oracleWorker?.close();
   }
 
   if (!expectedGrid || !expectedCurrentGrid) {
@@ -1286,6 +1611,10 @@ async function main(): Promise<void> {
       storeId: componentStoreId,
       compression: {
         features: plan.componentCompression?.features ?? "none",
+        rawOracleProbabilities:
+          plan.componentCompression?.rawOracleProbabilities ?? "none",
+        minuteOracleProbabilities:
+          plan.componentCompression?.minuteOracleProbabilities ?? "none",
       },
       inputRows: plan.exampleSelection
         ? "sparse row-addressable UTC day files containing selected prediction-time blocks"
@@ -1333,6 +1662,8 @@ async function main(): Promise<void> {
       factorLayout: "row-major [example, targetExposure]",
       factorShape: [expectedGrid.length],
       factorFileField: "rawOracleProbabilities",
+      factorCompression:
+        plan.componentCompression?.rawOracleProbabilities ?? "none",
       factorBytesPerExample: expectedGrid.length * Float32Array.BYTES_PER_ELEMENT,
       factorBytesBySplit: Object.fromEntries(SPLITS.map((split) => [
         split,
@@ -1349,9 +1680,12 @@ async function main(): Promise<void> {
       factorLayout: "row-major [example, targetExposure]",
       factorShape: [expectedGrid.length],
       factorFileField: "minuteOracleProbabilities",
+      factorCompression:
+        plan.componentCompression?.minuteOracleProbabilities ?? "none",
       storage: plan.runtimeMinuteOracleTargets
         ? "computed-directly-at-training-startup"
-        : "persisted-per-example",
+        : "persisted-per-minute-day",
+      storedRowsPerUtcDay: 1_441,
       sampling:
         "close-only one-minute path ending at the latest completed UTC minute available at the example timestamp",
       timestampAlignment:
@@ -1478,11 +1812,16 @@ class GpuTeacherFitter {
       || !inputs.data.every(Number.isFinite)) {
       throw new Error("CUDA teacher fitter received invalid base-probability rows.");
     }
-    const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "trading-mlp-teacher-"));
+    const workerTemporaryRoot = path.join(this.repoRoot, ".tools", "ml-worker");
+    await fs.mkdir(workerTemporaryRoot, { recursive: true });
+    const temporaryDirectory = await fs.mkdtemp(
+      path.join(workerTemporaryRoot, "trading-mlp-teacher-"),
+    );
     const inputFile = path.join(temporaryDirectory, "probabilities.f32");
     const configFile = path.join(temporaryDirectory, "config.json");
     const parameterFile = path.join(temporaryDirectory, "parameters.f32");
     const metricFile = path.join(temporaryDirectory, "metrics.f32");
+    let completed = false;
     try {
       await Promise.all([
         fs.writeFile(inputFile, Buffer.from(
@@ -1553,7 +1892,7 @@ class GpuTeacherFitter {
       }
       const parameters = bufferFloat32(parameterBuffer);
       const metrics = bufferFloat32(metricBuffer);
-      return Array.from({ length: inputs.count }, (_, index) => ({
+      const result = Array.from({ length: inputs.count }, (_, index) => ({
         rawParameters: parameters.slice(
           index * TEACHER_PARAMETER_COUNT,
           (index + 1) * TEACHER_PARAMETER_COUNT,
@@ -1563,8 +1902,16 @@ class GpuTeacherFitter {
           (index + 1) * TEACHER_METRIC_COUNT,
         )),
       }));
+      completed = true;
+      return result;
     } finally {
-      await fs.rm(temporaryDirectory, { recursive: true, force: true });
+      if (completed) {
+        await fs.rm(temporaryDirectory, { recursive: true, force: true });
+      } else {
+        process.stderr.write(
+          `Retained failed CUDA teacher exchange directory: ${temporaryDirectory}\n`,
+        );
+      }
     }
   }
 
@@ -1618,13 +1965,18 @@ class GpuTeacherFitter {
 
   private async ensureWorker(): Promise<void> {
     if (this.workerReady) return this.workerReady;
-    const python = path.join(this.repoRoot, ".venv-ml", "bin", "python");
+    const python = path.join(
+      this.repoRoot,
+      ".venv-ml",
+      process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+    );
     const child = spawn(python, [
       path.join(this.repoRoot, "ml", "fit_teacher_cuda.py"),
       "--worker",
       "--device", this.config.fit.device,
     ], {
       cwd: this.repoRoot,
+      env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
@@ -1702,6 +2054,20 @@ function bufferFloat32(buffer: Buffer): Float32Array {
   );
 }
 
+async function readFloat32Component(file: string, expectedBytes: number): Promise<Float32Array> {
+  const encoded = await fs.readFile(file);
+  const decoded = file.endsWith(".zst")
+    ? zstdDecompressSync(encoded, { maxOutputLength: expectedBytes })
+    : encoded;
+  if (decoded.byteLength !== expectedBytes) {
+    throw new Error(
+      `Float32 component ${file} decoded to ${decoded.byteLength} bytes; `
+      + `expected ${expectedBytes}.`,
+    );
+  }
+  return bufferFloat32(decoded);
+}
+
 function packTeacherInputs(
   probabilities: Float32Array,
   actionGrid: Float64Array,
@@ -1741,6 +2107,41 @@ function packTeacherInputs(
     data[destination + actionCount + 1] = raw[1];
   });
   return { data, count: rowIndexes.length, rowStride };
+}
+
+function directDiagnosticTeacherResults(
+  rowIndexes: readonly number[],
+  cutoffIntervals: readonly { lower: number; upper: number }[],
+  diagnostics: NonNullable<PreparedExposureValueOracle["directDiagnostics"]>,
+  support: { latentLower: number; latentUpper: number },
+): TeacherResult[] {
+  if (cutoffIntervals.length !== rowIndexes.length
+    || diagnostics.cutoffLowers.length !== diagnostics.cutoffUppers.length
+    || diagnostics.entropies.length !== diagnostics.cutoffLowers.length
+    || diagnostics.distanceImbalances.length !== diagnostics.cutoffLowers.length) {
+    throw new Error("Fused direct-oracle diagnostics do not match requested rows.");
+  }
+  return rowIndexes.map((sourceRow, outputRow) => {
+    const entropy = diagnostics.entropies[sourceRow];
+    const distanceImbalance = diagnostics.distanceImbalances[sourceRow];
+    const cutoff = cutoffIntervals[outputRow]!;
+    if (entropy === undefined || distanceImbalance === undefined
+      || !Number.isFinite(entropy) || !Number.isFinite(distanceImbalance)) {
+      throw new Error(`Fused direct-oracle diagnostic row ${sourceRow} is invalid.`);
+    }
+    const rawCutoff = conditionalCutoffRawParameters(
+      cutoff.lower,
+      cutoff.upper,
+      support,
+    );
+    const rawParameters = new Float32Array(TEACHER_PARAMETER_COUNT);
+    rawParameters[6] = rawCutoff[0];
+    rawParameters[7] = rawCutoff[1];
+    return {
+      rawParameters,
+      metrics: [entropy, 0, 0, 0, 0, 1, distanceImbalance],
+    };
+  });
 }
 
 function buildWindowRanges(plan: TrainingPlan): { trainRanges: TimeRange[]; validationRanges: TimeRange[] } {
@@ -1799,6 +2200,7 @@ function datasetShardForSegment(
   plan: TrainingPlan,
 ): DatasetShard {
   const pairPrefix = `${segment.split}-${segment.date}-${segment.segment}`;
+  const oracleDate = isoDate(utcDay(segment.oracleTargetTimeStart));
   return {
     split: segment.split,
     date: segment.date,
@@ -1815,10 +2217,9 @@ function datasetShardForSegment(
     baseTimeWeights: path.join("pairs", `${pairPrefix}.base-time-weights.f32`),
     timeWeights: path.join("pairs", `${pairPrefix}.time-weights.f32`),
     rawOracleProbabilities: oracle.rawOracleProbabilities,
-    minuteOracleProbabilities: path.join(
-      "pairs",
-      `${pairPrefix}.delay-${plan.predictionDelayMs}`
-        + ".completed-minute-oracle-probabilities.f32",
+    minuteOracleProbabilities: minuteOracleComponentFile(
+      oracleDate,
+      plan.componentCompression?.minuteOracleProbabilities,
     ),
     resolutionDivergence: path.join(
       "pairs",
@@ -1982,7 +2383,7 @@ function componentMaterializesRows(
   return true;
 }
 
-function selectionSignature(selection: ExplicitExampleSelection | undefined): string {
+function selectionSignature(selection: ExampleSelection | undefined): string {
   return selection
     ? createHash("sha256").update(JSON.stringify(selection)).digest("hex")
     : "full";
@@ -2083,7 +2484,7 @@ async function materializeFullFeatureDaysParallel(
       "--output", output,
     ], {
       cwd: repoRoot,
-      env: { ...process.env, TMPDIR: "/tmp" },
+      env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
     child.stderr.on("data", (chunk) => process.stderr.write(chunk));
@@ -2125,13 +2526,13 @@ function encodeFeatureRows(
   times: readonly number[],
   features: Awaited<ReturnType<MlpFeatureStore["prepare"]>>,
 ): Buffer {
-  const values = new Float32Array(times.length * MLP_INPUT_FEATURE_COUNT);
-  for (let row = 0; row < times.length; row += 1) {
-    features.encode(times[row]!, values, row * MLP_INPUT_FEATURE_COUNT);
-  }
-  const half = new Uint16Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    half[index] = float32ToFloat16(values[index]!);
+  const half = new Uint16Array(times.length * MLP_INPUT_FEATURE_COUNT);
+  if (features.encodeHalfRows) {
+    features.encodeHalfRows(times, half);
+  } else {
+    for (let row = 0; row < times.length; row += 1) {
+      features.encodeHalf(times[row]!, half, row * MLP_INPUT_FEATURE_COUNT);
+    }
   }
   return Buffer.from(half.buffer, half.byteOffset, half.byteLength);
 }
@@ -2186,6 +2587,7 @@ async function oracleComponentComplete(
   requiredRowSelection = "full",
 ): Promise<boolean> {
   return component.count === DAY_MS / SECOND_MS
+    && component.rawOracleSchemaVersion === RAW_ORACLE_SCHEMA_VERSION
     && componentCoversRows(component.rowSelectionSignature, requiredRowSelection)
     && await fileHasBytes(
       path.join(output, component.teacherParameters),
@@ -2195,10 +2597,14 @@ async function oracleComponentComplete(
       path.join(output, component.teacherMetrics),
       component.count * TEACHER_METRIC_COUNT * 4,
     )
-    && await fileHasBytes(
-      path.join(output, component.rawOracleProbabilities),
-      component.count * actionCount * 4,
-    )
+    && (component.rawOracleProbabilitiesCompression === "zstd"
+      ? component.rawOracleProbabilitiesUncompressedBytes
+          === component.count * actionCount * 4
+        && await nonEmptyFile(path.join(output, component.rawOracleProbabilities))
+      : await fileHasBytes(
+          path.join(output, component.rawOracleProbabilities),
+          component.count * actionCount * 4,
+        ))
     && await fileHasBytes(path.join(output, component.times), component.count * 8);
 }
 
@@ -2209,11 +2615,16 @@ async function rawOracleFactorComplete(
   requiredRowSelection = "full",
 ): Promise<boolean> {
   return component.count === DAY_MS / SECOND_MS
+    && component.rawOracleSchemaVersion === RAW_ORACLE_SCHEMA_VERSION
     && componentCoversRows(component.rowSelectionSignature, requiredRowSelection)
-    && await fileHasBytes(
-      path.join(output, component.rawOracleProbabilities),
-      component.count * actionCount * 4,
-    )
+    && (component.rawOracleProbabilitiesCompression === "zstd"
+      ? component.rawOracleProbabilitiesUncompressedBytes
+          === component.count * actionCount * 4
+        && await nonEmptyFile(path.join(output, component.rawOracleProbabilities))
+      : await fileHasBytes(
+          path.join(output, component.rawOracleProbabilities),
+          component.count * actionCount * 4,
+        ))
     && await fileHasBytes(path.join(output, component.times), component.count * 8);
 }
 
@@ -2528,6 +2939,109 @@ async function mergeTeacherResults(
   });
 }
 
+function minuteOracleComponentFile(
+  date: string,
+  compression?: "zstd",
+): string {
+  return path.join(
+    "components",
+    "oracle-minute",
+    `${date}.completed-minute-oracle-probabilities.f32`
+      + (compression === "zstd" ? ".zst" : ""),
+  );
+}
+
+async function persistMinuteOracleDay(
+  output: string,
+  plan: TrainingPlan,
+  source: readonly Candle[],
+  day: number,
+  date: string,
+  actionGrid: ArrayLike<number>,
+): Promise<string> {
+  const compression = plan.componentCompression?.minuteOracleProbabilities;
+  const relativeFile = minuteOracleComponentFile(date, compression);
+  const file = path.join(output, relativeFile);
+  const minuteRows = 1_441;
+  const expectedBytes = minuteRows * actionGrid.length * Float32Array.BYTES_PER_ELEMENT;
+  const complete = compression === "zstd"
+    ? await nonEmptyFile(file)
+    : await fileHasBytes(file, expectedBytes);
+  if (complete) return relativeFile;
+
+  const required = source.filter((candle) =>
+    candle.openTime >= day - MINUTE_MS
+    && candle.openTime
+      < day + DAY_MS + plan.execution.valueHorizonSteps * SECOND_MS);
+  const expectedSeconds = DAY_MS / SECOND_MS
+    + plan.execution.valueHorizonSteps
+    + MINUTE_MS / SECOND_MS;
+  const issue = inspectContinuousSourceRange(
+    required,
+    day - MINUTE_MS,
+    expectedSeconds,
+    date,
+    [],
+    "persisted one-minute oracle source",
+  );
+  if (issue) throw new Error(issue.detail);
+  const prices = Float64Array.from(
+    { length: required.length / 60 },
+    (_, index) => required[(index + 1) * 60 - 1]!.close,
+  );
+  const feeRate = plan.execution.feeBps / 10_000;
+  const { oracle } = await prepareExposureValueOracleCuda(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 1,
+    valueHorizonSteps: 60,
+    friction: feeRate,
+    gridSize: plan.execution.gridSize,
+    minExposure: plan.execution.minimumEffectiveExposure,
+    maxExposure: plan.execution.maximumEffectiveExposure,
+    maxEffectiveExposure: Math.max(
+      Math.abs(plan.execution.minimumEffectiveExposure),
+      Math.abs(plan.execution.maximumEffectiveExposure),
+    ),
+    terminalIndex: 1_440,
+    temperature: plan.execution.temperature,
+    opportunityEpsilon: 0,
+    quoteLendRate: bpsHourToPerSteps(
+      plan.execution.maintenanceBpsHour.quoteLend,
+      60,
+    ),
+    quoteBorrowRate: bpsHourToPerSteps(
+      plan.execution.maintenanceBpsHour.quoteBorrow,
+      60,
+    ),
+    assetBorrowRate: bpsHourToPerSteps(
+      plan.execution.maintenanceBpsHour.assetBorrow,
+      60,
+    ),
+    includeActionValues: false,
+    includeProbabilities: true,
+    includePath: false,
+    distributionOnly: true,
+  });
+  if (!oracle.probabilities) {
+    throw new Error(`One-minute oracle did not retain probabilities for ${date}.`);
+  }
+  assertSameGrid(actionGrid, oracle.grid, "one-minute action");
+  const values = oracle.probabilities.subarray(
+    0,
+    minuteRows * actionGrid.length,
+  );
+  if (values.byteLength !== expectedBytes) {
+    throw new Error(`One-minute oracle returned an invalid stored shape for ${date}.`);
+  }
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await writeMaybeCompressedAtomic(
+    file,
+    Buffer.from(values.buffer, values.byteOffset, values.byteLength),
+    compression,
+  );
+  return relativeFile;
+}
+
 async function persistMinuteOraclePairs(
   output: string,
   progress: Progress,
@@ -2540,6 +3054,7 @@ async function persistMinuteOraclePairs(
   meanResolutionJsd: number;
   maximumResolutionJsd: number;
 }>> {
+  const minuteCompression = plan.componentCompression?.minuteOracleProbabilities;
   const visibleIndexes = actionGrid
     .map((action, index) => ({ action, index }))
     .filter(({ action }) =>
@@ -2556,16 +3071,18 @@ async function persistMinuteOraclePairs(
   const fineCache = new Map<string, Float32Array>();
   for (const [date, shards] of [...byTargetDate].sort(([left], [right]) =>
     left.localeCompare(right))) {
-    const incomplete = await Promise.all(shards.map(async (shard) =>
-      (options.persistProbabilities && !await fileHasBytes(
-          path.join(output, shard.minuteOracleProbabilities),
-          shard.count * actionGrid.length * Float32Array.BYTES_PER_ELEMENT,
-        ))
-      || !await fileHasBytes(
+    const minuteFile = path.join(output, shards[0]!.minuteOracleProbabilities);
+    const minuteRows = 1_441;
+    const minuteBytes = minuteRows * actionGrid.length * Float32Array.BYTES_PER_ELEMENT;
+    const minuteIncomplete = options.persistProbabilities && !(minuteCompression === "zstd"
+      ? await nonEmptyFile(minuteFile)
+      : await fileHasBytes(minuteFile, minuteBytes));
+    const divergenceIncomplete = await Promise.all(shards.map(async (shard) =>
+      !await fileHasBytes(
         path.join(output, shard.resolutionDivergence),
         shard.count * Float32Array.BYTES_PER_ELEMENT,
       )));
-    if (incomplete.every((value) => !value)) continue;
+    if (!minuteIncomplete && divergenceIncomplete.every((value) => !value)) continue;
 
     const day = parseDay(date);
     const source = await oneSecondStore.loadRange(
@@ -2589,7 +3106,7 @@ async function persistMinuteOraclePairs(
       (_, index) => source[(index + 1) * 60 - 1]!.close,
     );
     const feeRate = plan.execution.feeBps / 10_000;
-    const minuteOracle = prepareExposureValueOracle(prices, {
+    const { oracle: minuteOracle } = await prepareExposureValueOracleCuda(prices, {
       scoreStartIndex: 0,
       holdingPeriodSteps: 1,
       valueHorizonSteps: 60,
@@ -2618,23 +3135,17 @@ async function persistMinuteOraclePairs(
       ),
       includeActionValues: false,
       includeProbabilities: true,
+      includePath: false,
+      distributionOnly: true,
     });
     if (!minuteOracle.probabilities) {
       throw new Error(`One-minute oracle did not retain probabilities for ${date}.`);
     }
     assertSameGrid(actionGrid, minuteOracle.grid, "one-minute action");
-    const outputs = new Map<DatasetShard, {
-      probabilities?: Float32Array;
-      divergence: Float32Array;
-    }>();
+    const outputs = new Map<DatasetShard, Float32Array>();
     shards.forEach((shard, index) => {
-      if (incomplete[index]) {
-        outputs.set(shard, {
-          ...(options.persistProbabilities
-            ? { probabilities: new Float32Array(shard.count * actionGrid.length) }
-            : {}),
-          divergence: new Float32Array(shard.count),
-        });
+      if (divergenceIncomplete[index]) {
+        outputs.set(shard, new Float32Array(shard.count));
       }
     });
     for (const shard of outputs.keys()) {
@@ -2652,49 +3163,54 @@ async function persistMinuteOraclePairs(
           coarseStart,
           coarseStart + actionGrid.length,
         );
-        const destination = outputs.get(shard)!;
-        destination.probabilities?.set(coarse, row * actionGrid.length);
         let fine = fineCache.get(shard.rawOracleProbabilities);
         if (!fine) {
-          fine = bufferFloat32(await fs.readFile(path.join(
-            output,
-            shard.rawOracleProbabilities,
-          )));
+          fine = await readFloat32Component(
+            path.join(output, shard.rawOracleProbabilities),
+            (DAY_MS / SECOND_MS) * actionGrid.length
+              * Float32Array.BYTES_PER_ELEMENT,
+          );
           fineCache.set(shard.rawOracleProbabilities, fine);
           while (fineCache.size > 4) fineCache.delete(fineCache.keys().next().value!);
         }
         const fineStart = (
           shard.oracleRowOffset + row * shard.oracleRowStride
         ) * actionGrid.length;
-        destination.divergence[row] = visibleJensenShannonDivergence(
+        outputs.get(shard)![row] = visibleJensenShannonDivergence(
           fine.subarray(fineStart, fineStart + actionGrid.length),
           coarse,
           visibleIndexes,
         );
       }
     }
-    await Promise.all([...outputs].flatMap(([shard, values]) => [
-      ...(values.probabilities ? [writeTypedArrayAtomic(
-        path.join(output, shard.minuteOracleProbabilities),
+    const storedMinuteProbabilities = minuteOracle.probabilities.subarray(
+      0,
+      minuteRows * actionGrid.length,
+    );
+    await Promise.all([
+      ...(minuteIncomplete ? [writeMaybeCompressedAtomic(
+        minuteFile,
         Buffer.from(
-          values.probabilities.buffer,
-          values.probabilities.byteOffset,
-          values.probabilities.byteLength,
+          storedMinuteProbabilities.buffer,
+          storedMinuteProbabilities.byteOffset,
+          storedMinuteProbabilities.byteLength,
         ),
+        minuteCompression,
       )] : []),
-      writeTypedArrayAtomic(
+      ...[...outputs].map(([shard, divergence]) => writeTypedArrayAtomic(
         path.join(output, shard.resolutionDivergence),
         Buffer.from(
-          values.divergence.buffer,
-          values.divergence.byteOffset,
-          values.divergence.byteLength,
+          divergence.buffer,
+          divergence.byteOffset,
+          divergence.byteLength,
         ),
-      ),
-    ]));
+      )),
+    ]);
     process.stdout.write(`${JSON.stringify({
       event: "dataset-minute-oracle",
       date,
       examples: [...outputs.keys()].reduce((sum, shard) => sum + shard.count, 0),
+      storedMinuteRows: minuteIncomplete ? minuteRows : 0,
       alignment: "latest-completed-minute",
     })}\n`);
   }
@@ -3196,9 +3712,13 @@ async function writeProductionTrainingPlan(
     config.sourceDatasetDir,
     ...(plan.componentSeedDatasetDirs ?? []),
   ];
-  generated.componentCompression = { features: "zstd" };
+  generated.componentCompression = {
+    features: "zstd",
+    rawOracleProbabilities: "zstd",
+    minuteOracleProbabilities: "zstd",
+  };
   generated.featurePreparationWorkers = 3;
-  generated.runtimeMinuteOracleTargets = true;
+  generated.runtimeMinuteOracleTargets = false;
   generated.training = {
     ...generated.training,
     targetRepresentation: "minuteOracleProbabilities",
@@ -3256,6 +3776,7 @@ async function writeRawOracleProbabilitiesAtomic(
   actionCount: number,
   indexes: readonly number[],
   componentRows?: readonly number[],
+  compression?: "zstd",
 ): Promise<void> {
   if (!Number.isInteger(actionCount) || actionCount < 1
     || probabilities.length % actionCount !== 0
@@ -3265,6 +3786,25 @@ async function writeRawOracleProbabilitiesAtomic(
   }
   if (componentRows && componentRows.length !== indexes.length) {
     throw new Error("Raw oracle component rows do not match selected probability rows.");
+  }
+  if (compression === "zstd") {
+    if (componentRows && rowSelectionSignature(componentRows) !== "full") {
+      throw new Error("Zstandard raw-oracle components require complete UTC-day rows.");
+    }
+    const values = new Float32Array(indexes.length * actionCount);
+    indexes.forEach((sourceIndex, destinationIndex) => {
+      const sourceStart = sourceIndex * actionCount;
+      values.set(
+        probabilities.subarray(sourceStart, sourceStart + actionCount),
+        destinationIndex * actionCount,
+      );
+    });
+    await writeMaybeCompressedAtomic(
+      file,
+      Buffer.from(values.buffer, values.byteOffset, values.byteLength),
+      compression,
+    );
+    return;
   }
   if (componentRows && rowSelectionSignature(componentRows) !== "full") {
     const values = new Float32Array(indexes.length * actionCount);
@@ -3350,6 +3890,23 @@ async function writeFeatureRowsAtomic(
   }
   if (rowSelectionSignature(componentRows) !== "full") {
     throw new Error("Zstandard feature components require complete UTC-day rows.");
+  }
+  const compressed = zstdCompressSync(rows, {
+    params: {
+      [zlibConstants.ZSTD_c_compressionLevel]: 3,
+    },
+  });
+  await writeTypedArrayAtomic(file, compressed);
+}
+
+async function writeMaybeCompressedAtomic(
+  file: string,
+  rows: Buffer,
+  compression?: "zstd",
+): Promise<void> {
+  if (compression !== "zstd") {
+    await writeTypedArrayAtomic(file, rows);
+    return;
   }
   const compressed = zstdCompressSync(rows, {
     params: {
@@ -3716,9 +4273,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function assertSameGrid(expected: readonly number[], observed: ArrayLike<number>, name: string): void {
-  if (expected.length !== observed.length
-    || expected.some((value, index) => value !== observed[index])) {
+function assertSameGrid(
+  expected: ArrayLike<number>,
+  observed: ArrayLike<number>,
+  name: string,
+): void {
+  let changed = expected.length !== observed.length;
+  for (let index = 0; !changed && index < expected.length; index += 1) {
+    changed = expected[index] !== observed[index];
+  }
+  if (changed) {
     throw new Error(`MLP dataset ${name} grid changed between shards.`);
   }
 }
@@ -3810,6 +4374,8 @@ function validatePlan(plan: TrainingPlan): void {
   if (plan.version !== 4 || !plan.id || !plan.componentStoreId
     || !plan.datasetDir || !Array.isArray(plan.windows)
     || plan.oraclePreparation?.backend !== "cuda"
+    || plan.oraclePreparation.pipelineDepth !== undefined
+      && ![1, 2, 3, 4].includes(plan.oraclePreparation.pipelineDepth)
     || !Number.isInteger(plan.samplingIntervalMs / SECOND_MS)
     || plan.samplingIntervalMs < SECOND_MS
     || !Number.isInteger(plan.predictionDelayMs / SECOND_MS)
@@ -3902,29 +4468,6 @@ function runtimePositiveInteger(value: string | undefined, fallback: number): nu
   return parsed;
 }
 
-const FLOAT32_TO_FLOAT16_SCRATCH = new Float32Array(1);
-const FLOAT32_TO_FLOAT16_BITS = new Uint32Array(FLOAT32_TO_FLOAT16_SCRATCH.buffer);
-
-function float32ToFloat16(value: number): number {
-  FLOAT32_TO_FLOAT16_SCRATCH[0] = value;
-  const bits = FLOAT32_TO_FLOAT16_BITS[0]!;
-  const sign = bits >>> 16 & 0x8000;
-  let exponent = (bits >>> 23 & 0xff) - 127 + 15;
-  let mantissa = bits & 0x7fffff;
-  if (exponent <= 0) {
-    if (exponent < -10) return sign;
-    mantissa = (mantissa | 0x800000) >>> (1 - exponent);
-    return sign | (mantissa + 0x1000 >>> 13);
-  }
-  if (exponent >= 31) return sign | 0x7c00;
-  mantissa += 0x1000;
-  if (mantissa & 0x800000) {
-    mantissa = 0;
-    exponent += 1;
-  }
-  return exponent >= 31 ? sign | 0x7c00 : sign | exponent << 10 | mantissa >>> 13;
-}
-
 function bpsHourToPerSecond(bps: number): number {
   return Math.expm1(Math.log1p(bps / 10_000) / 3_600);
 }
@@ -3934,9 +4477,21 @@ function bpsHourToPerSteps(bps: number, stepsPerHour: number): number {
 }
 
 async function atomicWriteJson(file: string, value: unknown): Promise<void> {
-  const temporary = `${file}.tmp`;
+  const temporary = `${file}.${process.pid}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`);
-  await fs.rename(temporary, file);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.rename(temporary, file);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32"
+        || code !== "EPERM" && code !== "EACCES"
+        || attempt >= 7) throw error;
+      await new Promise((resolve) =>
+        setTimeout(resolve, 20 * 2 ** attempt));
+    }
+  }
 }
 
 function parseDay(value: string): number {

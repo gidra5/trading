@@ -1,9 +1,9 @@
 import type { Candle } from "./legacy/types.js";
 
-export const MLP_FEATURE_SCHEMA_VERSION = 5;
+export const MLP_FEATURE_SCHEMA_VERSION = 6;
 export const MLP_OUTPUT_ACTION_COUNT = 255;
 export const MLP_CANDLE_FEATURE_COUNT = 4;
-export const MLP_VOLUME_EMA_WARMUP_MULTIPLE = 4;
+export const MLP_VOLUME_EMA_PERIOD_MULTIPLE = 4;
 
 export const MLP_CANDLE_WINDOWS = [
   { id: "1s", intervalMs: 1_000, candleCount: 64 },
@@ -61,6 +61,8 @@ export interface MlpModelManifest {
     testMetrics?: MlpTrainingMetrics;
     teacherFitMetrics?: Record<string, number>;
     lossWeights?: Record<string, number>;
+    distributionObjective?: "base-action-ce-pmse-v1";
+    oracleObjective?: "base-action-gaussian-time-correlation-mi-v1";
     selectionMetric?: "loss" | "klDivergence";
     policyMetricDefinitions?: {
       klDivergence: string;
@@ -118,8 +120,8 @@ export interface MlpDistributionPrediction {
 /**
  * Encode the last N causal candles as close/open log return, upward and
  * downward log deviations from the geometric candle midpoint, and log volume
- * relative to a slow causal EMA. Older candles may be supplied to warm the EMA;
- * only the final expectedCount candles are emitted.
+ * relative to a slow causal EMA. The EMA streams over all supplied causal
+ * history; only the final expectedCount candles are emitted.
  */
 export function encodeMlpCandleWindow(
   candles: readonly Pick<Candle, "open" | "high" | "low" | "close" | "volume">[],
@@ -132,10 +134,10 @@ export function encodeMlpCandleWindow(
     || outputOffset + expectedCount * MLP_CANDLE_FEATURE_COUNT > output.length) {
     throw new Error("MLP candle encoding requires a positive window and sufficient output storage.");
   }
-  const observed = candles.slice(-expectedCount * MLP_VOLUME_EMA_WARMUP_MULTIPLE);
+  const observed = candles;
   const emitStart = Math.max(0, observed.length - expectedCount);
   const padding = expectedCount - (observed.length - emitStart);
-  const volumeAlpha = 2 / (expectedCount * MLP_VOLUME_EMA_WARMUP_MULTIPLE + 1);
+  const volumeAlpha = 2 / (expectedCount * MLP_VOLUME_EMA_PERIOD_MULTIPLE + 1);
   let volumeEma = 0;
   for (let index = 0; index < observed.length; index += 1) {
     const candle = observed[index]!;
@@ -248,6 +250,10 @@ export function validateMlpModelManifest(manifest: MlpModelManifest): void {
     || (training.selectionMetric !== undefined
       && training.selectionMetric !== "loss"
       && training.selectionMetric !== "klDivergence")
+    || (training.distributionObjective !== undefined
+      && training.distributionObjective !== "base-action-ce-pmse-v1")
+    || (training.oracleObjective !== undefined
+      && training.oracleObjective !== "base-action-gaussian-time-correlation-mi-v1")
     || (training.lossWeights !== undefined
       && !Object.values(training.lossWeights).every((value) =>
         Number.isFinite(value) && value >= 0)))) {

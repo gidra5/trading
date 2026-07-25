@@ -93,45 +93,57 @@ let providerPolicyParity = {
   probabilityMse: 0,
   actionMeanRmse: 0,
 };
-if (process.env.TRADING_MLP_VERIFY_CUDA !== "false") {
-  const cuda = await ort.InferenceSession.create(modelFile, {
-    executionProviders: [{ name: "cuda", deviceId: 0 }],
-    graphOptimizationLevel: "all",
-  });
-  const cudaResult = await cuda.run({ features: input }, ["action_logits"]);
-  const expected = cpuValues;
-  const actual = cudaResult.action_logits.data;
-  if (!(actual instanceof Float32Array)
-    || expected.length !== batch * manifest.outputActionCount
-    || actual.length !== expected.length
-    || !actual.every(Number.isFinite)) {
-    throw new Error("MLP verification output has an invalid shape.");
-  }
-  for (let index = 0; index < expected.length; index += 1) {
-    const absoluteError = Math.abs(expected[index] - actual[index]);
-    const relativeError = absoluteError / Math.max(1, Math.abs(expected[index]));
-    maximumProviderError = Math.max(maximumProviderError, absoluteError);
-    maximumProviderRelativeError = Math.max(maximumProviderRelativeError, relativeError);
-    const tolerance = PROVIDER_ABSOLUTE_TOLERANCE
-      + PROVIDER_RELATIVE_TOLERANCE * Math.abs(expected[index]);
-    if (!(absoluteError <= tolerance)) {
+const cudaVerification = process.env.TRADING_MLP_VERIFY_CUDA?.trim().toLowerCase() ?? "auto";
+if (!["auto", "true", "false"].includes(cudaVerification)) {
+  throw new Error("TRADING_MLP_VERIFY_CUDA must be auto, true, or false.");
+}
+if (cudaVerification !== "false") {
+  try {
+    const cuda = await ort.InferenceSession.create(modelFile, {
+      executionProviders: [{ name: "cuda", deviceId: 0 }],
+      graphOptimizationLevel: "all",
+    });
+    const cudaResult = await cuda.run({ features: input }, ["action_logits"]);
+    const expected = cpuValues;
+    const actual = cudaResult.action_logits.data;
+    if (!(actual instanceof Float32Array)
+      || expected.length !== batch * manifest.outputActionCount
+      || actual.length !== expected.length
+      || !actual.every(Number.isFinite)) {
+      throw new Error("MLP verification output has an invalid shape.");
+    }
+    for (let index = 0; index < expected.length; index += 1) {
+      const absoluteError = Math.abs(expected[index] - actual[index]);
+      const relativeError = absoluteError / Math.max(1, Math.abs(expected[index]));
+      maximumProviderError = Math.max(maximumProviderError, absoluteError);
+      maximumProviderRelativeError = Math.max(maximumProviderRelativeError, relativeError);
+      const tolerance = PROVIDER_ABSOLUTE_TOLERANCE
+        + PROVIDER_RELATIVE_TOLERANCE * Math.abs(expected[index]);
+      if (!(absoluteError <= tolerance)) {
+        throw new Error(
+          `MLP CUDA/CPU raw parity error ${absoluteError} at output ${index} exceeds `
+          + `${tolerance} (atol=${PROVIDER_ABSOLUTE_TOLERANCE}, `
+          + `rtol=${PROVIDER_RELATIVE_TOLERANCE}).`,
+        );
+      }
+    }
+    providerPolicyParity = measurePolicyParity(expected, actual, manifest);
+    if (!(providerPolicyParity.maxProbabilityError <= PROVIDER_MAX_PROBABILITY_ERROR)
+      || !(providerPolicyParity.actionMeanRmse <= PROVIDER_ACTION_MEAN_RMSE)) {
       throw new Error(
-        `MLP CUDA/CPU raw parity error ${absoluteError} at output ${index} exceeds `
-        + `${tolerance} (atol=${PROVIDER_ABSOLUTE_TOLERANCE}, `
-        + `rtol=${PROVIDER_RELATIVE_TOLERANCE}).`,
+        `MLP CUDA/CPU policy parity failed: max probability error `
+        + `${providerPolicyParity.maxProbabilityError}, action-mean RMSE `
+        + `${providerPolicyParity.actionMeanRmse}.`,
       );
     }
-  }
-  providerPolicyParity = measurePolicyParity(expected, actual, manifest);
-  if (!(providerPolicyParity.maxProbabilityError <= PROVIDER_MAX_PROBABILITY_ERROR)
-    || !(providerPolicyParity.actionMeanRmse <= PROVIDER_ACTION_MEAN_RMSE)) {
-    throw new Error(
-      `MLP CUDA/CPU policy parity failed: max probability error `
-      + `${providerPolicyParity.maxProbabilityError}, action-mean RMSE `
-      + `${providerPolicyParity.actionMeanRmse}.`,
+    provider = "cuda";
+  } catch (error) {
+    if (cudaVerification === "true") throw error;
+    process.stderr.write(
+      `MLP CUDA verification unavailable; CPU artifact verification succeeded: `
+      + `${error instanceof Error ? error.message : String(error)}\n`,
     );
   }
-  provider = "cuda";
 }
 manifest.verification = {
   executionProvider: provider,

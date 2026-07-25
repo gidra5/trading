@@ -158,7 +158,11 @@ async function main(): Promise<void> {
     oracleWallMs: performance.now() - oracleStarted,
   })}\n`);
 
-  const python = path.join(repoRoot, ".venv-ml/bin/python");
+  const python = path.join(
+    repoRoot,
+    ".venv-ml",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+  );
   const result = spawnSync(python, [
     path.join(repoRoot, "ml/benchmark_temporal_cadence.py"),
     "--input", output,

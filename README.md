@@ -9,7 +9,7 @@ Handmade Binance trading interface with three TypeScript workspace projects:
 ## Run
 
 ```bash
-npm install
+npm run setup
 npm run dev
 ```
 
@@ -17,6 +17,13 @@ Dashboard: http://localhost:5173
 Backend API: http://localhost:3001
 
 The dev server writes live state and saved market data under `data/`.
+
+`npm run setup` installs the JavaScript workspaces, creates the Python 3.12
+environment, installs the CUDA-enabled PyTorch/Triton stack, builds the native
+oracle kernel, and builds all three workspaces. On Windows, the ML runtime is
+native and uses workspace-local CUDA compiler files under `.tools/`; Visual
+Studio 2022 C++ Build Tools must be installed. Linux continues to use the
+system CUDA toolkit.
 
 ## Experiments
 
@@ -43,6 +50,22 @@ Methodology and options are documented in
 produces a 5%-capped, liquidity-size-weighted index for every scale and an
 equal-weight aggregate of the five scale sleeves; see
 [docs/binance-multiscale-basis.md](docs/binance-multiscale-basis.md).
+
+## Historical data
+
+The downloader is resumable and stores independently compressed daily shards,
+so long downloads can run in the background while the server and trainer use
+completed days:
+
+```bash
+npm run fetch:candles -- --symbol BTCUSDT --interval 1s --days 1826 --end 2026-07-24 --compression gzip --fill-gaps --data-dir data
+```
+
+MLP dataset components are also independent daily shards. Features, full
+86,400-row raw one-second oracle distributions, and physical 1,441-row
+completed-minute oracle distributions use Zstandard-compressed Float32 arrays.
+The trainer decompresses one shard at a time for bounded-memory streaming and
+does not synthesize minute targets at training time.
 
 ## Build
 
@@ -85,3 +108,15 @@ TRADING_MLP_CUDNN_DIR=
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
 ```
+
+## MLP training
+
+Prepare and run a specific plan from PowerShell, cmd, or a POSIX shell:
+
+```bash
+npm run mlp:run -- --plan ml/training-plans/PLAN.json
+```
+
+The command is resumable. Runtime status is written under the plan's
+`data/ml-runs/...` directory and is exposed on the dashboard's MLP training
+page while the server is running.

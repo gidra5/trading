@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import {
+  directOracleDiagnosticsCuda,
+  exposureHoldingCutoffsCuda,
   prepareExposureValueOracleCuda,
   vwKamaCudaStatus,
   type Candle,
@@ -25,6 +28,24 @@ async function main(): Promise<void> {
   const candleLimit = positiveInteger(argument("candles") ?? "86400", "candles");
   const iterations = positiveInteger(argument("iterations") ?? "1", "iterations");
   const execution = plan.execution;
+  const holdingPeriodSteps = positiveInteger(
+    argument("holding-steps") ?? String(execution.holdingPeriodSteps),
+    "holding-steps",
+  );
+  const valueHorizonSteps = positiveInteger(
+    argument("horizon-steps") ?? String(execution.valueHorizonSteps),
+    "horizon-steps",
+  );
+  const maintenanceBps = argument("maintenance-bps") === undefined
+    ? execution.maintenanceBpsHour
+    : {
+        quoteLend: Number(argument("maintenance-bps")),
+        quoteBorrow: Number(argument("maintenance-bps")),
+        assetBorrow: Number(argument("maintenance-bps")),
+      };
+  if (!Object.values(maintenanceBps).every(Number.isFinite)) {
+    throw new Error("--maintenance-bps must be finite.");
+  }
   const gridSizes = (argument("grid-sizes") ?? String(execution.gridSize))
     .split(",")
     .map((value) => positiveInteger(value.trim(), "grid-sizes"));
@@ -50,8 +71,14 @@ async function main(): Promise<void> {
   const status = await vwKamaCudaStatus();
   if (!status.available) throw new Error(status.reason);
   const feeRate = execution.feeBps / 10_000;
-  const samples: Array<{ gridSize: number; kernelMs: number; wallMs: number }> = [];
+  const samples: Array<{
+    gridSize: number;
+    kernelMs: number;
+    wallMs: number;
+    probabilitiesSha256?: string;
+  }> = [];
   const latest = new Map<number, Awaited<ReturnType<typeof prepareExposureValueOracleCuda>>["oracle"]>();
+  const firstProbabilities = new Map<number, Float32Array>();
   for (let iteration = 0; iteration < iterations; iteration += 1) {
     const orderedGridSizes = gridSizes.map((_, index) =>
       gridSizes[(index + iteration) % gridSizes.length]!,
@@ -60,8 +87,8 @@ async function main(): Promise<void> {
       const started = performance.now();
       const result = await prepareExposureValueOracleCuda(candles.map((candle) => candle.close), {
         scoreStartIndex: 0,
-        holdingPeriodSteps: execution.holdingPeriodSteps,
-        valueHorizonSteps: execution.valueHorizonSteps,
+        holdingPeriodSteps,
+        valueHorizonSteps,
         friction: feeRate,
         gridSize,
         minExposure: execution.minimumUsableExposure,
@@ -73,18 +100,79 @@ async function main(): Promise<void> {
         terminalIndex: candles.length - 1,
         temperature: execution.temperature,
         opportunityEpsilon: 0,
-        quoteLendRate: bpsHourToPerSecond(execution.maintenanceBpsHour.quoteLend),
-        quoteBorrowRate: bpsHourToPerSecond(execution.maintenanceBpsHour.quoteBorrow),
-        assetBorrowRate: bpsHourToPerSecond(execution.maintenanceBpsHour.assetBorrow),
+        quoteLendRate: bpsHourToPerSecond(maintenanceBps.quoteLend),
+        quoteBorrowRate: bpsHourToPerSecond(maintenanceBps.quoteBorrow),
+        assetBorrowRate: bpsHourToPerSecond(maintenanceBps.assetBorrow),
         includeActionValues: false,
         includeProbabilities: true,
+        includePath: argument("include-path") !== "false",
+        distributionOnly: argument("distribution-only") === "true",
       });
-      samples.push({ gridSize, kernelMs: result.kernelMs, wallMs: performance.now() - started });
+      const first = firstProbabilities.get(gridSize);
+      const determinism = first && result.oracle.probabilities
+        ? compare(first, result.oracle.probabilities)
+        : undefined;
+      if (!first && result.oracle.probabilities) {
+        firstProbabilities.set(gridSize, result.oracle.probabilities.slice());
+      }
+      samples.push({
+        gridSize,
+        kernelMs: result.kernelMs,
+        wallMs: performance.now() - started,
+        probabilitiesSha256: result.oracle.probabilities
+          ? sha256(result.oracle.probabilities)
+          : undefined,
+        ...determinism,
+      });
       latest.set(gridSize, result.oracle);
     }
   }
   const referenceGridSize = Math.max(...gridSizes);
   const reference = latest.get(referenceGridSize)!;
+  const probabilitiesOutput = argument("probabilities-output");
+  if (probabilitiesOutput && reference.probabilities) {
+    fs.writeFileSync(
+      path.resolve(repoRoot, probabilitiesOutput),
+      Buffer.from(
+        reference.probabilities.buffer,
+        reference.probabilities.byteOffset,
+        reference.probabilities.byteLength,
+      ),
+    );
+  }
+  let diagnostics;
+  if (argument("diagnostics") === "true" && reference.probabilities) {
+    const cutoffStarted = performance.now();
+    const cutoffs = await exposureHoldingCutoffsCuda(
+      candles.map((candle) => candle.close),
+      candles.length,
+      holdingPeriodSteps,
+      reference.execution,
+    );
+    const diagnosticStarted = performance.now();
+    const measured = await directOracleDiagnosticsCuda(
+      reference.probabilities,
+      reference.grid,
+      reference.currentGrid,
+      cutoffs.cutoffLowers,
+      cutoffs.cutoffUppers,
+      {
+        visibleLower: execution.minimumUsableExposure,
+        visibleUpper: execution.maximumUsableExposure,
+        friction: feeRate,
+        transitionLogScale: 1 / execution.temperature,
+        distanceEpsilon: 1e-6,
+      },
+    );
+    diagnostics = {
+      cutoffKernelMs: cutoffs.kernelMs,
+      cutoffWallMs: diagnosticStarted - cutoffStarted,
+      kernelMs: measured.kernelMs,
+      wallMs: performance.now() - diagnosticStarted,
+      entropiesSha256: sha256(measured.entropies),
+      distanceImbalancesSha256: sha256(measured.distanceImbalances),
+    };
+  }
   const byGrid = Object.fromEntries(gridSizes.map((gridSize) => {
     const values = samples.filter((sample) => sample.gridSize === gridSize);
     const oracle = latest.get(gridSize)!;
@@ -95,6 +183,7 @@ async function main(): Promise<void> {
       zeroGridValue: oracle.grid[Math.floor(oracle.grid.length / 2)],
       finalLogReturn: oracle.path.logReturn,
       finalExposure: oracle.path.terminalExposure,
+      probabilitiesSha256: oracle.probabilities ? sha256(oracle.probabilities) : undefined,
       versusReference: gridSize === referenceGridSize ? undefined : {
         policyMeanRmse: rmse(oracle.policyMeans, reference.policyMeans),
         modalExposureRmse: rmse(oracle.modalExposures, reference.modalExposures),
@@ -113,13 +202,43 @@ async function main(): Promise<void> {
     gridSizes,
     referenceGridSize,
     execution,
+    holdingPeriodSteps,
+    valueHorizonSteps,
+    maintenanceBps,
     samples,
     byGrid,
+    diagnostics,
   }, null, 2)}\n`);
 }
 
 function mean(values: readonly number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function sha256(values: ArrayBufferView): string {
+  return createHash("sha256")
+    .update(Buffer.from(values.buffer, values.byteOffset, values.byteLength))
+    .digest("hex");
+}
+
+function compare(left: Float32Array, right: Float32Array): {
+  mismatches: number;
+  maximumAbsoluteDifference: number;
+  firstMismatch: number;
+} {
+  let mismatches = 0;
+  let maximumAbsoluteDifference = 0;
+  let firstMismatch = -1;
+  for (let index = 0; index < left.length; index += 1) {
+    if (Object.is(left[index], right[index])) continue;
+    if (firstMismatch < 0) firstMismatch = index;
+    mismatches += 1;
+    maximumAbsoluteDifference = Math.max(
+      maximumAbsoluteDifference,
+      Math.abs(left[index]! - right[index]!),
+    );
+  }
+  return { mismatches, maximumAbsoluteDifference, firstMismatch };
 }
 
 function rmse(left: ArrayLike<number>, right: ArrayLike<number>): number {

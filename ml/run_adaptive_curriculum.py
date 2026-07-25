@@ -7,6 +7,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -559,7 +560,7 @@ class AdaptiveCurriculumRunner:
             text=True,
             bufsize=1,
             start_new_session=True,
-            env={**os.environ, "TMPDIR": "/tmp"},
+            env=os.environ.copy(),
         )
         self.write_status(childPid=process.pid)
         try:
@@ -1128,7 +1129,7 @@ class AdaptiveCurriculumRunner:
             self.run_child(
                 f"project-r{round_index + 1}-{delay_seconds}s-{parent['key']}",
                 [
-                    str(self.repo / ".venv-ml/bin/python"),
+                    sys.executable,
                     str(self.repo / "ml/project_mlp_loss_weights.py"),
                     "--spec",
                     str(specification_file),
@@ -1328,7 +1329,7 @@ class AdaptiveCurriculumRunner:
                 f"{fidelity['key']}{suffix}"
             ),
             [
-                str(self.repo / ".venv-ml/bin/python"),
+                sys.executable,
                 str(self.repo / "ml/run_with_observability.py"),
                 str(self.repo / "ml/train_mlp_population.py"),
                 "--jobs",
@@ -2420,7 +2421,7 @@ class AdaptiveCurriculumRunner:
                 self.run_child(
                     f"export-{candidate['key']}",
                     [
-                        str(self.repo / ".venv-ml/bin/python"),
+                        sys.executable,
                         str(self.repo / "ml/export_mlp_study_artifact.py"),
                         "--dataset",
                         str(self.dataset),

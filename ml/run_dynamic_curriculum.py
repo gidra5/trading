@@ -355,7 +355,7 @@ class CurriculumRunner:
             text=True,
             bufsize=1,
             start_new_session=True,
-            env={**os.environ, "TMPDIR": "/tmp"},
+            env=os.environ.copy(),
         )
         self.write_status(childPid=process.pid)
         try:
@@ -630,7 +630,7 @@ class CurriculumRunner:
             self.run_child(
                 f"dynamic-stage-{stage_index + 1:02d}",
                 [
-                    str(self.repo / ".venv-ml/bin/python"),
+                    sys.executable,
                     str(self.repo / "ml/run_with_observability.py"),
                     str(self.repo / "ml/train_mlp_population.py"),
                     "--jobs",
@@ -807,7 +807,7 @@ class CurriculumRunner:
                 self.run_child(
                     f"export-{candidate['key']}",
                     [
-                        str(self.repo / ".venv-ml/bin/python"),
+                        sys.executable,
                         str(self.repo / "ml/export_mlp_study_artifact.py"),
                         "--dataset", str(self.dataset),
                         "--output", str(directory),

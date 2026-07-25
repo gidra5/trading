@@ -8,18 +8,140 @@ import {
 } from "../src/kama-signal-evaluator.js";
 import { perfectMarginOracle } from "../src/perfect-margin-oracle.js";
 import {
+  conditionalExposureProbabilities,
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
+  exposureHoldingFeasibleInterval,
   prepareExposureValueOracle,
 } from "../src/exposure-value-distillation.js";
 import type { TradingCandle } from "../src/trading-api.js";
 import {
+  directOracleDiagnosticsCuda,
   evaluateVwKamaCudaBatch,
   evaluateVwKamaCudaFitnessCases,
+  exposureHoldingCutoffsCuda,
   prepareExposureValueOracleCuda,
   vwKamaCudaStatus,
 } from "../src/vw-kama-cuda.js";
 
 const MINUTE = 60_000;
+
+test("CUDA mandatory-hold cutoffs match the causal CPU bisection", async (context) => {
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    context.skip(status.reason);
+    return;
+  }
+  const prices = Float64Array.from(
+    { length: 200 },
+    (_, index) => 100 + 35 * Math.sin(index / 5) + 0.04 * index,
+  );
+  const execution = {
+    friction: 0.00175,
+    minExposure: -10,
+    maxExposure: 10,
+    maxEffectiveExposure: 12,
+    quoteLendRate: 1e-7,
+    quoteBorrowRate: 2e-7,
+    assetBorrowRate: 3e-7,
+  };
+  const count = 180;
+  const holdingPeriodSteps = 20;
+  const gpu = await exposureHoldingCutoffsCuda(
+    prices,
+    count,
+    holdingPeriodSteps,
+    execution,
+  );
+  for (let index = 0; index < count; index += 1) {
+    const cpu = exposureHoldingFeasibleInterval(
+      prices,
+      index,
+      holdingPeriodSteps,
+      execution,
+    );
+    assert.ok(Math.abs(gpu.cutoffLowers[index]! - cpu.lower) < 1e-7);
+    assert.ok(Math.abs(gpu.cutoffUppers[index]! - cpu.upper) < 1e-7);
+  }
+});
+
+test("CUDA direct-oracle diagnostics match the transition-aware CPU surface", async (context) => {
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    context.skip(status.reason);
+    return;
+  }
+  const actions = Float64Array.from({ length: 21 }, (_, index) => index - 10);
+  const currents = Float64Array.from({ length: 25 }, (_, index) => index - 12);
+  const count = 32;
+  const probabilities = new Float32Array(count * actions.length);
+  const cutoffLowers = new Float64Array(count);
+  const cutoffUppers = new Float64Array(count);
+  for (let row = 0; row < count; row += 1) {
+    let total = 0;
+    for (let action = 0; action < actions.length; action += 1) {
+      const value = Math.exp(-Math.abs(action - row % actions.length) / 3)
+        + action % 4 * 0.001;
+      probabilities[row * actions.length + action] = value;
+      total += value;
+    }
+    for (let action = 0; action < actions.length; action += 1) {
+      probabilities[row * actions.length + action] /= total;
+    }
+    cutoffLowers[row] = -10 + row % 4;
+    cutoffUppers[row] = 10 - row % 5;
+  }
+  const options = {
+    visibleLower: -5,
+    visibleUpper: 5,
+    friction: 0.00175,
+    transitionLogScale: 100,
+    distanceEpsilon: 1e-6,
+  };
+  const gpu = await directOracleDiagnosticsCuda(
+    probabilities,
+    actions,
+    currents,
+    cutoffLowers,
+    cutoffUppers,
+    options,
+  );
+  const visibleActions = Float64Array.from(actions.filter((action) =>
+    action >= options.visibleLower && action <= options.visibleUpper));
+  const visibleCurrents = currents.filter((current) =>
+    current >= options.visibleLower && current <= options.visibleUpper);
+  for (let row = 0; row < count; row += 1) {
+    const base = Float64Array.from(visibleActions, (action) => {
+      const actionIndex = actions.indexOf(action);
+      return action >= cutoffLowers[row]! && action <= cutoffUppers[row]!
+        ? probabilities[row * actions.length + actionIndex]!
+        : 0;
+    });
+    let expectedEntropy = 0;
+    let expectedDisplacement = 0;
+    let expectedDistance = 0;
+    for (const current of visibleCurrents) {
+      const target = conditionalExposureProbabilities(
+        base,
+        visibleActions,
+        current,
+        options.friction,
+        options.transitionLogScale,
+      );
+      for (let action = 0; action < target.length; action += 1) {
+        const probability = target[action]!;
+        if (probability > 0) expectedEntropy -= probability * Math.log(probability);
+        const displacement = visibleActions[action]! - current;
+        expectedDisplacement += probability * displacement;
+        expectedDistance += probability * Math.abs(displacement);
+      }
+    }
+    expectedEntropy /= visibleCurrents.length;
+    const expectedAdvice = expectedDisplacement
+      / (expectedDistance + options.distanceEpsilon);
+    assert.ok(Math.abs(gpu.entropies[row]! - expectedEntropy) < 1e-5);
+    assert.ok(Math.abs(gpu.distanceImbalances[row]! - expectedAdvice) < 1e-5);
+  }
+});
 
 test("CUDA rolling-horizon oracle matches CPU statistics through liquidations", async (context) => {
   const status = await vwKamaCudaStatus();
@@ -58,6 +180,65 @@ test("CUDA rolling-horizon oracle matches CPU statistics through liquidations", 
     }
   }
   assert.ok(Math.abs(cpu.path.logReturn - gpu.path.logReturn) < 1e-10);
+});
+
+test("CUDA distribution-only oracle is deterministic and faithful to the full statistics path", async (context) => {
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    context.skip(status.reason);
+    return;
+  }
+  const prices = Float64Array.from({ length: 600 }, (_, index) =>
+    100 * Math.exp(index * 0.00001 + Math.sin(index / 17) * 0.002));
+  const options = {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 5,
+    valueHorizonSteps: 60,
+    friction: 0.00175,
+    gridSize: 21,
+    minExposure: -10,
+    maxExposure: 10,
+    maxEffectiveExposure: 12,
+    temperature: 0.01,
+    quoteLendRate: 0.000001,
+    quoteBorrowRate: 0.000002,
+    assetBorrowRate: 0.000003,
+    includeProbabilities: true,
+    includePath: false,
+  };
+  const full = (await prepareExposureValueOracleCuda(prices, options)).oracle;
+  const first = (await prepareExposureValueOracleCuda(prices, {
+    ...options,
+    distributionOnly: true,
+  })).oracle;
+  const second = (await prepareExposureValueOracleCuda(prices, {
+    ...options,
+    distributionOnly: true,
+  })).oracle;
+  assert.equal(first.probabilities!.length, full.probabilities!.length);
+  let maximumDifference = 0;
+  let maximumRowKlDivergence = 0;
+  for (let row = 0; row < prices.length; row += 1) {
+    let rowKlDivergence = 0;
+    for (let action = 0; action < options.gridSize; action += 1) {
+      const index = row * options.gridSize + action;
+      const expected = full.probabilities![index]!;
+      const actual = first.probabilities![index]!;
+      maximumDifference = Math.max(maximumDifference, Math.abs(expected - actual));
+      if (expected > 0 && actual > 0) {
+        rowKlDivergence += expected * Math.log(expected / actual);
+      }
+    }
+    maximumRowKlDivergence = Math.max(maximumRowKlDivergence, rowKlDivergence);
+  }
+  assert.ok(maximumDifference < 1e-5, `maximum probability drifted by ${maximumDifference}`);
+  assert.ok(
+    maximumRowKlDivergence < 1e-6,
+    `maximum row KL divergence drifted by ${maximumRowKlDivergence}`,
+  );
+  assert.deepEqual(second.probabilities, first.probabilities);
+  assert.equal(first.path.logReturn, 0);
+  assert.ok(first.path.exposures.every((value) => value === 0));
 });
 
 test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {

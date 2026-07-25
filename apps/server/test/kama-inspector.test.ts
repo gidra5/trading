@@ -389,7 +389,7 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
       id: "catalog-test",
       label: "Catalog test MLP",
       createdAt: "2026-07-20T00:00:00.000Z",
-      featureSchemaVersion: 5,
+      featureSchemaVersion: 6,
       inputFeatureCount: 901,
       outputRepresentation: "base-action-logits",
       outputActionCount: 255,

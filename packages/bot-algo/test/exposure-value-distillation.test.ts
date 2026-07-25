@@ -173,6 +173,46 @@ test("exposure-value oracle can retain absolute post-action log returns", () => 
   assert.equal(truncateExposureValueOracle(oracle, 1).actionValues?.length, oracle.grid.length);
 });
 
+test("passive holding is an exact linear transform in quote and asset amounts", () => {
+  const prices = [100, 103, 98, 107, 109];
+  const holdingPeriodSteps = 3;
+  const quoteLendRate = 0.0001;
+  const quoteBorrowRate = 0.0002;
+  const assetBorrowRate = 0.0003;
+  const oracle = prepareExposureValueOracle(prices, {
+    scoreStartIndex: 0,
+    holdingPeriodSteps,
+    valueHorizonSteps: holdingPeriodSteps,
+    friction: 0.001,
+    gridSize: 9,
+    minExposure: -2,
+    maxExposure: 2,
+    maxEffectiveExposure: 1_000,
+    temperature: 0.01,
+    quoteLendRate,
+    quoteBorrowRate,
+    assetBorrowRate,
+    includeActionValues: true,
+  });
+  const firstRow = oracle.actionValues!.subarray(0, oracle.grid.length);
+  const priceRatio = prices[holdingPeriodSteps]! / prices[0]!;
+  for (let index = 0; index < oracle.grid.length; index += 1) {
+    const exposure = oracle.grid[index]!;
+    const quoteFactor = (1 + (
+      exposure <= 1 ? quoteLendRate : quoteBorrowRate
+    )) ** holdingPeriodSteps;
+    const assetFactor = priceRatio * (
+      exposure < 0 ? (1 + assetBorrowRate) ** holdingPeriodSteps : 1
+    );
+    const expectedEquity = quoteFactor * (1 - exposure) + assetFactor * exposure;
+    assert.ok(expectedEquity > 0);
+    assert.ok(
+      Math.abs(Math.exp(firstRow[index]!) - expectedEquity) < 1e-12,
+      { exposure, actual: Math.exp(firstRow[index]!), expectedEquity },
+    );
+  }
+});
+
 test("mandatory-hold survival cutoffs reject any action that liquidates", () => {
   const prices = [100, 50, 150];
   const execution = {

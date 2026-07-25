@@ -442,7 +442,11 @@ function fitSingleCase(
       input_queue_batches: 1,
       pipelined_refinement: false,
     })}\n`);
-    const outcome = spawnSync(path.join(repoRoot, ".venv-ml/bin/python"), [
+    const outcome = spawnSync(path.join(
+      repoRoot,
+      ".venv-ml",
+      process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+    ), [
       path.join(repoRoot, "ml/fit_teacher_cuda.py"),
       "--input", input,
       "--count", "1",

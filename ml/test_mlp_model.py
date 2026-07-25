@@ -6,15 +6,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import zstandard
 
 from mlp_model import (
+    DirectLossWeights,
     FEATURE_SCHEMA_VERSION,
     INPUT_FEATURE_COUNT,
     ExposureMlp,
     LossWeights,
     PolicySupport,
     TimeWeighting,
+    conditional_transaction_transition,
     distance_imbalance_time_weights,
+    direct_oracle_loss,
     fitted_teacher_loss,
     gaussian_oracle_mutual_information,
     gaussian_temporal_mutual_information,
@@ -29,7 +33,9 @@ from train_mlp import (
     TemporalBlockBatchSampler,
     cached_training_normalization,
     cached_training_parameter_scale,
+    continuation_learning_rate_multiplier,
     merge_weighted_moments,
+    resume_contract_is_monotonic_extension,
     validate_dataset_manifest,
     weighted_standard_deviation,
     weighted_variance,
@@ -38,8 +44,54 @@ from train_mlp import (
 
 class MarketOnlyInputContractTests(unittest.TestCase):
     def test_model_uses_only_901_market_features(self) -> None:
-        self.assertEqual(FEATURE_SCHEMA_VERSION, 5)
+        self.assertEqual(FEATURE_SCHEMA_VERSION, 6)
         self.assertEqual(INPUT_FEATURE_COUNT, 901)
+
+    def test_resume_contract_allows_only_monotonic_horizon_extension(self) -> None:
+        original = {
+            "datasetVersion": 12,
+            "epochs": 64,
+            "patience": 8,
+        }
+        extended = {
+            **original,
+            "epochs": 256,
+            "patience": 16,
+        }
+        self.assertTrue(resume_contract_is_monotonic_extension(
+            original,
+            extended,
+        ))
+        self.assertFalse(resume_contract_is_monotonic_extension(
+            original,
+            {**extended, "datasetVersion": 13},
+        ))
+        self.assertFalse(resume_contract_is_monotonic_extension(
+            original,
+            {**extended, "patience": 4},
+        ))
+
+    def test_continuation_schedule_is_smooth_and_monotonic(self) -> None:
+        start = 172_723
+        total = 983_000
+        initial = 0.2612729393
+        values = [
+            continuation_learning_rate_multiplier(
+                step,
+                total,
+                start,
+                initial,
+            )
+            for step in (start, start + 1, 400_000, total)
+        ]
+        self.assertAlmostEqual(values[0], initial)
+        self.assertLess(abs(values[1] - initial), 1e-9)
+        self.assertTrue(all(
+            left >= right
+            for left, right in zip(values, values[1:])
+        ))
+        self.assertAlmostEqual(values[-1], 0.05)
+
 
     def test_runtime_minute_targets_follow_latest_completed_minute(self) -> None:
         day = 1_750_000_000_000 // 86_400_000 * 86_400_000
@@ -72,6 +124,274 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             targets[:4][:, 0],
             np.asarray([0, 1, 1, 1], dtype=np.float32),
         )
+
+
+class DirectOracleTrainingPathTests(unittest.TestCase):
+    def test_base_ce_and_pmse_match_direct_distribution_reference(self) -> None:
+        generator = torch.Generator().manual_seed(7)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        target = torch.softmax(torch.randn(5, 255, generator=generator), dim=-1)
+        logits = torch.randn(5, 255, generator=generator, requires_grad=True)
+        time_weights = torch.tensor([1.0, 3.0, 0.5, 2.0, 4.0])
+        weights = DirectLossWeights(
+            cross_entropy=1.0,
+            probability_mse=0.75,
+            excess_entropy=0.0,
+            temporal_mutual_information=0.0,
+            oracle_mutual_information=0.0,
+        )
+
+        actual = direct_oracle_loss(
+            logits,
+            target,
+            actions,
+            torch.linspace(-100.0, 100.0, 31).view(1, -1),
+            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+            weights,
+            time_weights,
+            torch.arange(5, dtype=torch.int64) * 1_000,
+            1_000,
+            include_diagnostics=False,
+            required_loss_terms=frozenset(("cross_entropy", "probability_mse")),
+        )
+        visible = (actions >= -100.0) & (actions <= 100.0)
+        predicted_log = torch.log_softmax(
+            logits.masked_fill(~visible, torch.finfo(torch.float32).min),
+            dim=-1,
+        )
+        predicted = predicted_log.exp()
+        visible_target = target.masked_fill(~visible, 0.0)
+        visible_target = visible_target / visible_target.sum(dim=-1, keepdim=True)
+        normalized_weight = time_weights / time_weights.mean()
+        cross_entropy = (
+            normalized_weight * -(visible_target * predicted_log).sum(dim=-1)
+        ).sum() / normalized_weight.sum()
+        probability_mse = (
+            normalized_weight
+            * (visible_target - predicted).square().mean(dim=-1)
+        ).sum() / normalized_weight.sum()
+        expected = cross_entropy + 0.75 * probability_mse
+
+        torch.testing.assert_close(actual["probabilityMse"], probability_mse)
+        torch.testing.assert_close(actual["loss"], expected)
+
+    def test_oracle_mi_matches_base_distribution_moments(self) -> None:
+        generator = torch.Generator().manual_seed(23)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        current = torch.linspace(-100.0, 100.0, 31).view(1, -1)
+        support = PolicySupport(
+            -250.0,
+            250.0,
+            -100.0,
+            100.0,
+            0.00175,
+            0.01,
+        )
+        logits = torch.randn(8, 255, generator=generator)
+        target = torch.softmax(torch.randn(8, 255, generator=generator), dim=-1)
+        times = torch.arange(8, dtype=torch.int64) * 1_000
+        time_weights = torch.linspace(1.0, 2.0, 8)
+        result = direct_oracle_loss(
+            logits,
+            target,
+            actions,
+            current,
+            support,
+            DirectLossWeights(
+                cross_entropy=0.0,
+                probability_mse=0.0,
+                excess_entropy=0.0,
+                temporal_mutual_information=0.0,
+                oracle_mutual_information=1.0,
+            ),
+            time_weights,
+            times,
+            1_000,
+            include_diagnostics=False,
+            required_loss_terms=frozenset(("oracle_mutual_information",)),
+        )
+        visible = (actions >= -100.0) & (actions <= 100.0)
+        predicted = torch.softmax(
+            logits.masked_fill(~visible, torch.finfo(torch.float32).min),
+            dim=-1,
+        )
+        normalized_target = target.masked_fill(~visible, 0.0)
+        normalized_target = (
+            normalized_target
+            / normalized_target.sum(dim=-1, keepdim=True)
+        )
+        action = actions.view(1, -1)
+        expected = gaussian_oracle_mutual_information(
+            (predicted * action).sum(dim=-1, keepdim=True),
+            (predicted * action.square()).sum(dim=-1, keepdim=True),
+            (normalized_target * action).sum(dim=-1, keepdim=True),
+            (normalized_target * action.square()).sum(dim=-1, keepdim=True),
+            times,
+            time_weights / time_weights.mean(),
+            1_000,
+            actions.numel(),
+        )
+
+        torch.testing.assert_close(result["oracleMutualInformation"], expected)
+        torch.testing.assert_close(result["loss"], -expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_compiled_base_loss_is_finite_under_fp16_autocast(self) -> None:
+        device = torch.device("cuda")
+        actions = torch.linspace(-250.0, 250.0, 255, device=device)
+        current = torch.linspace(
+            -100.0,
+            100.0,
+            31,
+            device=device,
+        ).view(1, -1)
+        support = PolicySupport(
+            -250.0,
+            250.0,
+            -100.0,
+            100.0,
+            0.00175,
+            0.01,
+        )
+        weights = DirectLossWeights(
+            cross_entropy=torch.tensor(1.0, device=device),
+            probability_mse=torch.tensor(1.0, device=device),
+            excess_entropy=torch.tensor(0.0, device=device),
+            temporal_mutual_information=torch.tensor(0.0, device=device),
+            oracle_mutual_information=torch.tensor(0.5, device=device),
+        )
+        required = frozenset((
+            "cross_entropy",
+            "probability_mse",
+            "oracle_mutual_information",
+        ))
+
+        def objective(logits, target, time_weights, times):
+            return direct_oracle_loss(
+                logits,
+                target,
+                actions,
+                current,
+                support,
+                weights,
+                time_weights,
+                times,
+                1_000,
+                include_diagnostics=False,
+                required_loss_terms=required,
+            )["loss"]
+
+        compiled = torch.compile(objective, mode="reduce-overhead", fullgraph=False)
+        logits = (
+            torch.randn(64, 255, device=device) * 4.0
+        ).clamp(-18.0, 18.0).requires_grad_(True)
+        target = torch.softmax(torch.randn(64, 255, device=device), dim=-1)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            loss = compiled(
+                logits,
+                target,
+                torch.ones(64, device=device),
+                torch.arange(64, device=device, dtype=torch.int64) * 1_000,
+            )
+        loss.backward()
+        torch.cuda.synchronize()
+
+        self.assertTrue(bool(torch.isfinite(loss)))
+        self.assertTrue(bool(torch.isfinite(logits.grad).all()))
+        self.assertGreater(float(logits.grad.abs().max()), 1e-8)
+
+    def test_compact_training_path_preserves_loss_and_gradient(self) -> None:
+        generator = torch.Generator().manual_seed(14)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        current = torch.linspace(-100.0, 100.0, 31).view(1, -1).expand(4, -1)
+        target = torch.softmax(torch.randn(4, 255, generator=generator), dim=-1)
+        logits = torch.randn(4, 255, generator=generator, requires_grad=True)
+        weights = DirectLossWeights(
+            cross_entropy=1.0,
+            probability_mse=1.0,
+            excess_entropy=0.0,
+            temporal_mutual_information=0.0,
+            oracle_mutual_information=0.5,
+        )
+        arguments = (
+            target,
+            actions,
+            current,
+            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+            weights,
+            torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            torch.arange(4, dtype=torch.int64) * 1_000,
+            1_000,
+        )
+
+        full = direct_oracle_loss(logits, *arguments)
+        full["loss"].backward()
+        full_gradient = logits.grad.detach().clone()
+        logits.grad = None
+        compact = direct_oracle_loss(
+            logits,
+            *arguments,
+            include_diagnostics=False,
+            required_loss_terms=frozenset((
+                "cross_entropy",
+                "probability_mse",
+                "oracle_mutual_information",
+            )),
+        )
+        compact["loss"].backward()
+
+        torch.testing.assert_close(compact["loss"], full["loss"])
+        torch.testing.assert_close(logits.grad, full_gradient)
+        self.assertNotIn("klDivergence", compact)
+        self.assertNotIn("temporalMutualInformation", compact)
+        self.assertIn("oracleMutualInformation", compact)
+
+    def test_indexed_minute_targets_and_precomputed_transition_preserve_loss(
+        self,
+    ) -> None:
+        generator = torch.Generator().manual_seed(41)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        current = torch.linspace(-100.0, 100.0, 31).view(1, -1)
+        unique_targets = torch.softmax(
+            torch.randn(3, 255, generator=generator),
+            dim=-1,
+        )
+        target_rows = torch.tensor([0, 0, 1, 1, 1, 2], dtype=torch.int64)
+        expanded_targets = unique_targets[target_rows]
+        logits = torch.randn(6, 255, generator=generator)
+        weights = DirectLossWeights(
+            cross_entropy=1.0,
+            probability_mse=1.0,
+            excess_entropy=0.0,
+            temporal_mutual_information=0.0,
+            oracle_mutual_information=0.5,
+        )
+        common = (
+            actions,
+            current.expand(6, -1),
+            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+            weights,
+            torch.ones(6),
+            torch.arange(6, dtype=torch.int64) * 1_000,
+            1_000,
+        )
+        expanded = direct_oracle_loss(logits, expanded_targets, *common)
+        indexed = direct_oracle_loss(
+            logits,
+            unique_targets,
+            actions,
+            current,
+            *common[2:],
+            target_row_indices=target_rows,
+            transaction_transition=conditional_transaction_transition(
+                actions,
+                current,
+                common[2],
+            ),
+        )
+
+        for name in expanded:
+            torch.testing.assert_close(indexed[name], expanded[name])
 
 
 class ValidationMetricAggregationTests(unittest.TestCase):
@@ -215,6 +535,86 @@ class ValidationMetricAggregationTests(unittest.TestCase):
             )
             self.assertEqual(float(minute_dataset[0][1][0]), 10.0)
             self.assertEqual(float(minute_dataset[1][1][0]), 11.0)
+            minute_dataset.close()
+            dataset.close()
+
+    def test_dataset_streams_compressed_persisted_minute_days(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            action_count = 8
+            np.zeros((3, INPUT_FEATURE_COUNT), dtype="<f2").tofile(root / "inputs.f16")
+            np.zeros((61, 8), dtype="<f4").tofile(root / "parameters.f32")
+            np.zeros((61, 8), dtype="<f4").tofile(root / "raw-oracle.f32")
+            np.zeros((61, 7), dtype="<f4").tofile(root / "metrics.f32")
+            np.zeros(3, dtype="<f4").tofile(root / "resolution.f32")
+            np.ones(3, dtype="<f4").tofile(root / "weights.f32")
+            minute = np.repeat(
+                np.arange(1_441, dtype="<f4")[:, None],
+                action_count,
+                axis=1,
+            )
+            (root / "minute-oracle.f32.zst").write_bytes(
+                zstandard.ZstdCompressor(level=3).compress(minute.tobytes())
+            )
+            manifest = {
+                "featureCount": INPUT_FEATURE_COUNT,
+                "teacherParameterCount": 8,
+                "teacherMetricCount": 7,
+                "actionCount": action_count,
+                "samplingIntervalMs": 1_000,
+                "minuteOracleMap": {
+                    "storage": "persisted-per-minute-day",
+                    "factorCompression": "zstd",
+                    "storedRowsPerUtcDay": 1_441,
+                },
+                "shards": [{
+                    "split": "train",
+                    "count": 3,
+                    "features": "inputs.f16",
+                    "featureRowOffset": 0,
+                    "featureRowStride": 1,
+                    "teacherParameters": "parameters.f32",
+                    "teacherMetrics": "metrics.f32",
+                    "rawOracleProbabilities": "raw-oracle.f32",
+                    "minuteOracleProbabilities": "minute-oracle.f32.zst",
+                    "resolutionDivergence": "resolution.f32",
+                    "oracleRowOffset": 58,
+                    "oracleRowStride": 1,
+                    "baseTimeWeights": "weights.f32",
+                    "timeWeights": "weights.f32",
+                    "predictionTimeStart": 58_000,
+                }],
+            }
+            dataset = FittedPolicyDataset(
+                manifest,
+                root,
+                "train",
+                target="minuteOracleProbabilities",
+            )
+            batch = dataset.__getitems__(range(0, 3))
+            torch.testing.assert_close(
+                batch[1][:, 0],
+                torch.tensor([0.0, 1.0, 1.0]),
+            )
+            compact_dataset = FittedPolicyDataset(
+                manifest,
+                root,
+                "train",
+                target="minuteOracleProbabilities",
+                compact_minute_targets=True,
+            )
+            compact_batch = compact_dataset.__getitems__(range(0, 3))
+            self.assertEqual(compact_batch[1].shape, (2, action_count))
+            torch.testing.assert_close(
+                compact_batch[5],
+                torch.tensor([0, 1, 1]),
+            )
+            torch.testing.assert_close(
+                compact_batch[1][compact_batch[5]][:, 0],
+                batch[1][:, 0],
+            )
+            compact_dataset.close()
+            dataset.close()
 
     def test_dataset_coalesces_temporal_runs_across_component_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +667,7 @@ class ValidationMetricAggregationTests(unittest.TestCase):
             batch = dataset.__getitems__(range(1, 4))
             self.assertEqual(tuple(batch[0].shape), (3, INPUT_FEATURE_COUNT))
             torch.testing.assert_close(batch[3], torch.tensor([1_999, 2_999, 9_999]))
+            dataset.close()
 
     def test_training_statistics_are_reused_from_valid_caches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -26,7 +26,7 @@ class PopulationMlpTests(unittest.TestCase):
         expected = prototype(features)
         actual = population(features)
 
-        self.assertEqual(actual.shape, (3, 5, 8))
+        self.assertEqual(actual.shape, (3, *expected.shape))
         torch.testing.assert_close(actual[0], expected, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(actual[1], expected, rtol=1e-5, atol=1e-5)
         extracted = population.member_state_dict(2)
@@ -130,7 +130,6 @@ class PopulationMlpTests(unittest.TestCase):
         weights = {
             "crossEntropy": 1,
             "probabilityMse": 0.25,
-            "parameterMse": 0,
             "excessEntropy": 0,
             "temporalMutualInformation": 4,
             "oracleMutualInformation": 1,
@@ -138,7 +137,6 @@ class PopulationMlpTests(unittest.TestCase):
         stored_weights = {
             "cross_entropy": 1.0,
             "probability_mse": 0.25,
-            "parameter_mse": 0.0,
             "excess_entropy": 0.0,
             "temporal_mutual_information": 4.0,
             "oracle_mutual_information": 1.0,

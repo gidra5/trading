@@ -12,8 +12,6 @@ import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 
 const DAY_MS = 86_400_000;
 const SECOND_MS = 1_000;
-const FLOAT32_TO_FLOAT16_SCRATCH = new Float32Array(1);
-const FLOAT32_TO_FLOAT16_BITS = new Uint32Array(FLOAT32_TO_FLOAT16_SCRATCH.buffer);
 
 interface Plan {
   dataDir: string;
@@ -48,20 +46,25 @@ async function main(): Promise<void> {
     const scored = source.slice(DAY_MS / SECOND_MS);
     const times = scored.map((candle) => candle.closeTime);
     const features = await store.prepare(source, times);
-    const started = performance.now();
+    const encodingStarted = performance.now();
     const encoded = encodeFeatureRows(times, features);
+    const encodingMs = performance.now() - encodingStarted;
+    const compressionStarted = performance.now();
     const compressed = zstdCompressSync(encoded, {
       params: {
         [zlibConstants.ZSTD_c_compressionLevel]: 3,
       },
     });
+    const compressionMs = performance.now() - compressionStarted;
     const prefix = path.join("components", "inputs", request.date);
     const featureFile = `${prefix}.features.f16.zst`;
     const timeFile = `${prefix}.times.i64`;
+    const persistStarted = performance.now();
     await Promise.all([
       writeAtomic(path.join(output, featureFile), compressed),
       writeAtomic(path.join(output, timeFile), encodeTimes(times)),
     ]);
+    const persistMs = performance.now() - persistStarted;
     process.stdout.write(`${JSON.stringify({
       event: "dataset-component",
       component: "inputs",
@@ -75,7 +78,9 @@ async function main(): Promise<void> {
       rowSelectionSignature: "full",
       day: request.day,
       days: request.days,
-      encodingMs: performance.now() - started,
+      encodingMs,
+      compressionMs,
+      persistMs,
       compressedBytes: compressed.byteLength,
     })}\n`);
   }
@@ -113,13 +118,13 @@ function encodeFeatureRows(
   times: readonly number[],
   features: Awaited<ReturnType<MlpFeatureStore["prepare"]>>,
 ): Buffer {
-  const values = new Float32Array(times.length * MLP_INPUT_FEATURE_COUNT);
-  for (let row = 0; row < times.length; row += 1) {
-    features.encode(times[row]!, values, row * MLP_INPUT_FEATURE_COUNT);
-  }
-  const half = new Uint16Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    half[index] = float32ToFloat16(values[index]!);
+  const half = new Uint16Array(times.length * MLP_INPUT_FEATURE_COUNT);
+  if (features.encodeHalfRows) {
+    features.encodeHalfRows(times, half);
+  } else {
+    for (let row = 0; row < times.length; row += 1) {
+      features.encodeHalf(times[row]!, half, row * MLP_INPUT_FEATURE_COUNT);
+    }
   }
   return Buffer.from(half.buffer, half.byteOffset, half.byteLength);
 }
@@ -130,26 +135,6 @@ function encodeTimes(times: readonly number[]): Buffer {
     buffer.writeBigInt64LE(BigInt(times[index]!), index * 8);
   }
   return buffer;
-}
-
-function float32ToFloat16(value: number): number {
-  FLOAT32_TO_FLOAT16_SCRATCH[0] = value;
-  const raw = FLOAT32_TO_FLOAT16_BITS[0]!;
-  const sign = raw >>> 16 & 0x8000;
-  let exponent = (raw >>> 23 & 0xff) - 127 + 15;
-  let mantissa = raw & 0x7fffff;
-  if (exponent <= 0) {
-    if (exponent < -10) return sign;
-    mantissa = (mantissa | 0x800000) >>> (1 - exponent);
-    return sign | (mantissa + 0x1000 >>> 13);
-  }
-  if (exponent >= 31) return sign | 0x7c00;
-  mantissa += 0x1000;
-  if (mantissa & 0x800000) {
-    mantissa = 0;
-    exponent += 1;
-  }
-  return exponent >= 31 ? sign | 0x7c00 : sign | exponent << 10 | mantissa >>> 13;
 }
 
 async function writeAtomic(file: string, value: Uint8Array): Promise<void> {

@@ -12,8 +12,8 @@ import {
   createExposureConditionalBinScratch,
   createExposureValueOracleStorage,
   normalizeExposureValueDistillationLossConfig,
-  shareExposureValueOracle,
   strategyExposureTemperatures,
+  type ExposureExecutionOptions,
   type ExposureValueDistillationLossConfig,
   type ExposureValueOracleOptions,
 } from "./exposure-value-distillation.js";
@@ -22,7 +22,10 @@ const PARAMETER_SIZE = 216;
 const RESULT_SIZE = 192;
 const INT_PARAMETER_COUNT = 21;
 const nativeDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../native/cuda/build");
-const defaultLibraryPath = path.join(nativeDirectory, "libvw_kama_cuda.so");
+const defaultLibraryPath = path.join(
+  nativeDirectory,
+  process.platform === "win32" ? "vw_kama_cuda.dll" : "libvw_kama_cuda.so",
+);
 
 type CudaHandle = number | bigint;
 
@@ -32,6 +35,24 @@ interface NativeCuda {
   lastError(): string;
   parameterSize(): number;
   resultSize(): number;
+  assembleMlpFeaturesHalf(
+    secondFeatures: Uint16Array,
+    secondCount: number,
+    minuteFeatures: Uint16Array,
+    minuteCount: number,
+    hourFeatures: Uint16Array,
+    hourCount: number,
+    dayFeatures: Uint16Array,
+    dayCount: number,
+    monthFeatures: Uint16Array,
+    monthCount: number,
+    quarterFeatures: Uint16Array,
+    quarterCount: number,
+    completeEnds: Int32Array,
+    partialFeatures: Float32Array,
+    rowCount: number,
+    output: Uint16Array,
+  ): number;
   createFitnessCase(
     high: Float64Array | null,
     low: Float64Array | null,
@@ -101,6 +122,8 @@ interface NativeCuda {
     assetBorrowRate: number,
     initialExposure: number,
     terminalIndex: number,
+    includePath: number,
+    distributionOnly: number,
     means: Float32Array,
     secondMoments: Float32Array,
     modalExposures: Float32Array,
@@ -117,6 +140,38 @@ interface NativeCuda {
     pathExposures: Float32Array,
     pathEquities: Float64Array,
     pathMetrics: Float64Array,
+    elapsedMs: Float64Array,
+  ): number;
+  directOracleDiagnostics(
+    probabilities: Float32Array,
+    exampleCount: number,
+    actions: Float64Array,
+    actionCount: number,
+    currents: Float64Array,
+    currentCount: number,
+    cutoffLowers: Float64Array,
+    cutoffUppers: Float64Array,
+    visibleLower: number,
+    visibleUpper: number,
+    friction: number,
+    transitionLogScale: number,
+    distanceEpsilon: number,
+    entropies: Float32Array,
+    distanceImbalances: Float32Array,
+    elapsedMs: Float64Array,
+  ): number;
+  exposureHoldingCutoffs(
+    prices: Float64Array,
+    priceCount: number,
+    exampleCount: number,
+    holdingPeriodSteps: number,
+    friction: number,
+    maximumEffectiveExposure: number,
+    quoteLendRate: number,
+    quoteBorrowRate: number,
+    assetBorrowRate: number,
+    cutoffLowers: Float64Array,
+    cutoffUppers: Float64Array,
     elapsedMs: Float64Array,
   ): number;
   evaluate(
@@ -229,6 +284,45 @@ export interface ExposureValueOracleCudaResult {
   kernelMs: number;
 }
 
+export interface DirectOracleDiagnosticsCudaOptions {
+  visibleLower: number;
+  visibleUpper: number;
+  friction: number;
+  transitionLogScale: number;
+  distanceEpsilon: number;
+}
+
+export interface DirectOracleDiagnosticsCudaResult {
+  entropies: Float32Array;
+  distanceImbalances: Float32Array;
+  kernelMs: number;
+}
+
+export interface ExposureHoldingCutoffsCudaResult {
+  cutoffLowers: Float64Array;
+  cutoffUppers: Float64Array;
+  kernelMs: number;
+}
+
+export interface MlpHalfFeatureAssembly {
+  sources: readonly [
+    Uint16Array,
+    Uint16Array,
+    Uint16Array,
+    Uint16Array,
+    Uint16Array,
+    Uint16Array,
+  ];
+  completeEnds: Int32Array;
+  partialFeatures: Float32Array;
+  rowCount: number;
+  output: Uint16Array;
+}
+
+export type MlpHalfFeatureAssembler = (
+  assembly: MlpHalfFeatureAssembly,
+) => void;
+
 let loaded: NativeCuda | null | undefined;
 let loadFailure: string | undefined;
 let nextObjectId = 1;
@@ -267,6 +361,34 @@ export async function vwKamaCudaStatus(): Promise<VwKamaCudaStatus> {
       libraryPath,
     };
   }
+}
+
+export async function prepareMlpHalfFeatureAssembler(): Promise<MlpHalfFeatureAssembler> {
+  const native = await loadNative();
+  return ({ sources, completeEnds, partialFeatures, rowCount, output }) => {
+    if (!Number.isInteger(rowCount) || rowCount < 0
+      || completeEnds.length !== rowCount * 6
+      || partialFeatures.length !== rowCount * 25
+      || output.length !== rowCount * 901
+      || sources.some((source) => source.length % 4 !== 0)) {
+      throw new Error("Native MLP half feature assembly has incompatible storage.");
+    }
+    const status = native.assembleMlpFeaturesHalf(
+      sources[0], sources[0].length / 4,
+      sources[1], sources[1].length / 4,
+      sources[2], sources[2].length / 4,
+      sources[3], sources[3].length / 4,
+      sources[4], sources[4].length / 4,
+      sources[5], sources[5].length / 4,
+      completeEnds,
+      partialFeatures,
+      rowCount,
+      output,
+    );
+    if (status !== 0) {
+      throw new Error(`Native MLP half feature assembly failed: ${native.lastError()}`);
+    }
+  };
 }
 
 export async function evaluateVwKamaCudaBatch(
@@ -557,6 +679,133 @@ function withCoherentOracleReturn(
   };
 }
 
+/** Computes exact mandatory-hold survival intervals for a dense time prefix. */
+export async function exposureHoldingCutoffsCuda(
+  pricesInput: ArrayLike<number>,
+  exampleCount: number,
+  holdingPeriodSteps: number,
+  execution: ExposureExecutionOptions,
+  shared = false,
+): Promise<ExposureHoldingCutoffsCudaResult> {
+  const prices = pricesInput instanceof Float64Array
+    ? pricesInput
+    : Float64Array.from(pricesInput);
+  if (!Number.isInteger(exampleCount) || exampleCount < 1
+    || exampleCount > prices.length
+    || !Number.isInteger(holdingPeriodSteps) || holdingPeriodSteps < 1
+    || !prices.every((price) => Number.isFinite(price) && price > 0)
+    || !Number.isFinite(execution.friction)
+    || execution.friction < 0
+    || execution.friction >= 1
+    || !Number.isFinite(execution.maxEffectiveExposure)
+    || execution.maxEffectiveExposure <= 0
+    || !Number.isFinite(execution.quoteLendRate)
+    || execution.quoteLendRate < 0
+    || !Number.isFinite(execution.quoteBorrowRate)
+    || execution.quoteBorrowRate < 0
+    || !Number.isFinite(execution.assetBorrowRate)
+    || execution.assetBorrowRate < 0) {
+    throw new Error("Exposure holding CUDA cutoffs received invalid inputs.");
+  }
+  const native = await loadNative();
+  const cutoffLowers = allocateFloat64(exampleCount, shared);
+  const cutoffUppers = allocateFloat64(exampleCount, shared);
+  const elapsedMs = new Float64Array(1);
+  const status = native.exposureHoldingCutoffs(
+    prices,
+    prices.length,
+    exampleCount,
+    holdingPeriodSteps,
+    execution.friction,
+    execution.maxEffectiveExposure,
+    execution.quoteLendRate,
+    execution.quoteBorrowRate,
+    execution.assetBorrowRate,
+    cutoffLowers,
+    cutoffUppers,
+    elapsedMs,
+  );
+  if (status !== 0) {
+    throw new Error(`Exposure holding CUDA cutoffs failed: ${native.lastError()}`);
+  }
+  if (!cutoffLowers.every(Number.isFinite)
+    || !cutoffUppers.every(Number.isFinite)
+    || cutoffLowers.some((lower, index) => lower > 0 || lower > cutoffUppers[index]!)
+    || cutoffUppers.some((upper) => upper < 0)) {
+    throw new Error("Exposure holding CUDA cutoffs returned invalid intervals.");
+  }
+  return { cutoffLowers, cutoffUppers, kernelMs: elapsedMs[0]! };
+}
+
+/**
+ * Computes direct-target entropy and signed distance imbalance on CUDA.
+ * Per-example survival cutoffs are applied before constructing the
+ * transition-aware current/action surface.
+ */
+export async function directOracleDiagnosticsCuda(
+  probabilities: Float32Array,
+  actions: Float64Array,
+  currents: Float64Array,
+  cutoffLowers: Float64Array,
+  cutoffUppers: Float64Array,
+  options: DirectOracleDiagnosticsCudaOptions,
+  shared = false,
+): Promise<DirectOracleDiagnosticsCudaResult> {
+  const exampleCount = cutoffLowers.length;
+  if (exampleCount < 1
+    || cutoffUppers.length !== exampleCount
+    || actions.length < 2
+    || currents.length < 1
+    || probabilities.length !== exampleCount * actions.length
+    || !probabilities.every(Number.isFinite)
+    || !actions.every(Number.isFinite)
+    || !currents.every(Number.isFinite)
+    || !cutoffLowers.every(Number.isFinite)
+    || !cutoffUppers.every(Number.isFinite)
+    || cutoffLowers.some((lower, index) => lower > cutoffUppers[index]!)
+    || !Number.isFinite(options.visibleLower)
+    || !Number.isFinite(options.visibleUpper)
+    || options.visibleLower > options.visibleUpper
+    || !Number.isFinite(options.friction)
+    || options.friction < 0
+    || options.friction >= 1
+    || !Number.isFinite(options.transitionLogScale)
+    || options.transitionLogScale < 0
+    || !Number.isFinite(options.distanceEpsilon)
+    || options.distanceEpsilon < 0) {
+    throw new Error("Direct-oracle CUDA diagnostics received invalid inputs.");
+  }
+  const native = await loadNative();
+  const entropies = allocateFloat32(exampleCount, shared);
+  const distanceImbalances = allocateFloat32(exampleCount, shared);
+  const elapsedMs = new Float64Array(1);
+  const status = native.directOracleDiagnostics(
+    probabilities,
+    exampleCount,
+    actions,
+    actions.length,
+    currents,
+    currents.length,
+    cutoffLowers,
+    cutoffUppers,
+    options.visibleLower,
+    options.visibleUpper,
+    options.friction,
+    options.transitionLogScale,
+    options.distanceEpsilon,
+    entropies,
+    distanceImbalances,
+    elapsedMs,
+  );
+  if (status !== 0) {
+    throw new Error(`Direct-oracle CUDA diagnostics failed: ${native.lastError()}`);
+  }
+  if (!entropies.every(Number.isFinite) || !distanceImbalances.every(Number.isFinite)) {
+    throw new Error("Direct-oracle CUDA diagnostics returned non-finite values.");
+  }
+  return { entropies, distanceImbalances, kernelMs: elapsedMs[0]! };
+}
+
 export async function prepareExposureValueOracleCuda(
   prices: ArrayLike<number>,
   options: ExposureValueOracleOptions,
@@ -567,7 +816,10 @@ export async function prepareExposureValueOracleCuda(
   }
   const native = await loadNative();
   const source = prices instanceof Float64Array ? prices : Float64Array.from(prices);
-  const oracle = createExposureValueOracleStorage(source, options, false);
+  // Worker callers need SharedArrayBuffer outputs. Allocate those buffers
+  // before the native call so CUDA writes them directly instead of copying
+  // every retained oracle column after the kernel completes.
+  const oracle = createExposureValueOracleStorage(source, options, shared);
   const elapsedMs = new Float64Array(1);
   const pathMetrics = new Float64Array(5);
   const terminalIndex = options.terminalIndex ?? source.length - 1;
@@ -589,6 +841,8 @@ export async function prepareExposureValueOracleCuda(
     oracle.execution.assetBorrowRate,
     options.initialExposure ?? 0,
     terminalIndex,
+    options.includePath === false ? 0 : 1,
+    options.distributionOnly ? 1 : 0,
     oracle.means,
     oracle.secondMoments,
     oracle.modalExposures,
@@ -629,7 +883,7 @@ export async function prepareExposureValueOracleCuda(
     throw new Error("CUDA exposure-value Q0 violated the cash-baseline invariant.");
   }
   return {
-    oracle: shared ? shareExposureValueOracle(oracle) : oracle,
+    oracle,
     kernelMs: elapsedMs[0]!,
   };
 }
@@ -653,6 +907,15 @@ async function loadNative(): Promise<NativeCuda> {
       lastError: library.func("str vw_kama_cuda_last_error()"),
       parameterSize: library.func("int vw_kama_cuda_params_size()"),
       resultSize: library.func("int vw_kama_cuda_result_size()"),
+      assembleMlpFeaturesHalf: library.func(
+        "vw_kama_mlp_assemble_half_v1",
+        "int",
+        [
+          pointer, "int", pointer, "int", pointer, "int",
+          pointer, "int", pointer, "int", pointer, "int",
+          pointer, pointer, "int", pointer,
+        ],
+      ),
       createFitnessCase: library.func("vw_kama_cuda_create_fitness_case", "uint64_t", [
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer,
@@ -673,11 +936,29 @@ async function loadNative(): Promise<NativeCuda> {
       prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle_v2", "int", [
         pointer, "int", "int", "int", "int", "int",
         "double", "double", "double", "double", "double", "double", "double", "double", "double",
-        "double", "int",
+        "double", "int", "int", "int",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer,
       ]),
+      directOracleDiagnostics: library.func(
+        "vw_kama_cuda_direct_oracle_diagnostics_v1",
+        "int",
+        [
+          pointer, "int", pointer, "int", pointer, "int", pointer, pointer,
+          "double", "double", "double", "double", "double",
+          pointer, pointer, pointer,
+        ],
+      ),
+      exposureHoldingCutoffs: library.func(
+        "vw_kama_cuda_exposure_holding_cutoffs_v1",
+        "int",
+        [
+          pointer, "int", "int", "int",
+          "double", "double", "double", "double", "double",
+          pointer, pointer, pointer,
+        ],
+      ),
       evaluate: library.func("vw_kama_cuda_evaluate", "int", [
         pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
@@ -902,6 +1183,18 @@ function candidateNeedsDmi(candidate: VwKamaParameters): boolean {
 
 function cudaLibraryPath(): string {
   return path.resolve(process.env.VW_KAMA_CUDA_LIBRARY ?? defaultLibraryPath);
+}
+
+function allocateFloat32(length: number, shared: boolean): Float32Array {
+  return shared
+    ? new Float32Array(new SharedArrayBuffer(length * Float32Array.BYTES_PER_ELEMENT))
+    : new Float32Array(length);
+}
+
+function allocateFloat64(length: number, shared: boolean): Float64Array {
+  return shared
+    ? new Float64Array(new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT))
+    : new Float64Array(length);
 }
 
 function writeParameters(

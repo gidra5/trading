@@ -63,7 +63,6 @@ from train_mlp import (
 LOSS_WEIGHT_KEYS = (
     "crossEntropy",
     "probabilityMse",
-    "parameterMse",
     "excessEntropy",
     "temporalMutualInformation",
     "oracleMutualInformation",

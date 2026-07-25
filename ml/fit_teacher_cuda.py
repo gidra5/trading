@@ -166,8 +166,11 @@ def run_job(args: argparse.Namespace) -> None:
         torch.cuda.reset_peak_memory_stats(device)
     action_count = len(config.action_grid)
     input_row_stride = config.input_row_stride or action_count
-    inputs = np.memmap(
-        args.input, mode="r", dtype="<f4", shape=(args.count, input_row_stride)
+    inputs = open_memmap_with_retry(
+        args.input,
+        mode="r",
+        dtype="<f4",
+        shape=(args.count, input_row_stride),
     )
     parameters = np.memmap(
         temporary(args.parameters_output), mode="w+", dtype="<f4", shape=(args.count, PARAMETER_COUNT)
@@ -445,13 +448,14 @@ def run_job(args: argparse.Namespace) -> None:
             pending_done.synchronize()
             pipeline_wait_seconds += time.monotonic() - wait_started
             persist_batch(pending[0], pending[1], pending_result)
-    parameters.flush()
-    metrics.flush()
+    close_memmap(parameters)
+    close_memmap(metrics)
+    close_memmap(inputs)
     del parameters, metrics
     mean_kl = float(totals[0] / totals[2])
     mean_mse = float(totals[1] / totals[2])
-    temporary(args.parameters_output).replace(args.parameters_output)
-    temporary(args.metrics_output).replace(args.metrics_output)
+    replace_temporary(args.parameters_output)
+    replace_temporary(args.metrics_output)
     emit({
         "event": "gpu-teacher-complete",
         "examples": args.count,
@@ -568,11 +572,12 @@ def run_direct_diagnostics(
             "pipelineWaitFraction": 0.0,
             "diagnosticOnly": True,
         })
-    parameters.flush()
-    metrics.flush()
+    close_memmap(parameters)
+    close_memmap(metrics)
+    close_memmap(inputs)
     del parameters, metrics
-    temporary(args.parameters_output).replace(args.parameters_output)
-    temporary(args.metrics_output).replace(args.metrics_output)
+    replace_temporary(args.parameters_output)
+    replace_temporary(args.metrics_output)
     emit({
         "event": "gpu-teacher-complete",
         "examples": args.count,
@@ -1970,6 +1975,37 @@ def domain_sampled_indices(
 
 def temporary(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".tmp")
+
+
+def close_memmap(values: np.memmap) -> None:
+    values.flush()
+    mapping = getattr(values, "_mmap", None)
+    if mapping is not None:
+        mapping.close()
+
+
+def open_memmap_with_retry(path: Path, **options) -> np.memmap:
+    for attempt in range(20):
+        try:
+            return np.memmap(path, **options)
+        except (FileNotFoundError, PermissionError):
+            if attempt == 19:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise RuntimeError(f"unreachable mmap retry state for {path}")
+
+
+def replace_temporary(path: Path) -> None:
+    source = temporary(path)
+    for attempt in range(10):
+        try:
+            source.replace(path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            # Windows virus scanners can briefly retain a handle after mmap.close().
+            time.sleep(0.05 * (attempt + 1))
 
 
 def validate(args: argparse.Namespace, config: FitConfig) -> None:

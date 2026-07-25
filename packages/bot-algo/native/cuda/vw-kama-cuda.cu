@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -13,9 +14,39 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define VW_KAMA_EXPORT extern "C" __declspec(dllexport)
+#else
+#define VW_KAMA_EXPORT extern "C"
+#endif
+
 namespace {
 
 thread_local std::string last_error;
+
+uint16_t float32_to_float16_bits(float value) {
+  uint32_t raw = 0;
+  std::memcpy(&raw, &value, sizeof(raw));
+  const uint32_t sign = (raw >> 16u) & 0x8000u;
+  int exponent = static_cast<int>((raw >> 23u) & 0xffu) - 127 + 15;
+  uint32_t mantissa = raw & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) return static_cast<uint16_t>(sign);
+    mantissa = (mantissa | 0x800000u) >> (1 - exponent);
+    return static_cast<uint16_t>(sign | ((mantissa + 0x1000u) >> 13u));
+  }
+  if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+  mantissa += 0x1000u;
+  if ((mantissa & 0x800000u) != 0) {
+    mantissa = 0;
+    exponent += 1;
+  }
+  return exponent >= 31
+    ? static_cast<uint16_t>(sign | 0x7c00u)
+    : static_cast<uint16_t>(
+        sign | (static_cast<uint32_t>(exponent) << 10u) | (mantissa >> 13u)
+      );
+}
 
 struct VwKamaParams {
   int32_t efficiency_period;
@@ -612,14 +643,21 @@ __device__ __forceinline__ void oracle_inclusive_argmax_scan(
   }
   synchronize_oracle_grid();
 
+  const double preceding_warp_value = warp > 0 ? warp_values[warp - 1] : -INFINITY;
+  const uint16_t preceding_warp_target = warp > 0
+    ? warp_targets[warp - 1]
+    : UINT16_MAX;
+  // Every warp must finish reading the scan summary before this shared
+  // scratch is reused by a following prefix/suffix scan.
+  synchronize_oracle_grid();
   if (warp > 0 && oracle_argmax_is_better(
-    warp_values[warp - 1],
-    warp_targets[warp - 1],
+    preceding_warp_value,
+    preceding_warp_target,
     value,
     target
   )) {
-    value = warp_values[warp - 1];
-    target = warp_targets[warp - 1];
+    value = preceding_warp_value;
+    target = preceding_warp_target;
   }
 }
 
@@ -1456,11 +1494,11 @@ __global__ void prepare_value_oracle_holds_kernel(
   double maximum_exposure,
   double maximum_effective_exposure,
   double friction,
-  double quote_lend_rate,
-  double quote_borrow_rate,
-  double asset_borrow_rate,
-  const double* holding_min_prices,
-  const double* holding_max_prices,
+  double quote_lend_log_factor,
+  double quote_borrow_log_factor,
+  const double* holding_min_adjusted_prices,
+  const double* holding_max_adjusted_prices,
+  const double* holding_endpoint_adjusted_prices,
   double* holding_values,
   double* endpoint_exposures
 ) {
@@ -1482,67 +1520,43 @@ __global__ void prepare_value_oracle_holds_kernel(
     return;
   }
   const int endpoint_time = min(price_count - 1, time + holding_period_steps);
-  if (holding_min_prices && holding_max_prices) {
-    const double starting_price = prices[time];
-    const double quote = 1.0 - exposure;
-    const auto triggers_liquidation = [&](double next_price) {
-      const double asset_value = exposure * next_price / starting_price;
-      const double liquidated_asset_value = asset_value >= 0.0
-        ? asset_value * (1.0 - friction)
-        : asset_value / fmax(2.220446049250313e-16, 1.0 - friction);
-      const double liquidation_equity = quote + liquidated_asset_value;
-      return !(liquidation_equity > 0.0) || !isfinite(liquidation_equity)
-        || fabs(liquidated_asset_value / liquidation_equity) > maximum_effective_exposure;
-    };
-    const size_t time_index = time - score_start;
-    if (!triggers_liquidation(holding_min_prices[time_index])
-      && !triggers_liquidation(holding_max_prices[time_index])) {
-      const double ratio = prices[endpoint_time] / starting_price;
-      const double marked_equity = quote + exposure * ratio;
-      if (marked_equity > 0.0 && isfinite(marked_equity)) {
-        holding_values[cell] = log(marked_equity);
-        endpoint_exposures[cell] = exposure * ratio / marked_equity;
-        return;
-      }
-    }
-  }
-  double absolute_quote = 1.0 - exposure;
-  double absolute_asset = exposure / prices[time];
-  double equity = 1.0;
-  bool valid = true;
-  for (int move = time; move < endpoint_time; ++move) {
-    absolute_quote *= absolute_quote >= 0.0
-      ? 1.0 + quote_lend_rate
-      : 1.0 + quote_borrow_rate;
-    if (absolute_asset < 0.0) absolute_asset *= 1.0 + asset_borrow_rate;
-    const double asset_value = absolute_asset * prices[move + 1];
-    const double marked_equity = absolute_quote + asset_value;
+  const int rate_category = exposure < 0.0 ? 0 : (exposure <= 1.0 ? 1 : 2);
+  const size_t range_index =
+    static_cast<size_t>(rate_category) * scored_count + time - score_start;
+  const double starting_price = prices[time];
+  const double quote = 1.0 - exposure;
+  const auto triggers_liquidation = [&](double adjusted_price) {
+    const double asset_value = exposure * adjusted_price / starting_price;
     const double liquidated_asset_value = asset_value >= 0.0
       ? asset_value * (1.0 - friction)
       : asset_value / fmax(2.220446049250313e-16, 1.0 - friction);
-    const double liquidation_equity = absolute_quote + liquidated_asset_value;
+    const double liquidation_equity = quote + liquidated_asset_value;
     if (!(liquidation_equity > 0.0) || !isfinite(liquidation_equity)) {
-      valid = false;
-      equity = 0.0;
-      break;
+      return true;
     }
     const double liquidation_exposure = liquidated_asset_value / liquidation_equity;
     if (fabs(liquidation_exposure) > maximum_effective_exposure) {
-      valid = false;
-      equity = 0.0;
-      break;
+      return true;
     }
-    if (!(marked_equity > 0.0) || !isfinite(marked_equity)) {
-      valid = false;
-      equity = 0.0;
-      break;
+    return false;
+  };
+  if (!triggers_liquidation(holding_min_adjusted_prices[range_index])
+    && !triggers_liquidation(holding_max_adjusted_prices[range_index])) {
+    const double endpoint_asset_value = exposure
+      * holding_endpoint_adjusted_prices[range_index] / starting_price;
+    const double normalized_equity = quote + endpoint_asset_value;
+    if (normalized_equity > 0.0 && isfinite(normalized_equity)) {
+      const int duration = endpoint_time - time;
+      const double quote_log_factor = exposure <= 1.0
+        ? quote_lend_log_factor
+        : quote_borrow_log_factor;
+      holding_values[cell] = log(normalized_equity) + duration * quote_log_factor;
+      endpoint_exposures[cell] = endpoint_asset_value / normalized_equity;
+      return;
     }
-    equity = marked_equity;
   }
-  holding_values[cell] = valid && equity > 0.0 ? log(equity) : -INFINITY;
-  endpoint_exposures[cell] = valid && equity > 0.0
-    ? absolute_asset * prices[endpoint_time] / equity
-    : 0.0;
+  holding_values[cell] = -INFINITY;
+  endpoint_exposures[cell] = 0.0;
 }
 
 __global__ void prepare_value_oracle_holding_ranges_kernel(
@@ -1550,22 +1564,104 @@ __global__ void prepare_value_oracle_holding_ranges_kernel(
   int price_count,
   int score_start,
   int holding_period_steps,
+  double short_relative_rate,
+  double unleveraged_long_relative_rate,
+  double leveraged_long_relative_rate,
   double* minimum_prices,
-  double* maximum_prices
+  double* maximum_prices,
+  double* endpoint_prices
 ) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   const int scored_count = price_count - score_start;
-  if (index >= scored_count) return;
-  const int time = score_start + index;
+  if (index >= scored_count * 3) return;
+  const int category = index / scored_count;
+  const int time_offset = index - category * scored_count;
+  const int time = score_start + time_offset;
   const int endpoint_time = min(price_count - 1, time + holding_period_steps);
-  double minimum_price = prices[min(price_count - 1, time + 1)];
-  double maximum_price = minimum_price;
+  const double relative_rate = category == 0
+    ? short_relative_rate
+    : (category == 1 ? unleveraged_long_relative_rate : leveraged_long_relative_rate);
+  double relative_scale = relative_rate;
+  double endpoint_price = prices[min(price_count - 1, time + 1)] * relative_scale;
+  double minimum_price = endpoint_price;
+  double maximum_price = endpoint_price;
   for (int move = time + 2; move <= endpoint_time; ++move) {
-    minimum_price = fmin(minimum_price, prices[move]);
-    maximum_price = fmax(maximum_price, prices[move]);
+    relative_scale *= relative_rate;
+    endpoint_price = prices[move] * relative_scale;
+    minimum_price = fmin(minimum_price, endpoint_price);
+    maximum_price = fmax(maximum_price, endpoint_price);
   }
   minimum_prices[index] = minimum_price;
   maximum_prices[index] = maximum_price;
+  endpoint_prices[index] = endpoint_price;
+}
+
+__global__ void prepare_value_oracle_compact_holds_kernel(
+  const double* prices,
+  int price_count,
+  int score_start,
+  int holding_period_steps,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  double maximum_effective_exposure,
+  double friction,
+  float quote_lend_log_factor,
+  float quote_borrow_log_factor,
+  const double* holding_min_adjusted_prices,
+  const double* holding_max_adjusted_prices,
+  const double* holding_endpoint_adjusted_prices,
+  float* holding_values,
+  float* endpoint_exposures
+) {
+  const size_t cell = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int scored_count = price_count - score_start;
+  const size_t cell_count = static_cast<size_t>(scored_count) * grid_size;
+  if (cell >= cell_count) return;
+  const int exposure_index = cell % grid_size;
+  const int time = score_start + cell / grid_size;
+  const double exposure = minimum_exposure
+    + static_cast<double>(exposure_index) / (grid_size - 1)
+      * (maximum_exposure - minimum_exposure);
+  if (time == price_count - 1) {
+    holding_values[cell] = 0.0f;
+    endpoint_exposures[cell] = static_cast<float>(exposure);
+    return;
+  }
+  const int endpoint_time = min(price_count - 1, time + holding_period_steps);
+  const int rate_category = exposure < 0.0 ? 0 : (exposure <= 1.0 ? 1 : 2);
+  const size_t range_index =
+    static_cast<size_t>(rate_category) * scored_count + time - score_start;
+  const double starting_price = prices[time];
+  const double quote = 1.0 - exposure;
+  const auto triggers_liquidation = [&](double adjusted_price) {
+    const double asset_value = exposure * adjusted_price / starting_price;
+    const double liquidated_asset_value = asset_value >= 0.0
+      ? asset_value * (1.0 - friction)
+      : asset_value / fmax(DBL_EPSILON, 1.0 - friction);
+    const double liquidation_equity = quote + liquidated_asset_value;
+    return !(liquidation_equity > 0.0) || !isfinite(liquidation_equity)
+      || fabs(liquidated_asset_value / liquidation_equity) > maximum_effective_exposure;
+  };
+  if (!triggers_liquidation(holding_min_adjusted_prices[range_index])
+    && !triggers_liquidation(holding_max_adjusted_prices[range_index])) {
+    const double endpoint_asset_value = exposure
+      * holding_endpoint_adjusted_prices[range_index] / starting_price;
+    const double normalized_equity = quote + endpoint_asset_value;
+    if (normalized_equity > 0.0 && isfinite(normalized_equity)) {
+      const int duration = endpoint_time - time;
+      const float quote_log_factor = exposure <= 1.0
+        ? quote_lend_log_factor
+        : quote_borrow_log_factor;
+      holding_values[cell] = logf(static_cast<float>(normalized_equity))
+        + duration * quote_log_factor;
+      endpoint_exposures[cell] =
+        static_cast<float>(endpoint_asset_value / normalized_equity);
+      return;
+    }
+  }
+  holding_values[cell] = -INFINITY;
+  endpoint_exposures[cell] = 0.0f;
 }
 
 template <bool collect_statistics, bool finite_horizon, bool terminal_closeout>
@@ -1587,7 +1683,6 @@ __global__ void prepare_value_oracle_chains_kernel(
   const double* buy_logs,
   const double* prior_continuations,
   double* continuations,
-  uint16_t* policy,
   float* means,
   float* second_moments,
   float* modal_exposures,
@@ -1839,11 +1934,6 @@ __global__ void prepare_value_oracle_chains_kernel(
     if (time == price_count - 1) {
       if (exposure_index < grid_size) {
         continuations[row + exposure_index] = forced_values[exposure_index];
-        const double zero_position = -minimum_exposure
-          / (maximum_exposure - minimum_exposure) * (grid_size - 1);
-        policy[row + exposure_index] = terminal_closeout
-          ? static_cast<uint16_t>(llround(zero_position))
-          : exposure_index;
       }
       synchronize_oracle_grid();
       continue;
@@ -1863,10 +1953,6 @@ __global__ void prepare_value_oracle_chains_kernel(
         scan_values_a,
         scan_targets_a
       );
-      if (exposure_index < grid_size) {
-        continuations[row + exposure_index] = prefix_value;
-        policy[row + exposure_index] = prefix_target;
-      }
 
       const int reverse_target = grid_size - 1 - exposure_index;
       double suffix_value = reverse_target >= 0
@@ -1887,20 +1973,16 @@ __global__ void prepare_value_oracle_chains_kernel(
       synchronize_oracle_grid();
       if (exposure_index < grid_size) {
         const int reverse_index = grid_size - 1 - exposure_index;
-        const double sell = sell_logs[exposure_index] + continuations[row + exposure_index];
+        const double sell = sell_logs[exposure_index] + prefix_value;
         const double buy = buy_logs[exposure_index] + scan_values_a[reverse_index];
-        const int sell_target = policy[row + exposure_index];
+        const int sell_target = prefix_target;
         const int buy_target = scan_targets_a[reverse_index];
         const bool choose_buy = buy > sell || (buy == sell && buy_target < sell_target);
         const double best = choose_buy ? buy : sell;
         continuations[row + exposure_index] = best;
-        policy[row + exposure_index] = isfinite(best)
-          ? (choose_buy ? buy_target : sell_target)
-          : exposure_index;
       }
     } else if (exposure_index < grid_size) {
       double best = -INFINITY;
-      int best_target = exposure_index;
       for (int target = 0; target < grid_size; ++target) {
         const double rebalance_log = rebalance_logs[exposure_index * grid_size + target];
         const double forced = forced_values[target];
@@ -1908,13 +1990,336 @@ __global__ void prepare_value_oracle_chains_kernel(
         const double value = rebalance_log + forced;
         if (value > best) {
           best = value;
-          best_target = target;
         }
       }
       continuations[row + exposure_index] = best;
-      policy[row + exposure_index] = best_target;
     }
     synchronize_oracle_grid();
+  }
+}
+
+/**
+ * Distribution preparation only needs the forced-action row at the outermost
+ * horizon level. For separable fees, each continuation row is the maximum of a
+ * sell-prefix and buy-suffix scan. Keep one 255-action row in warp-local shared
+ * memory and let every lane own eight consecutive actions. This removes the
+ * block-wide barriers and eight-warp scan summaries used by the general oracle
+ * kernel while preserving the Bellman recurrence at the target's float32 precision.
+ */
+__global__ void prepare_value_oracle_distribution_chains_kernel(
+  int price_count,
+  int score_start,
+  int holding_period_steps,
+  int grid_size,
+  double minimum_exposure,
+  double maximum_exposure,
+  const float* holding_values,
+  const float* endpoint_exposures,
+  const float* sell_logs,
+  const float* buy_logs,
+  const float* prior_continuations,
+  float* continuations,
+  float* forced_outputs,
+  bool has_prior_continuation
+) {
+  constexpr int actions_per_lane = 8;
+  constexpr int actions_per_warp = 32 * actions_per_lane;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int time_offset = blockIdx.x * warps_per_block + warp;
+  const int scored_count = price_count - score_start;
+  if (time_offset >= scored_count) return;
+
+  const int time = score_start + time_offset;
+  const size_t row = static_cast<size_t>(time_offset) * grid_size;
+  extern __shared__ float distribution_storage[];
+  float* forced_row = distribution_storage + warp * actions_per_warp;
+
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    float forced = -INFINITY;
+    if (target < grid_size) {
+      if (time == price_count - 1) {
+        forced = 0.0;
+      } else {
+        const size_t index = row + target;
+        const float holding = holding_values[index];
+        if (isfinite(holding)) {
+          if (!has_prior_continuation) {
+            forced = holding;
+          } else {
+            const int endpoint_time = min(price_count - 1, time + holding_period_steps);
+            const float* endpoint_continuation = prior_continuations
+              + static_cast<size_t>(endpoint_time - score_start) * grid_size;
+            const float position = (endpoint_exposures[index] - minimum_exposure)
+              / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+            const int left = max(0, min(grid_size - 1, static_cast<int>(floorf(position))));
+            const int right = min(grid_size - 1, left + 1);
+            const float fraction = fmaxf(0.0f, fminf(1.0f, position - left));
+            const float interpolated = endpoint_continuation[left] * (1.0f - fraction)
+              + endpoint_continuation[right] * fraction;
+            forced = holding + interpolated;
+          }
+        }
+      }
+      if (forced_outputs) forced_outputs[row + target] = forced;
+    }
+    forced_row[target] = forced;
+  }
+  __syncwarp();
+
+  const int chunk_start = lane * actions_per_lane;
+  float prefix_values[actions_per_lane];
+  float prefix = -INFINITY;
+  #pragma unroll
+  for (int item = 0; item < actions_per_lane; ++item) {
+    const int target = chunk_start + item;
+    const float candidate = target < grid_size && isfinite(forced_row[target])
+      ? forced_row[target] - sell_logs[target]
+      : -INFINITY;
+    prefix = fmaxf(prefix, candidate);
+    prefix_values[item] = prefix;
+  }
+  const unsigned int mask = __activemask();
+  #pragma unroll
+  for (int offset = 1; offset < warpSize; offset *= 2) {
+    const float candidate = __shfl_up_sync(mask, prefix, offset);
+    if (lane >= offset) prefix = fmaxf(prefix, candidate);
+  }
+  const float shuffled_prefix = __shfl_up_sync(mask, prefix, 1);
+  const float preceding_prefix = lane > 0 ? shuffled_prefix : -INFINITY;
+  #pragma unroll
+  for (int item = 0; item < actions_per_lane; ++item) {
+    const int target = chunk_start + item;
+    if (target < grid_size) {
+      continuations[row + target] = sell_logs[target]
+        + fmaxf(prefix_values[item], preceding_prefix);
+    }
+  }
+
+  float suffix_values[actions_per_lane];
+  float suffix = -INFINITY;
+  #pragma unroll
+  for (int item = actions_per_lane - 1; item >= 0; --item) {
+    const int target = chunk_start + item;
+    const float candidate = target < grid_size && isfinite(forced_row[target])
+      ? forced_row[target] - buy_logs[target]
+      : -INFINITY;
+    suffix = fmaxf(suffix, candidate);
+    suffix_values[item] = suffix;
+  }
+  #pragma unroll
+  for (int offset = 1; offset < warpSize; offset *= 2) {
+    const float candidate = __shfl_down_sync(mask, suffix, offset);
+    if (lane + offset < warpSize) suffix = fmaxf(suffix, candidate);
+  }
+  const float shuffled_suffix = __shfl_down_sync(mask, suffix, 1);
+  const float following_suffix = lane + 1 < warpSize ? shuffled_suffix : -INFINITY;
+  #pragma unroll
+  for (int item = 0; item < actions_per_lane; ++item) {
+    const int target = chunk_start + item;
+    if (target < grid_size) {
+      const float buy = buy_logs[target]
+        + fmaxf(suffix_values[item], following_suffix);
+      continuations[row + target] = fmaxf(continuations[row + target], buy);
+    }
+  }
+}
+
+/**
+ * The rolling finite-horizon dependency graph is a set of independent
+ * diagonals: the L-step result at t depends on the (L-1)-step result at t+H.
+ * Follow one complete diagonal per warp so intermediate continuations remain
+ * in shared memory instead of making a device-memory round trip for every
+ * horizon level.
+ */
+__global__ void prepare_value_oracle_fused_distribution_kernel(
+  int price_count,
+  int score_start,
+  int holding_period_steps,
+  int horizon_levels,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float inverse_temperature,
+  const float* holding_values,
+  const float* endpoint_exposures,
+  const float* sell_logs,
+  const float* buy_logs,
+  float* probabilities
+) {
+  constexpr int actions_per_lane = 8;
+  constexpr int actions_per_warp = 32 * actions_per_lane;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int time_offset = blockIdx.x * warps_per_block + warp;
+  const int scored_count = price_count - score_start;
+  if (time_offset >= scored_count) return;
+
+  const int time = score_start + time_offset;
+  const int chunk_start = lane * actions_per_lane;
+  const unsigned int mask = __activemask();
+  extern __shared__ float fused_distribution_storage[];
+  float* continuation_row = fused_distribution_storage + warp * actions_per_warp;
+
+  for (int level = horizon_levels - 1; level >= 0; --level) {
+    const int chain_time = min(
+      price_count - 1,
+      time + level * holding_period_steps
+    );
+    const size_t row =
+      static_cast<size_t>(chain_time - score_start) * grid_size;
+    float forced_values[actions_per_lane];
+    #pragma unroll
+    for (int group = 0; group < actions_per_lane; ++group) {
+      const int target = group * warpSize + lane;
+      float forced = -INFINITY;
+      if (target < grid_size) {
+        if (chain_time == price_count - 1) {
+          forced = 0.0f;
+        } else {
+          const size_t index = row + target;
+          const float holding = holding_values[index];
+          if (isfinite(holding)) {
+            if (level == horizon_levels - 1) {
+              forced = holding;
+            } else {
+              const float position = (endpoint_exposures[index] - minimum_exposure)
+                / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+              const int left = max(
+                0,
+                min(grid_size - 1, static_cast<int>(floorf(position)))
+              );
+              const int right = min(grid_size - 1, left + 1);
+              const float fraction = fmaxf(0.0f, fminf(1.0f, position - left));
+              const float interpolated = continuation_row[left] * (1.0f - fraction)
+                + continuation_row[right] * fraction;
+              forced = holding + interpolated;
+            }
+          }
+        }
+      }
+      forced_values[group] = forced;
+    }
+    if (level == 0) {
+      float maximum_forced = -INFINITY;
+      #pragma unroll
+      for (int group = 0; group < actions_per_lane; ++group) {
+        const int target = group * warpSize + lane;
+        if (target < grid_size) {
+          maximum_forced = fmaxf(maximum_forced, forced_values[group]);
+        }
+      }
+      #pragma unroll
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        maximum_forced = fmaxf(
+          maximum_forced,
+          __shfl_down_sync(mask, maximum_forced, offset)
+        );
+      }
+      maximum_forced = __shfl_sync(mask, maximum_forced, 0);
+      if (!isfinite(maximum_forced)) return;
+
+      float weights[actions_per_lane];
+      float total = 0.0f;
+      #pragma unroll
+      for (int group = 0; group < actions_per_lane; ++group) {
+        const int target = group * warpSize + lane;
+        const float scaled = target < grid_size && isfinite(forced_values[group])
+          ? (forced_values[group] - maximum_forced) * inverse_temperature
+          : -50.0f;
+        const float weight =
+          target < grid_size ? expf(fmaxf(-50.0f, scaled)) : 0.0f;
+        weights[group] = weight;
+        total += weight;
+      }
+      #pragma unroll
+      for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        total += __shfl_down_sync(mask, total, offset);
+      }
+      total = __shfl_sync(mask, total, 0);
+      const size_t output_row = static_cast<size_t>(time) * grid_size;
+      #pragma unroll
+      for (int group = 0; group < actions_per_lane; ++group) {
+        const int target = group * warpSize + lane;
+        if (target < grid_size) {
+          probabilities[output_row + target] = weights[group] / total;
+        }
+      }
+      return;
+    }
+    __syncwarp(mask);
+    #pragma unroll
+    for (int group = 0; group < actions_per_lane; ++group) {
+      const int target = group * warpSize + lane;
+      continuation_row[target] = forced_values[group];
+    }
+    __syncwarp(mask);
+
+    float prefix_values[actions_per_lane];
+    float continuation_values[actions_per_lane];
+    float prefix = -INFINITY;
+    #pragma unroll
+    for (int item = 0; item < actions_per_lane; ++item) {
+      const int target = chunk_start + item;
+      const float candidate = target < grid_size && isfinite(continuation_row[target])
+        ? continuation_row[target] - sell_logs[target]
+        : -INFINITY;
+      prefix = fmaxf(prefix, candidate);
+      prefix_values[item] = prefix;
+    }
+    #pragma unroll
+    for (int offset = 1; offset < warpSize; offset *= 2) {
+      const float candidate = __shfl_up_sync(mask, prefix, offset);
+      if (lane >= offset) prefix = fmaxf(prefix, candidate);
+    }
+    const float shuffled_prefix = __shfl_up_sync(mask, prefix, 1);
+    const float preceding_prefix = lane > 0 ? shuffled_prefix : -INFINITY;
+    #pragma unroll
+    for (int item = 0; item < actions_per_lane; ++item) {
+      const int target = chunk_start + item;
+      continuation_values[item] = target < grid_size
+        ? sell_logs[target] + fmaxf(prefix_values[item], preceding_prefix)
+        : -INFINITY;
+    }
+
+    float suffix_values[actions_per_lane];
+    float suffix = -INFINITY;
+    #pragma unroll
+    for (int item = actions_per_lane - 1; item >= 0; --item) {
+      const int target = chunk_start + item;
+      const float candidate = target < grid_size && isfinite(continuation_row[target])
+        ? continuation_row[target] - buy_logs[target]
+        : -INFINITY;
+      suffix = fmaxf(suffix, candidate);
+      suffix_values[item] = suffix;
+    }
+    #pragma unroll
+    for (int offset = 1; offset < warpSize; offset *= 2) {
+      const float candidate = __shfl_down_sync(mask, suffix, offset);
+      if (lane + offset < warpSize) suffix = fmaxf(suffix, candidate);
+    }
+    const float shuffled_suffix = __shfl_down_sync(mask, suffix, 1);
+    const float following_suffix = lane + 1 < warpSize ? shuffled_suffix : -INFINITY;
+    #pragma unroll
+    for (int item = 0; item < actions_per_lane; ++item) {
+      const int target = chunk_start + item;
+      if (target < grid_size) {
+        const float buy = buy_logs[target]
+          + fmaxf(suffix_values[item], following_suffix);
+        continuation_values[item] = fmaxf(continuation_values[item], buy);
+      }
+    }
+    __syncwarp(mask);
+    #pragma unroll
+    for (int item = 0; item < actions_per_lane; ++item) {
+      const int target = chunk_start + item;
+      continuation_row[target] = continuation_values[item];
+    }
+    __syncwarp(mask);
   }
 }
 
@@ -2279,6 +2684,383 @@ __global__ void prepare_value_oracle_statistics_kernel(
   }
 }
 
+__global__ void prepare_value_oracle_probabilities_kernel(
+  int price_count,
+  int score_start,
+  int grid_size,
+  double temperature,
+  const double* forced_rows,
+  float* probabilities
+) {
+  const int time = score_start + blockIdx.x;
+  if (time >= price_count || threadIdx.x != 0) return;
+  const size_t row = static_cast<size_t>(time - score_start) * grid_size;
+  const double* forced = forced_rows + row;
+  const double inverse_temperature = 1.0 / temperature;
+  double maximum_forced = -INFINITY;
+  for (int index = 0; index < grid_size; ++index) {
+    const double value = forced[index];
+    if (isfinite(value)) maximum_forced = fmax(maximum_forced, value);
+  }
+  if (!isfinite(maximum_forced)) return;
+  double total = 0.0;
+  const size_t output_row = static_cast<size_t>(time) * grid_size;
+  for (int index = 0; index < grid_size; ++index) {
+    const float scaled = isfinite(forced[index])
+      ? static_cast<float>((forced[index] - maximum_forced) * inverse_temperature)
+      : -50.0f;
+    const float probability_weight = expf(fmaxf(-50.0f, scaled));
+    probabilities[output_row + index] = probability_weight;
+    total += probability_weight;
+  }
+  for (int index = 0; index < grid_size; ++index) {
+    probabilities[output_row + index] /= total;
+  }
+}
+
+__global__ void prepare_value_oracle_float_probabilities_kernel(
+  int price_count,
+  int score_start,
+  int grid_size,
+  float inverse_temperature,
+  const float* forced_rows,
+  float* probabilities
+) {
+  constexpr int actions_per_lane = 8;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int time_offset = blockIdx.x * warps_per_block + warp;
+  const int time = score_start + time_offset;
+  if (time >= price_count) return;
+  const unsigned int mask = __activemask();
+  const size_t row = static_cast<size_t>(time_offset) * grid_size;
+  const float* forced = forced_rows + row;
+  float maximum_forced = -INFINITY;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int index = group * warpSize + lane;
+    if (index < grid_size) maximum_forced = fmaxf(maximum_forced, forced[index]);
+  }
+  #pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    maximum_forced = fmaxf(
+      maximum_forced,
+      __shfl_down_sync(mask, maximum_forced, offset)
+    );
+  }
+  maximum_forced = __shfl_sync(mask, maximum_forced, 0);
+  if (!isfinite(maximum_forced)) return;
+  float weights[actions_per_lane];
+  float total = 0.0f;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int index = group * warpSize + lane;
+    const float scaled = index < grid_size && isfinite(forced[index])
+      ? (forced[index] - maximum_forced) * inverse_temperature
+      : -50.0f;
+    const float probability_weight =
+      index < grid_size ? expf(fmaxf(-50.0f, scaled)) : 0.0f;
+    weights[group] = probability_weight;
+    total += probability_weight;
+  }
+  #pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    total += __shfl_down_sync(mask, total, offset);
+  }
+  total = __shfl_sync(mask, total, 0);
+  const size_t output_row = static_cast<size_t>(time) * grid_size;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int index = group * warpSize + lane;
+    if (index < grid_size) probabilities[output_row + index] = weights[group] / total;
+  }
+}
+
+__global__ void direct_oracle_diagnostics_kernel(
+  const float* base_probabilities,
+  int example_count,
+  const double* actions,
+  int action_count,
+  const double* currents,
+  int current_count,
+  const float* sell_action_adjustments,
+  const float* buy_action_adjustments,
+  const int* current_cursors,
+  const float* current_sell_log_scales,
+  const float* current_buy_log_scales,
+  const float* current_sell_scales,
+  const float* current_buy_scales,
+  const double* cutoff_lowers,
+  const double* cutoff_uppers,
+  double visible_lower,
+  double visible_upper,
+  float distance_epsilon,
+  float* entropies,
+  float* distance_imbalances
+) {
+  const int example = blockIdx.x;
+  const int worker = threadIdx.x;
+  if (example >= example_count) return;
+  const float* base = base_probabilities + static_cast<size_t>(example) * action_count;
+  const double cutoff_lower = cutoff_lowers[example];
+  const double cutoff_upper = cutoff_uppers[example];
+  extern __shared__ float diagnostics_scratch[];
+  float* base_logits = diagnostics_scratch;
+  float* sell_weights = base_logits + action_count;
+  float* sell_actions = sell_weights + action_count;
+  float* sell_weighted_logits = sell_actions + action_count;
+  float* buy_weights = sell_weighted_logits + action_count;
+  float* buy_actions = buy_weights + action_count;
+  float* buy_weighted_logits = buy_actions + action_count;
+  float* maximum_parts = buy_weighted_logits + action_count;
+  float* entropy_parts = maximum_parts + blockDim.x;
+  float* displacement_parts = entropy_parts + blockDim.x;
+  float* distance_parts = displacement_parts + blockDim.x;
+  float* current_count_parts = distance_parts + blockDim.x;
+  __shared__ float maximum_adjusted;
+
+  float local_maximum = -INFINITY;
+  for (int action_index = worker; action_index < action_count; action_index += blockDim.x) {
+    const double action = actions[action_index];
+    const float probability = base[action_index];
+    float base_logit = -INFINITY;
+    if (action >= visible_lower && action <= visible_upper
+      && action >= cutoff_lower && action <= cutoff_upper && probability > 0.0f) {
+      base_logit = logf(probability);
+      local_maximum = fmaxf(
+        local_maximum,
+        base_logit + sell_action_adjustments[action_index]
+      );
+      local_maximum = fmaxf(
+        local_maximum,
+        base_logit + buy_action_adjustments[action_index]
+      );
+    }
+    base_logits[action_index] = base_logit;
+  }
+  maximum_parts[worker] = local_maximum;
+  __syncthreads();
+
+  if (worker == 0) {
+    float maximum = -INFINITY;
+    for (int index = 0; index < blockDim.x; ++index) {
+      maximum = fmaxf(maximum, maximum_parts[index]);
+    }
+    maximum_adjusted = maximum;
+    float sell_weight = 0.0f;
+    float sell_action = 0.0f;
+    float sell_weighted_logit = 0.0f;
+    for (int action_index = 0; action_index < action_count; ++action_index) {
+      const float base_logit = base_logits[action_index];
+      if (isfinite(base_logit)) {
+        const float logit = base_logit + sell_action_adjustments[action_index];
+        const float weight = expf(logit - maximum);
+        sell_weight += weight;
+        sell_action += weight * static_cast<float>(actions[action_index]);
+        sell_weighted_logit += weight * logit;
+      }
+      sell_weights[action_index] = sell_weight;
+      sell_actions[action_index] = sell_action;
+      sell_weighted_logits[action_index] = sell_weighted_logit;
+    }
+    float buy_weight = 0.0f;
+    float buy_action = 0.0f;
+    float buy_weighted_logit = 0.0f;
+    for (int action_index = action_count - 1; action_index >= 0; --action_index) {
+      const float base_logit = base_logits[action_index];
+      if (isfinite(base_logit)) {
+        const float logit = base_logit + buy_action_adjustments[action_index];
+        const float weight = expf(logit - maximum);
+        buy_weight += weight;
+        buy_action += weight * static_cast<float>(actions[action_index]);
+        buy_weighted_logit += weight * logit;
+      }
+      buy_weights[action_index] = buy_weight;
+      buy_actions[action_index] = buy_action;
+      buy_weighted_logits[action_index] = buy_weighted_logit;
+    }
+  }
+  __syncthreads();
+
+  float entropy_sum = 0.0f;
+  float displacement_sum = 0.0f;
+  float distance_sum = 0.0f;
+  int visible_current_count = 0;
+  if (isfinite(maximum_adjusted)) {
+    for (int current_index = worker; current_index < current_count;
+      current_index += blockDim.x) {
+      const double current = currents[current_index];
+      if (current < visible_lower || current > visible_upper) continue;
+      ++visible_current_count;
+      const int cursor = current_cursors[current_index];
+      const bool has_sell = cursor > 0;
+      const bool has_buy = cursor < action_count;
+      const int sell_index = cursor - 1;
+      const int buy_index = cursor;
+      const float sell_log_scale = current_sell_log_scales[current_index];
+      const float buy_log_scale = current_buy_log_scales[current_index];
+      const float sell_scale = current_sell_scales[current_index];
+      const float buy_scale = current_buy_scales[current_index];
+      const float sell_weight = has_sell ? sell_weights[sell_index] : 0.0f;
+      const float buy_weight = has_buy ? buy_weights[buy_index] : 0.0f;
+      const float scaled_sell_weight = sell_scale * sell_weight;
+      const float scaled_buy_weight = buy_scale * buy_weight;
+      const float total = scaled_sell_weight + scaled_buy_weight;
+      if (!(total > 0.0f)) continue;
+      const float current_float = static_cast<float>(current);
+      const float weighted_action = sell_scale
+          * (has_sell ? sell_actions[sell_index] : 0.0f)
+        + buy_scale * (has_buy ? buy_actions[buy_index] : 0.0);
+      const float weighted_logit = sell_scale * (
+          (has_sell ? sell_weighted_logits[sell_index] : 0.0f)
+          + sell_log_scale * sell_weight
+        ) + buy_scale * (
+          (has_buy ? buy_weighted_logits[buy_index] : 0.0f)
+          + buy_log_scale * buy_weight
+        );
+      entropy_sum += maximum_adjusted + logf(total) - weighted_logit / total;
+      displacement_sum += weighted_action / total - current_float;
+      const float sell_distance = has_sell
+        ? current_float * sell_weight - sell_actions[sell_index]
+        : 0.0f;
+      const float buy_distance = has_buy
+        ? buy_actions[buy_index] - current_float * buy_weight
+        : 0.0f;
+      distance_sum += (sell_scale * sell_distance + buy_scale * buy_distance) / total;
+    }
+  }
+
+  entropy_parts[worker] = entropy_sum;
+  displacement_parts[worker] = displacement_sum;
+  distance_parts[worker] = distance_sum;
+  current_count_parts[worker] = visible_current_count;
+  __syncthreads();
+  if (worker != 0) return;
+  float entropy_total = 0.0f;
+  float displacement_total = 0.0f;
+  float distance_total = 0.0f;
+  float current_total = 0.0f;
+  for (int index = 0; index < blockDim.x; ++index) {
+    entropy_total += entropy_parts[index];
+    displacement_total += displacement_parts[index];
+    distance_total += distance_parts[index];
+    current_total += current_count_parts[index];
+  }
+  entropies[example] = current_total > 0.0
+    ? entropy_total / current_total
+    : 0.0f;
+  distance_imbalances[example] =
+    displacement_total / (distance_total + distance_epsilon);
+}
+
+__device__ __forceinline__ bool exposure_holding_survives_adjusted_range(
+  double starting_price,
+  double action,
+  double friction,
+  double maximum_effective_exposure,
+  double minimum_adjusted_price,
+  double maximum_adjusted_price
+) {
+  const double quote = 1.0 - action;
+  const double adjusted_prices[2] = {minimum_adjusted_price, maximum_adjusted_price};
+  #pragma unroll
+  for (int index = 0; index < 2; ++index) {
+    const double asset_value = action * adjusted_prices[index] / starting_price;
+    const double marked_equity = quote + asset_value;
+    const double liquidated_asset_value = asset_value >= 0.0
+      ? asset_value * (1.0 - friction)
+      : asset_value / fmax(DBL_EPSILON, 1.0 - friction);
+    const double liquidation_equity = quote + liquidated_asset_value;
+    if (!(liquidation_equity > 0.0) || !isfinite(liquidation_equity)
+      || fabs(liquidated_asset_value / liquidation_equity) > maximum_effective_exposure
+      || !(marked_equity > 0.0) || !isfinite(marked_equity)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+__global__ void exposure_holding_cutoffs_kernel(
+  const double* prices,
+  int price_count,
+  int example_count,
+  int holding_period_steps,
+  double friction,
+  double maximum_effective_exposure,
+  double quote_lend_rate,
+  double quote_borrow_rate,
+  double asset_borrow_rate,
+  double* cutoff_lowers,
+  double* cutoff_uppers
+) {
+  const int example = blockIdx.x * blockDim.x + threadIdx.x;
+  if (example >= example_count) return;
+  const int end_index = min(price_count - 1, example + holding_period_steps);
+  if (end_index <= example) {
+    cutoff_lowers[example] = -maximum_effective_exposure;
+    cutoff_uppers[example] = maximum_effective_exposure;
+    return;
+  }
+  const double relative_rates[3] = {
+    (1.0 + asset_borrow_rate) / (1.0 + quote_lend_rate),
+    1.0 / (1.0 + quote_lend_rate),
+    1.0 / (1.0 + quote_borrow_rate),
+  };
+  double minimum_adjusted_prices[3];
+  double maximum_adjusted_prices[3];
+  #pragma unroll
+  for (int category = 0; category < 3; ++category) {
+    double relative_scale = relative_rates[category];
+    double adjusted_price = prices[example + 1] * relative_scale;
+    double minimum_adjusted_price = adjusted_price;
+    double maximum_adjusted_price = adjusted_price;
+    for (int time = example + 2; time <= end_index; ++time) {
+      relative_scale *= relative_rates[category];
+      adjusted_price = prices[time] * relative_scale;
+      minimum_adjusted_price = fmin(minimum_adjusted_price, adjusted_price);
+      maximum_adjusted_price = fmax(maximum_adjusted_price, adjusted_price);
+    }
+    minimum_adjusted_prices[category] = minimum_adjusted_price;
+    maximum_adjusted_prices[category] = maximum_adjusted_price;
+  }
+  const auto survives = [&](double action) {
+    const int category = action < 0.0 ? 0 : (action <= 1.0 ? 1 : 2);
+    return exposure_holding_survives_adjusted_range(
+      prices[example],
+      action,
+      friction,
+      maximum_effective_exposure,
+      minimum_adjusted_prices[category],
+      maximum_adjusted_prices[category]
+    );
+  };
+  double lower = -maximum_effective_exposure;
+  if (!survives(lower)) {
+    double infeasible = lower;
+    double feasible = 0.0;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+      const double middle = (infeasible + feasible) / 2.0;
+      if (survives(middle)) feasible = middle;
+      else infeasible = middle;
+    }
+    lower = feasible;
+  }
+  double upper = maximum_effective_exposure;
+  if (!survives(upper)) {
+    double feasible = 0.0;
+    double infeasible = upper;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+      const double middle = (feasible + infeasible) / 2.0;
+      if (survives(middle)) feasible = middle;
+      else infeasible = middle;
+    }
+    upper = feasible;
+  }
+  cutoff_lowers[example] = lower;
+  cutoff_uppers[example] = upper;
+}
+
 __global__ void initialize_value_oracle_terminal_kernel(
   int terminal_time,
   int score_start,
@@ -2286,8 +3068,7 @@ __global__ void initialize_value_oracle_terminal_kernel(
   double minimum_exposure,
   double maximum_exposure,
   double friction,
-  double* continuations,
-  uint16_t* policy
+  double* continuations
 ) {
   const int exposure_index = blockIdx.x * blockDim.x + threadIdx.x;
   if (exposure_index >= grid_size) return;
@@ -2300,9 +3081,6 @@ __global__ void initialize_value_oracle_terminal_kernel(
   const double closeout = oracle_rebalance_equity_factor(exposure, 0.0, friction);
   const size_t row = static_cast<size_t>(terminal_time - score_start) * grid_size;
   continuations[row + exposure_index] = closeout > 0.0 ? log(closeout) : -INFINITY;
-  const double zero_position = -minimum_exposure
-    / (maximum_exposure - minimum_exposure) * (grid_size - 1);
-  policy[row + exposure_index] = static_cast<uint16_t>(llround(zero_position));
 }
 
 __global__ void reconstruct_value_oracle_policy_kernel(
@@ -3787,7 +4565,7 @@ AlignmentResult align_transitions(
 
 }  // namespace
 
-extern "C" int vw_kama_cuda_device_count() {
+VW_KAMA_EXPORT int vw_kama_cuda_device_count() {
   int count = 0;
   const cudaError_t error = cudaGetDeviceCount(&count);
   if (error != cudaSuccess) {
@@ -3798,7 +4576,7 @@ extern "C" int vw_kama_cuda_device_count() {
   return count;
 }
 
-extern "C" const char* vw_kama_cuda_device_name(int device) {
+VW_KAMA_EXPORT const char* vw_kama_cuda_device_name(int device) {
   static thread_local std::string name;
   cudaDeviceProp properties {};
   const cudaError_t error = cudaGetDeviceProperties(&properties, device);
@@ -3811,19 +4589,419 @@ extern "C" const char* vw_kama_cuda_device_name(int device) {
   return name.c_str();
 }
 
-extern "C" const char* vw_kama_cuda_last_error() {
+VW_KAMA_EXPORT const char* vw_kama_cuda_last_error() {
   return last_error.c_str();
 }
 
-extern "C" int vw_kama_cuda_params_size() {
+VW_KAMA_EXPORT int vw_kama_cuda_params_size() {
   return sizeof(VwKamaParams);
 }
 
-extern "C" int vw_kama_cuda_result_size() {
+VW_KAMA_EXPORT int vw_kama_cuda_result_size() {
   return sizeof(VwKamaResult);
 }
 
-extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
+VW_KAMA_EXPORT int vw_kama_mlp_assemble_half_v1(
+  const uint16_t* second_features,
+  int second_count,
+  const uint16_t* minute_features,
+  int minute_count,
+  const uint16_t* hour_features,
+  int hour_count,
+  const uint16_t* day_features,
+  int day_count,
+  const uint16_t* month_features,
+  int month_count,
+  const uint16_t* quarter_features,
+  int quarter_count,
+  const int32_t* complete_ends,
+  const float* partial_features,
+  int row_count,
+  uint16_t* output
+) {
+  try {
+    if (
+      (second_count > 0 && !second_features)
+      || (minute_count > 0 && !minute_features)
+      || (hour_count > 0 && !hour_features)
+      || (day_count > 0 && !day_features)
+      || (month_count > 0 && !month_features)
+      || (quarter_count > 0 && !quarter_features)
+      || !complete_ends
+      || !partial_features || !output || row_count < 0
+    ) {
+      throw std::runtime_error("MLP half feature assembly received invalid storage.");
+    }
+    constexpr int feature_stride = 4;
+    constexpr int output_features = 901;
+    constexpr int partial_stride = 25;
+    const int counts[6] = {
+      second_count, minute_count, hour_count, day_count, month_count, quarter_count,
+    };
+    const int window_counts[6] = {64, 64, 32, 32, 16, 16};
+    const uint16_t* sources[6] = {
+      second_features, minute_features, hour_features,
+      day_features, month_features, quarter_features,
+    };
+    for (int row = 0; row < row_count; ++row) {
+      uint16_t* destination = output + static_cast<size_t>(row) * output_features;
+      int destination_offset = 0;
+      int partial_offset = 0;
+      for (int window = 0; window < 6; ++window) {
+        const bool partial = window > 0;
+        const int emitted_slots = window_counts[window] - (partial ? 1 : 0);
+        const int complete_end = complete_ends[row * 6 + window];
+        if (complete_end < 0 || complete_end > counts[window]) {
+          throw std::runtime_error("MLP half feature assembly received an invalid candle end.");
+        }
+        const int emitted_count = std::min(complete_end, emitted_slots);
+        const int padding_count = emitted_slots - emitted_count;
+        if (padding_count > 0) {
+          std::memset(
+            destination + destination_offset,
+            0,
+            static_cast<size_t>(padding_count) * feature_stride * sizeof(uint16_t)
+          );
+        }
+        if (emitted_count > 0) {
+          std::memcpy(
+            destination + destination_offset + padding_count * feature_stride,
+            sources[window]
+              + static_cast<size_t>(complete_end - emitted_count) * feature_stride,
+            static_cast<size_t>(emitted_count) * feature_stride * sizeof(uint16_t)
+          );
+        }
+        destination_offset += emitted_slots * feature_stride;
+        if (partial) {
+          const float* partial_source = partial_features
+            + static_cast<size_t>(row) * partial_stride + partial_offset;
+          for (int feature = 0; feature < 5; ++feature) {
+            destination[destination_offset + feature] =
+              float32_to_float16_bits(partial_source[feature]);
+          }
+          destination_offset += 5;
+          partial_offset += 5;
+        }
+      }
+      if (destination_offset != output_features || partial_offset != partial_stride) {
+        throw std::runtime_error("MLP half feature assembly violated its feature contract.");
+      }
+    }
+    last_error.clear();
+    return 0;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return -1;
+  }
+}
+
+VW_KAMA_EXPORT int vw_kama_cuda_exposure_holding_cutoffs_v1(
+  const double* prices,
+  int price_count,
+  int example_count,
+  int holding_period_steps,
+  double friction,
+  double maximum_effective_exposure,
+  double quote_lend_rate,
+  double quote_borrow_rate,
+  double asset_borrow_rate,
+  double* cutoff_lowers,
+  double* cutoff_uppers,
+  double* elapsed_ms
+) {
+  try {
+    if (!prices || !cutoff_lowers || !cutoff_uppers || !elapsed_ms) {
+      throw std::runtime_error("Exposure holding CUDA cutoffs received a null pointer");
+    }
+    if (price_count < 2 || example_count < 1 || example_count > price_count
+      || holding_period_steps < 1 || !std::isfinite(friction)
+      || friction < 0.0 || friction >= 1.0
+      || !std::isfinite(maximum_effective_exposure)
+      || !(maximum_effective_exposure > 0.0)
+      || !std::isfinite(quote_lend_rate) || quote_lend_rate < 0.0
+      || !std::isfinite(quote_borrow_rate) || quote_borrow_rate < 0.0
+      || !std::isfinite(asset_borrow_rate) || asset_borrow_rate < 0.0) {
+      throw std::runtime_error("Exposure holding CUDA cutoffs received invalid dimensions or options");
+    }
+    DeviceBuffer<double> device_prices(price_count);
+    DeviceBuffer<double> device_cutoff_lowers(example_count);
+    DeviceBuffer<double> device_cutoff_uppers(example_count);
+    cuda_check(cudaMemcpy(
+      device_prices.get(), prices, price_count * sizeof(double), cudaMemcpyHostToDevice
+    ), "copy exposure holding cutoff prices");
+    cudaEvent_t start_event;
+    cudaEvent_t stop_event;
+    cuda_check(cudaEventCreate(&start_event), "create exposure cutoff CUDA start event");
+    cuda_check(cudaEventCreate(&stop_event), "create exposure cutoff CUDA stop event");
+    cuda_check(cudaEventRecord(start_event), "record exposure cutoff CUDA start event");
+    const int threads = 128;
+    exposure_holding_cutoffs_kernel<<<
+      (example_count + threads - 1) / threads,
+      threads
+    >>>(
+      device_prices.get(),
+      price_count,
+      example_count,
+      holding_period_steps,
+      friction,
+      maximum_effective_exposure,
+      quote_lend_rate,
+      quote_borrow_rate,
+      asset_borrow_rate,
+      device_cutoff_lowers.get(),
+      device_cutoff_uppers.get()
+    );
+    cuda_check(cudaGetLastError(), "launch exposure holding cutoff kernel");
+    cuda_check(cudaEventRecord(stop_event), "record exposure cutoff CUDA stop event");
+    cuda_check(cudaEventSynchronize(stop_event), "wait for exposure cutoff CUDA kernel");
+    float elapsed = 0.0f;
+    cuda_check(
+      cudaEventElapsedTime(&elapsed, start_event, stop_event),
+      "measure exposure cutoff CUDA kernel"
+    );
+    cuda_check(cudaEventDestroy(start_event), "destroy exposure cutoff CUDA start event");
+    cuda_check(cudaEventDestroy(stop_event), "destroy exposure cutoff CUDA stop event");
+    cuda_check(cudaMemcpy(
+      cutoff_lowers,
+      device_cutoff_lowers.get(),
+      example_count * sizeof(double),
+      cudaMemcpyDeviceToHost
+    ), "copy exposure holding lower cutoffs");
+    cuda_check(cudaMemcpy(
+      cutoff_uppers,
+      device_cutoff_uppers.get(),
+      example_count * sizeof(double),
+      cudaMemcpyDeviceToHost
+    ), "copy exposure holding upper cutoffs");
+    *elapsed_ms = elapsed;
+    last_error.clear();
+    return 0;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return -1;
+  }
+}
+
+VW_KAMA_EXPORT int vw_kama_cuda_direct_oracle_diagnostics_v1(
+  const float* probabilities,
+  int example_count,
+  const double* actions,
+  int action_count,
+  const double* currents,
+  int current_count,
+  const double* cutoff_lowers,
+  const double* cutoff_uppers,
+  double visible_lower,
+  double visible_upper,
+  double friction,
+  double transition_log_scale,
+  double distance_epsilon,
+  float* entropies,
+  float* distance_imbalances,
+  double* elapsed_ms
+) {
+  try {
+    if (!probabilities || !actions || !currents || !cutoff_lowers || !cutoff_uppers
+      || !entropies || !distance_imbalances || !elapsed_ms) {
+      throw std::runtime_error("Direct-oracle CUDA diagnostics received a null pointer");
+    }
+    if (example_count < 1 || action_count < 2 || action_count > 1024
+      || current_count < 1 || current_count > 1024 || !(visible_lower <= visible_upper)
+      || !std::isfinite(friction) || friction < 0.0 || friction >= 1.0
+      || !std::isfinite(transition_log_scale) || transition_log_scale < 0.0
+      || !std::isfinite(distance_epsilon) || distance_epsilon < 0.0) {
+      throw std::runtime_error("Direct-oracle CUDA diagnostics received invalid dimensions or options");
+    }
+    DeviceBuffer<float> device_probabilities(
+      static_cast<size_t>(example_count) * action_count
+    );
+    DeviceBuffer<double> device_actions(action_count);
+    DeviceBuffer<double> device_currents(current_count);
+    DeviceBuffer<float> device_sell_action_adjustments(action_count);
+    DeviceBuffer<float> device_buy_action_adjustments(action_count);
+    DeviceBuffer<int> device_current_cursors(current_count);
+    DeviceBuffer<float> device_current_sell_log_scales(current_count);
+    DeviceBuffer<float> device_current_buy_log_scales(current_count);
+    DeviceBuffer<float> device_current_sell_scales(current_count);
+    DeviceBuffer<float> device_current_buy_scales(current_count);
+    DeviceBuffer<double> device_cutoff_lowers(example_count);
+    DeviceBuffer<double> device_cutoff_uppers(example_count);
+    DeviceBuffer<float> device_entropies(example_count);
+    DeviceBuffer<float> device_distance_imbalances(example_count);
+    cuda_check(cudaMemcpy(
+      device_probabilities.get(),
+      probabilities,
+      static_cast<size_t>(example_count) * action_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle probabilities");
+    cuda_check(cudaMemcpy(
+      device_actions.get(), actions, action_count * sizeof(double), cudaMemcpyHostToDevice
+    ), "copy direct-oracle action grid");
+    cuda_check(cudaMemcpy(
+      device_currents.get(), currents, current_count * sizeof(double), cudaMemcpyHostToDevice
+    ), "copy direct-oracle current grid");
+    const float scale = static_cast<float>(transition_log_scale);
+    std::vector<float> sell_action_adjustments(action_count);
+    std::vector<float> buy_action_adjustments(action_count);
+    for (int index = 0; index < action_count; ++index) {
+      const float sell_denominator = static_cast<float>(1.0 - friction * actions[index]);
+      const float buy_denominator =
+        static_cast<float>(1.0 - friction + friction * actions[index]);
+      sell_action_adjustments[index] =
+        -scale * static_cast<float>(std::log(sell_denominator));
+      buy_action_adjustments[index] =
+        -scale * static_cast<float>(std::log(buy_denominator));
+    }
+    std::vector<int> current_cursors(current_count);
+    std::vector<float> current_sell_log_scales(current_count);
+    std::vector<float> current_buy_log_scales(current_count);
+    std::vector<float> current_sell_scales(current_count);
+    std::vector<float> current_buy_scales(current_count);
+    for (int index = 0; index < current_count; ++index) {
+      int cursor = 0;
+      while (cursor < action_count && actions[cursor] <= currents[index]) ++cursor;
+      current_cursors[index] = cursor;
+      const float sell_log_scale = scale * static_cast<float>(std::log(
+        static_cast<float>(1.0 - friction * currents[index])
+      ));
+      const float buy_log_scale = scale * static_cast<float>(std::log(
+        static_cast<float>(1.0 - friction + friction * currents[index])
+      ));
+      current_sell_log_scales[index] = sell_log_scale;
+      current_buy_log_scales[index] = buy_log_scale;
+      current_sell_scales[index] = std::exp(sell_log_scale);
+      current_buy_scales[index] = std::exp(buy_log_scale);
+    }
+    cuda_check(cudaMemcpy(
+      device_sell_action_adjustments.get(),
+      sell_action_adjustments.data(),
+      action_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle sell action adjustments");
+    cuda_check(cudaMemcpy(
+      device_buy_action_adjustments.get(),
+      buy_action_adjustments.data(),
+      action_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle buy action adjustments");
+    cuda_check(cudaMemcpy(
+      device_current_cursors.get(),
+      current_cursors.data(),
+      current_count * sizeof(int),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle current cursors");
+    cuda_check(cudaMemcpy(
+      device_current_sell_log_scales.get(),
+      current_sell_log_scales.data(),
+      current_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle current sell log scales");
+    cuda_check(cudaMemcpy(
+      device_current_buy_log_scales.get(),
+      current_buy_log_scales.data(),
+      current_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle current buy log scales");
+    cuda_check(cudaMemcpy(
+      device_current_sell_scales.get(),
+      current_sell_scales.data(),
+      current_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle current sell scales");
+    cuda_check(cudaMemcpy(
+      device_current_buy_scales.get(),
+      current_buy_scales.data(),
+      current_count * sizeof(float),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle current buy scales");
+    cuda_check(cudaMemcpy(
+      device_cutoff_lowers.get(),
+      cutoff_lowers,
+      example_count * sizeof(double),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle lower cutoffs");
+    cuda_check(cudaMemcpy(
+      device_cutoff_uppers.get(),
+      cutoff_uppers,
+      example_count * sizeof(double),
+      cudaMemcpyHostToDevice
+    ), "copy direct-oracle upper cutoffs");
+
+    cudaEvent_t start_event;
+    cudaEvent_t stop_event;
+    cuda_check(cudaEventCreate(&start_event), "create direct-diagnostic CUDA start event");
+    cuda_check(cudaEventCreate(&stop_event), "create direct-diagnostic CUDA stop event");
+    cuda_check(cudaEventRecord(start_event), "record direct-diagnostic CUDA start event");
+    const int threads = 128;
+    const size_t diagnostics_storage_bytes = (
+      static_cast<size_t>(action_count) * 7
+      + static_cast<size_t>(threads) * 5
+    ) * sizeof(float);
+    if (diagnostics_storage_bytes > 48 * 1024) {
+      cuda_check(cudaFuncSetAttribute(
+        direct_oracle_diagnostics_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(diagnostics_storage_bytes)
+      ), "configure direct-oracle diagnostic shared memory");
+    }
+    direct_oracle_diagnostics_kernel<<<
+      example_count,
+      threads,
+      diagnostics_storage_bytes
+    >>>(
+      device_probabilities.get(),
+      example_count,
+      device_actions.get(),
+      action_count,
+      device_currents.get(),
+      current_count,
+      device_sell_action_adjustments.get(),
+      device_buy_action_adjustments.get(),
+      device_current_cursors.get(),
+      device_current_sell_log_scales.get(),
+      device_current_buy_log_scales.get(),
+      device_current_sell_scales.get(),
+      device_current_buy_scales.get(),
+      device_cutoff_lowers.get(),
+      device_cutoff_uppers.get(),
+      visible_lower,
+      visible_upper,
+      static_cast<float>(distance_epsilon),
+      device_entropies.get(),
+      device_distance_imbalances.get()
+    );
+    cuda_check(cudaGetLastError(), "launch direct-oracle diagnostic kernel");
+    cuda_check(cudaEventRecord(stop_event), "record direct-diagnostic CUDA stop event");
+    cuda_check(cudaEventSynchronize(stop_event), "wait for direct-diagnostic CUDA kernel");
+    float elapsed = 0.0f;
+    cuda_check(
+      cudaEventElapsedTime(&elapsed, start_event, stop_event),
+      "measure direct-diagnostic CUDA kernel"
+    );
+    cuda_check(cudaEventDestroy(start_event), "destroy direct-diagnostic CUDA start event");
+    cuda_check(cudaEventDestroy(stop_event), "destroy direct-diagnostic CUDA stop event");
+    cuda_check(cudaMemcpy(
+      entropies,
+      device_entropies.get(),
+      example_count * sizeof(float),
+      cudaMemcpyDeviceToHost
+    ), "copy direct-oracle entropies");
+    cuda_check(cudaMemcpy(
+      distance_imbalances,
+      device_distance_imbalances.get(),
+      example_count * sizeof(float),
+      cudaMemcpyDeviceToHost
+    ), "copy direct-oracle distance imbalances");
+    *elapsed_ms = elapsed;
+    last_error.clear();
+    return 0;
+  } catch (const std::exception& error) {
+    last_error = error.what();
+    return -1;
+  }
+}
+
+VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
   const double* prices,
   int price_count,
   int score_start,
@@ -3841,6 +5019,8 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
   double asset_borrow_rate,
   double initial_exposure,
   int terminal_index,
+  int include_path,
+  int distribution_only,
   float* means,
   float* second_moments,
   float* modal_exposures,
@@ -3880,7 +5060,8 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
       || opportunity_epsilon < 0.0 || quote_lend_rate < 0.0
       || quote_borrow_rate < 0.0 || asset_borrow_rate < 0.0
       || !std::isfinite(initial_exposure)
-      || std::abs(initial_exposure) > maximum_effective_exposure) {
+      || std::abs(initial_exposure) > maximum_effective_exposure
+      || (distribution_only && !probabilities)) {
       throw std::runtime_error("Exposure-value CUDA oracle received invalid options");
     }
 
@@ -3889,31 +5070,53 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
     value_horizon_steps = std::min(value_horizon_steps, price_count - 1);
     const int scored_count = price_count - score_start;
     const size_t oracle_cells = static_cast<size_t>(scored_count) * grid_size;
+    const bool separable_rebalance_costs = 1.0 - friction * maximum_exposure > 0.0
+      && 1.0 - friction + friction * minimum_exposure > 0.0;
+    const bool compact_distribution = distribution_only && separable_rebalance_costs
+      && grid_size <= 256 && !action_values && !include_path
+      && value_horizon_steps < price_count - 1 - score_start;
+    const bool fused_compact_distribution = compact_distribution
+      && value_horizon_steps % holding_period_steps == 0;
+    const size_t double_oracle_cells = compact_distribution ? 0 : oracle_cells;
+    const size_t compact_transition_cells =
+      compact_distribution && !fused_compact_distribution ? oracle_cells : 0;
     size_t free_device_bytes = 0;
     size_t total_device_bytes = 0;
     cuda_check(cudaMemGetInfo(&free_device_bytes, &total_device_bytes), "query oracle CUDA memory");
     const size_t required_cell_bytes = oracle_cells
-      * (4 * sizeof(double) + sizeof(uint16_t) + (action_values ? sizeof(double) : 0));
+      * (
+        compact_distribution
+          ? (fused_compact_distribution ? 2 : 5) * sizeof(float)
+          : 4 * sizeof(double) + (action_values ? sizeof(double) : 0)
+      )
+      + (probabilities
+          ? static_cast<size_t>(price_count) * grid_size * sizeof(float)
+          : 0);
     if (required_cell_bytes > free_device_bytes * 4 / 5) {
       throw std::runtime_error("Exposure-value CUDA oracle grid exceeds the device-memory admission limit");
     }
-    DeviceBuffer<double> continuations(oracle_cells);
-    DeviceBuffer<double> alternate_continuations(oracle_cells);
-    DeviceBuffer<double> holding_values(oracle_cells);
-    DeviceBuffer<double> endpoint_exposures(oracle_cells);
-    const bool aggregate_zero_rate_holds = quote_lend_rate == 0.0
-      && quote_borrow_rate == 0.0 && asset_borrow_rate == 0.0;
-    DeviceBuffer<double> holding_min_prices(aggregate_zero_rate_holds ? scored_count : 0);
-    DeviceBuffer<double> holding_max_prices(aggregate_zero_rate_holds ? scored_count : 0);
-    const bool separable_rebalance_costs = 1.0 - friction * maximum_exposure > 0.0
-      && 1.0 - friction + friction * minimum_exposure > 0.0;
+    DeviceBuffer<double> continuations(double_oracle_cells);
+    DeviceBuffer<double> alternate_continuations(double_oracle_cells);
+    DeviceBuffer<double> holding_values(double_oracle_cells);
+    DeviceBuffer<double> endpoint_exposures(double_oracle_cells);
+    DeviceBuffer<double> holding_min_prices(static_cast<size_t>(scored_count) * 3);
+    DeviceBuffer<double> holding_max_prices(static_cast<size_t>(scored_count) * 3);
+    DeviceBuffer<double> holding_endpoint_prices(static_cast<size_t>(scored_count) * 3);
+    DeviceBuffer<float> compact_holding_values(compact_distribution ? oracle_cells : 0);
+    DeviceBuffer<float> compact_endpoint_exposures(compact_distribution ? oracle_cells : 0);
     const bool needs_rebalance_matrix = !separable_rebalance_costs;
     DeviceBuffer<double> rebalance_logs(
       needs_rebalance_matrix ? static_cast<size_t>(grid_size) * grid_size : 0
     );
     DeviceBuffer<double> sell_logs(separable_rebalance_costs ? grid_size : 0);
     DeviceBuffer<double> buy_logs(separable_rebalance_costs ? grid_size : 0);
-    DeviceBuffer<uint16_t> policy(oracle_cells);
+    DeviceBuffer<float> compact_sell_logs(compact_distribution ? grid_size : 0);
+    DeviceBuffer<float> compact_buy_logs(compact_distribution ? grid_size : 0);
+    DeviceBuffer<float> compact_continuations(compact_transition_cells);
+    DeviceBuffer<float> compact_alternate_continuations(compact_transition_cells);
+    DeviceBuffer<float> compact_forced_rows(
+      compact_distribution && !fused_compact_distribution ? oracle_cells : 0
+    );
     DeviceBuffer<float> device_means(price_count);
     DeviceBuffer<float> device_second_moments(price_count);
     DeviceBuffer<float> device_modal_exposures(price_count);
@@ -3929,9 +5132,9 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
       probabilities ? static_cast<size_t>(price_count) * grid_size : 0
     );
     DeviceBuffer<double> device_action_values(action_values ? oracle_cells : 0);
-    DeviceBuffer<float> device_path_exposures(price_count);
-    DeviceBuffer<double> device_path_equities(price_count);
-    DeviceBuffer<double> device_path_metrics(5);
+    DeviceBuffer<float> device_path_exposures(include_path ? price_count : 0);
+    DeviceBuffer<double> device_path_equities(include_path ? price_count : 0);
+    DeviceBuffer<double> device_path_metrics(include_path ? 5 : 0);
 
     cuda_check(cudaMemcpy(
       device_prices.get(),
@@ -3942,12 +5145,18 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
     if (separable_rebalance_costs) {
       std::vector<double> host_sell_logs(grid_size);
       std::vector<double> host_buy_logs(grid_size);
+      std::vector<float> host_compact_sell_logs(compact_distribution ? grid_size : 0);
+      std::vector<float> host_compact_buy_logs(compact_distribution ? grid_size : 0);
       for (int index = 0; index < grid_size; ++index) {
         const double exposure = minimum_exposure
           + static_cast<double>(index) / (grid_size - 1)
             * (maximum_exposure - minimum_exposure);
         host_sell_logs[index] = std::log(1.0 - friction * exposure);
         host_buy_logs[index] = std::log(1.0 - friction + friction * exposure);
+        if (compact_distribution) {
+          host_compact_sell_logs[index] = static_cast<float>(host_sell_logs[index]);
+          host_compact_buy_logs[index] = static_cast<float>(host_buy_logs[index]);
+        }
       }
       cuda_check(cudaMemcpy(
         sell_logs.get(),
@@ -3961,6 +5170,20 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         host_buy_logs.size() * sizeof(double),
         cudaMemcpyHostToDevice
       ), "copy exposure-value buy fee factors");
+      if (compact_distribution) {
+        cuda_check(cudaMemcpy(
+          compact_sell_logs.get(),
+          host_compact_sell_logs.data(),
+          host_compact_sell_logs.size() * sizeof(float),
+          cudaMemcpyHostToDevice
+        ), "copy compact exposure-value sell fee factors");
+        cuda_check(cudaMemcpy(
+          compact_buy_logs.get(),
+          host_compact_buy_logs.data(),
+          host_compact_buy_logs.size() * sizeof(float),
+          cudaMemcpyHostToDevice
+        ), "copy compact exposure-value buy fee factors");
+      }
     } else if (needs_rebalance_matrix) {
       std::vector<double> host_rebalance_logs(static_cast<size_t>(grid_size) * grid_size);
       for (int current_index = 0; current_index < grid_size; ++current_index) {
@@ -3983,11 +5206,13 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         cudaMemcpyHostToDevice
       ), "copy exposure-value oracle rebalance values");
     }
-    cuda_check(cudaMemset(
-      continuations.get(),
-      0,
-      oracle_cells * sizeof(double)
-    ), "clear oracle continuation values");
+    if (!compact_distribution) {
+      cuda_check(cudaMemset(
+        continuations.get(),
+        0,
+        oracle_cells * sizeof(double)
+      ), "clear oracle continuation values");
+    }
     cuda_check(cudaMemset(device_means.get(), 0, price_count * sizeof(float)), "clear oracle means");
     cuda_check(cudaMemset(device_second_moments.get(), 0, price_count * sizeof(float)), "clear oracle second moments");
     cuda_check(cudaMemset(device_modal_exposures.get(), 0, price_count * sizeof(float)), "clear oracle modes");
@@ -4006,16 +5231,18 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         static_cast<size_t>(price_count) * grid_size * sizeof(float)
       ), "clear oracle probabilities");
     }
-    cuda_check(cudaMemset(
-      device_path_exposures.get(),
-      0,
-      price_count * sizeof(float)
-    ), "clear exposure-value path exposures");
-    cuda_check(cudaMemset(
-      device_path_equities.get(),
-      0,
-      price_count * sizeof(double)
-    ), "clear exposure-value path equities");
+    if (include_path) {
+      cuda_check(cudaMemset(
+        device_path_exposures.get(),
+        0,
+        price_count * sizeof(float)
+      ), "clear exposure-value path exposures");
+      cuda_check(cudaMemset(
+        device_path_equities.get(),
+        0,
+        price_count * sizeof(double)
+      ), "clear exposure-value path equities");
+    }
 
     cudaEvent_t start_event;
     cudaEvent_t stop_event;
@@ -4026,17 +5253,53 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
     while (threads < grid_size) threads *= 2;
     const int hold_threads = 256;
     const int hold_blocks = static_cast<int>((oracle_cells + hold_threads - 1) / hold_threads);
-    const int range_blocks = (scored_count + hold_threads - 1) / hold_threads;
+    const int range_blocks = (scored_count * 3 + hold_threads - 1) / hold_threads;
     const int terminal_threads = 128;
     const int terminal_blocks = (grid_size + terminal_threads - 1) / terminal_threads;
     auto prepare_holds = [&](int active_price_count, int duration_steps) {
-      if (aggregate_zero_rate_holds) {
+      const double quote_lend_factor = 1.0 + quote_lend_rate;
+      const double quote_borrow_factor = 1.0 + quote_borrow_rate;
+      const double asset_borrow_factor = 1.0 + asset_borrow_rate;
+      if (compact_distribution) {
         prepare_value_oracle_holding_ranges_kernel<<<range_blocks, hold_threads>>>(
           device_prices.get(), active_price_count, score_start, duration_steps,
-          holding_min_prices.get(), holding_max_prices.get()
+          asset_borrow_factor / quote_lend_factor,
+          1.0 / quote_lend_factor,
+          1.0 / quote_borrow_factor,
+          holding_min_prices.get(),
+          holding_max_prices.get(),
+          holding_endpoint_prices.get()
         );
-        cuda_check(cudaGetLastError(), "launch exposure-value holding range kernel");
+        cuda_check(cudaGetLastError(), "launch compact exposure-value holding range kernel");
+        prepare_value_oracle_compact_holds_kernel<<<hold_blocks, hold_threads>>>(
+          device_prices.get(),
+          active_price_count,
+          score_start,
+          duration_steps,
+          grid_size,
+          minimum_exposure,
+          maximum_exposure,
+          maximum_effective_exposure,
+          friction,
+          static_cast<float>(std::log1p(quote_lend_rate)),
+          static_cast<float>(std::log1p(quote_borrow_rate)),
+          holding_min_prices.get(),
+          holding_max_prices.get(),
+          holding_endpoint_prices.get(),
+          compact_holding_values.get(),
+          compact_endpoint_exposures.get()
+        );
+        cuda_check(cudaGetLastError(), "launch compact exposure-value hold precomputation kernel");
+        return;
       }
+      prepare_value_oracle_holding_ranges_kernel<<<range_blocks, hold_threads>>>(
+        device_prices.get(), active_price_count, score_start, duration_steps,
+        asset_borrow_factor / quote_lend_factor,
+        1.0 / quote_lend_factor,
+        1.0 / quote_borrow_factor,
+        holding_min_prices.get(), holding_max_prices.get(), holding_endpoint_prices.get()
+      );
+      cuda_check(cudaGetLastError(), "launch exposure-value holding range kernel");
       prepare_value_oracle_holds_kernel<<<hold_blocks, hold_threads>>>(
         device_prices.get(),
         active_price_count,
@@ -4047,11 +5310,11 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         maximum_exposure,
         maximum_effective_exposure,
         friction,
-        quote_lend_rate,
-        quote_borrow_rate,
-        asset_borrow_rate,
-        aggregate_zero_rate_holds ? holding_min_prices.get() : nullptr,
-        aggregate_zero_rate_holds ? holding_max_prices.get() : nullptr,
+        std::log1p(quote_lend_rate),
+        std::log1p(quote_borrow_rate),
+        holding_min_prices.get(),
+        holding_max_prices.get(),
+        holding_endpoint_prices.get(),
         holding_values.get(),
         endpoint_exposures.get()
       );
@@ -4087,7 +5350,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         minimum_exposure, maximum_exposure, temperature, friction, opportunity_epsilon,
         holding_values.get(), endpoint_exposures.get(), rebalance_logs.get(),
         separable_rebalance_costs, sell_logs.get(), buy_logs.get(), prior,
-        output_continuations, policy.get(), device_means.get(), device_second_moments.get(),
+        output_continuations, device_means.get(), device_second_moments.get(),
         device_modal_exposures.get(), device_entropies.get(), device_policy_means.get(),
         device_policy_second_moments.get(), device_policy_mean_log_rebalances.get(),
         device_policy_entropies.get(), device_average_regrets.get(), device_weights.get(),
@@ -4100,8 +5363,14 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
       const int chain_count = std::min(holding_period_steps, scored_count);
       double* forced_outputs = action_values
         ? device_action_values.get()
-        : (separable_rebalance_costs ? holding_values.get() : nullptr);
+        : ((separable_rebalance_costs || distribution_only) ? holding_values.get() : nullptr);
       if (separable_rebalance_costs) {
+        launch_chains(
+          std::false_type{}, std::false_type{}, std::false_type{},
+          chain_count, price_count, holding_period_steps,
+          nullptr, continuations.get(), forced_outputs, false
+        );
+      } else if (distribution_only) {
         launch_chains(
           std::false_type{}, std::false_type{}, std::false_type{},
           chain_count, price_count, holding_period_steps,
@@ -4114,7 +5383,17 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
           nullptr, continuations.get(), forced_outputs, false
         );
       }
-      if (separable_rebalance_costs) {
+      if (distribution_only) {
+        prepare_value_oracle_probabilities_kernel<<<scored_count, 32>>>(
+          price_count,
+          score_start,
+          grid_size,
+          temperature,
+          action_values ? device_action_values.get() : holding_values.get(),
+          probabilities ? device_probabilities.get() : nullptr
+        );
+        cuda_check(cudaGetLastError(), "launch full-window exposure-value probabilities kernel");
+      } else if (separable_rebalance_costs) {
         const int state_grid_size = current_exposure_grid_size(
           grid_size, minimum_exposure, maximum_exposure, maximum_effective_exposure
         );
@@ -4148,41 +5427,136 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
         remaining -= duration;
       }
       double* prior = nullptr;
-      double* current = continuations.get();
-      int prepared_duration = -1;
-      for (int level = static_cast<int>(block_durations.size()) - 1; level >= 0; --level) {
-        const int duration = block_durations[level];
-        // Full rolling-horizon levels normally share H. Keep that transition
-        // table resident instead of recomputing every candle/grid outcome once
-        // per level (60 identical passes for the 1h/60s default).
-        if (duration != prepared_duration) {
-          prepare_holds(price_count, duration);
-          prepared_duration = duration;
-        }
-        double* forced_outputs = level == 0
-          ? (action_values
-              ? device_action_values.get()
-              : (separable_rebalance_costs ? holding_values.get() : nullptr))
-          : nullptr;
-        if (!separable_rebalance_costs && level == 0) {
-          launch_chains(
-            std::true_type{}, std::true_type{}, std::false_type{},
-            scored_count, price_count, duration,
-            prior, current, forced_outputs, prior != nullptr
+      if (fused_compact_distribution) {
+        prepare_holds(price_count, holding_period_steps);
+        constexpr int distribution_threads = 256;
+        constexpr int distribution_warps = distribution_threads / 32;
+        constexpr size_t distribution_storage_bytes =
+          static_cast<size_t>(distribution_threads) * 8 * sizeof(float);
+        const int distribution_blocks =
+          (scored_count + distribution_warps - 1) / distribution_warps;
+        prepare_value_oracle_fused_distribution_kernel<<<
+          distribution_blocks,
+          distribution_threads,
+          distribution_storage_bytes
+        >>>(
+          price_count,
+          score_start,
+          holding_period_steps,
+          static_cast<int>(block_durations.size()),
+          grid_size,
+          static_cast<float>(minimum_exposure),
+          static_cast<float>(maximum_exposure),
+          static_cast<float>(1.0 / temperature),
+          compact_holding_values.get(),
+          compact_endpoint_exposures.get(),
+          compact_sell_logs.get(),
+          compact_buy_logs.get(),
+          device_probabilities.get()
+        );
+      } else {
+        double* current = continuations.get();
+        float* compact_prior = nullptr;
+        float* compact_current = compact_continuations.get();
+        int prepared_duration = -1;
+        for (int level = static_cast<int>(block_durations.size()) - 1;
+          level >= 0; --level) {
+          const int duration = block_durations[level];
+          // Full rolling-horizon levels normally share H. Keep that transition
+          // table resident instead of recomputing every candle/grid outcome once
+          // per level (60 identical passes for the 1h/60s default).
+          if (duration != prepared_duration) {
+            prepare_holds(price_count, duration);
+            prepared_duration = duration;
+          }
+          double* forced_outputs = level == 0
+            ? (action_values
+                ? device_action_values.get()
+                : ((separable_rebalance_costs || distribution_only)
+                    ? holding_values.get()
+                    : nullptr))
+            : nullptr;
+          if (compact_distribution) {
+          constexpr int distribution_threads = 256;
+          constexpr int distribution_warps = distribution_threads / 32;
+          constexpr size_t distribution_storage_bytes =
+            static_cast<size_t>(distribution_threads) * 8 * sizeof(float);
+          const int distribution_blocks =
+            (scored_count + distribution_warps - 1) / distribution_warps;
+          prepare_value_oracle_distribution_chains_kernel<<<
+            distribution_blocks,
+            distribution_threads,
+            distribution_storage_bytes
+          >>>(
+            price_count,
+            score_start,
+            duration,
+            grid_size,
+            static_cast<float>(minimum_exposure),
+            static_cast<float>(maximum_exposure),
+            compact_holding_values.get(),
+            compact_endpoint_exposures.get(),
+            compact_sell_logs.get(),
+            compact_buy_logs.get(),
+            compact_prior,
+            compact_current,
+            level == 0 ? compact_forced_rows.get() : nullptr,
+            compact_prior != nullptr
           );
-        } else {
-          launch_chains(
-            std::false_type{}, std::true_type{}, std::false_type{},
-            scored_count, price_count, duration,
-            prior, current, forced_outputs, prior != nullptr
-          );
+          } else if (!separable_rebalance_costs && level == 0 && !distribution_only) {
+            launch_chains(
+              std::true_type{}, std::true_type{}, std::false_type{},
+              scored_count, price_count, duration,
+              prior, current, forced_outputs, prior != nullptr
+            );
+          } else {
+            launch_chains(
+              std::false_type{}, std::true_type{}, std::false_type{},
+              scored_count, price_count, duration,
+              prior, current, forced_outputs, prior != nullptr
+            );
+          }
+          if (compact_distribution) {
+            compact_prior = compact_current;
+            compact_current = compact_current == compact_continuations.get()
+              ? compact_alternate_continuations.get()
+              : compact_continuations.get();
+          } else {
+            prior = current;
+            current = current == continuations.get()
+              ? alternate_continuations.get()
+              : continuations.get();
+          }
         }
-        prior = current;
-        current = current == continuations.get()
-          ? alternate_continuations.get()
-          : continuations.get();
       }
-      if (separable_rebalance_costs) {
+      if (compact_distribution) {
+        if (!fused_compact_distribution) {
+          constexpr int probability_threads = 256;
+          constexpr int probability_warps = probability_threads / 32;
+          prepare_value_oracle_float_probabilities_kernel<<<
+            (scored_count + probability_warps - 1) / probability_warps,
+            probability_threads
+          >>>(
+            price_count,
+            score_start,
+            grid_size,
+            static_cast<float>(1.0 / temperature),
+            compact_forced_rows.get(),
+            probabilities ? device_probabilities.get() : nullptr
+          );
+          cuda_check(cudaGetLastError(), "launch compact exposure-value probabilities kernel");
+        }
+      } else if (distribution_only) {
+        prepare_value_oracle_probabilities_kernel<<<scored_count, 32>>>(
+          price_count,
+          score_start,
+          grid_size,
+          temperature,
+          action_values ? device_action_values.get() : holding_values.get(),
+          probabilities ? device_probabilities.get() : nullptr
+        );
+        cuda_check(cudaGetLastError(), "launch linear exposure-value probabilities kernel");
+      } else if (separable_rebalance_costs) {
         const int state_grid_size = current_exposure_grid_size(
           grid_size, minimum_exposure, maximum_exposure, maximum_effective_exposure
         );
@@ -4210,49 +5584,50 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
       }
     }
     cuda_check(cudaGetLastError(), "launch exposure-value oracle chain kernels");
-    const int path_price_count = terminal_index + 1;
-    const int path_scored_count = path_price_count - score_start;
-    prepare_holds(path_price_count, holding_period_steps);
-    initialize_value_oracle_terminal_kernel<<<terminal_blocks, terminal_threads>>>(
-      terminal_index,
-      score_start,
-      grid_size,
-      minimum_exposure,
-      maximum_exposure,
-      friction,
-      continuations.get(),
-      policy.get()
-    );
-    cuda_check(cudaGetLastError(), "initialize full-window oracle terminal row");
-    const int path_chain_count = std::min(holding_period_steps, path_scored_count);
-    launch_chains(
-      std::false_type{}, std::false_type{}, std::true_type{},
-      path_chain_count, path_price_count, holding_period_steps,
-      nullptr, continuations.get(), nullptr, false
-    );
-    cuda_check(cudaGetLastError(), "launch full-window exposure-value Bellman kernel");
-    reconstruct_value_oracle_policy_kernel<<<1, 256>>>(
-      device_prices.get(),
-      path_price_count,
-      score_start,
-      holding_period_steps,
-      grid_size,
-      minimum_exposure,
-      maximum_exposure,
-      maximum_effective_exposure,
-      friction,
-      quote_lend_rate,
-      quote_borrow_rate,
-      asset_borrow_rate,
-      initial_exposure,
-      holding_values.get(),
-      endpoint_exposures.get(),
-      continuations.get(),
-      device_path_exposures.get(),
-      device_path_equities.get(),
-      device_path_metrics.get()
-    );
-    cuda_check(cudaGetLastError(), "launch exposure-value policy kernel");
+    if (include_path) {
+      const int path_price_count = terminal_index + 1;
+      const int path_scored_count = path_price_count - score_start;
+      prepare_holds(path_price_count, holding_period_steps);
+      initialize_value_oracle_terminal_kernel<<<terminal_blocks, terminal_threads>>>(
+        terminal_index,
+        score_start,
+        grid_size,
+        minimum_exposure,
+        maximum_exposure,
+        friction,
+        continuations.get()
+      );
+      cuda_check(cudaGetLastError(), "initialize full-window oracle terminal row");
+      const int path_chain_count = std::min(holding_period_steps, path_scored_count);
+      launch_chains(
+        std::false_type{}, std::false_type{}, std::true_type{},
+        path_chain_count, path_price_count, holding_period_steps,
+        nullptr, continuations.get(), nullptr, false
+      );
+      cuda_check(cudaGetLastError(), "launch full-window exposure-value Bellman kernel");
+      reconstruct_value_oracle_policy_kernel<<<1, 256>>>(
+        device_prices.get(),
+        path_price_count,
+        score_start,
+        holding_period_steps,
+        grid_size,
+        minimum_exposure,
+        maximum_exposure,
+        maximum_effective_exposure,
+        friction,
+        quote_lend_rate,
+        quote_borrow_rate,
+        asset_borrow_rate,
+        initial_exposure,
+        holding_values.get(),
+        endpoint_exposures.get(),
+        continuations.get(),
+        device_path_exposures.get(),
+        device_path_equities.get(),
+        device_path_metrics.get()
+      );
+      cuda_check(cudaGetLastError(), "launch exposure-value policy kernel");
+    }
     cuda_check(cudaEventRecord(stop_event), "record oracle CUDA stop event");
     cuda_check(cudaEventSynchronize(stop_event), "synchronize exposure-value oracle kernels");
     float kernel_elapsed_ms = 0.0f;
@@ -4284,19 +5659,21 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
     copy_output(average_regrets, device_average_regrets, "copy oracle average regrets");
     copy_output(weights, device_weights, "copy oracle weights");
     copy_output(opportunities, device_opportunities, "copy oracle opportunities");
-    copy_output(path_exposures, device_path_exposures, "copy full-window oracle exposures");
-    cuda_check(cudaMemcpy(
-      path_equities,
-      device_path_equities.get(),
-      price_count * sizeof(double),
-      cudaMemcpyDeviceToHost
-    ), "copy full-window oracle equities");
-    cuda_check(cudaMemcpy(
-      path_metrics,
-      device_path_metrics.get(),
-      5 * sizeof(double),
-      cudaMemcpyDeviceToHost
-    ), "copy full-window oracle metrics");
+    if (include_path) {
+      copy_output(path_exposures, device_path_exposures, "copy full-window oracle exposures");
+      cuda_check(cudaMemcpy(
+        path_equities,
+        device_path_equities.get(),
+        price_count * sizeof(double),
+        cudaMemcpyDeviceToHost
+      ), "copy full-window oracle equities");
+      cuda_check(cudaMemcpy(
+        path_metrics,
+        device_path_metrics.get(),
+        5 * sizeof(double),
+        cudaMemcpyDeviceToHost
+      ), "copy full-window oracle metrics");
+    }
     if (probabilities) {
       cuda_check(cudaMemcpy(
         probabilities,
@@ -4321,7 +5698,7 @@ extern "C" int vw_kama_cuda_prepare_value_oracle_v2(
   }
 }
 
-extern "C" uint64_t vw_kama_cuda_create_fitness_case(
+VW_KAMA_EXPORT uint64_t vw_kama_cuda_create_fitness_case(
   const double* high,
   const double* low,
   const double* close,
@@ -4493,7 +5870,7 @@ extern "C" uint64_t vw_kama_cuda_create_fitness_case(
   }
 }
 
-extern "C" int vw_kama_cuda_evaluate_fitness_case(
+VW_KAMA_EXPORT int vw_kama_cuda_evaluate_fitness_case(
   uint64_t handle,
   const void* parameter_data,
   int candidate_count,
@@ -4655,7 +6032,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_case(
   }
 }
 
-extern "C" int vw_kama_cuda_evaluate_fitness_cases(
+VW_KAMA_EXPORT int vw_kama_cuda_evaluate_fitness_cases(
   const uint64_t* handles,
   int case_count,
   const void* parameter_data,
@@ -4833,7 +6210,7 @@ extern "C" int vw_kama_cuda_evaluate_fitness_cases(
   }
 }
 
-extern "C" double vw_kama_cuda_fitness_case_device_bytes(uint64_t handle) {
+VW_KAMA_EXPORT double vw_kama_cuda_fitness_case_device_bytes(uint64_t handle) {
   auto* test_case = reinterpret_cast<CudaFitnessCase*>(static_cast<uintptr_t>(handle));
   if (!test_case || test_case->magic != CudaFitnessCase::MAGIC) return 0.0;
   return static_cast<double>(test_case->resident_bytes
@@ -4845,7 +6222,7 @@ extern "C" double vw_kama_cuda_fitness_case_device_bytes(uint64_t handle) {
     + test_case->precise_joint.capacity() * sizeof(double));
 }
 
-extern "C" int vw_kama_cuda_destroy_fitness_case(uint64_t handle) {
+VW_KAMA_EXPORT int vw_kama_cuda_destroy_fitness_case(uint64_t handle) {
   try {
     auto* test_case = reinterpret_cast<CudaFitnessCase*>(static_cast<uintptr_t>(handle));
     if (!test_case || test_case->magic != CudaFitnessCase::MAGIC) {
@@ -4861,7 +6238,7 @@ extern "C" int vw_kama_cuda_destroy_fitness_case(uint64_t handle) {
   }
 }
 
-extern "C" int vw_kama_cuda_evaluate(
+VW_KAMA_EXPORT int vw_kama_cuda_evaluate(
   const double* close_times,
   const double* high,
   const double* low,

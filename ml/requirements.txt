@@ -1,6 +1,8 @@
 numpy==2.4.6
 onnx==1.22.0
 onnxscript==0.7.1
-torch==2.13.0
-triton==3.7.1
+torch==2.13.0; sys_platform != "win32"
+torch==2.13.0+cu130; sys_platform == "win32"
+triton==3.7.1; sys_platform != "win32"
+triton-windows==3.7.1.post27; sys_platform == "win32"
 zstandard==0.25.0
