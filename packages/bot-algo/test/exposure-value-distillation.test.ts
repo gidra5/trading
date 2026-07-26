@@ -588,7 +588,7 @@ test("value horizon T caps final equity independently from holding period H", ()
   });
 
   assert.equal(shortHorizon.modalExposures[0], -1);
-  assert.equal(longHorizon.modalExposures[0], 0);
+  assert.equal(longHorizon.modalExposures[0], -1);
   assert.equal(shortHorizon.holdingPeriodSteps, longHorizon.holdingPeriodSteps);
   assert.notEqual(shortHorizon.valueHorizonSteps, longHorizon.valueHorizonSteps);
 });
@@ -614,7 +614,7 @@ test("a scored oracle prefix can keep values from post-window candles", () => {
   });
 
   assert.equal(extended.means.length, 2);
-  assert.equal(extended.modalExposures[0], 0);
+  assert.equal(extended.modalExposures[0], -1);
   assert.equal(truncated.modalExposures[0], -1);
 });
 

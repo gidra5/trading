@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "id": "mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch",
+  "label": "Direct 255-action MLP v12 · 1-minute candles/oracle · 60m→0m delay curriculum · scratch",
+  "basePlanFile": "ml/training-plans/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch.json",
+  "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch/delay-3600s",
+  "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch-delay-0s",
+  "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch",
+  "samplingIntervalMs": 60000,
+  "predictionDelayMs": 3600000,
+  "training": {
+    "epochs": 256,
+    "patience": 16,
+    "selectionMetric": "baseKlDivergence",
+    "targetValidation": {
+      "baseKlDivergence": 0.15
+    },
+    "lossWeights": {
+      "crossEntropy": 1,
+      "probabilityMse": 1,
+      "excessEntropy": 0,
+      "temporalMutualInformation": 0,
+      "oracleMutualInformation": 0.5
+    },
+    "timeWeighting": {
+      "mode": "distanceImbalance",
+      "distanceEpsilon": 0.000001,
+      "minimumWeight": 0.000001,
+      "stateAggregation": "globalDistanceRatio",
+      "minimumAdviceMagnitude": 0.25,
+      "memoryHalfLifeSteps": 15,
+      "growthPerPriorAdvice": 0.25,
+      "maximumMultiplier": 4,
+      "resetAfterGapSteps": 60,
+      "resolutionDivergenceMultiplier": 1
+    }
+  },
+  "delayCurriculum": {
+    "startDelayMinutes": 60,
+    "endDelayMinutes": 0,
+    "stepMinutes": 1,
+    "epochsPerPhase": 256,
+    "patience": 16,
+    "targetValidationBaseKl": 0.15,
+    "skipTeacherRefinement": true,
+    "datasetRetention": "anchor-and-active",
+    "minimumFreeSpaceGb": 8
+  }
+}

@@ -11,6 +11,7 @@ const datasetOnly = process.argv.includes("--dataset-only");
 const verificationOnly = process.argv.includes("--verification-only");
 const frozenStudyOnly = process.argv.includes("--frozen-study-only");
 const productionMinuteOnly = process.argv.includes("--production-minute");
+const skipContractBuild = process.argv.includes("--skip-contract-build");
 const derivedTrainingOnly = frozenStudyOnly || productionMinuteOnly;
 if ([trainingOnly, datasetOnly, verificationOnly, frozenStudyOnly, productionMinuteOnly]
   .filter(Boolean).length > 1) {
@@ -82,10 +83,12 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 }
 
 try {
-  await runStage("feature-contract-build", process.execPath, [
-    path.join(repoRoot, "node_modules/typescript/bin/tsc"),
-    "-p", path.join(repoRoot, "packages/bot-algo/tsconfig.json"),
-  ]);
+  if (!skipContractBuild) {
+    await runStage("feature-contract-build", process.execPath, [
+      path.join(repoRoot, "node_modules/typescript/bin/tsc"),
+      "-p", path.join(repoRoot, "packages/bot-algo/tsconfig.json"),
+    ]);
+  }
   if (verificationOnly) {
     await runStage("verification", process.execPath, [
       path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
@@ -218,7 +221,10 @@ try {
     "--selection-metric", training.selectionMetric ?? "loss",
     "--loss-weights-json", JSON.stringify(training.lossWeights),
     "--time-weighting-json", JSON.stringify(training.timeWeighting),
-    "--feature-statistics-cache", path.join(runDir, "feature-statistics.npz"),
+    "--feature-statistics-cache", path.resolve(
+      repoRoot,
+      training.featureStatisticsCache ?? path.join(runDir, "feature-statistics.npz"),
+    ),
     "--finalize-file", finalizeFile,
     "--resume",
     ...(training.initializeFromCheckpoint
@@ -234,10 +240,17 @@ try {
     ...(Number.isFinite(training.targetValidation?.klDivergence)
       ? ["--target-validation-kl", String(training.targetValidation.klDivergence)]
       : []),
+    ...(Number.isFinite(training.targetValidation?.baseKlDivergence)
+      ? [
+          "--target-validation-base-kl",
+          String(training.targetValidation.baseKlDivergence),
+        ]
+      : []),
     ...(Number.isFinite(training.targetValidation?.klDivergenceStdDev)
       ? ["--target-validation-kl-stddev", String(training.targetValidation.klDivergenceStdDev)]
       : []),
     ...(training.weightedTrainingSample ? ["--weighted-training-sample"] : []),
+    ...(training.reuseFeatureStatisticsCache ? ["--reuse-feature-statistics-cache"] : []),
     ...(training.compile ? ["--compile"] : []),
   ]);
   await runStage("verification", process.execPath, [

@@ -8,7 +8,7 @@ The selected window supplies all prices. Training targets default to a fixed 60-
 
 ## Bellman execution
 
-At each decision, the oracle may rebalance once to a target from the configured exposure grid. It then leaves the resulting quote and asset quantities alone for `H` price moves. Marked exposure is allowed to drift with price and maintenance; there are no intermediate target-restoring trades and therefore no intermediate rebalancing friction. At the next decision the oracle compares every grid target with an explicit **no-trade** continuation from its exact drifted exposure, and trades only when the continuation value after friction is better. The final continuation value for current exposure `a` is the log of its fee-aware rebalance factor to zero.
+At each decision, the oracle may rebalance once to a target from the configured exposure grid. It then leaves the resulting quote and asset quantities alone for `H` price moves. Marked exposure is allowed to drift with price and maintenance; there are no intermediate target-restoring trades and therefore no intermediate rebalancing friction. The coherent full-window inspector path compares every grid target with an explicit **no-trade** continuation from its drifted exposure and trades only when the continuation after friction is better. The rolling unconditional training target instead evaluates the next grid transition directly from the exact drifted exposure; this is the schema-v4 target contract. Reaching the final price ends the rolling horizon without an artificial terminal transition.
 
 The soft training target is transition-aware. Let `F_t(a)` be the forced-action value after selecting target `a`, including its untouched `H`-candle evolution and optimal continuation. For any input/current exposure `x`, the action value and policy are
 
@@ -91,15 +91,17 @@ implementation already uses the log-domain form of those two linear scans
 instead of a dense 255 by 255 transition matrix. It evaluates the resulting
 layered path DAG directly without materializing all backpointer paths.
 
-The remaining rolling-target approximation is the lookup after passive drift:
-the current implementation linearly interpolates the sampled continuation log
-values at `drift_t(a)`. Querying the prefix/suffix aggregates directly at that
-exact exposure would remove this interpolation. For the unconditional
-255-action target, this requires only the discrete path row for each forced
-initial action; it does not require representing the optimal policy over every
-possible continuous starting exposure. An exact continuous no-trade policy
-would still be an upper envelope of amount-space linear terms, but that is a
-broader object than the unconditional training target.
+The rolling target queries those prefix/suffix aggregates directly at the exact
+`drift_t(a)` exposure. It does not interpolate a continuation sampled at nearby
+grid states. Each horizon level therefore passes its forced-action row to the
+preceding level; two linear scans turn that row into the complete sell/buy
+transition envelope needed by all 255 exact endpoint queries. For the
+unconditional 255-action target this retains only the discrete path row for
+each forced initial action. It does not represent the optimal policy over every
+possible continuous starting exposure. This distinction is intentional: the
+full-window no-trade inspector path remains a separate coherent control
+problem, while persisted raw training rows use the exact transition-row
+contract.
 
 A 60-candle one-minute path contains at most 60 passive-hold intervals and 59
 subsequent transitions. This does not strictly cap the number of distinct
@@ -118,7 +120,15 @@ GPU without retaining the transition paths.
 The distribution-only CUDA path follows each complete horizon diagonal in
 warp-local memory. Its final level performs the softmax directly from the
 warp's forced-action registers, avoiding an intermediate device table and a
-second full-memory pass.
+second full-memory pass. The same exact transition-row query is used by the
+non-fused rolling path and the general statistics path, so inspector statistics
+and persisted unconditional targets share one Bellman definition.
+
+Oracle input prices and probability output cross the native boundary through a
+reused pair of pinned host staging slots. Slots alternate between calls, while
+the outer dataset worker pipeline can persist/compress one shared output as the
+next day is prepared. Distribution-only calls also skip the eleven unused
+diagnostic-column transfers.
 
 The compact fused path must not allocate the general Float64 Bellman tables.
 On the 255-action, 60-second hold, 3,600-second horizon production case this
@@ -129,8 +139,8 @@ allocation estimate to about 427 MiB. The generated probability bytes remain
 identical to the prior compact implementation.
 
 The final base log-density is empirically sparse enough for an optional lossy
-storage representation, but not an exact handful-of-lines representation
-under the current discrete interpolation contract. Across 768 sampled
+storage representation, but not an exact handful-of-lines representation.
+Across 768 sampled
 one-second rows from three market regimes, adaptive piecewise-linear
 log-probability interpolation over the full 255-action support required about
 17 knots on average for mean row KL `6.1e-5`. Restricting to the trained

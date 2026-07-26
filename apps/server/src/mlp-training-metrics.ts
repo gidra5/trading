@@ -199,9 +199,15 @@ export class MlpTrainingMetricsReader {
         ...(files.plan.samplingIntervalMs === undefined
           ? {}
           : { samplingIntervalMs: files.plan.samplingIntervalMs }),
-        ...(files.plan.predictionDelayMs === undefined
+        ...((typeof files.status?.predictionDelayMs === "number"
+          ? files.status.predictionDelayMs
+          : files.plan.predictionDelayMs) === undefined
           ? {}
-          : { predictionDelayMs: files.plan.predictionDelayMs }),
+          : {
+              predictionDelayMs: typeof files.status?.predictionDelayMs === "number"
+                ? files.status.predictionDelayMs
+                : files.plan.predictionDelayMs,
+            }),
         ...(files.plan.training?.lossWeights
           ? { lossWeights: files.plan.training.lossWeights }
           : {}),

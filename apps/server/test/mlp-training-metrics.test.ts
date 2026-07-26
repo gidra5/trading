@@ -154,6 +154,7 @@ test("MLP training metrics discovers plans and defaults to the live run", async 
       pid: process.pid,
       stage: "training",
       updatedAt: "2026-07-25T00:00:00.000Z",
+      predictionDelayMs: 59 * 60_000,
     })),
     writeFile(path.join(defaultRunDir, "training.log"), `${JSON.stringify({
       event: "training-complete",
@@ -171,6 +172,7 @@ test("MLP training metrics discovers plans and defaults to the live run", async 
     assert.equal(active.plan.id, "live");
     assert.equal(active.plan.epochs, 64);
     assert.equal(active.plan.patience, 8);
+    assert.equal(active.plan.predictionDelayMs, 59 * 60_000);
     assert.equal(active.running, true);
     assert.deepEqual(active.runs.map((run) => run.key), [
       "ml/training-plans/live.json",

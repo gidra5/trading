@@ -330,7 +330,7 @@ export interface VwKamaInspectorCatalog {
       teacherFitMetrics?: Record<string, number>;
       lossWeights?: Record<string, number>;
       bestEpoch?: number;
-      selectionMetric?: "loss" | "klDivergence";
+      selectionMetric?: "loss" | "klDivergence" | "baseKlDivergence";
       curriculum?: NonNullable<MlpModelManifest["training"]>["curriculum"];
       finalizedEarly?: boolean;
     };

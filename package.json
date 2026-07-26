@@ -62,6 +62,8 @@
     "mlp:study-adaptive:no-entropy:watch": "node scripts/mlp-adaptive-curriculum-status.mjs --study-key adaptiveCurriculumStudyNoEntropy --watch",
     "mlp:study-adaptive:status": "node scripts/mlp-adaptive-curriculum-status.mjs",
     "mlp:study-adaptive:watch": "node scripts/mlp-adaptive-curriculum-status.mjs --watch",
+    "mlp:curriculum:minute-delay": "node scripts/run-node-with-ml-libs.mjs scripts/run-mlp-delay-curriculum.mjs --plan ml/training-plans/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch.json",
+    "mlp:curriculum:minute-delay:status": "node scripts/run-node-with-ml-libs.mjs scripts/mlp-training-control.mjs status --plan ml/training-plans/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch.json",
     "mlp:benchmark:fitter": "node scripts/run-ml-python.mjs --env TRADING_MLP_TEACHER_COMPILE=0 ml/benchmark_teacher_fitter.py",
     "mlp:benchmark:temporal": "npm run mlp:build-contract && node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/benchmark-mlp-temporal-cadence.ts",
     "mlp:benchmark:oracle": "node scripts/run-node-with-ml-libs.mjs node_modules/tsx/dist/cli.mjs scripts/profile-exposure-value-oracle-cuda.ts",

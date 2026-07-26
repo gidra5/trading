@@ -809,11 +809,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every-steps", type=int, default=25)
     parser.add_argument("--loss-weights-json", default="{}")
     parser.add_argument("--time-weighting-json", default="{}")
-    parser.add_argument("--selection-metric", choices=("loss", "klDivergence"), default="loss")
+    parser.add_argument(
+        "--selection-metric",
+        choices=("loss", "klDivergence", "baseKlDivergence"),
+        default="loss",
+    )
     parser.add_argument("--target-validation-kl", type=float)
+    parser.add_argument("--target-validation-base-kl", type=float)
     parser.add_argument("--target-validation-kl-stddev", type=float)
     parser.add_argument("--study-file", type=Path)
     parser.add_argument("--feature-statistics-cache", type=Path)
+    parser.add_argument(
+        "--reuse-feature-statistics-cache",
+        action="store_true",
+        help=(
+            "Reuse an existing feature normalization cache when delayed pairing "
+            "changes only the number of examples."
+        ),
+    )
     parser.add_argument("--finalize-file", type=Path)
     parser.add_argument("--initialize-from-checkpoint", type=Path)
     parser.add_argument("--inherited-best-epoch", type=int, default=-1)
@@ -1031,7 +1044,9 @@ def main() -> None:
 
     device = resolve_device(args.device)
     feature_mean, feature_std = cached_training_normalization(
-        train, args.feature_statistics_cache
+        train,
+        args.feature_statistics_cache,
+        allow_count_mismatch=args.reuse_feature_statistics_cache,
     )
     model = ExposureMlp(feature_mean, feature_std, args.dropout).to(device)
     if args.initialize_from_checkpoint is not None:
@@ -1097,6 +1112,7 @@ def main() -> None:
         "seed": args.seed,
         "selectionMetric": args.selection_metric,
         "targetValidationKl": args.target_validation_kl,
+        "targetValidationBaseKl": args.target_validation_base_kl,
         "targetValidationKlStdDev": args.target_validation_kl_stddev,
         "initializeFromCheckpoint": checkpoint_identity(
             args.initialize_from_checkpoint
@@ -1319,6 +1335,7 @@ def main() -> None:
         "evaluationOnly": args.evaluation_only,
         "targetValidation": {
             "klDivergence": args.target_validation_kl,
+            "baseKlDivergence": args.target_validation_base_kl,
             "klDivergenceStdDev": args.target_validation_kl_stddev,
         },
         "resumeContractExtended": resume_contract_extended,
@@ -1354,6 +1371,7 @@ def main() -> None:
             "epoch": best_epoch,
             "validation": best_validation_metrics,
             "targetKlDivergence": args.target_validation_kl,
+            "targetBaseKlDivergence": args.target_validation_base_kl,
             "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
         })
     if patience_exhausted:
@@ -1440,6 +1458,7 @@ def main() -> None:
                     "epoch": epoch,
                     "validation": validation_metrics,
                     "targetKlDivergence": args.target_validation_kl,
+                    "targetBaseKlDivergence": args.target_validation_base_kl,
                     "targetKlDivergenceStdDev": args.target_validation_kl_stddev,
                 })
             if stopped or quality_target_reached or patience_exhausted:
@@ -1964,20 +1983,26 @@ def training_normalization(dataset: FittedPolicyDataset) -> tuple[Tensor, Tensor
 
 
 def cached_training_normalization(
-    dataset: FittedPolicyDataset, cache_file: Path | None
+    dataset: FittedPolicyDataset,
+    cache_file: Path | None,
+    *,
+    allow_count_mismatch: bool = False,
 ) -> tuple[Tensor, Tensor]:
     if cache_file is not None and cache_file.exists():
         with np.load(cache_file, allow_pickle=False) as cache:
             mean = cache["mean"]
             std = cache["std"]
             count = int(cache["count"])
-        if count != len(dataset) or mean.shape != (INPUT_FEATURE_COUNT,) \
+        if (count != len(dataset) and not allow_count_mismatch) \
+                or mean.shape != (INPUT_FEATURE_COUNT,) \
                 or std.shape != (INPUT_FEATURE_COUNT,) \
                 or not np.isfinite(mean).all() or not np.isfinite(std).all() \
                 or np.any(std <= 0):
             raise ValueError(f"invalid cached feature statistics: {cache_file}")
         emit({"event": "training-statistics-cache", "kind": "features", "hit": True,
-              "file": str(cache_file), "examples": count})
+              "file": str(cache_file), "examples": len(dataset),
+              "cachedExamples": count,
+              "countMismatchAccepted": count != len(dataset)})
         return torch.from_numpy(mean.astype(np.float32)), torch.from_numpy(std.astype(np.float32))
     mean, std = training_normalization(dataset)
     if cache_file is not None:
@@ -2276,6 +2301,7 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "evaluationOnly": args.evaluation_only,
             "targetValidation": {
                 "klDivergence": args.target_validation_kl,
+                "baseKlDivergence": args.target_validation_base_kl,
                 "klDivergenceStdDev": args.target_validation_kl_stddev,
             },
             "policyMetricDefinitions": {
@@ -2555,6 +2581,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("invalid optimizer or dropout configuration")
     if args.target_validation_kl is not None and args.target_validation_kl <= 0:
         raise ValueError("target validation KL must be positive")
+    if args.target_validation_base_kl is not None \
+            and args.target_validation_base_kl <= 0:
+        raise ValueError("target validation base KL must be positive")
+    if args.target_validation_kl is not None \
+            and args.target_validation_base_kl is not None:
+        raise ValueError("choose either conditional or base validation KL target")
     if args.target_validation_kl_stddev is not None \
             and args.target_validation_kl_stddev <= 0:
         raise ValueError("target validation KL standard deviation must be positive")
@@ -2576,6 +2608,11 @@ def validation_target_reached(
     metrics: dict[str, float],
     args: argparse.Namespace,
 ) -> bool:
+    if args.target_validation_base_kl is not None:
+        return (
+            metrics.get("baseKlDivergence", math.inf)
+            <= args.target_validation_base_kl
+        )
     if args.target_validation_kl is None:
         return False
     if metrics.get("klDivergence", math.inf) > args.target_validation_kl:

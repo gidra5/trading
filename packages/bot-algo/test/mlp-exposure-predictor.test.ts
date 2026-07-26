@@ -71,6 +71,20 @@ test("MLP manifest validation rejects architecture drift", () => {
     modelFile: "model.onnx",
   };
   assert.doesNotThrow(() => validateMlpModelManifest(manifest));
+  assert.doesNotThrow(() => validateMlpModelManifest({
+    ...manifest,
+    training: {
+      trainExamples: 1,
+      validationExamples: 1,
+      testExamples: 1,
+      bestEpoch: 0,
+      bestValidationLoss: 1,
+      testLoss: 1,
+      selectionMetric: "baseKlDivergence",
+      seed: 1,
+      device: "cuda",
+    },
+  }));
   assert.throws(() => validateMlpModelManifest({ ...manifest, outputActionCount: 127 }));
   assert.throws(() => validateMlpModelManifest({
     ...manifest,

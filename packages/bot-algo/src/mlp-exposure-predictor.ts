@@ -63,7 +63,7 @@ export interface MlpModelManifest {
     lossWeights?: Record<string, number>;
     distributionObjective?: "base-action-ce-pmse-v1";
     oracleObjective?: "base-action-gaussian-time-correlation-mi-v1";
-    selectionMetric?: "loss" | "klDivergence";
+    selectionMetric?: "loss" | "klDivergence" | "baseKlDivergence";
     policyMetricDefinitions?: {
       klDivergence: string;
       klDivergenceVariance?: string;
@@ -249,7 +249,8 @@ export function validateMlpModelManifest(manifest: MlpModelManifest): void {
       && training.targetRepresentation !== "minuteOracleProbabilities")
     || (training.selectionMetric !== undefined
       && training.selectionMetric !== "loss"
-      && training.selectionMetric !== "klDivergence")
+      && training.selectionMetric !== "klDivergence"
+      && training.selectionMetric !== "baseKlDivergence")
     || (training.distributionObjective !== undefined
       && training.distributionObjective !== "base-action-ce-pmse-v1")
     || (training.oracleObjective !== undefined

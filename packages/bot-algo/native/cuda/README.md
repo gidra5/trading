@@ -26,9 +26,13 @@ PTX.
 
 The exposure-value distribution path factors each target into a precomputed
 mandatory hold and a fee-separable continuation. Buy/sell prefix and suffix
-scans make each Bellman transition linear in the action-grid size. For the
+scans make each Bellman transition linear in the action-grid size and query
+each passively drifted exposure exactly, without interpolating a sampled
+continuation row. For the
 production rolling horizon, complete diagonals stay in warp-local memory and
 the compact path allocates only its Float32 holding and endpoint rows; the
 outer forced-action values are normalized directly from registers into the
 probability output. The unused general Float64 Bellman tables and intermediate
-forced-action table are omitted.
+forced-action table are omitted. Reused double-buffered pinned host slots stage
+prices into CUDA and probabilities back out while the dataset worker pipeline
+streams the preceding output into compression.

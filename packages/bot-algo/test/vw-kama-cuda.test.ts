@@ -231,7 +231,9 @@ test("CUDA distribution-only oracle is deterministic and faithful to the full st
     }
     maximumRowKlDivergence = Math.max(maximumRowKlDivergence, rowKlDivergence);
   }
-  assert.ok(maximumDifference < 1e-5, `maximum probability drifted by ${maximumDifference}`);
+  // The compact production path evaluates the exact recurrence in Float32;
+  // the full diagnostic path retains Float64 intermediates.
+  assert.ok(maximumDifference < 2e-5, `maximum probability drifted by ${maximumDifference}`);
   assert.ok(
     maximumRowKlDivergence < 1e-6,
     `maximum row KL divergence drifted by ${maximumRowKlDivergence}`,
@@ -239,6 +241,33 @@ test("CUDA distribution-only oracle is deterministic and faithful to the full st
   assert.deepEqual(second.probabilities, first.probabilities);
   assert.equal(first.path.logReturn, 0);
   assert.ok(first.path.exposures.every((value) => value === 0));
+
+  const unevenOptions = {
+    ...options,
+    valueHorizonSteps: 62,
+  };
+  const unevenFull = (await prepareExposureValueOracleCuda(
+    prices,
+    unevenOptions,
+  )).oracle;
+  const unevenCompact = (await prepareExposureValueOracleCuda(prices, {
+    ...unevenOptions,
+    distributionOnly: true,
+  })).oracle;
+  let unevenMaximumDifference = 0;
+  for (let index = 0; index < unevenFull.probabilities!.length; index += 1) {
+    unevenMaximumDifference = Math.max(
+      unevenMaximumDifference,
+      Math.abs(
+        unevenFull.probabilities![index]!
+          - unevenCompact.probabilities![index]!,
+      ),
+    );
+  }
+  assert.ok(
+    unevenMaximumDifference < 2e-5,
+    `non-fused probability drifted by ${unevenMaximumDifference}`,
+  );
 });
 
 test("CUDA evaluation tracks the Float64 CPU evaluator", async (context) => {

@@ -348,13 +348,10 @@ export function prepareExposureValueOracle(
   const opportunityEpsilon = Math.max(0, options.opportunityEpsilon ?? 1e-6);
   const forcedValues = new Float64Array(grid.length);
   const cellCount = prices.length * grid.length;
-  let previousContinuations: Float64Array | null = null;
-  let currentContinuations = new Float64Array(cellCount);
-  const policy = new Uint16Array((prices.length - options.scoreStartIndex) * grid.length);
+  let previousForcedRows: Float64Array | null = null;
+  let currentForcedRows = new Float64Array(cellCount);
   const prefixValues = new Float64Array(grid.length);
   const suffixValues = new Float64Array(grid.length);
-  const prefixTargets = new Uint16Array(grid.length);
-  const suffixTargets = new Uint16Array(grid.length);
   const transitionScratch = createTransitionDistributionScratch(grid.length);
   const separableRebalanceCosts = 1 - execution.friction * grid[grid.length - 1]! > 0
     && 1 - execution.friction + execution.friction * grid[0]! > 0;
@@ -380,20 +377,36 @@ export function prepareExposureValueOracle(
       const row = time * grid.length;
       const endpointTime = Math.min(prices.length - 1, time + duration);
       const endpointRow = endpointTime * grid.length;
+      const hasContinuation = previousForcedRows !== null
+        && endpointTime < prices.length - 1;
+      if (hasContinuation && separableRebalanceCosts) {
+        prepareOptimalContinuationScans(
+          previousForcedRows!,
+          endpointRow,
+          grid,
+          execution.friction,
+          prefixValues,
+          suffixValues,
+        );
+      }
       for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
         const cell = row + exposureIndex;
         const holdingValue = transitions.values[cell]!;
         forcedValues[exposureIndex] = Number.isFinite(holdingValue)
-          ? holdingValue + (previousContinuations
-              ? interpolateRow(
-                  previousContinuations,
+          ? holdingValue + (hasContinuation
+              ? optimalContinuationAtExposure(
+                  previousForcedRows!,
                   endpointRow,
                   grid,
+                  execution.friction,
                   transitions.endpointExposures[cell]!,
+                  separableRebalanceCosts ? prefixValues : undefined,
+                  separableRebalanceCosts ? suffixValues : undefined,
                 )
               : 0)
           : Number.NEGATIVE_INFINITY;
       }
+      currentForcedRows.set(forcedValues, row);
 
       if (finalLevel) {
         actionValues?.set(forcedValues, row);
@@ -424,24 +437,9 @@ export function prepareExposureValueOracle(
         averageRegrets[time] = policy.averageRegret;
         weights[time] = policy.averageRegret + opportunityEpsilon;
       }
-
-      fillOptimalContinuation(
-        forcedValues,
-        currentContinuations,
-        row,
-        grid,
-        execution.friction,
-        separableRebalanceCosts,
-        prefixValues,
-        suffixValues,
-        prefixTargets,
-        suffixTargets,
-        finalLevel ? policy : undefined,
-        finalLevel ? (time - options.scoreStartIndex) * grid.length : 0,
-      );
     }
-    previousContinuations = currentContinuations;
-    currentContinuations = new Float64Array(cellCount);
+    previousForcedRows = currentForcedRows;
+    currentForcedRows = new Float64Array(cellCount);
   }
 
   prepareExposureValueOraclePath(prices, options, oracle);
@@ -508,34 +506,34 @@ export function populateSparseExposureValueOracle(
   }
   const grid = oracle.grid;
   const forcedValues = new Float64Array(grid.length);
-  let nextValues = new Float64Array(grid.length);
-  let currentValues = new Float64Array(grid.length);
+  const nextForcedValues = new Float64Array(grid.length);
   const prefixValues = new Float64Array(grid.length);
   const suffixValues = new Float64Array(grid.length);
-  const prefixTargets = new Uint16Array(grid.length);
-  const suffixTargets = new Uint16Array(grid.length);
   const transitionScratch = createTransitionDistributionScratch(grid.length);
   const separableRebalanceCosts = 1 - oracle.execution.friction * grid[grid.length - 1]! > 0
     && 1 - oracle.execution.friction + oracle.execution.friction * grid[0]! > 0;
-  const sellRebalanceLogs = separableRebalanceCosts
-    ? Float64Array.from(grid, (exposure) => Math.log(1 - oracle.execution.friction * exposure))
-    : null;
-  const buyRebalanceLogs = separableRebalanceCosts
-    ? Float64Array.from(
-        grid,
-        (exposure) => Math.log(1 - oracle.execution.friction + oracle.execution.friction * exposure),
-      )
-    : null;
   const opportunityEpsilon = Math.max(0, options.opportunityEpsilon ?? 1e-6);
 
   for (const scoreIndex of indexes) {
     throwIfExposureValueOracleCancelled(options.cancelFlag);
-    nextValues.fill(0);
+    nextForcedValues.fill(0);
     for (let block = blockDurations.length - 1; block >= 0; block -= 1) {
       const start = Math.min(prices.length - 1, scoreIndex + blockOffsets[block]!);
       const duration = blockDurations[block]!;
       const end = Math.min(prices.length - 1, start + duration);
       const blockExtrema = extrema.get(duration);
+      const hasContinuation = block < blockDurations.length - 1
+        && end < prices.length - 1;
+      if (hasContinuation && separableRebalanceCosts) {
+        prepareOptimalContinuationScans(
+          nextForcedValues,
+          0,
+          grid,
+          oracle.execution.friction,
+          prefixValues,
+          suffixValues,
+        );
+      }
       for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
         const holding = blockExtrema
           ? unmaintainedHoldingBlockOutcome(
@@ -554,36 +552,21 @@ export function populateSparseExposureValueOracle(
               oracle.execution,
             );
         forcedValues[exposureIndex] = Number.isFinite(holding.logReturn)
-          ? holding.logReturn + (block === blockDurations.length - 1
-              ? 0
-              : interpolateRow(nextValues, 0, grid, holding.exposure))
+          ? holding.logReturn + (hasContinuation
+              ? optimalContinuationAtExposure(
+                  nextForcedValues,
+                  0,
+                  grid,
+                  oracle.execution.friction,
+                  holding.exposure,
+                  separableRebalanceCosts ? prefixValues : undefined,
+                  separableRebalanceCosts ? suffixValues : undefined,
+                )
+              : 0)
           : Number.NEGATIVE_INFINITY;
       }
       if (block > 0) {
-        if (sellRebalanceLogs && buyRebalanceLogs) {
-          fillPreparedOptimalContinuation(
-            forcedValues,
-            currentValues,
-            sellRebalanceLogs,
-            buyRebalanceLogs,
-            prefixValues,
-            suffixValues,
-          );
-        } else {
-          fillOptimalContinuation(
-            forcedValues,
-            currentValues,
-            0,
-            grid,
-            oracle.execution.friction,
-            false,
-            prefixValues,
-            suffixValues,
-            prefixTargets,
-            suffixTargets,
-          );
-        }
-        [nextValues, currentValues] = [currentValues, nextValues];
+        nextForcedValues.set(forcedValues);
         continue;
       }
       const probabilityRow = oracle.probabilities?.subarray(
@@ -645,14 +628,12 @@ function prepareSegmentEndingExposureValueOracle(
   const opportunityEpsilon = Math.max(0, options.opportunityEpsilon ?? 1e-6);
   const forcedValues = new Float64Array(grid.length);
   const ringLength = Math.min(prices.length, holdingPeriodSteps + 1);
-  const continuationRing = Array.from(
+  const forcedRing = Array.from(
     { length: ringLength },
     () => new Float64Array(grid.length),
   );
   const prefixValues = new Float64Array(grid.length);
   const suffixValues = new Float64Array(grid.length);
-  const prefixTargets = new Uint16Array(grid.length);
-  const suffixTargets = new Uint16Array(grid.length);
   const transitionScratch = createTransitionDistributionScratch(grid.length);
   const separableRebalanceCosts = 1 - execution.friction * grid[grid.length - 1]! > 0
     && 1 - execution.friction + execution.friction * grid[0]! > 0;
@@ -662,7 +643,18 @@ function prepareSegmentEndingExposureValueOracle(
       forcedValues.fill(0);
     } else {
       const endpointTime = Math.min(prices.length - 1, time + holdingPeriodSteps);
-      const endpointContinuation = continuationRing[endpointTime % ringLength]!;
+      const endpointForced = forcedRing[endpointTime % ringLength]!;
+      const hasContinuation = endpointTime < prices.length - 1;
+      if (hasContinuation && separableRebalanceCosts) {
+        prepareOptimalContinuationScans(
+          endpointForced,
+          0,
+          grid,
+          execution.friction,
+          prefixValues,
+          suffixValues,
+        );
+      }
       for (let exposureIndex = 0; exposureIndex < grid.length; exposureIndex += 1) {
         const holding = holdingBlockOutcome(
           prices,
@@ -672,12 +664,17 @@ function prepareSegmentEndingExposureValueOracle(
           execution,
         );
         forcedValues[exposureIndex] = Number.isFinite(holding.logReturn)
-          ? holding.logReturn + interpolateRow(
-              endpointContinuation,
-              0,
-              grid,
-              holding.exposure,
-            )
+          ? holding.logReturn + (hasContinuation
+              ? optimalContinuationAtExposure(
+                  endpointForced,
+                  0,
+                  grid,
+                  execution.friction,
+                  holding.exposure,
+                  separableRebalanceCosts ? prefixValues : undefined,
+                  separableRebalanceCosts ? suffixValues : undefined,
+                )
+              : 0)
           : Number.NEGATIVE_INFINITY;
       }
     }
@@ -705,18 +702,7 @@ function prepareSegmentEndingExposureValueOracle(
     averageRegrets[time] = policy.averageRegret;
     weights[time] = policy.averageRegret + opportunityEpsilon;
 
-    fillOptimalContinuation(
-      forcedValues,
-      continuationRing[time % ringLength]!,
-      0,
-      grid,
-      execution.friction,
-      separableRebalanceCosts,
-      prefixValues,
-      suffixValues,
-      prefixTargets,
-      suffixTargets,
-    );
+    forcedRing[time % ringLength]!.set(forcedValues);
   }
 
   return oracle;
@@ -1167,30 +1153,71 @@ function fillOptimalContinuation(
   }
 }
 
-function fillPreparedOptimalContinuation(
+function prepareOptimalContinuationScans(
   forcedValues: Float64Array,
-  continuations: Float64Array,
-  sellRebalanceLogs: Float64Array,
-  buyRebalanceLogs: Float64Array,
+  row: number,
+  grid: Float64Array,
+  friction: number,
   prefixValues: Float64Array,
   suffixValues: Float64Array,
 ): void {
   let best = Number.NEGATIVE_INFINITY;
-  for (let index = 0; index < forcedValues.length; index += 1) {
-    best = Math.max(best, forcedValues[index]! - sellRebalanceLogs[index]!);
+  for (let index = 0; index < grid.length; index += 1) {
+    const denominator = 1 - friction * grid[index]!;
+    const forced = forcedValues[row + index]!;
+    const candidate = denominator > 0 && Number.isFinite(forced)
+      ? forced - Math.log(denominator)
+      : Number.NEGATIVE_INFINITY;
+    best = Math.max(best, candidate);
     prefixValues[index] = best;
   }
   best = Number.NEGATIVE_INFINITY;
-  for (let index = forcedValues.length - 1; index >= 0; index -= 1) {
-    best = Math.max(best, forcedValues[index]! - buyRebalanceLogs[index]!);
+  for (let index = grid.length - 1; index >= 0; index -= 1) {
+    const denominator = 1 - friction + friction * grid[index]!;
+    const forced = forcedValues[row + index]!;
+    const candidate = denominator > 0 && Number.isFinite(forced)
+      ? forced - Math.log(denominator)
+      : Number.NEGATIVE_INFINITY;
+    best = Math.max(best, candidate);
     suffixValues[index] = best;
   }
-  for (let index = 0; index < forcedValues.length; index += 1) {
-    continuations[index] = Math.max(
-      sellRebalanceLogs[index]! + prefixValues[index]!,
-      buyRebalanceLogs[index]! + suffixValues[index]!,
-    );
+}
+
+/**
+ * Exact fee-aware continuation from a marked exposure into a discrete target
+ * row. Prefix/suffix scans retain the complete target choice, so a drifted
+ * off-grid state is queried directly instead of interpolating sampled values.
+ */
+function optimalContinuationAtExposure(
+  forcedValues: Float64Array,
+  row: number,
+  grid: Float64Array,
+  friction: number,
+  exposure: number,
+  prefixValues?: Float64Array,
+  suffixValues?: Float64Array,
+): number {
+  if (prefixValues && suffixValues) {
+    const cursor = upperBoundExposure(grid, exposure);
+    const sellFactor = 1 - friction * exposure;
+    const buyFactor = 1 - friction + friction * exposure;
+    const sell = cursor > 0 && sellFactor > 0
+      ? Math.log(sellFactor) + prefixValues[cursor - 1]!
+      : Number.NEGATIVE_INFINITY;
+    const buy = cursor < grid.length && buyFactor > 0
+      ? Math.log(buyFactor) + suffixValues[cursor]!
+      : Number.NEGATIVE_INFINITY;
+    return Math.max(sell, buy);
   }
+
+  let best = Number.NEGATIVE_INFINITY;
+  for (let targetIndex = 0; targetIndex < grid.length; targetIndex += 1) {
+    const forced = forcedValues[row + targetIndex]!;
+    if (!Number.isFinite(forced)) continue;
+    const factor = rebalanceEquityFactor(exposure, grid[targetIndex]!, friction);
+    if (factor > 0) best = Math.max(best, Math.log(factor) + forced);
+  }
+  return best;
 }
 
 /** Allocate and validate an oracle result without running the Bellman recurrence. */

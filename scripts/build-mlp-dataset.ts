@@ -26,7 +26,7 @@ import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
 const SECOND_MS = 1_000;
-const RAW_ORACLE_SCHEMA_VERSION = 3;
+const RAW_ORACLE_SCHEMA_VERSION = 4;
 const TEACHER_PARAMETER_COUNT = 8;
 const TEACHER_METRIC_NAMES = [
   "crossEntropy",
@@ -78,6 +78,7 @@ interface TrainingPlan {
   artifactDir: string;
   runDir: string;
   componentSeedDatasetDirs?: string[];
+  minuteOracleComponentSeedDatasetDirs?: string[];
   oraclePreparation: { backend: "cuda"; pipelineDepth?: 1 | 2 | 3 | 4 };
   samplingIntervalMs: number;
   predictionDelayMs: number;
@@ -548,7 +549,21 @@ async function main(): Promise<void> {
       oracleRowsByDay,
     );
   }
-  if (componentSeedDatasetDirs.length > 0) await atomicWriteJson(progressFile, progress);
+  const minuteOracleComponentSeedDatasetDirs = [...new Set(
+    plan.minuteOracleComponentSeedDatasetDirs ?? [],
+  )];
+  for (const seedDatasetDir of minuteOracleComponentSeedDatasetDirs) {
+    await importReusableMinuteOracleComponents(
+      path.resolve(repoRoot, seedDatasetDir),
+      output,
+      selectedDays,
+      plan,
+    );
+  }
+  if (componentSeedDatasetDirs.length > 0
+    || minuteOracleComponentSeedDatasetDirs.length > 0) {
+    await atomicWriteJson(progressFile, progress);
+  }
   const refinementQueueFile = path.join(output, "teacher-refinement-queue.json");
   const refinementQueue = await loadRefinementQueue(refinementQueueFile, componentStoreId);
   const refinementCases = new Map(refinementQueue.cases.map((item) => [
@@ -2733,6 +2748,53 @@ async function importReusableComponents(
       sourceOutput,
       importedFeatures,
       importedOracles,
+    })}\n`);
+  }
+}
+
+async function importReusableMinuteOracleComponents(
+  sourceOutput: string,
+  output: string,
+  oracleDays: readonly number[],
+  plan: TrainingPlan,
+): Promise<void> {
+  if (plan.runtimeMinuteOracleTargets
+    || path.resolve(sourceOutput) === path.resolve(output)) return;
+  let source: Progress;
+  try {
+    source = JSON.parse(
+      await fs.readFile(path.join(sourceOutput, "progress.json"), "utf8"),
+    ) as Progress;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (source.planId !== plan.componentStoreId) return;
+  const actionCount = source.grid?.length ?? plan.execution.gridSize;
+  if (actionCount !== plan.execution.gridSize) return;
+  const compression = plan.componentCompression?.minuteOracleProbabilities;
+  const expectedBytes = 1_441 * actionCount * Float32Array.BYTES_PER_ELEMENT;
+  let importedMinuteOracles = 0;
+  for (const day of oracleDays) {
+    const relativeFile = minuteOracleComponentFile(isoDate(day), compression);
+    const sourceFile = path.join(sourceOutput, relativeFile);
+    const targetFile = path.join(output, relativeFile);
+    const targetComplete = compression === "zstd"
+      ? await nonEmptyFile(targetFile)
+      : await fileHasBytes(targetFile, expectedBytes);
+    if (targetComplete) continue;
+    const sourceComplete = compression === "zstd"
+      ? await nonEmptyFile(sourceFile)
+      : await fileHasBytes(sourceFile, expectedBytes);
+    if (!sourceComplete) continue;
+    await linkComponentFiles(sourceOutput, output, [relativeFile]);
+    importedMinuteOracles += 1;
+  }
+  if (importedMinuteOracles > 0) {
+    process.stdout.write(`${JSON.stringify({
+      event: "dataset-minute-oracle-components-reused",
+      sourceOutput,
+      importedMinuteOracles,
     })}\n`);
   }
 }
