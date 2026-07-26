@@ -14,7 +14,6 @@ LOSS_TERMS = (
     "probabilityMse",
     "parameterMse",
     "excessEntropy",
-    "temporalMutualInformation",
     "oracleMutualInformation",
 )
 DISTRIBUTION_ANCHORS = (

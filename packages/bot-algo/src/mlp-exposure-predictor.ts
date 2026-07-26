@@ -100,9 +100,6 @@ export interface MlpTrainingMetrics {
   probabilityMseVariance?: number;
   probabilityMseStdDev?: number;
   excessEntropy: number;
-  temporalMutualInformation: number;
-  targetTemporalMutualInformation: number;
-  temporalMutualInformationReward: number;
   oracleMutualInformation: number;
   targetEntropy: number;
   predictedEntropy: number;

@@ -47,7 +47,6 @@ from train_mlp import (
     learning_rate_multiplier,
     loader,
     merge_weighted_moments,
-    parse_loss_weights,
     parse_time_weighting,
     report_stored_example_weights,
     resolve_device,
@@ -63,10 +62,20 @@ from train_mlp import (
 LOSS_WEIGHT_KEYS = (
     "crossEntropy",
     "probabilityMse",
+    "parameterMse",
     "excessEntropy",
-    "temporalMutualInformation",
     "oracleMutualInformation",
 )
+
+
+def parse_population_loss_weights(value: dict) -> LossWeights:
+    return LossWeights(
+        cross_entropy=float(value.get("crossEntropy", 1)),
+        probability_mse=float(value.get("probabilityMse", 1)),
+        parameter_mse=float(value.get("parameterMse", 1)),
+        excess_entropy=float(value.get("excessEntropy", 1)),
+        oracle_mutual_information=float(value.get("oracleMutualInformation", 1)),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,8 +157,8 @@ def main() -> None:
         device,
         visible=True,
     )
-    # Keep the exact validation blocks used by the scalar trainer. Temporal MI
-    # is a block statistic, so shrinking these batches for a wider population
+    # Keep the exact validation blocks used by the scalar trainer. Oracle MI is
+    # a block statistic, so shrinking these batches for a wider population
     # would change both the sampled rows and the reported selection metric.
     evaluation_batch_size = common["evaluationBatchSize"]
     loader_args = argparse.Namespace(workers=common["workers"])
@@ -573,7 +582,7 @@ def run_group(
         )
 
     for member, job in enumerate(group):
-        loss_weights = parse_loss_weights(json.dumps(job["lossWeights"]))
+        loss_weights = parse_population_loss_weights(job["lossWeights"])
         training_batches = epochs_trained[member] * train_batches_per_epoch
         training_examples_per_epoch = min(
             len(train),
@@ -784,7 +793,7 @@ def train_epoch(
         runtime.population_size,
         device=runtime.device,
     )
-    temporal_example_count = torch.zeros(runtime.population_size, device=runtime.device)
+    information_example_count = torch.zeros(runtime.population_size, device=runtime.device)
     active_tensor = torch.tensor(active, dtype=torch.float32, device=runtime.device)
     started = time.monotonic()
     epoch_batches = min(
@@ -883,17 +892,17 @@ def train_epoch(
             metrics["klDivergence"].detach(),
             metrics["klCenteredSquareSum"].detach(),
         )
-        temporal_count = metrics["temporalExampleCount"].detach()
-        temporal_example_count += temporal_count
+        information_count = metrics["informationExampleCount"].detach()
+        information_example_count += information_count
         for name in TRAIN_METRIC_NAMES:
             if name in KL_MOMENT_METRIC_NAMES:
                 continue
-            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            metric_count = information_count if name in TIME_BLOCK_METRIC_NAMES else count
             totals[name] += metrics[name].detach() * metric_count
     return finalize_metrics(
         totals,
         total_examples,
-        temporal_example_count,
+        information_example_count,
         time_weight_sum,
         time_weight_square_sum,
         kl_weight_sum,
@@ -937,7 +946,7 @@ def evaluate_population(
         runtime.population_size,
         device=runtime.device,
     )
-    temporal_example_count = torch.zeros(runtime.population_size, device=runtime.device)
+    information_example_count = torch.zeros(runtime.population_size, device=runtime.device)
     for features, targets, time_weights, times, _ in data:
         features = features.to(runtime.device, non_blocking=True)
         targets = targets.to(runtime.device, non_blocking=True)
@@ -976,17 +985,17 @@ def evaluate_population(
                 metrics["deploymentKlDivergence"],
                 metrics["deploymentKlCenteredSquareSum"],
             )
-        temporal_count = metrics["temporalExampleCount"]
-        temporal_example_count += temporal_count
+        information_count = metrics["informationExampleCount"]
+        information_example_count += information_count
         for name in METRIC_NAMES:
             if name in KL_MOMENT_METRIC_NAMES:
                 continue
-            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            metric_count = information_count if name in TIME_BLOCK_METRIC_NAMES else count
             totals[name] += metrics[name] * metric_count
     return finalize_metrics(
         totals,
         total_examples,
-        temporal_example_count,
+        information_example_count,
         time_weight_sum,
         time_weight_square_sum,
         kl_weight_sum,
@@ -1001,7 +1010,7 @@ def evaluate_population(
 def finalize_metrics(
     totals: dict[str, Tensor],
     total_examples: int,
-    temporal_example_count: Tensor,
+    information_example_count: Tensor,
     time_weight_sum: Tensor,
     time_weight_square_sum: Tensor,
     kl_weight_sum: Tensor,
@@ -1014,9 +1023,9 @@ def finalize_metrics(
     population_size = time_weight_sum.numel()
     results = [{} for _ in range(population_size)]
     for member in range(population_size):
-        temporal_count = max(1.0, float(temporal_example_count[member]))
+        information_count = max(1.0, float(information_example_count[member]))
         for name, values in totals.items():
-            denominator = temporal_count if name in TIME_BLOCK_METRIC_NAMES \
+            denominator = information_count if name in TIME_BLOCK_METRIC_NAMES \
                 else max(1, total_examples)
             results[member][name] = float(values[member]) / denominator
         results[member]["timeWeightEffectiveSampleRatio"] = float(
@@ -1152,7 +1161,7 @@ def completed_job(job: dict, manifest: dict, common: dict) -> bool:
         result = json.loads(result_file.read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    expected_weights = asdict(parse_loss_weights(json.dumps(job["lossWeights"])))
+    expected_weights = asdict(parse_population_loss_weights(job["lossWeights"]))
     epochs_trained = result.get("epochsTrained")
     stopped_by_patience = result.get(
         "stoppedByPatience",

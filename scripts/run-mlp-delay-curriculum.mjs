@@ -424,6 +424,7 @@ function generatePhasePlan(
   ];
   const training = {
     ...basePlan.training,
+    ...curriculumPlan.training,
     epochs: epochLimit,
     earlyStopping: "target-only",
     targetValidation: {

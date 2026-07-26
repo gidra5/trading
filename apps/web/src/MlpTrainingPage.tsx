@@ -14,9 +14,6 @@ interface MetricValues {
   probabilityMseVariance?: number;
   probabilityMseStdDev?: number;
   excessEntropy?: number;
-  temporalMutualInformation?: number;
-  targetTemporalMutualInformation?: number;
-  temporalMutualInformationReward?: number;
   oracleMutualInformation?: number;
   distanceImbalanceWeight?: number;
   timeWeightEffectiveSampleRatio?: number;
@@ -492,11 +489,6 @@ export function MlpTrainingPage() {
               <MetricChart title="Excess entropy" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.excessEntropy)} xLabel="global step" series={[
                 metricPlot("Excess entropy", "#a78bfa", trainSteps(), "excessEntropy"),
               ]} />
-              <MetricChart title="Temporal mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.temporalMutualInformation)} xLabel="global step" series={[
-                metricPlot("Predicted MI", "#38bdf8", trainSteps(), "temporalMutualInformation"),
-                metricPlot("Capped reward", "#a78bfa", trainSteps(), "temporalMutualInformationReward"),
-                metricPlot("Teacher MI", "#f5b84b", trainSteps(), "targetTemporalMutualInformation"),
-              ]} />
               <MetricChart title="Oracle mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.oracleMutualInformation)} xLabel="global step" series={[
                 metricPlot("Oracle MI", "#22c55e", trainSteps(), "oracleMutualInformation"),
               ]} />
@@ -831,9 +823,7 @@ function metricValues(value: unknown): MetricValues {
     probabilityMse: numberValue(record.probabilityMse),
     probabilityMseVariance: numberValue(record.probabilityMseVariance),
     probabilityMseStdDev: numberValue(record.probabilityMseStdDev),
-    excessEntropy: numberValue(record.excessEntropy), temporalMutualInformation: numberValue(record.temporalMutualInformation),
-    targetTemporalMutualInformation: numberValue(record.targetTemporalMutualInformation),
-    temporalMutualInformationReward: numberValue(record.temporalMutualInformationReward),
+    excessEntropy: numberValue(record.excessEntropy),
     oracleMutualInformation: numberValue(record.oracleMutualInformation),
     distanceImbalanceWeight: numberValue(record.distanceImbalanceWeight),
     timeWeightEffectiveSampleRatio: numberValue(record.timeWeightEffectiveSampleRatio),

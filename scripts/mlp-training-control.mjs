@@ -169,8 +169,7 @@ function metricLine(label, metrics) {
     + ` ± ${number(metrics.probabilityMseStdDev)}`
     + ` (var ${number(metrics.probabilityMseVariance)})`
     + ` · paramMSE ${number(metrics.parameterMse)}`
-    + ` · excess H ${number(metrics.excessEntropy)} · Temporal MI ${number(metrics.temporalMutualInformation)}`
-    + ` · Temporal reward ${number(metrics.temporalMutualInformationReward)}`
+    + ` · excess H ${number(metrics.excessEntropy)}`
     + ` · Oracle MI ${number(metrics.oracleMutualInformation)}`;
 }
 

@@ -59,9 +59,6 @@ METRIC_NAMES = (
     "probabilityMseVariance",
     "probabilityMseStdDev",
     "excessEntropy",
-    "temporalMutualInformation",
-    "targetTemporalMutualInformation",
-    "temporalMutualInformationReward",
     "oracleMutualInformation",
     "targetEntropy",
     "predictedEntropy",
@@ -80,9 +77,6 @@ PROBABILITY_MSE_MOMENT_METRIC_NAMES = frozenset((
     "probabilityMseStdDev",
 ))
 TIME_BLOCK_METRIC_NAMES = frozenset((
-    "temporalMutualInformation",
-    "targetTemporalMutualInformation",
-    "temporalMutualInformationReward",
     "oracleMutualInformation",
 ))
 
@@ -1366,8 +1360,7 @@ def main() -> None:
         "skipBaseline": args.skip_baseline,
         "compile": args.compile,
         "lossWeights": asdict(loss_weights),
-        "distributionObjective": "base-action-ce-pmse-v1",
-        "temporalObjective": "base-action-gaussian-mi-v1",
+        "distributionObjective": "conditional-plus-action-only-ce-pmse-v1",
         "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
     }
     if manifest["exampleWeighting"]["timeWeighting"] != time_weighting_metadata(time_weighting):
@@ -1412,7 +1405,7 @@ def main() -> None:
     if checkpoint is not None:
         checkpoint_contract = checkpoint.get("trainingContract")
         if not isinstance(checkpoint_contract, dict):
-            raise RuntimeError("checkpoint does not contain a temporal training contract")
+            raise RuntimeError("checkpoint does not contain a training contract")
         checkpoint_schedule = checkpoint_contract.get("learningRateSchedule")
         if checkpoint_schedule is not None:
             training_contract["learningRateSchedule"] = checkpoint_schedule
@@ -1422,7 +1415,7 @@ def main() -> None:
                 training_contract,
             ):
                 raise RuntimeError(
-                    "checkpoint does not match the current temporal training contract"
+                    "checkpoint does not match the current training contract"
                 )
             resume_contract_extended = True
             scheduler_state = checkpoint.get("scheduler", {})
@@ -1602,7 +1595,6 @@ def main() -> None:
         ),
         "lossWeights": asdict(loss_weights),
         "distributionObjective": training_contract["distributionObjective"],
-        "temporalObjective": training_contract["temporalObjective"],
         "oracleObjective": training_contract["oracleObjective"],
         "timeWeighting": time_weighting_metadata(time_weighting),
         "predictionDelayMs": int(manifest["predictionDelayMs"]),
@@ -1807,9 +1799,9 @@ def main() -> None:
                 "baseKlDivergence":
                     "KL between stored and predicted base-action distributions",
                 "probabilityMse":
-                    "weighted mean per-example probability MSE on the visible-range base-action distribution",
+                    "weighted mean per-example probability MSE across all visible-range conditional rows",
                 "probabilityMseVariance":
-                    "weighted population variance of per-example visible-range base-action probability MSE",
+                    "weighted population variance of per-example visible-range conditional probability MSE",
             },
             "bestEpoch": best_epoch,
             "bestValidationScore": best_validation,
@@ -1819,7 +1811,7 @@ def main() -> None:
             "screeningValidationExamples": validation_loader.batch_sampler.example_count,
             "validationFraction": args.validation_fraction,
             "lossWeights": asdict(loss_weights),
-            "distributionObjective": "base-action-ce-pmse-v1",
+            "distributionObjective": "conditional-plus-action-only-ce-pmse-v1",
             "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "trainExamples": len(train),
             "validationExamples": len(validation),
@@ -2005,23 +1997,24 @@ def train_epoch(
                 batch_metrics["klDivergence"].detach(),
                 batch_metrics["klCenteredSquareSum"].detach(),
             )
-        probability_mse_weight_sum, probability_mse_mean, \
-            probability_mse_centered_square_sum = merge_weighted_moments(
-                probability_mse_weight_sum,
-                probability_mse_mean,
-                probability_mse_centered_square_sum,
-                batch_metrics["probabilityMseWeightSum"].detach(),
-                batch_metrics["probabilityMse"].detach(),
-                batch_metrics["probabilityMseCenteredSquareSum"].detach(),
-            )
-        temporal_count = batch_metrics["temporalExampleCount"].detach()
+        if "probabilityMseWeightSum" in batch_metrics:
+            probability_mse_weight_sum, probability_mse_mean, \
+                probability_mse_centered_square_sum = merge_weighted_moments(
+                    probability_mse_weight_sum,
+                    probability_mse_mean,
+                    probability_mse_centered_square_sum,
+                    batch_metrics["probabilityMseWeightSum"].detach(),
+                    batch_metrics["probabilityMse"].detach(),
+                    batch_metrics["probabilityMseCenteredSquareSum"].detach(),
+                )
+        information_count = batch_metrics["informationExampleCount"].detach()
         for name in TRAIN_METRIC_NAMES:
             if name in KL_MOMENT_METRIC_NAMES \
                     or name in PROBABILITY_MSE_MOMENT_METRIC_NAMES:
                 continue
             if name not in batch_metrics:
                 continue
-            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            metric_count = information_count if name in TIME_BLOCK_METRIC_NAMES else count
             totals[name] += batch_metrics[name].detach() * metric_count
             metric_counts[name] += metric_count
         if stopped:
@@ -2070,7 +2063,7 @@ def evaluate(model, data, actions, current, support,
     probability_mse_weight_sum = torch.zeros((), device=device)
     probability_mse_mean = torch.zeros((), device=device)
     probability_mse_centered_square_sum = torch.zeros((), device=device)
-    temporal_example_count = torch.zeros((), device=device)
+    information_example_count = torch.zeros((), device=device)
     for (
         features,
         targets,
@@ -2114,18 +2107,18 @@ def evaluate(model, data, actions, current, support,
                 batch_metrics["probabilityMse"],
                 batch_metrics["probabilityMseCenteredSquareSum"],
             )
-        temporal_count = batch_metrics["temporalExampleCount"]
-        temporal_example_count += temporal_count
+        information_count = batch_metrics["informationExampleCount"]
+        information_example_count += information_count
         for name in METRIC_NAMES:
             if name in KL_MOMENT_METRIC_NAMES \
                     or name in PROBABILITY_MSE_MOMENT_METRIC_NAMES:
                 continue
-            metric_count = temporal_count if name in TIME_BLOCK_METRIC_NAMES else count
+            metric_count = information_count if name in TIME_BLOCK_METRIC_NAMES else count
             totals[name] += batch_metrics[name] * metric_count
-    temporal_count_value = max(1.0, float(temporal_example_count))
+    information_count_value = max(1.0, float(information_example_count))
     result = {
         name: float(value) / (
-            temporal_count_value if name in TIME_BLOCK_METRIC_NAMES else max(1, total_examples)
+            information_count_value if name in TIME_BLOCK_METRIC_NAMES else max(1, total_examples)
         ) for name, value in totals.items()
     }
     result["timeWeightEffectiveSampleRatio"] = float(
@@ -2385,8 +2378,9 @@ def parse_loss_weights(value: str) -> DirectLossWeights:
     return DirectLossWeights(
         cross_entropy=float(parsed.get("crossEntropy", 1)),
         probability_mse=float(parsed.get("probabilityMse", 0.1)),
+        action_cross_entropy=float(parsed.get("actionCrossEntropy", 0)),
+        action_probability_mse=float(parsed.get("actionProbabilityMse", 0)),
         excess_entropy=float(parsed.get("excessEntropy", 0)),
-        temporal_mutual_information=float(parsed.get("temporalMutualInformation", 1)),
         oracle_mutual_information=float(parsed.get("oracleMutualInformation", 1)),
     )
 
@@ -2609,7 +2603,7 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "testMetrics": test_metrics,
             "teacherFitMetrics": teacher_metrics,
             "lossWeights": asdict(loss_weights),
-            "distributionObjective": "base-action-ce-pmse-v1",
+            "distributionObjective": "conditional-plus-action-only-ce-pmse-v1",
             "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "selectionMetric": args.selection_metric,
             "patience": None if args.disable_patience else args.patience,

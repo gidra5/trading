@@ -271,19 +271,16 @@ ML model based on MLP:
        the eight-parameter quadratic fitter only as a diagnostic.
 4.  Optimize the loss function directly against the stored raw oracle policy. All
     distribution objectives use the visible current/target exposure surface:
-    cross entropy + probability MSE, with excess entropy,
-    teacher-capped conditional Gaussian temporal MI, and oracle MI as separately
-    reported objectives. CE and both MI terms have weight 1; probability MSE
-    has weight 0.1 and excess entropy is currently disabled. There is no
-    parameter-MSE term for the direct output. At each current exposure, temporal MI uses
-    action first/second moments and a total-versus-within variance decomposition
-    over the complete contiguous minibatch time axis, then averages uniformly
-    across current exposures. It cannot earn more reward than the teacher's MI.
-    Oracle MI likewise computes predicted/teacher Gaussian correlation over
-    batch time independently at each current exposure before averaging states.
+    conditional cross entropy + probability MSE and action-only cross entropy
+    + probability MSE, with oracle MI as a separately reported objective. All
+    four distribution weights are 1, oracle MI has weight 0.5, and excess
+    entropy is currently disabled. There is no parameter-MSE term for the
+    direct output. Oracle MI computes predicted/teacher Gaussian correlation
+    over batch time independently at each current exposure before averaging
+    states.
     Measure weight sensitivity with the configured resolution-VI joint screen:
-    32 simultaneous low/high combinations plus the production-weight center,
-    crossed with every configured delay. Report all main effects and 15
+    16 simultaneous low/high combinations plus the production-weight center,
+    crossed with every configured delay. Report all main effects and 10
     pairwise weight interactions independently at each delay so delay × weight
     dependence is measured rather than assumed away.
     After the response screen, run the resumable one-epoch curriculum pilot:
@@ -343,3 +340,4 @@ try finding simpler distributions to learn and then gradually move to the full m
 1. add prediction delay
 2. add oracle moving average
 3. add temperature scaling - the higher means more diffuse and even distribution
+   1. Lets add gradual temperature learning. Start training with high temperature (like 0.1-0.5) and once we saturate scale it down with some factor (like 0.75) until we hit target temperature of 0.01. Then on each new delay set it proportional to initial KL loss in some way, such that we will have the distributions much closer overall (within the target KL). Thus a condition for reducing delay becomes KL<0.15 and temp=0.01. Note that setting initial temp to already equal target temp

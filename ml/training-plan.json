@@ -159,7 +159,6 @@
       "crossEntropy": 1,
       "probabilityMse": 1,
       "excessEntropy": 0,
-      "temporalMutualInformation": 0,
       "oracleMutualInformation": 0
     }
   },
@@ -203,7 +202,6 @@
       "probabilityMse",
       "parameterMse",
       "excessEntropy",
-      "temporalMutualInformation",
       "oracleMutualInformation"
     ]
   },
@@ -276,7 +274,6 @@
       "probabilityMse",
       "parameterMse",
       "excessEntropy",
-      "temporalMutualInformation",
       "oracleMutualInformation"
     ]
   },

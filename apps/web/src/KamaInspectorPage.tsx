@@ -1591,7 +1591,6 @@ export function KamaInspectorPage() {
                                 {' '}· base KL {formatQuote(metrics().baseKlDivergence, 5)}
                                 {' '}· probability MSE {formatQuote(metrics().probabilityMse, 7)}
                                 {' '}· excess entropy {formatQuote(metrics().excessEntropy, 5)}
-                                {' '}· Temporal MI {formatQuote(metrics().temporalMutualInformation, 5)}
                                 {' '}· Oracle MI {formatQuote(metrics().oracleMutualInformation, 5)}
                                 <Show when={metrics().distanceImbalanceWeight}>
                                   {(value) => <>{' '}· mean persistent advice weight {formatQuote(value(), 5)}</>}

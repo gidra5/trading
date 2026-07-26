@@ -174,7 +174,6 @@ interface TrainingPlan {
       crossEntropy: number;
       probabilityMse: number;
       excessEntropy: number;
-      temporalMutualInformation: number;
       oracleMutualInformation: number;
     };
     timeWeighting: {
@@ -3732,7 +3731,6 @@ async function freezeWeightedStudyPlan(
       crossEntropy: 1,
       probabilityMse: 1,
       excessEntropy: 0,
-      temporalMutualInformation: 0,
       oracleMutualInformation: 0,
     },
   } as TrainingPlan["training"] & Record<string, unknown>;
@@ -3788,7 +3786,6 @@ async function writeProductionTrainingPlan(
       crossEntropy: 1,
       probabilityMse: 1,
       excessEntropy: 0,
-      temporalMutualInformation: 0,
       oracleMutualInformation: 0,
     },
   } as TrainingPlan["training"] & Record<string, unknown>;

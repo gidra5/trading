@@ -59,7 +59,6 @@ class AdaptiveCurriculumTest(unittest.TestCase):
                 "probabilityMse": 1,
                 "parameterMse": 0.25,
                 "excessEntropy": 0.25,
-                "temporalMutualInformation": 4,
                 "oracleMutualInformation": 1,
             },
             {"excessEntropy": 0},
@@ -70,7 +69,6 @@ class AdaptiveCurriculumTest(unittest.TestCase):
             "probabilityMse": 1,
             "parameterMse": 0.25,
             "excessEntropy": 0,
-            "temporalMutualInformation": 4,
             "oracleMutualInformation": 1,
         })
 
@@ -98,11 +96,11 @@ class AdaptiveCurriculumTest(unittest.TestCase):
 
     def test_absolute_space_requires_anchor_and_collapses_global_scale(self) -> None:
         candidates = enumerate_weight_candidates([0, 0.25, 1, 4])
-        self.assertEqual(len(candidates), 3_330)
+        self.assertEqual(len(candidates), 774)
         values = {candidate.values for candidate in candidates}
-        self.assertIn((4, 4, 4, 4, 4, 4), values)
-        self.assertIn((4, 0, 0, 0, 0, 0), values)
-        self.assertNotIn((0, 0, 0, 1, 1, 1), values)
+        self.assertIn((4, 4, 4, 4, 4), values)
+        self.assertIn((4, 0, 0, 0, 0), values)
+        self.assertNotIn((0, 0, 0, 1, 1), values)
         self.assertTrue(all(max(candidate.values) == 4 for candidate in candidates))
         self.assertTrue(all(
             set(candidate.values).issubset({0, 0.25, 1, 4})
@@ -120,8 +118,8 @@ class AdaptiveCurriculumTest(unittest.TestCase):
             canonicalize_global_scale=False,
             fixed_loss_weights={"excessEntropy": 0},
         )
-        self.assertEqual(len(candidates), 774)
-        self.assertEqual(len(raw), 1_008)
+        self.assertEqual(len(candidates), 174)
+        self.assertEqual(len(raw), 252)
         self.assertTrue(all(candidate.values[3] == 0 for candidate in candidates))
         self.assertTrue(all(max(candidate.values) == 4 for candidate in candidates))
 
@@ -137,8 +135,8 @@ class AdaptiveCurriculumTest(unittest.TestCase):
             fixed_loss_weights={"excessEntropy": 0},
             term_weight_levels={"crossEntropy": [0.25, 1, 4]},
         )
-        self.assertEqual(len(candidates), 606)
-        self.assertEqual(len(raw), 768)
+        self.assertEqual(len(candidates), 138)
+        self.assertEqual(len(raw), 192)
         self.assertTrue(all(candidate.values[0] > 0 for candidate in candidates))
         self.assertTrue(all(candidate.values[3] == 0 for candidate in candidates))
 
@@ -152,7 +150,7 @@ class AdaptiveCurriculumTest(unittest.TestCase):
             candidate.values: candidate
             for candidate in candidates
         }
-        origin = by_values[(4.0, 1.0, 0.0, 0.0, 4.0, 0.0)]
+        origin = by_values[(4.0, 1.0, 0.0, 0.0, 0.0)]
 
         keys = set(one_coordinate_neighbor_keys(
             origin,
@@ -165,12 +163,10 @@ class AdaptiveCurriculumTest(unittest.TestCase):
         expected = {
             by_values[values].key
             for values in (
-                (1.0, 1.0, 0.0, 0.0, 4.0, 0.0),
-                (4.0, 0.25, 0.0, 0.0, 4.0, 0.0),
-                (4.0, 4.0, 0.0, 0.0, 4.0, 0.0),
-                (4.0, 1.0, 0.25, 0.0, 4.0, 0.0),
-                (4.0, 1.0, 0.0, 0.0, 1.0, 0.0),
-                (4.0, 1.0, 0.0, 0.0, 4.0, 0.25),
+                (4.0, 0.25, 0.0, 0.0, 0.0),
+                (4.0, 4.0, 0.0, 0.0, 0.0),
+                (4.0, 1.0, 0.25, 0.0, 0.0),
+                (4.0, 1.0, 0.0, 0.0, 0.25),
             )
         }
         self.assertEqual(keys, expected)
@@ -189,7 +185,7 @@ class AdaptiveCurriculumTest(unittest.TestCase):
         origin = next(
             candidate
             for candidate in candidates
-            if candidate.values == (4.0, 1.0, 0.0, 0.0, 4.0, 0.0)
+            if candidate.values == (4.0, 1.0, 0.0, 0.0, 0.0)
         )
         runner = object.__new__(AdaptiveCurriculumRunner)
         runner.config = {
@@ -218,7 +214,7 @@ class AdaptiveCurriculumTest(unittest.TestCase):
 
         trials = runner.neighborhood_trials([seed])
 
-        self.assertEqual(len(trials), 6)
+        self.assertEqual(len(trials), 4)
         self.assertTrue(all(
             trial["_initialize"] is seed
             and trial["_searchParent"] is parent
@@ -233,13 +229,13 @@ class AdaptiveCurriculumTest(unittest.TestCase):
     def test_projected_quadratic_includes_clipped_full_tuple(self) -> None:
         model = ProjectedQuadratic(
             base_validation=2,
-            linear=np.asarray([1, 2, 0, 0, 0, 0], dtype=np.float64),
-            quadratic=np.eye(6, dtype=np.float64),
-            gradient_gram=np.eye(6, dtype=np.float64),
+            linear=np.asarray([1, 2, 0, 0, 0], dtype=np.float64),
+            quadratic=np.eye(5, dtype=np.float64),
+            gradient_gram=np.eye(5, dtype=np.float64),
             learning_rate=0.1,
             maximum_gradient_norm=1,
         )
-        score = model.scores(np.asarray([[1, 1, 0, 0, 0, 0]], dtype=np.float64))[0]
+        score = model.scores(np.asarray([[1, 1, 0, 0, 0]], dtype=np.float64))[0]
         scale = 1 / np.sqrt(2)
         expected = 2 - 0.1 * scale * 3 + 0.5 * 0.1**2 * scale**2 * 2
         self.assertAlmostEqual(score, expected)
@@ -252,7 +248,7 @@ class AdaptiveCurriculumTest(unittest.TestCase):
         np.testing.assert_allclose(mean, [0.2, -0.1, 0.3], atol=1e-5)
         self.assertTrue(np.all(uncertainty < 1e-3))
 
-        candidates = np.pad(inputs, ((0, 0), (0, 4)))
+        candidates = np.pad(inputs, ((0, 0), (0, 3)))
         selected, prediction, spread = select_gp_acquisition_indices(
             candidates,
             np.asarray([1.0, 0.9, 1.2]),

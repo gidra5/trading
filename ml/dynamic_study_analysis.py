@@ -16,7 +16,6 @@ LOSS_TERMS = (
     "probabilityMse",
     "parameterMse",
     "excessEntropy",
-    "temporalMutualInformation",
     "oracleMutualInformation",
 )
 PYTHON_LOSS_TERMS = {
@@ -24,7 +23,6 @@ PYTHON_LOSS_TERMS = {
     "probability_mse": "probabilityMse",
     "parameter_mse": "parameterMse",
     "excess_entropy": "excessEntropy",
-    "temporal_mutual_information": "temporalMutualInformation",
     "oracle_mutual_information": "oracleMutualInformation",
 }
 SURROGATE_METRIC = "klDivergence"

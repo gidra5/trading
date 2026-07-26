@@ -130,15 +130,15 @@ class PopulationMlpTests(unittest.TestCase):
         weights = {
             "crossEntropy": 1,
             "probabilityMse": 0.25,
+            "parameterMse": 4,
             "excessEntropy": 0,
-            "temporalMutualInformation": 4,
             "oracleMutualInformation": 1,
         }
         stored_weights = {
             "cross_entropy": 1.0,
             "probability_mse": 0.25,
+            "parameter_mse": 4.0,
             "excess_entropy": 0.0,
-            "temporal_mutual_information": 4.0,
             "oracle_mutual_information": 1.0,
         }
         common = {

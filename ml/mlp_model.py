@@ -34,7 +34,6 @@ class LossWeights:
     probability_mse: float | Tensor = 1.0
     parameter_mse: float | Tensor = 1.0
     excess_entropy: float | Tensor = 1.0
-    temporal_mutual_information: float | Tensor = 1.0
     oracle_mutual_information: float | Tensor = 1.0
 
 
@@ -42,10 +41,15 @@ class LossWeights:
 class DirectLossWeights:
     """Loss weights for the deployable direct-distribution model."""
 
+    # These are the original full conditional-surface objectives, averaged
+    # across every configured current-exposure state.
     cross_entropy: float | Tensor = 1.0
     probability_mse: float | Tensor = 0.1
+    # The cheaper base/action-only objectives remain available as an explicit
+    # alternative, but are disabled unless a plan opts into them.
+    action_cross_entropy: float | Tensor = 0.0
+    action_probability_mse: float | Tensor = 0.0
     excess_entropy: float | Tensor = 0.0
-    temporal_mutual_information: float | Tensor = 1.0
     oracle_mutual_information: float | Tensor = 1.0
 
 
@@ -350,7 +354,7 @@ def direct_oracle_loss(
     target_row_indices: Tensor | None = None,
     transaction_transition: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    """Train base-action probabilities and score deployment through the fee transform."""
+    """Train the fee-conditioned surface while retaining optional base losses."""
     if predicted_base_logits.ndim != 2 \
             or target_base_probabilities.ndim != 2 \
             or predicted_base_logits.shape[1] != actions.numel():
@@ -406,11 +410,12 @@ def direct_oracle_loss(
     required = required_loss_terms
     need_excess_entropy = include_diagnostics or required is None \
         or "excess_entropy" in required
-    need_temporal_information = include_diagnostics or required is None \
-        or "temporal_mutual_information" in required
     need_oracle_information = include_diagnostics or required is None \
         or "oracle_mutual_information" in required
-    need_conditional_surface = include_diagnostics or need_excess_entropy
+    need_conditional_surface = include_diagnostics or need_excess_entropy \
+        or required is None \
+        or "cross_entropy" in required \
+        or "probability_mse" in required
     need_transition = need_conditional_surface
 
     target_base_for_example = target_base
@@ -430,24 +435,18 @@ def direct_oracle_loss(
     def weighted_mean(value: Tensor) -> Tensor:
         return (value * normalized_weight).sum() / denominator
 
-    # The network directly represents the base distribution.  Every
-    # fee-conditioned policy is a deterministic, invertible reweighting of
-    # this same vector, so base CE and pMSE have the same unique perfect
-    # solution without repeating the objective for every current exposure.
+    # The network directly represents this base/action-only distribution.
+    # Keep its cheaper losses available separately; they are not substitutes
+    # for the original objective below, which weights every conditional row.
     predicted_base = predicted_base_log.exp()
-    cross_entropy_per_example = -(
+    action_cross_entropy_per_example = -(
         target_base_for_example * predicted_base_log
     ).sum(dim=-1)
-    probability_mse_per_example = (
+    action_probability_mse_per_example = (
         target_base_for_example - predicted_base
     ).square().mean(dim=-1)
-    cross_entropy = weighted_mean(cross_entropy_per_example)
-    probability_mse = weighted_mean(probability_mse_per_example)
-    probability_mse_weight_sum = time_weight.sum()
-    probability_mse_centered_square_sum = (
-        time_weight
-        * (probability_mse_per_example - probability_mse).square()
-    ).sum()
+    action_cross_entropy = weighted_mean(action_cross_entropy_per_example)
+    action_probability_mse = weighted_mean(action_probability_mse_per_example)
 
     transition: Tensor | None = None
     if need_transition:
@@ -495,6 +494,24 @@ def direct_oracle_loss(
         predicted_entropy = -(predicted * predicted_log).sum(dim=-1).mean(dim=-1)
         target_entropy = -(target * target_log).sum(dim=-1).mean(dim=-1)
 
+    if need_conditional_surface:
+        assert predicted is not None and predicted_log is not None \
+            and target is not None and target_log is not None
+        cross_entropy_per_example = -(target * predicted_log).sum(
+            dim=-1,
+        ).mean(dim=-1)
+        probability_mse_per_example = surface_probability_mse_per_example(
+            predicted,
+            target,
+        )
+        cross_entropy = weighted_mean(cross_entropy_per_example)
+        probability_mse = weighted_mean(probability_mse_per_example)
+        probability_mse_weight_sum = time_weight.sum()
+        probability_mse_centered_square_sum = (
+            time_weight
+            * (probability_mse_per_example - probability_mse).square()
+        ).sum()
+
     if need_excess_entropy:
         assert predicted_entropy is not None and target_entropy is not None
         excess_entropy_per_example = (
@@ -505,7 +522,7 @@ def direct_oracle_loss(
 
     target_state_mean: Tensor | None = None
     target_state_second: Tensor | None = None
-    if need_temporal_information or need_oracle_information:
+    if need_oracle_information:
         # MI measures the base action distribution the network actually emits.
         # Fees deterministically condition that distribution at deployment, so
         # repeating MI for every current exposure only reweights the same
@@ -523,29 +540,13 @@ def direct_oracle_loss(
         target_state_second = (
             target_base_for_example * base_action.square()
         ).sum(dim=-1, keepdim=True)
-    if need_temporal_information:
-        assert target_state_mean is not None and target_state_second is not None
-        temporal_mutual_information_reward, temporal_mutual_information, \
-            target_temporal_mutual_information, temporal_example_count = (
-                gaussian_temporal_mutual_information(
-                    predicted_state_mean,
-                    predicted_state_second,
-                    target_state_mean,
-                    target_state_second,
-                    example_times_ms,
-                    normalized_weight,
-                    sampling_interval_ms,
-                    action_count,
-                )
-            )
-    else:
-        contiguous = (
-            (example_times_ms[1:] - example_times_ms[:-1])
-            == sampling_interval_ms
-        ).all().to(probability_mse.dtype)
-        temporal_example_count = probability_mse.new_tensor(
-            predicted_base_logits.shape[0]
-        ) * contiguous
+    contiguous = (
+        (example_times_ms[1:] - example_times_ms[:-1])
+        == sampling_interval_ms
+    ).all().to(action_probability_mse.dtype)
+    information_example_count = action_probability_mse.new_tensor(
+        predicted_base_logits.shape[0]
+    ) * contiguous
     if need_oracle_information:
         assert target_state_mean is not None and target_state_second is not None
         oracle_mutual_information = gaussian_oracle_mutual_information(
@@ -560,47 +561,45 @@ def direct_oracle_loss(
         )
 
     loss = (
-        weights.cross_entropy * cross_entropy
-        + weights.probability_mse * probability_mse
+        weights.action_cross_entropy * action_cross_entropy
+        + weights.action_probability_mse * action_probability_mse
     )
+    if need_conditional_surface:
+        loss = loss + weights.cross_entropy * cross_entropy \
+            + weights.probability_mse * probability_mse
     if need_excess_entropy:
         loss = loss + weights.excess_entropy * excess_entropy
-    if need_temporal_information:
-        loss = loss - weights.temporal_mutual_information \
-            * temporal_mutual_information_reward
     if need_oracle_information:
         loss = loss - weights.oracle_mutual_information * oracle_mutual_information
 
     result = {
         "loss": loss,
-        "probabilityMse": probability_mse,
-        "probabilityMseVariance": (
-            probability_mse_centered_square_sum
-            / probability_mse_weight_sum.clamp_min(1e-8)
-        ).clamp_min(0),
-        "probabilityMseStdDev": (
-            probability_mse_centered_square_sum
-            / probability_mse_weight_sum.clamp_min(1e-8)
-        ).clamp_min(0).sqrt(),
-        "probabilityMseWeightSum": probability_mse_weight_sum,
-        "probabilityMseCenteredSquareSum":
-            probability_mse_centered_square_sum,
-        "temporalExampleCount": temporal_example_count,
+        "actionCrossEntropy": action_cross_entropy,
+        "actionProbabilityMse": action_probability_mse,
+        "informationExampleCount": information_example_count,
         "distanceImbalanceWeight": time_weight.mean(),
         "timeWeightEffectiveSampleRatio": effective_sample_ratio,
         "timeWeightSum": time_weight.sum(),
         "timeWeightSquareSum": time_weight.square().sum(),
     }
+    if need_conditional_surface:
+        result.update({
+            "crossEntropy": cross_entropy,
+            "probabilityMse": probability_mse,
+            "probabilityMseVariance": (
+                probability_mse_centered_square_sum
+                / probability_mse_weight_sum.clamp_min(1e-8)
+            ).clamp_min(0),
+            "probabilityMseStdDev": (
+                probability_mse_centered_square_sum
+                / probability_mse_weight_sum.clamp_min(1e-8)
+            ).clamp_min(0).sqrt(),
+            "probabilityMseWeightSum": probability_mse_weight_sum,
+            "probabilityMseCenteredSquareSum":
+                probability_mse_centered_square_sum,
+        })
     if need_excess_entropy:
         result["excessEntropy"] = excess_entropy
-    if need_temporal_information:
-        result.update({
-            "temporalMutualInformation": temporal_mutual_information,
-            "targetTemporalMutualInformation":
-                target_temporal_mutual_information,
-            "temporalMutualInformationReward":
-                temporal_mutual_information_reward,
-        })
     if need_oracle_information:
         result["oracleMutualInformation"] = oracle_mutual_information
     if include_diagnostics:
@@ -741,19 +740,6 @@ def fitted_teacher_loss(
     predicted_state_second = (predicted * action.square()).sum(dim=-1)
     target_state_mean = (target * action).sum(dim=-1)
     target_state_second = (target * action.square()).sum(dim=-1)
-    temporal_mutual_information_reward, temporal_mutual_information, \
-        target_temporal_mutual_information, temporal_example_count = (
-        gaussian_temporal_mutual_information(
-            predicted_state_mean,
-            predicted_state_second,
-            target_state_mean,
-            target_state_second,
-            example_times_ms,
-            normalized_weight,
-            sampling_interval_ms,
-            actions.numel(),
-        )
-    )
     oracle_mutual_information = gaussian_oracle_mutual_information(
         predicted_state_mean,
         predicted_state_second,
@@ -803,9 +789,13 @@ def fitted_teacher_loss(
         + weights.probability_mse * probability_mse
         + weights.parameter_mse * parameter_mse
         + weights.excess_entropy * excess_entropy
-        - weights.temporal_mutual_information * temporal_mutual_information_reward
         - weights.oracle_mutual_information * oracle_mutual_information
     )
+    contiguous = (
+        (example_times_ms[1:] - example_times_ms[:-1])
+        == sampling_interval_ms
+    ).all().to(loss.dtype)
+    information_example_count = loss.new_tensor(predicted_raw.shape[0]) * contiguous
     metrics = {
         "loss": loss,
         "klDivergence": kl_divergence,
@@ -829,10 +819,7 @@ def fitted_teacher_loss(
             probability_mse_centered_square_sum,
         "parameterMse": parameter_mse,
         "excessEntropy": excess_entropy,
-        "temporalMutualInformation": temporal_mutual_information,
-        "targetTemporalMutualInformation": target_temporal_mutual_information,
-        "temporalMutualInformationReward": temporal_mutual_information_reward,
-        "temporalExampleCount": temporal_example_count,
+        "informationExampleCount": information_example_count,
         "oracleMutualInformation": oracle_mutual_information,
         "targetEntropy": weighted_mean(target_entropy),
         "predictedEntropy": weighted_mean(predicted_entropy),
@@ -852,72 +839,6 @@ def fitted_teacher_loss(
                 deployment_kl_centered_square_sum,
         })
     return metrics
-
-
-def gaussian_temporal_mutual_information(
-    predicted_mean: Tensor,
-    predicted_second: Tensor,
-    target_mean: Tensor,
-    target_second: Tensor,
-    times_ms: Tensor,
-    example_weights: Tensor,
-    sampling_interval_ms: int,
-    action_count: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Gaussian I(time; action | current exposure), capped by the teacher."""
-    if predicted_mean.shape != predicted_second.shape \
-            or predicted_mean.shape != target_mean.shape \
-            or predicted_mean.shape != target_second.shape \
-            or predicted_mean.ndim != 2:
-        raise ValueError("temporal moments must have matching [time, current exposure] shapes")
-    if times_ms.ndim != 1 or example_weights.ndim != 1 \
-            or times_ms.shape != example_weights.shape \
-            or times_ms.shape[0] != predicted_mean.shape[0]:
-        raise ValueError("temporal policy metadata must match the timestamp axis")
-    if sampling_interval_ms <= 0 or action_count < 2:
-        raise ValueError("temporal MI requires a positive cadence and at least two actions")
-    if predicted_mean.shape[0] < 2:
-        zero = predicted_mean.sum() * 0.0
-        return zero, zero, zero, torch.zeros((), device=predicted_mean.device)
-
-    weight = example_weights.float().view(-1, 1)
-    denominator = weight.sum().clamp_min(1e-8)
-
-    def gaussian_information(mean: Tensor, second: Tensor) -> Tensor:
-        mean = mean.float()
-        second = second.float()
-        time_mean = (weight * mean).sum(dim=0) / denominator
-        total_variance = (
-            (weight * second).sum(dim=0) / denominator - time_mean.square()
-        ).clamp_min(0)
-        within_variance = (
-            weight * (second - mean.square()).clamp_min(0)
-        ).sum(dim=0) / denominator
-        return (
-            0.5 * torch.log(
-                ((total_variance + 1e-8) / (within_variance + 1e-8)).clamp_min(1)
-            ) / math.log(action_count)
-        ).clamp(0, 1)
-
-    predicted_information = gaussian_information(predicted_mean, predicted_second)
-    target_information_by_state = gaussian_information(target_mean, target_second).detach()
-    contiguous = (
-        (times_ms[1:] - times_ms[:-1]) == sampling_interval_ms
-    ).all().to(predicted_information.dtype)
-    # Cap each conditioning state's reward separately so temporal variation at
-    # one exposure cannot compensate for a missing teacher change at another.
-    temporal_information = torch.minimum(
-        predicted_information,
-        target_information_by_state,
-    ).mean() * contiguous
-    predicted_information_mean = predicted_information.mean() * contiguous
-    target_information = target_information_by_state.mean() * contiguous
-    example_count = torch.as_tensor(
-        predicted_mean.shape[0],
-        device=predicted_mean.device,
-        dtype=predicted_information.dtype,
-    ) * contiguous
-    return temporal_information, predicted_information_mean, target_information, example_count
 
 
 def gaussian_oracle_mutual_information(

@@ -21,7 +21,6 @@ from mlp_model import (
     direct_oracle_loss,
     fitted_teacher_loss,
     gaussian_oracle_mutual_information,
-    gaussian_temporal_mutual_information,
     materialize_raw_oracle_policy_map,
     persistent_distance_imbalance_time_weights,
     surface_probability_mse_per_example,
@@ -167,17 +166,25 @@ class MarketOnlyInputContractTests(unittest.TestCase):
 
 
 class DirectOracleTrainingPathTests(unittest.TestCase):
-    def test_base_ce_and_pmse_match_direct_distribution_reference(self) -> None:
+    def test_conditional_ce_and_pmse_match_full_surface_reference(self) -> None:
         generator = torch.Generator().manual_seed(7)
         actions = torch.linspace(-250.0, 250.0, 255)
         target = torch.softmax(torch.randn(5, 255, generator=generator), dim=-1)
         logits = torch.randn(5, 255, generator=generator, requires_grad=True)
         time_weights = torch.tensor([1.0, 3.0, 0.5, 2.0, 4.0])
+        current = torch.linspace(-100.0, 100.0, 31).view(1, -1)
+        support = PolicySupport(
+            -250.0,
+            250.0,
+            -100.0,
+            100.0,
+            0.00175,
+            0.01,
+        )
         weights = DirectLossWeights(
             cross_entropy=1.0,
             probability_mse=0.75,
             excess_entropy=0.0,
-            temporal_mutual_information=0.0,
             oracle_mutual_information=0.0,
         )
 
@@ -185,8 +192,8 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
             logits,
             target,
             actions,
-            torch.linspace(-100.0, 100.0, 31).view(1, -1),
-            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+            current,
+            support,
             weights,
             time_weights,
             torch.arange(5, dtype=torch.int64) * 1_000,
@@ -202,18 +209,173 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
         predicted = predicted_log.exp()
         visible_target = target.masked_fill(~visible, 0.0)
         visible_target = visible_target / visible_target.sum(dim=-1, keepdim=True)
+        target_base_log = torch.where(
+            visible_target > 0,
+            visible_target.clamp_min(torch.finfo(torch.float32).tiny).log(),
+            torch.full_like(visible_target, torch.finfo(torch.float32).min),
+        )
+        transition = conditional_transaction_transition(
+            actions,
+            current,
+            support,
+        )
+        predicted_log = torch.log_softmax(
+            predicted_log[:, None, :] + transition,
+            dim=-1,
+        )
+        predicted = predicted_log.exp()
+        target_log = torch.log_softmax(
+            target_base_log[:, None, :] + transition,
+            dim=-1,
+        )
+        conditional_target = target_log.exp()
         normalized_weight = time_weights / time_weights.mean()
         cross_entropy = (
-            normalized_weight * -(visible_target * predicted_log).sum(dim=-1)
+            normalized_weight
+            * -(conditional_target * predicted_log).sum(dim=-1).mean(dim=-1)
         ).sum() / normalized_weight.sum()
         probability_mse = (
             normalized_weight
-            * (visible_target - predicted).square().mean(dim=-1)
+            * (conditional_target - predicted).square().mean(dim=(-1, -2))
         ).sum() / normalized_weight.sum()
         expected = cross_entropy + 0.75 * probability_mse
 
         torch.testing.assert_close(actual["probabilityMse"], probability_mse)
         torch.testing.assert_close(actual["loss"], expected)
+
+    def test_action_only_ce_and_pmse_remain_available(self) -> None:
+        generator = torch.Generator().manual_seed(71)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        target = torch.softmax(torch.randn(5, 255, generator=generator), dim=-1)
+        logits = torch.randn(5, 255, generator=generator)
+        time_weights = torch.tensor([1.0, 3.0, 0.5, 2.0, 4.0])
+        result = direct_oracle_loss(
+            logits,
+            target,
+            actions,
+            torch.linspace(-100.0, 100.0, 31).view(1, -1),
+            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+            DirectLossWeights(
+                cross_entropy=0.0,
+                probability_mse=0.0,
+                action_cross_entropy=1.0,
+                action_probability_mse=0.75,
+                excess_entropy=0.0,
+                oracle_mutual_information=0.0,
+            ),
+            time_weights,
+            torch.arange(5, dtype=torch.int64) * 1_000,
+            1_000,
+            include_diagnostics=False,
+            required_loss_terms=frozenset((
+                "action_cross_entropy",
+                "action_probability_mse",
+            )),
+        )
+        visible = (actions >= -100.0) & (actions <= 100.0)
+        predicted_log = torch.log_softmax(
+            logits.masked_fill(~visible, torch.finfo(torch.float32).min),
+            dim=-1,
+        )
+        normalized_target = target.masked_fill(~visible, 0.0)
+        normalized_target = (
+            normalized_target
+            / normalized_target.sum(dim=-1, keepdim=True)
+        )
+        normalized_weight = time_weights / time_weights.mean()
+        cross_entropy = (
+            normalized_weight
+            * -(normalized_target * predicted_log).sum(dim=-1)
+        ).sum() / normalized_weight.sum()
+        probability_mse = (
+            normalized_weight
+            * (normalized_target - predicted_log.exp()).square().mean(dim=-1)
+        ).sum() / normalized_weight.sum()
+
+        self.assertNotIn("probabilityMse", result)
+        torch.testing.assert_close(result["actionCrossEntropy"], cross_entropy)
+        torch.testing.assert_close(
+            result["actionProbabilityMse"],
+            probability_mse,
+        )
+        torch.testing.assert_close(
+            result["loss"],
+            cross_entropy + 0.75 * probability_mse,
+        )
+
+    def test_combined_distribution_loss_adds_conditional_and_action_terms(
+        self,
+    ) -> None:
+        generator = torch.Generator().manual_seed(79)
+        actions = torch.linspace(-250.0, 250.0, 255)
+        target = torch.softmax(torch.randn(4, 255, generator=generator), dim=-1)
+        logits = torch.randn(4, 255, generator=generator)
+        arguments = (
+            logits,
+            target,
+            actions,
+            torch.linspace(-100.0, 100.0, 31).view(1, -1),
+            PolicySupport(-250.0, 250.0, -100.0, 100.0, 0.00175, 0.01),
+        )
+        trailing = (
+            torch.ones(4),
+            torch.arange(4, dtype=torch.int64) * 1_000,
+            1_000,
+        )
+        disabled = {
+            "excess_entropy": 0.0,
+            "oracle_mutual_information": 0.0,
+        }
+        conditional = direct_oracle_loss(
+            *arguments,
+            DirectLossWeights(
+                cross_entropy=1.0,
+                probability_mse=1.0,
+                **disabled,
+            ),
+            *trailing,
+            include_diagnostics=False,
+            required_loss_terms=frozenset(("cross_entropy", "probability_mse")),
+        )
+        action = direct_oracle_loss(
+            *arguments,
+            DirectLossWeights(
+                cross_entropy=0.0,
+                probability_mse=0.0,
+                action_cross_entropy=1.0,
+                action_probability_mse=1.0,
+                **disabled,
+            ),
+            *trailing,
+            include_diagnostics=False,
+            required_loss_terms=frozenset((
+                "action_cross_entropy",
+                "action_probability_mse",
+            )),
+        )
+        combined = direct_oracle_loss(
+            *arguments,
+            DirectLossWeights(
+                cross_entropy=1.0,
+                probability_mse=1.0,
+                action_cross_entropy=1.0,
+                action_probability_mse=1.0,
+                **disabled,
+            ),
+            *trailing,
+            include_diagnostics=False,
+            required_loss_terms=frozenset((
+                "cross_entropy",
+                "probability_mse",
+                "action_cross_entropy",
+                "action_probability_mse",
+            )),
+        )
+
+        torch.testing.assert_close(
+            combined["loss"],
+            conditional["loss"] + action["loss"],
+        )
 
     def test_oracle_mi_matches_base_distribution_moments(self) -> None:
         generator = torch.Generator().manual_seed(23)
@@ -241,7 +403,6 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
                 cross_entropy=0.0,
                 probability_mse=0.0,
                 excess_entropy=0.0,
-                temporal_mutual_information=0.0,
                 oracle_mutual_information=1.0,
             ),
             time_weights,
@@ -276,7 +437,7 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
         torch.testing.assert_close(result["loss"], -expected)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_compiled_base_loss_is_finite_under_fp16_autocast(self) -> None:
+    def test_compiled_conditional_loss_is_finite_under_fp16_autocast(self) -> None:
         device = torch.device("cuda")
         actions = torch.linspace(-250.0, 250.0, 255, device=device)
         current = torch.linspace(
@@ -297,7 +458,6 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
             cross_entropy=torch.tensor(1.0, device=device),
             probability_mse=torch.tensor(1.0, device=device),
             excess_entropy=torch.tensor(0.0, device=device),
-            temporal_mutual_information=torch.tensor(0.0, device=device),
             oracle_mutual_information=torch.tensor(0.5, device=device),
         )
         required = frozenset((
@@ -350,7 +510,6 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
             cross_entropy=1.0,
             probability_mse=1.0,
             excess_entropy=0.0,
-            temporal_mutual_information=0.0,
             oracle_mutual_information=0.5,
         )
         arguments = (
@@ -383,7 +542,6 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
         torch.testing.assert_close(compact["loss"], full["loss"])
         torch.testing.assert_close(logits.grad, full_gradient)
         self.assertNotIn("klDivergence", compact)
-        self.assertNotIn("temporalMutualInformation", compact)
         self.assertIn("oracleMutualInformation", compact)
 
     def test_indexed_minute_targets_and_precomputed_transition_preserve_loss(
@@ -403,7 +561,6 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
             cross_entropy=1.0,
             probability_mse=1.0,
             excess_entropy=0.0,
-            temporal_mutual_information=0.0,
             oracle_mutual_information=0.5,
         )
         common = (
@@ -1249,7 +1406,6 @@ class VisibleProbabilityMseTests(unittest.TestCase):
             probability_mse=0.0,
             parameter_mse=0.0,
             excess_entropy=0.0,
-            temporal_mutual_information=0.0,
             oracle_mutual_information=0.0,
         )
 
@@ -1270,75 +1426,6 @@ class VisibleProbabilityMseTests(unittest.TestCase):
             metrics["klDivergence"],
             metrics["loss"] - metrics["targetEntropy"],
         )
-
-    def test_temporal_information_rewards_only_real_teacher_changes(self) -> None:
-        actions = torch.linspace(-10.0, 10.0, 31)
-        current = torch.linspace(-10.0, 10.0, 7).view(1, -1).expand(2, -1)
-        changing = torch.tensor([
-            [0.0, 0.0, -5.0, 0.0, 0.0, 0.0, -14.0, 14.0],
-            [0.0, 0.0, 5.0, 0.0, 0.0, 0.0, -14.0, 14.0],
-        ])
-        stationary = changing[:1].expand(2, -1).clone()
-        weights = LossWeights(
-            cross_entropy=0.0,
-            probability_mse=0.0,
-            parameter_mse=0.0,
-            excess_entropy=0.0,
-            temporal_mutual_information=1.0,
-            oracle_mutual_information=0.0,
-        )
-        arguments = (
-            actions,
-            current,
-            PolicySupport(-10.0, 10.0, -10.0, 10.0, 0.001, 0.01),
-            torch.ones(8),
-            weights,
-            torch.ones(2),
-        )
-
-        changed = fitted_teacher_loss(
-            changing, changing, *arguments, torch.tensor([1_000, 2_000]), 1_000
-        )
-        unchanged = fitted_teacher_loss(
-            stationary, stationary, *arguments, torch.tensor([1_000, 2_000]), 1_000
-        )
-        gapped = fitted_teacher_loss(
-            changing, changing, *arguments, torch.tensor([1_000, 3_000]), 1_000
-        )
-
-        self.assertGreater(float(changed["temporalMutualInformation"]), 0.0)
-        torch.testing.assert_close(
-            changed["temporalMutualInformation"],
-            changed["targetTemporalMutualInformation"],
-        )
-        torch.testing.assert_close(
-            changed["temporalMutualInformationReward"],
-            changed["targetTemporalMutualInformation"],
-        )
-        self.assertEqual(float(unchanged["temporalMutualInformation"]), 0.0)
-        self.assertEqual(float(gapped["temporalMutualInformation"]), 0.0)
-        self.assertLess(float(changed["loss"]), 0.0)
-
-    def test_temporal_information_uses_gaussian_time_variance_ratio(self) -> None:
-        means = torch.tensor([[-1.0], [1.0]])
-        seconds = torch.tensor([[2.0], [2.0]])
-
-        reward, predicted, teacher, count = gaussian_temporal_mutual_information(
-            means,
-            seconds,
-            means,
-            seconds,
-            torch.tensor([1_000, 2_000]),
-            torch.ones(2),
-            1_000,
-            31,
-        )
-
-        expected = 0.5 * torch.log(torch.tensor(2.0)) / torch.log(torch.tensor(31.0))
-        torch.testing.assert_close(reward, expected)
-        torch.testing.assert_close(predicted, expected)
-        torch.testing.assert_close(teacher, expected)
-        self.assertEqual(float(count), 2.0)
 
     def test_oracle_information_uses_per_exposure_time_correlation(self) -> None:
         means = torch.tensor([[-1.0], [1.0]])

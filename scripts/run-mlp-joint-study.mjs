@@ -61,8 +61,6 @@ const METRIC_NAMES = [
   "probabilityMse",
   "parameterMse",
   "excessEntropy",
-  "temporalMutualInformation",
-  "temporalMutualInformationReward",
   "oracleMutualInformation",
 ];
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1186,7 +1184,6 @@ function normalizeLossWeights(weights) {
     probabilityMse: "probability_mse",
     parameterMse: "parameter_mse",
     excessEntropy: "excess_entropy",
-    temporalMutualInformation: "temporal_mutual_information",
     oracleMutualInformation: "oracle_mutual_information",
   };
   const normalized = {};
@@ -2277,14 +2274,14 @@ function markdownSummary(summary) {
     "",
     "## Best combinations observed",
     "",
-    "| Delay | Weight setting | Validation KL | KL σ | pMSE | Parameter MSE | Excess H | Temporal reward | Oracle MI |",
-    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Delay | Weight setting | Validation KL | KL σ | pMSE | Parameter MSE | Excess H | Oracle MI |",
+    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
   );
   for (const row of [...summary.results]
     .sort((left, right) => left.validation.klDivergence - right.validation.klDivergence)
     .slice(0, 20)) {
     const metric = row.validation;
-    lines.push(`| ${formatDelay(row.delayMs)} | ${row.weightVariant} | ${number(metric.klDivergence)} | ${number(metric.klDivergenceStdDev)} | ${number(metric.probabilityMse)} | ${number(metric.parameterMse)} | ${number(metric.excessEntropy)} | ${number(metric.temporalMutualInformationReward)} | ${number(metric.oracleMutualInformation)} |`);
+    lines.push(`| ${formatDelay(row.delayMs)} | ${row.weightVariant} | ${number(metric.klDivergence)} | ${number(metric.klDivergenceStdDev)} | ${number(metric.probabilityMse)} | ${number(metric.parameterMse)} | ${number(metric.excessEntropy)} | ${number(metric.oracleMutualInformation)} |`);
   }
   lines.push(
     "",
@@ -2303,7 +2300,6 @@ function pythonLossWeights(weights) {
     probability_mse: weights.probabilityMse,
     parameter_mse: weights.parameterMse,
     excess_entropy: weights.excessEntropy,
-    temporal_mutual_information: weights.temporalMutualInformation,
     oracle_mutual_information: weights.oracleMutualInformation,
   };
 }

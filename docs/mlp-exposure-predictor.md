@@ -167,20 +167,21 @@ nor recomputes persistence or resolution; it only applies
 cross entropy
 + probability MSE
 + squared normalized excess entropy
-- teacher-capped conditional Gaussian temporal MI
 - conditional Gaussian Oracle MI
 ```
 
-All learned distribution objectives—cross entropy, probability MSE, excess
-entropy, temporal MI, and Oracle MI—use a 255-action by 31-current-state surface
-spanning only the visible usable range. The persisted distance imbalance uses
+Conditional cross entropy, conditional probability MSE, and excess entropy use
+a 255-action by 31-current-state surface spanning only the visible usable
+range. The action-only CE/pMSE terms and Oracle MI use the emitted 255-action
+base distribution. The persisted distance imbalance uses
 all visible cells of the raw 255-by-255 oracle map rather than that training
 resampling. Teacher and
 predicted policies are normalized on that surface, so latent-only cells do not
 dilute any optimized metric. For the current one-minute-oracle learnability
-run, cross entropy and probability MSE both have coefficient `1`; excess
-entropy, temporal MI, and Oracle MI are disabled. There is no parameter-MSE term
-in the deployable direct-output model. Training logs also
+run, conditional and action-only cross entropy and probability MSE all have
+coefficient `1`; excess entropy is disabled and Oracle MI has coefficient
+`0.5`. There is no parameter-MSE term in the deployable direct-output model.
+Training logs also
 report the mean raw distance-imbalance weight and
 its effective-sample ratio; both appear on the live training page.
 
@@ -217,20 +218,6 @@ workers, converted to float16, and stored as independent zstd frames. This
 keeps decompression day-local and resumable; the trainer shuffles day groups
 and contiguous blocks without repeatedly expanding unrelated days. One-minute
 targets remain memory-only for every epoch.
-
-Temporal MI does not reward variation across current-exposure conditioning. At
-every timestamp and each of the 31 current-exposure states, the trainer computes
-the first and second moments of the target-action distribution. It then averages
-those moments over the complete contiguous minibatch time axis. For each current
-exposure independently, the Gaussian approximation is
-`0.5 * log((total variance + eps) / (mean within-time variance + eps)) / log(|A|)`.
-The final metric is the uniform mean across current-exposure states. Each
-state's predicted reward is capped by the teacher's corresponding temporal MI,
-so variation at one exposure cannot compensate for a missing teacher change at
-another. Training shuffles contiguous within-shard minibatches as blocks; a
-non-contiguous block earns no temporal reward. The live chart reports raw
-predicted MI, raw teacher MI, and the capped value actually subtracted from the
-loss as three separate series.
 
 Oracle MI uses the same time/state layout. For every current-exposure state, it
 computes weighted predicted and teacher means, total variances, and their
@@ -669,13 +656,12 @@ reports free blocks. Override the guard only deliberately with
 `TRADING_MLP_MIN_LINUX_FREE_GIB` or `TRADING_MLP_MIN_WINDOWS_FREE_GIB`.
 
 The report includes validation KL, its validation-set standard deviation,
-probability MSE, parameter MSE, excess
-entropy, raw/capped temporal MI, and Oracle MI. For validation KL, a negative
+probability MSE, parameter MSE, excess entropy, and Oracle MI. For validation KL, a negative
 main effect means increasing that term helped on average. A pairwise
 difference-of-differences far from zero means the effect of either term depends
 on the other's weight. Variation in the same weight contrast across delay
 columns is the measured delay × weight interaction. The JSON report retains all
-15 pairwise interactions at every delay; the Markdown report shows the
+10 pairwise interactions at every delay; the Markdown report shows the
 per-delay main effects, their cross-delay ranges, the center controls, and the
 best combinations. A deliberately cheaper fresh design can override the budget:
 
@@ -792,15 +778,15 @@ The production follow-up removes the fixed 33-profile/fixed-delay restriction.
 Every loss receives an absolute value from `[0, 0.25, 1, 4]`; these values are
 not multiplied by the production loss weights. At least one distribution
 matching term—cross entropy, probability MSE, or parameter MSE—must be nonzero.
-That leaves 4,032 valid raw six-way tuples. Globally proportional tuples are
+That leaves 1,008 valid raw five-way tuples. Globally proportional tuples are
 represented once by the largest member that is still on the configured
-absolute grid, leaving 3,330 distinct weight directions. Excess entropy,
-temporal MI, and oracle MI may independently be zero.
+absolute grid, leaving 774 distinct weight directions. Excess entropy and
+Oracle MI may independently be zero.
 
 It would still be wasteful to fully train all 3,330 descendants of every
-surviving model. For each parent, the runner computes the six individual
-training-loss gradients, the validation-KL gradient, the 6×6 training-gradient
-Gram matrix, and six validation-Hessian/vector products. It evaluates the local
+surviving model. For each parent, the runner computes the five individual
+training-loss gradients, the validation-KL gradient, the 5×5 training-gradient
+Gram matrix, and five validation-Hessian/vector products. It evaluates the local
 clipped-update approximation
 
 `KL(w) ≈ KL₀ - η bᵀw + ½ η² wᵀAw`

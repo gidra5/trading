@@ -37,7 +37,6 @@ TERM_METRICS = (
     ("probabilityMse", 1.0),
     ("parameterMse", 1.0),
     ("excessEntropy", 1.0),
-    ("temporalMutualInformationReward", -1.0),
     ("oracleMutualInformation", -1.0),
 )
 

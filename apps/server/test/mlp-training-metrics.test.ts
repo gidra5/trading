@@ -101,7 +101,7 @@ test("MLP training metrics stream only complete new metric events", async () => 
       label: "Next model",
       runDir: "data/runs/next-model",
       datasetDir: "data/datasets/test-model",
-      training: { epochs: 15, lossWeights: { temporalMutualInformation: 0.1 } },
+      training: { epochs: 15, lossWeights: { oracleMutualInformation: 0.1 } },
     }));
     await writeFile(path.join(nextRunDir, "training.log"), [
       JSON.stringify({ event: "training-start", epochs: 15 }),
