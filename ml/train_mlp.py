@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -10,7 +11,8 @@ import subprocess
 import tempfile
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +82,8 @@ TIME_BLOCK_METRIC_NAMES = frozenset((
     "oracleMutualInformation",
 ))
 
+DeviceBatch = tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+
 
 @dataclass
 class TrainingThroughputMeter:
@@ -119,6 +123,180 @@ class TrainingThroughputMeter:
         self.active_since = None
 
 
+@dataclass
+class DeviceBatchCache:
+    batches: list[DeviceBatch]
+    example_count: int
+    storage_mib: float
+
+    def __iter__(self):
+        yield from self.batches
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
+class DeviceBatchPipeline:
+    """Reuse one copy stream so allocator blocks remain reusable across epochs."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.copy_stream = (
+            torch.cuda.Stream(device=device)
+            if device.type == "cuda"
+            else None
+        )
+
+    def batches(self, data) -> Iterator[DeviceBatch]:
+        if isinstance(data, DeviceBatchCache):
+            yield from data
+            return
+        if self.copy_stream is None:
+            yield from data
+            return
+
+        iterator = iter(data)
+
+        def copy(batch) -> DeviceBatch:
+            (
+                features,
+                targets,
+                time_weights,
+                times,
+                diagnostics,
+                target_row_indices,
+            ) = batch
+            with torch.cuda.stream(self.copy_stream):
+                return (
+                    features.to(self.device, non_blocking=True),
+                    targets.to(self.device, non_blocking=True),
+                    time_weights.to(self.device, non_blocking=True),
+                    times.to(self.device, non_blocking=True),
+                    diagnostics,
+                    target_row_indices.to(self.device, non_blocking=True),
+                )
+
+        try:
+            pending = copy(next(iterator))
+        except StopIteration:
+            return
+
+        while True:
+            torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+            batch = pending
+            for value in (*batch[:4], batch[5]):
+                value.record_stream(torch.cuda.current_stream(self.device))
+            try:
+                pending = copy(next(iterator))
+            except StopIteration:
+                pending = None
+            yield batch
+            if pending is None:
+                break
+
+
+def frozen_cpu_copy(value):
+    if isinstance(value, Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, dict):
+        return {
+            key: frozen_cpu_copy(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [frozen_cpu_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(frozen_cpu_copy(item) for item in value)
+    return copy.deepcopy(value)
+
+
+class AsyncCheckpointWriter:
+    """Serialize one frozen checkpoint while the next epoch uses the GPU."""
+
+    def __init__(self) -> None:
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="checkpoint-writer",
+        )
+        self.pending: Future | None = None
+        self.closed = False
+
+    @staticmethod
+    def _write(
+        checkpoint: dict,
+        checkpoint_file: Path,
+        best_model_file: Path | None,
+    ) -> dict[str, float]:
+        started = time.monotonic()
+        if best_model_file is not None:
+            atomic_torch_save(checkpoint["model"], best_model_file)
+        best_seconds = time.monotonic() - started
+        atomic_torch_save(checkpoint, checkpoint_file)
+        return {
+            "bestModelWriteSeconds": (
+                round(best_seconds, 4)
+                if best_model_file is not None
+                else 0.0
+            ),
+            "checkpointWriteSeconds": round(
+                time.monotonic() - started - best_seconds,
+                4,
+            ),
+        }
+
+    def submit(
+        self,
+        checkpoint: dict,
+        checkpoint_file: Path,
+        best_model_file: Path | None = None,
+    ) -> dict[str, float | bool | None]:
+        if self.closed:
+            raise RuntimeError("checkpoint writer is closed")
+        wait_started = time.monotonic()
+        previous = self.flush()
+        wait_seconds = time.monotonic() - wait_started
+        snapshot_started = time.monotonic()
+        frozen = frozen_cpu_copy(checkpoint)
+        snapshot_seconds = time.monotonic() - snapshot_started
+        self.pending = self.executor.submit(
+            self._write,
+            frozen,
+            checkpoint_file,
+            best_model_file,
+        )
+        return {
+            "asynchronous": True,
+            "snapshotSeconds": round(snapshot_seconds, 4),
+            "previousWriteWaitSeconds": round(wait_seconds, 4),
+            "previousCheckpointWriteSeconds": (
+                previous["checkpointWriteSeconds"]
+                if previous is not None
+                else None
+            ),
+            "previousBestModelWriteSeconds": (
+                previous["bestModelWriteSeconds"]
+                if previous is not None
+                else None
+            ),
+        }
+
+    def flush(self) -> dict[str, float] | None:
+        if self.pending is None:
+            return None
+        pending = self.pending
+        self.pending = None
+        return pending.result()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            self.flush()
+        finally:
+            self.closed = True
+            self.executor.shutdown(wait=True)
+
+
 def cuda_memory_metrics(device: torch.device) -> dict[str, float]:
     if device.type != "cuda":
         return {
@@ -145,12 +323,25 @@ def cuda_memory_metrics(device: torch.device) -> dict[str, float]:
     return result
 
 
-def release_inactive_cuda_memory(device: torch.device) -> dict[str, float]:
+def trim_inactive_cuda_memory(
+    device: torch.device,
+    maximum_reserved_fraction: float,
+) -> dict[str, float | bool]:
     before = cuda_memory_metrics(device)
+    threshold_mib = 0.0
+    trimmed = False
     if device.type == "cuda":
+        _, total_bytes = torch.cuda.mem_get_info(device)
+        threshold_mib = (
+            total_bytes * maximum_reserved_fraction / (1024 * 1024)
+        )
+        trimmed = before["gpuReservedMiB"] > threshold_mib
+    if trimmed:
         torch.cuda.empty_cache()
     after = cuda_memory_metrics(device)
     return {
+        "trimmed": trimmed,
+        "thresholdMiB": round(threshold_mib, 1),
         "allocatedMiB": after["gpuAllocatedMiB"],
         "reservedBeforeMiB": before["gpuReservedMiB"],
         "reservedAfterMiB": after["gpuReservedMiB"],
@@ -1114,6 +1305,32 @@ def parse_args() -> argparse.Namespace:
         help="Disable plateau stopping; validation targets are the only automatic stop.",
     )
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
+    parser.add_argument(
+        "--evaluation-workers",
+        type=int,
+        default=min(2, os.cpu_count() or 1),
+        help=(
+            "Persistent workers used only by recurring validation. Test evaluation "
+            "stays in-process so its worker cannot coexist with validation."
+        ),
+    )
+    parser.add_argument(
+        "--cache-validation-on-device",
+        action="store_true",
+        help=(
+            "Stage the fixed validation split into a GPU-resident batch cache once. "
+            "Loading workers exit after staging."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-cache-trim-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Release inactive CUDA allocations after an epoch only when PyTorch's "
+            "reserved memory exceeds this fraction of device capacity."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--log-every-steps", type=int, default=25)
@@ -1371,6 +1588,7 @@ def main() -> None:
         raise RuntimeError("train, validation, and test datasets must all be non-empty")
 
     device = resolve_device(args.device)
+    batch_pipeline = DeviceBatchPipeline(device)
     feature_mean, feature_std = cached_training_normalization(
         train,
         args.feature_statistics_cache,
@@ -1472,6 +1690,7 @@ def main() -> None:
         batch_size=args.batch_size,
         sample_fraction=args.training_fraction,
         weighted_sample=args.weighted_training_sample,
+        workers=args.workers,
     )
     validation_loader = loader(
         validation,
@@ -1479,8 +1698,53 @@ def main() -> None:
         shuffle=False,
         batch_size=evaluation_batch_size,
         sample_fraction=args.validation_fraction,
+        workers=args.evaluation_workers,
+        persistent=not args.cache_validation_on_device,
     )
-    test_loader = loader(test, args, shuffle=False, batch_size=evaluation_batch_size)
+    test_loader = loader(
+        test,
+        args,
+        shuffle=False,
+        batch_size=evaluation_batch_size,
+        workers=0,
+    )
+    validation_example_count = validation_loader.batch_sampler.example_count
+    validation_data: DataLoader | DeviceBatchCache = validation_loader
+    validation_cache = None
+    if args.cache_validation_on_device:
+        if device.type != "cuda":
+            raise ValueError("validation device caching requires CUDA")
+        estimated_cache_bytes = validation_example_count * (
+            validation.feature_count * np.dtype("<f2").itemsize
+            + validation.action_count * np.dtype("<f4").itemsize
+            + np.dtype("<f4").itemsize
+            + np.dtype("<i8").itemsize
+        )
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        if estimated_cache_bytes > free_bytes * 0.5:
+            raise RuntimeError(
+                "validation device cache would consume more than half of "
+                "currently free CUDA memory"
+            )
+        emit({
+            "event": "validation-device-cache-start",
+            "examples": validation_example_count,
+            "estimatedMiB": estimated_cache_bytes / (1024 * 1024),
+        })
+        validation_cache = cache_device_batches(
+            validation_loader,
+            batch_pipeline,
+        )
+        if validation_cache.example_count != validation_example_count:
+            raise RuntimeError("validation device cache is incomplete")
+        validation_data = validation_cache
+        emit({
+            "event": "validation-device-cache-ready",
+            "examples": validation_cache.example_count,
+            "batches": len(validation_cache),
+            "storageMiB": validation_cache.storage_mib,
+            **cuda_memory_metrics(device),
+        })
     steps_per_epoch = math.ceil(len(train_loader) / args.accumulate)
     total_steps = max(1, steps_per_epoch * args.epochs)
     checkpoint_file = args.output / "checkpoint.pt"
@@ -1672,7 +1936,7 @@ def main() -> None:
         "trainExamples": len(train),
         "selectedTrainingExamples": train_loader.batch_sampler.example_count,
         "validationExamples": len(validation),
-        "screeningValidationExamples": validation_loader.batch_sampler.example_count,
+        "screeningValidationExamples": validation_example_count,
         "batchSize": args.batch_size,
         "evaluationBatchSize": evaluation_batch_size,
         "validationFraction": args.validation_fraction,
@@ -1681,9 +1945,24 @@ def main() -> None:
         if args.compile else "disabled",
         "dataLoaderWorkers": {
             "training": args.workers,
-            "evaluation": 0,
-            "prefetchFactor": 2 if args.workers > 0 else 0,
+            "validation": (
+                0 if validation_cache is not None else args.evaluation_workers
+            ),
+            "validationStaging": (
+                args.evaluation_workers if validation_cache is not None else 0
+            ),
+            "test": 0,
+            "prefetchFactor": 2,
         },
+        "validationDeviceCache": (
+            {
+                "enabled": True,
+                "batches": len(validation_cache),
+                "storageMiB": validation_cache.storage_mib,
+            }
+            if validation_cache is not None
+            else {"enabled": False}
+        ),
         "testExamples": len(test),
         "targetRepresentation": args.target,
         "compactMinuteFeatureComponents": (
@@ -1717,9 +1996,10 @@ def main() -> None:
 
     if not best_model_file.exists() and not args.skip_baseline:
         baseline = evaluate(
-            model, validation_loader, actions, current, support,
+            model, validation_data, actions, current, support,
             loss_weights, device, sampling_interval_ms,
             objective=evaluation_objective,
+            batch_pipeline=batch_pipeline,
         )
         best_validation = baseline[args.selection_metric]
         best_validation_metrics = baseline
@@ -1757,6 +2037,7 @@ def main() -> None:
         })
     last_epoch = start_epoch - 1
     throughput_meter = TrainingThroughputMeter()
+    checkpoint_writer = AsyncCheckpointWriter()
     try:
         for epoch in range(start_epoch, args.epochs):
             if args.evaluation_only or quality_target_reached or patience_exhausted:
@@ -1781,46 +2062,72 @@ def main() -> None:
                 objective=training_objective,
                 diagnostic_objective=training_diagnostic_objective,
                 throughput_meter=throughput_meter,
+                batch_pipeline=batch_pipeline,
             )
+            training_completed = time.monotonic()
             validation_metrics = evaluate(
-                model, validation_loader, actions, current, support,
+                model, validation_data, actions, current, support,
                 loss_weights, device, sampling_interval_ms,
                 objective=evaluation_objective,
+                batch_pipeline=batch_pipeline,
             )
+            validation_completed = time.monotonic()
             improved = validation_metrics[args.selection_metric] < best_validation - 1e-6
             if improved:
                 best_validation = validation_metrics[args.selection_metric]
                 best_validation_metrics = validation_metrics
                 best_epoch = epoch
                 stale_epochs = 0
-                atomic_torch_save(model.state_dict(), best_model_file)
             else:
                 stale_epochs += 1
             patience_exhausted = (
                 not args.disable_patience and stale_epochs >= args.patience
             )
-            save_checkpoint(
+            checkpoint_io = checkpoint_writer.submit(
+                checkpoint_state(
+                    epoch,
+                    global_step,
+                    best_epoch,
+                    best_validation,
+                    best_validation_metrics,
+                    stale_epochs,
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    training_contract,
+                ),
                 checkpoint_file,
-                epoch,
-                global_step,
-                best_epoch,
-                best_validation,
-                best_validation_metrics,
-                stale_epochs,
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                training_contract,
+                best_model_file if improved else None,
             )
-            cuda_cache = release_inactive_cuda_memory(device)
+            checkpoint_enqueued = time.monotonic()
+            cuda_cache = trim_inactive_cuda_memory(
+                device,
+                args.cuda_cache_trim_fraction,
+            )
+            cache_checked = time.monotonic()
             quality_target_reached = validation_target_reached(validation_metrics, args)
             emit({
                 "event": "epoch",
                 "epoch": epoch,
                 "epochs": args.epochs,
                 "globalStep": global_step,
-                "seconds": round(time.monotonic() - started, 2),
+                "seconds": round(cache_checked - started, 2),
+                "phaseSeconds": {
+                    "training": round(training_completed - started, 4),
+                    "validation": round(
+                        validation_completed - training_completed,
+                        4,
+                    ),
+                    "checkpointSnapshot": round(
+                        checkpoint_enqueued - validation_completed,
+                        4,
+                    ),
+                    "cacheCheck": round(
+                        cache_checked - checkpoint_enqueued,
+                        4,
+                    ),
+                },
                 "train": train_metrics,
                 "validation": validation_metrics,
                 "bestEpoch": best_epoch,
@@ -1830,6 +2137,7 @@ def main() -> None:
                 "stopRequested": stopped,
                 "validationTargetReached": quality_target_reached,
                 "cudaCache": cuda_cache,
+                "checkpointIo": checkpoint_io,
             })
             if quality_target_reached:
                 emit({
@@ -1844,11 +2152,13 @@ def main() -> None:
                 break
     except KeyboardInterrupt:
         interrupted = True
+        checkpoint_writer.flush()
         emit({"event": "interrupt", "message": "Finalizing the best validated checkpoint."})
         validation_metrics = evaluate(
-            model, validation_loader, actions, current, support,
+            model, validation_data, actions, current, support,
             loss_weights, device, sampling_interval_ms,
             objective=evaluation_objective,
+            batch_pipeline=batch_pipeline,
         )
         if validation_metrics[args.selection_metric] < best_validation - 1e-6:
             best_validation = validation_metrics[args.selection_metric]
@@ -1869,6 +2179,8 @@ def main() -> None:
             scaler,
             training_contract,
         )
+    finally:
+        checkpoint_writer.close()
 
     if not best_model_file.exists():
         raise RuntimeError("training finished without a validated checkpoint")
@@ -1877,9 +2189,10 @@ def main() -> None:
     # describe the actual checkpoint under the current metric definitions,
     # including metrics added after a resumable checkpoint was written.
     best_validation_metrics = evaluate(
-        model, validation_loader, actions, current, support,
+        model, validation_data, actions, current, support,
         loss_weights, device, sampling_interval_ms,
         objective=evaluation_objective,
+        batch_pipeline=batch_pipeline,
     )
     best_validation = best_validation_metrics[args.selection_metric]
     if args.study_file is not None:
@@ -1910,7 +2223,7 @@ def main() -> None:
             "bestValidationMetrics": best_validation_metrics,
             "screeningBestValidationScore": best_validation,
             "screeningBestValidationMetrics": best_validation_metrics,
-            "screeningValidationExamples": validation_loader.batch_sampler.example_count,
+            "screeningValidationExamples": validation_example_count,
             "validationFraction": args.validation_fraction,
             "lossWeights": asdict(loss_weights),
             "distributionObjective": "conditional-plus-action-only-ce-pmse-v1",
@@ -1936,6 +2249,7 @@ def main() -> None:
         model, test_loader, actions, current, support,
         loss_weights, device, sampling_interval_ms,
         objective=evaluation_objective,
+        batch_pipeline=batch_pipeline,
     )
     teacher_metrics = teacher_fit_summary(manifest, args.dataset)
     export_artifact(
@@ -1986,6 +2300,7 @@ def train_epoch(
     objective=None,
     diagnostic_objective=None,
     throughput_meter: TrainingThroughputMeter | None = None,
+    batch_pipeline: DeviceBatchPipeline | None = None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -2007,6 +2322,7 @@ def train_epoch(
     probability_mse_mean = torch.zeros((), device=device)
     probability_mse_centered_square_sum = torch.zeros((), device=device)
     throughput_meter = throughput_meter or TrainingThroughputMeter()
+    batch_pipeline = batch_pipeline or DeviceBatchPipeline(device)
     throughput_meter.resume()
     stopped = False
     for batch_step, (
@@ -2017,7 +2333,7 @@ def train_epoch(
         _,
         target_row_indices,
     ) in enumerate(
-        device_batches(data, device)
+        batch_pipeline.batches(data)
     ):
         should_step = (batch_step + 1) % args.accumulate == 0 \
             or batch_step + 1 == len(data)
@@ -2163,8 +2479,10 @@ def train_epoch(
 @torch.inference_mode()
 def evaluate(model, data, actions, current, support,
              loss_weights, device, sampling_interval_ms,
-             objective=None) -> dict[str, float]:
+             objective=None,
+             batch_pipeline: DeviceBatchPipeline | None = None) -> dict[str, float]:
     model.eval()
+    batch_pipeline = batch_pipeline or DeviceBatchPipeline(device)
     totals = {name: torch.zeros((), device=device) for name in METRIC_NAMES}
     total_examples = 0
     time_weight_sum = torch.zeros((), device=device)
@@ -2183,7 +2501,7 @@ def evaluate(model, data, actions, current, support,
         times,
         _,
         target_row_indices,
-    ) in device_batches(data, device):
+    ) in batch_pipeline.batches(data):
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
             batch_metrics = objective(
                 features,
@@ -2266,8 +2584,9 @@ def loader(
     batch_size: int,
     sample_fraction: float = 1.0,
     weighted_sample: bool = False,
+    workers: int,
+    persistent: bool = True,
 ) -> DataLoader:
-    workers = args.workers if shuffle else 0
     return DataLoader(
         dataset,
         batch_sampler=TemporalBlockBatchSampler(
@@ -2280,57 +2599,52 @@ def loader(
         ),
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=workers > 0,
+        persistent_workers=workers > 0 and persistent,
         prefetch_factor=2 if workers > 0 else None,
         collate_fn=passthrough_batch,
     )
 
 
-def device_batches(data: DataLoader, device: torch.device):
-    """Overlap pinned host-to-device copies with the preceding CUDA batch."""
-    if device.type != "cuda":
-        yield from data
-        return
-
-    copy_stream = torch.cuda.Stream(device=device)
-    iterator = iter(data)
-
-    def copy(batch):
-        (
-            features,
+def cache_device_batches(
+    data: DataLoader,
+    pipeline: DeviceBatchPipeline,
+) -> DeviceBatchCache:
+    """Materialize immutable validation inputs once and retain them on the GPU."""
+    batches: list[DeviceBatch] = []
+    example_count = 0
+    empty_diagnostics = torch.empty(0)
+    for (
+        features,
+        targets,
+        time_weights,
+        times,
+        _,
+        target_row_indices,
+    ) in pipeline.batches(data):
+        batch = (
+            # Stored minute features are float16; avoid retaining a redundant
+            # float32 expansion between validation passes.
+            features.to(dtype=torch.float16),
             targets,
             time_weights,
             times,
-            diagnostics,
+            empty_diagnostics,
             target_row_indices,
-        ) = batch
-        with torch.cuda.stream(copy_stream):
-            return (
-                features.to(device, non_blocking=True),
-                targets.to(device, non_blocking=True),
-                time_weights.to(device, non_blocking=True),
-                times.to(device, non_blocking=True),
-                diagnostics,
-                target_row_indices.to(device, non_blocking=True),
-            )
-
-    try:
-        pending = copy(next(iterator))
-    except StopIteration:
-        return
-
-    while True:
-        torch.cuda.current_stream(device).wait_stream(copy_stream)
-        batch = pending
-        for value in (*batch[:4], batch[5]):
-            value.record_stream(torch.cuda.current_stream(device))
-        try:
-            pending = copy(next(iterator))
-        except StopIteration:
-            pending = None
-        yield batch
-        if pending is None:
-            break
+        )
+        batches.append(batch)
+        example_count += features.shape[0]
+    if pipeline.device.type == "cuda":
+        torch.cuda.synchronize(pipeline.device)
+    storage_bytes = sum(
+        value.numel() * value.element_size()
+        for batch in batches
+        for value in (*batch[:4], batch[5])
+    )
+    return DeviceBatchCache(
+        batches=batches,
+        example_count=example_count,
+        storage_mib=storage_bytes / (1024 * 1024),
+    )
 
 
 def report_stored_example_weights(dataset: FittedPolicyDataset) -> None:
@@ -2596,16 +2910,29 @@ def resume_contract_is_monotonic_extension(
     checkpoint_contract: dict,
     requested_contract: dict,
 ) -> bool:
-    """Allow only a larger epoch or patience horizon for an exact run contract."""
+    """Allow longer training or a runtime-only evaluation batch-size change."""
     previous = dict(checkpoint_contract)
     requested = dict(requested_contract)
     previous_epochs = previous.pop("epochs", None)
     requested_epochs = requested.pop("epochs", None)
     previous_patience = previous.pop("patience", None)
     requested_patience = requested.pop("patience", None)
+    previous_evaluation_batch_size = previous.pop("evaluationBatchSize", None)
+    requested_evaluation_batch_size = requested.pop("evaluationBatchSize", None)
     previous.pop("learningRateSchedule", None)
     requested.pop("learningRateSchedule", None)
+    evaluation_batch_size_changed = (
+        previous_evaluation_batch_size != requested_evaluation_batch_size
+    )
+    evaluation_batch_size_compatible = (
+        not evaluation_batch_size_changed
+        or isinstance(previous_evaluation_batch_size, int)
+        and isinstance(requested_evaluation_batch_size, int)
+        and previous_evaluation_batch_size >= 0
+        and requested_evaluation_batch_size >= 0
+    )
     if previous != requested \
+            or not evaluation_batch_size_compatible \
             or not all(isinstance(value, int) for value in (
                 previous_epochs,
                 requested_epochs,
@@ -2631,14 +2958,15 @@ def resume_contract_is_monotonic_extension(
         and (
             requested_epochs > previous_epochs
             or patience_extended
+            or evaluation_batch_size_changed
         )
     )
 
 
-def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
-                    best_validation_metrics, stale_epochs, model, optimizer, scheduler,
-                    scaler, training_contract) -> None:
-    atomic_torch_save({
+def checkpoint_state(epoch, global_step, best_epoch, best_validation,
+                     best_validation_metrics, stale_epochs, model, optimizer, scheduler,
+                     scaler, training_contract) -> dict:
+    return {
         "epoch": epoch,
         "globalStep": global_step,
         "bestEpoch": best_epoch,
@@ -2651,7 +2979,25 @@ def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
         "scaler": scaler.state_dict(),
         "rng": capture_rng(),
         "trainingContract": training_contract,
-    }, file)
+    }
+
+
+def save_checkpoint(file, epoch, global_step, best_epoch, best_validation,
+                    best_validation_metrics, stale_epochs, model, optimizer, scheduler,
+                    scaler, training_contract) -> None:
+    atomic_torch_save(checkpoint_state(
+        epoch,
+        global_step,
+        best_epoch,
+        best_validation,
+        best_validation_metrics,
+        stale_epochs,
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        training_contract,
+    ), file)
 
 
 def export_artifact(model, args, dataset_manifest, train_count, validation_count, test_count,
@@ -3001,12 +3347,14 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     if min(args.epochs, args.batch_size, args.accumulate, args.states_per_example,
-           args.log_every_steps) < 1 or args.workers < 0:
+           args.log_every_steps) < 1 or min(args.workers, args.evaluation_workers) < 0:
         raise ValueError("training counts must be positive (workers may be zero)")
     if not args.disable_patience and args.patience < 1:
         raise ValueError("training patience must be positive when enabled")
     if args.evaluation_batch_size < 0:
         raise ValueError("evaluation batch size must be non-negative")
+    if not 0 < args.cuda_cache_trim_fraction <= 1:
+        raise ValueError("CUDA cache trim fraction must be in (0, 1]")
     if not 0 < args.validation_fraction <= 1 or not 0 < args.training_fraction <= 1:
         raise ValueError("training and validation fractions must be in (0, 1]")
     if args.learning_rate <= 0 or args.weight_decay < 0 or not 0 <= args.dropout < 1:

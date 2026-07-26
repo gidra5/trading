@@ -537,15 +537,28 @@ learning rate, gradient norm, throughput, and GPU memory.
 
 The direct-distribution trainer keeps compressed minute-oracle components lazy
 inside Windows DataLoader workers instead of pickling every decoded day into
-each process. Only the shuffled training loader owns persistent workers;
-validation and test execute in the main process, so they cannot accumulate
-additional worker pools. The compiled objectives use static Inductor graphs
-with CUDA graphs disabled. At every epoch boundary the trainer releases only
-inactive CUDA allocator blocks, preserving live tensors and optimizer state
-while preventing varying batch shapes from filling device memory with cached
-blocks. Training events report current tensor allocation, PyTorch reservation,
-and whole-device usage separately. Throughput is a rolling completed-example
-rate across training segments and excludes validation time.
+each process. The shuffled training loader owns the only persistent worker
+pool. Minute-curriculum validation uses two temporary workers to materialize a
+bounded GPU-resident cache once; they exit before training workers start.
+Recurring validation therefore performs neither decompression nor host-to-device
+copies. Final test evaluation remains in the main process. All uncached transfers
+reuse one run-lifetime CUDA copy stream so allocator blocks stay reusable across
+epochs instead of becoming associated with new streams. The compiled objectives
+use static Inductor graphs with CUDA graphs disabled; only the full and final
+partial batch shapes need workspaces. At epoch boundaries the trainer releases
+inactive CUDA allocator blocks only after reserved memory exceeds half of device
+capacity. This is now an emergency fragmentation guard rather than routine
+cleanup. Training events report current tensor allocation, PyTorch reservation,
+whole-device usage, validation-cache storage, and whether cache trimming occurred
+separately. Throughput is a rolling completed-example rate across training
+segments and excludes validation time.
+
+Epoch checkpoints take one bounded frozen CPU snapshot, then serialize the
+snapshot atomically on a single background writer while the next GPU epoch
+starts. The writer must finish before another snapshot is accepted, so disk
+backpressure cannot accumulate checkpoint copies in memory. A newly improved
+best-model state shares the checkpoint's frozen model tensors and is written by
+the same ordered job. Shutdown and finalization always flush the pending job.
 
 The v11 run starts from a fresh random initialization and runs at most 256 epochs
 with 64-epoch early-stopping patience. CE and both MI rewards have weight `1`;

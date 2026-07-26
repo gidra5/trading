@@ -217,6 +217,9 @@ try {
       ? ["--disable-patience"]
       : ["--patience", String(training.patience)]),
     "--workers", String(training.workers),
+    ...(training.cacheValidationOnDevice
+      ? ["--cache-validation-on-device"]
+      : []),
     "--seed", String(training.seed),
     "--device", training.device,
     "--log-every-steps", String(training.logEverySteps),

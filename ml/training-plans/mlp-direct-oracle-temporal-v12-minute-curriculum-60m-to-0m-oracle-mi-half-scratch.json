@@ -10,6 +10,8 @@
   "predictionDelayMs": 3600000,
   "training": {
     "epochs": 256,
+    "evaluationBatchSize": 4096,
+    "cacheValidationOnDevice": true,
     "earlyStopping": "target-only",
     "selectionMetric": "baseKlDivergence",
     "targetValidation": {

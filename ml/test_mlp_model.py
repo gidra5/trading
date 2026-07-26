@@ -28,8 +28,11 @@ from mlp_model import (
     surface_probability_mse_per_example,
 )
 from train_mlp import (
+    AsyncCheckpointWriter,
     CompactMinuteFeatureComponent,
     CompressedComponentRows,
+    DeviceBatchCache,
+    DeviceBatchPipeline,
     FittedPolicyDataset,
     RuntimeMinuteOracleRows,
     Shard,
@@ -37,12 +40,13 @@ from train_mlp import (
     TrainingThroughputMeter,
     cached_training_normalization,
     cached_training_parameter_scale,
+    cache_device_batches,
     continuation_learning_rate_multiplier,
     merge_weighted_moments,
     loader,
-    release_inactive_cuda_memory,
     resume_contract_is_monotonic_extension,
     scheduler_resume_steps,
+    trim_inactive_cuda_memory,
     validate_dataset_manifest,
     weighted_standard_deviation,
     weighted_variance,
@@ -59,6 +63,7 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             "datasetVersion": 12,
             "epochs": 64,
             "patience": 8,
+            "evaluationBatchSize": 4096,
         }
         extended = {
             **original,
@@ -76,6 +81,14 @@ class MarketOnlyInputContractTests(unittest.TestCase):
         self.assertFalse(resume_contract_is_monotonic_extension(
             original,
             {**extended, "patience": 4},
+        ))
+        self.assertTrue(resume_contract_is_monotonic_extension(
+            original,
+            {**original, "evaluationBatchSize": 8192},
+        ))
+        self.assertFalse(resume_contract_is_monotonic_extension(
+            original,
+            {**original, "evaluationBatchSize": -1},
         ))
         target_only = {
             "datasetVersion": 12,
@@ -602,10 +615,47 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
 
 
 class ValidationMetricAggregationTests(unittest.TestCase):
+    def test_async_checkpoint_writer_freezes_state_before_background_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_file = Path(directory) / "checkpoint.pt"
+            best_model_file = Path(directory) / "best-model.pt"
+            source = torch.tensor([1.0, 2.0])
+            writer = AsyncCheckpointWriter()
+
+            metrics = writer.submit(
+                {"model": {"weight": source}, "epoch": 3},
+                checkpoint_file,
+                best_model_file,
+            )
+            source.add_(10)
+            writer.close()
+
+            checkpoint = torch.load(
+                checkpoint_file,
+                map_location="cpu",
+                weights_only=True,
+            )
+            best_model = torch.load(
+                best_model_file,
+                map_location="cpu",
+                weights_only=True,
+            )
+            torch.testing.assert_close(
+                checkpoint["model"]["weight"],
+                torch.tensor([1.0, 2.0]),
+            )
+            torch.testing.assert_close(
+                best_model["weight"],
+                torch.tensor([1.0, 2.0]),
+            )
+            self.assertTrue(metrics["asynchronous"])
+
     def test_inactive_cuda_release_is_a_noop_on_cpu(self) -> None:
         self.assertEqual(
-            release_inactive_cuda_memory(torch.device("cpu")),
+            trim_inactive_cuda_memory(torch.device("cpu"), 0.5),
             {
+                "trimmed": False,
+                "thresholdMiB": 0.0,
                 "allocatedMiB": 0.0,
                 "reservedBeforeMiB": 0.0,
                 "reservedAfterMiB": 0.0,
@@ -634,7 +684,7 @@ class ValidationMetricAggregationTests(unittest.TestCase):
         self.assertEqual(second_examples, 200)
         self.assertEqual(second_rate, 40.0)
 
-    def test_evaluation_loader_does_not_create_persistent_worker_pool(self) -> None:
+    def test_loader_uses_explicit_bounded_worker_pools(self) -> None:
         dataset = type("Dataset", (), {
             "temporal_runs": [(0, 8)],
             "storage_runs": [(0, 8, "day-a")],
@@ -648,20 +698,62 @@ class ValidationMetricAggregationTests(unittest.TestCase):
             args,
             shuffle=True,
             batch_size=4,
+            workers=4,
         )
-        evaluation = loader(
+        validation = loader(
             dataset,
             args,
             shuffle=False,
             batch_size=4,
+            workers=2,
+        )
+        staging = loader(
+            dataset,
+            args,
+            shuffle=False,
+            batch_size=4,
+            workers=2,
+            persistent=False,
+        )
+        test = loader(
+            dataset,
+            args,
+            shuffle=False,
+            batch_size=4,
+            workers=0,
         )
 
         self.assertEqual(training.num_workers, 4)
         self.assertEqual(training.prefetch_factor, 2)
         self.assertTrue(training.persistent_workers)
-        self.assertEqual(evaluation.num_workers, 0)
-        self.assertIsNone(evaluation.prefetch_factor)
-        self.assertFalse(evaluation.persistent_workers)
+        self.assertEqual(validation.num_workers, 2)
+        self.assertEqual(validation.prefetch_factor, 2)
+        self.assertTrue(validation.persistent_workers)
+        self.assertEqual(staging.num_workers, 2)
+        self.assertFalse(staging.persistent_workers)
+        self.assertEqual(test.num_workers, 0)
+        self.assertIsNone(test.prefetch_factor)
+        self.assertFalse(test.persistent_workers)
+
+    def test_device_batch_cache_retains_half_features_and_bypasses_copying(self) -> None:
+        source = [(
+            torch.arange(12, dtype=torch.float32).view(3, 4),
+            torch.ones((3, 2), dtype=torch.float32),
+            torch.ones(3, dtype=torch.float32),
+            torch.arange(3, dtype=torch.int64),
+            torch.ones((3, 1), dtype=torch.float32),
+            torch.empty(0, dtype=torch.int64),
+        )]
+        pipeline = DeviceBatchPipeline(torch.device("cpu"))
+
+        cached = cache_device_batches(source, pipeline)
+
+        self.assertIsInstance(cached, DeviceBatchCache)
+        self.assertEqual(cached.example_count, 3)
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached.batches[0][0].dtype, torch.float16)
+        self.assertEqual(cached.batches[0][1].dtype, torch.float32)
+        self.assertEqual(list(pipeline.batches(cached)), cached.batches)
 
     def test_weighted_moments_merge_across_minibatches(self) -> None:
         weight, mean, centered_square_sum = merge_weighted_moments(
