@@ -130,10 +130,12 @@ export interface BacktestOraclePoint {
   fromState: BacktestOracleState;
   state: BacktestOracleState;
   action: "hold" | "open" | "close" | "switch";
+  /** Exact portfolio exposure when the reference path provides one. */
+  exposure?: number;
 }
 
 export interface BacktestOraclePath {
-  mode: "fixed-notional";
+  mode: "fixed-notional" | "bellman-exposure";
   eventMode: BacktestOracleEventMode;
   leverage: number;
   friction: number;

@@ -70,6 +70,20 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             original,
             {**extended, "patience": 4},
         ))
+        target_only = {
+            "datasetVersion": 12,
+            "epochs": 256,
+            "patience": None,
+            "earlyStopping": "target-only",
+        }
+        self.assertTrue(resume_contract_is_monotonic_extension(
+            target_only,
+            {**target_only, "epochs": 512},
+        ))
+        self.assertFalse(resume_contract_is_monotonic_extension(
+            target_only,
+            {**target_only, "patience": 16},
+        ))
 
     def test_continuation_schedule_is_smooth_and_monotonic(self) -> None:
         start = 172_723

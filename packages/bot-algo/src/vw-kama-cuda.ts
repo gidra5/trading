@@ -6,6 +6,7 @@ import type {
   VwKamaParameters,
   VwKamaPreparedOracle,
 } from "./kama-signal-evaluator.js";
+import { exposureValueOracleStateCodes } from "./kama-signal-evaluator.js";
 import type { ExposureValueOracle } from "./exposure-value-distillation.js";
 import {
   binnedConditionalExposureProbabilities,
@@ -394,10 +395,13 @@ export async function evaluateVwKamaCudaBatch(
   options: VwKamaCudaBatchOptions,
 ): Promise<VwKamaCudaCaseResult[]> {
   if (candidates.length === 0) return [];
-  if (oracle.stateCodes.length < candles.length) {
+  const valueDistillation = options.valueDistillation;
+  const referenceStateCodes = valueDistillation
+    ? exposureValueOracleStateCodes(valueDistillation.oracle)
+    : oracle.stateCodes;
+  if (referenceStateCodes.length < candles.length) {
     throw new Error("VW-KAMA CUDA oracle states do not cover the candle columns.");
   }
-  const valueDistillation = options.valueDistillation;
   const loss = normalizeExposureValueDistillationLossConfig(
     valueDistillation?.lossConfig,
     valueDistillation?.oracle.grid.length,
@@ -506,7 +510,7 @@ export async function evaluateVwKamaCudaBatch(
     candles.low,
     candles.close,
     candles.volume,
-    oracle.stateCodes,
+    referenceStateCodes,
     valueDistillation?.oracle.policyMeans ?? null,
     valueDistillation?.oracle.policySecondMoments ?? null,
     valueDistillation?.oracle.policyMeanLogRebalances ?? null,

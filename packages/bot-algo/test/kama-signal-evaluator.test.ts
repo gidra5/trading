@@ -330,16 +330,45 @@ test("VW-KAMA b2 volatility window is independent from the one-step holding peri
       lossConfig: { ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS },
     },
   });
+  assert.equal(result.oracle.mode, "bellman-exposure");
+  assert.ok(result.oracle.points.length > 0);
+  assert.equal(result.oracle.points.at(-1)!.exposure, 0);
+  assert.deepEqual(
+    result.statePoints.map((point) => point.oracleExposure),
+    result.valueOraclePath.map((point) => point.exposure),
+  );
   assert.equal(result.valueDistributions.length, 2);
   assert.ok(result.valueDistributions.every((point) =>
     point.oracleHoldingPeriodMs === 1_000 && point.oracleValueHorizonMs === 1_000));
+  assert.ok(result.valueDistributions.every((point) =>
+    point.values.every((value) =>
+      Number.isFinite(value.oracleEmaProbability) && value.oracleEmaProbability >= 0)
+    && Math.abs(point.values.reduce(
+      (total, value) => total + value.oracleEmaProbability,
+      0,
+    ) - 1) < 1e-6));
   assert.equal(result.valueCandidatePath.length, result.kamaSeries.points.length);
+  assert.equal(result.valueOraclePredictionPath.length, result.kamaSeries.points.length);
+  assert.equal(result.valueOracleEmaPath.length, result.kamaSeries.points.length);
   assert.ok(result.valueCandidatePath.every((point) =>
     Number.isFinite(point.time)
     && Number.isFinite(point.exposure)
     && Number.isFinite(point.equity)
     && point.equity >= 0));
+  assert.ok([...result.valueOraclePredictionPath, ...result.valueOracleEmaPath].every((point) =>
+    Number.isFinite(point.time)
+    && Number.isFinite(point.exposure)
+    && Number.isFinite(point.equity)
+    && point.equity >= 0));
   assert.equal(result.valueCandidatePath[0]!.equity, 1);
+  assert.equal(result.valueOraclePredictionPath[0]!.equity, 1);
+  assert.equal(result.valueOracleEmaPath[0]!.equity, 1);
+  assert.ok(result.oraclePredictionMetrics);
+  assert.ok(result.oracleEmaMetrics);
+  assert.ok(Number.isFinite(
+    result.metrics.valueDistillation!.returns.oraclePrediction.totalReturn,
+  ));
+  assert.ok(Number.isFinite(result.metrics.valueDistillation!.returns.oracleEma.totalReturn));
   const point = result.valueDistributions.at(-1)!;
   assert.equal(point.currentExposureMinimum, -valueOracle.execution.maxEffectiveExposure);
   assert.equal(point.currentExposureMaximum, valueOracle.execution.maxEffectiveExposure);

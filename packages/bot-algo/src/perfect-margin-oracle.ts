@@ -39,6 +39,11 @@ const LONG = 1;
 const SHORT = 2;
 type OracleStateCode = typeof FLAT | typeof LONG | typeof SHORT;
 
+/**
+ * @deprecated Use the coherent exposure-value Bellman path for executable
+ * hindsight references. This solver remains for legacy fixed-notional
+ * backtests that explicitly need its three-state additive objective.
+ */
 export function perfectMarginOracle(
   candles: readonly OracleCandle[],
   options: PerfectMarginOracleOptions,

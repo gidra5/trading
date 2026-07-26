@@ -36,6 +36,7 @@ import type {
   VwKamaInspectorResponse,
   VwKamaMlpOracleAlignment,
   VwKamaParameters,
+  VwKamaPathAccuracyMetrics,
   VwKamaPreset,
   VwKamaPredictorFitResponse,
   VwKamaPredictorModel,
@@ -66,6 +67,7 @@ const detailMaxCandles = 5_000;
 const detailTriggerCandles = detailMaxCandles * 4;
 const hoverPredictionThrottleMs = 300;
 const hoverPredictionCacheSize = 64;
+const defaultOracleEmaWindowMs = 60_000;
 const defaultValueDistillation: VwKamaValueDistillationConfig = {
   gridSize: DEFAULT_EXPOSURE_VALUE_GRID_SIZE,
   minExposure: -100,
@@ -76,12 +78,12 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   holdingPeriodMs: 60_000,
   valueHorizonMode: "fixed",
   valueHorizonMs: 60 * 60_000,
-  horizonEndMode: "truncate",
+  horizonEndMode: "extend",
   oracleTemperature: 0.01,
   strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
-  quoteBorrowRate: 0,
-  assetBorrowRate: 0,
+  quoteBorrowRate: 5,
+  assetBorrowRate: 5,
   entropyGapLambda: 0,
   stateMutualInformationLambda: 0,
   oracleMutualInformationLambda: 0,
@@ -225,7 +227,9 @@ const metricHelp = {
   oracleMutualInformation: "Normalized dependence between soft oracle and strategy exposure distributions. Approximate mode uses distribution moments; precise mode computes categorical MI over the configured exposure bins.",
   valueHoldingPeriod: "Resolved H between oracle decisions. An action rebalances once, then quote and asset quantities remain untouched while exposure drifts until the next decision. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
   valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
-  strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, using the sampled forecast-regret mean exposure and configured friction.",
+  strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, executing modal target cells with the configured friction, maintenance, and no-trade-cell semantics.",
+  oraclePredictionReturn: "The rolling-horizon oracle distribution is conditioned on the current exposure and friction, then its modal target is executed through exactly the same return simulator as the candidate.",
+  oracleEmaReturn: "The configured EMA is applied to the rolling-horizon oracle probability distribution, then conditioned on the current exposure and friction and evaluated exactly like the candidate.",
   oracleReturn: "exp(Q₀(initial exposure))−1 for one full-window Bellman policy after the mandatory terminal rebalance to zero, including friction and maintenance.",
   drawdown: "Largest peak-to-trough equity loss in the scored path. Continuous segments each restart at equity 1 and zero exposure.",
 } as const;
@@ -250,6 +254,8 @@ export function KamaInspectorPage() {
   const [selectedPredictorPresetId, setSelectedPredictorPresetId] = createSignal("custom");
   const [rankedPair, setRankedPair] = createSignal<"current" | "best" | "worst">("current");
   const [oracleFriction, setOracleFriction] = createSignal(0.00175);
+  const [oracleEmaWindowMs, setOracleEmaWindowMs] =
+    createSignal(defaultOracleEmaWindowMs);
   const [matchWindowMs, setMatchWindowMs] = createSignal(2 * 3_600_000);
   const [timingHalfLifeMs, setTimingHalfLifeMs] = createSignal(10 * 60_000);
   const [warmupMultiple, setWarmupMultiple] = createSignal(3);
@@ -265,13 +271,17 @@ export function KamaInspectorPage() {
   const [showSignals, setShowSignals] = createSignal(true);
   const [showOracle, setShowOracle] = createSignal(true);
   const [valuePathVisibility, setValuePathVisibility] = createSignal({
-    oracleExposure: true,
-    oracleEquity: false,
+    dpExposure: true,
+    dpEquity: false,
+    oraclePredictionExposure: true,
+    oraclePredictionEquity: false,
+    oracleEmaExposure: true,
+    oracleEmaEquity: false,
     candidateExposure: true,
-    candidateEquity: true,
+    candidateEquity: false,
   });
   const toggleValuePathSeries = (
-    series: "oracleExposure" | "oracleEquity" | "candidateExposure" | "candidateEquity",
+    series: keyof ReturnType<typeof valuePathVisibility>,
   ) => setValuePathVisibility((visible) => ({ ...visible, [series]: !visible[series] }));
   const [diagnosticVisibility, setDiagnosticVisibility] = createSignal({ ...defaultDiagnosticVisibility });
   const [timeViewport, setTimeViewport] = createSignal<TimeRange>();
@@ -350,6 +360,28 @@ export function KamaInspectorPage() {
       analysis,
     );
   });
+  const valueOraclePredictionPath = createMemo(() => {
+    const analysis = result();
+    return mergeDetailValuePath(
+      analysis?.valueOraclePredictionPath ?? [],
+      detail()?.valueOraclePredictionPath,
+      detail(),
+      analysis,
+    );
+  });
+  const valueOracleEmaPath = createMemo(() => {
+    const analysis = result();
+    return mergeDetailValuePath(
+      analysis?.valueOracleEmaPath ?? [],
+      detail()?.valueOracleEmaPath,
+      detail(),
+      analysis,
+    );
+  });
+  const renderedOracleEmaWindowMs = createMemo(() =>
+    result()?.oracleEmaPath.windowMs ?? oracleEmaWindowMs());
+  const oracleEmaDisplayLabel = createMemo(() =>
+    formatOracleEmaLabel(renderedOracleEmaWindowMs()));
   const valueCandidatePath = createMemo(() => {
     const analysis = result();
     return mergeDetailValueCandidatePath(
@@ -358,7 +390,7 @@ export function KamaInspectorPage() {
       analysis,
     );
   });
-  const oracle = createMemo(() => exposurePathOracle(
+  const bellmanOptimalPath = createMemo(() => exposurePathOracle(
     valueOraclePath(),
     chartCandles(),
     oracleFriction(),
@@ -380,8 +412,22 @@ export function KamaInspectorPage() {
     }
     return [...points.values()].sort((left, right) => left.time - right.time);
   });
+  const oraclePredictionStatePoints = createMemo(() => predictionStatePoints(
+    result()?.statePoints ?? [],
+    result()?.oraclePredictionTransitions ?? [],
+    "oraclePrediction",
+    "oraclePredictionExposure",
+  ));
+  const oracleEmaStatePoints = createMemo(() => predictionStatePoints(
+    result()?.statePoints ?? [],
+    result()?.oracleEmaTransitions ?? [],
+    "oracleEma",
+    "oracleEmaExposure",
+  ));
   const chartStateBands = createMemo<CandleChartStateBand[]>(() => [
-    { label: "Oracle", points: oracle().points },
+    { label: "Bellman optimal", points: bellmanOptimalPath().points },
+    { label: "Oracle", points: oraclePredictionStatePoints() },
+    { label: oracleEmaDisplayLabel(), points: oracleEmaStatePoints() },
     { label: "Candidate", points: candidateStatePoints() },
   ]);
   const indicatorPoints = createMemo(() => mergeDetailIndicatorPoints(
@@ -485,23 +531,61 @@ export function KamaInspectorPage() {
   });
   const valuePathSeries = createMemo<IndicatorChartSeries[]>(() => {
     const visible = valuePathVisibility();
-    const oraclePath = visible.oracleExposure || visible.oracleEquity ? valueOraclePath() : [];
+    const dpPath = visible.dpExposure || visible.dpEquity ? valueOraclePath() : [];
+    const oraclePredictionPath = visible.oraclePredictionExposure
+      || visible.oraclePredictionEquity ? valueOraclePredictionPath() : [];
+    const oracleEmaPath = visible.oracleEmaExposure
+      || visible.oracleEmaEquity ? valueOracleEmaPath() : [];
     const candidatePath = visible.candidateExposure || visible.candidateEquity ? valueCandidatePath() : [];
     return [
-      ...(visible.oracleExposure && oraclePath.length > 0 ? [{
-        id: "value-oracle-exposure",
-        label: "Full-window optimal exposure",
+      ...(visible.dpExposure && dpPath.length > 0 ? [{
+        id: "value-dp-exposure",
+        label: "Bellman optimal exposure",
         color: "#22d3ee",
-        points: oraclePath.map((point) => ({ time: point.time, value: point.exposure })),
+        points: dpPath.map((point) => ({ time: point.time, value: point.exposure })),
         symmetric: true,
         references: [{ value: 0 }],
         decimals: 3,
       }] : []),
-      ...(visible.oracleEquity && oraclePath.length > 0 ? [{
-        id: "value-oracle-equity",
-        label: "Full-window oracle equity",
+      ...(visible.dpEquity && dpPath.length > 0 ? [{
+        id: "value-dp-equity",
+        label: "Bellman optimal equity",
         color: "#22c55e",
-        points: oraclePath.map((point) => ({ time: point.time, value: point.equity })),
+        points: dpPath.map((point) => ({ time: point.time, value: point.equity })),
+        minimum: 0,
+        decimals: 4,
+      }] : []),
+      ...(visible.oraclePredictionExposure && oraclePredictionPath.length > 0 ? [{
+        id: "value-oracle-prediction-exposure",
+        label: "Oracle modal prediction exposure",
+        color: "#34d399",
+        points: oraclePredictionPath.map((point) => ({ time: point.time, value: point.exposure })),
+        symmetric: true,
+        references: [{ value: 0 }],
+        decimals: 3,
+      }] : []),
+      ...(visible.oraclePredictionEquity && oraclePredictionPath.length > 0 ? [{
+        id: "value-oracle-prediction-equity",
+        label: "Oracle modal prediction equity",
+        color: "#86efac",
+        points: oraclePredictionPath.map((point) => ({ time: point.time, value: point.equity })),
+        minimum: 0,
+        decimals: 4,
+      }] : []),
+      ...(visible.oracleEmaExposure && oracleEmaPath.length > 0 ? [{
+        id: "value-oracle-ema-exposure",
+        label: `${oracleEmaDisplayLabel()} exposure`,
+        color: "#fb7185",
+        points: oracleEmaPath.map((point) => ({ time: point.time, value: point.exposure })),
+        symmetric: true,
+        references: [{ value: 0 }],
+        decimals: 3,
+      }] : []),
+      ...(visible.oracleEmaEquity && oracleEmaPath.length > 0 ? [{
+        id: "value-oracle-ema-equity",
+        label: `${oracleEmaDisplayLabel()} equity`,
+        color: "#fda4af",
+        points: oracleEmaPath.map((point) => ({ time: point.time, value: point.equity })),
         minimum: 0,
         decimals: 4,
       }] : []),
@@ -528,8 +612,27 @@ export function KamaInspectorPage() {
     diagnosticVisibility().kamaRate ? signalRejectionEvents(indicatorPoints()) : []);
   const activeDiagnosticCount = createMemo(() =>
     diagnosticOptions.filter((option) => diagnosticVisibility()[option.id]).length);
-  const annotations = createMemo(() => showSignals()
+  const candidateChartAnnotations = createMemo(() => showSignals()
     ? candidateAnnotations(result()?.candidateTransitions ?? [])
+    : []);
+  const annotations = createMemo(() => showSignals()
+    ? [
+        ...candidateChartAnnotations(),
+        ...predictorAnnotations(
+          result()?.oraclePredictionTransitions ?? [],
+          "Oracle",
+          "O",
+          "#34d399",
+          -7,
+        ),
+        ...predictorAnnotations(
+          result()?.oracleEmaTransitions ?? [],
+          oracleEmaDisplayLabel(),
+          "E",
+          "#fb7185",
+          7,
+        ),
+      ]
     : []);
   const matchedCandidate = createMemo(() => {
     const oraclePoint = hoveredOracle();
@@ -537,7 +640,7 @@ export function KamaInspectorPage() {
     const oracleTransition = result()?.oracleTransitions.find((point) =>
       point.time === oraclePoint.time && point.state === oraclePoint.state);
     if (oracleTransition?.matchedTime === null || oracleTransition?.matchedTime === undefined) return undefined;
-    return annotations().find((annotation) =>
+    return candidateChartAnnotations().find((annotation) =>
       annotation.time === oracleTransition.matchedTime && annotation.signalState === oracleTransition.state);
   });
   const trace = createMemo<BacktestTrace>(() => ({
@@ -546,7 +649,7 @@ export function KamaInspectorPage() {
     orders: [],
     signals: [],
     extrema: [],
-    oracle: showOracle() ? oracle() : emptyOracle,
+    oracle: showOracle() ? bellmanOptimalPath() : emptyOracle,
     frames: [],
   }));
   const overlays = createMemo<CandleChartOverlayVisibility>(() => ({
@@ -671,6 +774,7 @@ export function KamaInspectorPage() {
     const selectedMlpModel = mlpModelId();
     const oracleAlignment = mlpOracleAlignment();
     const friction = oracleFriction();
+    const emaWindow = oracleEmaWindowMs();
     const matchWindow = matchWindowMs();
     const timingHalfLife = timingHalfLifeMs();
     const warmup = warmupMultiple();
@@ -695,6 +799,7 @@ export function KamaInspectorPage() {
           mlpOracleAlignment: oracleAlignment,
         },
         oracleFriction: friction,
+        oracleEmaWindowMs: emaWindow,
         matchWindowMs: matchWindow,
         timingHalfLifeMs: timingHalfLife,
         warmupMultiple: warmup,
@@ -874,6 +979,9 @@ export function KamaInspectorPage() {
       );
       setRankedPair("current");
       setOracleFriction(next.defaults.oracleFriction);
+      setOracleEmaWindowMs(
+        next.defaults.oracleEmaWindowMs ?? defaultOracleEmaWindowMs,
+      );
       setMatchWindowMs(next.defaults.matchWindowMs);
       setTimingHalfLifeMs(next.defaults.timingHalfLifeMs);
       setWarmupMultiple(next.defaults.warmupMultiple);
@@ -1115,7 +1223,7 @@ export function KamaInspectorPage() {
             <div class="muted-label">Research workspace</div>
             <h1 class="mt-1 text-2xl font-semibold">Volume-weighted KAMA inspector</h1>
             <p class="mt-1 max-w-3xl text-sm text-ink-300">
-              Compare causal KAMA state changes with the close-only perfect-margin oracle. Editing a field reruns the selected cached window.
+              Compare causal KAMA state changes with the complete executable Bellman optimum. Editing a field reruns the selected cached window.
             </p>
           </div>
           <div class="flex flex-wrap gap-2">
@@ -1764,6 +1872,11 @@ export function KamaInspectorPage() {
             </div>
             <div class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <InspectorNumber label="Oracle friction (bps)" value={oracleFriction() * 10_000} min={0} step={1} onInput={(value) => setOracleFriction(value / 10_000)} />
+              <DurationInput
+                label="Oracle EMA window"
+                value={oracleEmaWindowMs()}
+                onInput={setOracleEmaWindowMs}
+              />
               <Show when={predictorModel() === "legacy"}>
                 <DurationInput label="Match window" value={matchWindowMs()} onInput={setMatchWindowMs} />
                 <DurationInput label="Timing half-life" value={timingHalfLifeMs()} onInput={setTimingHalfLifeMs} />
@@ -1805,11 +1918,11 @@ export function KamaInspectorPage() {
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
               <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
               <InspectorNumber label="Initial exposure" value={valueConfig().initialExposure} min={-valueConfig().maxEffectiveExposure} max={valueConfig().maxEffectiveExposure} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, initialExposure: value }))} />
-              <InspectorNumber label="Quote borrow maintenance / hour" value={valueConfig().quoteBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, quoteBorrowRate: value }))} />
-              <InspectorNumber label="Asset borrow maintenance / hour" value={valueConfig().assetBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, assetBorrowRate: value }))} />
+              <InspectorNumber label="Quote borrow maintenance (bps/hour)" value={valueConfig().quoteBorrowRate} min={0} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, quoteBorrowRate: value }))} />
+              <InspectorNumber label="Asset borrow maintenance (bps/hour)" value={valueConfig().assetBorrowRate} min={0} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, assetBorrowRate: value }))} />
             </div>
             <div class="mt-2 text-xs text-ink-400">
-              The displayed oracle return is exp(Q₀(initial exposure))−1 for one coherent policy ending at the selected terminal candle, where exposure is forcibly closed to zero. Rolling targets default to T−t=1h and H=60s.
+              The displayed Bellman DP return is exp(Q₀(initial exposure))−1 for one coherent policy ending at the selected terminal candle, where exposure is forcibly closed to zero. The separate oracle-prediction baseline conditions each rolling-horizon distribution on its current exposure like the candidate; its {formatDuration(oracleEmaWindowMs())} EMA smooths the full probability distribution before the modal action is selected. Rolling targets default to T−t=1h and H=60s.
               <Show when={predictorModel() === "handcrafted"}>
                 <> The handcrafted predictor estimates causal EWMA drift and variance, forecasts them over T, and runs a friction-aware Bellman recursion directly on the exposure grid. Its plotted prediction is raw forecast regret; local presets and per-candle fitting are explicitly hindsight diagnostics.</>
               </Show>
@@ -1843,7 +1956,7 @@ export function KamaInspectorPage() {
                     <div class="muted-label">Performance</div>
                     <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-ink-400">
                       <Info aria-hidden="true" size={12} />
-                      VW-KAMA against the perfect-margin oracle · diagnostic accuracy, not trading profitability
+                      Candidate and oracle-derived predictors against the complete Bellman reference · diagnostic accuracy, not trading profitability
                     </div>
                   </div>
                   <PerformanceMetric
@@ -1853,6 +1966,17 @@ export function KamaInspectorPage() {
                     prominent
                   />
                 </div>
+                <Show when={analysis().oraclePredictionMetrics && analysis().oracleEmaMetrics}>
+                  <PathPerformanceComparison
+                    candidate={analysis().metrics}
+                    oraclePrediction={analysis().oraclePredictionMetrics!}
+                    oracleEma={analysis().oracleEmaMetrics!}
+                    oracleEmaWindowMs={analysis().oracleEmaPath.windowMs}
+                    candidateScore={weightedScore(analysis().metrics)}
+                    oraclePredictionScore={weightedScore(analysis().oraclePredictionMetrics!)}
+                    oracleEmaScore={weightedScore(analysis().oracleEmaMetrics!)}
+                  />
+                </Show>
                 <div class="grid border-t border-line xl:grid-cols-2">
                   <div class="min-w-0 p-2.5">
                     <div class="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wider text-ink-500">Signal quality</div>
@@ -1896,8 +2020,12 @@ export function KamaInspectorPage() {
                             description={metricHelp.valueHorizon}
                           />
                           <PerformanceMetric label="Forecast return" value={ratioPercent(value().returns.strategy.totalReturn)} description={metricHelp.strategyReturn} />
-                          <PerformanceMetric label="Oracle exp(Q₀)−1" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
+                          <PerformanceMetric label="Oracle prediction return" value={ratioPercent(value().returns.oraclePrediction.totalReturn)} description={metricHelp.oraclePredictionReturn} />
+                          <PerformanceMetric label={`${oracleEmaDisplayLabel()} return`} value={ratioPercent(value().returns.oracleEma.totalReturn)} description={metricHelp.oracleEmaReturn} />
+                          <PerformanceMetric label="Bellman DP exp(Q₀)−1" value={ratioPercent(value().returns.oracle.totalReturn)} description={metricHelp.oracleReturn} />
                           <PerformanceMetric label="Forecast drawdown" value={ratioPercent(value().returns.strategy.maxDrawdown)} description={metricHelp.drawdown} />
+                          <PerformanceMetric label="Oracle prediction drawdown" value={ratioPercent(value().returns.oraclePrediction.maxDrawdown)} description={metricHelp.drawdown} />
+                          <PerformanceMetric label="Oracle EMA drawdown" value={ratioPercent(value().returns.oracleEma.maxDrawdown)} description={metricHelp.drawdown} />
                         </div>
                       </div>
                     )}
@@ -1929,7 +2057,7 @@ export function KamaInspectorPage() {
                 <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                   <div>
                     <div class="muted-label">Signal overlay</div>
-                    <h2 class="text-lg font-semibold">Candidate against oracle</h2>
+                    <h2 class="text-lg font-semibold">Bellman reference and prediction paths</h2>
                     <div class="mt-1 text-xs text-ink-300">
                       {formatDateRange(timeRange().start, timeRange().end)} · {formatQuote(chartCandles().length, 0)} chart points · {formatDuration(analysis().intervalMs)} source · {chartResolution().exact ? "exact price candles" : `~${formatDuration(chartResolution().renderIntervalMs)} price buckets`}
                       <Show when={showKama()}> · {chartResolution().exact ? "exact KAMA" : "sampled KAMA"}</Show>
@@ -1942,7 +2070,7 @@ export function KamaInspectorPage() {
                   <div class="flex flex-wrap gap-2">
                     <OverlayButton label="KAMA" active={showKama()} onClick={() => setShowKama(!showKama())} />
                     <OverlayButton label={displayedPredictorModel() === "legacy" ? "Candidate signals" : "Forecast trades"} active={showSignals()} onClick={() => setShowSignals(!showSignals())} />
-                    <OverlayButton label="Oracle" active={showOracle()} onClick={() => setShowOracle(!showOracle())} />
+                    <OverlayButton label="Bellman actions" active={showOracle()} onClick={() => setShowOracle(!showOracle())} />
                     <details class="relative">
                       <summary class="btn list-none cursor-pointer">
                         Indicators{activeDiagnosticCount() > 0 ? ` (${activeDiagnosticCount()})` : ""}
@@ -1981,7 +2109,7 @@ export function KamaInspectorPage() {
                 <div class="mb-3 text-xs text-ink-400">
                   {displayedPredictorModel() === "legacy"
                     ? "Purple L / F / S marks the peak–valley candidate target state."
-                    : "Purple L / F / S marks a trade to the selected forecast’s modal target cell; no trade is emitted while the mode remains in the current exposure cell."} Red and green L / S marks are retrospective oracle actions. Hover to inspect a timestamp, click to pin it across the charts, and double-click to unpin.
+                    : "Purple L / F / S marks a trade to the selected forecast’s modal target cell; no trade is emitted while the mode remains in the current exposure cell."} Green O-L / O-F / O-S marks the rolling-horizon oracle transitions, and pink E-L / E-F / E-S marks its {formatDuration(renderedOracleEmaWindowMs())} EMA transitions. Red and green L / S marks are actions from the complete retrospective Bellman reference. The four lanes separate that reference from the rolling-horizon oracle modal prediction, its configured EMA baseline, and the candidate. Hover to inspect a timestamp, click to pin it across the charts, and double-click to unpin.
                 </div>
                 <div class={diagnosticSeries().length > 0
                   ? "h-80 lg:h-[calc(100vh-27rem)] lg:min-h-[300px]"
@@ -2075,15 +2203,22 @@ export function KamaInspectorPage() {
                     </div>
                   </div>
                 </Show>
-                <Show when={valueOraclePath().length > 0 || valueCandidatePath().length > 0}>
+                <Show when={valueOraclePath().length > 0
+                  || valueOraclePredictionPath().length > 0
+                  || valueOracleEmaPath().length > 0
+                  || valueCandidatePath().length > 0}>
                   <div class="mt-3">
                     <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
                       <div class="text-xs text-ink-400">
-                        Full-window paths · oracle equity includes friction, maintenance, and terminal liquidation; candidate equity follows the evaluated forecast exposure with the same friction and maintenance semantics.
+                        Exposure and equity paths · the Bellman DP optimum is a coherent full-window solution with terminal liquidation. Oracle modal, oracle EMA, and candidate predictions are each executed causally from equity 1 with identical friction, maintenance, and no-trade-cell semantics.
                       </div>
                       <div class="flex flex-wrap gap-1.5">
-                        <ChartSeriesToggle label="Oracle exposure" color="#22d3ee" active={valuePathVisibility().oracleExposure} onClick={() => toggleValuePathSeries("oracleExposure")} />
-                        <ChartSeriesToggle label="Oracle equity" color="#22c55e" active={valuePathVisibility().oracleEquity} onClick={() => toggleValuePathSeries("oracleEquity")} />
+                        <ChartSeriesToggle label="DP exposure" color="#22d3ee" active={valuePathVisibility().dpExposure} onClick={() => toggleValuePathSeries("dpExposure")} />
+                        <ChartSeriesToggle label="DP equity" color="#22c55e" active={valuePathVisibility().dpEquity} onClick={() => toggleValuePathSeries("dpEquity")} />
+                        <ChartSeriesToggle label="Oracle prediction exposure" color="#34d399" active={valuePathVisibility().oraclePredictionExposure} onClick={() => toggleValuePathSeries("oraclePredictionExposure")} />
+                        <ChartSeriesToggle label="Oracle prediction equity" color="#86efac" active={valuePathVisibility().oraclePredictionEquity} onClick={() => toggleValuePathSeries("oraclePredictionEquity")} />
+                        <ChartSeriesToggle label={`${oracleEmaDisplayLabel()} exposure`} color="#fb7185" active={valuePathVisibility().oracleEmaExposure} onClick={() => toggleValuePathSeries("oracleEmaExposure")} />
+                        <ChartSeriesToggle label={`${oracleEmaDisplayLabel()} equity`} color="#fda4af" active={valuePathVisibility().oracleEmaEquity} onClick={() => toggleValuePathSeries("oracleEmaEquity")} />
                         <ChartSeriesToggle label="Candidate exposure" color="#a78bfa" active={valuePathVisibility().candidateExposure} onClick={() => toggleValuePathSeries("candidateExposure")} />
                         <ChartSeriesToggle label="Candidate equity" color="#f5b84b" active={valuePathVisibility().candidateEquity} onClick={() => toggleValuePathSeries("candidateEquity")} />
                       </div>
@@ -2295,10 +2430,14 @@ function ExposureDistributionChart(props: {
   );
 }
 
-type DistributionProbability = "oracleProbability" | "strategyProbability";
+type DistributionProbability =
+  | "oracleProbability"
+  | "oracleEmaProbability"
+  | "strategyProbability";
 
 interface TransitionHeatmaps {
   oracle: Float64Array;
+  oracleEma: Float64Array;
   strategy: Float64Array;
   residual: Float64Array;
 }
@@ -2313,6 +2452,7 @@ const EMPTY_MODE_INDICES = new Uint16Array(0);
 
 type TransitionHeatmapPanel =
   | "oracle"
+  | "oracleEma"
   | "prediction"
   | "difference"
   | "fit"
@@ -2321,7 +2461,7 @@ type TransitionHeatmapPanel =
   | "averageReturnGap"
   | "averageReturnDifference";
 type TransitionHeatmapExposureMode = "usable" | "possible" | "custom";
-type TransitionDistributionSource = "oracle" | "prediction" | "fit";
+type TransitionDistributionSource = "oracle" | "oracleEma" | "prediction" | "fit";
 interface TransitionHeatmapSelection {
   source: TransitionDistributionSource;
   stateIndex: number;
@@ -2349,8 +2489,12 @@ function TransitionPolicyDiagnostics(props: {
   point: VwKamaValueDistributionPoint;
   request?: VwKamaInspectorRequest;
 }) {
+  const oracleEmaLabel = () => formatOracleEmaLabel(
+    props.request?.oracleEmaWindowMs ?? defaultOracleEmaWindowMs,
+  );
   const [visibleHeatmaps, setVisibleHeatmaps] = createSignal<Record<TransitionHeatmapPanel, boolean>>({
     oracle: true,
+    oracleEma: true,
     prediction: true,
     difference: true,
     fit: false,
@@ -2713,9 +2857,11 @@ function TransitionPolicyDiagnostics(props: {
   const heatmapSlices = (selection: TransitionHeatmapSelection, pinned: boolean) => {
     const matrix = selection.source === "oracle"
       ? matrices().oracle
-      : selection.source === "prediction"
-        ? matrices().strategy
-        : fittedPolicy();
+      : selection.source === "oracleEma"
+        ? matrices().oracleEma
+        : selection.source === "prediction"
+          ? matrices().strategy
+          : fittedPolicy();
     const targetSize = targetExposures().length;
     const stateSize = currentExposures().length;
     const row = matrix.slice(
@@ -2730,7 +2876,7 @@ function TransitionPolicyDiagnostics(props: {
   };
   const inspectedHeatmapSlices = createMemo<TransitionHoverSlices[]>(() => {
     const selected = selectedHeatmapCells();
-    const slices = (["oracle", "prediction", "fit"] as const)
+    const slices = (["oracle", "oracleEma", "prediction", "fit"] as const)
       .flatMap((source) => selected[source] ? [heatmapSlices(selected[source]!, true)] : []);
     const hovered = hoveredHeatmapCell();
     const duplicatesPinnedCell = hovered && selected[hovered.source]
@@ -2741,6 +2887,7 @@ function TransitionPolicyDiagnostics(props: {
   });
   const probabilityScale = createMemo(() => robustPositiveScale(
     matrices().oracle,
+    matrices().oracleEma,
     matrices().strategy,
     fittedHeatmapNeeded() ? fittedPolicy() : EMPTY_PROBABILITIES,
     visibleHeatmaps().averageRegret ? historicalMatrices().regret : EMPTY_PROBABILITIES,
@@ -2751,11 +2898,17 @@ function TransitionPolicyDiagnostics(props: {
   const oracleModes = createMemo(() => visibleHeatmapMarkings().oracleMode
     ? transitionModeIndices(matrices().oracle, targetExposures(), currentExposures().length)
     : EMPTY_MODE_INDICES);
+  const oracleEmaModes = createMemo(() => visibleHeatmapMarkings().oracleMode
+    ? transitionModeIndices(matrices().oracleEma, targetExposures(), currentExposures().length)
+    : EMPTY_MODE_INDICES);
   const strategyModes = createMemo(() => visibleHeatmapMarkings().predictionMode
     ? transitionModeIndices(matrices().strategy, targetExposures(), currentExposures().length)
     : EMPTY_MODE_INDICES);
   const oracleMeans = createMemo(() => visibleHeatmapMarkings().oracleMean
     ? transitionRowMeans(matrices().oracle, targetExposures(), currentExposures().length)
+    : EMPTY_PROBABILITIES);
+  const oracleEmaMeans = createMemo(() => visibleHeatmapMarkings().oracleMean
+    ? transitionRowMeans(matrices().oracleEma, targetExposures(), currentExposures().length)
     : EMPTY_PROBABILITIES);
   const strategyMeans = createMemo(() => visibleHeatmapMarkings().predictionMean
     ? transitionRowMeans(matrices().strategy, targetExposures(), currentExposures().length)
@@ -2992,6 +3145,7 @@ function TransitionPolicyDiagnostics(props: {
       </div>
       <div class="mb-2 flex flex-wrap items-center justify-center gap-1.5">
         <ChartSeriesToggle label="Oracle heatmap" color="#22d3ee" heatmap active={visibleHeatmaps().oracle} onClick={() => toggleHeatmap("oracle")} />
+        <ChartSeriesToggle label={`${oracleEmaLabel()} heatmap`} color="#fb7185" heatmap active={visibleHeatmaps().oracleEma} onClick={() => toggleHeatmap("oracleEma")} />
         <ChartSeriesToggle label="Prediction heatmap" color="#a78bfa" heatmap active={visibleHeatmaps().prediction} onClick={() => toggleHeatmap("prediction")} />
         <ChartSeriesToggle label="Difference heatmap" color="#fb7185" secondaryColor="#22d3ee" heatmap active={visibleHeatmaps().difference} onClick={() => toggleHeatmap("difference")} />
         <ChartSeriesToggle label="Fitted model heatmap" color="#fbbf24" heatmap active={visibleHeatmaps().fit} onClick={() => toggleHeatmap("fit")} />
@@ -3025,6 +3179,7 @@ function TransitionPolicyDiagnostics(props: {
         <div
           class="grid gap-3"
           classList={{
+            "xl:grid-cols-4": visibleHeatmapCount() >= 4,
             "lg:grid-cols-3": visibleHeatmapCount() >= 3,
             "lg:grid-cols-2": visibleHeatmapCount() === 2,
             "lg:grid-cols-1": visibleHeatmapCount() <= 1,
@@ -3050,6 +3205,28 @@ function TransitionPolicyDiagnostics(props: {
               onSliceHover={setHoveredHeatmapCell}
               onSliceSelect={selectHeatmapCell}
               onSliceDeselect={() => deselectHeatmap("oracle")}
+            />
+          </Show>
+          <Show when={visibleHeatmaps().oracleEma}>
+            <TransitionHeatmapCanvas
+              title={`${oracleEmaLabel()} p(a | x)`}
+              matrix={matrices().oracleEma}
+              targetExposures={targetExposures()}
+              currentExposures={currentExposures()}
+              scale={probabilityScale()}
+              palette="rose"
+              oracleModes={oracleEmaModes()}
+              strategyModes={strategyModes()}
+              oracleMeans={oracleEmaMeans()}
+              strategyMeans={strategyMeans()}
+              oracleCurrentExposure={props.point.oraclePathExposure}
+              candidateCurrentExposure={props.point.candidateExposure}
+              markings={visibleHeatmapMarkings()}
+              sliceSource="oracleEma"
+              selectedCell={selectedHeatmapCells().oracleEma}
+              onSliceHover={setHoveredHeatmapCell}
+              onSliceSelect={selectHeatmapCell}
+              onSliceDeselect={() => deselectHeatmap("oracleEma")}
             />
           </Show>
           <Show when={visibleHeatmaps().prediction}>
@@ -3260,6 +3437,9 @@ function TransitionPolicyDiagnostics(props: {
           oracleOppositeExposure={oracleOppositeExposureSlice()}
           predictionOppositeExposure={strategyOppositeExposureSlice()}
           inspectedSlices={inspectedHeatmapSlices()}
+          oracleEmaWindowMs={
+            props.request?.oracleEmaWindowMs ?? defaultOracleEmaWindowMs
+          }
           onToggleSeries={toggleConditionalSeries}
           onReleasePinnedSlice={deselectHeatmap}
           onReleasePinnedSlices={() => setSelectedHeatmapCells({})}
@@ -3275,7 +3455,7 @@ function TransitionHeatmapCanvas(props: {
   targetExposures: number[];
   currentExposures: Float64Array;
   scale: number;
-  palette: "cyan" | "violet" | "amber" | "emerald" | "difference";
+  palette: "cyan" | "rose" | "violet" | "amber" | "emerald" | "difference";
   oracleModes: Uint16Array;
   strategyModes: Uint16Array;
   oracleMeans: Float64Array;
@@ -3460,6 +3640,7 @@ function ConditionalPolicyCurveChart(props: {
   oracleOppositeExposure: Float64Array;
   predictionOppositeExposure: Float64Array;
   inspectedSlices: TransitionHoverSlices[];
+  oracleEmaWindowMs: number;
   onToggleSeries: (series: ConditionalPolicySeries) => void;
   onReleasePinnedSlice: (source: TransitionDistributionSource) => void;
   onReleasePinnedSlices: () => void;
@@ -3492,14 +3673,20 @@ function ConditionalPolicyCurveChart(props: {
             <For each={props.inspectedSlices}>{(slices) => (
               <span>
                 <strong style={{ color: transitionInspectionColor(slices.source) }}>
-                  {slices.pinned ? "Pinned" : "Hovered"} {transitionInspectionLabel(slices.source)}
+                  {slices.pinned ? "Pinned" : "Hovered"} {transitionInspectionLabel(
+                    slices.source,
+                    props.oracleEmaWindowMs,
+                  )}
                 </strong>
                 {" · "}x {signedExposure(slices.currentExposure)} · a {signedExposure(slices.targetExposure)}
                 <Show when={slices.pinned}>
                   <button
                     type="button"
                     class="ml-1 text-ink-500 transition hover:text-ink-100"
-                    aria-label={`Release ${transitionInspectionLabel(slices.source)} selection`}
+                    aria-label={`Release ${transitionInspectionLabel(
+                      slices.source,
+                      props.oracleEmaWindowMs,
+                    )} selection`}
                     onClick={() => props.onReleasePinnedSlice(slices.source)}
                   >×</button>
                 </Show>
@@ -3617,11 +3804,22 @@ function ConditionalPolicyCurveChart(props: {
 }
 
 function transitionInspectionColor(source: TransitionDistributionSource): string {
-  return source === "oracle" ? "#67e8f9" : source === "prediction" ? "#c4b5fd" : "#fbbf24";
+  return source === "oracle"
+    ? "#67e8f9"
+    : source === "oracleEma"
+      ? "#fb7185"
+      : source === "prediction" ? "#c4b5fd" : "#fbbf24";
 }
 
-function transitionInspectionLabel(source: TransitionDistributionSource): string {
-  return source === "oracle" ? "oracle" : source === "prediction" ? "prediction" : "fitted model";
+function transitionInspectionLabel(
+  source: TransitionDistributionSource,
+  oracleEmaWindowMs = defaultOracleEmaWindowMs,
+): string {
+  return source === "oracle"
+    ? "oracle"
+    : source === "oracleEma"
+      ? formatOracleEmaLabel(oracleEmaWindowMs).toLowerCase()
+      : source === "prediction" ? "prediction" : "fitted model";
 }
 
 function ChartSeriesToggle(props: {
@@ -3885,6 +4083,7 @@ function transitionHeatmaps(
 ): TransitionHeatmaps {
   const targetSize = targetIndices.length;
   const oracle = new Float64Array(currentGrid.length * targetSize);
+  const oracleEma = new Float64Array(currentGrid.length * targetSize);
   const strategy = new Float64Array(currentGrid.length * targetSize);
   const residual = new Float64Array(currentGrid.length * targetSize);
   for (let stateIndex = 0; stateIndex < currentGrid.length; stateIndex += 1) {
@@ -3897,17 +4096,27 @@ function transitionHeatmaps(
       oracleTemperature,
       1,
     );
+    const oracleEmaRow = conditionalExposureSlice(
+      point.values,
+      "oracleEmaProbability",
+      current,
+      friction,
+      oracleTemperature,
+      1,
+    );
     const strategyRow = predictedConditionalExposureSlice(point, current);
     const visibleOracleRow = selectedNormalizedProbabilities(oracleRow, targetIndices);
+    const visibleOracleEmaRow = selectedNormalizedProbabilities(oracleEmaRow, targetIndices);
     const visibleStrategyRow = selectedNormalizedProbabilities(strategyRow, targetIndices);
     for (let targetIndex = 0; targetIndex < targetSize; targetIndex += 1) {
       const offset = stateIndex * targetSize + targetIndex;
       oracle[offset] = visibleOracleRow[targetIndex]!;
+      oracleEma[offset] = visibleOracleEmaRow[targetIndex]!;
       strategy[offset] = visibleStrategyRow[targetIndex]!;
       residual[offset] = visibleStrategyRow[targetIndex]! - visibleOracleRow[targetIndex]!;
     }
   }
-  return { oracle, strategy, residual };
+  return { oracle, oracleEma, strategy, residual };
 }
 
 function historicalTransitionHeatmaps(
@@ -3981,10 +4190,7 @@ function selectedNormalizedProbabilities(
 ): Float64Array {
   const selected = Float64Array.from(indices, (index) => probabilities[index] ?? 0);
   const total = selected.reduce((sum, probability) => sum + probability, 0);
-  if (!(total > Number.EPSILON)) {
-    selected.fill(1 / Math.max(1, selected.length));
-    return selected;
-  }
+  if (!(total > Number.EPSILON)) return selected;
   for (let index = 0; index < selected.length; index += 1) selected[index] /= total;
   return selected;
 }
@@ -4021,13 +4227,21 @@ function conditionalExposureSlice(
   temperature: number,
   frictionScale: number,
 ): Float64Array {
-  return conditionalExposureProbabilities(
-    values.map((value) => value[probability]),
-    values.map((value) => value.exposure),
-    currentExposure,
-    friction,
-    frictionScale / temperature,
-  );
+  try {
+    return conditionalExposureProbabilities(
+      values.map((value) => value[probability]),
+      values.map((value) => value.exposure),
+      currentExposure,
+      friction,
+      frictionScale / temperature,
+    );
+  } catch (error) {
+    if (error instanceof Error
+      && error.message === "Conditional exposure policy has no valid target action.") {
+      return new Float64Array(values.length);
+    }
+    throw error;
+  }
 }
 
 function predictedConditionalExposureSlice(
@@ -4164,7 +4378,7 @@ function drawTransitionHeatmap(
   canvas: HTMLCanvasElement,
   matrix: Float64Array,
   scale: number,
-  palette: "cyan" | "violet" | "amber" | "emerald" | "difference",
+  palette: "cyan" | "rose" | "violet" | "amber" | "emerald" | "difference",
   targetExposures: number[],
   currentExposures: Float64Array,
   oracleModes: Uint16Array,
@@ -4200,6 +4414,8 @@ function drawTransitionHeatmap(
       const base = [24, 31, 45];
       const endpoint = palette === "violet"
         ? [167, 139, 250]
+        : palette === "rose"
+          ? [251, 113, 133]
         : palette === "amber"
           ? [251, 191, 36]
         : palette === "emerald"
@@ -4352,7 +4568,7 @@ function drawTransitionHeatmap(
 
 function distributionMode(
   values: VwKamaValueDistributionPoint["values"],
-  probability: "oracleProbability" | "strategyProbability",
+  probability: DistributionProbability,
 ): number {
   if (values.length === 0) return 0;
   return values.reduce((best, value) =>
@@ -4592,6 +4808,84 @@ function PerformanceMetric(props: {
   );
 }
 
+function PathPerformanceComparison(props: {
+  candidate: VwKamaPathAccuracyMetrics;
+  oraclePrediction: VwKamaPathAccuracyMetrics;
+  oracleEma: VwKamaPathAccuracyMetrics;
+  oracleEmaWindowMs: number;
+  candidateScore: number;
+  oraclePredictionScore: number;
+  oracleEmaScore: number;
+}) {
+  const rows = () => [
+    {
+      label: "Candidate prediction",
+      color: "#a78bfa",
+      metrics: props.candidate,
+      score: props.candidateScore,
+    },
+    {
+      label: "Oracle prediction",
+      color: "#34d399",
+      metrics: props.oraclePrediction,
+      score: props.oraclePredictionScore,
+    },
+    {
+      label: formatOracleEmaLabel(props.oracleEmaWindowMs),
+      color: "#fb7185",
+      metrics: props.oracleEma,
+      score: props.oracleEmaScore,
+    },
+  ];
+  return (
+    <div class="overflow-x-auto border-t border-line px-3 py-2.5">
+      <div class="mb-2 text-[10px] font-semibold uppercase tracking-wider text-ink-500">
+        Same path scoring against Bellman optimal
+      </div>
+      <table class="w-full min-w-[68rem] border-collapse text-right text-[11px] tabular-nums">
+        <thead class="text-[9px] uppercase tracking-wider text-ink-500">
+          <tr>
+            <th class="pb-1.5 pr-4 text-left font-medium">Path</th>
+            <th class="px-2 pb-1.5 font-medium">Score</th>
+            <th class="px-2 pb-1.5 font-medium">F1</th>
+            <th class="px-2 pb-1.5 font-medium">Precision</th>
+            <th class="px-2 pb-1.5 font-medium">Recall</th>
+            <th class="px-2 pb-1.5 font-medium">Agreement</th>
+            <th class="px-2 pb-1.5 font-medium">Matched</th>
+            <th class="px-2 pb-1.5 font-medium">Extra</th>
+            <th class="px-2 pb-1.5 font-medium">Cleanliness</th>
+            <th class="px-2 pb-1.5 font-medium">Timing P50</th>
+            <th class="pl-2 pb-1.5 font-medium">Signals/day</th>
+          </tr>
+        </thead>
+        <tbody>
+          <For each={rows()}>{(row) => (
+            <tr class="border-t border-line/60 text-ink-200">
+              <td class="py-1.5 pr-4 text-left font-medium">
+                <span
+                  class="mr-2 inline-block h-2 w-2 rounded-full"
+                  style={{ "background-color": row.color }}
+                />
+                {row.label}
+              </td>
+              <td class="px-2 py-1.5 font-semibold text-ink-100">{ratioPercent(row.score)}</td>
+              <td class="px-2 py-1.5">{ratioPercent(row.metrics.f1)}</td>
+              <td class="px-2 py-1.5">{ratioPercent(row.metrics.precision)}</td>
+              <td class="px-2 py-1.5">{ratioPercent(row.metrics.recall)}</td>
+              <td class="px-2 py-1.5">{ratioPercent(row.metrics.exposureAgreement)}</td>
+              <td class="px-2 py-1.5">{formatQuote(row.metrics.matchedCount, 0)} / {formatQuote(row.metrics.oracleCount, 0)}</td>
+              <td class="px-2 py-1.5">{formatQuote(row.metrics.extraSignalCount, 0)}</td>
+              <td class="px-2 py-1.5">{ratioPercent(row.metrics.signalCleanliness)}</td>
+              <td class="px-2 py-1.5">{formatDuration(row.metrics.lagP50Ms ?? undefined)}</td>
+              <td class="pl-2 py-1.5">{formatQuote(row.metrics.signalsPerDay, 1)}</td>
+            </tr>
+          )}</For>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function ErrorNotice(props: { message: string; onRetry?: () => void }) {
   return (
     <div class="flex items-center justify-between gap-3 rounded-2 border border-loss/50 bg-loss/10 px-3 py-2 text-sm text-loss">
@@ -4634,6 +4928,32 @@ function candidateAnnotations(points: VwKamaTransition[]): BacktestChartAnnotati
         : point.matchedTime === null
           ? `Quality ${ratioPercent(point.quality)} · acceleration ${formatQuote(point.acceleration, 3)} · overextension ${formatQuote(point.overextension, 3)} · EMA ${formatQuote(point.emaRate, 2)} bps/h · RSI ${formatQuote(point.rsi, 1)} · DMI/ADX ${formatQuote(point.dmi, 1)}/${formatQuote(point.adx, 1)} · unmatched`
           : `Quality ${ratioPercent(point.quality)} · acceleration ${formatQuote(point.acceleration, 3)} · overextension ${formatQuote(point.overextension, 3)} · EMA ${formatQuote(point.emaRate, 2)} bps/h · RSI ${formatQuote(point.rsi, 1)} · DMI/ADX ${formatQuote(point.dmi, 1)}/${formatQuote(point.adx, 1)} · matched oracle ${signedDuration(point.lagMs ?? 0)}`,
+      signalState: point.state,
+    };
+  });
+}
+
+function predictorAnnotations(
+  points: VwKamaTransition[],
+  source: string,
+  markerPrefix: string,
+  markerColor: string,
+  markerOffsetX: number,
+): BacktestChartAnnotation[] {
+  return points.map((point) => {
+    const targetProbability = point.targetProbability;
+    const stateLabel = point.state === "long" ? "L" : point.state === "short" ? "S" : "F";
+    return {
+      time: point.time,
+      price: point.price,
+      kind: transitionSide(point) === "buy" ? "buy-signal" : "sell-signal",
+      label: `${source} ${signedExposure(point.fromExposure)} → ${signedExposure(point.exposure)}`,
+      reason: targetProbability === null
+        ? `${source} changed target exposure from ${signedExposure(point.fromExposure)} to ${signedExposure(point.exposure)}.`
+        : `${source} selected target exposure ${signedExposure(point.exposure)} with ${ratioPercent(targetProbability)} modal probability from current exposure ${signedExposure(point.fromExposure)}.`,
+      markerColor,
+      markerLabel: `${markerPrefix}-${stateLabel}`,
+      markerOffsetX,
       signalState: point.state,
     };
   });
@@ -4730,6 +5050,10 @@ async function fetchAnalysis(
   const payload = await response.json() as unknown;
   if (!response.ok) throw new Error(errorMessage(payload, "KAMA analysis failed"));
   return payload as VwKamaInspectorResponse;
+}
+
+function formatOracleEmaLabel(windowMs: number): string {
+  return `Oracle EMA · ${formatDuration(windowMs)}`;
 }
 
 function ratioPercent(value: number): string {
@@ -4978,29 +5302,30 @@ function exposurePathOracle(
   candles: Candle[],
   friction: number,
 ): BacktestOraclePath {
-  if (path.length === 0) return { ...emptyOracle, friction };
+  if (path.length === 0) return { ...emptyOracle, mode: "bellman-exposure", friction };
   let previous: OracleState = "flat";
   const points = path.map((point): BacktestOraclePoint => {
     const state: OracleState = point.exposure > Number.EPSILON
       ? "long"
       : point.exposure < -Number.EPSILON ? "short" : "flat";
     const candle = nearestCandle(candles, point.time);
-    const result = {
+    const result: BacktestOraclePoint = {
       time: point.time,
       price: candle?.close ?? 0,
       fromState: previous,
       state,
       action: previous === state
-        ? "hold" as const
+        ? "hold"
         : previous === "flat"
-          ? "open" as const
-          : state === "flat" ? "close" as const : "switch" as const,
+          ? "open"
+          : state === "flat" ? "close" : "switch",
+      exposure: point.exposure,
     };
     previous = state;
     return result;
   });
   return {
-    mode: "fixed-notional",
+    mode: "bellman-exposure",
     eventMode: "close",
     leverage: Math.max(...path.map((point) => Math.abs(point.exposure)), 0),
     friction,
@@ -5020,6 +5345,27 @@ function nearestCandle(candles: Candle[], time: number): Candle | undefined {
   const right = candles[Math.min(candles.length - 1, low)]!;
   const left = candles[Math.max(0, low - 1)]!;
   return Math.abs(left.closeTime - time) <= Math.abs(right.closeTime - time) ? left : right;
+}
+
+function predictionStatePoints(
+  points: VwKamaInspectorResponse["statePoints"],
+  transitions: VwKamaTransition[],
+  stateKey: "oraclePrediction" | "oracleEma",
+  exposureKey: "oraclePredictionExposure" | "oracleEmaExposure",
+): CandleChartStateBand["points"] {
+  const result = new Map(points.map((point) => [point.time, {
+    time: point.time,
+    state: point[stateKey],
+    exposure: point[exposureKey],
+  }]));
+  for (const transition of transitions) {
+    result.set(transition.time, {
+      time: transition.time,
+      state: transition.state,
+      exposure: transition.exposure,
+    });
+  }
+  return [...result.values()].sort((left, right) => left.time - right.time);
 }
 
 function mergeDetailKamaSeries(
@@ -5081,16 +5427,7 @@ function mergeDetailValueOraclePath(
   detail: VwKamaCandleRangeResponse | undefined,
   analysis: VwKamaInspectorResponse | undefined,
 ): VwKamaValuePathPoint[] {
-  if (!detail?.valueOraclePath?.length || !analysis
-    || detail.windowId !== analysis.window.id
-    || detail.intervalMs !== analysis.intervalMs) return overview;
-  const replacement = detailReplacementRange(analysis.candles, detail.candles);
-  if (!replacement) return overview;
-  return [
-    ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
-    ...detail.valueOraclePath.filter((point) =>
-      point.time >= replacement.start && point.time < replacement.end),
-  ].sort((left, right) => left.time - right.time);
+  return mergeDetailValuePath(overview, detail?.valueOraclePath, detail, analysis);
 }
 
 function mergeDetailValueCandidatePath(
@@ -5098,14 +5435,23 @@ function mergeDetailValueCandidatePath(
   detail: VwKamaCandleRangeResponse | undefined,
   analysis: VwKamaInspectorResponse | undefined,
 ): VwKamaValuePathPoint[] {
-  if (!detail?.valueCandidatePath?.length || !analysis
+  return mergeDetailValuePath(overview, detail?.valueCandidatePath, detail, analysis);
+}
+
+function mergeDetailValuePath(
+  overview: VwKamaValuePathPoint[],
+  detailed: VwKamaValuePathPoint[] | undefined,
+  detail: VwKamaCandleRangeResponse | undefined,
+  analysis: VwKamaInspectorResponse | undefined,
+): VwKamaValuePathPoint[] {
+  if (!detailed?.length || !detail || !analysis
     || detail.windowId !== analysis.window.id
     || detail.intervalMs !== analysis.intervalMs) return overview;
   const replacement = detailReplacementRange(analysis.candles, detail.candles);
   if (!replacement) return overview;
   return [
     ...overview.filter((point) => point.time < replacement.start || point.time >= replacement.end),
-    ...detail.valueCandidatePath.filter((point) =>
+    ...detailed.filter((point) =>
       point.time >= replacement.start && point.time < replacement.end),
   ].sort((left, right) => left.time - right.time);
 }

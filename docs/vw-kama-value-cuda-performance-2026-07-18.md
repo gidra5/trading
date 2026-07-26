@@ -153,3 +153,53 @@ npm run build
 Tests compare CPU and CUDA oracle means, moments, entropy, opportunity, retained probabilities,
 modal exposure, exact policy targets, fitness-only/scheduled cross-entropy, and strategy/oracle
 return diagnostics.
+
+## Rolling one-second Monge blocks - 2026-07-26
+
+The corrected rolling oracle makes one continuation decision per candle. For `H=60s` and
+`T=3600s`, every complete origin therefore evaluates 3,540 one-second Bellman transitions. The
+previous roughly 50 ms implementation evaluated only 60 coarse transitions and is not a valid
+performance baseline for this recurrence.
+
+The retained CUDA path composes aligned groups of 256 one-candle max-plus operators into Monge
+block matrices. A rolling query replays the two unaligned boundary fragments with the canonical
+one-candle recurrence and applies each complete middle block with monotone divide-and-conquer
+matrix/vector search. Each warp stores only the row-maximizer transition boundaries for a query;
+there are no grid-wide barriers.
+
+On an RTX 3070, 86,400 one-second prices, grid 255, `H=60`, `T=3600`, distribution-only:
+
+| Implementation | Kernel | Warm wall |
+| --- | ---: | ---: |
+| Canonical direct rolling recurrence | 1,869 ms | 2,014 ms |
+| 256-step Monge blocks | 361 ms | 460 ms |
+
+The blocked result is deterministic. Against the direct Float32 recurrence over all 22,032,000
+probabilities, maximum absolute difference was `8.16e-5`, RMSE `1.07e-6`, mean row KL
+`9.01e-9`, and maximum row KL `1.46e-6`; there were no finite/infinite or zero-mass
+disagreements. A separate 512-step block fixture compares the CUDA path with the independent
+Float64 brute-force oracle.
+
+An explicit sparse density-core encoding was not retained. In exact real arithmetic the block
+matrices are core-sparse, but Float32 cancellation makes about 55% of measured second
+differences bitwise nonzero; only about 5% exceed `1e-6`. Thresholding those entries would make
+the oracle approximate. Dense block storage plus exact monotone search was faster while
+preserving the mathematical recurrence. The code falls back to the direct kernel when the grid
+or horizon is unsupported or the additional block storage would cross the CUDA memory admission
+limit.
+
+### Follow-up exact-path profiling
+
+CUDA-event profiling on the same `86,400 x 255`, `H=60`, `T=3600` workload attributes roughly
+`0.13-0.15s` to constructing the 256-step operators and `0.21s` to the rolling query. The
+unaligned direct boundary fragments alone account for about `0.145s`; each additional complete
+block adds about `5ms` across all origins.
+
+Sharing transition rows between destination warps, keeping query columns in registers, composing
+128-step leaves into 256-step blocks, launching 16 warps per block, and removing finite-value
+checks were each tested against the same ground-truth fixture. None produced a repeatable
+improvement over the retained implementation; several regressed. Consequently, reaching `0.1s`
+single-day latency is not realistic for the exact dense Float32 recurrence on this RTX 3070.
+Cross-day block reuse or batched streaming can improve throughput, while a sparse/thresholded
+operator would need to be treated as an explicitly approximate oracle and audited against the
+brute-force ground truth.

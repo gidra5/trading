@@ -2,7 +2,7 @@ import { performance } from "node:perf_hooks";
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
-  prepareVwKamaOracle,
+  prepareVwKamaBellmanReference,
   type VwKamaParameters,
 } from "../packages/bot-algo/src/kama-signal-evaluator.js";
 import {
@@ -10,7 +10,6 @@ import {
   DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
   prepareExposureValueOracle,
 } from "../packages/bot-algo/src/exposure-value-distillation.js";
-import { perfectMarginOracle } from "../packages/bot-algo/src/perfect-margin-oracle.js";
 import type { TradingCandle } from "../packages/bot-algo/src/trading-api.js";
 import {
   evaluateVwKamaCudaBatch,
@@ -87,14 +86,12 @@ async function run(): Promise<void> {
   const cudaOracle = await prepareExposureValueOracleCuda(prices, oracleOptions);
   const cudaOracleWallMs = performance.now() - started;
 
-  const signalOracle = perfectMarginOracle(candles, {
-    startingQuote: 1,
-    leverage: 1,
-    friction: 0.00175,
-    eventMode: "close",
-    maxPathCandles: 1,
-  });
-  const preparedSignalOracle = prepareVwKamaOracle(columns, scoreStartIndex, signalOracle);
+  const preparedSignalOracle = prepareVwKamaBellmanReference(
+    columns,
+    scoreStartIndex,
+    cpuOracle,
+    1,
+  );
   const candidates = Array.from({ length: candidateCount }, (_, index) => ({
     ...parameters(index),
     strategyTemperature: 0.001,

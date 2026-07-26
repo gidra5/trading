@@ -10,7 +10,7 @@
   "predictionDelayMs": 3600000,
   "training": {
     "epochs": 256,
-    "patience": 16,
+    "earlyStopping": "target-only",
     "selectionMetric": "baseKlDivergence",
     "targetValidation": {
       "baseKlDivergence": 0.15
@@ -40,10 +40,11 @@
     "endDelayMinutes": 0,
     "stepMinutes": 1,
     "epochsPerPhase": 256,
-    "patience": 16,
     "targetValidationBaseKl": 0.15,
+    "regenerateRawOracle": true,
     "skipTeacherRefinement": true,
     "datasetRetention": "anchor-and-active",
+    "modelRetention": "smallest-delay-best-only",
     "minimumFreeSpaceGb": 8
   }
 }

@@ -888,6 +888,9 @@ export interface BacktestChartAnnotation {
   kind: "buy-signal" | "sell-signal" | "buy-order" | "sell-order" | "buy-fill" | "sell-fill";
   label: string;
   reason?: string;
+  markerColor?: string;
+  markerLabel?: string;
+  markerOffsetX?: number;
   signalState?: "long" | "flat" | "short";
   orderId?: string;
   fillId?: string;

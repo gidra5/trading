@@ -803,6 +803,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--states-per-example", type=int, default=31)
     parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument(
+        "--disable-patience",
+        action="store_true",
+        help="Disable plateau stopping; validation targets are the only automatic stop.",
+    )
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -1105,7 +1110,8 @@ def main() -> None:
         "weightedTrainingSample": args.weighted_training_sample,
         "gradientAccumulation": args.accumulate,
         "epochs": args.epochs,
-        "patience": args.patience,
+        "patience": None if args.disable_patience else args.patience,
+        "earlyStopping": "target-only" if args.disable_patience else "patience",
         "learningRate": args.learning_rate,
         "weightDecay": args.weight_decay,
         "dropout": args.dropout,
@@ -1364,7 +1370,9 @@ def main() -> None:
     stopped = False
     interrupted = False
     quality_target_reached = validation_target_reached(best_validation_metrics, args)
-    patience_exhausted = stale_epochs >= args.patience
+    patience_exhausted = (
+        not args.disable_patience and stale_epochs >= args.patience
+    )
     if quality_target_reached:
         emit({
             "event": "validation-target-reached",
@@ -1421,7 +1429,9 @@ def main() -> None:
                 atomic_torch_save(model.state_dict(), best_model_file)
             else:
                 stale_epochs += 1
-            patience_exhausted = stale_epochs >= args.patience
+            patience_exhausted = (
+                not args.disable_patience and stale_epochs >= args.patience
+            )
             save_checkpoint(
                 checkpoint_file,
                 epoch,
@@ -1539,7 +1549,10 @@ def main() -> None:
             "trainExamples": len(train),
             "validationExamples": len(validation),
             "epochs": args.epochs,
-            "patience": args.patience,
+            "patience": None if args.disable_patience else args.patience,
+            "earlyStopping": (
+                "target-only" if args.disable_patience else "patience"
+            ),
             "seed": args.seed,
             "device": str(device),
             "finalizedEarly":
@@ -2195,16 +2208,28 @@ def resume_contract_is_monotonic_extension(
             or not all(isinstance(value, int) for value in (
                 previous_epochs,
                 requested_epochs,
-                previous_patience,
-                requested_patience,
-            )):
+            )) \
+            or not (
+                previous_patience is None and requested_patience is None
+                or isinstance(previous_patience, int)
+                and isinstance(requested_patience, int)
+            ):
         return False
+    patience_extended = (
+        previous_patience is not None
+        and requested_patience is not None
+        and requested_patience > previous_patience
+    )
+    patience_compatible = (
+        previous_patience is None and requested_patience is None
+        or requested_patience >= previous_patience
+    )
     return (
         requested_epochs >= previous_epochs
-        and requested_patience >= previous_patience
+        and patience_compatible
         and (
             requested_epochs > previous_epochs
-            or requested_patience > previous_patience
+            or patience_extended
         )
     )
 
@@ -2293,6 +2318,10 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
             "distributionObjective": "base-action-ce-pmse-v1",
             "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "selectionMetric": args.selection_metric,
+            "patience": None if args.disable_patience else args.patience,
+            "earlyStopping": (
+                "target-only" if args.disable_patience else "patience"
+            ),
             "initializeFromCheckpoint": (
                 str(args.initialize_from_checkpoint)
                 if args.initialize_from_checkpoint is not None
@@ -2571,8 +2600,10 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     if min(args.epochs, args.batch_size, args.accumulate, args.states_per_example,
-           args.patience, args.log_every_steps) < 1 or args.workers < 0:
+           args.log_every_steps) < 1 or args.workers < 0:
         raise ValueError("training counts must be positive (workers may be zero)")
+    if not args.disable_patience and args.patience < 1:
+        raise ValueError("training patience must be positive when enabled")
     if args.evaluation_batch_size < 0:
         raise ValueError("evaluation batch size must be non-negative")
     if not 0 < args.validation_fraction <= 1 or not 0 < args.training_fraction <= 1:

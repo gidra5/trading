@@ -25,8 +25,9 @@ import {
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
+  prepareVwKamaBellmanReference,
   prepareVwKamaOracle,
-  resolveVwKamaHoldingPeriodSteps,
+  resolveVwKamaBellmanHoldingPeriodSteps,
   VW_KAMA_SCORE_VERSION,
   vwKamaParametersFromPeakValleySignal,
   vwKamaScore,
@@ -2429,15 +2430,23 @@ async function prepareStageWindow(
         prepared.valueOracleKernelMs += built.valueOracleKernelMs;
         for (const testCase of built.cases) {
           const candles = columnarVwKamaCandles(testCase.candles as TradingCandle[], true);
-          const preparedOracle = prepareVwKamaOracle(
-            candles,
-            testCase.scoreStart,
-            testCase.oracle!,
-            true,
-          );
           const valueOracle = testCase.valueOracle
             ? shareExposureValueOracle(testCase.valueOracle)
             : undefined;
+          const preparedOracle = valueOracle
+            ? prepareVwKamaBellmanReference(
+                candles,
+                testCase.scoreStart,
+                valueOracle,
+                1,
+                true,
+              )
+            : prepareVwKamaOracle(
+                candles,
+                testCase.scoreStart,
+                testCase.oracle!,
+                true,
+              );
           const strategyTemperatures = testCase.strategyTemperatures;
           prepared.bytes += candleColumnBytes(candles)
             + preparedOracle.stateCodes.byteLength
@@ -2607,30 +2616,24 @@ async function buildCases(
         if (scoreStart < 0 || caseCandles.length - scoreStart < 3) continue;
         const scored = caseCandles.slice(scoreStart);
         if (scored.length < 3) continue;
-        const oracle = perfectMarginOracle(caseCandles, {
-          startingQuote: 1,
-          leverage: 1,
-          friction: config.oracleFriction,
-          eventMode: "close",
-          maxPathCandles: 1,
-        });
+        const oracle = config.objective === "signal"
+          ? perfectMarginOracle(caseCandles, {
+              startingQuote: 1,
+              leverage: 1,
+              friction: config.oracleFriction,
+              eventMode: "close",
+              maxPathCandles: 1,
+            })
+          : undefined;
         let valueOracle: ExposureValueOracle | undefined;
         let strategyTemperatures: Float32Array | undefined;
         let holdingPeriodMs: number | undefined;
         let valueHorizonMs: number | undefined;
         if (config.objective === "value-distillation") {
-          const holdingPeriodSteps = resolveVwKamaHoldingPeriodSteps(
-            caseCandles,
-            scoreStart,
-            oracle.stateCodes,
-            scaleMs,
-            {
-              holdingPeriodMode: config.valueHoldingPeriodMode,
-              holdingPeriodMs: config.valueHoldingPeriodMs,
-            },
-          );
+          let holdingPeriodSteps = Math.max(1, Math.round(config.valueHoldingPeriodMs / scaleMs));
           const valueHorizonSteps = Math.max(1, Math.round(config.valueHorizonMs / scaleMs));
-          if (valueHorizonSteps < holdingPeriodSteps) {
+          if (config.valueHoldingPeriodMode === "fixed"
+            && valueHorizonSteps < holdingPeriodSteps) {
             throw new Error(
               `Resolved holding period H=${holdingPeriodSteps} exceeds value horizon `
               + `T−t=${valueHorizonSteps} for ${window.label} at ${formatDuration(scaleMs)}.`,
@@ -2645,11 +2648,8 @@ async function buildCases(
             );
           }
           const prices = valueCandles.map((candle) => candle.close);
-          holdingPeriodMs = holdingPeriodSteps * scaleMs;
-          valueHorizonMs = valueHorizonSteps * scaleMs;
-          const options = {
+          const baseOptions = {
             scoreStartIndex: scoreStart,
-            holdingPeriodSteps,
             valueHorizonSteps,
             friction: config.oracleFriction,
             gridSize: config.exposureGridSize,
@@ -2662,6 +2662,35 @@ async function buildCases(
             opportunityEpsilon: config.opportunityEpsilon,
             quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, scaleMs),
             assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, scaleMs),
+          };
+          if (config.valueHoldingPeriodMode === "oracle-half-average-trade") {
+            const oneStepBellman = prepareExposureValueOracle(prices, {
+              ...baseOptions,
+              holdingPeriodSteps: 1,
+              includeProbabilities: false,
+            });
+            holdingPeriodSteps = resolveVwKamaBellmanHoldingPeriodSteps(
+              caseCandles,
+              scoreStart,
+              oneStepBellman,
+              scaleMs,
+              {
+                holdingPeriodMode: config.valueHoldingPeriodMode,
+                holdingPeriodMs: config.valueHoldingPeriodMs,
+              },
+            );
+          }
+          if (valueHorizonSteps < holdingPeriodSteps) {
+            throw new Error(
+              `Resolved Bellman holding period H=${holdingPeriodSteps} exceeds value horizon `
+              + `T−t=${valueHorizonSteps} for ${window.label} at ${formatDuration(scaleMs)}.`,
+            );
+          }
+          holdingPeriodMs = holdingPeriodSteps * scaleMs;
+          valueHorizonMs = valueHorizonSteps * scaleMs;
+          const options = {
+            ...baseOptions,
+            holdingPeriodSteps,
             includeProbabilities: config.oracleMutualInformationLambda > 0
               && config.oracleMutualInformationMode === "precise"
               || config.strategyNormalMixture.max > 0,

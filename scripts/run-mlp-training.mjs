@@ -213,7 +213,9 @@ try {
     "--weight-decay", String(training.weightDecay),
     "--dropout", String(training.dropout),
     "--states-per-example", String(training.statesPerExample),
-    "--patience", String(training.patience),
+    ...(training.earlyStopping === "target-only"
+      ? ["--disable-patience"]
+      : ["--patience", String(training.patience)]),
     "--workers", String(training.workers),
     "--seed", String(training.seed),
     "--device", training.device,

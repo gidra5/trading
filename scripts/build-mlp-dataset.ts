@@ -79,6 +79,7 @@ interface TrainingPlan {
   runDir: string;
   componentSeedDatasetDirs?: string[];
   minuteOracleComponentSeedDatasetDirs?: string[];
+  regenerateOracleComponents?: boolean;
   oraclePreparation: { backend: "cuda"; pipelineDepth?: 1 | 2 | 3 | 4 };
   samplingIntervalMs: number;
   predictionDelayMs: number;
@@ -547,18 +548,21 @@ async function main(): Promise<void> {
       plan,
       featureRowsByDay,
       oracleRowsByDay,
+      !plan.regenerateOracleComponents,
     );
   }
   const minuteOracleComponentSeedDatasetDirs = [...new Set(
     plan.minuteOracleComponentSeedDatasetDirs ?? [],
   )];
-  for (const seedDatasetDir of minuteOracleComponentSeedDatasetDirs) {
-    await importReusableMinuteOracleComponents(
-      path.resolve(repoRoot, seedDatasetDir),
-      output,
-      selectedDays,
-      plan,
-    );
+  if (!plan.regenerateOracleComponents) {
+    for (const seedDatasetDir of minuteOracleComponentSeedDatasetDirs) {
+      await importReusableMinuteOracleComponents(
+        path.resolve(repoRoot, seedDatasetDir),
+        output,
+        selectedDays,
+        plan,
+      );
+    }
   }
   if (componentSeedDatasetDirs.length > 0
     || minuteOracleComponentSeedDatasetDirs.length > 0) {
@@ -2669,6 +2673,7 @@ async function importReusableComponents(
   plan: TrainingPlan,
   featureRowsByDay: ReadonlyMap<string, readonly number[]>,
   oracleRowsByDay: ReadonlyMap<string, readonly number[]>,
+  importOracleComponents: boolean,
 ): Promise<void> {
   if (path.resolve(sourceOutput) === path.resolve(output)) return;
   let source: Progress;
@@ -2700,42 +2705,44 @@ async function importReusableComponents(
     });
     importedFeatures += 1;
   }
-  const actionCount = source.grid?.length ?? plan.execution.gridSize;
-  for (const day of oracleDays) {
-    const date = isoDate(day);
-    const required = rowSelectionSignature(oracleRowsByDay.get(date) ?? []);
-    const target = progress.oracleComponents.find((item) => item.date === date);
-    if (target?.teacherFitSignature
-      && compatibleTeacherFitSignatures.has(target.teacherFitSignature)
-      && target.teacherMetricVisibleLower === plan.execution.minimumUsableExposure
-      && target.teacherMetricVisibleUpper === plan.execution.maximumUsableExposure
-      && await oracleComponentComplete(output, target, actionCount, required)) continue;
-    const component = source.oracleComponents.find((item) => item.date === date);
-    if (!component
-      || !component.teacherFitSignature
-      || !compatibleTeacherFitSignatures.has(component.teacherFitSignature)
-      || component.teacherMetricVisibleLower !== plan.execution.minimumUsableExposure
-      || component.teacherMetricVisibleUpper !== plan.execution.maximumUsableExposure
-      || !await oracleComponentComplete(
-        sourceOutput,
-        component,
-        actionCount,
-        component.rowSelectionSignature ?? "full",
-      )) continue;
-    const targetRows = materializedComponentRows(target);
-    const sourceRows = materializedComponentRows(component);
-    if (targetRows.length > 0 && targetRows.length >= sourceRows.length) continue;
-    await linkComponentFiles(sourceOutput, output, [
-      component.teacherParameters,
-      component.teacherMetrics,
-      component.rawOracleProbabilities,
-      component.times,
-    ]);
-    replaceByDate(progress.oracleComponents, {
-      ...component,
-      rowSelectionSignature: component.rowSelectionSignature ?? "full",
-    });
-    importedOracles += 1;
+  if (importOracleComponents) {
+    const actionCount = source.grid?.length ?? plan.execution.gridSize;
+    for (const day of oracleDays) {
+      const date = isoDate(day);
+      const required = rowSelectionSignature(oracleRowsByDay.get(date) ?? []);
+      const target = progress.oracleComponents.find((item) => item.date === date);
+      if (target?.teacherFitSignature
+        && compatibleTeacherFitSignatures.has(target.teacherFitSignature)
+        && target.teacherMetricVisibleLower === plan.execution.minimumUsableExposure
+        && target.teacherMetricVisibleUpper === plan.execution.maximumUsableExposure
+        && await oracleComponentComplete(output, target, actionCount, required)) continue;
+      const component = source.oracleComponents.find((item) => item.date === date);
+      if (!component
+        || !component.teacherFitSignature
+        || !compatibleTeacherFitSignatures.has(component.teacherFitSignature)
+        || component.teacherMetricVisibleLower !== plan.execution.minimumUsableExposure
+        || component.teacherMetricVisibleUpper !== plan.execution.maximumUsableExposure
+        || !await oracleComponentComplete(
+          sourceOutput,
+          component,
+          actionCount,
+          component.rowSelectionSignature ?? "full",
+        )) continue;
+      const targetRows = materializedComponentRows(target);
+      const sourceRows = materializedComponentRows(component);
+      if (targetRows.length > 0 && targetRows.length >= sourceRows.length) continue;
+      await linkComponentFiles(sourceOutput, output, [
+        component.teacherParameters,
+        component.teacherMetrics,
+        component.rawOracleProbabilities,
+        component.times,
+      ]);
+      replaceByDate(progress.oracleComponents, {
+        ...component,
+        rowSelectionSignature: component.rowSelectionSignature ?? "full",
+      });
+      importedOracles += 1;
+    }
   }
   progress.grid ??= source.grid;
   progress.currentGrid ??= source.currentGrid;

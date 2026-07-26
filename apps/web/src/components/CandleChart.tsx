@@ -1582,30 +1582,53 @@ function drawAnnotationMarkers(
   if (annotations.length === 0) return;
   const signals = annotations.filter((annotation) => annotation.kind.endsWith("signal"));
   const events = annotations.filter((annotation) => !annotation.kind.endsWith("signal"));
+  const labeledSignals = signals.filter((annotation) => annotation.markerLabel !== undefined);
+  const ordinarySignals = signals.filter((annotation) => annotation.markerLabel === undefined);
   const width = Math.max(1, plot.right - plot.left);
-  const dense = signals.length > width / 7;
-  const signalEvery = dense ? Math.max(1, Math.ceil(signals.length / (width * 2))) : 1;
+  const dense = ordinarySignals.length > width / 7;
+  const signalEvery = dense
+    ? Math.max(1, Math.ceil(ordinarySignals.length / (width * 2)))
+    : 1;
+  const renderedSignals = [
+    ...ordinarySignals.filter((_annotation, index) => index % signalEvery === 0),
+    ...labeledSignals,
+  ].sort((left, right) => left.time - right.time);
   const occupied = new Set<string>();
 
   ctx.save();
-  for (let index = 0; index < signals.length; index += signalEvery) {
-    const annotation = signals[index];
-    if (!annotation) continue;
+  for (const annotation of renderedSignals) {
     if (
       selectedCandle &&
       annotation.time >= selectedCandle.openTime &&
       annotation.time <= selectedCandle.closeTime
     ) continue;
 
-    const x = clamp(timeToX(annotation.time), plot.left, plot.right);
+    const x = clamp(
+      timeToX(annotation.time) + (annotation.markerOffsetX ?? 0),
+      plot.left,
+      plot.right,
+    );
     const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
     const isBuy = annotation.kind.startsWith("buy");
-    if (dense) {
-      const key = `${Math.round(x)}:${annotation.signalState ?? (isBuy ? "buy" : "sell")}`;
+    const denseMarker = dense && annotation.markerLabel === undefined;
+    if (denseMarker) {
+      const key = [
+        Math.round(x),
+        annotation.markerLabel ?? annotation.signalState ?? (isBuy ? "buy" : "sell"),
+      ].join(":");
       if (occupied.has(key)) continue;
       occupied.add(key);
     }
-    drawCandidateSignalMarker(ctx, x, y, isBuy, dense, annotation.signalState);
+    drawSignalMarker(
+      ctx,
+      x,
+      y,
+      isBuy,
+      denseMarker,
+      annotation.signalState,
+      annotation.markerColor,
+      annotation.markerLabel,
+    );
   }
 
   const eventEvery = Math.max(1, Math.ceil(events.length / MAX_BACKGROUND_ANNOTATION_MARKERS));
@@ -1632,17 +1655,19 @@ function drawAnnotationMarkers(
   ctx.restore();
 }
 
-function drawCandidateSignalMarker(
+function drawSignalMarker(
   ctx: CanvasRenderingContext2D,
   x: number,
   y: number,
   isBuy: boolean,
   dense: boolean,
   state?: BacktestChartAnnotation["signalState"],
+  markerColor = CANDIDATE_SIGNAL_COLOR,
+  markerLabel?: string,
 ): void {
   ctx.save();
   ctx.globalAlpha = dense ? 0.86 : 1;
-  ctx.strokeStyle = dense ? CANDIDATE_SIGNAL_COLOR : "#090a0d";
+  ctx.strokeStyle = dense ? markerColor : "#090a0d";
   ctx.lineWidth = dense ? 4 : 1.5;
   ctx.beginPath();
   if (dense) {
@@ -1650,7 +1675,7 @@ function drawCandidateSignalMarker(
     ctx.lineTo(x, y + 5);
   } else if (state === "flat") {
     const radius = 6;
-    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.fillStyle = markerColor;
     ctx.moveTo(x, y - radius);
     ctx.lineTo(x + radius, y);
     ctx.lineTo(x, y + radius);
@@ -1658,7 +1683,7 @@ function drawCandidateSignalMarker(
     ctx.closePath();
   } else {
     const radius = 7;
-    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.fillStyle = markerColor;
     ctx.moveTo(x, isBuy ? y - radius : y + radius);
     ctx.lineTo(x - radius, isBuy ? y + radius * 0.72 : y - radius * 0.72);
     ctx.lineTo(x + radius, isBuy ? y + radius * 0.72 : y - radius * 0.72);
@@ -1667,12 +1692,12 @@ function drawCandidateSignalMarker(
   ctx.stroke();
   if (!dense) ctx.fill();
   if (!dense && state) {
-    ctx.fillStyle = CANDIDATE_SIGNAL_COLOR;
+    ctx.fillStyle = markerColor;
     ctx.font = "bold 10px Inter, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = state === "long" ? "bottom" : "top";
     ctx.fillText(
-      state === "long" ? "L" : state === "short" ? "S" : "F",
+      markerLabel ?? (state === "long" ? "L" : state === "short" ? "S" : "F"),
       x,
       state === "long" ? y - 9 : y + 9,
     );
@@ -1786,11 +1811,17 @@ function drawAnnotations(
   timeToX: (time: number) => number,
 ): void {
   for (const annotation of annotations) {
-    const x = clamp(timeToX(annotation.time), plot.left, plot.right);
+    const x = clamp(
+      timeToX(annotation.time) + (annotation.markerOffsetX ?? 0),
+      plot.left,
+      plot.right,
+    );
     const y = clamp(priceToY(annotation.price), plot.top, plot.bottom);
     const isBuy = annotation.kind.startsWith("buy");
     const isSignal = annotation.kind.endsWith("signal");
-    const color = isSignal ? CANDIDATE_SIGNAL_COLOR : isBuy ? "#22c55e" : "#f05252";
+    const color = isSignal
+      ? annotation.markerColor ?? CANDIDATE_SIGNAL_COLOR
+      : isBuy ? "#22c55e" : "#f05252";
     const markerUp = annotation.signalState === "long" || (annotation.signalState === undefined && isBuy);
 
     ctx.save();
@@ -1836,6 +1867,7 @@ function drawAnnotations(
 }
 
 function annotationShortLabel(annotation: BacktestChartAnnotation): string {
+  if (annotation.markerLabel) return annotation.markerLabel;
   if (annotation.kind.includes("signal")) {
     return annotation.signalState === "long" ? "L"
       : annotation.signalState === "short" ? "S"

@@ -7,7 +7,6 @@ import { gunzipSync } from "node:zlib";
 import {
   evaluateVwKamaOracle,
   noiseSignalRatio,
-  perfectMarginOracle,
   prepareHandcraftedIndicatorStates,
   DEFAULT_HANDCRAFTED_INDICATOR_PARAMETERS,
   HANDCRAFTED_INDICATOR_PARAMETER_BOUNDS,
@@ -23,16 +22,17 @@ import {
   rebalanceEquityFactor,
   prepareExposureValueOracleCuda,
   normalizeExposureValueDistillationLossConfig,
-  resolveVwKamaHoldingPeriodSteps,
+  resolveVwKamaBellmanHoldingPeriodSteps,
   rescoreVwKamaEvaluation,
   truncateExposureValueOracle,
   vwKamaScore,
   vwKamaCudaStatus,
+  VW_KAMA_ORACLE_EMA_WINDOW_MS,
   VW_KAMA_SCORE_VERSION,
   type Candle,
   type BacktestOraclePoint,
-  type PerfectMarginOracleResult,
   type VwKamaAccuracyMetrics,
+  type VwKamaPathAccuracyMetrics,
   type VwKamaCandleRangeRequest,
   type VwKamaCandleRangeResponse,
   type VwKamaEvaluation,
@@ -173,6 +173,7 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     mlpOracleAlignment: "model-target",
   },
   oracleFriction: 0.00175,
+  oracleEmaWindowMs: VW_KAMA_ORACLE_EMA_WINDOW_MS,
   matchWindowMs: 2 * 3_600_000,
   timingHalfLifeMs: 10 * 60_000,
   warmupMultiple: 3,
@@ -186,12 +187,12 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     holdingPeriodMs: 60_000,
     valueHorizonMode: "fixed",
     valueHorizonMs: 60 * 60_000,
-    horizonEndMode: "truncate",
+    horizonEndMode: "extend",
     oracleTemperature: 0.01,
     strategyVolatilityScaling: false,
     opportunityEpsilon: 0.000001,
-    quoteBorrowRate: 0,
-    assetBorrowRate: 0,
+    quoteBorrowRate: 5,
+    assetBorrowRate: 5,
     entropyGapLambda: 0,
     stateMutualInformationLambda: 0,
     oracleMutualInformationLambda: 0,
@@ -281,7 +282,6 @@ interface CachedWindow {
   sourceIntervalMs: number;
   source: Promise<Candle[]>;
   scales: Map<number, Promise<Candle[][]>>;
-  oracles: Map<string, Promise<PerfectMarginOracleResult>>;
   valueOracles: Map<string, CachedExposureOracle>;
   analyses: Map<string, CachedAnalysis>;
 }
@@ -508,22 +508,16 @@ export class KamaInspectorEngine {
             candles[0]!.openTime + (index > 0 ? warmupMs : 0),
           );
           if (scoreStart >= selected.endTime || candles.at(-1)!.openTime < scoreStart) continue;
-          const scoreStartIndex = candleLowerBound(candles, scoreStart);
-          const maxPoints = Math.max(100, Math.floor(MAX_CHART_CANDLES / segments.length));
-          const oracle = await this.oracle(
-            cached,
-            request,
-            valueCandles.slice(0, oracleEndIndex),
-          );
-          const valueOracle = await this.exposureOracle(
-            cached,
-            request,
-            valueCandles,
-            scoreStartIndex,
-            oracleEndIndex,
-            oracle.stateCodes,
-            sampledIndexes(candles.length, scoreStartIndex, maxPoints),
-            cancelFlag,
+           const scoreStartIndex = candleLowerBound(candles, scoreStart);
+           const maxPoints = Math.max(100, Math.floor(MAX_CHART_CANDLES / segments.length));
+           const valueOracle = await this.exposureOracle(
+             cached,
+             request,
+             valueCandles,
+             scoreStartIndex,
+             oracleEndIndex,
+             sampledIndexes(candles.length, scoreStartIndex, maxPoints),
+             cancelFlag,
           );
           evaluated.push({
             candles,
@@ -536,10 +530,9 @@ export class KamaInspectorEngine {
               maxDistributionPoints: Math.max(
                 25,
                 Math.floor(MAX_VALUE_DISTRIBUTIONS / segments.length),
-              ),
-              cancelFlag,
-              oracleResult: oracle,
-              valueDistillation: {
+               ),
+               cancelFlag,
+               valueDistillation: {
                 oracle: valueOracle,
                 strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
                 lossConfig: request.valueDistillation!,
@@ -602,6 +595,8 @@ export class KamaInspectorEngine {
     const indicatorPoints: VwKamaIndicatorPoint[] = [];
     const valueDistributions: VwKamaCandleRangeResponse["valueDistributions"] = [];
     const valueOraclePath: VwKamaCandleRangeResponse["valueOraclePath"] = [];
+    const valueOraclePredictionPath: VwKamaCandleRangeResponse["valueOraclePredictionPath"] = [];
+    const valueOracleEmaPath: VwKamaCandleRangeResponse["valueOracleEmaPath"] = [];
     const valueCandidatePath: VwKamaCandleRangeResponse["valueCandidatePath"] = [];
     const warmupMs = candidateWarmupMs(request);
     for (const [index, segment] of segments.entries()) {
@@ -622,14 +617,12 @@ export class KamaInspectorEngine {
         candles.at(-1)!.openTime,
       );
       const scoreStartIndex = candleLowerBound(segment, scoreStart);
-      const oracle = await this.oracle(cached, request, segment);
       const valueOracle = await this.exposureOracle(
         cached,
         request,
         segment,
         scoreStartIndex,
         candleLowerBound(segment, selected.endTime),
-        oracle.stateCodes,
         distributionTraceTimes.map((time) => candleIndexAtClose(segment, time)),
         cancelFlag,
       );
@@ -641,7 +634,6 @@ export class KamaInspectorEngine {
         maxDistributionPoints: distributionTraceTimes.length,
         traceTimes,
         cancelFlag,
-        oracleResult: oracle,
         valueDistillation: {
           oracle: valueOracle,
           score: false,
@@ -659,6 +651,8 @@ export class KamaInspectorEngine {
       indicatorPoints.push(...evaluation.indicatorPoints);
       valueDistributions.push(...evaluation.valueDistributions);
       valueOraclePath.push(...evaluation.valueOraclePath);
+      valueOraclePredictionPath.push(...evaluation.valueOraclePredictionPath);
+      valueOracleEmaPath.push(...evaluation.valueOracleEmaPath);
       valueCandidatePath.push(...evaluation.valueCandidatePath);
     }
     indicatorPoints.sort((left, right) => left.time - right.time);
@@ -680,6 +674,8 @@ export class KamaInspectorEngine {
       indicatorPoints,
       valueDistributions: valueDistributions.sort((left, right) => left.time - right.time),
       valueOraclePath: valueOraclePath.sort((left, right) => left.time - right.time),
+      valueOraclePredictionPath: valueOraclePredictionPath.sort((left, right) => left.time - right.time),
+      valueOracleEmaPath: valueOracleEmaPath.sort((left, right) => left.time - right.time),
       valueCandidatePath: valueCandidatePath.sort((left, right) => left.time - right.time),
     };
   }
@@ -712,14 +708,20 @@ export class KamaInspectorEngine {
       const scoreEndIndex = candleLowerBound(segment, selected.endTime);
       const scoreStart = Math.max(selected.startTime, segment[0]!.openTime);
       const scoreStartIndex = candleLowerBound(segment, scoreStart);
-      const perfectOracle = await this.oracle(cached, request, segment);
-      const mainHoldingSteps = resolveVwKamaHoldingPeriodSteps(
-        segment.slice(0, scoreEndIndex),
-        scoreStartIndex,
-        perfectOracle.stateCodes,
-        request.intervalMs,
-        request.valueDistillation!,
-      );
+      const mainHoldingSteps = request.valueDistillation!.holdingPeriodMode === "fixed"
+        ? Math.max(
+            1,
+            Math.round(request.valueDistillation!.holdingPeriodMs / request.intervalMs),
+          )
+        : (await this.exposureOracle(
+            cached,
+            request,
+            segment,
+            scoreStartIndex,
+            scoreEndIndex,
+            [selectedIndex],
+            cancelFlag,
+          )).holdingPeriodSteps;
       const mainHorizonSteps = request.valueDistillation!.valueHorizonMode === "fixed"
         ? Math.max(1, Math.round(request.valueDistillation!.valueHorizonMs / request.intervalMs))
         : Math.max(1, scoreEndIndex - scoreStartIndex - 1);
@@ -826,14 +828,12 @@ export class KamaInspectorEngine {
         throw new Error("MLP prediction candle is outside the scored inspector range.");
       }
       const candles = segment.slice(0, candleIndex + 1);
-      const oracle = await this.oracle(cached, request, segment);
       const valueOracle = await this.exposureOracle(
         cached,
         request,
         segment,
         scoreStartIndex,
         scoreEndIndex,
-        oracle.stateCodes,
         [candleIndex],
         cancelFlag,
       );
@@ -845,7 +845,6 @@ export class KamaInspectorEngine {
         maxDistributionPoints: 1,
         traceTimes: [input.time],
         cancelFlag,
-        oracleResult: oracle,
         valueDistillation: {
           oracle: valueOracle,
           score: false,
@@ -903,14 +902,12 @@ export class KamaInspectorEngine {
       if (candleIndex < scoreStartIndex || candleIndex >= scoreEndIndex) {
         throw new Error("Predictor fit candle is outside the scored inspector range.");
       }
-      const oracle = await this.oracle(cached, request, candles);
       const valueOracle = await this.exposureOracle(
         cached,
         request,
         candles,
         scoreStartIndex,
         scoreEndIndex,
-        oracle.stateCodes,
         [candleIndex],
         cancelFlag,
       );
@@ -932,7 +929,6 @@ export class KamaInspectorEngine {
         maxPoints: 1,
         traceTimes: [input.time],
         cancelFlag,
-        oracleResult: oracle,
         valueDistillation: {
           oracle: valueOracle,
           strategyVolatilityScaling: request.valueDistillation!.strategyVolatilityScaling,
@@ -1011,7 +1007,6 @@ export class KamaInspectorEngine {
       sourceIntervalMs: selected.sourceIntervalMs,
       source,
       scales: new Map<number, Promise<Candle[][]>>(),
-      oracles: new Map<string, Promise<PerfectMarginOracleResult>>(),
       valueOracles: new Map<string, CachedExposureOracle>(),
       analyses: new Map<string, CachedAnalysis>(),
     };
@@ -1031,54 +1026,19 @@ export class KamaInspectorEngine {
     return pending;
   }
 
-  private oracle(
-    cached: CachedWindow,
-    request: VwKamaInspectorRequest,
-    candles: Candle[],
-  ): Promise<PerfectMarginOracleResult> {
-    const key = `${request.intervalMs}:${candles[0]!.openTime}:${candles.at(-1)!.closeTime}:${request.oracleFriction}`;
-    const existing = cached.oracles.get(key);
-    if (existing) return existing;
-    const pending = Promise.resolve(perfectMarginOracle(candles, {
-      startingQuote: 1,
-      leverage: 1,
-      friction: request.oracleFriction,
-      eventMode: "close",
-      maxPathCandles: MAX_CHART_CANDLES,
-    }));
-    cached.oracles.set(key, pending);
-    while (cached.oracles.size > 4) {
-      const oldest = cached.oracles.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      cached.oracles.delete(oldest);
-    }
-    return pending;
-  }
-
   private async exposureOracle(
     cached: CachedWindow,
     request: VwKamaInspectorRequest,
     candles: Candle[],
     scoreStartIndex: number,
     scoreEndIndex: number,
-    oracleStateCodes: Uint8Array,
     scoreIndexes?: readonly number[],
     cancelFlag?: Int32Array,
   ): Promise<ExposureValueOracle> {
     const config = request.valueDistillation!;
-    const holdingPeriodSteps = resolveVwKamaHoldingPeriodSteps(
-      candles.slice(0, scoreEndIndex),
-      scoreStartIndex,
-      oracleStateCodes,
-      request.intervalMs,
-      config,
-    );
     const valueHorizonSteps = config.valueHorizonMode === "fixed"
       ? Math.max(1, Math.round(config.valueHorizonMs / request.intervalMs))
       : Math.max(1, scoreEndIndex - scoreStartIndex - 1);
-    if (valueHorizonSteps < holdingPeriodSteps) {
-      throw new Error("Resolved holding period exceeds the configured value horizon.");
-    }
     if (config.valueHorizonMode === "fixed" && config.horizonEndMode === "extend"
       && candles.length - scoreEndIndex < valueHorizonSteps) {
       throw new Error("Value horizon requires more continuous post-window candles.");
@@ -1087,11 +1047,8 @@ export class KamaInspectorEngine {
       ? candles
       : candles.slice(0, scoreEndIndex);
     const prices = valueCandles.map((candle) => candle.close);
-    const sparse = scoreIndexes !== undefined
-      && valueHorizonSteps < prices.length - 1 - scoreStartIndex;
-    const options = {
+    const baseOptions = {
       scoreStartIndex,
-      holdingPeriodSteps,
       valueHorizonSteps,
       friction: request.oracleFriction,
       gridSize: config.gridSize,
@@ -1101,13 +1058,37 @@ export class KamaInspectorEngine {
       initialExposure: config.initialExposure,
       terminalIndex: scoreEndIndex - 1,
       temperature: config.oracleTemperature,
-      // Opportunity epsilon only offsets per-row weights. Keep the expensive
-      // oracle neutral so epsilon edits can reuse its exact values/statistics.
       opportunityEpsilon: 0,
       quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, request.intervalMs),
       assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, request.intervalMs),
-      includeProbabilities: true,
       cancelFlag,
+    };
+    let holdingPeriodSteps = Math.max(1, Math.round(config.holdingPeriodMs / request.intervalMs));
+    if (config.holdingPeriodMode === "oracle-half-average-trade") {
+      const oneStepBellman = prepareExposureValueOracle(prices, {
+        ...baseOptions,
+        holdingPeriodSteps: 1,
+        includeProbabilities: false,
+      });
+      holdingPeriodSteps = resolveVwKamaBellmanHoldingPeriodSteps(
+        candles.slice(0, scoreEndIndex),
+        scoreStartIndex,
+        oneStepBellman,
+        request.intervalMs,
+        config,
+      );
+    }
+    if (valueHorizonSteps < holdingPeriodSteps) {
+      throw new Error("Resolved holding period exceeds the configured value horizon.");
+    }
+    const sparse = scoreIndexes !== undefined
+      && valueHorizonSteps < prices.length - 1 - scoreStartIndex;
+    const options = {
+      ...baseOptions,
+      holdingPeriodSteps,
+      // Opportunity epsilon only offsets per-row weights. Keep the expensive
+      // oracle neutral so epsilon edits can reuse its exact values/statistics.
+      includeProbabilities: true,
     };
     const key = [
       request.intervalMs,
@@ -1331,14 +1312,34 @@ function combineEvaluations(
   const results = evaluated.map((item) => item.result);
   const candidateTransitions = results.flatMap((item) => item.candidateTransitions);
   const oracleTransitions = results.flatMap((item) => item.oracleTransitions);
+  const oraclePredictionTransitions = results.flatMap((item) => item.oraclePredictionTransitions);
+  const oracleEmaTransitions = results.flatMap((item) => item.oracleEmaTransitions);
   const candleCount = results.reduce((sum, item) => sum + item.candleCount, 0);
   const metrics = combineMetrics(results, candidateTransitions, oracleTransitions, candleCount, request.intervalMs);
+  const oraclePredictionMetrics = combinePathMetrics(
+    results.flatMap((item) => item.oraclePredictionMetrics ?? []),
+    results.filter((item) => item.oraclePredictionMetrics).map((item) => item.candleCount),
+    oraclePredictionTransitions,
+    oracleTransitions,
+    candleCount,
+    request.intervalMs,
+  );
+  const oracleEmaMetrics = combinePathMetrics(
+    results.flatMap((item) => item.oracleEmaMetrics ?? []),
+    results.filter((item) => item.oracleEmaMetrics).map((item) => item.candleCount),
+    oracleEmaTransitions,
+    oracleTransitions,
+    candleCount,
+    request.intervalMs,
+  );
   const scored = evaluated.flatMap((item) =>
     item.candles.filter((candle) => candle.openTime >= item.scoreStart));
   const statePoints = results.flatMap((item) => item.statePoints);
   const indicatorPoints = results.flatMap((item) => item.indicatorPoints);
   const valueDistributions = results.flatMap((item) => item.valueDistributions);
   const valueOraclePath = results.flatMap((item) => item.valueOraclePath);
+  const valueOraclePredictionPath = results.flatMap((item) => item.valueOraclePredictionPath);
+  const valueOracleEmaPath = results.flatMap((item) => item.valueOracleEmaPath);
   const valueCandidatePath = results.flatMap((item) => item.valueCandidatePath);
   const rendered = renderCandleRange(
     continuousSegments(scored, request.intervalMs),
@@ -1350,6 +1351,8 @@ function combineEvaluations(
   return {
     candleCount,
     metrics,
+    ...(oraclePredictionMetrics ? { oraclePredictionMetrics } : {}),
+    ...(oracleEmaMetrics ? { oracleEmaMetrics } : {}),
     renderIntervalMs: rendered.intervalMs,
     candles: rendered.candles,
     kamaSeries: {
@@ -1361,19 +1364,34 @@ function combineEvaluations(
     },
     annotations: sampleEven(results.flatMap((item) => item.annotations), 5_000),
     oracle: {
-      mode: "fixed-notional",
+      mode: "bellman-exposure",
       eventMode: "close",
-      leverage: 1,
+      leverage: Math.max(...results.map((item) => item.oracle.leverage), 0),
       friction: request.oracleFriction,
       points: results.flatMap((item) => item.oracle.points),
+    },
+    oraclePredictionPath: {
+      points: results.flatMap((item) => item.oraclePredictionPath.points)
+        .sort((left, right) => left.time - right.time),
+    },
+    oracleEmaPath: {
+      windowMs: results[0]?.oracleEmaPath.windowMs
+        ?? request.oracleEmaWindowMs
+        ?? VW_KAMA_ORACLE_EMA_WINDOW_MS,
+      points: results.flatMap((item) => item.oracleEmaPath.points)
+        .sort((left, right) => left.time - right.time),
     },
     candidatePath: { points: candidatePath(evaluated) },
     statePoints,
     indicatorPoints,
     valueDistributions,
     valueOraclePath,
+    valueOraclePredictionPath,
+    valueOracleEmaPath,
     valueCandidatePath,
     candidateTransitions,
+    oraclePredictionTransitions,
+    oracleEmaTransitions,
     oracleTransitions,
   };
 }
@@ -1567,21 +1585,14 @@ function combineMetrics(
   candleCount: number,
   intervalMs: number,
 ): VwKamaAccuracyMetrics {
-  const signalCount = candidates.length;
-  const oracleCount = oracle.length;
-  const matchedCount = results.reduce((sum, item) => sum + item.metrics.matchedCount, 0);
-  const extraSignalCount = signalCount - matchedCount;
-  const signalCleanliness = signalCount > 0 ? matchedCount / signalCount : 1;
-  const timingCredit = candidates.reduce((sum, item) => sum + item.timingCredit, 0);
-  const precision = eventRatio(timingCredit, signalCount, oracleCount);
-  const recall = eventRatio(timingCredit, oracleCount, signalCount);
-  const f1 = harmonic(precision, recall);
-  const exposureAgreement = results.reduce(
-    (sum, item) => sum + item.metrics.exposureAgreement * item.candleCount,
-    0,
-  ) / candleCount;
-  const lags = candidates.flatMap((item) => item.lagMs === null ? [] : [item.lagMs]);
-  const absoluteLags = lags.map(Math.abs);
+  const path = combinePathMetrics(
+    results.map((item) => item.metrics),
+    results.map((item) => item.candleCount),
+    candidates,
+    oracle,
+    candleCount,
+    intervalMs,
+  )!;
   const valueParts = results.flatMap((item) => item.metrics.valueDistillation ?? []);
   const distillationWeight = valueParts.reduce((sum, item) => sum + item.weightSum, 0);
   const weightedCrossEntropy = valueParts.reduce(
@@ -1617,25 +1628,7 @@ function combineMetrics(
     0,
   ) / distillationWeight : 0;
   return {
-    score: vwKamaScore(f1, exposureAgreement, signalCleanliness),
-    precision,
-    recall,
-    f1,
-    rawPrecision: eventRatio(matchedCount, signalCount, oracleCount),
-    rawRecall: eventRatio(matchedCount, oracleCount, signalCount),
-    exposureAgreement,
-    noiseSignalRatio: noiseSignalRatio(extraSignalCount, matchedCount),
-    signalCleanliness,
-    signalsPerDay: signalCount / Math.max(intervalMs / DAY_MS, candleCount * intervalMs / DAY_MS),
-    signalCount,
-    oracleCount,
-    matchedCount,
-    extraSignalCount,
-    missedOracleCount: oracleCount - matchedCount,
-    lagP50Ms: percentile(absoluteLags, 0.5),
-    lagP90Ms: percentile(absoluteLags, 0.9),
-    lagP95Ms: percentile(absoluteLags, 0.95),
-    lagMedianSignedMs: percentile(lags, 0.5),
+    ...path,
     ...(valueParts.length > 0 ? {
       valueDistillation: {
         holdingPeriodMs: valueParts.reduce(
@@ -1671,10 +1664,62 @@ function combineMetrics(
           / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
         returns: {
           oracle: combineExposureReturns(valueParts.map((item) => item.returns.oracle)),
+          oraclePrediction: combineExposureReturns(
+            valueParts.map((item) => item.returns.oraclePrediction),
+          ),
+          oracleEma: combineExposureReturns(valueParts.map((item) => item.returns.oracleEma)),
           strategy: combineExposureReturns(valueParts.map((item) => item.returns.strategy)),
         },
       },
     } : {}),
+  };
+}
+
+function combinePathMetrics(
+  parts: VwKamaPathAccuracyMetrics[],
+  partCandleCounts: number[],
+  candidates: VwKamaTransition[],
+  oracle: VwKamaTransition[],
+  candleCount: number,
+  intervalMs: number,
+): VwKamaPathAccuracyMetrics | undefined {
+  if (parts.length === 0) return undefined;
+  const signalCount = candidates.length;
+  const oracleCount = oracle.length;
+  const matchedCount = parts.reduce((sum, item) => sum + item.matchedCount, 0);
+  const extraSignalCount = signalCount - matchedCount;
+  const signalCleanliness = signalCount > 0 ? matchedCount / signalCount : 1;
+  const timingCredit = candidates.reduce((sum, item) => sum + item.timingCredit, 0);
+  const precision = eventRatio(timingCredit, signalCount, oracleCount);
+  const recall = eventRatio(timingCredit, oracleCount, signalCount);
+  const f1 = harmonic(precision, recall);
+  const exposureAgreement = parts.reduce(
+    (sum, item, index) => sum + item.exposureAgreement
+      * (partCandleCounts[index] ?? 0),
+    0,
+  ) / candleCount;
+  const lags = candidates.flatMap((item) => item.lagMs === null ? [] : [item.lagMs]);
+  const absoluteLags = lags.map(Math.abs);
+  return {
+    score: vwKamaScore(f1, exposureAgreement, signalCleanliness),
+    precision,
+    recall,
+    f1,
+    rawPrecision: eventRatio(matchedCount, signalCount, oracleCount),
+    rawRecall: eventRatio(matchedCount, oracleCount, signalCount),
+    exposureAgreement,
+    noiseSignalRatio: noiseSignalRatio(extraSignalCount, matchedCount),
+    signalCleanliness,
+    signalsPerDay: signalCount / Math.max(intervalMs / DAY_MS, candleCount * intervalMs / DAY_MS),
+    signalCount,
+    oracleCount,
+    matchedCount,
+    extraSignalCount,
+    missedOracleCount: oracleCount - matchedCount,
+    lagP50Ms: percentile(absoluteLags, 0.5),
+    lagP90Ms: percentile(absoluteLags, 0.9),
+    lagP95Ms: percentile(absoluteLags, 0.95),
+    lagMedianSignedMs: percentile(lags, 0.5),
   };
 }
 
@@ -1695,8 +1740,8 @@ function combineExposureReturns(parts: ExposureReturnMetrics[]): ExposureReturnM
   };
 }
 
-function hourlyRatePerCandle(hourlyRate: number, intervalMs: number): number {
-  return Math.expm1(Math.log1p(hourlyRate) * intervalMs / 3_600_000);
+function hourlyRatePerCandle(hourlyRateBps: number, intervalMs: number): number {
+  return Math.expm1(Math.log1p(hourlyRateBps / 10_000) * intervalMs / 3_600_000);
 }
 
 function handcraftedPredictorOptions(
@@ -1835,6 +1880,7 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   const request = structuredClone(input);
   request.latestDays = normalizeLatestDays(request.latestDays);
+  request.oracleEmaWindowMs ??= VW_KAMA_ORACLE_EMA_WINDOW_MS;
   request.predictor = {
     model: request.predictor?.model ?? "handcrafted",
     handcraftedParameters: {
@@ -2039,6 +2085,9 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
     || !Number.isFinite(valueConfig.oracleTemperature) || valueConfig.oracleTemperature <= 0
     || typeof valueConfig.strategyVolatilityScaling !== "boolean") {
     throw new Error("VW-KAMA value and strategy calibration settings are invalid.");
+  }
+  if (!Number.isFinite(request.oracleEmaWindowMs) || request.oracleEmaWindowMs <= 0) {
+    throw new Error("VW-KAMA oracle EMA window must be finite and positive.");
   }
   if ([
     valueConfig.opportunityEpsilon,

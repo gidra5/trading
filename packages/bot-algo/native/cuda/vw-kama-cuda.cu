@@ -2385,6 +2385,500 @@ __device__ __forceinline__ void prepare_compact_oracle_scans(
   __syncwarp(mask);
 }
 
+__global__ void prepare_compact_oracle_transitions_kernel(
+  int scored_count,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float friction,
+  const float* holding_values,
+  const float* endpoint_exposures,
+  float* sell_potentials,
+  float* buy_potentials,
+  uint8_t* endpoint_cursors
+) {
+  const size_t cell = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t cell_count = static_cast<size_t>(scored_count) * grid_size;
+  if (cell >= cell_count) return;
+  const float holding = holding_values[cell];
+  const float endpoint = endpoint_exposures[cell];
+  if (!isfinite(holding)) {
+    sell_potentials[cell] = -INFINITY;
+    buy_potentials[cell] = -INFINITY;
+    endpoint_cursors[cell] = 0;
+    return;
+  }
+
+  const float position = (endpoint - minimum_exposure)
+    / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+  endpoint_cursors[cell] = static_cast<uint8_t>(
+    endpoint < minimum_exposure
+      ? 0
+      : (endpoint >= maximum_exposure
+          ? grid_size
+          : max(0, min(
+              grid_size,
+              static_cast<int>(floorf(position)) + 1
+            )))
+  );
+  const float sell_factor = 1.0f - friction * endpoint;
+  const float buy_factor = 1.0f - friction + friction * endpoint;
+  sell_potentials[cell] = sell_factor > 0.0f
+    ? holding + logf(sell_factor)
+    : -INFINITY;
+  buy_potentials[cell] = buy_factor > 0.0f
+    ? holding + logf(buy_factor)
+    : -INFINITY;
+}
+
+__device__ __forceinline__ void apply_prepared_compact_oracle_step(
+  size_t row,
+  int grid_size,
+  const float* sell_potentials,
+  const float* buy_potentials,
+  const uint8_t* endpoint_cursors,
+  const float* sell_logs,
+  const float* buy_logs,
+  float* values,
+  float* suffix_scratch,
+  int lane,
+  unsigned int mask
+) {
+  constexpr int actions_per_lane = 8;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    if (target < grid_size) suffix_scratch[target] = values[target];
+  }
+  __syncwarp(mask);
+  prepare_compact_oracle_scans(
+    values,
+    suffix_scratch,
+    sell_logs,
+    buy_logs,
+    grid_size,
+    lane,
+    mask
+  );
+
+  float forced_values[actions_per_lane];
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int source = group * warpSize + lane;
+    float forced = -INFINITY;
+    if (source < grid_size) {
+      const size_t cell = row + source;
+      const int cursor = endpoint_cursors[cell];
+      const float sell = cursor > 0
+        ? sell_potentials[cell] + values[cursor - 1]
+        : -INFINITY;
+      const float buy = cursor < grid_size
+        ? buy_potentials[cell] + suffix_scratch[cursor]
+        : -INFINITY;
+      forced = fmaxf(sell, buy);
+    }
+    forced_values[group] = forced;
+  }
+  __syncwarp(mask);
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int source = group * warpSize + lane;
+    if (source < grid_size) values[source] = forced_values[group];
+  }
+  __syncwarp(mask);
+}
+
+/**
+ * Build exact dense products for aligned one-candle blocks. The products are
+ * Monge; each warp owns one destination column and walks the block backward,
+ * so no inter-block or grid-wide synchronization is required.
+ */
+__global__ void prepare_compact_oracle_monge_blocks_kernel(
+  int price_count,
+  int score_start,
+  int block_size,
+  int block_count,
+  int grid_size,
+  const float* sell_potentials,
+  const float* buy_potentials,
+  const uint8_t* endpoint_cursors,
+  const float* sell_logs,
+  const float* buy_logs,
+  float* block_matrices
+) {
+  constexpr int actions_per_lane = 8;
+  constexpr int warp_storage = 256;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int job = blockIdx.x * warps_per_block + warp;
+  if (job >= block_count * grid_size) return;
+  const int time_block = job / grid_size;
+  const int destination = job - time_block * grid_size;
+  const unsigned int mask = __activemask();
+  extern __shared__ float monge_block_storage[];
+  float* values = monge_block_storage + warp * warp_storage * 2;
+  float* scratch = values + warp_storage;
+
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int source = group * warpSize + lane;
+    if (source < grid_size) {
+      values[source] =
+        destination < grid_size && source == destination ? 0.0f : -INFINITY;
+    }
+  }
+  __syncwarp(mask);
+
+  const int block_start = score_start + time_block * block_size;
+  const int block_end = min(price_count - 1, block_start + block_size);
+  for (int time = block_end - 1; time >= block_start; --time) {
+    const size_t row = static_cast<size_t>(time - score_start) * grid_size;
+    apply_prepared_compact_oracle_step(
+      row,
+      grid_size,
+      sell_potentials,
+      buy_potentials,
+      endpoint_cursors,
+      sell_logs,
+      buy_logs,
+      values,
+      scratch,
+      lane,
+      mask
+    );
+  }
+
+  const size_t matrix =
+    static_cast<size_t>(time_block) * grid_size * grid_size;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int source = group * warpSize + lane;
+    if (source < grid_size) {
+      block_matrices[
+        matrix + static_cast<size_t>(source) * grid_size + destination
+      ] = values[source];
+    }
+  }
+}
+
+/**
+ * Exact max-plus matrix/vector multiplication for a 255x255 Monge matrix.
+ * Row maximizers are monotone. The perfect 2^8-1 row count lets each depth
+ * recover its column bounds from maximizers written at earlier depths,
+ * avoiding a per-warp recursion stack.
+ */
+template<int monge_grid_size, int monge_depth_count>
+__device__ __forceinline__ void apply_compact_monge_block(
+  const float* matrix,
+  const float* input,
+  float* output,
+  uint8_t* maximizers,
+  int lane,
+  unsigned int mask
+) {
+  #pragma unroll
+  for (int depth = 0; depth < monge_depth_count; ++depth) {
+    const int node_count = 1 << depth;
+    const int span = (monge_grid_size + 1) >> depth;
+    for (int node = lane; node < node_count; node += warpSize) {
+      const int row_lower = node * span;
+      const int row_upper = min(monge_grid_size - 1, (node + 1) * span - 2);
+      const int row = row_lower + (span >> 1) - 1;
+      const int column_lower = row_lower > 0 ? maximizers[row_lower - 1] : 0;
+      const int column_upper =
+        row_upper + 1 < monge_grid_size
+          ? maximizers[row_upper + 1]
+          : monge_grid_size - 1;
+      float maximum = -INFINITY;
+      int maximizing_column = column_lower;
+      for (int column = column_lower; column <= column_upper; ++column) {
+        const float candidate =
+          matrix[static_cast<size_t>(row) * monge_grid_size + column]
+            + input[column];
+        if (candidate > maximum) {
+          maximum = candidate;
+          maximizing_column = column;
+        }
+      }
+      output[row] = maximum;
+      maximizers[row] = static_cast<uint8_t>(maximizing_column);
+    }
+    __syncwarp(mask);
+  }
+}
+
+__device__ __forceinline__ void apply_compact_monge_block_by_grid(
+  int grid_size,
+  const float* matrix,
+  const float* input,
+  float* output,
+  uint8_t* maximizers,
+  int lane,
+  unsigned int mask
+) {
+  if (grid_size == 255) {
+    apply_compact_monge_block<255, 8>(
+      matrix,
+      input,
+      output,
+      maximizers,
+      lane,
+      mask
+    );
+  } else {
+    apply_compact_monge_block<15, 4>(
+      matrix,
+      input,
+      output,
+      maximizers,
+      lane,
+      mask
+    );
+  }
+}
+
+/**
+ * Use aligned Monge block products for the middle of every rolling horizon and
+ * retain the canonical one-candle recurrence for the two boundary fragments.
+ */
+__global__ void prepare_value_oracle_monge_distribution_kernel(
+  int price_count,
+  int score_start,
+  int holding_period_steps,
+  int value_horizon_steps,
+  int block_size,
+  int block_count,
+  int grid_size,
+  float minimum_exposure,
+  float maximum_exposure,
+  float friction,
+  float inverse_temperature,
+  const float* initial_holding_values,
+  const float* initial_endpoint_exposures,
+  const float* sell_potentials,
+  const float* buy_potentials,
+  const uint8_t* endpoint_cursors,
+  const float* sell_logs,
+  const float* buy_logs,
+  const float* block_matrices,
+  float* probabilities
+) {
+  constexpr int actions_per_lane = 8;
+  constexpr int warp_storage = 256;
+  const int lane = threadIdx.x & (warpSize - 1);
+  const int warp = threadIdx.x / warpSize;
+  const int warps_per_block = blockDim.x / warpSize;
+  const int time_offset = blockIdx.x * warps_per_block + warp;
+  const int scored_count = price_count - score_start;
+  if (time_offset >= scored_count) return;
+  const int time = score_start + time_offset;
+  const unsigned int mask = __activemask();
+  extern __shared__ float monge_distribution_storage[];
+  float* values = monge_distribution_storage + warp * warp_storage * 3;
+  float* scratch = values + warp_storage;
+  float* alternate = scratch + warp_storage;
+  uint8_t* maximizers = reinterpret_cast<uint8_t*>(
+    monge_distribution_storage + warps_per_block * warp_storage * 3
+  ) + warp * warp_storage;
+
+  const int zero_index = static_cast<int>(llround(
+    -minimum_exposure / (maximum_exposure - minimum_exposure) * (grid_size - 1)
+  ));
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    if (target < grid_size) {
+      values[target] = target == zero_index ? 0.0f : -INFINITY;
+    }
+  }
+  __syncwarp(mask);
+
+  const int terminal_time = min(price_count - 1, time + value_horizon_steps);
+  const int initial_endpoint_time = min(
+    terminal_time,
+    time + holding_period_steps
+  );
+  const int relative_start = initial_endpoint_time - score_start;
+  const int relative_end = terminal_time - score_start;
+  const int first_full_block = (relative_start + block_size - 1) / block_size;
+  const int last_full_block = relative_end / block_size;
+
+  if (first_full_block < last_full_block) {
+    const int right_boundary = score_start + last_full_block * block_size;
+    for (int chain_time = terminal_time - 1;
+      chain_time >= right_boundary; --chain_time) {
+      const size_t row =
+        static_cast<size_t>(chain_time - score_start) * grid_size;
+      apply_prepared_compact_oracle_step(
+        row,
+        grid_size,
+        sell_potentials,
+        buy_potentials,
+        endpoint_cursors,
+        sell_logs,
+        buy_logs,
+        values,
+        scratch,
+        lane,
+        mask
+      );
+    }
+    for (int time_block = last_full_block - 1;
+      time_block >= first_full_block; --time_block) {
+      if (time_block >= block_count) continue;
+      const float* matrix = block_matrices
+        + static_cast<size_t>(time_block) * grid_size * grid_size;
+      apply_compact_monge_block_by_grid(
+        grid_size,
+        matrix,
+        values,
+        alternate,
+        maximizers,
+        lane,
+        mask
+      );
+      float* previous = values;
+      values = alternate;
+      alternate = previous;
+      __syncwarp(mask);
+    }
+    const int left_boundary = score_start + first_full_block * block_size;
+    for (int chain_time = left_boundary - 1;
+      chain_time >= initial_endpoint_time; --chain_time) {
+      const size_t row =
+        static_cast<size_t>(chain_time - score_start) * grid_size;
+      apply_prepared_compact_oracle_step(
+        row,
+        grid_size,
+        sell_potentials,
+        buy_potentials,
+        endpoint_cursors,
+        sell_logs,
+        buy_logs,
+        values,
+        scratch,
+        lane,
+        mask
+      );
+    }
+  } else {
+    for (int chain_time = terminal_time - 1;
+      chain_time >= initial_endpoint_time; --chain_time) {
+      const size_t row =
+        static_cast<size_t>(chain_time - score_start) * grid_size;
+      apply_prepared_compact_oracle_step(
+        row,
+        grid_size,
+        sell_potentials,
+        buy_potentials,
+        endpoint_cursors,
+        sell_logs,
+        buy_logs,
+        values,
+        scratch,
+        lane,
+        mask
+      );
+    }
+  }
+
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    if (target < grid_size) scratch[target] = values[target];
+  }
+  __syncwarp(mask);
+  prepare_compact_oracle_scans(
+    values,
+    scratch,
+    sell_logs,
+    buy_logs,
+    grid_size,
+    lane,
+    mask
+  );
+
+  const size_t initial_row = static_cast<size_t>(time_offset) * grid_size;
+  float forced_values[actions_per_lane];
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    float forced = -INFINITY;
+    if (target < grid_size) {
+      const size_t index = initial_row + target;
+      const float holding = initial_holding_values[index];
+      if (isfinite(holding)) {
+        const float endpoint = initial_endpoint_exposures[index];
+        const float position = (endpoint - minimum_exposure)
+          / (maximum_exposure - minimum_exposure) * (grid_size - 1);
+        const int cursor = endpoint < minimum_exposure
+          ? 0
+          : (endpoint >= maximum_exposure
+              ? grid_size
+              : max(0, min(
+                  grid_size,
+                  static_cast<int>(floorf(position)) + 1
+                )));
+        const float sell_factor = 1.0f - friction * endpoint;
+        const float buy_factor = 1.0f - friction + friction * endpoint;
+        const float sell = cursor > 0 && sell_factor > 0.0f
+          ? holding + logf(sell_factor) + values[cursor - 1]
+          : -INFINITY;
+        const float buy = cursor < grid_size && buy_factor > 0.0f
+          ? holding + logf(buy_factor) + scratch[cursor]
+          : -INFINITY;
+        forced = fmaxf(sell, buy);
+      }
+    }
+    forced_values[group] = forced;
+  }
+
+  float maximum_forced = -INFINITY;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    if (target < grid_size) {
+      maximum_forced = fmaxf(maximum_forced, forced_values[group]);
+    }
+  }
+  #pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    maximum_forced = fmaxf(
+      maximum_forced,
+      __shfl_down_sync(mask, maximum_forced, offset)
+    );
+  }
+  maximum_forced = __shfl_sync(mask, maximum_forced, 0);
+  if (!isfinite(maximum_forced)) return;
+
+  float weights[actions_per_lane];
+  float total = 0.0f;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    const float weight =
+      target < grid_size && isfinite(forced_values[group])
+        ? expf((forced_values[group] - maximum_forced) * inverse_temperature)
+        : 0.0f;
+    weights[group] = weight;
+    total += weight;
+  }
+  #pragma unroll
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+    total += __shfl_down_sync(mask, total, offset);
+  }
+  total = __shfl_sync(mask, total, 0);
+  const size_t output_row = static_cast<size_t>(time) * grid_size;
+  #pragma unroll
+  for (int group = 0; group < actions_per_lane; ++group) {
+    const int target = group * warpSize + lane;
+    if (target < grid_size) {
+      probabilities[output_row + target] = weights[group] / total;
+    }
+  }
+}
+
 /**
  * One warp builds one complete canonical target row:
  *   forced H-step hold + one-candle optimal continuation + terminal closeout.
@@ -5333,6 +5827,17 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
       && grid_size <= 256 && !action_values && !include_path
       && value_horizon_steps < price_count - 1 - score_start;
     const bool fused_compact_distribution = compact_distribution;
+    constexpr int monge_block_size = 256;
+    const int continuation_steps = value_horizon_steps - holding_period_steps;
+    const int continuation_operator_count = price_count - 1 - score_start;
+    const int monge_block_count = continuation_operator_count / monge_block_size;
+    const bool monge_block_candidate = fused_compact_distribution
+      && (grid_size == 15 || grid_size == 255)
+      && continuation_steps >= monge_block_size * 2
+      && monge_block_count > 0;
+    const size_t monge_block_cells = monge_block_candidate
+      ? static_cast<size_t>(monge_block_count) * grid_size * grid_size
+      : 0;
     const size_t double_oracle_cells = compact_distribution ? 0 : oracle_cells;
     const size_t compact_transition_cells =
       compact_distribution && !fused_compact_distribution ? oracle_cells : 0;
@@ -5351,6 +5856,12 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
     if (required_cell_bytes > free_device_bytes * 4 / 5) {
       throw std::runtime_error("Exposure-value CUDA oracle grid exceeds the device-memory admission limit");
     }
+    const size_t monge_extra_bytes = monge_block_candidate
+      ? oracle_cells * (2 * sizeof(float) + sizeof(uint8_t))
+        + monge_block_cells * sizeof(float)
+      : 0;
+    const bool monge_block_distribution = monge_block_candidate
+      && required_cell_bytes + monge_extra_bytes <= free_device_bytes * 4 / 5;
     DeviceBuffer<double> continuations(double_oracle_cells);
     DeviceBuffer<double> alternate_continuations(double_oracle_cells);
     DeviceBuffer<double> holding_values(double_oracle_cells);
@@ -5365,6 +5876,18 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
     );
     DeviceBuffer<float> compact_initial_endpoint_exposures(
       fused_compact_distribution ? oracle_cells : 0
+    );
+    DeviceBuffer<float> compact_sell_potentials(
+      monge_block_distribution ? oracle_cells : 0
+    );
+    DeviceBuffer<float> compact_buy_potentials(
+      monge_block_distribution ? oracle_cells : 0
+    );
+    DeviceBuffer<uint8_t> compact_endpoint_cursors(
+      monge_block_distribution ? oracle_cells : 0
+    );
+    DeviceBuffer<float> compact_monge_blocks(
+      monge_block_distribution ? monge_block_cells : 0
     );
     const bool needs_rebalance_matrix = !separable_rebalance_costs;
     DeviceBuffer<double> rebalance_logs(
@@ -5641,32 +6164,103 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
         prepare_holds(price_count, 1);
         constexpr int distribution_threads = 256;
         constexpr int distribution_warps = distribution_threads / 32;
-        constexpr size_t distribution_storage_bytes =
-          static_cast<size_t>(distribution_threads) * 16 * sizeof(float);
         const int distribution_blocks =
           (scored_count + distribution_warps - 1) / distribution_warps;
-        prepare_value_oracle_fused_distribution_kernel<<<
-          distribution_blocks,
-          distribution_threads,
-          distribution_storage_bytes
-        >>>(
-          price_count,
-          score_start,
-          holding_period_steps,
-          value_horizon_steps,
-          grid_size,
-          static_cast<float>(minimum_exposure),
-          static_cast<float>(maximum_exposure),
-          static_cast<float>(friction),
-          static_cast<float>(1.0 / temperature),
-          compact_initial_holding_values.get(),
-          compact_initial_endpoint_exposures.get(),
-          compact_holding_values.get(),
-          compact_endpoint_exposures.get(),
-          compact_sell_logs.get(),
-          compact_buy_logs.get(),
-          device_probabilities.get()
-        );
+        if (monge_block_distribution) {
+          prepare_compact_oracle_transitions_kernel<<<hold_blocks, hold_threads>>>(
+            scored_count,
+            grid_size,
+            static_cast<float>(minimum_exposure),
+            static_cast<float>(maximum_exposure),
+            static_cast<float>(friction),
+            compact_holding_values.get(),
+            compact_endpoint_exposures.get(),
+            compact_sell_potentials.get(),
+            compact_buy_potentials.get(),
+            compact_endpoint_cursors.get()
+          );
+          cuda_check(cudaGetLastError(), "prepare compact Monge oracle transitions");
+          constexpr int monge_build_threads = 256;
+          constexpr int monge_build_warps = monge_build_threads / 32;
+          const int monge_jobs = monge_block_count * grid_size;
+          const int monge_build_blocks =
+            (monge_jobs + monge_build_warps - 1) / monge_build_warps;
+          constexpr size_t monge_build_storage_bytes =
+            static_cast<size_t>(monge_build_threads) * 16 * sizeof(float);
+          prepare_compact_oracle_monge_blocks_kernel<<<
+            monge_build_blocks,
+            monge_build_threads,
+            monge_build_storage_bytes
+          >>>(
+            price_count,
+            score_start,
+            monge_block_size,
+            monge_block_count,
+            grid_size,
+            compact_sell_potentials.get(),
+            compact_buy_potentials.get(),
+            compact_endpoint_cursors.get(),
+            compact_sell_logs.get(),
+            compact_buy_logs.get(),
+            compact_monge_blocks.get()
+          );
+          cuda_check(cudaGetLastError(), "build compact Monge oracle blocks");
+          constexpr size_t monge_distribution_storage_bytes =
+            static_cast<size_t>(distribution_warps)
+              * (256 * 3 * sizeof(float) + 256 * sizeof(uint8_t));
+          prepare_value_oracle_monge_distribution_kernel<<<
+            distribution_blocks,
+            distribution_threads,
+            monge_distribution_storage_bytes
+          >>>(
+            price_count,
+            score_start,
+            holding_period_steps,
+            value_horizon_steps,
+            monge_block_size,
+            monge_block_count,
+            grid_size,
+            static_cast<float>(minimum_exposure),
+            static_cast<float>(maximum_exposure),
+            static_cast<float>(friction),
+            static_cast<float>(1.0 / temperature),
+            compact_initial_holding_values.get(),
+            compact_initial_endpoint_exposures.get(),
+            compact_sell_potentials.get(),
+            compact_buy_potentials.get(),
+            compact_endpoint_cursors.get(),
+            compact_sell_logs.get(),
+            compact_buy_logs.get(),
+            compact_monge_blocks.get(),
+            device_probabilities.get()
+          );
+          cuda_check(cudaGetLastError(), "launch compact Monge oracle distribution");
+        } else {
+          constexpr size_t distribution_storage_bytes =
+            static_cast<size_t>(distribution_threads) * 16 * sizeof(float);
+          prepare_value_oracle_fused_distribution_kernel<<<
+            distribution_blocks,
+            distribution_threads,
+            distribution_storage_bytes
+          >>>(
+            price_count,
+            score_start,
+            holding_period_steps,
+            value_horizon_steps,
+            grid_size,
+            static_cast<float>(minimum_exposure),
+            static_cast<float>(maximum_exposure),
+            static_cast<float>(friction),
+            static_cast<float>(1.0 / temperature),
+            compact_initial_holding_values.get(),
+            compact_initial_endpoint_exposures.get(),
+            compact_holding_values.get(),
+            compact_endpoint_exposures.get(),
+            compact_sell_logs.get(),
+            compact_buy_logs.get(),
+            device_probabilities.get()
+          );
+        }
       } else {
         const int closeout_blocks = static_cast<int>(
           (oracle_cells + hold_threads - 1) / hold_threads
@@ -5684,7 +6278,6 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
         prepare_holds(price_count, 1);
         prior = continuations.get();
         double* current = alternate_continuations.get();
-        const int continuation_steps = value_horizon_steps - holding_period_steps;
         for (int step = 0; step < continuation_steps; ++step) {
           launch_chains(
             std::false_type{}, std::true_type{}, std::true_type{},

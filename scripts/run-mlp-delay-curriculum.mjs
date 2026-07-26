@@ -48,13 +48,14 @@ if (dryRun) {
     delaysMinutes,
     firstPhaseScratch: true,
     epochsPerPhase: curriculum.epochsPerPhase,
-    patience: curriculum.patience,
+    earlyStopping: "target-only",
     targetValidationMetric: "baseKlDivergence",
     targetValidationBaseKl: curriculum.targetValidationBaseKl,
     targetRepresentation: basePlan.training.targetRepresentation,
     samplingIntervalMs: curriculumPlan.samplingIntervalMs,
+    regenerateRawOracle: curriculum.regenerateRawOracle,
     datasetRetention: curriculum.datasetRetention,
-    modelRetention: "all",
+    modelRetention: curriculum.modelRetention,
     minimumFreeSpaceGb: curriculum.minimumFreeSpaceGb,
   }, null, 2)}\n`);
   process.exit(0);
@@ -88,7 +89,7 @@ let summary = readJson(summaryFile) ?? {
   basePlanFile: relative(basePlanFile),
   delayScheduleMinutes: delaysMinutes,
   epochsPerPhase: curriculum.epochsPerPhase,
-  patience: curriculum.patience,
+  earlyStopping: "target-only",
   targetValidationMetric: "baseKlDivergence",
   targetValidationBaseKl: curriculum.targetValidationBaseKl,
   completedPhases: [],
@@ -97,6 +98,7 @@ let summary = readJson(summaryFile) ?? {
 };
 summary = {
   ...summary,
+  earlyStopping: "target-only",
   targetValidationMetric: "baseKlDivergence",
   targetValidationBaseKl: curriculum.targetValidationBaseKl,
   completedPhases: (summary.completedPhases ?? []).map((phase) => ({
@@ -108,6 +110,7 @@ summary = {
     ),
   })),
 };
+delete summary.patience;
 delete summary.targetValidationKl;
 let activeChild;
 let activePhaseFinalizeFile;
@@ -167,17 +170,24 @@ try {
         summary.completedPhases.push(recovered);
         writeSummary();
       }
+      pruneCompletedPhaseCheckpoint(phase);
       pruneCompletedPhaseDataset(phaseIndex, phase);
       continue;
     }
     const previousDelaySeconds = phaseIndex === 0
       ? undefined
       : delaysMinutes[phaseIndex - 1] * 60;
-    const generatedPlan = generatePhasePlan(
+    stageParentCheckpoint(phaseIndex, phase, previousDelaySeconds);
+    let phaseEpochLimit = Math.max(
+      curriculum.epochsPerPhase,
+      readJson(phase.planFile)?.training?.epochs ?? 0,
+    );
+    let generatedPlan = generatePhasePlan(
       phaseIndex,
       delayMinutes,
       phase,
       previousDelaySeconds,
+      phaseEpochLimit,
     );
     atomicJson(phase.planFile, generatedPlan);
     activePhaseFinalizeFile = path.join(phase.runDir, "FINALIZE");
@@ -195,7 +205,9 @@ try {
       phasePlanFile: phase.planFile,
       message: (
         `Preparing delay ${delayMinutes}m (${phaseIndex + 1}/${delaysMinutes.length}); `
-        + "reusing shared compressed input/oracle components."
+        + (phaseIndex === 0 && curriculum.regenerateRawOracle
+          ? "regenerating raw one-second and one-minute oracle distributions."
+          : "reusing the regenerated compressed oracle components.")
       ),
     };
     writeStatus();
@@ -205,25 +217,64 @@ try {
       path.join(repoRoot, "scripts/build-mlp-dataset.ts"),
       "--plan", phase.planFile,
     ]);
-    status = {
-      ...status,
-      stage: "training",
-      message: (
-        `Training delay ${delayMinutes}m from ${phaseIndex === 0 ? "scratch" : "the previous phase"} `
-        + `until validation base KL ≤ ${curriculum.targetValidationBaseKl} `
-        + `or patience ${curriculum.patience}.`
-      ),
-    };
-    writeStatus();
-    await runStage("training", process.execPath, [
-      path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
-      path.join(repoRoot, "scripts/run-mlp-training.mjs"),
-      "--plan", phase.planFile,
-      "--training-only",
-      "--skip-contract-build",
-    ]);
-    patchManifestCurriculum(phaseIndex, delayMinutes, phase);
-    const completed = completedPhase(phaseIndex, delayMinutes, phase);
+    let completed;
+    while (!completed?.validationTargetReached) {
+      status = {
+        ...status,
+        stage: "training",
+        message: (
+          `Training delay ${delayMinutes}m from ${phaseIndex === 0 ? "scratch" : "the previous phase"} `
+          + `until validation base KL ≤ ${curriculum.targetValidationBaseKl}; `
+          + "patience stopping is disabled."
+        ),
+      };
+      writeStatus();
+      await runStage("training", process.execPath, [
+        path.join(repoRoot, "scripts/run-node-with-ml-libs.mjs"),
+        path.join(repoRoot, "scripts/run-mlp-training.mjs"),
+        "--plan", phase.planFile,
+        "--training-only",
+        "--skip-contract-build",
+      ]);
+      patchManifestCurriculum(phaseIndex, delayMinutes, phase);
+      completed = completedPhase(phaseIndex, delayMinutes, phase);
+      retainOnlyPhaseModel(phase);
+      if (!completed.validationTargetReached) {
+        if (fs.existsSync(finalizeFile)) {
+          status = {
+            ...status,
+            stage: "paused",
+            pausedAt: new Date().toISOString(),
+            message: (
+              `Paused at delay ${delayMinutes}m before reaching validation base KL `
+              + `${curriculum.targetValidationBaseKl}.`
+            ),
+          };
+          writeStatus();
+          process.exit(0);
+        }
+        phaseEpochLimit += curriculum.epochsPerPhase;
+        generatedPlan = generatePhasePlan(
+          phaseIndex,
+          delayMinutes,
+          phase,
+          previousDelaySeconds,
+          phaseEpochLimit,
+        );
+        atomicJson(phase.planFile, generatedPlan);
+        status = {
+          ...status,
+          stage: "training",
+          epochs: phaseEpochLimit,
+          message: (
+            `Delay ${delayMinutes}m has not reached validation base KL `
+            + `${curriculum.targetValidationBaseKl}; extending the same phase to `
+            + `${phaseEpochLimit} epochs.`
+          ),
+        };
+        writeStatus();
+      }
+    }
     summary.completedPhases = [
       ...summary.completedPhases.filter((entry) => entry.stage !== phaseIndex + 1),
       completed,
@@ -240,6 +291,7 @@ try {
       ),
     };
     writeStatus();
+    pruneCompletedPhaseCheckpoint(phase);
     pruneCompletedPhaseDataset(phaseIndex, phase);
     activePhaseFinalizeFile = undefined;
     if (fs.existsSync(finalizeFile)) {
@@ -307,11 +359,11 @@ function validateCurriculum(plan, source) {
     || value.startDelayMinutes < value.endDelayMinutes
     || !Number.isInteger(value.epochsPerPhase)
     || value.epochsPerPhase <= 0
-    || !Number.isInteger(value.patience)
-    || value.patience <= 0
     || !Number.isFinite(value.targetValidationBaseKl)
     || value.targetValidationBaseKl <= 0
+    || value.regenerateRawOracle !== true
     || value.datasetRetention !== "anchor-and-active"
+    || value.modelRetention !== "smallest-delay-best-only"
     || !Number.isFinite(value.minimumFreeSpaceGb)
     || value.minimumFreeSpaceGb <= 0) {
     throw new Error("Invalid delayCurriculum configuration.");
@@ -353,20 +405,27 @@ function phasePaths(delaySeconds) {
     ),
     artifactDir: path.join(repoRoot, "data", "models", "mlp", modelId),
     runDir: path.join(phasesRunDir, suffix),
+    parentCheckpointFile: path.join(phasesRunDir, suffix, "parent-best-model.pt"),
   };
 }
 
-function generatePhasePlan(phaseIndex, delayMinutes, phase, previousDelaySeconds) {
+function generatePhasePlan(
+  phaseIndex,
+  delayMinutes,
+  phase,
+  previousDelaySeconds,
+  epochLimit,
+) {
   const phaseZeroDataset = phasePaths(delaysMinutes[0] * 60).datasetDir;
   const componentSeeds = [
+    ...(phaseIndex === 0 ? [] : [relative(phaseZeroDataset)]),
     ...(basePlan.componentSeedDatasetDirs ?? []),
     basePlan.datasetDir,
-    ...(phaseIndex === 0 ? [] : [relative(phaseZeroDataset)]),
   ];
   const training = {
     ...basePlan.training,
-    epochs: curriculum.epochsPerPhase,
-    patience: curriculum.patience,
+    epochs: epochLimit,
+    earlyStopping: "target-only",
     targetValidation: {
       baseKlDivergence: curriculum.targetValidationBaseKl,
     },
@@ -374,12 +433,11 @@ function generatePhasePlan(phaseIndex, delayMinutes, phase, previousDelaySeconds
     featureStatisticsCache: relative(path.join(runDir, "feature-statistics.npz")),
     reuseFeatureStatisticsCache: phaseIndex > 0,
   };
+  delete training.patience;
   delete training.initializeFromCheckpoint;
   delete training.inheritedBestEpoch;
   if (previousDelaySeconds !== undefined) {
-    training.initializeFromCheckpoint = relative(
-      phasePaths(previousDelaySeconds).artifactDir + path.sep + "best-model.pt",
-    );
+    training.initializeFromCheckpoint = relative(phase.parentCheckpointFile);
   }
   return {
     ...basePlan,
@@ -392,6 +450,7 @@ function generatePhasePlan(phaseIndex, delayMinutes, phase, previousDelaySeconds
     planFile: relative(phase.planFile),
     datasetDir: relative(phase.datasetDir),
     componentSeedDatasetDirs: [...new Set(componentSeeds)],
+    regenerateOracleComponents: phaseIndex === 0 && curriculum.regenerateRawOracle,
     minuteOracleComponentSeedDatasetDirs: phaseIndex === 0
       ? []
       : [relative(phaseZeroDataset)],
@@ -413,6 +472,7 @@ function generatePhasePlan(phaseIndex, delayMinutes, phase, previousDelaySeconds
       delayMs: delayMinutes * 60_000,
       targetValidationMetric: "baseKlDivergence",
       targetValidationBaseKl: curriculum.targetValidationBaseKl,
+      earlyStopping: "target-only",
       firstPhaseScratch: phaseIndex === 0,
     },
   };
@@ -483,21 +543,14 @@ function consume(stream, stderr) {
 
 function recoverCompletedPhase(phaseIndex, delayMinutes, phase) {
   const recorded = summary.completedPhases.find((entry) => entry.stage === phaseIndex + 1);
-  if (recorded && phaseArtifactsComplete(phase)) return recorded;
+  if (recorded?.validationTargetReached) return recorded;
   const phaseStatus = readJson(path.join(phase.runDir, "status.json"));
   if (phaseStatus?.stage === "complete" && phaseFilesComplete(phase)) {
     patchManifestCurriculum(phaseIndex, delayMinutes, phase);
-    return completedPhase(phaseIndex, delayMinutes, phase);
+    const completed = completedPhase(phaseIndex, delayMinutes, phase);
+    if (completed.validationTargetReached) return completed;
   }
   return undefined;
-}
-
-function phaseArtifactsComplete(phase) {
-  return [
-    path.join(phase.artifactDir, "best-model.pt"),
-    path.join(phase.artifactDir, "model.onnx"),
-    path.join(phase.artifactDir, "manifest.json"),
-  ].every((file) => fs.existsSync(file));
 }
 
 function phaseFilesComplete(phase) {
@@ -509,6 +562,58 @@ function phaseFilesComplete(phase) {
       "manifest.json",
     ].map((file) => path.join(phase.artifactDir, file)),
   ].every((file) => fs.existsSync(file));
+}
+
+function stageParentCheckpoint(phaseIndex, phase, previousDelaySeconds) {
+  if (phaseIndex === 0 || previousDelaySeconds === undefined) return;
+  if (fs.existsSync(phase.parentCheckpointFile)) return;
+  const source = path.join(
+    phasePaths(previousDelaySeconds).artifactDir,
+    "best-model.pt",
+  );
+  if (!fs.existsSync(source)) {
+    throw new Error(`Missing parent best model for delay curriculum: ${source}`);
+  }
+  fs.mkdirSync(path.dirname(phase.parentCheckpointFile), { recursive: true });
+  try {
+    fs.linkSync(source, phase.parentCheckpointFile);
+  } catch {
+    fs.copyFileSync(source, phase.parentCheckpointFile);
+  }
+}
+
+function retainOnlyPhaseModel(phase) {
+  if (curriculum.modelRetention !== "smallest-delay-best-only") return;
+  const modelRoot = path.dirname(phasePaths(delaysMinutes[0] * 60).artifactDir);
+  const expectedPrefix = `${curriculumPlan.id}-delay-`;
+  const target = path.resolve(phase.artifactDir);
+  if (path.dirname(target) !== modelRoot
+    || !path.basename(target).startsWith(expectedPrefix)
+    || !/-delay-\d+s$/.test(path.basename(target))) {
+    throw new Error(`Refusing to retain an unexpected curriculum model path: ${target}`);
+  }
+  for (const entry of fs.readdirSync(modelRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()
+      || !entry.name.startsWith(expectedPrefix)
+      || !/-delay-\d+s$/.test(entry.name)) continue;
+    const candidate = path.join(modelRoot, entry.name);
+    if (path.resolve(candidate) === target) continue;
+    fs.rmSync(candidate, { recursive: true, force: true });
+    appendLog(`${JSON.stringify({
+      event: "curriculum-model-pruned",
+      artifactDir: relative(candidate),
+      retainedArtifactDir: relative(target),
+    })}\n`);
+  }
+}
+
+function pruneCompletedPhaseCheckpoint(phase) {
+  for (const file of [
+    path.join(phase.artifactDir, "checkpoint.pt"),
+    phase.parentCheckpointFile,
+  ]) {
+    fs.rmSync(file, { force: true });
+  }
 }
 
 function pruneCompletedPhaseDataset(phaseIndex, phase) {

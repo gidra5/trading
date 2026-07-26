@@ -16,6 +16,7 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
   const dataDir = await fixture();
   try {
     const engine = new KamaInspectorEngine(dataDir, { now: () => FIXED_NOW });
+    assert.equal(engine.catalog().defaults.oracleEmaWindowMs, 60_000);
     const latest = engine.catalog().windows.find((window) => window.id === "latest");
     assert.equal(latest?.endTime, LATEST_END);
     assert.match(latest?.label ?? "", /last 7 days/);
@@ -32,14 +33,22 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(raw.indicatorPoints.length, raw.candles.length);
     assert.equal(raw.valueDistributions.length, raw.candles.length);
     assert.equal(raw.valueCandidatePath.length, raw.candles.length);
+    assert.equal(raw.valueOraclePredictionPath.length, raw.candles.length);
+    assert.equal(raw.valueOracleEmaPath.length, raw.candles.length);
     assert.ok(raw.valueCandidatePath.every((point) =>
       Number.isFinite(point.exposure)
       && Number.isFinite(point.equity)
       && point.equity >= 0));
     assert.ok(raw.valueDistributions.every((point) =>
       Math.abs(point.values.reduce((sum, value) => sum + value.oracleProbability, 0) - 1) < 1e-6
+      && Math.abs(point.values.reduce(
+        (sum, value) => sum + value.oracleEmaProbability,
+        0,
+      ) - 1) < 1e-6
       && Math.abs(point.values.reduce((sum, value) => sum + value.strategyProbability, 0) - 1) < 1e-9
       && point.predictor !== undefined));
+    assert.ok(raw.valueDistributions.some((point) =>
+      point.values.filter((value) => value.oracleProbability > 1e-9).length > 10));
     assert.deepEqual(
       raw.kamaSeries.points.map((point) => point.time),
       raw.candles.map((candle) => candle.closeTime),
@@ -154,6 +163,15 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.equal(analysis.metrics.valueDistillation!.valueHorizonMs, 3_600_000);
     assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.strategy.totalReturn));
     assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.oracle.totalReturn));
+    assert.ok(Number.isFinite(
+      analysis.metrics.valueDistillation!.returns.oraclePrediction.totalReturn,
+    ));
+    assert.ok(Number.isFinite(analysis.metrics.valueDistillation!.returns.oracleEma.totalReturn));
+    assert.ok(analysis.oraclePredictionMetrics);
+    assert.ok(analysis.oracleEmaMetrics);
+    assert.ok(analysis.oraclePredictionPath.points.length > 0);
+    assert.ok(analysis.oracleEmaPath.points.length > 0);
+    assert.equal(analysis.oracleEmaPath.windowMs, 15_000);
     assert.equal(analysis.indicatorPoints.length, analysis.kamaSeries.points.length);
     assert.deepEqual(
       analysis.indicatorPoints.map((point) => point.time),
@@ -202,6 +220,7 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
       gridSize: 11,
       holdingPeriodMs: 1_000,
       valueHorizonMs: 10_000,
+      horizonEndMode: "truncate" as const,
     };
     const legacy = await engine.candles({
       ...analysisRequest(),
@@ -423,6 +442,28 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
     assert.equal(catalog.predictorPresets.length, 68);
     assert.equal(catalog.defaults.predictor?.model, "handcrafted");
     assert.equal(catalog.defaults.predictor?.mlpOracleAlignment, "model-target");
+    assert.deepEqual(catalog.defaults.valueDistillation, {
+      gridSize: 255,
+      minExposure: -100,
+      maxExposure: 100,
+      maxEffectiveExposure: 250,
+      initialExposure: 0,
+      holdingPeriodMode: "fixed",
+      holdingPeriodMs: 60_000,
+      valueHorizonMode: "fixed",
+      valueHorizonMs: 3_600_000,
+      horizonEndMode: "extend",
+      oracleTemperature: 0.01,
+      strategyVolatilityScaling: false,
+      opportunityEpsilon: 0.000001,
+      quoteBorrowRate: 5,
+      assetBorrowRate: 5,
+      entropyGapLambda: 0,
+      stateMutualInformationLambda: 0,
+      oracleMutualInformationLambda: 0,
+      oracleMutualInformationMode: "approximate",
+      mutualInformationBins: 15,
+    });
     assert.deepEqual(catalog.mlpModels, [{
       id: "catalog-test",
       label: "Catalog test MLP",
@@ -490,7 +531,15 @@ async function fixture(futureShockAfterIndex?: number): Promise<string> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "kama-inspector-"));
   const root = path.join(dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
   await mkdir(root, { recursive: true });
-  const dates = ["2024-02-21", "2024-02-22", "2024-02-23", "2024-02-24", "2024-02-25", "2024-02-26"];
+  const dates = [
+    "2024-02-21",
+    "2024-02-22",
+    "2024-02-23",
+    "2024-02-24",
+    "2024-02-25",
+    "2024-02-26",
+    "2024-02-27",
+  ];
   const byDate = new Map(dates.map((date) => [date, [] as Candle[]]));
   byDate.get("2024-02-23")!.push(candle(-1));
   for (let index = 0; index < 2_400; index += 1) {
@@ -557,8 +606,31 @@ function analysisRequest(): VwKamaInspectorRequest {
       deadbandMode: "hold",
     },
     oracleFriction: 0.001,
+    oracleEmaWindowMs: 15_000,
     matchWindowMs: 10_000,
     timingHalfLifeMs: 1_000,
     warmupMultiple: 1,
+    valueDistillation: {
+      gridSize: 255,
+      minExposure: -100,
+      maxExposure: 100,
+      maxEffectiveExposure: 250,
+      initialExposure: 0,
+      holdingPeriodMode: "fixed",
+      holdingPeriodMs: 60_000,
+      valueHorizonMode: "fixed",
+      valueHorizonMs: 3_600_000,
+      horizonEndMode: "truncate",
+      oracleTemperature: 0.01,
+      strategyVolatilityScaling: false,
+      opportunityEpsilon: 0.000001,
+      quoteBorrowRate: 5,
+      assetBorrowRate: 5,
+      entropyGapLambda: 0,
+      stateMutualInformationLambda: 0,
+      oracleMutualInformationLambda: 0,
+      oracleMutualInformationMode: "approximate",
+      mutualInformationBins: 15,
+    },
   };
 }

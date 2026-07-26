@@ -140,6 +140,49 @@ test("CUDA oracle distributions match brute-force ground truth", async (context)
   }
 });
 
+test("CUDA Monge block distributions match brute-force ground truth", async (context) => {
+  const status = await vwKamaCudaStatus();
+  if (!status.available) {
+    context.skip(status.reason);
+    return;
+  }
+  const fixture: OracleFixture = {
+    name: "aligned Monge blocks with rolling boundary fragments",
+    prices: Array.from({ length: 540 }, (_, index) =>
+      100 * Math.exp(
+        index * 0.00005
+          + Math.sin(index * 0.17) * 0.08
+          + Math.cos(index * 0.041) * 0.03,
+      )),
+    options: {
+      scoreStartIndex: 0,
+      holdingPeriodSteps: 1,
+      valueHorizonSteps: 513,
+      friction: 0.00175,
+      gridSize: 15,
+      minExposure: -4,
+      maxExposure: 4,
+      maxEffectiveExposure: 8,
+      temperature: 0.01,
+      quoteBorrowRate: 0.00001,
+      assetBorrowRate: 0.00001,
+    },
+  };
+  const expected = prepareBruteForceExposureValueOracle(
+    fixture.prices,
+    fixture.options,
+  );
+  const { oracle: actual } = await prepareExposureValueOracleCuda(fixture.prices, {
+    ...fixture.options,
+    includeProbabilities: true,
+    includePath: false,
+    distributionOnly: true,
+  });
+  // Both the direct and blocked CUDA recurrences accumulate float32 values
+  // across 512 continuation steps; the reference intentionally stays float64.
+  assertOracleProbabilitiesMatchReference(actual, expected, fixture, 1e-4);
+});
+
 function assertOracleMatchesReference(
   actual: ExposureValueOracle,
   expected: ReturnType<typeof prepareBruteForceExposureValueOracle>,

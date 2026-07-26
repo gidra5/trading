@@ -55,6 +55,19 @@ test("conditional exposure probabilities are the normalized transition policy us
   }
 });
 
+test("conditional exposure probabilities reject policies with no solvent supported action", () => {
+  assert.throws(
+    () => conditionalExposureProbabilities(
+      Float64Array.of(1, 0, 0),
+      Float64Array.of(-1, 0, 1),
+      100,
+      0.02,
+      1,
+    ),
+    /no valid target action/,
+  );
+});
+
 test("conditional quadratic policy fit recovers shared predictor coefficients", () => {
   const grid = Float64Array.from({ length: 41 }, (_, index) => -2 + index / 10);
   const currentExposures = Float64Array.of(-1.7, -0.3, 0.8, 1.9);
