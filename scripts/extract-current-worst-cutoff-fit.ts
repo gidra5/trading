@@ -26,7 +26,7 @@ interface TrainingPlan {
     maximumUsableExposure: number;
     minimumEffectiveExposure: number;
     maximumEffectiveExposure: number;
-    maintenanceBpsHour: { quoteLend: number; quoteBorrow: number; assetBorrow: number };
+    maintenanceBpsHour: { quoteBorrow: number; assetBorrow: number };
     gridSize: number;
     temperature: number;
     holdingPeriodSteps: number;
@@ -121,7 +121,6 @@ async function main(): Promise<void> {
     Math.abs(plan.execution.maximumEffectiveExposure),
   );
   const maintenance = {
-    quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
     quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
     assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
   };

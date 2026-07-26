@@ -173,10 +173,9 @@ test("exposure-value oracle can retain absolute post-action log returns", () => 
   assert.equal(truncateExposureValueOracle(oracle, 1).actionValues?.length, oracle.grid.length);
 });
 
-test("passive holding is an exact linear transform in quote and asset amounts", () => {
+test("passive holding is an exact amount transform before terminal closeout", () => {
   const prices = [100, 103, 98, 107, 109];
   const holdingPeriodSteps = 3;
-  const quoteLendRate = 0.0001;
   const quoteBorrowRate = 0.0002;
   const assetBorrowRate = 0.0003;
   const oracle = prepareExposureValueOracle(prices, {
@@ -189,7 +188,6 @@ test("passive holding is an exact linear transform in quote and asset amounts", 
     maxExposure: 2,
     maxEffectiveExposure: 1_000,
     temperature: 0.01,
-    quoteLendRate,
     quoteBorrowRate,
     assetBorrowRate,
     includeActionValues: true,
@@ -198,14 +196,18 @@ test("passive holding is an exact linear transform in quote and asset amounts", 
   const priceRatio = prices[holdingPeriodSteps]! / prices[0]!;
   for (let index = 0; index < oracle.grid.length; index += 1) {
     const exposure = oracle.grid[index]!;
-    const quoteFactor = (1 + (
-      exposure <= 1 ? quoteLendRate : quoteBorrowRate
-    )) ** holdingPeriodSteps;
+    const quoteFactor = exposure <= 1
+      ? 1
+      : (1 + quoteBorrowRate) ** holdingPeriodSteps;
     const assetFactor = priceRatio * (
       exposure < 0 ? (1 + assetBorrowRate) ** holdingPeriodSteps : 1
     );
-    const expectedEquity = quoteFactor * (1 - exposure) + assetFactor * exposure;
-    assert.ok(expectedEquity > 0);
+    const heldAssetValue = assetFactor * exposure;
+    const heldEquity = quoteFactor * (1 - exposure) + heldAssetValue;
+    assert.ok(heldEquity > 0);
+    const endpointExposure = heldAssetValue / heldEquity;
+    const expectedEquity = heldEquity
+      * rebalanceEquityFactor(endpointExposure, 0, 0.001);
     assert.ok(
       Math.abs(Math.exp(firstRow[index]!) - expectedEquity) < 1e-12,
       { exposure, actual: Math.exp(firstRow[index]!), expectedEquity },
@@ -220,7 +222,6 @@ test("mandatory-hold survival cutoffs reject any action that liquidates", () => 
     minExposure: -100,
     maxExposure: 100,
     maxEffectiveExposure: 250,
-    quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
   };
@@ -262,7 +263,6 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
       maxExposure: 1,
       temperature: 0.001,
       opportunityEpsilon: 0.000001,
-      quoteLendRate: 0.000001,
       quoteBorrowRate: 0.000002,
       assetBorrowRate: 0.000003,
       includeProbabilities: true,
@@ -577,6 +577,7 @@ test("value horizon T caps final equity independently from holding period H", ()
     friction: 0.1,
     gridSize: 21,
     temperature: 0.01,
+    includeActionValues: true,
   });
   const longHorizon = prepareExposureValueOracle(prices, {
     scoreStartIndex: 0,
@@ -585,10 +586,12 @@ test("value horizon T caps final equity independently from holding period H", ()
     friction: 0.1,
     gridSize: 21,
     temperature: 0.01,
+    includeActionValues: true,
   });
 
-  assert.equal(shortHorizon.modalExposures[0], -1);
-  assert.equal(longHorizon.modalExposures[0], -1);
+  const shortMaximum = Math.max(...shortHorizon.actionValues!.subarray(0, 21));
+  const longMaximum = Math.max(...longHorizon.actionValues!.subarray(0, 21));
+  assert.ok(longMaximum > shortMaximum + 1);
   assert.equal(shortHorizon.holdingPeriodSteps, longHorizon.holdingPeriodSteps);
   assert.notEqual(shortHorizon.valueHorizonSteps, longHorizon.valueHorizonSteps);
 });
@@ -614,8 +617,8 @@ test("a scored oracle prefix can keep values from post-window candles", () => {
   });
 
   assert.equal(extended.means.length, 2);
-  assert.equal(extended.modalExposures[0], -1);
-  assert.equal(truncated.modalExposures[0], -1);
+  assert.ok(Math.abs(extended.means[0]!) < 1e-6);
+  assert.ok(truncated.means[0]! < -0.4);
 });
 
 test("H-step oracle values let the portfolio drift without intermediate rebalancing", () => {
@@ -632,7 +635,12 @@ test("H-step oracle values let the portfolio drift without intermediate rebalanc
     includeProbabilities: true,
   });
   const values = Array.from(oracle.grid, (exposure) => {
-    return Math.log(1 - exposure + exposure * prices[2]! / prices[0]!);
+    const assetValue = exposure * prices[2]! / prices[0]!;
+    const heldEquity = 1 - exposure + assetValue;
+    const endpointExposure = assetValue / heldEquity;
+    return Math.log(
+      heldEquity * rebalanceEquityFactor(endpointExposure, 0, friction),
+    );
   });
   const maximum = Math.max(...values);
   const weights = values.map((value) => Math.exp((value - maximum) / temperature));
@@ -1062,7 +1070,6 @@ test("return measurement starts flat and marks the requested exposure", () => {
     minExposure: -1,
     maxExposure: 1,
     maxEffectiveExposure: 250,
-    quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
   });
@@ -1079,7 +1086,6 @@ test("tradable exposure may drift beyond its target bound up to the effective li
     minExposure: -100,
     maxExposure: 100,
     maxEffectiveExposure: 250,
-    quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
   };

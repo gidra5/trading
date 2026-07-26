@@ -194,7 +194,6 @@
     "minimumEffectiveExposure": -250,
     "maximumEffectiveExposure": 250,
     "maintenanceBpsHour": {
-      "quoteLend": 10,
       "quoteBorrow": 10,
       "assetBorrow": 10
     },

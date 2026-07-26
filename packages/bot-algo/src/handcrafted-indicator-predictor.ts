@@ -631,9 +631,7 @@ function upperBound(values: Float64Array, target: number): number {
 
 function maintenanceUtility(exposure: number, execution: ExposureExecutionOptions): number {
   const quote = 1 - exposure;
-  const quoteUtility = quote >= 0
-    ? quote * execution.quoteLendRate
-    : quote * execution.quoteBorrowRate;
+  const quoteUtility = quote >= 0 ? 0 : quote * execution.quoteBorrowRate;
   const assetUtility = exposure < 0 ? exposure * execution.assetBorrowRate : 0;
   return quoteUtility + assetUtility;
 }

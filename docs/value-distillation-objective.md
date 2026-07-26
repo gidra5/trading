@@ -77,7 +77,8 @@ only the hindsight oracle target may read beyond it. Missing or discontinuous po
 are an error in `extend` mode. The inspector and reports display both durations and the end mode.
 
 Rebalancing uses the exact buy/sell fee equations recorded in `tasks.md`. Maintenance applies
-the configured per-candle quote lend, quote borrow, and asset borrow rates. Trades may select only
+the configured per-candle quote-borrow and asset-borrow rates; owned quote does not earn lending
+yield. Trades may select only
 targets inside `[exposure-min, exposure-max]`. Price and fee drift may carry the marked position
 outside that target range; liquidation to quote occurs only when its absolute fee-adjusted
 exposure exceeds `max-effective-exposure` (250× by default).
@@ -273,7 +274,7 @@ execution-level PnL.
 - Close-to-close price observations.
 - Fixed or per-segment half-oracle-average `H` target-exposure hold followed by perfect-oracle
   continuation.
-- Per-candle borrow/lend rates, defaulting to zero.
+- Per-candle quote-debt and asset-debt borrow rates, defaulting to zero.
 - Uniform operational weighting over all full-range current-state exposures; no minimum-order or absolute
   balance state.
 - Existing transition metrics remain diagnostic and can still be selected with

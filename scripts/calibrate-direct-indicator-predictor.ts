@@ -43,7 +43,6 @@ const execution = {
   minExposure: -100,
   maxExposure: 100,
   maxEffectiveExposure: 250,
-  quoteLendRate: 0,
   quoteBorrowRate: 0,
   assetBorrowRate: 0,
 };

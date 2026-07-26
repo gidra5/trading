@@ -30,7 +30,6 @@ parentPort.on("message", (message) => {
         minExposure: message.options.minExposure,
         maxExposure: message.options.maxExposure,
         maxEffectiveExposure: message.options.maxEffectiveExposure,
-        quoteLendRate: message.options.quoteLendRate ?? 0,
         quoteBorrowRate: message.options.quoteBorrowRate ?? 0,
         assetBorrowRate: message.options.assetBorrowRate ?? 0,
       };

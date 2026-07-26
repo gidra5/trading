@@ -15,7 +15,6 @@ interface Plan {
     minimumEffectiveExposure: number;
     maximumEffectiveExposure: number;
     maintenanceBpsHour: {
-      quoteLend: number;
       quoteBorrow: number;
       assetBorrow: number;
     };
@@ -73,9 +72,6 @@ async function main(): Promise<void> {
         terminalIndex: 1_440,
         temperature: plan.execution.temperature,
         opportunityEpsilon: 0,
-        quoteLendRate: bpsHourToPerMinute(
-          plan.execution.maintenanceBpsHour.quoteLend,
-        ),
         quoteBorrowRate: bpsHourToPerMinute(
           plan.execution.maintenanceBpsHour.quoteBorrow,
         ),

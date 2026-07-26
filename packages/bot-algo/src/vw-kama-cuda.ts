@@ -73,7 +73,6 @@ interface NativeCuda {
     valueHoldingPeriodSteps: number,
     oracleFriction: number,
     oracleTemperature: number,
-    quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
     valueGridSize: number,
@@ -117,7 +116,6 @@ interface NativeCuda {
     temperature: number,
     friction: number,
     opportunityEpsilon: number,
-    quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
     initialExposure: number,
@@ -167,7 +165,6 @@ interface NativeCuda {
     holdingPeriodSteps: number,
     friction: number,
     maximumEffectiveExposure: number,
-    quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
     cutoffLowers: Float64Array,
@@ -198,7 +195,6 @@ interface NativeCuda {
     valueHoldingPeriodSteps: number,
     oracleFriction: number,
     oracleTemperature: number,
-    quoteLendRate: number,
     quoteBorrowRate: number,
     assetBorrowRate: number,
     matchWindowMs: number,
@@ -528,7 +524,6 @@ export async function evaluateVwKamaCudaBatch(
     valueDistillation?.oracle.holdingPeriodSteps ?? 1,
     options.oracleFriction,
     valueDistillation?.oracle.temperature ?? 1,
-    valueDistillation?.oracle.execution.quoteLendRate ?? 0,
     valueDistillation?.oracle.execution.quoteBorrowRate ?? 0,
     valueDistillation?.oracle.execution.assetBorrowRate ?? 0,
     options.matchWindowMs,
@@ -699,8 +694,6 @@ export async function exposureHoldingCutoffsCuda(
     || execution.friction >= 1
     || !Number.isFinite(execution.maxEffectiveExposure)
     || execution.maxEffectiveExposure <= 0
-    || !Number.isFinite(execution.quoteLendRate)
-    || execution.quoteLendRate < 0
     || !Number.isFinite(execution.quoteBorrowRate)
     || execution.quoteBorrowRate < 0
     || !Number.isFinite(execution.assetBorrowRate)
@@ -718,7 +711,6 @@ export async function exposureHoldingCutoffsCuda(
     holdingPeriodSteps,
     execution.friction,
     execution.maxEffectiveExposure,
-    execution.quoteLendRate,
     execution.quoteBorrowRate,
     execution.assetBorrowRate,
     cutoffLowers,
@@ -836,7 +828,6 @@ export async function prepareExposureValueOracleCuda(
     options.temperature,
     oracle.execution.friction,
     Math.max(0, options.opportunityEpsilon ?? 1e-6),
-    oracle.execution.quoteLendRate,
     oracle.execution.quoteBorrowRate,
     oracle.execution.assetBorrowRate,
     options.initialExposure ?? 0,
@@ -919,7 +910,7 @@ async function loadNative(): Promise<NativeCuda> {
       createFitnessCase: library.func("vw_kama_cuda_create_fitness_case", "uint64_t", [
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer,
-        "int", "int", "double", "int", "double", "double", "double", "double", "double",
+        "int", "int", "double", "int", "double", "double", "double", "double",
         "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "int", "int", pointer,
       ]),
@@ -935,7 +926,7 @@ async function loadNative(): Promise<NativeCuda> {
       destroyFitnessCase: library.func("int vw_kama_cuda_destroy_fitness_case(uint64_t)"),
       prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle_v2", "int", [
         pointer, "int", "int", "int", "int", "int",
-        "double", "double", "double", "double", "double", "double", "double", "double", "double",
+        "double", "double", "double", "double", "double", "double", "double", "double",
         "double", "int", "int", "int",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer, pointer,
@@ -955,7 +946,7 @@ async function loadNative(): Promise<NativeCuda> {
         "int",
         [
           pointer, "int", "int", "int",
-          "double", "double", "double", "double", "double",
+          "double", "double", "double", "double",
           pointer, pointer, pointer,
         ],
       ),
@@ -963,7 +954,7 @@ async function loadNative(): Promise<NativeCuda> {
         pointer, pointer, pointer, pointer, pointer, pointer,
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,
         pointer,
-        "int", "int", "double", "int", "double", "double", "double", "double", "double", "double", "double",
+        "int", "int", "double", "int", "double", "double", "double", "double", "double", "double",
         "int", "double", "double", "double", "double", "double", "double", "double",
         "int", "int",
         pointer, "int", "int", pointer,
@@ -1045,7 +1036,6 @@ function getOrCreateFitnessCase(
     oracle.holdingPeriodSteps,
     options.oracleFriction,
     oracle.temperature,
-    oracle.execution.quoteLendRate,
     oracle.execution.quoteBorrowRate,
     oracle.execution.assetBorrowRate,
     oracle.grid.length,

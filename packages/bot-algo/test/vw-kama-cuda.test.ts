@@ -40,7 +40,6 @@ test("CUDA mandatory-hold cutoffs match the causal CPU bisection", async (contex
     minExposure: -10,
     maxExposure: 10,
     maxEffectiveExposure: 12,
-    quoteLendRate: 1e-7,
     quoteBorrowRate: 2e-7,
     assetBorrowRate: 3e-7,
   };
@@ -200,7 +199,6 @@ test("CUDA distribution-only oracle is deterministic and faithful to the full st
     maxExposure: 10,
     maxEffectiveExposure: 12,
     temperature: 0.01,
-    quoteLendRate: 0.000001,
     quoteBorrowRate: 0.000002,
     assetBorrowRate: 0.000003,
     includeProbabilities: true,
@@ -233,7 +231,11 @@ test("CUDA distribution-only oracle is deterministic and faithful to the full st
   }
   // The compact production path evaluates the exact recurrence in Float32;
   // the full diagnostic path retains Float64 intermediates.
-  assert.ok(maximumDifference < 2e-5, `maximum probability drifted by ${maximumDifference}`);
+  const float32LayerTolerance = options.valueHorizonSteps * 1e-6;
+  assert.ok(
+    maximumDifference < float32LayerTolerance,
+    `maximum probability drifted by ${maximumDifference}`,
+  );
   assert.ok(
     maximumRowKlDivergence < 1e-6,
     `maximum row KL divergence drifted by ${maximumRowKlDivergence}`,
@@ -265,7 +267,7 @@ test("CUDA distribution-only oracle is deterministic and faithful to the full st
     );
   }
   assert.ok(
-    unevenMaximumDifference < 2e-5,
+    unevenMaximumDifference < unevenOptions.valueHorizonSteps * 1e-6,
     `non-fused probability drifted by ${unevenMaximumDifference}`,
   );
 });

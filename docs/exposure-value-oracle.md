@@ -8,7 +8,19 @@ The selected window supplies all prices. Training targets default to a fixed 60-
 
 ## Bellman execution
 
-At each decision, the oracle may rebalance once to a target from the configured exposure grid. It then leaves the resulting quote and asset quantities alone for `H` price moves. Marked exposure is allowed to drift with price and maintenance; there are no intermediate target-restoring trades and therefore no intermediate rebalancing friction. The coherent full-window inspector path compares every grid target with an explicit **no-trade** continuation from its drifted exposure and trades only when the continuation after friction is better. The rolling unconditional training target instead evaluates the next grid transition directly from the exact drifted exposure; this is the schema-v4 target contract. Reaching the final price ends the rolling horizon without an artificial terminal transition.
+At each scored timestamp, the rolling oracle forces target `a` for `H` price moves. Marked exposure is allowed to drift with price and maintenance during that initial hold; there are no intermediate target-restoring trades and therefore no intermediate rebalancing friction. After the forced hold, the perfect continuation may choose a new target on every candle until the total `T`-move horizon is exhausted. It then closes the remaining exposure to exact cash. This forced-`H`, one-candle-continuation, terminal-closeout definition is the schema-v5 raw-target contract.
+
+Let `h_(t,k)(a)` and `d_(t,k)(a)` be the log return and drifted exposure obtained by passively holding target `a` from `t` for `k` moves. Let `R_t(x -> b)` be the exact fee-aware equity factor for rebalancing current exposure `x` to target `b`. The independent recurrence is
+
+`V_(t,0)(x) = log R_t(x -> 0)`,
+
+`V_(t,k)(x) = max_b [log R_t(x -> b) + h_(t,1)(b) + V_(t+1,k-1)(d_(t,1)(b))]`,
+
+`F_(t,H,T)(a) = h_(t,H')(a) + V_(t+H',T-H')(d_(t,H')(a))`,
+
+where `H' = min(H, T, remaining price moves)`. Equivalently, the one-candle hold/drift can be folded into a time-indexed transition return. Crucially, `H` applies only to the initially forced action; it is not reapplied at every continuation decision.
+
+The coherent full-window inspector path remains a separate policy reconstruction problem. It compares every grid target with an explicit **no-trade** continuation from its drifted exposure and trades only when the continuation after friction is better.
 
 The soft training target is transition-aware. Let `F_t(a)` be the forced-action value after selecting target `a`, including its untouched `H`-candle evolution and optimal continuation. For any input/current exposure `x`, the action value and policy are
 
@@ -22,9 +34,9 @@ The CPU solver retains square-root-spaced Bellman checkpoints and recomputes eac
 
 ## Holding and continuation factorization
 
-The rolling target is already evaluated as two separate terms:
+The initial forced action is evaluated as two separate terms:
 
-`F_t(a) = H_t(a) + V_(t+H)(drift_t(a))`.
+`F_(t,H,T)(a) = H_(t,H)(a) + V_(t+H,T-H)(drift_(t,H)(a))`.
 
 Use normalized quote and marked-asset amounts immediately after the action,
 
@@ -33,7 +45,8 @@ Use normalized quote and marked-asset amounts immediately after the action,
 During a passive hold their signs do not change, so each financing category
 has two precomputable multipliers: `g_q` for quote and `g_a` for marked asset.
 `g_a` includes the endpoint price ratio and, for a short, compounded asset
-borrow maintenance. `g_q` applies the quote lend or borrow maintenance factor.
+borrow maintenance. `g_q` is one for owned quote and applies the compounded
+quote-borrow maintenance factor only to negative quote debt.
 The exact surviving endpoint is therefore
 
 `[Q', A'] = [g_q * (1 - a), g_a * a]`,
@@ -55,7 +68,9 @@ timestamp and financing category, then materializes the 255 hold values and
 endpoint exposures once. They are reused by every rolling-horizon level.
 Intermediate price extrema reduce liquidation to a continuous feasible
 starting-exposure interval. Actions outside it have invalid value; no
-liquidation branch is retained as a candidate continuation.
+liquidation branch is retained as a candidate continuation. Their action value
+is `-Infinity`, which maps to probability exactly zero. Finite negative log
+returns remain valid action values and participate normally in the softmax.
 
 Fixed-target proportional-fee transitions have the same amount-space
 factorization. If `[Q, A]` is the current marked amount vector, `f` is friction,

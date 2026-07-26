@@ -37,7 +37,6 @@ interface DatasetManifest {
     minimumEffectiveExposure: number;
     maximumEffectiveExposure: number;
     maintenanceBpsHour: {
-      quoteLend: number;
       quoteBorrow: number;
       assetBorrow: number;
     };
@@ -142,10 +141,6 @@ async function main(): Promise<void> {
       terminalIndex: 1_439,
       temperature: execution.temperature,
       opportunityEpsilon: 0,
-      quoteLendRate: bpsHourToPerSteps(
-        execution.maintenanceBpsHour.quoteLend,
-        60,
-      ),
       quoteBorrowRate: bpsHourToPerSteps(
         execution.maintenanceBpsHour.quoteBorrow,
         60,

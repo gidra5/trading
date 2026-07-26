@@ -62,7 +62,6 @@ async function main(): Promise<void> {
     Math.abs(plan.execution.maximumEffectiveExposure),
   );
   const maintenance = {
-    quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
     quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
     assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
   };

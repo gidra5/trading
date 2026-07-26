@@ -25,14 +25,17 @@ addon ABI. The binary contains RTX 30-series (`sm_86`) code plus forward-compati
 PTX.
 
 The exposure-value distribution path factors each target into a precomputed
-mandatory hold and a fee-separable continuation. Buy/sell prefix and suffix
-scans make each Bellman transition linear in the action-grid size and query
-each passively drifted exposure exactly, without interpolating a sampled
-continuation row. For the
-production rolling horizon, complete diagonals stay in warp-local memory and
-the compact path allocates only its Float32 holding and endpoint rows; the
-outer forced-action values are normalized directly from registers into the
-probability output. The unused general Float64 Bellman tables and intermediate
-forced-action table are omitted. Reused double-buffered pinned host slots stage
-prices into CUDA and probabilities back out while the dataset worker pipeline
-streams the preceding output into compression.
+mandatory initial hold and a fee-separable continuation. The initial target is
+held for `H` candles; continuation then advances one candle per Bellman layer
+until the total `T`-candle horizon, followed by an exact closeout to cash.
+Buy/sell prefix and suffix scans make each continuation layer linear in the
+action-grid size and query each passively drifted exposure exactly, without
+interpolating a sampled continuation row. For the production rolling horizon,
+complete rows stay in warp-local memory and the compact path allocates only its
+Float32 holding and endpoint rows; the outer forced-action values are
+normalized directly from registers into the probability output. Infeasible
+`-Infinity` values receive exactly zero probability. The unused general
+Float64 Bellman tables and intermediate forced-action table are omitted.
+Reused double-buffered pinned host slots stage prices into CUDA and
+probabilities back out while the dataset worker pipeline streams the preceding
+output into compression.

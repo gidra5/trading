@@ -16,7 +16,7 @@ The target uses the same configuration as the inspector default:
 - 31 calibration-grid targets from -100 to +100 exposure;
 - 0.175% friction;
 - 0.01 oracle temperature; and
-- no lending or borrow maintenance.
+- no quote-debt or asset-debt borrow maintenance.
 
 The primary loss is realized oracle regret at the exposure selected by the forecast predictor.
 Distribution cross-entropy is retained as a diagnostic and is not optimized. This follows the

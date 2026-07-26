@@ -156,7 +156,7 @@ we need to adjust the oracle evaluation:
             5. that is true when (a\*E-P\*u)<0
       2. Maintenance phase:
          1. define [x]=max(0,x)
-         2. q^-_{t+1}=(1+r_lend)\*[q^+_t]-(1+r_borrow)\*[-q^+_t]
+         2. q^-_{t+1}=[q^+_t]-(1+r_borrow)\*[-q^+_t]
          3. u^-_{t+1}=[u^+_t]-(1+r_borrow)\*[-u^+_t]
       3. Liquidation phase:
          1. u_liq=(1-f_{t+1})y^-\_{t+1} if u^-_{t+1}>0 and u_liq=y^-\_{t+1}/(1-f_{t+1}) if u^-_{t+1}<0
@@ -172,13 +172,14 @@ we need to adjust the oracle evaluation:
       2. or more generally a_t=argmax_a(Q_t(a)), which can be found with DP
    7. Then the definition for oracle's return is simply the log return over initial and final equity:
       1. Q_t(a)=ln E_{t+T}/E_t
-      2. H is the forced holding period for a; T is the independently configured value horizon. 
-      3. In truncate mode, T=min(t+valueHorizon, segmentEnd).
-      4. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
-      5. MLP dataset preparation must always use extend mode so every timestamp,
-         including timestamps at a UTC shard boundary, receives the full future horizon.
+      2. H is the forced holding period for a; T is the independently configured total value horizon.
+      3. Let h_t,k(a) and d_t,k(a) be the log wealth multiplier and drifted exposure after passively holding a for k price moves, and let R_t(x->b) be the rebalance wealth multiplier.
+      4. The faithful recurrence is V_t,0(x)=ln R_t(x->0), V_t,k(x)=max_b[ln R_t(x->b)+h_t,1(b)+V_t+1,k-1(d_t,1(b))], and Q_t,H,T(a)=h_t,H'(a)+V_t+H',T-H'(d_t,H'(a)), with H'=min(H,T,remaining moves).
+      5. H applies only to the initially forced target. The optimal continuation may rebalance every candle and the final state closes to exact zero exposure.
+      6. In truncate mode, T=min(t+valueHorizon, segmentEnd).
+      7. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
+      8. MLP dataset preparation must always use extend mode so every timestamp, including timestamps at a UTC shard boundary, receives the full future horizon.
    8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
-   9. bellman equation???
 2. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
 3. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
    1. R_t(a) = max_A(Q_t(A)) - Q_t(a)

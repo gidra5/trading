@@ -281,7 +281,6 @@ export interface VwKamaValueDistillationConfig extends ExposureValueDistillation
   oracleTemperature: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
-  quoteLendRate: number;
   quoteBorrowRate: number;
   assetBorrowRate: number;
 }

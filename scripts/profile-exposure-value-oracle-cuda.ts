@@ -39,7 +39,6 @@ async function main(): Promise<void> {
   const maintenanceBps = argument("maintenance-bps") === undefined
     ? execution.maintenanceBpsHour
     : {
-        quoteLend: Number(argument("maintenance-bps")),
         quoteBorrow: Number(argument("maintenance-bps")),
         assetBorrow: Number(argument("maintenance-bps")),
       };
@@ -100,7 +99,6 @@ async function main(): Promise<void> {
         terminalIndex: candles.length - 1,
         temperature: execution.temperature,
         opportunityEpsilon: 0,
-        quoteLendRate: bpsHourToPerSecond(maintenanceBps.quoteLend),
         quoteBorrowRate: bpsHourToPerSecond(maintenanceBps.quoteBorrow),
         assetBorrowRate: bpsHourToPerSecond(maintenanceBps.assetBorrow),
         includeActionValues: false,

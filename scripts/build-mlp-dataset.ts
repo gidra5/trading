@@ -26,7 +26,7 @@ import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
 const SECOND_MS = 1_000;
-const RAW_ORACLE_SCHEMA_VERSION = 4;
+const RAW_ORACLE_SCHEMA_VERSION = 5;
 const TEACHER_PARAMETER_COUNT = 8;
 const TEACHER_METRIC_NAMES = [
   "crossEntropy",
@@ -114,7 +114,7 @@ interface TrainingPlan {
     maximumUsableExposure: number;
     minimumEffectiveExposure: number;
     maximumEffectiveExposure: number;
-    maintenanceBpsHour: { quoteLend: number; quoteBorrow: number; assetBorrow: number };
+    maintenanceBpsHour: { quoteBorrow: number; assetBorrow: number };
     gridSize: number;
     temperature: number;
     holdingPeriodSteps: number;
@@ -659,7 +659,6 @@ async function main(): Promise<void> {
     terminalIndex: scoredCandleCount - 1,
     temperature: plan.execution.temperature,
     opportunityEpsilon: 0,
-    quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
     quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
     assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
     includeActionValues: false,
@@ -1038,7 +1037,6 @@ async function main(): Promise<void> {
                   Math.abs(plan.execution.minimumEffectiveExposure),
                   Math.abs(plan.execution.maximumEffectiveExposure),
                 ),
-                quoteLendRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteLend),
                 quoteBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.quoteBorrow),
                 assetBorrowRate: bpsHourToPerSecond(plan.execution.maintenanceBpsHour.assetBorrow),
               },
@@ -3067,10 +3065,6 @@ async function persistMinuteOracleDay(
     terminalIndex: 1_440,
     temperature: plan.execution.temperature,
     opportunityEpsilon: 0,
-    quoteLendRate: bpsHourToPerSteps(
-      plan.execution.maintenanceBpsHour.quoteLend,
-      60,
-    ),
     quoteBorrowRate: bpsHourToPerSteps(
       plan.execution.maintenanceBpsHour.quoteBorrow,
       60,
@@ -3183,10 +3177,6 @@ async function persistMinuteOraclePairs(
       terminalIndex: 1_440,
       temperature: plan.execution.temperature,
       opportunityEpsilon: 0,
-      quoteLendRate: bpsHourToPerSteps(
-        plan.execution.maintenanceBpsHour.quoteLend,
-        60,
-      ),
       quoteBorrowRate: bpsHourToPerSteps(
         plan.execution.maintenanceBpsHour.quoteBorrow,
         60,

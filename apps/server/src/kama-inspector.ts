@@ -190,7 +190,6 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     oracleTemperature: 0.01,
     strategyVolatilityScaling: false,
     opportunityEpsilon: 0.000001,
-    quoteLendRate: 0,
     quoteBorrowRate: 0,
     assetBorrowRate: 0,
     entropyGapLambda: 0,
@@ -766,7 +765,6 @@ export class KamaInspectorEngine {
         terminalIndex: prices.length - 1,
         temperature: config.oracleTemperature,
         opportunityEpsilon: 0,
-        quoteLendRate: hourlyRatePerCandle(config.quoteLendRate, request.intervalMs),
         quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, request.intervalMs),
         assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, request.intervalMs),
         includeActionValues: true,
@@ -1106,7 +1104,6 @@ export class KamaInspectorEngine {
       // Opportunity epsilon only offsets per-row weights. Keep the expensive
       // oracle neutral so epsilon edits can reuse its exact values/statistics.
       opportunityEpsilon: 0,
-      quoteLendRate: hourlyRatePerCandle(config.quoteLendRate, request.intervalMs),
       quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, request.intervalMs),
       assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, request.intervalMs),
       includeProbabilities: true,
@@ -1131,7 +1128,6 @@ export class KamaInspectorEngine {
       valueHorizonSteps,
       config.horizonEndMode,
       config.oracleTemperature,
-      config.quoteLendRate,
       config.quoteBorrowRate,
       config.assetBorrowRate,
       sparse ? "sparse" : "dense",
@@ -2046,7 +2042,6 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   if ([
     valueConfig.opportunityEpsilon,
-    valueConfig.quoteLendRate,
     valueConfig.quoteBorrowRate,
     valueConfig.assetBorrowRate,
   ].some((value) => !Number.isFinite(value) || value < 0)) {

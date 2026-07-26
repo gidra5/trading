@@ -80,7 +80,6 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   oracleTemperature: 0.01,
   strategyVolatilityScaling: false,
   opportunityEpsilon: 0.000001,
-  quoteLendRate: 0,
   quoteBorrowRate: 0,
   assetBorrowRate: 0,
   entropyGapLambda: 0,
@@ -1806,7 +1805,6 @@ export function KamaInspectorPage() {
               <InspectorNumber label="Maximum exposure" value={valueConfig().maxExposure} min={0.000001} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, maxExposure: value }))} />
               <InspectorNumber label="Maximum effective exposure" value={valueConfig().maxEffectiveExposure} min={Math.max(Math.abs(valueConfig().minExposure), Math.abs(valueConfig().maxExposure))} step={1} onInput={(value) => setValueConfig((current) => ({ ...current, maxEffectiveExposure: value }))} />
               <InspectorNumber label="Initial exposure" value={valueConfig().initialExposure} min={-valueConfig().maxEffectiveExposure} max={valueConfig().maxEffectiveExposure} step={0.1} onInput={(value) => setValueConfig((current) => ({ ...current, initialExposure: value }))} />
-              <InspectorNumber label="Quote lend maintenance / hour" value={valueConfig().quoteLendRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, quoteLendRate: value }))} />
               <InspectorNumber label="Quote borrow maintenance / hour" value={valueConfig().quoteBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, quoteBorrowRate: value }))} />
               <InspectorNumber label="Asset borrow maintenance / hour" value={valueConfig().assetBorrowRate} min={0} step={0.000001} onInput={(value) => setValueConfig((current) => ({ ...current, assetBorrowRate: value }))} />
             </div>

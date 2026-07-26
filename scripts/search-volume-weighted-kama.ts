@@ -108,7 +108,6 @@ interface Args {
   oracleTemperature: number;
   strategyVolatilityScaling: boolean;
   opportunityEpsilon: number;
-  quoteLendRate: number;
   quoteBorrowRate: number;
   assetBorrowRate: number;
   entropyGapLambda: number;
@@ -543,7 +542,6 @@ async function run(config: Args): Promise<void> {
       oracleTemperature: config.oracleTemperature,
       strategyVolatilityScaling: config.strategyVolatilityScaling,
       opportunityWeight: `max(Q)-min(Q)+${config.opportunityEpsilon}`,
-      quoteLendRate: config.quoteLendRate,
       quoteBorrowRate: config.quoteBorrowRate,
       assetBorrowRate: config.assetBorrowRate,
       entropyGapLambda: config.entropyGapLambda,
@@ -726,7 +724,6 @@ function writeGlobalPresets(
         oracleTemperature: config.oracleTemperature,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
-        quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
         assetBorrowRate: config.assetBorrowRate,
         entropyGapLambda: config.entropyGapLambda,
@@ -1657,7 +1654,6 @@ async function runPerWindow(
         oracleTemperature: config.oracleTemperature,
         strategyVolatilityScaling: config.strategyVolatilityScaling,
         opportunityEpsilon: config.opportunityEpsilon,
-        quoteLendRate: config.quoteLendRate,
         quoteBorrowRate: config.quoteBorrowRate,
         assetBorrowRate: config.assetBorrowRate,
         entropyGapLambda: config.entropyGapLambda,
@@ -2376,7 +2372,6 @@ async function prepareStageWindow(
     oracleTemperature: config.oracleTemperature,
     strategyVolatilityScaling: config.strategyVolatilityScaling,
     opportunityEpsilon: config.opportunityEpsilon,
-    quoteLendRate: config.quoteLendRate,
     quoteBorrowRate: config.quoteBorrowRate,
     assetBorrowRate: config.assetBorrowRate,
     entropyGapLambda: config.entropyGapLambda,
@@ -2665,7 +2660,6 @@ async function buildCases(
             terminalIndex: caseCandles.length - 1,
             temperature: config.oracleTemperature,
             opportunityEpsilon: config.opportunityEpsilon,
-            quoteLendRate: hourlyRatePerCandle(config.quoteLendRate, scaleMs),
             quoteBorrowRate: hourlyRatePerCandle(config.quoteBorrowRate, scaleMs),
             assetBorrowRate: hourlyRatePerCandle(config.assetBorrowRate, scaleMs),
             includeProbabilities: config.oracleMutualInformationLambda > 0
@@ -3505,7 +3499,7 @@ function parseArgs(argv: string[]): Args {
     "strategy-volatility-scaling",
     "entropy-gap-lambda", "state-mi-lambda", "oracle-mi-lambda",
     "oracle-mi-mode", "mi-bins",
-    "opportunity-epsilon", "quote-lend-rate", "quote-borrow-rate",
+    "opportunity-epsilon", "quote-borrow-rate",
     "asset-borrow-rate", "seed-candidates", "preset-window-ids", "preset-output", "output", "report",
   ]);
   const values = new Map<string, string>();
@@ -3649,7 +3643,6 @@ function parseArgs(argv: string[]): Args {
     oracleMutualInformationMode: oracleMutualInformationMode as ExposureValueOracleMutualInformationMode,
     mutualInformationBins,
     opportunityEpsilon: nonNegative(get("opportunity-epsilon", "0.000001"), "opportunity-epsilon"),
-    quoteLendRate: nonNegative(get("quote-lend-rate", "0"), "quote-lend-rate"),
     quoteBorrowRate: nonNegative(get("quote-borrow-rate", "0"), "quote-borrow-rate"),
     assetBorrowRate: nonNegative(get("asset-borrow-rate", "0"), "asset-borrow-rate"),
     seedCandidatePaths: values.has("seed-candidates")
@@ -4133,7 +4126,7 @@ function help(): void {
   --oracle-mi-mode approximate     approximate Gaussian moments or precise soft categorical bins
   --mi-bins 15                     Precise-MI exposure bins (2..min(32, grid size))
   --opportunity-epsilon 0.000001    Added to uniform-state average-regret time weights
-  --quote-lend-rate 0 --quote-borrow-rate 0 --asset-borrow-rate 0
+  --quote-borrow-rate 0 --asset-borrow-rate 0
   --score-version ${VW_KAMA_SCORE_VERSION}                  Objective formula version
   --seed-candidates FILE,...        Put prior fit JSONL/preset candidates in generation zero
   --screen-windows 1 --screen-scales 1m,15m   Cheap early-pruning stage
