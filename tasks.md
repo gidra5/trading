@@ -171,8 +171,8 @@ we need to adjust the oracle evaluation:
       1. a_t=L^+ if r_t>0 and a_t=-L^- if r_t<0
       2. or more generally a_t=argmax_a(Q_t(a)), which can be found with DP
    7. Then the definition for oracle's return is simply the log return over initial and final equity:
-      1. Q_t(a)=ln E_T/E_t
-      2. H is the forced holding period for a; T-t is the independently configured value horizon.
+      1. Q_t(a)=ln E_{t+T}/E_t
+      2. H is the forced holding period for a; T is the independently configured value horizon. 
       3. In truncate mode, T=min(t+valueHorizon, segmentEnd).
       4. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
       5. MLP dataset preparation must always use extend mode so every timestamp,
@@ -213,9 +213,25 @@ we need to adjust the oracle evaluation:
    3.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute. 
    4.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
    5.  but this idea is for future iterations, not for now.
+8.  the limit order model:
+    1.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
+    2.  I want to design similar regret but for limit orders. i think he premise should be similar. Assume we create a limit order at chosen relative price from current in percents and a reserved exposure. If reserved exposure is borrowed we count borrowing fees each step we hold it before the execution. The reserved amount cant be used for market orders which defines opportunity cost (maybe computed in a similar way to regret). But executing limit order has less fees (potentially 0) than market orders. Then we compute regret as difference between optimal limit order and the chosen one. The optimal one balances opportunity cost such that we get the most profit. We also assume that after limit order is done we act as perfect margin trader.
+    3.  The limit order exposure delta is signed - negative is sell, positive is buy.
+    4.  The oracle can trade optimally with unreserved assets during lifetime of the lo.
+    5.  That essentially scales the optimal market trade return by 1-a
+    6.  Then it can trade optimally with post execution equity
+    7.  The limit order either executed until the duration T passed, or is cancelled at that time. That is the value horizon
+    8.  If candle fully crosses the target price, we execute it at that price.
+    9.  The "no order" is identified as any lo with size 0
+    10. Limit orders can execute at wicks, while market orders assumed to execute at close basically
+    11. Limit price is always positive
+    12. Value of the lo is the same way as the mo = final equity over initial
+    13. Regret is difference between best value and chosen
+    14. Best value is the one where we setr just below wick top at every significant turn. That benefits both from volatility and from reduced fees
+    15. We can decide if making limit order is profitable by comparing with empty lo?
 
-8.  maybe it is time for actual neural network to be trained. it should probably be autoregressive at least, possibly an llm like transformer architecture.
-9.  train the model on progressively larger intervals based on amounts of oracle signals it contains. start from 1 signal, fit as much as we can to it and then extend up to the next signal, repeat.
+
+the oracle implementation seems to be incorrect.
 
 ML model based on MLP:
 1. Historic inputs:
@@ -310,7 +326,6 @@ Alternatives:
 
 launch a fresh training run for the distribution model version of the arch.
 Insufficient margin trades should not happen
-
 
 Timestamp (UTC)	Usable-range KL after deep fitting	Action-mean RMSE
 2022-06-15 06:39:59	0.147	6.98×
