@@ -117,7 +117,9 @@ interface TrainStepPoint {
   learningRate?: number;
   gradientNorm?: number;
   examplesPerSecond?: number;
-  gpuMemoryMiB?: number;
+  gpuAllocatedMiB?: number;
+  gpuReservedMiB?: number;
+  gpuDeviceUsedMiB?: number;
   latest: MetricValues;
 }
 
@@ -269,7 +271,9 @@ export function MlpTrainingPage() {
           learningRate: numberValue(event.learningRate),
           gradientNorm: numberValue(event.gradientNorm),
           examplesPerSecond: numberValue(event.examplesPerSecond),
-          gpuMemoryMiB: numberValue(event.gpuMemoryMiB),
+          gpuAllocatedMiB: numberValue(event.gpuAllocatedMiB),
+          gpuReservedMiB: numberValue(event.gpuReservedMiB),
+          gpuDeviceUsedMiB: numberValue(event.gpuDeviceUsedMiB),
           latest: metricValues(event.latest),
         });
       } else if (event.event === "epoch") {
@@ -506,7 +510,9 @@ export function MlpTrainingPage() {
                 directStepPlot("Throughput", "#22c55e", trainSteps(), "examplesPerSecond"),
               ]} />
               <MetricChart title="Training GPU memory" unit="MiB" xLabel="global step" series={[
-                directStepPlot("Allocated", "#a78bfa", trainSteps(), "gpuMemoryMiB"),
+                directStepPlot("Allocated tensors", "#a78bfa", trainSteps(), "gpuAllocatedMiB"),
+                directStepPlot("PyTorch reserved", "#38bdf8", trainSteps(), "gpuReservedMiB"),
+                directStepPlot("Whole device", "#f5b84b", trainSteps(), "gpuDeviceUsedMiB"),
               ]} />
             </div>
           </Show>
@@ -588,7 +594,9 @@ export function MlpTrainingPage() {
           <MetricCard label="Last best validation" value={formatMetric(latestEpoch()?.bestValidation)} />
           <MetricCard label="Learning rate" value={formatMetric(latestStep()?.learningRate)} />
           <MetricCard label="Train rate" value={formatUnit(latestStep()?.examplesPerSecond, " ex/s", 1)} />
-          <MetricCard label="Train GPU" value={formatUnit(latestStep()?.gpuMemoryMiB, " MiB", 1)} />
+          <MetricCard label="GPU tensors" value={formatUnit(latestStep()?.gpuAllocatedMiB, " MiB", 1)} />
+          <MetricCard label="GPU reserved" value={formatUnit(latestStep()?.gpuReservedMiB, " MiB", 1)} />
+          <MetricCard label="GPU device" value={formatUnit(latestStep()?.gpuDeviceUsedMiB, " MiB", 1)} />
         </section>
 
         <Show when={datasetPoints().length > 0}>

@@ -81,6 +81,87 @@ TIME_BLOCK_METRIC_NAMES = frozenset((
 ))
 
 
+@dataclass
+class TrainingThroughputMeter:
+    """Measure completed examples over training time while excluding validation."""
+
+    pending_examples: int = 0
+    pending_seconds: float = 0.0
+    active_since: float | None = None
+
+    def resume(self) -> None:
+        if self.active_since is not None:
+            raise RuntimeError("training throughput meter is already active")
+        self.active_since = time.monotonic()
+
+    def add(self, examples: int) -> None:
+        if self.active_since is None or examples < 0:
+            raise RuntimeError("training throughput meter received an invalid batch")
+        self.pending_examples += examples
+
+    def sample(self) -> tuple[float, int]:
+        if self.active_since is None:
+            raise RuntimeError("training throughput meter is not active")
+        now = time.monotonic()
+        elapsed = self.pending_seconds + now - self.active_since
+        examples = self.pending_examples
+        rate = examples / max(elapsed, 1e-6)
+        self.pending_examples = 0
+        self.pending_seconds = 0.0
+        self.active_since = now
+        return rate, examples
+
+    def pause(self) -> None:
+        if self.active_since is None:
+            raise RuntimeError("training throughput meter is not active")
+        now = time.monotonic()
+        self.pending_seconds += now - self.active_since
+        self.active_since = None
+
+
+def cuda_memory_metrics(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {
+            "gpuAllocatedMiB": 0.0,
+            "gpuReservedMiB": 0.0,
+            "gpuDeviceUsedMiB": 0.0,
+        }
+    divisor = 1_048_576
+    result = {
+        "gpuAllocatedMiB": round(
+            torch.cuda.memory_allocated(device) / divisor,
+            1,
+        ),
+        "gpuReservedMiB": round(
+            torch.cuda.memory_reserved(device) / divisor,
+            1,
+        ),
+    }
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    result["gpuDeviceUsedMiB"] = round(
+        (total_bytes - free_bytes) / divisor,
+        1,
+    )
+    return result
+
+
+def release_inactive_cuda_memory(device: torch.device) -> dict[str, float]:
+    before = cuda_memory_metrics(device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    after = cuda_memory_metrics(device)
+    return {
+        "allocatedMiB": after["gpuAllocatedMiB"],
+        "reservedBeforeMiB": before["gpuReservedMiB"],
+        "reservedAfterMiB": after["gpuReservedMiB"],
+        "releasedMiB": round(
+            before["gpuReservedMiB"] - after["gpuReservedMiB"],
+            1,
+        ),
+        "deviceUsedMiB": after["gpuDeviceUsedMiB"],
+    }
+
+
 def merge_weighted_moments(
     total_weight: Tensor,
     total_mean: Tensor,
@@ -191,7 +272,7 @@ class PersistedMinuteOracleRows:
 
     def __init__(
         self,
-        probabilities: np.ndarray,
+        probabilities: np.ndarray | CompressedComponentRows,
         shard: Shard,
         action_count: int,
     ) -> None:
@@ -286,7 +367,9 @@ class FittedPolicyDataset(
         total = 0
         run_start = 0
         previous_prediction_time: int | None = None
-        minute_components: dict[Path, np.ndarray] = {}
+        minute_components: dict[
+            Path, np.ndarray | CompressedComponentRows
+        ] = {}
         for value in manifest["shards"]:
             if value["split"] != split:
                 continue
@@ -393,11 +476,14 @@ class FittedPolicyDataset(
                     minute_component = minute_components.get(minute_file)
                     if minute_component is None:
                         minute_component = (
-                            load_compressed_component(
+                            CompressedComponentRows(
                                 minute_file,
                                 "<f4",
                                 self.action_count,
+                                0,
+                                1,
                                 1_441,
+                                total_rows=1_441,
                             )
                             if minute_file.name.endswith(".zst")
                             else np.memmap(
@@ -696,6 +782,10 @@ class CompressedComponentRows:
         self.row_stride = row_stride
         self.count = count
         self.total_rows = total_rows
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.count, self.columns)
 
     def __getitem__(self, key) -> np.ndarray:
         values = load_compressed_component(
@@ -1559,19 +1649,20 @@ def main() -> None:
         precompute_transition=False,
     )
     if args.compile:
+        compile_options = {"triton.cudagraphs": False}
         training_objective = torch.compile(
             training_objective,
-            mode="reduce-overhead",
+            options=compile_options,
             fullgraph=False,
         )
         training_diagnostic_objective = torch.compile(
             training_diagnostic_objective,
-            mode="reduce-overhead",
+            options=compile_options,
             fullgraph=False,
         )
         evaluation_objective = torch.compile(
             evaluation_objective,
-            mode="reduce-overhead",
+            options=compile_options,
             fullgraph=False,
         )
     emit({
@@ -1586,6 +1677,13 @@ def main() -> None:
         "evaluationBatchSize": evaluation_batch_size,
         "validationFraction": args.validation_fraction,
         "compiledObjective": args.compile,
+        "compileMode": "default-static-no-cudagraphs"
+        if args.compile else "disabled",
+        "dataLoaderWorkers": {
+            "training": args.workers,
+            "evaluation": 0,
+            "prefetchFactor": 2 if args.workers > 0 else 0,
+        },
         "testExamples": len(test),
         "targetRepresentation": args.target,
         "compactMinuteFeatureComponents": (
@@ -1658,6 +1756,7 @@ def main() -> None:
             "message": "Finalizing the saved best validated checkpoint.",
         })
     last_epoch = start_epoch - 1
+    throughput_meter = TrainingThroughputMeter()
     try:
         for epoch in range(start_epoch, args.epochs):
             if args.evaluation_only or quality_target_reached or patience_exhausted:
@@ -1681,6 +1780,7 @@ def main() -> None:
                 sampling_interval_ms,
                 objective=training_objective,
                 diagnostic_objective=training_diagnostic_objective,
+                throughput_meter=throughput_meter,
             )
             validation_metrics = evaluate(
                 model, validation_loader, actions, current, support,
@@ -1713,6 +1813,7 @@ def main() -> None:
                 scaler,
                 training_contract,
             )
+            cuda_cache = release_inactive_cuda_memory(device)
             quality_target_reached = validation_target_reached(validation_metrics, args)
             emit({
                 "event": "epoch",
@@ -1728,6 +1829,7 @@ def main() -> None:
                 "staleEpochs": stale_epochs,
                 "stopRequested": stopped,
                 "validationTargetReached": quality_target_reached,
+                "cudaCache": cuda_cache,
             })
             if quality_target_reached:
                 emit({
@@ -1883,6 +1985,7 @@ def train_epoch(
     sampling_interval_ms,
     objective=None,
     diagnostic_objective=None,
+    throughput_meter: TrainingThroughputMeter | None = None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1903,7 +2006,8 @@ def train_epoch(
     probability_mse_weight_sum = torch.zeros((), device=device)
     probability_mse_mean = torch.zeros((), device=device)
     probability_mse_centered_square_sum = torch.zeros((), device=device)
-    started = time.monotonic()
+    throughput_meter = throughput_meter or TrainingThroughputMeter()
+    throughput_meter.resume()
     stopped = False
     for batch_step, (
         features,
@@ -1951,6 +2055,9 @@ def train_epoch(
         elif not bool(torch.isfinite(loss)):
             raise RuntimeError(f"non-finite training loss at epoch {epoch}, batch {batch_step}")
         scaler.scale(loss).backward()
+        count = features.shape[0]
+        total_examples += count
+        throughput_meter.add(count)
         if should_step:
             scaler.unscale_(optimizer)
             gradient_norm = clip_grad_norm_(
@@ -1968,6 +2075,10 @@ def train_epoch(
             scheduler.step()
             global_step += 1
             if will_log:
+                gradient_norm_value = float(gradient_norm)
+                latest_metrics = detached_metrics(batch_metrics)
+                examples_per_second, throughput_window_examples = \
+                    throughput_meter.sample()
                 emit({
                     "event": "train-step",
                     "epoch": epoch,
@@ -1976,16 +2087,14 @@ def train_epoch(
                     "batches": len(data),
                     "globalStep": global_step,
                     "learningRate": optimizer.param_groups[0]["lr"],
-                    "gradientNorm": float(gradient_norm),
-                    "examplesPerSecond": round(total_examples / max(time.monotonic() - started, 1e-6), 1),
-                    "gpuMemoryMiB": round(torch.cuda.max_memory_allocated() / 1_048_576, 1)
-                    if device.type == "cuda" else 0,
-                    "latest": detached_metrics(batch_metrics),
+                    "gradientNorm": gradient_norm_value,
+                    "examplesPerSecond": round(examples_per_second, 1),
+                    "throughputWindowExamples": throughput_window_examples,
+                    **cuda_memory_metrics(device),
+                    "latest": latest_metrics,
                 })
             if args.finalize_file and args.finalize_file.exists():
                 stopped = True
-        count = features.shape[0]
-        total_examples += count
         time_weight_sum += batch_metrics["timeWeightSum"].detach()
         time_weight_square_sum += batch_metrics["timeWeightSquareSum"].detach()
         if "klWeightSum" in batch_metrics:
@@ -2019,6 +2128,9 @@ def train_epoch(
             metric_counts[name] += metric_count
         if stopped:
             break
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    throughput_meter.pause()
     result = {
         name: float(value) / max(1.0, float(metric_counts[name]))
         for name, value in totals.items()
@@ -2155,6 +2267,7 @@ def loader(
     sample_fraction: float = 1.0,
     weighted_sample: bool = False,
 ) -> DataLoader:
+    workers = args.workers if shuffle else 0
     return DataLoader(
         dataset,
         batch_sampler=TemporalBlockBatchSampler(
@@ -2165,10 +2278,10 @@ def loader(
             weighted_sample=weighted_sample,
             seed=args.seed,
         ),
-        num_workers=args.workers,
+        num_workers=workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.workers > 0,
-        prefetch_factor=4 if args.workers > 0 else None,
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else None,
         collate_fn=passthrough_batch,
     )
 

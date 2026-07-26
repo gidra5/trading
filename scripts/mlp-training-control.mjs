@@ -130,9 +130,14 @@ function format(status) {
   }
   const step = status.latestStep;
   if (step) {
+    const gpu = [
+      `allocated ${number(step.gpuAllocatedMiB)}`,
+      `reserved ${number(step.gpuReservedMiB)}`,
+      `device ${number(step.gpuDeviceUsedMiB)}`,
+    ].join("/");
     lines.push(
       `Epoch ${step.epoch + 1}/${step.epochs} · batch ${step.batch}/${step.batches} · update ${step.globalStep}`,
-      `LR ${number(step.learningRate)} · grad ${number(step.gradientNorm)} · ${step.examplesPerSecond} examples/s · GPU ${step.gpuMemoryMiB} MiB`,
+      `LR ${number(step.learningRate)} · grad ${number(step.gradientNorm)} · ${step.examplesPerSecond} examples/s · GPU ${gpu} MiB`,
       metricLine("Latest", step.latest),
     );
   }

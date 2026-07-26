@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -27,14 +29,18 @@ from mlp_model import (
 )
 from train_mlp import (
     CompactMinuteFeatureComponent,
+    CompressedComponentRows,
     FittedPolicyDataset,
     RuntimeMinuteOracleRows,
     Shard,
     TemporalBlockBatchSampler,
+    TrainingThroughputMeter,
     cached_training_normalization,
     cached_training_parameter_scale,
     continuation_learning_rate_multiplier,
     merge_weighted_moments,
+    loader,
+    release_inactive_cuda_memory,
     resume_contract_is_monotonic_extension,
     scheduler_resume_steps,
     validate_dataset_manifest,
@@ -481,7 +487,11 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
                 required_loss_terms=required,
             )["loss"]
 
-        compiled = torch.compile(objective, mode="reduce-overhead", fullgraph=False)
+        compiled = torch.compile(
+            objective,
+            options={"triton.cudagraphs": False},
+            fullgraph=False,
+        )
         logits = (
             torch.randn(64, 255, device=device) * 4.0
         ).clamp(-18.0, 18.0).requires_grad_(True)
@@ -592,6 +602,67 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
 
 
 class ValidationMetricAggregationTests(unittest.TestCase):
+    def test_inactive_cuda_release_is_a_noop_on_cpu(self) -> None:
+        self.assertEqual(
+            release_inactive_cuda_memory(torch.device("cpu")),
+            {
+                "allocatedMiB": 0.0,
+                "reservedBeforeMiB": 0.0,
+                "reservedAfterMiB": 0.0,
+                "releasedMiB": 0.0,
+                "deviceUsedMiB": 0.0,
+            },
+        )
+
+    def test_throughput_meter_counts_current_batches_and_excludes_validation(self) -> None:
+        meter = TrainingThroughputMeter()
+        with patch(
+            "train_mlp.time.monotonic",
+            side_effect=(10.0, 12.0, 15.0, 20.0, 22.0),
+        ):
+            meter.resume()
+            meter.add(100)
+            first_rate, first_examples = meter.sample()
+            meter.add(100)
+            meter.pause()
+            meter.resume()
+            meter.add(100)
+            second_rate, second_examples = meter.sample()
+
+        self.assertEqual(first_examples, 100)
+        self.assertEqual(first_rate, 50.0)
+        self.assertEqual(second_examples, 200)
+        self.assertEqual(second_rate, 40.0)
+
+    def test_evaluation_loader_does_not_create_persistent_worker_pool(self) -> None:
+        dataset = type("Dataset", (), {
+            "temporal_runs": [(0, 8)],
+            "storage_runs": [(0, 8, "day-a")],
+            "group_batches_by_storage": False,
+            "coalesce_batches_across_storage": False,
+        })()
+        args = SimpleNamespace(workers=4, seed=1337)
+
+        training = loader(
+            dataset,
+            args,
+            shuffle=True,
+            batch_size=4,
+        )
+        evaluation = loader(
+            dataset,
+            args,
+            shuffle=False,
+            batch_size=4,
+        )
+
+        self.assertEqual(training.num_workers, 4)
+        self.assertEqual(training.prefetch_factor, 2)
+        self.assertTrue(training.persistent_workers)
+        self.assertEqual(evaluation.num_workers, 0)
+        self.assertIsNone(evaluation.prefetch_factor)
+        self.assertFalse(evaluation.persistent_workers)
+
     def test_weighted_moments_merge_across_minibatches(self) -> None:
         weight, mean, centered_square_sum = merge_weighted_moments(
             torch.tensor(2.0),
@@ -882,6 +953,10 @@ class ValidationMetricAggregationTests(unittest.TestCase):
                 root,
                 "train",
                 target="minuteOracleProbabilities",
+            )
+            self.assertIsInstance(
+                dataset.parts[0][4].probabilities,
+                CompressedComponentRows,
             )
             batch = dataset.__getitems__(range(0, 3))
             torch.testing.assert_close(

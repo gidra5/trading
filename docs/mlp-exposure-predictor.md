@@ -502,8 +502,8 @@ npm run mlp:run
 ```
 
 In another terminal, watch daily oracle preparation, CUDA teacher throughput,
-allocated GPU memory, mean teacher KL/MSE, or model-training updates (Ctrl+C only
-stops the watcher):
+allocated/reserved/whole-device GPU memory, mean teacher KL/MSE, or
+model-training updates (Ctrl+C only stops the watcher):
 
 ```bash
 npm run mlp:status
@@ -532,8 +532,20 @@ seconds. A tested 512/2,048 configuration was slower on its cold compiled pass,
 halved optimizer updates, and had worse one-epoch validation KL, so it is not the
 default. `data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s/training.log`
 contains the complete append-only event stream. The status display includes loss,
-KL divergence, probability/parameter MSE, excess entropy, both MI rewards, learning rate,
-gradient norm, throughput, and GPU memory.
+conditional/base KL divergence, probability MSE, excess entropy, oracle MI,
+learning rate, gradient norm, throughput, and GPU memory.
+
+The direct-distribution trainer keeps compressed minute-oracle components lazy
+inside Windows DataLoader workers instead of pickling every decoded day into
+each process. Only the shuffled training loader owns persistent workers;
+validation and test execute in the main process, so they cannot accumulate
+additional worker pools. The compiled objectives use static Inductor graphs
+with CUDA graphs disabled. At every epoch boundary the trainer releases only
+inactive CUDA allocator blocks, preserving live tensors and optimizer state
+while preventing varying batch shapes from filling device memory with cached
+blocks. Training events report current tensor allocation, PyTorch reservation,
+and whole-device usage separately. Throughput is a rolling completed-example
+rate across training segments and excludes validation time.
 
 The v11 run starts from a fresh random initialization and runs at most 256 epochs
 with 64-epoch early-stopping patience. CE and both MI rewards have weight `1`;
