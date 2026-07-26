@@ -258,6 +258,9 @@ class FittedPolicyDataset(
         target: str = "rawOracleProbabilities",
         runtime_minute_oracles: dict[int, np.ndarray] | None = None,
         compact_minute_targets: bool = False,
+        compact_minute_features: dict[
+            Path, CompactMinuteFeatureComponent
+        ] | None = None,
     ) -> None:
         if target not in (
             "rawOracleProbabilities",
@@ -281,6 +284,11 @@ class FittedPolicyDataset(
         self.temporal_runs: list[tuple[int, int]] = []
         self.storage_runs: list[tuple[int, int, str]] = []
         self.group_batches_by_storage = False
+        self.coalesce_batches_across_storage = (
+            target == "minuteOracleProbabilities"
+            and self.manifest_sampling_interval_ms == 60_000
+            and compact_minute_features is not None
+        )
         total = 0
         run_start = 0
         previous_prediction_time: int | None = None
@@ -315,10 +323,56 @@ class FittedPolicyDataset(
                     + self.manifest_sampling_interval_ms:
                 self.temporal_runs.append((run_start, total))
                 run_start = total
-            features = component_rows(
-                root / shard.features, "<f2", self.feature_count,
-                shard.feature_row_offset, shard.feature_row_stride, shard.count,
+            feature_file = root / shard.features
+            compact_feature = (
+                compact_minute_features.get(feature_file)
+                if compact_minute_features is not None
+                else None
             )
+            if compact_feature is None:
+                features = component_rows(
+                    feature_file, "<f2", self.feature_count,
+                    shard.feature_row_offset, shard.feature_row_stride, shard.count,
+                )
+                feature_storage = shard.features
+            else:
+                relative_offset = (
+                    shard.feature_row_offset - compact_feature.row_phase
+                )
+                if relative_offset < 0 \
+                        or relative_offset % compact_feature.row_stride != 0 \
+                        or shard.feature_row_stride % compact_feature.row_stride != 0:
+                    raise ValueError(
+                        f"minute feature rows are incompatible with "
+                        f"{compact_feature.file}"
+                    )
+                compact_offset = (
+                    relative_offset // compact_feature.row_stride
+                )
+                compact_stride = (
+                    shard.feature_row_stride // compact_feature.row_stride
+                )
+                features = (
+                    CompressedComponentRows(
+                        compact_feature.file,
+                        "<f2",
+                        self.feature_count,
+                        compact_offset,
+                        compact_stride,
+                        shard.count,
+                        total_rows=compact_feature.total_rows,
+                    )
+                    if compact_feature.file.name.endswith(".zst")
+                    else component_rows(
+                        compact_feature.file,
+                        "<f2",
+                        self.feature_count,
+                        compact_offset,
+                        compact_stride,
+                        shard.count,
+                    )
+                )
+                feature_storage = str(compact_feature.file)
             teacher_parameters = component_rows(
                 root / shard.teacher_parameters, "<f4", self.parameter_count,
                 shard.oracle_row_offset, shard.oracle_row_stride, shard.count,
@@ -402,7 +456,7 @@ class FittedPolicyDataset(
             ))
             total += shard.count
             self.offsets.append(total)
-            self.storage_runs.append((total - shard.count, total, shard.features))
+            self.storage_runs.append((total - shard.count, total, feature_storage))
             self.group_batches_by_storage = self.group_batches_by_storage \
                 or shard.features.endswith(".zst") \
                 or shard.raw_oracle_probabilities.endswith(".zst") \
@@ -615,6 +669,14 @@ _COMPRESSED_COMPONENT_CACHE_DAYS = max(
 )
 
 
+@dataclass(frozen=True)
+class CompactMinuteFeatureComponent:
+    file: Path
+    row_phase: int
+    row_stride: int = 60
+    total_rows: int = 1_440
+
+
 class CompressedComponentRows:
     """Lazy row-addressable view over one lossless zstd component chunk."""
 
@@ -684,6 +746,164 @@ def load_compressed_component(
     return values
 
 
+def prepare_compact_minute_features(
+    manifest: dict,
+    dataset_root: Path,
+    cache_root: Path,
+) -> dict[Path, CompactMinuteFeatureComponent]:
+    """Materialize exact minute-cadence views of compressed one-second features."""
+    if int(manifest["samplingIntervalMs"]) != 60_000:
+        return {}
+    if zstandard is None:
+        raise RuntimeError(
+            "zstandard is required for compact minute feature components; "
+            "run `npm run mlp:bootstrap`"
+        )
+
+    columns = int(manifest["featureCount"])
+    schema_version = int(manifest["featureSchemaVersion"])
+    source_phases: dict[Path, int] = {}
+    for value in manifest["shards"]:
+        source = dataset_root / value["features"]
+        if not source.name.endswith(".zst"):
+            continue
+        row_stride = int(value["featureRowStride"])
+        if row_stride != 60:
+            raise ValueError(
+                "one-minute feature compaction requires featureRowStride = 60"
+            )
+        phase = int(value["featureRowOffset"]) % row_stride
+        previous = source_phases.setdefault(source, phase)
+        if previous != phase:
+            raise ValueError(
+                f"compressed feature component uses multiple minute phases: {source}"
+            )
+    if not source_phases:
+        return {}
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    expected_bytes = 1_440 * columns * np.dtype("<f2").itemsize
+    source_bytes = 86_400 * columns * np.dtype("<f2").itemsize
+
+    def cache_file(source: Path, phase: int) -> Path:
+        return cache_root / (
+            f"{source.name}.phase-{phase}.schema-{schema_version}."
+            f"columns-{columns}.minute.f16.zst"
+        )
+
+    def prepare_one(
+        source: Path,
+        phase: int,
+    ) -> tuple[Path, CompactMinuteFeatureComponent, bool, int]:
+        target = cache_file(source, phase)
+        source_stat = source.stat()
+        try:
+            target_stat = target.stat()
+            if target_stat.st_size > 0 \
+                    and target_stat.st_mtime_ns >= source_stat.st_mtime_ns:
+                return (
+                    source,
+                    CompactMinuteFeatureComponent(target, phase),
+                    True,
+                    target_stat.st_size,
+                )
+        except FileNotFoundError:
+            pass
+
+        decoded = zstandard.ZstdDecompressor().decompress(
+            source.read_bytes(),
+            max_output_size=source_bytes,
+        )
+        if len(decoded) != source_bytes:
+            raise ValueError(
+                f"compressed feature component has {len(decoded)} decoded bytes, "
+                f"expected {source_bytes}: {source}"
+            )
+        values = np.frombuffer(decoded, dtype="<f2").reshape(86_400, columns)
+        compact = np.ascontiguousarray(values[phase::60])
+        if compact.nbytes != expected_bytes:
+            raise ValueError(
+                f"minute feature component has {compact.nbytes} bytes, "
+                f"expected {expected_bytes}: {source}"
+            )
+        compressed = zstandard.ZstdCompressor(level=3).compress(compact.tobytes())
+        temporary = target.with_name(
+            f"{target.name}.tmp-{os.getpid()}-{random.randrange(1 << 30)}"
+        )
+        try:
+            temporary.write_bytes(compressed)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return (
+            source,
+            CompactMinuteFeatureComponent(target, phase),
+            False,
+            len(compressed),
+        )
+
+    worker_count = min(
+        len(source_phases),
+        max(1, int(os.environ.get("MLP_MINUTE_FEATURE_CACHE_WORKERS", "4"))),
+    )
+    emit({
+        "event": "minute-feature-cache-start",
+        "components": len(source_phases),
+        "rowsPerComponent": 1_440,
+        "sourceRowsPerComponent": 86_400,
+        "columns": columns,
+        "workers": worker_count,
+        "cache": str(cache_root),
+    })
+    result: dict[Path, CompactMinuteFeatureComponent] = {}
+    cached = 0
+    compressed_bytes = 0
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="minute-features",
+    ) as executor:
+        futures = {
+            executor.submit(prepare_one, source, phase): source
+            for source, phase in source_phases.items()
+        }
+        for completed, future in enumerate(as_completed(futures), start=1):
+            source, component, reused, size = future.result()
+            result[source] = component
+            cached += int(reused)
+            compressed_bytes += size
+            if completed == 1 or completed % 25 == 0 \
+                    or completed == len(futures):
+                emit({
+                    "event": "minute-feature-cache-progress",
+                    "completedComponents": completed,
+                    "components": len(futures),
+                    "reusedComponents": cached,
+                })
+    obsolete_bytes = 0
+    obsolete_components = 0
+    for obsolete in cache_root.glob("*.minute.f16"):
+        if not obsolete.is_file():
+            continue
+        obsolete_bytes += obsolete.stat().st_size
+        obsolete.unlink()
+        obsolete_components += 1
+    emit({
+        "event": "minute-feature-cache-complete",
+        "components": len(result),
+        "reusedComponents": cached,
+        "materializedComponents": len(result) - cached,
+        "storage": "shared-compressed-minute-view-cache",
+        "compressedMiB": compressed_bytes / (1024 * 1024),
+        "decodedMiBPerEpoch": len(result) * expected_bytes / (1024 * 1024),
+        "avoidedDecodedMiBPerEpoch": len(result)
+        * (source_bytes - expected_bytes) / (1024 * 1024),
+        "prunedObsoleteComponents": obsolete_components,
+        "prunedObsoleteMiB": obsolete_bytes / (1024 * 1024),
+        "cache": str(cache_root),
+    })
+    return result
+
+
 class TemporalBlockBatchSampler:
     """Shuffle contiguous time blocks without inheriting component boundaries."""
 
@@ -700,6 +920,7 @@ class TemporalBlockBatchSampler:
         groups_by_storage: OrderedDict[str, list[range]] = OrderedDict()
         source_runs = dataset.storage_runs \
             if getattr(dataset, "group_batches_by_storage", False) \
+            and not getattr(dataset, "coalesce_batches_across_storage", False) \
             else [
                 (start, end, f"temporal-{index}")
                 for index, (start, end) in enumerate(dataset.temporal_runs)
@@ -1022,6 +1243,21 @@ def main() -> None:
         == "persisted-per-minute-day"
         and 60_000 % sampling_interval_ms == 0
     )
+    minute_feature_cache_root = (
+        args.feature_statistics_cache.parent / "minute-feature-components"
+        if args.feature_statistics_cache is not None
+        else args.dataset / ".training-cache" / "minute-feature-components"
+    )
+    compact_minute_features = (
+        prepare_compact_minute_features(
+            manifest,
+            args.dataset,
+            minute_feature_cache_root,
+        )
+        if args.target == "minuteOracleProbabilities"
+        and sampling_interval_ms == 60_000
+        else None
+    )
     train = FittedPolicyDataset(
         manifest,
         args.dataset,
@@ -1029,6 +1265,7 @@ def main() -> None:
         target=args.target,
         runtime_minute_oracles=runtime_minute_oracles,
         compact_minute_targets=compact_training_targets,
+        compact_minute_features=compact_minute_features,
     )
     validation = FittedPolicyDataset(
         manifest,
@@ -1036,6 +1273,7 @@ def main() -> None:
         "validation",
         target=args.target,
         runtime_minute_oracles=runtime_minute_oracles,
+        compact_minute_features=compact_minute_features,
     )
     test = FittedPolicyDataset(
         manifest,
@@ -1043,6 +1281,7 @@ def main() -> None:
         "test",
         target=args.target,
         runtime_minute_oracles=runtime_minute_oracles,
+        compact_minute_features=compact_minute_features,
     )
     if min(len(train), len(validation), len(test)) == 0:
         raise RuntimeError("train, validation, and test datasets must all be non-empty")
@@ -1242,7 +1481,38 @@ def main() -> None:
             for group in optimizer.param_groups:
                 group["fused"] = True
                 group["foreach"] = None
-        scheduler.load_state_dict(checkpoint["scheduler"])
+        saved_scheduler_step, resumed_scheduler_step = scheduler_resume_steps(
+            checkpoint,
+            steps_per_epoch,
+        )
+        if saved_scheduler_step == resumed_scheduler_step:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        else:
+            scheduler.last_epoch = resumed_scheduler_step
+            scheduler._step_count = resumed_scheduler_step + 1
+            resumed_learning_rates = [
+                base_lr * learning_rate_lambda(resumed_scheduler_step)
+                for base_lr, learning_rate_lambda in zip(
+                    scheduler.base_lrs,
+                    scheduler.lr_lambdas,
+                    strict=True,
+                )
+            ]
+            for group, learning_rate in zip(
+                optimizer.param_groups,
+                resumed_learning_rates,
+                strict=True,
+            ):
+                group["lr"] = learning_rate
+            scheduler._last_lr = resumed_learning_rates
+            emit({
+                "event": "learning-rate-schedule-rebased",
+                "reason": "optimizer batches per epoch changed",
+                "checkpointStep": saved_scheduler_step,
+                "resumedStep": resumed_scheduler_step,
+                "optimizerStepsPerEpoch": steps_per_epoch,
+                "learningRates": resumed_learning_rates,
+            })
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = checkpoint["epoch"] + 1
         global_step = checkpoint.get("globalStep", start_epoch * steps_per_epoch)
@@ -1325,6 +1595,11 @@ def main() -> None:
         "compiledObjective": args.compile,
         "testExamples": len(test),
         "targetRepresentation": args.target,
+        "compactMinuteFeatureComponents": (
+            len(compact_minute_features)
+            if compact_minute_features is not None
+            else 0
+        ),
         "lossWeights": asdict(loss_weights),
         "distributionObjective": training_contract["distributionObjective"],
         "temporalObjective": training_contract["temporalObjective"],
@@ -2189,6 +2464,25 @@ def continuation_learning_rate_multiplier(
     progress = (step - start_step) / max(1, total - start_step)
     cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
     return end_multiplier + (start_multiplier - end_multiplier) * cosine
+
+
+def scheduler_resume_steps(
+    checkpoint: dict,
+    optimizer_steps_per_epoch: int,
+) -> tuple[int, int]:
+    """Translate an old loader-sized schedule onto the current epoch geometry."""
+    saved_step = int(
+        checkpoint.get("scheduler", {}).get(
+            "last_epoch",
+            checkpoint.get("globalStep", 0),
+        )
+    )
+    checkpoint_epoch = int(checkpoint["epoch"])
+    current_epoch_start = checkpoint_epoch * optimizer_steps_per_epoch
+    current_epoch_end = current_epoch_start + optimizer_steps_per_epoch
+    if current_epoch_start <= saved_step <= current_epoch_end:
+        return saved_step, saved_step
+    return saved_step, current_epoch_end
 
 
 def resume_contract_is_monotonic_extension(

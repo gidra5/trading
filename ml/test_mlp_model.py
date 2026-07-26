@@ -27,6 +27,7 @@ from mlp_model import (
     surface_probability_mse_per_example,
 )
 from train_mlp import (
+    CompactMinuteFeatureComponent,
     FittedPolicyDataset,
     RuntimeMinuteOracleRows,
     Shard,
@@ -36,6 +37,7 @@ from train_mlp import (
     continuation_learning_rate_multiplier,
     merge_weighted_moments,
     resume_contract_is_monotonic_extension,
+    scheduler_resume_steps,
     validate_dataset_manifest,
     weighted_standard_deviation,
     weighted_variance,
@@ -84,6 +86,30 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             target_only,
             {**target_only, "patience": 16},
         ))
+
+    def test_scheduler_resume_rebases_changed_batches_per_epoch(self) -> None:
+        checkpoint = {
+            "epoch": 51,
+            "globalStep": 19_240,
+            "scheduler": {"last_epoch": 19_240},
+        }
+
+        self.assertEqual(
+            scheduler_resume_steps(checkpoint, optimizer_steps_per_epoch=77),
+            (19_240, 4_004),
+        )
+
+    def test_scheduler_resume_keeps_partial_current_epoch(self) -> None:
+        checkpoint = {
+            "epoch": 456,
+            "globalStep": 50_573,
+            "scheduler": {"last_epoch": 35_182},
+        }
+
+        self.assertEqual(
+            scheduler_resume_steps(checkpoint, optimizer_steps_per_epoch=77),
+            (35_182, 35_182),
+        )
 
     def test_continuation_schedule_is_smooth_and_monotonic(self) -> None:
         start = 172_723
@@ -441,6 +467,101 @@ class ValidationMetricAggregationTests(unittest.TestCase):
             [list(block) for block in sampler],
             [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]],
         )
+
+    def test_minute_batches_coalesce_compressed_daily_storage(self) -> None:
+        dataset = type("Dataset", (), {
+            "temporal_runs": [(0, 8), (8, 10)],
+            "storage_runs": [
+                (0, 2, "day-a"),
+                (2, 4, "day-b"),
+                (4, 8, "day-c"),
+                (8, 10, "day-d"),
+            ],
+            "group_batches_by_storage": True,
+            "coalesce_batches_across_storage": True,
+        })()
+        sampler = TemporalBlockBatchSampler(dataset, batch_size=6, shuffle=False)
+
+        self.assertEqual(
+            [list(block) for block in sampler],
+            [list(range(0, 6)), [6, 7], [8, 9]],
+        )
+
+    def test_raw_compressed_batches_remain_grouped_by_storage(self) -> None:
+        dataset = type("Dataset", (), {
+            "temporal_runs": [(0, 8)],
+            "storage_runs": [
+                (0, 2, "day-a"),
+                (2, 8, "day-b"),
+            ],
+            "group_batches_by_storage": True,
+            "coalesce_batches_across_storage": False,
+        })()
+        sampler = TemporalBlockBatchSampler(dataset, batch_size=6, shuffle=False)
+
+        self.assertEqual(
+            [list(block) for block in sampler],
+            [[0, 1], list(range(2, 8))],
+        )
+
+    def test_minute_dataset_reads_exact_compact_feature_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "inputs.features.f16.zst"
+            compact_file = root / "inputs.minute.f16"
+            compact = np.zeros((1_440, INPUT_FEATURE_COUNT), dtype="<f2")
+            compact[0, 0] = 11
+            compact[1, 0] = 22
+            compact.tofile(compact_file)
+            np.zeros((2, 8), dtype="<f4").tofile(root / "parameters.f32")
+            np.zeros((2, 8), dtype="<f4").tofile(root / "raw-oracle.f32")
+            np.zeros((2, 8), dtype="<f4").tofile(root / "minute-oracle.f32")
+            np.zeros((2, 7), dtype="<f4").tofile(root / "metrics.f32")
+            np.zeros(2, dtype="<f4").tofile(root / "resolution.f32")
+            np.ones(2, dtype="<f4").tofile(root / "weights.f32")
+            manifest = {
+                "featureCount": INPUT_FEATURE_COUNT,
+                "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
+                "teacherParameterCount": 8,
+                "teacherMetricCount": 7,
+                "actionCount": 8,
+                "samplingIntervalMs": 60_000,
+                "shards": [{
+                    "split": "train",
+                    "count": 2,
+                    "features": source.name,
+                    "featureRowOffset": 59,
+                    "featureRowStride": 60,
+                    "teacherParameters": "parameters.f32",
+                    "teacherMetrics": "metrics.f32",
+                    "rawOracleProbabilities": "raw-oracle.f32",
+                    "minuteOracleProbabilities": "minute-oracle.f32",
+                    "resolutionDivergence": "resolution.f32",
+                    "oracleRowOffset": 0,
+                    "oracleRowStride": 1,
+                    "baseTimeWeights": "weights.f32",
+                    "timeWeights": "weights.f32",
+                    "predictionTimeStart": 59_999,
+                }],
+            }
+            dataset = FittedPolicyDataset(
+                manifest,
+                root,
+                "train",
+                target="minuteOracleProbabilities",
+                compact_minute_features={
+                    source: CompactMinuteFeatureComponent(compact_file, 59),
+                },
+            )
+
+            batch = dataset.__getitems__(range(0, 2))
+            torch.testing.assert_close(
+                batch[0][:, 0],
+                torch.tensor([11.0, 22.0]),
+            )
+            self.assertTrue(dataset.coalesce_batches_across_storage)
+            self.assertEqual(dataset.storage_runs[0][2], str(compact_file))
+            dataset.close()
 
     def test_temporal_validation_fraction_is_deterministic_and_stratified(self) -> None:
         dataset = type("Dataset", (), {"temporal_runs": [(0, 12), (12, 24)]})()

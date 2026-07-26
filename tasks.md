@@ -324,8 +324,8 @@ Alternatives:
 2.  Decision Transformer
 3.  iTransformer
 4.  encoder(-decoder)s
+5.  LSTM
 
-launch a fresh training run for the distribution model version of the arch.
 Insufficient margin trades should not happen
 
 Timestamp (UTC)	Usable-range KL after deep fitting	Action-mean RMSE
@@ -335,4 +335,11 @@ Timestamp (UTC)	Usable-range KL after deep fitting	Action-mean RMSE
 2025-06-05 02:11:59	0.058	5.89×
 2025-11-05 16:16:59	0.072	3.24×
 
-We have found these bad oracle fit cases. search for other cases where the fit is bad over all the available windows on 1s accuracy. We can skip known good cases from the dataset values
+measure confidence as entropy of the predicted distribution - the more uniform it is, the more uncertain it is. that means confidence corresponds to lower entropy. since entropy is in range 0-inf, we should convert it to 0-1 range with exp(-entropy/temperature).
+
+the 60m delay cant match the distributions, even though the model has all the information.
+
+try finding simpler distributions to learn and then gradually move to the full model:
+1. add prediction delay
+2. add oracle moving average
+3. add temperature scaling - the higher means more diffuse and even distribution
