@@ -147,15 +147,16 @@ class DeviceBatchPipeline:
             else None
         )
 
-    def batches(self, data) -> Iterator[DeviceBatch]:
+    def batches(self, data, prepared_iterator=None) -> Iterator[DeviceBatch]:
         if isinstance(data, DeviceBatchCache):
             yield from data
             return
+        source = prepared_iterator if prepared_iterator is not None else data
         if self.copy_stream is None:
-            yield from data
+            yield from source
             return
 
-        iterator = iter(data)
+        iterator = iter(source)
 
         def copy(batch) -> DeviceBatch:
             (
@@ -266,6 +267,7 @@ class AsyncCheckpointWriter:
         )
         return {
             "asynchronous": True,
+            "submitted": True,
             "snapshotSeconds": round(snapshot_seconds, 4),
             "previousWriteWaitSeconds": round(wait_seconds, 4),
             "previousCheckpointWriteSeconds": (
@@ -278,6 +280,17 @@ class AsyncCheckpointWriter:
                 if previous is not None
                 else None
             ),
+        }
+
+    @staticmethod
+    def skipped() -> dict[str, float | bool | None]:
+        return {
+            "asynchronous": True,
+            "submitted": False,
+            "snapshotSeconds": 0.0,
+            "previousWriteWaitSeconds": 0.0,
+            "previousCheckpointWriteSeconds": None,
+            "previousBestModelWriteSeconds": None,
         }
 
     def flush(self) -> dict[str, float] | None:
@@ -1304,6 +1317,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable plateau stopping; validation targets are the only automatic stop.",
     )
+    parser.add_argument(
+        "--target-only-extension-epochs",
+        type=int,
+        default=0,
+        help=(
+            "When patience is disabled and a validation target is configured, "
+            "continue this many epochs past the scheduled horizon in the same "
+            "process. The learning rate remains at the schedule floor."
+        ),
+    )
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument(
         "--evaluation-workers",
@@ -1334,6 +1357,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--log-every-steps", type=int, default=25)
+    parser.add_argument(
+        "--checkpoint-interval-epochs",
+        type=int,
+        default=8,
+        help=(
+            "Write a resumable optimizer checkpoint at this epoch interval. "
+            "New best and terminal epochs are always checkpointed."
+        ),
+    )
     parser.add_argument("--loss-weights-json", default="{}")
     parser.add_argument("--time-weighting-json", default="{}")
     parser.add_argument(
@@ -1523,6 +1555,7 @@ def utc_date(time_ms: int) -> str:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    training_epochs = target_only_training_epoch_limit(args)
     set_determinism(args.seed)
     manifest = json.loads((args.dataset / "dataset.json").read_text())
     validate_dataset_manifest(manifest, args.dataset)
@@ -1650,7 +1683,7 @@ def main() -> None:
         "trainingFraction": args.training_fraction,
         "weightedTrainingSample": args.weighted_training_sample,
         "gradientAccumulation": args.accumulate,
-        "epochs": args.epochs,
+        "epochs": training_epochs,
         "patience": None if args.disable_patience else args.patience,
         "earlyStopping": "target-only" if args.disable_patience else "patience",
         "learningRate": args.learning_rate,
@@ -1746,6 +1779,8 @@ def main() -> None:
             **cuda_memory_metrics(device),
         })
     steps_per_epoch = math.ceil(len(train_loader) / args.accumulate)
+    # Target-only continuation extends process lifetime, not the requested
+    # schedule. Past this horizon the cosine lambda remains at its 5% floor.
     total_steps = max(1, steps_per_epoch * args.epochs)
     checkpoint_file = args.output / "checkpoint.pt"
     best_model_file = args.output / "best-model.pt"
@@ -1954,6 +1989,8 @@ def main() -> None:
             "test": 0,
             "prefetchFactor": 2,
         },
+        "nextEpochPrefetchDuringValidation": args.workers > 0,
+        "checkpointIntervalEpochs": args.checkpoint_interval_epochs,
         "validationDeviceCache": (
             {
                 "enabled": True,
@@ -1981,7 +2018,9 @@ def main() -> None:
         ],
         "currentStates": args.states_per_example,
         "startEpoch": start_epoch,
-        "epochs": args.epochs,
+        "epochs": training_epochs,
+        "learningRateScheduleEpochs": args.epochs,
+        "targetOnlyExtensionEpochs": training_epochs - args.epochs,
         "evaluationOnly": args.evaluation_only,
         "targetValidation": {
             "klDivergence": args.target_validation_kl,
@@ -2038,12 +2077,15 @@ def main() -> None:
     last_epoch = start_epoch - 1
     throughput_meter = TrainingThroughputMeter()
     checkpoint_writer = AsyncCheckpointWriter()
+    prepared_train_iterator = None
     try:
-        for epoch in range(start_epoch, args.epochs):
+        for epoch in range(start_epoch, training_epochs):
             if args.evaluation_only or quality_target_reached or patience_exhausted:
                 break
             last_epoch = epoch
             started = time.monotonic()
+            current_train_iterator = prepared_train_iterator
+            prepared_train_iterator = None
             train_metrics, global_step, stopped = train_epoch(
                 model,
                 train_loader,
@@ -2057,14 +2099,23 @@ def main() -> None:
                 args,
                 device,
                 epoch,
+                training_epochs,
                 global_step,
                 sampling_interval_ms,
                 objective=training_objective,
                 diagnostic_objective=training_diagnostic_objective,
                 throughput_meter=throughput_meter,
                 batch_pipeline=batch_pipeline,
+                prepared_iterator=current_train_iterator,
             )
             training_completed = time.monotonic()
+            # Queue the next epoch's compressed CPU batches while the fixed
+            # validation cache occupies the GPU. Capture the prefetch-boundary
+            # RNG state so a resumed checkpoint recreates the same next epoch.
+            resume_rng = capture_rng()
+            if not stopped and epoch + 1 < training_epochs:
+                prepared_train_iterator = iter(train_loader)
+            prefetch_enqueued = time.monotonic()
             validation_metrics = evaluate(
                 model, validation_data, actions, current, support,
                 loss_weights, device, sampling_interval_ms,
@@ -2083,40 +2134,62 @@ def main() -> None:
             patience_exhausted = (
                 not args.disable_patience and stale_epochs >= args.patience
             )
-            checkpoint_io = checkpoint_writer.submit(
-                checkpoint_state(
-                    epoch,
-                    global_step,
-                    best_epoch,
-                    best_validation,
-                    best_validation_metrics,
-                    stale_epochs,
-                    model,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    training_contract,
-                ),
-                checkpoint_file,
-                best_model_file if improved else None,
+            quality_target_reached = validation_target_reached(
+                validation_metrics,
+                args,
             )
+            checkpoint_due = should_checkpoint_epoch(
+                epoch,
+                training_epochs,
+                args.checkpoint_interval_epochs,
+                improved=improved,
+                stopping=(
+                    stopped
+                    or quality_target_reached
+                    or patience_exhausted
+                ),
+            )
+            if checkpoint_due:
+                checkpoint_io = checkpoint_writer.submit(
+                    checkpoint_state(
+                        epoch,
+                        global_step,
+                        best_epoch,
+                        best_validation,
+                        best_validation_metrics,
+                        stale_epochs,
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        training_contract,
+                        rng=resume_rng,
+                    ),
+                    checkpoint_file,
+                    best_model_file if improved else None,
+                )
+            else:
+                checkpoint_io = checkpoint_writer.skipped()
             checkpoint_enqueued = time.monotonic()
             cuda_cache = trim_inactive_cuda_memory(
                 device,
                 args.cuda_cache_trim_fraction,
             )
             cache_checked = time.monotonic()
-            quality_target_reached = validation_target_reached(validation_metrics, args)
             emit({
                 "event": "epoch",
                 "epoch": epoch,
-                "epochs": args.epochs,
+                "epochs": training_epochs,
                 "globalStep": global_step,
                 "seconds": round(cache_checked - started, 2),
                 "phaseSeconds": {
                     "training": round(training_completed - started, 4),
                     "validation": round(
-                        validation_completed - training_completed,
+                        validation_completed - prefetch_enqueued,
+                        4,
+                    ),
+                    "nextEpochPrefetchSetup": round(
+                        prefetch_enqueued - training_completed,
                         4,
                     ),
                     "checkpointSnapshot": round(
@@ -2230,7 +2303,7 @@ def main() -> None:
             "oracleObjective": "base-action-gaussian-time-correlation-mi-v1",
             "trainExamples": len(train),
             "validationExamples": len(validation),
-            "epochs": args.epochs,
+            "epochs": training_epochs,
             "patience": None if args.disable_patience else args.patience,
             "earlyStopping": (
                 "target-only" if args.disable_patience else "patience"
@@ -2279,6 +2352,7 @@ def main() -> None:
             stopped or interrupted or quality_target_reached
             or patience_exhausted or args.evaluation_only,
         "validationTargetReached": quality_target_reached,
+        "patienceExhausted": patience_exhausted,
     })
 
 
@@ -2295,12 +2369,14 @@ def train_epoch(
     args,
     device,
     epoch,
+    total_epochs,
     global_step,
     sampling_interval_ms,
     objective=None,
     diagnostic_objective=None,
     throughput_meter: TrainingThroughputMeter | None = None,
     batch_pipeline: DeviceBatchPipeline | None = None,
+    prepared_iterator=None,
 ) -> tuple[dict[str, float], int, bool]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -2333,7 +2409,7 @@ def train_epoch(
         _,
         target_row_indices,
     ) in enumerate(
-        batch_pipeline.batches(data)
+        batch_pipeline.batches(data, prepared_iterator)
     ):
         should_step = (batch_step + 1) % args.accumulate == 0 \
             or batch_step + 1 == len(data)
@@ -2398,7 +2474,7 @@ def train_epoch(
                 emit({
                     "event": "train-step",
                     "epoch": epoch,
-                    "epochs": args.epochs,
+                    "epochs": total_epochs,
                     "batch": batch_step + 1,
                     "batches": len(data),
                     "globalStep": global_step,
@@ -2917,8 +2993,26 @@ def resume_contract_is_monotonic_extension(
     requested_epochs = requested.pop("epochs", None)
     previous_patience = previous.pop("patience", None)
     requested_patience = requested.pop("patience", None)
+    previous_early_stopping = previous.pop("earlyStopping", None)
+    requested_early_stopping = requested.pop("earlyStopping", None)
     previous_evaluation_batch_size = previous.pop("evaluationBatchSize", None)
     requested_evaluation_batch_size = requested.pop("evaluationBatchSize", None)
+    runtime_stop_changed = any(
+        previous.get(key) != requested.get(key)
+        for key in (
+            "targetValidationKl",
+            "targetValidationBaseKl",
+            "targetValidationKlStdDev",
+        )
+    ) or previous_patience != requested_patience \
+        or previous_early_stopping != requested_early_stopping
+    for runtime_stop_key in (
+        "targetValidationKl",
+        "targetValidationBaseKl",
+        "targetValidationKlStdDev",
+    ):
+        previous.pop(runtime_stop_key, None)
+        requested.pop(runtime_stop_key, None)
     previous.pop("learningRateSchedule", None)
     requested.pop("learningRateSchedule", None)
     evaluation_batch_size_changed = (
@@ -2937,35 +3031,58 @@ def resume_contract_is_monotonic_extension(
                 previous_epochs,
                 requested_epochs,
             )) \
-            or not (
-                previous_patience is None and requested_patience is None
-                or isinstance(previous_patience, int)
-                and isinstance(requested_patience, int)
+            or not all(
+                value is None or isinstance(value, int) and value > 0
+                for value in (previous_patience, requested_patience)
             ):
         return False
-    patience_extended = (
-        previous_patience is not None
-        and requested_patience is not None
-        and requested_patience > previous_patience
-    )
     patience_compatible = (
-        previous_patience is None and requested_patience is None
-        or requested_patience >= previous_patience
+        previous_patience is None
+        or requested_patience is not None
+        and requested_patience >= previous_patience
     )
     return (
         requested_epochs >= previous_epochs
         and patience_compatible
         and (
             requested_epochs > previous_epochs
-            or patience_extended
             or evaluation_batch_size_changed
+            or runtime_stop_changed
         )
     )
 
 
+def should_checkpoint_epoch(
+    epoch: int,
+    epochs: int,
+    interval: int,
+    *,
+    improved: bool,
+    stopping: bool,
+) -> bool:
+    return (
+        improved
+        or stopping
+        or epoch + 1 >= epochs
+        or (epoch + 1) % interval == 0
+    )
+
+
+def target_only_training_epoch_limit(args: argparse.Namespace) -> int:
+    target_configured = (
+        args.target_validation_kl is not None
+        or args.target_validation_base_kl is not None
+    )
+    if not args.disable_patience \
+            or not target_configured \
+            or args.target_only_extension_epochs == 0:
+        return args.epochs
+    return args.epochs + args.target_only_extension_epochs
+
+
 def checkpoint_state(epoch, global_step, best_epoch, best_validation,
                      best_validation_metrics, stale_epochs, model, optimizer, scheduler,
-                     scaler, training_contract) -> dict:
+                     scaler, training_contract, rng=None) -> dict:
     return {
         "epoch": epoch,
         "globalStep": global_step,
@@ -2977,7 +3094,7 @@ def checkpoint_state(epoch, global_step, best_epoch, best_validation,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
-        "rng": capture_rng(),
+        "rng": capture_rng() if rng is None else rng,
         "trainingContract": training_contract,
     }
 
@@ -3347,10 +3464,13 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
 
 def validate_args(args: argparse.Namespace) -> None:
     if min(args.epochs, args.batch_size, args.accumulate, args.states_per_example,
-           args.log_every_steps) < 1 or min(args.workers, args.evaluation_workers) < 0:
+           args.log_every_steps, args.checkpoint_interval_epochs) < 1 \
+            or min(args.workers, args.evaluation_workers) < 0:
         raise ValueError("training counts must be positive (workers may be zero)")
     if not args.disable_patience and args.patience < 1:
         raise ValueError("training patience must be positive when enabled")
+    if args.target_only_extension_epochs < 0:
+        raise ValueError("target-only extension epochs must be non-negative")
     if args.evaluation_batch_size < 0:
         raise ValueError("evaluation batch size must be non-negative")
     if not 0 < args.cuda_cache_trim_fraction <= 1:

@@ -216,6 +216,7 @@ try {
     ...(training.earlyStopping === "target-only"
       ? ["--disable-patience"]
       : ["--patience", String(training.patience)]),
+    "--target-only-extension-epochs", String(training.targetOnlyExtensionEpochs ?? 0),
     "--workers", String(training.workers),
     ...(training.cacheValidationOnDevice
       ? ["--cache-validation-on-device"]
@@ -223,6 +224,7 @@ try {
     "--seed", String(training.seed),
     "--device", training.device,
     "--log-every-steps", String(training.logEverySteps),
+    "--checkpoint-interval-epochs", String(training.checkpointIntervalEpochs ?? 8),
     "--selection-metric", training.selectionMetric ?? "loss",
     "--loss-weights-json", JSON.stringify(training.lossWeights),
     "--time-weighting-json", JSON.stringify(training.timeWeighting),

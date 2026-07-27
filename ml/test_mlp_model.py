@@ -46,6 +46,8 @@ from train_mlp import (
     loader,
     resume_contract_is_monotonic_extension,
     scheduler_resume_steps,
+    should_checkpoint_epoch,
+    target_only_training_epoch_limit,
     trim_inactive_cuda_memory,
     validate_dataset_manifest,
     weighted_standard_deviation,
@@ -86,6 +88,16 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             original,
             {**original, "evaluationBatchSize": 8192},
         ))
+        self.assertTrue(resume_contract_is_monotonic_extension(
+            {
+                **original,
+                "targetValidationBaseKl": 0.15,
+            },
+            {
+                **original,
+                "targetValidationBaseKl": 0.16,
+            },
+        ))
         self.assertFalse(resume_contract_is_monotonic_extension(
             original,
             {**original, "evaluationBatchSize": -1},
@@ -100,9 +112,13 @@ class MarketOnlyInputContractTests(unittest.TestCase):
             target_only,
             {**target_only, "epochs": 512},
         ))
-        self.assertFalse(resume_contract_is_monotonic_extension(
+        self.assertTrue(resume_contract_is_monotonic_extension(
             target_only,
-            {**target_only, "patience": 16},
+            {
+                **target_only,
+                "patience": 1024,
+                "earlyStopping": "patience",
+            },
         ))
 
     def test_scheduler_resume_rebases_changed_batches_per_epoch(self) -> None:
@@ -615,6 +631,57 @@ class DirectOracleTrainingPathTests(unittest.TestCase):
 
 
 class ValidationMetricAggregationTests(unittest.TestCase):
+    def test_target_only_epoch_extension_preserves_the_schedule_horizon(self) -> None:
+        base = SimpleNamespace(
+            epochs=256,
+            disable_patience=True,
+            target_validation_kl=None,
+            target_validation_base_kl=0.15,
+            target_only_extension_epochs=4096,
+        )
+        self.assertEqual(target_only_training_epoch_limit(base), 4352)
+        self.assertEqual(target_only_training_epoch_limit(SimpleNamespace(
+            **{
+                **vars(base),
+                "disable_patience": False,
+            },
+        )), 256)
+        self.assertEqual(target_only_training_epoch_limit(SimpleNamespace(
+            **{
+                **vars(base),
+                "target_validation_base_kl": None,
+            },
+        )), 256)
+
+    def test_checkpoint_schedule_keeps_best_terminal_and_periodic_epochs(self) -> None:
+        self.assertFalse(should_checkpoint_epoch(
+            2, 32, 8, improved=False, stopping=False,
+        ))
+        self.assertTrue(should_checkpoint_epoch(
+            7, 32, 8, improved=False, stopping=False,
+        ))
+        self.assertTrue(should_checkpoint_epoch(
+            2, 32, 8, improved=True, stopping=False,
+        ))
+        self.assertTrue(should_checkpoint_epoch(
+            2, 32, 8, improved=False, stopping=True,
+        ))
+        self.assertTrue(should_checkpoint_epoch(
+            31, 32, 8, improved=False, stopping=False,
+        ))
+
+    def test_device_pipeline_accepts_a_prefetched_cpu_iterator(self) -> None:
+        regular = [("regular",)]
+        prefetched = iter([("prefetched",)])
+
+        self.assertEqual(
+            list(DeviceBatchPipeline(torch.device("cpu")).batches(
+                regular,
+                prefetched,
+            )),
+            [("prefetched",)],
+        )
+
     def test_async_checkpoint_writer_freezes_state_before_background_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkpoint_file = Path(directory) / "checkpoint.pt"

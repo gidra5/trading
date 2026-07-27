@@ -48,9 +48,11 @@ if (dryRun) {
     delaysMinutes,
     firstPhaseScratch: true,
     epochsPerPhase: curriculum.epochsPerPhase,
-    earlyStopping: "target-only",
+    earlyStopping: "target-or-patience",
+    patience: curriculum.patience,
     targetValidationMetric: "baseKlDivergence",
     targetValidationBaseKl: curriculum.targetValidationBaseKl,
+    finalPhaseCompletion: curriculum.finalPhaseCompletion,
     targetRepresentation: basePlan.training.targetRepresentation,
     samplingIntervalMs: curriculumPlan.samplingIntervalMs,
     regenerateRawOracle: curriculum.regenerateRawOracle,
@@ -89,7 +91,8 @@ let summary = readJson(summaryFile) ?? {
   basePlanFile: relative(basePlanFile),
   delayScheduleMinutes: delaysMinutes,
   epochsPerPhase: curriculum.epochsPerPhase,
-  earlyStopping: "target-only",
+  earlyStopping: "target-or-patience",
+  patience: curriculum.patience,
   targetValidationMetric: "baseKlDivergence",
   targetValidationBaseKl: curriculum.targetValidationBaseKl,
   completedPhases: [],
@@ -98,7 +101,8 @@ let summary = readJson(summaryFile) ?? {
 };
 summary = {
   ...summary,
-  earlyStopping: "target-only",
+  earlyStopping: "target-or-patience",
+  patience: curriculum.patience,
   targetValidationMetric: "baseKlDivergence",
   targetValidationBaseKl: curriculum.targetValidationBaseKl,
   completedPhases: (summary.completedPhases ?? []).map((phase) => ({
@@ -110,7 +114,6 @@ summary = {
     ),
   })),
 };
-delete summary.patience;
 delete summary.targetValidationKl;
 let activeChild;
 let activePhaseFinalizeFile;
@@ -181,6 +184,7 @@ try {
     let phaseEpochLimit = Math.max(
       curriculum.epochsPerPhase,
       readJson(phase.planFile)?.training?.epochs ?? 0,
+      readJson(path.join(phase.runDir, "status.json"))?.epochs ?? 0,
     );
     let generatedPlan = generatePhasePlan(
       phaseIndex,
@@ -218,14 +222,20 @@ try {
       "--plan", phase.planFile,
     ]);
     let completed;
-    while (!completed?.validationTargetReached) {
+    while (!phaseCompletionReached(completed, phaseIndex)) {
+      const unrestrictedFinalPhase = isUnrestrictedFinalPhase(phaseIndex);
       status = {
         ...status,
         stage: "training",
         message: (
-          `Training delay ${delayMinutes}m from ${phaseIndex === 0 ? "scratch" : "the previous phase"} `
+          unrestrictedFinalPhase
+            ? `Training final delay ${delayMinutes}m from the previous phase for its full `
+              + `${phaseEpochLimit}-epoch horizon; KL and patience stopping are disabled.`
+            : (
+              `Training delay ${delayMinutes}m from ${phaseIndex === 0 ? "scratch" : "the previous phase"} `
           + `until validation base KL ≤ ${curriculum.targetValidationBaseKl}; `
-          + "patience stopping is disabled."
+              + `or ${curriculum.patience} stale epochs.`
+            )
         ),
       };
       writeStatus();
@@ -239,7 +249,7 @@ try {
       patchManifestCurriculum(phaseIndex, delayMinutes, phase);
       completed = completedPhase(phaseIndex, delayMinutes, phase);
       retainOnlyPhaseModel(phase);
-      if (!completed.validationTargetReached) {
+      if (!phaseCompletionReached(completed, phaseIndex)) {
         if (fs.existsSync(finalizeFile)) {
           status = {
             ...status,
@@ -253,7 +263,10 @@ try {
           writeStatus();
           process.exit(0);
         }
-        phaseEpochLimit += curriculum.epochsPerPhase;
+        phaseEpochLimit += (
+          curriculumPlan.training?.targetOnlyExtensionEpochs
+          ?? curriculum.epochsPerPhase
+        );
         generatedPlan = generatePhasePlan(
           phaseIndex,
           delayMinutes,
@@ -359,8 +372,11 @@ function validateCurriculum(plan, source) {
     || value.startDelayMinutes < value.endDelayMinutes
     || !Number.isInteger(value.epochsPerPhase)
     || value.epochsPerPhase <= 0
+    || !Number.isInteger(value.patience)
+    || value.patience <= 0
     || !Number.isFinite(value.targetValidationBaseKl)
     || value.targetValidationBaseKl <= 0
+    || value.finalPhaseCompletion !== "full-epoch-horizon"
     || value.regenerateRawOracle !== true
     || value.datasetRetention !== "anchor-and-active"
     || value.modelRetention !== "smallest-delay-best-only"
@@ -370,6 +386,10 @@ function validateCurriculum(plan, source) {
   }
   if (source.training?.targetRepresentation !== "minuteOracleProbabilities") {
     throw new Error("Delay curriculum requires persisted one-minute oracle targets.");
+  }
+  if (!Number.isInteger(plan.training?.targetOnlyExtensionEpochs ?? 0)
+    || (plan.training?.targetOnlyExtensionEpochs ?? 0) < 0) {
+    throw new Error("Target-only extension epochs must be a non-negative integer.");
   }
   return value;
 }
@@ -416,6 +436,7 @@ function generatePhasePlan(
   previousDelaySeconds,
   epochLimit,
 ) {
+  const unrestrictedFinalPhase = isUnrestrictedFinalPhase(phaseIndex);
   const phaseZeroDataset = phasePaths(delaysMinutes[0] * 60).datasetDir;
   const componentSeeds = [
     ...(phaseIndex === 0 ? [] : [relative(phaseZeroDataset)]),
@@ -426,15 +447,18 @@ function generatePhasePlan(
     ...basePlan.training,
     ...curriculumPlan.training,
     epochs: epochLimit,
-    earlyStopping: "target-only",
-    targetValidation: {
-      baseKlDivergence: curriculum.targetValidationBaseKl,
-    },
+    earlyStopping: unrestrictedFinalPhase
+      ? "target-only"
+      : "target-or-patience",
+    patience: curriculum.patience,
+    targetValidation: unrestrictedFinalPhase
+      ? {}
+      : { baseKlDivergence: curriculum.targetValidationBaseKl },
     selectionMetric: "baseKlDivergence",
     featureStatisticsCache: relative(path.join(runDir, "feature-statistics.npz")),
     reuseFeatureStatisticsCache: phaseIndex > 0,
   };
-  delete training.patience;
+  if (unrestrictedFinalPhase) delete training.patience;
   delete training.initializeFromCheckpoint;
   delete training.inheritedBestEpoch;
   if (previousDelaySeconds !== undefined) {
@@ -471,9 +495,19 @@ function generatePhasePlan(
       stage: phaseIndex + 1,
       stages: delaysMinutes.length,
       delayMs: delayMinutes * 60_000,
-      targetValidationMetric: "baseKlDivergence",
-      targetValidationBaseKl: curriculum.targetValidationBaseKl,
-      earlyStopping: "target-only",
+      targetValidationMetric: unrestrictedFinalPhase
+        ? null
+        : "baseKlDivergence",
+      targetValidationBaseKl: unrestrictedFinalPhase
+        ? null
+        : curriculum.targetValidationBaseKl,
+      earlyStopping: unrestrictedFinalPhase
+        ? "target-only"
+        : "target-or-patience",
+      patience: unrestrictedFinalPhase ? null : curriculum.patience,
+      completionCondition: unrestrictedFinalPhase
+        ? "full-epoch-horizon"
+        : "validation-target-or-patience",
       firstPhaseScratch: phaseIndex === 0,
     },
   };
@@ -544,12 +578,12 @@ function consume(stream, stderr) {
 
 function recoverCompletedPhase(phaseIndex, delayMinutes, phase) {
   const recorded = summary.completedPhases.find((entry) => entry.stage === phaseIndex + 1);
-  if (recorded?.validationTargetReached) return recorded;
+  if (phaseCompletionReached(recorded, phaseIndex)) return recorded;
   const phaseStatus = readJson(path.join(phase.runDir, "status.json"));
   if (phaseStatus?.stage === "complete" && phaseFilesComplete(phase)) {
     patchManifestCurriculum(phaseIndex, delayMinutes, phase);
     const completed = completedPhase(phaseIndex, delayMinutes, phase);
-    if (completed.validationTargetReached) return completed;
+    if (phaseCompletionReached(completed, phaseIndex)) return completed;
   }
   return undefined;
 }
@@ -666,8 +700,23 @@ function completedPhase(phaseIndex, delayMinutes, phase) {
       || manifest.training?.bestValidationMetrics?.baseKlDivergence
         <= curriculum.targetValidationBaseKl
     ),
+    patienceExhausted: phaseStatus?.finalMetrics?.patienceExhausted === true,
+    unrestrictedTrainingComplete: isUnrestrictedFinalPhase(phaseIndex),
     completedAt: phaseStatus?.completedAt ?? new Date().toISOString(),
   };
+}
+
+function isUnrestrictedFinalPhase(phaseIndex) {
+  return curriculum.finalPhaseCompletion === "full-epoch-horizon"
+    && phaseIndex === delaysMinutes.length - 1;
+}
+
+function phaseCompletionReached(completed, phaseIndex) {
+  if (!completed) return false;
+  return isUnrestrictedFinalPhase(phaseIndex)
+    ? completed.unrestrictedTrainingComplete === true
+    : completed.validationTargetReached === true
+      || completed.patienceExhausted === true;
 }
 
 function patchManifestCurriculum(phaseIndex, delayMinutes, phase) {

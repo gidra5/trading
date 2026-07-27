@@ -553,12 +553,26 @@ whole-device usage, validation-cache storage, and whether cache trimming occurre
 separately. Throughput is a rolling completed-example rate across training
 segments and excludes validation time.
 
-Epoch checkpoints take one bounded frozen CPU snapshot, then serialize the
-snapshot atomically on a single background writer while the next GPU epoch
-starts. The writer must finish before another snapshot is accepted, so disk
-backpressure cannot accumulate checkpoint copies in memory. A newly improved
-best-model state shares the checkpoint's frozen model tensors and is written by
-the same ordered job. Shutdown and finalization always flush the pending job.
+The training loader queues the next epoch before validation starts, so its
+persistent workers decompress and pin the first batches while the fixed
+validation cache occupies the GPU. This removes the recurring first-batch wait
+from the train/validation boundary. Resumable checkpoints default to every eight
+epochs, plus every newly improved best state and every terminal epoch. Each
+checkpoint takes one bounded frozen CPU snapshot, then serializes it atomically
+on a single background writer while the GPU continues. The writer must finish
+before another snapshot is accepted, so disk backpressure cannot accumulate
+checkpoint copies in memory. A newly improved best-model state shares the
+checkpoint's frozen model tensors and is written by the same ordered job.
+Shutdown and finalization always flush the pending job. With the current
+one-minute workload, an interruption can therefore repeat at most seven epochs,
+roughly twenty seconds of work.
+
+Target-only curriculum phases keep their requested 256-epoch cosine schedule,
+then continue for up to 4,096 additional epochs at the schedule floor inside
+the same Python process. This avoids a model reload, validation-cache rebuild,
+and compiled-kernel warm-up every 256 epochs. If the unusually large continuation
+ceiling is exhausted, the curriculum adds another continuation block and remains
+resumable.
 
 The v11 run starts from a fresh random initialization and runs at most 256 epochs
 with 64-epoch early-stopping patience. CE and both MI rewards have weight `1`;

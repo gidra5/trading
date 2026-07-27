@@ -134,106 +134,6 @@ https://chatgpt.com/c/6a58d7b3-dd44-83eb-b172-a7aec93cf050
 https://chatgpt.com/c/6a58fb11-2eb0-83ed-8bfb-807dca191a58
 https://chatgpt.com/c/6a58fd5c-bda4-83eb-bd94-3d7c853ac950
 
-we need to adjust the oracle evaluation:
-1. for a given window and a point in it, it should generate a range of returns based on some initial exposure, lets call that Q_t(a), the window is implied. Currently it is as if we assume 0 initial exposure, but in general it can be any other value. That models "picking up" from whatever is the current state, not just from clean quote-only portfolio. that matters because moving money back incurs friction. Or rather there should simply be a procedure to do this computation for a given interval and exposure, it can even be defined recursively/iteratively. You could also interpret it as forcing the exposure a at time t and then computing oracle's perfect return afterwards. 
-   1. For that lets define a few common sequences: P_t is the price at time t, r_t=P_t/P_{t-1}-1 is the return at time t, E_t is the equity at time t
-   2. E_t can be defined as evolution of simple portfolio with the quote and asset j_t=(q_t,u_t). Then mark-to-market value is y_t=u_t*P_t and E_t=q_t+y_t is the total equity at time t.
-   3. f_t here is the friction term, generally accounting for fees, slippage, etc. at time t.
-   4. based on j_t we also define exposure to the asset as a_t=y_t/E_t
-   5. The evolution of j_t is defined as the recurrence over (q,u,a,P,f) tuple: 
-      1. Rebalancing phase
-         1. Assume we are buying the asset. 
-            1. dq is the cost and du is the received amount. that means du=(1-f)*dq/P
-            2. the equity then is E^+_t=E-f*dq
-            3. and with y^+_t=P\*u+(1-f)*dq
-            4. we get dq=(a\*E-P\*u)/(1-f+f*a)
-            5. that is true when (a\*E-P\*u)>0
-         2. Assume we are selling the asset. 
-            1. du is the cost and dq is the received amount. that means dq=P\*(1-f)\*du
-            2. the equity then is E^+_t=E-f\*P\*du
-            3. and with y^+_t=P\*(u-du)
-            4. we get du=(P\*u-a\*E)/(P*(1-f*a))
-            5. that is true when (a\*E-P\*u)<0
-      2. Maintenance phase:
-         1. define [x]=max(0,x)
-         2. q^-_{t+1}=[q^+_t]-(1+r_borrow)\*[-q^+_t]
-         3. u^-_{t+1}=[u^+_t]-(1+r_borrow)\*[-u^+_t]
-      3. Liquidation phase:
-         1. u_liq=(1-f_{t+1})y^-\_{t+1} if u^-_{t+1}>0 and u_liq=y^-\_{t+1}/(1-f_{t+1}) if u^-_{t+1}<0
-         2. E_liq=q^-_{t+1}+u_liq
-         3. a_eff=u_liq/E_liq
-         4. Liquidated when abs(a_eff)>L_max or E_liq<=0
-         5. alternatively, liquidated when maintenance margin ratio E_liq/abs(u_liq) is less than 1/L_max
-         6. L_max is max effective leverage.
-         7. If liquidated, u_{t+1}=0 and q_{t+1}=E_liq
-         8. otherwise u_{t+1}=u^-_{t+1} and q_{t+1}=q^-_{t+1}
-   6. The oracle defines exposure based on the future returns:
-      1. a_t=L^+ if r_t>0 and a_t=-L^- if r_t<0
-      2. or more generally a_t=argmax_a(Q_t(a)), which can be found with DP
-   7. Then the definition for oracle's return is simply the log return over initial and final equity:
-      1. Q_t(a)=ln E_{t+T}/E_t
-      2. H is the forced holding period for a; T is the independently configured total value horizon.
-      3. Let h_t,k(a) and d_t,k(a) be the log wealth multiplier and drifted exposure after passively holding a for k price moves, and let R_t(x->b) be the rebalance wealth multiplier.
-      4. The faithful recurrence is V_t,0(x)=ln R_t(x->0), V_t,k(x)=max_b[ln R_t(x->b)+h_t,1(b)+V_t+1,k-1(d_t,1(b))], and Q_t,H,T(a)=h_t,H'(a)+V_t+H',T-H'(d_t,H'(a)), with H'=min(H,T,remaining moves).
-      5. H applies only to the initially forced target. The optimal continuation may rebalance every candle and the final state closes to exact zero exposure.
-      6. In truncate mode, T=min(t+valueHorizon, segmentEnd).
-      7. In extend mode, T=t+valueHorizon and post-window candles are loaded only for oracle targets; scoring still stops at the window end.
-      8. MLP dataset preparation must always use extend mode so every timestamp, including timestamps at a UTC shard boundary, receives the full future horizon.
-   8. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
-2. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
-3. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
-   1. R_t(a) = max_A(Q_t(A)) - Q_t(a)
-   2. This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
-4. p_t(a) is the oracle's preference for the exposure a at time t.
-   1. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
-5. we compute objective as oracle value distillation over all example windows
-   1. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
-   2. w_t=W_t/mean_batch(W_t)
-   3. D_t=sum_x E[a-x|x] / (sum_x E[abs(a-x)|x]+eps), computed once per complete timestamp example from the exact cutoff-applied raw oracle map over every visible current-exposure/action cell and stored as aligned dataset metadata.
-   4. Build p_1m from completed UTC one-minute closes only. At second 59 it is
-      exactly aligned; otherwise use the latest completed minute (a conservative
-      1-59 second shift) so a 60-minute-delay target contains no hidden
-      within-minute ordering.
-   5. W_t=(eps+abs(D_t)*persistenceMultiplier)*(1+lambda_resolution*JSD(p_1s,p_1m)).
-      The completed-minute target and its visible-range JSD are stored
-      separately so lambda_resolution can change without rebuilding either
-      oracle.
-      This is a ratio of the global signed and absolute displacement integrals, not a mean of separately normalized rows, so each row contributes in proportion to its expected actionable distance.
-      1. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
-      2. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
-      3. Persist the resulting causal unnormalized whole-example W_t in the dataset; training may only normalize it by the current batch mean and must not reconstruct it from fitted parameters.
-   5. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
-      1. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
-      2. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
-      3. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
-      4. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
-6. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence. 
-7. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price. 
-   1. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing. 
-   2. it generally just outputs what is the preferred final state of the bot state (exposure and pending order), and then execution engine calculates the actual actions needed to achieve that from current state. 
-   3.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute. 
-   4.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
-   5.  but this idea is for future iterations, not for now.
-8.  the limit order model:
-    1.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
-    2.  I want to design similar regret but for limit orders. i think he premise should be similar. Assume we create a limit order at chosen relative price from current in percents and a reserved exposure. If reserved exposure is borrowed we count borrowing fees each step we hold it before the execution. The reserved amount cant be used for market orders which defines opportunity cost (maybe computed in a similar way to regret). But executing limit order has less fees (potentially 0) than market orders. Then we compute regret as difference between optimal limit order and the chosen one. The optimal one balances opportunity cost such that we get the most profit. We also assume that after limit order is done we act as perfect margin trader.
-    3.  The limit order exposure delta is signed - negative is sell, positive is buy.
-    4.  The oracle can trade optimally with unreserved assets during lifetime of the lo.
-    5.  That essentially scales the optimal market trade return by 1-a
-    6.  Then it can trade optimally with post execution equity
-    7.  The limit order either executed until the duration T passed, or is cancelled at that time. That is the value horizon
-    8.  If candle fully crosses the target price, we execute it at that price.
-    9.  The "no order" is identified as any lo with size 0
-    10. Limit orders can execute at wicks, while market orders assumed to execute at close basically
-    11. Limit price is always positive
-    12. Value of the lo is the same way as the mo = final equity over initial
-    13. Regret is difference between best value and chosen
-    14. Best value is the one where we setr just below wick top at every significant turn. That benefits both from volatility and from reduced fees
-    15. We can decide if making limit order is profitable by comparing with empty lo?
-
-
-the oracle implementation seems to be incorrect.
-
 ML model based on MLP:
 1. Historic inputs:
    1. normalize into log returns
@@ -336,8 +236,39 @@ measure confidence as entropy of the predicted distribution - the more uniform i
 
 the 60m delay cant match the distributions, even though the model has all the information.
 
-try finding simpler distributions to learn and then gradually move to the full model:
+ML model based on MLP:
+3.  Architecture:
+    1.  accept 60 historic simple market returns
+    2.  network depth 16
+    3.  encoder-like shrinking of the layers. Start from 1024 and shrink to 255 in steps of (1024-255)/16=48 per layer.
+    4. 255 output neurons predict raw base-action logits on the stored allowed-range grid.
+4.  Optimize the loss function directly against the stored raw oracle policy.
+    1.  the model should learn to derive the oracle distribution from the input candles
+    2.  the loss is mutual information
+5.  Examples are every candle in inspector windows
+    - Pair features with oracle distributions 
+    - 60 1m candle close values (returns) with the oracle distributions computed over the same candles.
+6.  validation on a separate, non overlapping set of 1m candles.
+7.  at least as many examples as there are parameters in the model.
+8.  testing on last 1M worth of 1m candles.
+
+
+can we somehow use the difference between two successive oracle distributions? Since they are limited in horizon, this isolates the effect of the two candles that leave and enter the window.
+
+try finding simpler learning tasks and then gradually move to the full model:
 1. add prediction delay
 2. add oracle moving average
-3. add temperature scaling - the higher means more diffuse and even distribution
+3. freezing inner layers after/before some layer.
+4. add candle size scaling - the larger the candle, the more of a "rough" idea the oracle has about optimal path. That is basically a proxy for oracle transition path - the more opportunities oracle has for transitions, the more intricate distribution becomes. If oracle only can do one action for the full value horizon, then its decision policy is very simple - depending on the next candle either enter, exit or stay, depending on current position. The candle span tells us how uncertain it is going to be.
+5. add temperature scaling - the higher means more diffuse and even distribution
    1. Lets add gradual temperature learning. Start training with high temperature (like 0.1-0.5) and once we saturate scale it down with some factor (like 0.75) until we hit target temperature of 0.01. Then on each new delay set it proportional to initial KL loss in some way, such that we will have the distributions much closer overall (within the target KL). Thus a condition for reducing delay becomes KL<0.15 and temp=0.01. Note that setting initial temp to already equal target temp
+
+6. test a simple kind of encoder - get full minute candle data and encode into PDF of actions that should match the oracle distribution.
+7. make a joint model with encoder and diffusion model. the encoder will condition the diffusion model, and diffusion model will generate the oracle distribution. We can use temperature as our "noise" parameter, since it evens out the distributions.
+8. codex suggests freezing the parameters of hidden layers, and only train the output layer for a while, when we move to the next delay.
+9. Maybe it makes sense to design architecture around trading intuition? Like for example main elements of a strategy are trend estimator, mean-reversion estimator, (anticipatory) entry estimator, volatility estimator (direct or through er, volume), and confidence estimator (position sizing and entry), which are used to determine overall market dynamics and what should we do exactly. The idea for using them is mostly as follows:
+   1. follow large scale trend as they are slow changing
+   2. when we see unnatural deviation of the price we can trade against the trend, expecting mean reversion
+   3. volatility to measure certainty and importance of particular changes. It also presents us many opportunities for profit, since movement range can be larger than fees and quickly accumulate returns.
+   4. dont trade persistent moves, prefer entering and exiting at extrema
+   5. if market state is uncertain, dont overcommit to a single entry. scale signal according to confidence in its quality.

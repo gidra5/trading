@@ -182,7 +182,15 @@ export function MlpTrainingPage() {
 
   const applyEvents = (events: TrainingEvent[]) => {
     for (const event of events) {
-      if (event.event === "dataset-oracle") {
+      if (event.event === "training-start") {
+        const startEpoch = numberValue(event.startEpoch) ?? 0;
+        for (const [globalStep, point] of stepsById) {
+          if (point.epoch >= startEpoch) stepsById.delete(globalStep);
+        }
+        for (const epoch of epochsById.keys()) {
+          if (epoch >= startEpoch) epochsById.delete(epoch);
+        }
+      } else if (event.event === "dataset-oracle") {
         const date = textValue(event.date);
         const x = numberValue(event.day);
         if (!date || x === undefined) continue;

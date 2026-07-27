@@ -12,10 +12,13 @@
     "epochs": 256,
     "evaluationBatchSize": 4096,
     "cacheValidationOnDevice": true,
-    "earlyStopping": "target-only",
+    "checkpointIntervalEpochs": 8,
+    "targetOnlyExtensionEpochs": 4096,
+    "earlyStopping": "target-or-patience",
+    "patience": 1024,
     "selectionMetric": "baseKlDivergence",
     "targetValidation": {
-      "baseKlDivergence": 0.15
+      "baseKlDivergence": 0.16
     },
     "lossWeights": {
       "crossEntropy": 1,
@@ -43,7 +46,9 @@
     "endDelayMinutes": 0,
     "stepMinutes": 1,
     "epochsPerPhase": 256,
-    "targetValidationBaseKl": 0.15,
+    "patience": 1024,
+    "targetValidationBaseKl": 0.16,
+    "finalPhaseCompletion": "full-epoch-horizon",
     "regenerateRawOracle": true,
     "skipTeacherRefinement": true,
     "datasetRetention": "anchor-and-active",
