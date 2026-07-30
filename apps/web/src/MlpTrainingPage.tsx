@@ -1,4 +1,11 @@
-import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import {
+  For,
+  Show,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { Activity, ArrowLeft, BarChart3, Search } from "lucide-solid";
 
 const apiBase = import.meta.env.DEV ? "/backend" : "";
@@ -6,15 +13,33 @@ const POLL_MS = 2_000;
 
 interface MetricValues {
   loss?: number;
+  crossEntropy?: number;
   klDivergence?: number;
   klDivergenceVariance?: number;
   klDivergenceStdDev?: number;
   baseKlDivergence?: number;
+  reverseKlDivergence?: number;
   probabilityMse?: number;
   probabilityMseVariance?: number;
   probabilityMseStdDev?: number;
   excessEntropy?: number;
   oracleMutualInformation?: number;
+  targetEntropy?: number;
+  predictedEntropy?: number;
+  entropyGap?: number;
+  entropySharpness?: number;
+  reverseKlGate?: number;
+  entropySharpnessGate?: number;
+  softLayerNorm?: number;
+  softLayerNormMeanPenalty?: number;
+  softLayerNormVariancePenalty?: number;
+  distributionLayer?: number;
+  distributionLayerSumPenalty?: number;
+  distributionLayerNegativePenalty?: number;
+  softWeightBound?: number;
+  centeringConstraint?: number;
+  centeringIdempotence?: number;
+  centeringSymmetry?: number;
   distanceImbalanceWeight?: number;
   timeWeightEffectiveSampleRatio?: number;
 }
@@ -47,6 +72,30 @@ interface TimeWeightingPlan {
   resolutionDivergenceMultiplier: number;
 }
 
+interface SoftWeightBoundPlan {
+  desiredMagnitude: number;
+  sharpness: number;
+  absoluteEpsilon: number;
+}
+
+interface ReverseKlPlan {
+  predictionMixtureWeight: number;
+}
+
+interface OutputRegularizerPlan {
+  applicationProbabilities: {
+    reverseKl: number;
+    entropySharpness: number;
+  };
+  samplingUnit: "optimizer-update";
+  independentGates: boolean;
+  inverseProbabilityScaling: boolean;
+}
+
+interface BranchNormalizationPlan {
+  learnableCentering?: boolean;
+}
+
 interface MetricsResponse {
   runs: Array<{
     key: string;
@@ -66,7 +115,13 @@ interface MetricsResponse {
     patience?: number;
     samplingIntervalMs?: number;
     predictionDelayMs?: number;
+    dropout?: number;
+    dropoutRate?: number;
     lossWeights?: Record<string, number>;
+    reverseKl?: ReverseKlPlan;
+    outputRegularizer?: OutputRegularizerPlan;
+    softWeightBound?: SoftWeightBoundPlan;
+    branchNormalization?: BranchNormalizationPlan;
     timeWeighting?: TimeWeightingPlan;
   };
   status?: TrainingStatus;
@@ -117,6 +172,8 @@ interface TrainStepPoint {
   learningRate?: number;
   gradientNorm?: number;
   examplesPerSecond?: number;
+  networkRowsPerSecond?: number;
+  batchCompactionRatio?: number;
   gpuAllocatedMiB?: number;
   gpuReservedMiB?: number;
   gpuDeviceUsedMiB?: number;
@@ -141,6 +198,12 @@ interface PlotSeries {
   label: string;
   color: string;
   values: PlotPoint[];
+}
+
+interface ChartViewport {
+  xMin: number;
+  xMax: number;
+  followLatest: boolean;
 }
 
 export function MlpTrainingPage() {
@@ -279,6 +342,8 @@ export function MlpTrainingPage() {
           learningRate: numberValue(event.learningRate),
           gradientNorm: numberValue(event.gradientNorm),
           examplesPerSecond: numberValue(event.examplesPerSecond),
+          networkRowsPerSecond: numberValue(event.networkRowsPerSecond),
+          batchCompactionRatio: numberValue(event.batchCompactionRatio),
           gpuAllocatedMiB: numberValue(event.gpuAllocatedMiB),
           gpuReservedMiB: numberValue(event.gpuReservedMiB),
           gpuDeviceUsedMiB: numberValue(event.gpuDeviceUsedMiB),
@@ -385,10 +450,10 @@ export function MlpTrainingPage() {
   });
 
   return (
-    <main class="min-h-screen bg-ink-950 text-ink-100">
+    <main class="min-h-screen overflow-x-hidden bg-ink-950 text-ink-100">
       <div class="mx-auto flex w-full max-w-[96rem] flex-col gap-4 px-4 py-4 lg:px-6">
-        <header class="flex flex-col gap-3 border-b border-line pb-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
+        <header class="flex min-w-0 flex-col gap-3 border-b border-line pb-4 lg:flex-row lg:items-center lg:justify-between">
+          <div class="min-w-0 flex-1">
             <div class="muted-label">Machine learning</div>
             <div class="mt-1 flex flex-wrap items-center gap-3">
               <h1 class="text-2xl font-semibold">Live MLP training</h1>
@@ -398,11 +463,11 @@ export function MlpTrainingPage() {
               {snapshot()?.plan.label ?? "Loading the active training plan…"}
             </p>
           </div>
-          <div class="flex min-w-0 flex-col gap-2 lg:items-end">
-            <label class="flex min-w-0 flex-col gap-1">
+          <div class="flex w-full min-w-0 flex-col gap-2 lg:w-[32rem] lg:max-w-[45vw] lg:flex-none lg:items-end">
+            <label class="flex w-full min-w-0 flex-col gap-1">
               <span class="muted-label">Training run</span>
               <select
-                class="min-w-64 max-w-full rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                class="block w-full min-w-0 max-w-full truncate rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
                 value={selectedRunKey() ?? ""}
                 disabled={runs().length === 0}
                 onChange={(event) => selectRun(event.currentTarget.value)}
@@ -481,8 +546,11 @@ export function MlpTrainingPage() {
                 directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
               ]} />
               <MetricChart title="Distribution losses" scale="log" xLabel="global step" series={[
+                metricPlot("Cross entropy", "#f5b84b", trainSteps(), "crossEntropy"),
                 metricPlot("Conditional KL", "#38bdf8", trainSteps(), "klDivergence"),
                 metricPlot("Base-action KL", "#22c55e", trainSteps(), "baseKlDivergence"),
+                metricPlot("Skew reverse KL", "#a78bfa", trainSteps(), "reverseKlDivergence"),
+                metricPlot("Entropy sharpness", "#fb7185", trainSteps(), "entropySharpness"),
                 metricPlot("Probability MSE", "#f05252", trainSteps(), "probabilityMse"),
               ]} />
               <MetricChart title="Validation conditional KL" subtitle="Actual fee-conditioned distribution on the visible range" scale="log" xLabel="epoch" series={[
@@ -492,6 +560,13 @@ export function MlpTrainingPage() {
               ]} />
               <MetricChart title="Validation base-action KL" subtitle="Stored raw oracle factor versus the direct 255-logit head" scale="log" xLabel="epoch" series={[
                 epochPlot("Mean base-action KL", "#22c55e", epochs(), "validation", "baseKlDivergence"),
+              ]} />
+              <MetricChart title="Validation skew reverse KL" subtitle={reverseKlLabel(
+                snapshot()?.plan.lossWeights?.reverseKl,
+                snapshot()?.plan.reverseKl?.predictionMixtureWeight,
+                snapshot()?.plan.outputRegularizer,
+              )} scale="log" xLabel="epoch" series={[
+                epochPlot("KL(P || (1-epsilon)Q + epsilon P)", "#a78bfa", epochs(), "validation", "reverseKlDivergence"),
               ]} />
               <MetricChart title="Validation probability MSE" subtitle="Per-example visible-range surface error" scale="log" xLabel="epoch" series={[
                 epochPlot("Mean pMSE", "#f05252", epochs(), "validation", "probabilityMse"),
@@ -504,6 +579,54 @@ export function MlpTrainingPage() {
               <MetricChart title="Oracle mutual information" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.oracleMutualInformation)} xLabel="global step" series={[
                 metricPlot("Oracle MI", "#22c55e", trainSteps(), "oracleMutualInformation"),
               ]} />
+              <MetricChart title="Soft-target cross-entropy" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.crossEntropy)} xLabel="global step" series={[
+                metricPlot("Cross entropy", "#f5b84b", trainSteps(), "crossEntropy"),
+                metricPlot("Oracle entropy", "#22c55e", trainSteps(), "targetEntropy"),
+                metricPlot("Predicted entropy", "#38bdf8", trainSteps(), "predictedEntropy"),
+              ]} />
+              <MetricChart title="Skew reverse KL" subtitle={reverseKlLabel(
+                snapshot()?.plan.lossWeights?.reverseKl,
+                snapshot()?.plan.reverseKl?.predictionMixtureWeight,
+                snapshot()?.plan.outputRegularizer,
+              )} scale="log" xLabel="global step" series={[
+                metricPlot("KL(P || (1-epsilon)Q + epsilon P)", "#a78bfa", trainSteps(), "reverseKlDivergence"),
+              ]} />
+              <MetricChart title="One-sided entropy sharpness" subtitle={gatedLossWeightLabel(
+                snapshot()?.plan.lossWeights?.entropySharpness,
+                snapshot()?.plan.outputRegularizer,
+                "entropySharpness",
+              )} scale="log" xLabel="global step" series={[
+                metricPlot("ReLU(H(P) - H(Q)) squared", "#fb7185", trainSteps(), "entropySharpness"),
+              ]} />
+              <MetricChart title="Soft LayerNorm" subtitle={lossWeightLabel(snapshot()?.plan.lossWeights?.softLayerNorm)} scale="log" xLabel="global step" series={[
+                metricPlot("Total penalty", "#a78bfa", trainSteps(), "softLayerNorm"),
+                metricPlot("Mean penalty", "#38bdf8", trainSteps(), "softLayerNormMeanPenalty"),
+                metricPlot("Variance penalty", "#f5b84b", trainSteps(), "softLayerNormVariancePenalty"),
+              ]} />
+              <Show when={snapshot()?.plan.branchNormalization?.learnableCentering !== false}>
+                <MetricChart title="Learnable centering projector" subtitle={centeringConstraintLabel(
+                  snapshot()?.plan.lossWeights?.centeringIdempotence,
+                  snapshot()?.plan.lossWeights?.centeringSymmetry,
+                )} scale="log" xLabel="global step" series={[
+                  metricPlot("Weighted constraint", "#22c55e", trainSteps(), "centeringConstraint"),
+                  metricPlot("Idempotence C^2 - C", "#38bdf8", trainSteps(), "centeringIdempotence"),
+                  metricPlot("Symmetry C^T - C", "#f5b84b", trainSteps(), "centeringSymmetry"),
+                ]} />
+              </Show>
+              <MetricChart title="Distribution-like hidden layers" subtitle={distributionLayerLabel(
+                snapshot()?.plan.lossWeights?.distributionLayerSum,
+                snapshot()?.plan.lossWeights?.distributionLayerNegative,
+              )} scale="log" xLabel="global step" series={[
+                metricPlot("Weighted loss", "#22c55e", trainSteps(), "distributionLayer"),
+                metricPlot("Width-normalized unit-sum", "#38bdf8", trainSteps(), "distributionLayerSumPenalty"),
+                metricPlot("Mean negative penalty", "#f5b84b", trainSteps(), "distributionLayerNegativePenalty"),
+              ]} />
+              <MetricChart title="Soft weight bound" subtitle={softWeightBoundLabel(
+                snapshot()?.plan.lossWeights?.softWeightBound,
+                snapshot()?.plan.softWeightBound?.desiredMagnitude,
+              )} scale="log" xLabel="global step" series={[
+                metricPlot("Mean squared smooth excess", "#f05252", trainSteps(), "softWeightBound"),
+              ]} />
               <MetricChart title="Distance-imbalance time weighting" unit="ratio" yDomain={[0, 1]} xLabel="global step" series={[
                 metricPlot("Mean weight", "#38bdf8", trainSteps(), "distanceImbalanceWeight"),
                 metricPlot("Effective sample ratio", "#f5b84b", trainSteps(), "timeWeightEffectiveSampleRatio"),
@@ -515,7 +638,8 @@ export function MlpTrainingPage() {
                 directStepPlot("Gradient norm", "#f5b84b", trainSteps(), "gradientNorm"),
               ]} />
               <MetricChart title="Training throughput" unit="examples/s" xLabel="global step" series={[
-                directStepPlot("Throughput", "#22c55e", trainSteps(), "examplesPerSecond"),
+                directStepPlot("Weighted source examples", "#22c55e", trainSteps(), "examplesPerSecond"),
+                directStepPlot("Network rows", "#38bdf8", trainSteps(), "networkRowsPerSecond"),
               ]} />
               <MetricChart title="Training GPU memory" unit="MiB" xLabel="global step" series={[
                 directStepPlot("Allocated tensors", "#a78bfa", trainSteps(), "gpuAllocatedMiB"),
@@ -601,7 +725,19 @@ export function MlpTrainingPage() {
           <MetricCard label="Last batch loss" value={formatMetric(latestStep()?.latest.loss)} />
           <MetricCard label="Last best validation" value={formatMetric(latestEpoch()?.bestValidation)} />
           <MetricCard label="Learning rate" value={formatMetric(latestStep()?.learningRate)} />
+          <MetricCard label="Activation dropout" value={formatUnit(
+            snapshot()?.plan.dropout === undefined ? undefined : snapshot()!.plan.dropout! * 100,
+            "%",
+            1,
+          )} />
+          <MetricCard label="Dropout application" value={formatUnit(
+            snapshot()?.plan.dropoutRate === undefined ? undefined : snapshot()!.plan.dropoutRate! * 100,
+            "%",
+            1,
+          )} />
           <MetricCard label="Train rate" value={formatUnit(latestStep()?.examplesPerSecond, " ex/s", 1)} />
+          <MetricCard label="Network rate" value={formatUnit(latestStep()?.networkRowsPerSecond, " rows/s", 1)} />
+          <MetricCard label="Batch compaction" value={formatUnit(latestStep()?.batchCompactionRatio, "×", 1)} />
           <MetricCard label="GPU tensors" value={formatUnit(latestStep()?.gpuAllocatedMiB, " MiB", 1)} />
           <MetricCard label="GPU reserved" value={formatUnit(latestStep()?.gpuReservedMiB, " MiB", 1)} />
           <MetricCard label="GPU device" value={formatUnit(latestStep()?.gpuDeviceUsedMiB, " MiB", 1)} />
@@ -652,6 +788,7 @@ export function MlpTrainingPage() {
                 <th class="table-head">Epoch</th><th class="table-head">Step</th>
                 <th class="table-head">Train loss</th><th class="table-head">Validation loss</th>
                 <th class="table-head">Conditional KL</th><th class="table-head">Base KL</th>
+                <th class="table-head">Reverse KL</th><th class="table-head">Entropy gap</th>
                 <th class="table-head">pMSE mean</th><th class="table-head">pMSE variance</th>
                 <th class="table-head">Best</th><th class="table-head">Stale</th>
               </tr></thead>
@@ -661,6 +798,8 @@ export function MlpTrainingPage() {
                 <td class="td-cell">{formatMetric(item.validation.loss)}</td>
                 <td class="td-cell">{formatMetric(item.validation.klDivergence)}</td>
                 <td class="td-cell">{formatMetric(item.validation.baseKlDivergence)}</td>
+                <td class="td-cell">{formatMetric(item.validation.reverseKlDivergence)}</td>
+                <td class="td-cell">{formatMetric(item.validation.entropyGap)}</td>
                 <td class="td-cell">{formatMetric(item.validation.probabilityMse)}</td>
                 <td class="td-cell">{formatMetric(item.validation.probabilityMseVariance)}</td>
                 <td class="td-cell text-gain">{formatMetric(item.bestValidation)}</td>
@@ -696,19 +835,79 @@ function MetricChart(props: {
   const innerWidth = width - margin.left - margin.right;
   const innerHeight = height - margin.top - margin.bottom;
   const scale = () => props.scale ?? "linear";
+  const [viewport, setViewport] = createSignal<ChartViewport>();
+  const [plotPixelWidth, setPlotPixelWidth] = createSignal(innerWidth);
+  const [dragging, setDragging] = createSignal(false);
+  let svg!: SVGSVGElement;
+  let resizeObserver: ResizeObserver | undefined;
+  let drag: { pointerId: number; clientX: number } | undefined;
   const usable = createMemo(() => props.series.map((series) => ({
     ...series,
     values: series.values.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)
       && (scale() !== "log" || point.y > 0)),
   })).filter((series) => series.values.length > 0));
+  const fullXDomain = createMemo(() => {
+    let xMin = Number.POSITIVE_INFINITY;
+    let xMax = Number.NEGATIVE_INFINITY;
+    for (const series of usable()) {
+      for (const point of series.values) {
+        xMin = Math.min(xMin, point.x);
+        xMax = Math.max(xMax, point.x);
+      }
+    }
+    return Number.isFinite(xMin) && Number.isFinite(xMax)
+      ? { xMin, xMax }
+      : undefined;
+  });
+  const visibleXDomain = createMemo(() => {
+    const full = fullXDomain();
+    if (!full) return undefined;
+    const requested = viewport();
+    if (!requested || full.xMax <= full.xMin) return full;
+    const fullSpan = full.xMax - full.xMin;
+    const minimumSpan = Math.max(fullSpan / 1_000_000, Number.EPSILON);
+    const span = Math.min(
+      fullSpan,
+      Math.max(minimumSpan, requested.xMax - requested.xMin),
+    );
+    if (requested.followLatest) {
+      return {
+        xMin: Math.max(full.xMin, full.xMax - span),
+        xMax: full.xMax,
+      };
+    }
+    const xMin = Math.max(
+      full.xMin,
+      Math.min(requested.xMin, full.xMax - span),
+    );
+    return { xMin, xMax: xMin + span };
+  });
+  const rendered = createMemo(() => {
+    const domain = visibleXDomain();
+    if (!domain) return [];
+    return usable().map((series) => ({
+      ...series,
+      values: convolveLinearChartOnGeometricGrid(
+        series.values,
+        domain.xMin,
+        domain.xMax,
+        plotPixelWidth(),
+        scale(),
+      ),
+    })).filter((series) => series.values.length > 0);
+  });
   const bounds = createMemo(() => {
-    const points = usable().flatMap((series) => series.values);
-    if (points.length === 0) return undefined;
-    const xValues = points.map((point) => point.x);
+    const domain = visibleXDomain();
+    const points = rendered().flatMap((series) => series.values);
+    if (!domain || points.length === 0) return undefined;
     const transform = (value: number) => scale() === "log" ? Math.log10(value) : value;
-    const yValues = points.map((point) => transform(point.y));
-    const observedMin = Math.min(...yValues);
-    const observedMax = Math.max(...yValues);
+    let observedMin = Number.POSITIVE_INFINITY;
+    let observedMax = Number.NEGATIVE_INFINITY;
+    for (const point of points) {
+      const transformed = transform(point.y);
+      observedMin = Math.min(observedMin, transformed);
+      observedMax = Math.max(observedMax, transformed);
+    }
     let yMin = props.yDomain ? transform(props.yDomain[0] || Number.MIN_VALUE) : observedMin;
     let yMax = props.yDomain ? transform(props.yDomain[1]) : observedMax;
     if (yMin === yMax) {
@@ -723,8 +922,8 @@ function MetricChart(props: {
         && observedMin <= (observedMax - observedMin) * 0.1) yMin = 0;
     }
     return {
-      xMin: Math.min(...xValues),
-      xMax: Math.max(...xValues),
+      xMin: domain.xMin,
+      xMax: domain.xMax,
       yMin,
       yMax,
       transform,
@@ -752,28 +951,197 @@ function MetricChart(props: {
       };
     });
   });
+  const isZoomed = createMemo(() => {
+    const full = fullXDomain();
+    const visible = visibleXDomain();
+    if (!full || !visible) return false;
+    const tolerance = Math.max(
+      Number.EPSILON,
+      (full.xMax - full.xMin) * 1e-9,
+    );
+    return Math.abs(visible.xMin - full.xMin) > tolerance
+      || Math.abs(visible.xMax - full.xMax) > tolerance;
+  });
+  const isFollowingLatest = createMemo(() =>
+    isZoomed() && viewport()?.followLatest === true);
+  const zoomViewport = (factor: number, anchor = 0.5) => {
+    const full = fullXDomain();
+    const current = visibleXDomain();
+    if (!full || !current || full.xMax <= full.xMin) return;
+    const fullSpan = full.xMax - full.xMin;
+    const minimumSpan = Math.max(fullSpan / 1_000_000, Number.EPSILON);
+    const currentSpan = current.xMax - current.xMin;
+    const nextSpan = Math.max(
+      minimumSpan,
+      Math.min(fullSpan, currentSpan * factor),
+    );
+    if (nextSpan >= fullSpan) {
+      setViewport(undefined);
+      return;
+    }
+    const preserveRightPin = viewport()?.followLatest === true;
+    const normalizedAnchor = Math.max(0, Math.min(1, anchor));
+    const anchorX = current.xMin + normalizedAnchor * currentSpan;
+    const requestedMin = anchorX - normalizedAnchor * nextSpan;
+    const xMin = preserveRightPin
+      ? full.xMax - nextSpan
+      : Math.max(
+        full.xMin,
+        Math.min(requestedMin, full.xMax - nextSpan),
+      );
+    const xMax = xMin + nextSpan;
+    const rightTolerance = Math.max(Number.EPSILON, fullSpan * 1e-9);
+    setViewport({
+      xMin,
+      xMax,
+      followLatest: preserveRightPin
+        || Math.abs(xMax - full.xMax) <= rightTolerance,
+    });
+  };
+  const panViewport = (fraction: number) => {
+    const full = fullXDomain();
+    const current = visibleXDomain();
+    if (!full || !current) return;
+    const span = current.xMax - current.xMin;
+    const fullSpan = full.xMax - full.xMin;
+    if (span >= fullSpan) return;
+    const requestedMin = current.xMin + fraction * span;
+    const xMin = Math.max(
+      full.xMin,
+      Math.min(requestedMin, full.xMax - span),
+    );
+    const xMax = xMin + span;
+    const rightTolerance = Math.max(Number.EPSILON, fullSpan * 1e-9);
+    setViewport({
+      xMin,
+      xMax,
+      followLatest: Math.abs(xMax - full.xMax) <= rightTolerance,
+    });
+  };
+  const resetViewport = () => setViewport(undefined);
+  const plotClientGeometry = () => {
+    const bounds = svg.getBoundingClientRect();
+    const scaleX = bounds.width / width;
+    return {
+      left: bounds.left + margin.left * scaleX,
+      width: Math.max(1, innerWidth * scaleX),
+    };
+  };
+  const handleWheel = (event: WheelEvent) => {
+    event.preventDefault();
+    const geometry = plotClientGeometry();
+    if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+      panViewport((event.deltaX || event.deltaY) / geometry.width);
+      return;
+    }
+    const anchor = Math.max(
+      0,
+      Math.min(1, (event.clientX - geometry.left) / geometry.width),
+    );
+    zoomViewport(Math.exp(Math.sign(event.deltaY) * 0.18), anchor);
+  };
+  const handlePointerDown = (event: PointerEvent) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    drag = { pointerId: event.pointerId, clientX: event.clientX };
+    setDragging(true);
+    svg.setPointerCapture(event.pointerId);
+  };
+  const handlePointerMove = (event: PointerEvent) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    const distance = drag.clientX - event.clientX;
+    drag.clientX = event.clientX;
+    panViewport(distance / plotClientGeometry().width);
+  };
+  const handlePointerUp = (event: PointerEvent) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (svg.hasPointerCapture(event.pointerId)) {
+      svg.releasePointerCapture(event.pointerId);
+    }
+    drag = undefined;
+    setDragging(false);
+  };
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      zoomViewport(0.5);
+    } else if (event.key === "-") {
+      event.preventDefault();
+      zoomViewport(2);
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      panViewport(event.key === "ArrowLeft" ? -0.2 : 0.2);
+    } else if (event.key === "Home" || event.key === "0") {
+      event.preventDefault();
+      resetViewport();
+    }
+  };
+  const attachSvg = (element: SVGSVGElement) => {
+    svg = element;
+    resizeObserver?.disconnect();
+    const measure = () => {
+      const renderedWidth = svg.getBoundingClientRect().width;
+      setPlotPixelWidth(Math.max(
+        1,
+        Math.round(renderedWidth * innerWidth / width),
+      ));
+    };
+    resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(svg);
+    measure();
+  };
+  onCleanup(() => resizeObserver?.disconnect());
 
   return (
     <article class="panel min-w-0 overflow-hidden">
       <div class="flex flex-wrap items-start justify-between gap-2">
         <div><h3 class="font-semibold">{props.title}</h3><Show when={props.subtitle}><p class="text-xs text-ink-300">{props.subtitle}</p></Show></div>
-        <div class="flex flex-wrap justify-end gap-x-3 gap-y-1 text-xs">
-          <For each={usable()}>{(series) => <span class="inline-flex items-center gap-1 text-ink-300">
-            <span class="h-2 w-2 rounded-full" style={{ background: series.color }} />
-            {series.label} <span class="tabular-nums text-ink-100">{formatMetric(series.values.at(-1)?.y)}{props.unit ? ` ${props.unit}` : ""}</span>
-          </span>}</For>
+        <div class="flex flex-col items-end gap-1.5">
+          <div class="flex flex-wrap justify-end gap-x-3 gap-y-1 text-xs">
+            <For each={rendered()}>{(series) => <span class="inline-flex items-center gap-1 text-ink-300">
+              <span class="h-2 w-2 rounded-full" style={{ background: series.color }} />
+              {series.label} <span class="tabular-nums text-ink-100">{formatMetric(series.values.at(-1)?.y)}{props.unit ? ` ${props.unit}` : ""}</span>
+            </span>}</For>
+          </div>
+          <div class="flex items-center gap-1 text-[11px] text-ink-400">
+            <span class={`mr-1 ${isFollowingLatest() ? "text-gain" : ""}`}>
+              {isFollowingLatest()
+                ? "Following newest · pan left to detach"
+                : "Wheel to zoom · drag to pan"}
+            </span>
+            <button class="btn min-w-7 px-1.5 py-0.5" type="button" title="Zoom in" aria-label={`Zoom ${props.title} in`} onClick={() => zoomViewport(0.5)}>+</button>
+            <button class="btn min-w-7 px-1.5 py-0.5" type="button" title="Zoom out" aria-label={`Zoom ${props.title} out`} onClick={() => zoomViewport(2)}>−</button>
+            <button class="btn px-2 py-0.5" type="button" title="Reset view" aria-label={`Reset ${props.title} view`} disabled={!isZoomed()} onClick={resetViewport}>Reset</button>
+          </div>
         </div>
       </div>
       <Show when={bounds()} fallback={<div class="flex h-64 items-center justify-center text-sm text-ink-300">Waiting for data</div>}>
-        <svg class="mt-2 block h-auto w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={props.title}>
+        <svg
+          ref={attachSvg}
+          class={`mt-2 block h-auto w-full select-none outline-none focus-visible:ring-2 focus-visible:ring-accent/45 ${dragging() ? "cursor-grabbing" : "cursor-grab"}`}
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label={`${props.title}. Interactive chart`}
+          tabIndex={0}
+          style={{ "touch-action": "none" }}
+          onDblClick={resetViewport}
+          onKeyDown={handleKeyDown}
+          onPointerCancel={handlePointerUp}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onWheel={handleWheel}
+        >
+          <title>Wheel to zoom. Drag to pan. Double-click to reset.</title>
           <For each={ticks()}>{(tick) => <g>
             <line class="training-chart-grid" x1={margin.left} x2={width - margin.right} y1={tick.y} y2={tick.y} />
             <text class="training-chart-axis" x={margin.left - 9} y={tick.y + 4} text-anchor="end">{shortNumber(tick.value)}</text>
           </g>}</For>
           <line class="training-chart-axis-line" x1={margin.left} x2={margin.left} y1={margin.top} y2={height - margin.bottom} />
           <line class="training-chart-axis-line" x1={margin.left} x2={width - margin.right} y1={height - margin.bottom} y2={height - margin.bottom} />
-          <For each={usable()}>{(series) => {
-            const points = () => downsampleMinMax(series.values, 900)
+          <For each={rendered()}>{(series) => {
+            const points = () => series.values
               .map((point) => `${xPosition(point.x)},${yPosition(point.y)}`).join(" ");
             return <polyline points={points()} fill="none" stroke={series.color} stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" />;
           }}</For>
@@ -832,15 +1200,34 @@ function metricValues(value: unknown): MetricValues {
   if (!value || typeof value !== "object") return {};
   const record = value as Record<string, unknown>;
   return {
-    loss: numberValue(record.loss), klDivergence: numberValue(record.klDivergence),
+    loss: numberValue(record.loss),
+    crossEntropy: numberValue(record.crossEntropy),
+    klDivergence: numberValue(record.klDivergence),
     klDivergenceVariance: numberValue(record.klDivergenceVariance),
     klDivergenceStdDev: numberValue(record.klDivergenceStdDev),
     baseKlDivergence: numberValue(record.baseKlDivergence),
+    reverseKlDivergence: numberValue(record.reverseKlDivergence),
     probabilityMse: numberValue(record.probabilityMse),
     probabilityMseVariance: numberValue(record.probabilityMseVariance),
     probabilityMseStdDev: numberValue(record.probabilityMseStdDev),
     excessEntropy: numberValue(record.excessEntropy),
     oracleMutualInformation: numberValue(record.oracleMutualInformation),
+    targetEntropy: numberValue(record.targetEntropy),
+    predictedEntropy: numberValue(record.predictedEntropy),
+    entropyGap: numberValue(record.entropyGap),
+    entropySharpness: numberValue(record.entropySharpness),
+    reverseKlGate: numberValue(record.reverseKlGate),
+    entropySharpnessGate: numberValue(record.entropySharpnessGate),
+    softLayerNorm: numberValue(record.softLayerNorm),
+    softLayerNormMeanPenalty: numberValue(record.softLayerNormMeanPenalty),
+    softLayerNormVariancePenalty: numberValue(record.softLayerNormVariancePenalty),
+    distributionLayer: numberValue(record.distributionLayer),
+    distributionLayerSumPenalty: numberValue(record.distributionLayerSumPenalty),
+    distributionLayerNegativePenalty: numberValue(record.distributionLayerNegativePenalty),
+    softWeightBound: numberValue(record.softWeightBound),
+    centeringConstraint: numberValue(record.centeringConstraint),
+    centeringIdempotence: numberValue(record.centeringIdempotence),
+    centeringSymmetry: numberValue(record.centeringSymmetry),
     distanceImbalanceWeight: numberValue(record.distanceImbalanceWeight),
     timeWeightEffectiveSampleRatio: numberValue(record.timeWeightEffectiveSampleRatio),
   };
@@ -859,23 +1246,150 @@ function percentValue(value: unknown): number | undefined {
   return number === undefined ? undefined : number * 100;
 }
 
-function downsampleMinMax(points: PlotPoint[], buckets: number): PlotPoint[] {
-  if (points.length <= buckets * 2) return points;
-  const result: PlotPoint[] = [];
-  const size = points.length / buckets;
-  for (let bucket = 0; bucket < buckets; bucket += 1) {
-    const slice = points.slice(Math.floor(bucket * size), Math.floor((bucket + 1) * size));
-    if (slice.length === 0) continue;
-    let low = slice[0]!;
-    let high = slice[0]!;
-    for (const point of slice) {
-      if (point.y < low.y) low = point;
-      if (point.y > high.y) high = point;
+function convolveLinearChartOnGeometricGrid(
+  points: PlotPoint[],
+  xMin: number,
+  xMax: number,
+  pixelWidth: number,
+  scale: "linear" | "log",
+): PlotPoint[] {
+  if (points.length === 0) return [];
+  if (points.length === 1) {
+    const point = points[0]!;
+    return point.x >= xMin && point.x <= xMax ? [point] : [];
+  }
+  if (xMax <= xMin) return [];
+  const targetCellPixelWidth = 2;
+  const chartUnitsPerPixel = (
+    (xMax - xMin) / Math.max(1, pixelWidth)
+  );
+  const targetCellWidth = chartUnitsPerPixel * targetCellPixelWidth;
+  const cellScaleRatio = 1.2;
+  const cellWidth = cellScaleRatio ** Math.ceil(
+    Math.log(targetCellWidth) / Math.log(cellScaleRatio),
+  );
+  const chartGridOrigin = 0;
+  const firstGridCell = Math.ceil(
+    (xMin - chartGridOrigin) / cellWidth - 0.5,
+  );
+  const lastGridCell = Math.floor(
+    (xMax - chartGridOrigin) / cellWidth - 0.5,
+  );
+  const firstCellStart = chartGridOrigin + firstGridCell * cellWidth;
+  const lastCellEnd = chartGridOrigin + (lastGridCell + 1) * cellWidth;
+  const lowerIndex = lowerBoundPlotPoint(points, firstCellStart);
+  const upperIndex = upperBoundPlotPoint(points, lastCellEnd);
+  const start = Math.max(0, lowerIndex - 1);
+  const end = Math.min(points.length, upperIndex + 1);
+  const transformed: Array<{
+    x: number;
+    y: number;
+    count: number;
+  }> = [];
+  for (let index = start; index < end; index += 1) {
+    const point = points[index]!;
+    const displayY = scale === "log" ? Math.log10(point.y) : point.y;
+    const previous = transformed.at(-1);
+    if (previous?.x === point.x) {
+      previous.y = (
+        previous.y * previous.count + displayY
+      ) / (previous.count + 1);
+      previous.count += 1;
+    } else {
+      transformed.push({ x: point.x, y: displayY, count: 1 });
     }
-    if (low.x <= high.x) result.push(low, ...(low === high ? [] : [high]));
-    else result.push(high, low);
+  }
+  if (transformed.length === 0) return [];
+  if (transformed.length === 1) {
+    const point = transformed[0]!;
+    return point.x >= xMin && point.x <= xMax
+      ? [{ x: point.x, y: restoreChartValue(point.y, scale) }]
+      : [];
+  }
+
+  const prefixArea = new Float64Array(transformed.length);
+  for (let index = 1; index < transformed.length; index += 1) {
+    const previous = transformed[index - 1]!;
+    const point = transformed[index]!;
+    prefixArea[index] = prefixArea[index - 1]!
+      + (previous.y + point.y) / 2 * (point.x - previous.x);
+  }
+  const supportMin = transformed[0]!.x;
+  const supportMax = transformed.at(-1)!.x;
+  const result: PlotPoint[] = [];
+  for (
+    let gridCell = firstGridCell;
+    gridCell <= lastGridCell;
+    gridCell += 1
+  ) {
+    // Every geometric scale shares one chart-space origin. Cell membership
+    // stays fixed within a level, while 1.2x steps keep level transitions
+    // much finer than the previous binary ladder.
+    const cellStart = chartGridOrigin + gridCell * cellWidth;
+    const cellEnd = cellStart + cellWidth;
+    const x = (cellStart + cellEnd) / 2;
+    if (x < supportMin || x > supportMax) continue;
+    const left = Math.max(supportMin, cellStart);
+    const right = Math.min(supportMax, cellEnd);
+    if (right <= left) continue;
+    const displayY = (
+      integrateLinearChartTo(transformed, prefixArea, right)
+      - integrateLinearChartTo(transformed, prefixArea, left)
+    ) / (right - left);
+    result.push({ x, y: restoreChartValue(displayY, scale) });
   }
   return result;
+}
+
+function integrateLinearChartTo(
+  points: Array<{ x: number; y: number }>,
+  prefixArea: Float64Array,
+  x: number,
+): number {
+  if (x <= points[0]!.x) return 0;
+  const lastIndex = points.length - 1;
+  if (x >= points[lastIndex]!.x) return prefixArea[lastIndex]!;
+  let low = 0;
+  let high = lastIndex;
+  while (low + 1 < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.x <= x) low = middle;
+    else high = middle;
+  }
+  const left = points[low]!;
+  const right = points[low + 1]!;
+  const fraction = (x - left.x) / (right.x - left.x);
+  const y = left.y + fraction * (right.y - left.y);
+  return prefixArea[low]! + (left.y + y) / 2 * (x - left.x);
+}
+
+function lowerBoundPlotPoint(points: PlotPoint[], x: number): number {
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.x < x) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function upperBoundPlotPoint(points: PlotPoint[], x: number): number {
+  let low = 0;
+  let high = points.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (points[middle]!.x <= x) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function restoreChartValue(
+  displayValue: number,
+  scale: "linear" | "log",
+): number {
+  return scale === "log" ? 10 ** displayValue : displayValue;
 }
 
 function formatMetric(value: number | undefined): string {
@@ -887,6 +1401,93 @@ function formatMetric(value: number | undefined): string {
 
 function lossWeightLabel(value: number | undefined): string | undefined {
   return value === undefined ? undefined : `Loss weight ${value}`;
+}
+
+function reverseKlLabel(
+  lossWeight: number | undefined,
+  predictionMixtureWeight: number | undefined,
+  gate: OutputRegularizerPlan | undefined,
+): string | undefined {
+  const parts = [
+    ...gatedLossWeightParts(lossWeight, gate, "reverseKl"),
+    predictionMixtureWeight === undefined
+      ? undefined
+      : `Prediction-mixture epsilon ${predictionMixtureWeight}`,
+  ].filter((part): part is string => part !== undefined);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function gatedLossWeightLabel(
+  lossWeight: number | undefined,
+  gate: OutputRegularizerPlan | undefined,
+  loss: keyof OutputRegularizerPlan["applicationProbabilities"],
+): string | undefined {
+  const parts = gatedLossWeightParts(lossWeight, gate, loss);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function gatedLossWeightParts(
+  lossWeight: number | undefined,
+  gate: OutputRegularizerPlan | undefined,
+  loss: keyof OutputRegularizerPlan["applicationProbabilities"],
+): string[] {
+  if (lossWeight === undefined) return [];
+  if (!gate) return [`Loss weight ${lossWeight}`];
+  const probability = gate.applicationProbabilities[loss];
+  const activeWeight = gate.inverseProbabilityScaling
+    ? lossWeight / probability
+    : lossWeight;
+  const expectedWeight = gate.inverseProbabilityScaling
+    ? lossWeight
+    : lossWeight * probability;
+  return [
+    `Expected weight ${expectedWeight}`,
+    `Active weight ${activeWeight}`,
+    `${probability * 100}% of optimizer updates`,
+  ];
+}
+
+function softWeightBoundLabel(
+  lossWeight: number | undefined,
+  desiredMagnitude: number | undefined,
+): string | undefined {
+  const parts = [
+    lossWeight === undefined ? undefined : `Loss weight ${lossWeight}`,
+    desiredMagnitude === undefined
+      ? undefined
+      : `Desired |weight| <= ${desiredMagnitude}`,
+  ].filter((part): part is string => part !== undefined);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function distributionLayerLabel(
+  sumWeight: number | undefined,
+  negativeWeight: number | undefined,
+): string | undefined {
+  if (sumWeight === undefined && negativeWeight === undefined) return undefined;
+  return [
+    sumWeight === undefined ? undefined : `λsum ${sumWeight}`,
+    negativeWeight === undefined ? undefined : `λnegative ${negativeWeight}`,
+    "post-GLU · pre-dropout",
+  ].filter((part): part is string => part !== undefined).join(" · ");
+}
+
+function centeringConstraintLabel(
+  idempotenceWeight: number | undefined,
+  symmetryWeight: number | undefined,
+): string | undefined {
+  if (idempotenceWeight === undefined && symmetryWeight === undefined) {
+    return undefined;
+  }
+  return [
+    idempotenceWeight === undefined
+      ? undefined
+      : `Idempotence weight ${idempotenceWeight}`,
+    symmetryWeight === undefined
+      ? undefined
+      : `Symmetry weight ${symmetryWeight}`,
+    "mean squared matrix residuals",
+  ].filter((part): part is string => part !== undefined).join(" · ");
 }
 
 function shortNumber(value: number): string {

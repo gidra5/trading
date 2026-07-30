@@ -1,7 +1,7 @@
 {
   "version": 4,
   "id": "mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
-  "label": "Direct 255-action MLP v12 · one-minute oracle learnability · 60-minute full-hindsight delay · 1-second examples · full 33M production corpus",
+  "label": "Direct 255-action MLP v12 · one-minute oracle learnability · 60-minute full-hindsight delay · 1-second examples · expanded 51.3M corpus",
   "dataDir": "data",
   "componentStoreId": "mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s",
   "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
@@ -189,6 +189,137 @@
       "end": "2022-06-13"
     }
   ],
+  "randomTrainingChunks": {
+    "seed": 20260731,
+    "sampling": "uniform-without-replacement-from-unused-complete-utc-days-before-test",
+    "windows": [
+      {
+        "id": "random-train-2021-09-30-to-2021-10-05",
+        "start": "2021-09-30",
+        "end": "2021-10-05"
+      },
+      {
+        "id": "random-train-2021-11-07-to-2021-11-16",
+        "start": "2021-11-07",
+        "end": "2021-11-16"
+      },
+      {
+        "id": "random-train-2022-02-24-to-2022-03-05",
+        "start": "2022-02-24",
+        "end": "2022-03-05"
+      },
+      {
+        "id": "random-train-2022-05-27-to-2022-06-05",
+        "start": "2022-05-27",
+        "end": "2022-06-05"
+      },
+      {
+        "id": "random-train-2023-06-17",
+        "start": "2023-06-17",
+        "end": "2023-06-17"
+      },
+      {
+        "id": "random-train-2023-09-24",
+        "start": "2023-09-24",
+        "end": "2023-09-24"
+      },
+      {
+        "id": "random-train-2023-12-12-to-2023-12-21",
+        "start": "2023-12-12",
+        "end": "2023-12-21"
+      },
+      {
+        "id": "random-train-2024-03-05-to-2024-03-14",
+        "start": "2024-03-05",
+        "end": "2024-03-14"
+      },
+      {
+        "id": "random-train-2024-04-22-to-2024-05-01",
+        "start": "2024-04-22",
+        "end": "2024-05-01"
+      },
+      {
+        "id": "random-train-2024-05-15",
+        "start": "2024-05-15",
+        "end": "2024-05-15"
+      },
+      {
+        "id": "random-train-2024-05-19-to-2024-05-28",
+        "start": "2024-05-19",
+        "end": "2024-05-28"
+      },
+      {
+        "id": "random-train-2024-06-25-to-2024-07-04",
+        "start": "2024-06-25",
+        "end": "2024-07-04"
+      },
+      {
+        "id": "random-train-2024-07-27-to-2024-08-05",
+        "start": "2024-07-27",
+        "end": "2024-08-05"
+      },
+      {
+        "id": "random-train-2024-09-11",
+        "start": "2024-09-11",
+        "end": "2024-09-11"
+      },
+      {
+        "id": "random-train-2025-11-24-to-2025-12-03",
+        "start": "2025-11-24",
+        "end": "2025-12-03"
+      },
+      {
+        "id": "random-train-2026-03-17-to-2026-03-26",
+        "start": "2026-03-17",
+        "end": "2026-03-26"
+      },
+      {
+        "id": "random-train-2022-12-08-to-2022-12-17",
+        "start": "2022-12-08",
+        "end": "2022-12-17"
+      },
+      {
+        "id": "random-train-2025-03-06-to-2025-03-15",
+        "start": "2025-03-06",
+        "end": "2025-03-15"
+      },
+      {
+        "id": "random-train-2026-02-12-to-2026-02-21",
+        "start": "2026-02-12",
+        "end": "2026-02-21"
+      },
+      {
+        "id": "random-train-2022-10-21-to-2022-10-30",
+        "start": "2022-10-21",
+        "end": "2022-10-30"
+      },
+      {
+        "id": "random-train-2026-02-28-to-2026-03-09",
+        "start": "2026-02-28",
+        "end": "2026-03-09"
+      },
+      {
+        "id": "random-train-2023-01-19-to-2023-01-28",
+        "start": "2023-01-19",
+        "end": "2023-01-28"
+      },
+      {
+        "id": "random-train-2024-07-10-to-2024-07-19",
+        "start": "2024-07-10",
+        "end": "2024-07-19"
+      },
+      {
+        "id": "random-train-2022-12-29-to-2023-01-07",
+        "start": "2022-12-29",
+        "end": "2023-01-07"
+      },
+      {
+        "id": "random-train-2026-05-02-to-2026-05-11",
+        "start": "2026-05-02",
+        "end": "2026-05-11"
+      }
+    ]
+  },
   "execution": {
     "feeBps": 17.5,
     "minimumUsableExposure": -100,
@@ -693,8 +824,10 @@
     "spread": "removed"
   },
   "componentCompression": {
-    "features": "zstd"
+    "features": "zstd",
+    "rawOracleProbabilities": "zstd",
+    "minuteOracleProbabilities": "zstd"
   },
   "featurePreparationWorkers": 3,
-  "runtimeMinuteOracleTargets": true
+  "runtimeMinuteOracleTargets": false
 }

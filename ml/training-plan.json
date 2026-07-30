@@ -54,6 +54,16 @@
     { "id": "failure-down-3d-2022-06", "start": "2022-06-11", "end": "2022-06-13" },
     { "id": "failure-down-7d-2022-06", "start": "2022-06-07", "end": "2022-06-13" }
   ],
+  "randomTrainingChunks": {
+    "seed": 20260729,
+    "sampling": "uniform-without-replacement-from-unused-complete-utc-days-before-test",
+    "windows": [
+      { "id": "random-train-2023-06-17", "start": "2023-06-17", "end": "2023-06-17" },
+      { "id": "random-train-2023-09-24", "start": "2023-09-24", "end": "2023-09-24" },
+      { "id": "random-train-2024-05-15", "start": "2024-05-15", "end": "2024-05-15" },
+      { "id": "random-train-2024-09-11", "start": "2024-09-11", "end": "2024-09-11" }
+    ]
+  },
   "execution": {
     "feeBps": 17.5,
     "minimumUsableExposure": -100,

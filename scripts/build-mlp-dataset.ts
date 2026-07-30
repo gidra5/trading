@@ -43,6 +43,11 @@ const SPLITS = ["train", "validation", "test"] as const;
 type Split = typeof SPLITS[number];
 
 interface TrainingWindow { id: string; start: string; end: string }
+interface RandomTrainingChunks {
+  seed: number;
+  sampling: "uniform-without-replacement-from-unused-complete-utc-days-before-test";
+  windows: TrainingWindow[];
+}
 interface ExplicitExampleSelection {
   mode: "explicit-time-blocks";
   days: Array<{ date: string; split: Split }>;
@@ -87,6 +92,7 @@ interface TrainingPlan {
   latestTestDays: number;
   excludedAggregateWindows: string[];
   windows: TrainingWindow[];
+  randomTrainingChunks?: RandomTrainingChunks;
   exampleSelection?: ExampleSelection;
   frozenStudySampling?: {
     sourceDatasetDir: string;
@@ -727,8 +733,6 @@ async function main(): Promise<void> {
     );
     const reuseOracleFactor = Boolean(existingComponent)
       && expectedGrid && expectedCurrentGrid
-      && existingComponent?.rawOracleProbabilitiesCompression
-        === plan.componentCompression?.rawOracleProbabilities
       && await rawOracleFactorComplete(
         output,
         existingComponent,
@@ -917,8 +921,6 @@ async function main(): Promise<void> {
       const reuseOracleFactor = pipelinedOracle?.reuseOracleFactor ?? (
         Boolean(existingComponent)
           && expectedGrid && expectedCurrentGrid
-          && existingComponent?.rawOracleProbabilitiesCompression
-            === plan.componentCompression?.rawOracleProbabilities
           && await rawOracleFactorComplete(
             output, existingComponent, expectedGrid.length, requiredOracleSignature,
           )
@@ -1748,6 +1750,9 @@ async function main(): Promise<void> {
     splitPolicy: {
       training: plan.exampleSelection
         ? "explicit calendar days selected for the study training split"
+        : plan.randomTrainingChunks
+        ? "first half of every non-aggregate inspector window plus the "
+          + "seeded random training-only UTC-day chunks"
         : "first half of every non-aggregate inspector window",
       validation: plan.exampleSelection
         ? "explicit calendar days selected for the study validation split"
@@ -1757,6 +1762,9 @@ async function main(): Promise<void> {
         : `latest ${plan.latestTestDays} complete cached days`,
       overlapPriority: ["test", "validation", "train"],
       excludedAggregateWindows: plan.excludedAggregateWindows,
+      ...(plan.randomTrainingChunks
+        ? { randomTrainingChunks: plan.randomTrainingChunks }
+        : {}),
     },
     execution: plan.execution,
     oraclePreparation: plan.oraclePreparation,
@@ -2172,6 +2180,13 @@ function buildWindowRanges(plan: TrainingPlan): { trainRanges: TimeRange[]; vali
       * plan.samplingIntervalMs;
     trainRanges.push({ id: window.id, start, end: midpoint });
     validationRanges.push({ id: window.id, start: midpoint, end });
+  }
+  for (const window of plan.randomTrainingChunks?.windows ?? []) {
+    trainRanges.push({
+      id: window.id,
+      start: parseDay(window.start),
+      end: parseDay(window.end) + DAY_MS,
+    });
   }
   return { trainRanges, validationRanges };
 }
@@ -4413,6 +4428,21 @@ function validatePlan(plan: TrainingPlan): void {
         : false
   );
   const frozenStudy = plan.frozenStudySampling;
+  const randomTrainingChunks = plan.randomTrainingChunks;
+  const validRandomTrainingChunks = !randomTrainingChunks || (
+    Number.isInteger(randomTrainingChunks.seed)
+    && randomTrainingChunks.sampling
+      === "uniform-without-replacement-from-unused-complete-utc-days-before-test"
+    && Array.isArray(randomTrainingChunks.windows)
+    && randomTrainingChunks.windows.length > 0
+    && new Set(randomTrainingChunks.windows.map((window) => window.id)).size
+      === randomTrainingChunks.windows.length
+    && randomTrainingChunks.windows.every((window) =>
+      window.id.length > 0
+      && Number.isFinite(parseDay(window.start))
+      && Number.isFinite(parseDay(window.end))
+      && parseDay(window.start) <= parseDay(window.end))
+  );
   const validFrozenStudy = !frozenStudy || (
     typeof frozenStudy.sourceDatasetDir === "string"
     && typeof frozenStudy.outputDatasetDir === "string"
@@ -4506,7 +4536,8 @@ function validatePlan(plan: TrainingPlan): void {
     || execution.valueHorizonSteps < execution.holdingPeriodSteps
     || !(execution.temperature > 0)
     || !validSelection
-    || !validFrozenStudy) {
+    || !validFrozenStudy
+    || !validRandomTrainingChunks) {
     throw new Error("Invalid MLP v4 training plan.");
   }
 }

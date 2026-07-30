@@ -34,9 +34,39 @@ interface TrainingPlan {
   training?: {
     epochs?: number;
     patience?: number;
+    dropout?: number;
+    dropoutRate?: number;
     lossWeights?: Record<string, number>;
+    reverseKl?: MlpReverseKlPlan;
+    outputRegularizer?: MlpOutputRegularizerPlan;
+    softWeightBound?: MlpSoftWeightBoundPlan;
+    branchNormalization?: MlpBranchNormalizationPlan;
     timeWeighting?: MlpTimeWeightingPlan;
   };
+}
+
+export interface MlpReverseKlPlan {
+  predictionMixtureWeight: number;
+}
+
+export interface MlpOutputRegularizerPlan {
+  applicationProbabilities: {
+    reverseKl: number;
+    entropySharpness: number;
+  };
+  samplingUnit: "optimizer-update";
+  independentGates: boolean;
+  inverseProbabilityScaling: boolean;
+}
+
+export interface MlpSoftWeightBoundPlan {
+  desiredMagnitude: number;
+  sharpness: number;
+  absoluteEpsilon: number;
+}
+
+export interface MlpBranchNormalizationPlan {
+  learnableCentering?: boolean;
 }
 
 export interface MlpTimeWeightingPlan {
@@ -92,7 +122,13 @@ export interface MlpTrainingMetricsResponse {
     patience?: number;
     samplingIntervalMs?: number;
     predictionDelayMs?: number;
+    dropout?: number;
+    dropoutRate?: number;
     lossWeights?: Record<string, number>;
+    reverseKl?: MlpReverseKlPlan;
+    outputRegularizer?: MlpOutputRegularizerPlan;
+    softWeightBound?: MlpSoftWeightBoundPlan;
+    branchNormalization?: MlpBranchNormalizationPlan;
     timeWeighting?: MlpTimeWeightingPlan;
   };
   status?: TrainingStatus;
@@ -208,8 +244,26 @@ export class MlpTrainingMetricsReader {
                 ? files.status.predictionDelayMs
                 : files.plan.predictionDelayMs,
             }),
+        ...(files.plan.training?.dropout === undefined
+          ? {}
+          : { dropout: files.plan.training.dropout }),
+        ...(files.plan.training?.dropoutRate === undefined
+          ? {}
+          : { dropoutRate: files.plan.training.dropoutRate }),
         ...(files.plan.training?.lossWeights
           ? { lossWeights: files.plan.training.lossWeights }
+          : {}),
+        ...(files.plan.training?.reverseKl
+          ? { reverseKl: files.plan.training.reverseKl }
+          : {}),
+        ...(files.plan.training?.outputRegularizer
+          ? { outputRegularizer: files.plan.training.outputRegularizer }
+          : {}),
+        ...(files.plan.training?.softWeightBound
+          ? { softWeightBound: files.plan.training.softWeightBound }
+          : {}),
+        ...(files.plan.training?.branchNormalization
+          ? { branchNormalization: files.plan.training.branchNormalization }
           : {}),
         ...(files.plan.training?.timeWeighting
           ? { timeWeighting: files.plan.training.timeWeighting }

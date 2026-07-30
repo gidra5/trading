@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "df87be096acfd431",
+        "id": "f7d945aa67ead381",
         "type": "tabs",
         "children": [
           {
-            "id": "d04154746b237cc6",
+            "id": "2e06481950b61c7e",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "theory/Oracle.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "Oracle"
+              "title": "New tab"
             }
           }
         ]
@@ -94,7 +90,6 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "theory/Oracle.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -104,7 +99,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Oracle"
+              "title": "Backlinks"
             }
           },
           {
@@ -113,12 +108,11 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "theory/Oracle.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links from Oracle"
+              "title": "Outgoing links"
             }
           },
           {
@@ -156,13 +150,12 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "theory/Oracle.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline of Oracle"
+              "title": "Outline"
             }
           }
         ]
@@ -183,10 +176,32 @@
       "bases:Create new base": false
     }
   },
-  "active": "d04154746b237cc6",
+  "active": "2e06481950b61c7e",
   "lastOpenFiles": [
-    "Untitled.md",
+    "experiments/return-oracle-dense-all-layer-residuals-fixed-c-baseline-2026-07-30.md",
+    "return-oracle-ce-experiment.md",
+    "experiments/return-oracle-dense-all-layer-residuals-learnable-c-baseline-2026-07-30.md",
+    "experiments/return-oracle-second-layer-peak-tanh-ce10-no-residual-baseline-2026-07-30.md",
     "theory/Oracle.md",
+    "experiments/return-oracle-learned-radius-shrinking-baseline-2026-07-30.md",
+    "experiments/return-oracle-shared-c-sharpness-p1-baseline-2026-07-29.md",
+    "experiments/return-oracle-independent-p01-w002-softln1-baseline-2026-07-29.md",
+    "experiments/return-oracle-shared-shake-w0p2-softln0-baseline-2026-07-29.md",
+    "experiments/return-oracle-continuous-skew-sharpness-w1-baseline-2026-07-29.md",
+    "experiments/return-oracle-skew-eps1e2-w1-no-sharpness-baseline-2026-07-29.md",
+    "experiments/return-oracle-skew-reverse-kl-eps1e4-w1-baseline-2026-07-29.md",
+    "experiments/return-oracle-smoothed-reverse-kl-w005-baseline-2026-07-29.md",
+    "experiments/return-oracle-fast-ce-only-baseline-2026-07-29.md",
+    "experiments/return-oracle-batch86400-muon3-no-accumulation-baseline-2026-07-29.md",
+    "experiments/return-oracle-batch65536-muon5-speed-baseline-2026-07-29.md",
+    "experiments/return-oracle-learnable-centering-diagnostic-activations-batch8192-baseline-2026-07-29.md",
+    "experiments/return-oracle-learnable-centering-full-regularization-baseline-2026-07-29.md",
+    "experiments/return-oracle-bias-ln-full-a-baseline-2026-07-29.md",
+    "theory/Basic notions.md",
+    "experiments/return-oracle-hard-layernorm-baseline-2026-07-28.md",
+    "experiments",
+    "return-oracle-mi-experiment.md",
+    "Untitled.md",
     "theory"
   ]
 }

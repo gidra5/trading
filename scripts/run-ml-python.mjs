@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +21,8 @@ while (args[0] === "--env") {
   overrides[assignment.slice(0, equals)] = assignment.slice(equals + 1);
 }
 if (args.length === 0) throw new Error("Python arguments are required.");
+const toolchainEnvironment =
+  process.platform === "win32" ? visualStudioEnvironment() : {};
 
 const runtimeRoot = path.join(repoRoot, "data", "runtime-cache");
 const temporaryDirectory = path.join(runtimeRoot, "tmp");
@@ -40,6 +42,7 @@ const child = spawn(python, args, {
   cwd: repoRoot,
   env: {
     ...process.env,
+    ...toolchainEnvironment,
     ...overrides,
     PYTHONUTF8: process.env.PYTHONUTF8 || "1",
     PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
@@ -66,3 +69,35 @@ child.once("error", (error) => {
 child.once("exit", (code) => {
   process.exitCode = code ?? 1;
 });
+
+function visualStudioEnvironment() {
+  const roots = [
+    process.env.VSINSTALLDIR,
+    "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools",
+    "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools",
+  ].filter(Boolean);
+  const setup = roots
+    .map((root) => path.join(root, "VC", "Auxiliary", "Build", "vcvars64.bat"))
+    .find((candidate) => fs.existsSync(candidate));
+  if (!setup) return {};
+  const result = spawnSync(
+    process.env.ComSpec ?? "cmd.exe",
+    ["/d", "/s", "/c", `""${setup}" >nul && set"`],
+    { encoding: "utf8", windowsVerbatimArguments: true },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `Failed to load the Visual Studio build environment: ${result.stderr}`,
+    );
+  }
+  return Object.fromEntries(
+    result.stdout
+      .split(/\r?\n/)
+      .flatMap((line) => {
+        const equals = line.indexOf("=");
+        return equals > 0
+          ? [[line.slice(0, equals), line.slice(equals + 1)]]
+          : [];
+      }),
+  );
+}

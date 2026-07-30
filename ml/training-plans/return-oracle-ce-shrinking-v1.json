@@ -1,0 +1,96 @@
+{
+  "id": "return-oracle-ce-shrinking-v1",
+  "label": "Test · dense fully normalized GLU residuals from original input and every earlier hidden layer into every later layer; fixed canonical C, path-shared value/gate A, path-specific projections/radii/biases; 8 uniform 256-wide hidden layers → 255-action oracle · hybrid Muon/AdamW · gradient clip 100 · CE weight 10 + inverse-probability-corrected skew-KL/sharpness expected weight 0.1 each + soft LN weight 1",
+  "sourceDatasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "datasetDir": "data/ml-datasets/return-oracle-ce-shrinking-v1",
+  "runDir": "data/ml-runs/return-oracle-ce-shrinking-v1",
+  "historyDir": "data/historical/spot-btcusdt/btcusdt/1s",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 3600000,
+  "training": {
+    "targetRepresentation": "minuteOracleProbabilities",
+    "inputStandardization": "training-split per-position population mean/std across 60 return coordinates",
+    "architecture": "eight-uniform-256-fused-glu-shared-layer-centering-tanh-learned-radius-full-a-post-bias-full-normalized-global-input-glu-dense-all-prior-layer-residuals-fixed-c-path-shared-value-gate-a-v38",
+    "objective": "soft-target-ce-plus-independent-skew-reverse-kl-p1-entropy-sharpness-p1-weight-point1-soft-layernorm-centering-weight-regularizers-v16",
+    "epochs": 1000000,
+    "batchSize": 86400,
+    "evaluationBatchSize": 86400,
+    "gradientAccumulationSteps": 2,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 32,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "dropout": 0.05,
+    "dropoutRate": 0.5,
+    "branchNormalization": {
+      "family": "tanh",
+      "denominator": "u/tanh(u)",
+      "scaleRole": "denominatorRadius",
+      "initialScale": 0.0031622776601683794,
+      "initialSquaredScale": 0.00001,
+      "minimumScale": 0.0001,
+      "scaleParameterization": "softplus(rawScale)+minimumScale",
+      "learnableCentering": false
+    },
+    "reverseKl": {
+      "predictionMixtureWeight": 0.01
+    },
+    "outputRegularizer": {
+      "applicationProbabilities": {
+        "reverseKl": 0.1,
+        "entropySharpness": 0.1
+      },
+      "samplingUnit": "optimizer-update",
+      "independentGates": true,
+      "inverseProbabilityScaling": true
+    },
+    "softLayerNorm": {
+      "varianceWeight": 1
+    },
+    "softWeightBound": {
+      "desiredMagnitude": 1,
+      "sharpness": 10,
+      "absoluteEpsilon": 1e-8
+    },
+    "gradientClip": 100,
+    "patience": 1024,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 100,
+    "workers": 4,
+    "prefetchFactor": 2,
+    "compile": true,
+    "lossWeights": {
+      "crossEntropy": 10,
+      "reverseKl": 0.1,
+      "entropySharpness": 0.1,
+      "softLayerNorm": 1,
+      "softWeightBound": 0.01,
+      "distributionLayerSum": 0,
+      "distributionLayerNegative": 0,
+      "centeringIdempotence": 1,
+      "centeringSymmetry": 1
+    }
+  }
+}

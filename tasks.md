@@ -222,6 +222,13 @@ Alternatives:
 3.  iTransformer
 4.  encoder(-decoder)s
 5.  LSTM
+6.  DLinear
+7.  TiDE
+8.  DUET
+9.  TQNet
+10.  MoE
+11.  FITS
+12.  TSMixer
 
 Insufficient margin trades should not happen
 
@@ -272,3 +279,127 @@ try finding simpler learning tasks and then gradually move to the full model:
    3. volatility to measure certainty and importance of particular changes. It also presents us many opportunities for profit, since movement range can be larger than fees and quickly accumulate returns.
    4. dont trade persistent moves, prefer entering and exiting at extrema
    5. if market state is uncertain, dont overcommit to a single entry. scale signal according to confidence in its quality.
+
+x
+
+      26. Let h_t,k(a) and d_t,k(a) be the log wealth multiplier and drifted exposure after passively holding a for k price moves, and let R_t(x->b) be the rebalance wealth multiplier.
+
+      27. The faithful recurrence is V_t,0(x)=ln R_t(x->0), V_t,k(x)=max_b[ln R_t(x->b)+h_t,1(b)+V_t+1,k-1(d_t,1(b))], and Q_t,H,T(a)=h_t,H'(a)+V_t+H',T-H'(d_t,H'(a)), with H'=min(H,T,remaining moves).
+
+      28. H applies only to the initially forced target. The optimal continuation may rebalance every candle and the final state closes to exact zero exposure.
+
+   29. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
+
+30. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
+
+31. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
+
+   32. R_t(a) = max_A(Q_t(A)) - Q_t(a)
+
+   33. This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
+
+34. p_t(a) is the oracle's preference for the exposure a at time t.
+
+   35. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
+
+36. we compute objective as oracle value distillation over all example windows
+
+   37. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
+
+   38. w_t=W_t/mean_batch(W_t)
+
+   39. D_t=sum_x E[a-x|x] / (sum_x E[abs(a-x)|x]+eps), computed once per complete timestamp example from the exact cutoff-applied raw oracle map over every visible current-exposure/action cell and stored as aligned dataset metadata.
+
+   40. Build p_1m from completed UTC one-minute closes only. At second 59 it is
+
+      exactly aligned; otherwise use the latest completed minute (a conservative
+
+      1-59 second shift) so a 60-minute-delay target contains no hidden
+
+      within-minute ordering.
+
+   41. W_t=(eps+abs(D_t)*persistenceMultiplier)*(1+lambda_resolution*JSD(p_1s,p_1m)).
+
+      The completed-minute target and its visible-range JSD are stored
+
+      separately so lambda_resolution can change without rebuilding either
+
+      oracle.
+
+      This is a ratio of the global signed and absolute displacement integrals, not a mean of separately normalized rows, so each row contributes in proportion to its expected actionable distance.
+
+      42. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
+
+      43. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
+
+      44. Persist the resulting causal unnormalized whole-example W_t in the dataset; training may only normalize it by the current batch mean and must not reconstruct it from fitted parameters.
+
+   45. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
+
+      46. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
+
+      47. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
+
+      48. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
+
+      49. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
+
+50. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence.
+
+51. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price.
+
+   52. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing.
+
+   53. it generally just outputs what is the preferred final state of the bot state (exposure and pending order), and then execution engine calculates the actual actions needed to achieve that from current state.
+
+   54.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute.
+
+   55.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
+
+   56.  but this idea is for future iterations, not for now.
+
+57.  the limit order model:
+
+    58.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
+
+    59.  I want to design similar regret but for limit orders. i think he premise should be similar. Assume we create a limit order at chosen relative price from current in percents and a reserved exposure. If reserved exposure is borrowed we count borrowing fees each step we hold it before the execution. The reserved amount cant be used for market orders which defines opportunity cost (maybe computed in a similar way to regret). But executing limit order has less fees (potentially 0) than market orders. Then we compute regret as difference between optimal limit order and the chosen one. The optimal one balances opportunity cost such that we get the most profit. We also assume that after limit order is done we act as perfect margin trader.
+
+    60.  The limit order exposure delta is signed - negative is sell, positive is buy.
+
+    61.  The oracle can trade optimally with unreserved assets during lifetime of the lo.
+
+    62.  That essentially scales the optimal market trade return by 1-a
+
+    63.  Then it can trade optimally with post execution equity
+
+    64.  The limit order either executed until the duration T passed, or is cancelled at that time. That is the value horizon
+
+    65.  If candle fully crosses the target price, we execute it at that price.
+
+    66.  The "no order" is identified as any lo with size 0
+
+    67. Limit orders can execute at wicks, while market orders assumed to execute at close basically
+
+    68. Limit price is always positive
+
+    69. Value of the lo is the same way as the mo = final equity over initial
+
+    70. Regret is difference between best value and chosen
+
+    71. Best value is the one where we setr just below wick top at every significant turn. That benefits both from volatility and from reduced fees
+
+    72. We can decide if making limit order is profitable by comparing with empty lo?
+
+train a joint model with predictor-oracle policy.
+
+Lets try this arch:
+1. A mix of TiDE, RLinear and DLinear for multivariate prediction
+2. Take input candle closes
+3. compute MA and pass it as another input
+3. compute "residual" of the candle and MA and pass it as another input
+4. Normalize both streams to have mean 0 and variance 1, like in RLinear
+5. Pass through separate TiDEs both streams
+6. Combine, then undo normalization
+7. Try adding PatchTST-like elements to create learned aggregates instead of MAs
+8. It will predict the next price movement, that will then be passed into an oracle/learned policy predictor
+9. For activation/normalization/residuals use same design as in current return-oracle prediction model

@@ -24,6 +24,26 @@ test("MLP training metrics stream only complete new metric events", async () => 
     training: {
       epochs: 12,
       lossWeights: { crossEntropy: 1 },
+      reverseKl: {
+        predictionMixtureWeight: 1e-2,
+      },
+      outputRegularizer: {
+        applicationProbabilities: {
+          reverseKl: 0.01,
+          entropySharpness: 0.1,
+        },
+        samplingUnit: "optimizer-update",
+        independentGates: true,
+        inverseProbabilityScaling: true,
+      },
+      softWeightBound: {
+        desiredMagnitude: 1,
+        sharpness: 10,
+        absoluteEpsilon: 1e-8,
+      },
+      branchNormalization: {
+        learnableCentering: false,
+      },
       timeWeighting: {
         mode: "distanceImbalance",
         distanceEpsilon: 1e-6,
@@ -65,6 +85,26 @@ test("MLP training metrics stream only complete new metric events", async () => 
     assert.equal(first.running, true);
     assert.equal(first.plan.epochs, 12);
     assert.equal(first.plan.samplingIntervalMs, 1_000);
+    assert.deepEqual(first.plan.reverseKl, {
+      predictionMixtureWeight: 1e-2,
+    });
+    assert.deepEqual(first.plan.outputRegularizer, {
+      applicationProbabilities: {
+        reverseKl: 0.01,
+        entropySharpness: 0.1,
+      },
+      samplingUnit: "optimizer-update",
+      independentGates: true,
+      inverseProbabilityScaling: true,
+    });
+    assert.deepEqual(first.plan.softWeightBound, {
+      desiredMagnitude: 1,
+      sharpness: 10,
+      absoluteEpsilon: 1e-8,
+    });
+    assert.deepEqual(first.plan.branchNormalization, {
+      learnableCentering: false,
+    });
     assert.deepEqual(first.plan.timeWeighting, {
       mode: "distanceImbalance",
       distanceEpsilon: 1e-6,
