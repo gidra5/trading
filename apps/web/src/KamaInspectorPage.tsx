@@ -76,6 +76,7 @@ const defaultValueDistillation: VwKamaValueDistillationConfig = {
   initialExposure: 0,
   holdingPeriodMode: "fixed",
   holdingPeriodMs: 60_000,
+  decisionDelayMs: 1_000,
   valueHorizonMode: "fixed",
   valueHorizonMs: 60 * 60_000,
   horizonEndMode: "extend",
@@ -225,7 +226,8 @@ const metricHelp = {
   entropyGap: "Opportunity-weighted squared excess of forecast entropy over oracle entropy, normalized by the grid's maximum entropy.",
   stateMutualInformation: "Normalized Gaussian variance-decomposition estimate of how much the strategy exposure distribution changes across market states. Higher is more state-responsive.",
   oracleMutualInformation: "Normalized dependence between soft oracle and strategy exposure distributions. Approximate mode uses distribution moments; precise mode computes categorical MI over the configured exposure bins.",
-  valueHoldingPeriod: "Resolved H between oracle decisions. An action rebalances once, then quote and asset quantities remain untouched while exposure drifts until the next decision. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
+  valueHoldingPeriod: "Resolved mandatory hold H for the action whose value is being measured. Adaptive mode uses half the mean time between consecutive executable oracle state changes.",
+  valueDecisionDelay: "Delay D between decisions made by the continuation policy after the initially forced H-step action hold.",
   valueHorizon: "Rolling T−t interval between E_t and E_T. Truncate mode caps it at the window end; future-candle mode loads post-window prices so every scored target reaches t + horizon.",
   strategyReturn: "Close-to-close marked return from equity 1 and zero initial exposure, executing modal target cells with the configured friction, maintenance, and no-trade-cell semantics.",
   oraclePredictionReturn: "The rolling-horizon oracle distribution is conditioned on the current exposure and friction, then its modal target is executed through exactly the same return simulator as the candidate.",
@@ -1898,6 +1900,7 @@ export function KamaInspectorPage() {
               />
               <InspectorSelect label="Holding-period source" value={valueConfig().holdingPeriodMode} options={[{ value: "fixed", label: "Fixed duration" }, { value: "oracle-half-average-trade", label: "Half average time between oracle trades" }]} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMode: value as VwKamaValueDistillationConfig["holdingPeriodMode"] }))} />
               <DurationInput label={valueConfig().holdingPeriodMode === "fixed" ? "Holding period H" : "Fallback holding period H"} value={valueConfig().holdingPeriodMs} onInput={(value) => setValueConfig((current) => ({ ...current, holdingPeriodMs: value, valueHorizonMs: Math.max(current.valueHorizonMs, value) }))} />
+              <DurationInput label="Continuation decision delay D" value={valueConfig().decisionDelayMs ?? 1_000} onInput={(value) => setValueConfig((current) => ({ ...current, decisionDelayMs: value }))} />
               <InspectorSelect label="Value horizon" value={valueConfig().valueHorizonMode ?? "full-window"} options={[{ value: "full-window", label: "Full selected window" }, { value: "fixed", label: "Fixed duration" }]} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMode: value as "full-window" | "fixed" }))} />
               <Show when={valueConfig().valueHorizonMode === "fixed"}>
                 <DurationInput label="Fixed value horizon T−t" value={valueConfig().valueHorizonMs} onInput={(value) => setValueConfig((current) => ({ ...current, valueHorizonMs: Math.max(value, current.holdingPeriodMs) }))} />
@@ -2011,6 +2014,7 @@ export function KamaInspectorPage() {
                           <PerformanceMetric label="exp(−KL)" value={ratioPercent(value().score)} description={metricHelp.distillation} />
                           <PerformanceMetric label="Mixed exp(−KL)" value={ratioPercent(value().mixedScore)} description={metricHelp.mixedLoss} />
                           <PerformanceMetric label="Resolved holding H" value={formatDuration(value().holdingPeriodMs)} description={metricHelp.valueHoldingPeriod} />
+                          <PerformanceMetric label="Decision delay D" value={formatDuration(value().decisionDelayMs)} description={metricHelp.valueDecisionDelay} />
                           <PerformanceMetric
                             label="Value horizon T−t"
                             value={valueConfig().valueHorizonMode === "fixed"

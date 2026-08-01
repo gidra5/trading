@@ -6,7 +6,7 @@ adding the one-sided output-entropy sharpness loss.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-skew-eps1e2-w1-no-sharpness-baseline-20260729-175200
+data/training/runs/return-oracle-ce-shrinking-v1-skew-eps1e2-w1-no-sharpness-baseline-20260729-175200
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

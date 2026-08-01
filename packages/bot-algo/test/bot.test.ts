@@ -10,6 +10,8 @@ import {
   type TradingStrategy,
   type TradingStrategyEntrySignal,
   type TradingStrategyExitSignal,
+  type TradingStrategyTargetExposureContext,
+  type TradingStrategyTargetExposureSignal,
   type TradingTick,
 } from "../src/index.js";
 
@@ -209,6 +211,60 @@ test("entry sizing absorbs provider dust before applying the trade cap", async (
   assert.equal(api.orders[0].order.size, 0.98);
 });
 
+test("target exposure expands and reduces positions through the bot contract", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  strategy.target = { targetExposure: 3, price: 100, confidence: 0.8 };
+  await bot.onTick(tick);
+  assert.equal(api.orders[0].order.side, "buy");
+  assert.equal(api.orders[0].order.size, 30);
+  assert.equal((await bot.snapshot()).positions[0].leverage, 3);
+  assert.equal(strategy.contexts[0]?.currentExposure, 0);
+
+  await bot.onOrder({
+    type: "fill",
+    orderId: api.orders[0].order.id,
+    fill: { filledAsset: 30, filledQuote: 3_000, remaining: 0 },
+  });
+  strategy.target = { targetExposure: 1, price: 100, confidence: 0.8 };
+  await bot.onTick({ ...tick, timestamp: 2_000 });
+
+  assert.equal(strategy.contexts[1]?.currentExposure, 3);
+  assert.equal(api.orders[1].order.side, "sell");
+  assert.equal(api.orders[1].order.size, 20);
+});
+
+test("target exposure reversals exit before entering the opposite side", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  strategy.target = { targetExposure: 2, price: 100, confidence: 1 };
+  await bot.onTick(tick);
+  await bot.onOrder({
+    type: "fill",
+    orderId: api.orders[0].order.id,
+    fill: { filledAsset: 20, filledQuote: 2_000, remaining: 0 },
+  });
+  strategy.target = { targetExposure: -2, price: 100, confidence: 1 };
+  await bot.onTick({ ...tick, timestamp: 2_000 });
+
+  assert.equal(api.orders[1].order.type, "market");
+  assert.equal(api.orders[1].order.side, "sell");
+  assert.equal(api.orders[1].order.size, 20);
+  assert.equal(api.orders[2].order.type, "limit");
+  assert.equal(api.orders[2].order.side, "sell");
+  assert.equal(api.orders[2].order.size, 20);
+});
+
 test("internal borrowing locks only the amount borrowed from the lender", async () => {
   const api = new FakeApi();
   const strategy = new FakeStrategy();
@@ -249,6 +305,14 @@ test("internal borrowing locks only the amount borrowed from the lender", async 
 class FakeApi implements TradingApi {
   orders: TradingOrderResult[] = [];
   capacity?: { quote: number; leverage: number };
+  equity = {
+    quoteAvailable: 1_000,
+    quoteReserved: 0,
+    quoteUnleveraged: 1_000,
+    assetAvailable: 0,
+    assetReserved: 0,
+    assetUnleveraged: 0,
+  };
 
   createStopMarketOrder = this.create.bind(this, "stop-market");
   createStopLimitOrder = this.create.bind(this, "stop-limit");
@@ -277,6 +341,10 @@ class FakeApi implements TradingApi {
 
   async getOrderCapacity(input: { leverage: number }) {
     return this.capacity ?? { quote: 1_000 * input.leverage, leverage: input.leverage };
+  }
+
+  async getEquity() {
+    return this.equity;
   }
 
   async getFriction() {
@@ -332,6 +400,18 @@ class FakeStrategy implements TradingStrategy<unknown, StrategySnapshot, Strateg
   async updateConfig() { this.updates += 1; }
   getDiagnostics() {
     return { indicators: {}, gates: [], blockers: [], lastSignal: null };
+  }
+}
+
+class FakeTargetStrategy extends FakeStrategy {
+  target: TradingStrategyTargetExposureSignal | null = null;
+  contexts: TradingStrategyTargetExposureContext[] = [];
+
+  async targetExposureSignal(context: TradingStrategyTargetExposureContext) {
+    this.contexts.push(context);
+    const signal = this.target;
+    this.target = null;
+    return signal;
   }
 }
 

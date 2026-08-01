@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { gzipSync } from "node:zlib";
 import { VW_KAMA_SCORE_VERSION, type Candle, type VwKamaInspectorRequest } from "@trading/bot-algo";
 import { KamaInspectorEngine } from "../src/kama-inspector.js";
+import { writeCanonicalCandleDay } from "./canonical-storage-fixture.js";
 
 const WINDOW_ID = "shape-up-low-2024-02";
 const START = Date.parse("2024-02-24T00:00:00.000Z");
@@ -104,15 +104,11 @@ test("KAMA inspector serves truthful viewport candle resolutions", async () => {
     assert.ok(wide.candles.every((candle) =>
       candle.closeTime - candle.openTime + 1 <= wide.renderIntervalMs
       && candle.interval === intervalLabel(candle.closeTime - candle.openTime + 1)));
-    assert.equal(wide.candles.some((candle) =>
-      candle.openTime === START + 121_000
-      && candle.closeTime === START + 121_999
-      && candle.interval === "1s"), true);
+    assert.equal(wide.candles.some((candle) => candle.openTime === START + 120_000), false);
     assert.deepEqual(
       pick(wide.candles[0]!),
       { open: 99.75, high: 102, low: 99, close: 101.25, volume: 3 },
     );
-    assert.equal(wide.candles.some((candle) => candle.openTime === START + 120_000), false);
 
     const unaligned = await engine.candles({
       ...analysisRequest(),
@@ -450,6 +446,7 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
       initialExposure: 0,
       holdingPeriodMode: "fixed",
       holdingPeriodMs: 60_000,
+      decisionDelayMs: 1_000,
       valueHorizonMode: "fixed",
       valueHorizonMs: 3_600_000,
       horizonEndMode: "extend",
@@ -529,8 +526,6 @@ test("KAMA inspector catalogs generated global and per-window presets", async ()
 
 async function fixture(futureShockAfterIndex?: number): Promise<string> {
   const dataDir = await mkdtemp(path.join(tmpdir(), "kama-inspector-"));
-  const root = path.join(dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
-  await mkdir(root, { recursive: true });
   const dates = [
     "2024-02-21",
     "2024-02-22",
@@ -542,20 +537,16 @@ async function fixture(futureShockAfterIndex?: number): Promise<string> {
   ];
   const byDate = new Map(dates.map((date) => [date, [] as Candle[]]));
   byDate.get("2024-02-23")!.push(candle(-1));
+  byDate.set("2024-02-24", []);
   for (let index = 0; index < 2_400; index += 1) {
-    if (index !== 120) {
-      byDate.get("2024-02-24")!.push(candle(
-        index,
-        futureShockAfterIndex !== undefined && index > futureShockAfterIndex ? 1_000_000 : 0,
-      ));
-    }
+    if (index === 120) continue;
+    byDate.get("2024-02-24")!.push(candle(
+      index,
+      futureShockAfterIndex !== undefined && index > futureShockAfterIndex ? 1_000_000 : 0,
+    ));
   }
-  await Promise.all(dates.map((date, index) => {
-    const content = byDate.get(date)!.map((value) => JSON.stringify(value)).join("\n");
-    return index === 0
-      ? writeFile(path.join(root, `${date}.jsonl.gz`), gzipSync(content))
-      : writeFile(path.join(root, `${date}.jsonl`), content);
-  }));
+  await Promise.all(dates.map((date) =>
+    writeCanonicalCandleDay(dataDir, byDate.get(date)!, { date, stepMs: 1_000 })));
   return dataDir;
 }
 

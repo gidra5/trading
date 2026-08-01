@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   prepareExposureValueOracle,
   type Candle,
@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   const datasetRoot = path.resolve(
     repoRoot,
     argument("dataset")
-      ?? "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+      ?? "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
   );
   const manifest = JSON.parse(
     fs.readFileSync(path.join(datasetRoot, "dataset.json"), "utf8"),
@@ -101,7 +101,7 @@ async function main(): Promise<void> {
   const historyRoot = path.resolve(
     repoRoot,
     argument("history")
-      ?? "data/historical/spot-btcusdt/btcusdt/1m",
+      ?? "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m",
   );
   const byTargetDate = groupBy(examples, (example) => example.targetDate);
   const observations: Observation[] = [];
@@ -437,13 +437,7 @@ function cachedFloat32File(
 }
 
 function readCandleDay(root: string, date: string): Candle[] {
-  const plain = path.join(root, `${date}.jsonl`);
-  const content = fs.existsSync(plain)
-    ? fs.readFileSync(plain, "utf8")
-    : gunzipSync(fs.readFileSync(`${plain}.gz`)).toString("utf8");
-  const candles = content.split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Candle);
+  const candles = readCandleShardReferenceSync(path.join(root, `${date}.json`));
   if (candles.length !== 1_440) {
     throw new Error(`${date} has ${candles.length}/1440 one-minute candles.`);
   }

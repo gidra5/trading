@@ -6,7 +6,7 @@ Recorded on 2026-07-30 before reducing every hidden layer to width 256.
 
 The complete run, logs, and best/last checkpoints are in:
 
-`data/ml-runs/return-oracle-ce-shrinking-v1-dense-all-layer-residuals-fixed-c-baseline-20260730-232337`
+`data/training/runs/return-oracle-ce-shrinking-v1-dense-all-layer-residuals-fixed-c-baseline-20260730-232337`
 
 Architecture contract:
 

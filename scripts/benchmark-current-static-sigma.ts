@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   defaultStrategyConfig,
-  runBacktestFromCandles,
   type BacktestExtremaOrderMassSummary,
   type BacktestResult,
   type Candle,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 type BenchmarkKind = "fixed" | "random-sample";
 
@@ -127,7 +128,10 @@ const marketKey = "spot-btcusdt";
 const candleDir = path.join(
   repoRoot,
   "data",
-  "historical",
+  "market",
+  "immutable",
+  "refs",
+  "candles",
   marketKey,
   symbol.toLowerCase(),
   interval,
@@ -163,10 +167,15 @@ if (args.renderOnly) {
   }
   renderReport(path.resolve(repoRoot, inputPath), reportPath);
 } else {
-  runBenchmark(args.seed, outputPath, reportPath);
+  runBenchmark(args.seed, outputPath, reportPath).catch(fail);
 }
 
-function runBenchmark(seed: number, targetOutputPath: string, targetReportPath: string): void {
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
+
+async function runBenchmark(seed: number, targetOutputPath: string, targetReportPath: string): Promise<void> {
   const startedAt = Date.now();
   fs.mkdirSync(path.dirname(targetOutputPath), { recursive: true });
   fs.writeFileSync(targetOutputPath, "");
@@ -224,7 +233,7 @@ function runBenchmark(seed: number, targetOutputPath: string, targetReportPath: 
         : window.group;
     console.error(`Running ${progress} on ${candleCount.toLocaleString()} candles...`);
     const startedWindow = Date.now();
-    const result = runBacktestFromCandles(candles, {
+    const result = await runCanonicalBacktestFromCandles(candles, {
       config,
       startIndex: window.startIndex,
       endIndex: window.endIndex,
@@ -640,7 +649,7 @@ function listCandleFiles(dir: string): string[] {
   }
   return fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 }
@@ -648,13 +657,7 @@ function listCandleFiles(dir: string): string[] {
 function loadCandles(dir: string, files: string[]): Candle[] {
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        candles.push(JSON.parse(trimmed) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

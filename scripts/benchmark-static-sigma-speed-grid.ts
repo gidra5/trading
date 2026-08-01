@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
-  runBacktestFromCandles,
   type Candle,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 interface BenchmarkCase {
   label: string;
@@ -52,6 +53,9 @@ const speedProfiles: Array<{
   },
 ];
 
+main().catch(fail);
+
+async function main(): Promise<void> {
 const args = parseArgs(process.argv.slice(2));
 const selectedCases =
   args.caseIndex === undefined ? cases : [caseByIndex(args.caseIndex)];
@@ -63,7 +67,7 @@ for (const testCase of selectedCases) {
   for (const speedProfile of speedProfiles) {
     for (const pair of sigmaPairs) {
       const started = Date.now();
-      const result = runBacktestFromCandles(candles, {
+      const result = await runCanonicalBacktestFromCandles(candles, {
         config: {
           symbol: "BTCUSDT",
           algorithm: "legacy-valley-peak",
@@ -136,6 +140,12 @@ for (const testCase of selectedCases) {
     }
   }
 }
+}
+
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
 
 function parseArgs(argv: string[]): Args {
   const values = new Map<string, string>();
@@ -177,20 +187,15 @@ function nonNegativeInteger(value: string, label: string): number {
 }
 
 function loadCandles(startDate: string, endDate: string): Candle[] {
-  const dir = "data/historical/spot-btcusdt/btcusdt/1m";
+  const dir = "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m";
   const candles: Candle[] = [];
   for (
     let timestamp = Date.parse(`${startDate}T00:00:00Z`);
     timestamp <= Date.parse(`${endDate}T00:00:00Z`);
     timestamp += 24 * 60 * 60 * 1000
   ) {
-    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.jsonl`;
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      if (line.trim()) {
-        candles.push(JSON.parse(line) as Candle);
-      }
-    }
+    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.json`;
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

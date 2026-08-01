@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import zstandard
 
+from trading_storage import load_torch_checkpoint
+
 from mlp_model import (
     DirectLossWeights,
     FEATURE_SCHEMA_VERSION,
@@ -684,8 +686,9 @@ class ValidationMetricAggregationTests(unittest.TestCase):
 
     def test_async_checkpoint_writer_freezes_state_before_background_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint_file = Path(directory) / "checkpoint.pt"
-            best_model_file = Path(directory) / "best-model.pt"
+            run = Path(directory) / "data" / "training" / "runs" / "test"
+            checkpoint_file = run / "checkpoints" / "last.json"
+            best_model_file = run / "checkpoints" / "best.json"
             source = torch.tensor([1.0, 2.0])
             writer = AsyncCheckpointWriter()
 
@@ -697,12 +700,12 @@ class ValidationMetricAggregationTests(unittest.TestCase):
             source.add_(10)
             writer.close()
 
-            checkpoint = torch.load(
+            checkpoint = load_torch_checkpoint(
                 checkpoint_file,
                 map_location="cpu",
                 weights_only=True,
             )
-            best_model = torch.load(
+            best_model = load_torch_checkpoint(
                 best_model_file,
                 map_location="cpu",
                 weights_only=True,

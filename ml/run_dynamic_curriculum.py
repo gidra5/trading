@@ -15,6 +15,8 @@ from typing import Any
 
 import numpy as np
 
+from trading_storage import require_under, training_storage_layout
+
 
 LOSS_TERMS = (
     "crossEntropy",
@@ -230,15 +232,22 @@ class CurriculumRunner:
         self.plan_file = plan_file.resolve()
         self.plan = read_json(self.plan_file)
         self.config = self.plan["dynamicCurriculumStudy"]
-        self.output = (self.repo / self.config["outputDir"]).resolve()
+        storage = training_storage_layout(self.repo)
+        self.output = require_under(
+            self.repo / self.config["outputDir"],
+            storage.runs,
+            "dynamic study outputDir",
+        )
         self.run_dir = (self.repo / self.config["runDir"]).resolve()
         self.dataset = (self.repo / self.config["datasetDir"]).resolve()
         self.source_summary_file = (
             self.repo / self.config["sourceSummary"]
         ).resolve()
         self.source = read_json(self.source_summary_file)
-        self.status_file = self.run_dir / "status.json"
-        self.log_file = self.run_dir / "study.log"
+        self.status_file = self.run_dir / "state" / "status.json"
+        self.log_file = self.run_dir / "logs" / "study.jsonl"
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.summary_file = self.output / "summary.json"
         self.plans_dir = self.output / "plans"
         self.jobs_dir = self.run_dir / "population-jobs"
@@ -554,7 +563,7 @@ class CurriculumRunner:
             candidates.append({
                 "key": job["key"],
                 "delayMs": delay_ms,
-                "model": str(job["_directory"] / "best-model.pt"),
+                "model": str(job["_directory"] / "checkpoints" / "best.json"),
                 "directory": str(job["_directory"]),
                 "resultFile": job["resultFile"],
                 "parentKey": job["parentKey"],
@@ -705,7 +714,7 @@ class CurriculumRunner:
             job["key"]
             for job in jobs
             if not Path(job["resultFile"]).is_file()
-            or not (job["_directory"] / "best-model.pt").is_file()
+            or not (job["_directory"] / "checkpoints" / "best.json").is_file()
         ]
         if missing:
             raise RuntimeError(
@@ -860,7 +869,10 @@ class CurriculumRunner:
         summary["artifacts"] = artifacts
         summary["completedAt"] = utc_now()
         atomic_json(summary, self.summary_file)
-        retained = {str(Path(item["directory"]) / "best-model.pt") for item in artifacts}
+        retained = {
+            str(Path(item["directory"]) / "checkpoints" / "best.json")
+            for item in artifacts
+        }
         for stage in summary["stages"]:
             for survivor in stage["survivors"]:
                 checkpoint = str(Path(survivor["model"]))

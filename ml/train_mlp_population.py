@@ -30,6 +30,11 @@ from mlp_model import (
     fitted_teacher_loss,
 )
 from population_mlp import PopulationExposureMlp, population_clip_grad_norm_
+from trading_storage import (
+    checkpoint_exists,
+    load_torch_checkpoint,
+    resolve_artifact,
+)
 from train_mlp import (
     KL_MOMENT_METRIC_NAMES,
     METRIC_NAMES,
@@ -405,8 +410,12 @@ def run_group(
     stale_epochs = [0] * len(group)
     epochs_trained = [0] * len(group)
     active = [True] * len(group)
-    if checkpoint_file.exists():
-        checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
+    if checkpoint_exists(checkpoint_file):
+        checkpoint = load_torch_checkpoint(
+            checkpoint_file,
+            map_location=device,
+            weights_only=False,
+        )
         if checkpoint.get("trainingContract") != training_contract:
             raise RuntimeError(f"population checkpoint contract mismatch: {checkpoint_file}")
         runtime.model.load_state_dict(checkpoint["model"])
@@ -570,7 +579,7 @@ def run_group(
         for member, job in enumerate(group):
             atomic_torch_save(
                 best_states[member],
-                Path(job["output"]) / "best-model.pt",
+                Path(job["output"]) / "checkpoints" / "best.json",
             )
     elif replaces_winner:
         # Materialize the recoverable model before publishing its study result.
@@ -578,7 +587,7 @@ def run_group(
         # whose weights are unavailable for artifact export.
         atomic_torch_save(
             best_states[group_winner_member],
-            Path(group_winner_job["output"]) / "best-model.pt",
+            Path(group_winner_job["output"]) / "checkpoints" / "best.json",
         )
 
     for member, job in enumerate(group):
@@ -661,14 +670,20 @@ def run_group(
     winner = previous_winner
     if replaces_winner:
         if winner is not None and not common.get("retainAllBestModels", False):
-            (Path(winner[1]["output"]) / "best-model.pt").unlink(missing_ok=True)
+            (Path(winner[1]["output"]) / "checkpoints" / "best.json").unlink(
+                missing_ok=True
+            )
         winner = (group_winner_score, group_winner_job)
     if not common.get("retainAllBestModels", False):
         for job in group:
             if winner is not None and job["key"] == winner[1]["key"]:
                 continue
-            (Path(job["output"]) / "best-model.pt").unlink(missing_ok=True)
-            (Path(job["output"]) / "checkpoint.pt").unlink(missing_ok=True)
+            (Path(job["output"]) / "checkpoints" / "best.json").unlink(
+                missing_ok=True
+            )
+            (Path(job["output"]) / "checkpoints" / "last.json").unlink(
+                missing_ok=True
+            )
     checkpoint_file.unlink(missing_ok=True)
     emit({
         "event": "population-group-complete",
@@ -1198,7 +1213,9 @@ def completed_job(job: dict, manifest: dict, common: dict) -> bool:
         and isinstance(result.get("bestValidationMetrics"), dict)
     )
     if common.get("retainAllBestModels", False):
-        complete = complete and (Path(job["output"]) / "best-model.pt").is_file()
+        complete = complete and checkpoint_exists(
+            Path(job["output"]) / "checkpoints" / "best.json"
+        )
     parent = job.get("initializeFromCheckpoint")
     if parent is not None:
         complete = complete and isinstance(population_training, dict) \
@@ -1209,12 +1226,17 @@ def completed_job(job: dict, manifest: dict, common: dict) -> bool:
 
 def population_checkpoint_file(jobs_file: Path, keys: list[str]) -> Path:
     digest = hashlib.sha256("\0".join(keys).encode()).hexdigest()[:12]
-    return jobs_file.with_name(f"{jobs_file.stem}-{digest}.population-checkpoint.pt")
+    return (
+        jobs_file.parent.parent
+        / "checkpoints"
+        / "populations"
+        / f"{jobs_file.stem}-{digest}.json"
+    )
 
 
 def cleanup_population_checkpoints(jobs_file: Path) -> None:
-    for checkpoint in jobs_file.parent.glob(
-        f"{jobs_file.stem}-*.population-checkpoint.pt"
+    for checkpoint in (jobs_file.parent.parent / "checkpoints" / "populations").glob(
+        f"{jobs_file.stem}-*.json"
     ):
         checkpoint.unlink(missing_ok=True)
 
@@ -1270,7 +1292,11 @@ def load_parent_state(
             name: initializers[name].to(dtype=value.dtype)
             for name, value in expected.items()
         }
-    value = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
+    value = load_torch_checkpoint(
+        Path(checkpoint),
+        map_location="cpu",
+        weights_only=True,
+    )
     if isinstance(value, dict) and isinstance(value.get("model"), dict):
         value = value["model"]
     if not isinstance(value, dict) or not all(
@@ -1286,11 +1312,19 @@ def parent_checkpoint_identity(job: dict) -> dict | None:
     if checkpoint is None:
         return None
     file = Path(checkpoint).resolve()
-    stat = file.stat()
+    if file.suffix == ".onnx":
+        stat = file.stat()
+        return {
+            "path": str(file),
+            "size": stat.st_size,
+            "modifiedNs": stat.st_mtime_ns,
+            "parentKey": job.get("parentKey"),
+        }
+    reference, object_file = resolve_artifact(file)
     return {
         "path": str(file),
-        "size": stat.st_size,
-        "modifiedNs": stat.st_mtime_ns,
+        "contentHash": reference["object"]["contentHash"],
+        "size": object_file.stat().st_size,
         "parentKey": job.get("parentKey"),
     }
 

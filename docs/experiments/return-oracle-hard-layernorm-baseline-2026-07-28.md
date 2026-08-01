@@ -5,7 +5,7 @@ no-hard-LayerNorm comparison. It was intentionally stopped during epoch 150
 and preserved at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-hard-layernorm-baseline-20260728-195427
+data/training/runs/return-oracle-ce-shrinking-v1-hard-layernorm-baseline-20260728-195427
 ```
 
 The archive contains `best.pt`, `last.pt`, `training.log`, and the complete

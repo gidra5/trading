@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("data/ml-analysis/mlp-rejection-oracles"),
+        default=Path("data/training/analysis/mlp-rejection-oracles"),
     )
     parser.add_argument("--examples", type=int, default=2880)
     parser.add_argument("--repetitions", type=int, default=3)

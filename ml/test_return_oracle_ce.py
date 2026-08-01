@@ -66,42 +66,7 @@ class ReturnOracleCeTest(unittest.TestCase):
         self.assertEqual(model.layers[-1].out_features, 512)
         self.assertEqual(model.output.in_features, 256)
         self.assertEqual(model.output.out_features, OUTPUT_ACTION_COUNT)
-        self.assertEqual(parameter_count(model), 5_622_857)
-        self.assertEqual(
-            [
-                (layer.in_features, layer.out_features)
-                for layer in model.residual_glu_layers
-            ],
-            [(INPUT_RETURN_COUNT, 2 * width) for width in HIDDEN_WIDTHS],
-        )
-        self.assertTrue(all(
-            bool(torch.count_nonzero(
-                layer.weight.chunk(2, dim=0)[0]
-            ) == 0)
-            and bool(torch.count_nonzero(
-                layer.weight.chunk(2, dim=0)[1]
-            ) > 0)
-            and bool(torch.count_nonzero(layer.bias) == 0)
-            for layer in model.residual_glu_layers
-        ))
-        self.assertEqual(
-            [
-                [
-                    (layer.in_features, layer.out_features)
-                    for layer in target_layers
-                ]
-                for target_layers in model.dense_residual_layers
-            ],
-            [
-                [
-                    (source_width, 2 * HIDDEN_WIDTHS[target_index])
-                    for source_width in HIDDEN_WIDTHS[
-                        :max(target_index - 1, 0)
-                    ]
-                ]
-                for target_index in range(HIDDEN_LAYER_COUNT)
-            ],
-        )
+        self.assertEqual(parameter_count(model), 2_594_831)
         self.assertEqual(
             [
                 normalizer.normalized_shape
@@ -121,37 +86,13 @@ class ReturnOracleCeTest(unittest.TestCase):
                 isinstance(module, LearnableCenteringNorm)
                 for module in model.modules()
             ),
-            4 * HIDDEN_LAYER_COUNT + 42,
+            2 * HIDDEN_LAYER_COUNT,
         )
         self.assertTrue(all(
-            len({
-                id(value.weight),
-                id(gate.weight),
-                id(residual_value.weight),
-                id(residual_gate.weight),
-            }) == 1
-            for value, gate, residual_value, residual_gate in zip(
+            id(value.weight) == id(gate.weight)
+            for value, gate in zip(
                 model.value_centering_normalizers,
                 model.gate_centering_normalizers,
-                model.residual_value_centering_normalizers,
-                model.residual_gate_centering_normalizers,
-                strict=True,
-            )
-        ))
-        self.assertTrue(all(
-            all(
-                id(dense_value.weight) == id(value.weight)
-                and id(dense_gate.weight) == id(value.weight)
-                for dense_value, dense_gate in zip(
-                    dense_values,
-                    dense_gates,
-                    strict=True,
-                )
-            )
-            for value, dense_values, dense_gates in zip(
-                model.value_centering_normalizers,
-                model.dense_residual_value_centering_normalizers,
-                model.dense_residual_gate_centering_normalizers,
                 strict=True,
             )
         ))
@@ -285,15 +226,15 @@ class ReturnOracleCeTest(unittest.TestCase):
             not normalizer.weight.requires_grad
             for normalizer in model.value_centering_normalizers
         ))
-        self.assertEqual(parameter_count(model), 5_098_569)
+        self.assertEqual(parameter_count(model), 2_070_543)
         muon_parameters, adamw_parameters = hybrid_optimizer_parameters(model)
         self.assertEqual(
             sum(parameter.numel() for parameter in muon_parameters),
-            4_995_072,
+            1_996_800,
         )
         self.assertEqual(
             sum(parameter.numel() for parameter in adamw_parameters),
-            103_497,
+            73_743,
         )
 
     def test_hybrid_optimizer_routes_projection_and_a_matrices_to_muon(
@@ -308,15 +249,6 @@ class ReturnOracleCeTest(unittest.TestCase):
             (
                 tuple(id(layer.weight) for layer in model.layers)
                 + tuple(
-                    id(layer.weight)
-                    for layer in model.residual_glu_layers
-                )
-                + tuple(
-                    id(layer.weight)
-                    for target_layers in model.dense_residual_layers
-                    for layer in target_layers
-                )
-                + tuple(
                     id(transform.weight)
                     for transform in model.value_transforms
                 )
@@ -328,11 +260,11 @@ class ReturnOracleCeTest(unittest.TestCase):
         )
         self.assertEqual(
             sum(parameter.numel() for parameter in muon_parameters),
-            4_995_072,
+            1_996_800,
         )
         self.assertEqual(
             sum(parameter.numel() for parameter in adamw_parameters),
-            627_785,
+            598_031,
         )
         adamw_ids = {id(parameter) for parameter in adamw_parameters}
         self.assertIn(id(model.output.weight), adamw_ids)

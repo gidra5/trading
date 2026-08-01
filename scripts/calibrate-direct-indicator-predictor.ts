@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   conditionalFourSegmentExposureProbabilities,
 } from "../packages/bot-algo/src/conditional-exposure-distribution.js";
@@ -33,7 +33,7 @@ const FRICTION = 0.00175;
 const SAMPLES_PER_WINDOW = 8;
 const RANDOM_CANDIDATES = 144;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const historyRoot = path.join(repoRoot, "data/historical/spot-btcusdt/btcusdt/1m");
+const historyRoot = path.join(repoRoot, "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m");
 const actionGrid = Float64Array.from(
   { length: GRID_SIZE },
   (_, index) => -100 + index * 200 / (GRID_SIZE - 1),
@@ -425,16 +425,11 @@ function writePresets(
 
 function readDay(day: number): Array<{ openTime: number; close: number }> {
   const date = new Date(day).toISOString().slice(0, 10);
-  const plain = path.join(historyRoot, `${date}.jsonl`);
-  const compressed = `${plain}.gz`;
-  if (!fs.existsSync(plain) && !fs.existsSync(compressed)) {
+  const file = path.join(historyRoot, `${date}.json`);
+  if (!fs.existsSync(file)) {
     throw new Error(`Missing calibration history ${date}; fetch the BTCUSDT 1m daily shard and retry.`);
   }
-  const content = fs.existsSync(plain)
-    ? fs.readFileSync(plain, "utf8")
-    : gunzipSync(fs.readFileSync(compressed)).toString("utf8");
-  return content.trim().split("\n").filter(Boolean).map((line) => {
-    const candle = JSON.parse(line) as { openTime: number; close: number };
+  return readCandleShardReferenceSync(file).map((candle) => {
     return { openTime: candle.openTime, close: candle.close };
   });
 }

@@ -6,7 +6,7 @@ reverse-KL term before switching to an unbiased prediction-mixture reference.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-smoothed-reverse-kl-w005-baseline-20260729-170500
+data/training/runs/return-oracle-ce-shrinking-v1-smoothed-reverse-kl-w005-baseline-20260729-170500
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

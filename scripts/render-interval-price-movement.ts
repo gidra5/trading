@@ -139,16 +139,17 @@ async function main(): Promise<void> {
 
 async function createBrowserStrategyBundle(): Promise<string> {
   const source = `
-    import { runBacktestFromCandles } from "./packages/bot-algo/src/index.js";
+    import { createStrategyConfig } from "./packages/bot-algo/src/index.js";
+    import { runBotBacktestFromCandles } from "./apps/server/src/bot-backtest.js";
 
-    export function runEntryOverlay(cases, settings) {
-      return cases.map((testCase) => runEntryOverlayCase(testCase, settings));
+    export async function runEntryOverlay(cases, settings) {
+      return Promise.all(cases.map((testCase) => runEntryOverlayCase(testCase, settings)));
     }
 
-    export function runEntryOverlayCase(testCase, settings) {
+    export async function runEntryOverlayCase(testCase, settings) {
       const legacyValleyPeak = legacyConfigFromSettings(settings);
-      const result = runBacktestFromCandles(testCase.replayCandles, {
-        config: {
+      const result = await runBotBacktestFromCandles(testCase.replayCandles, {
+        config: createStrategyConfig({
           symbol: "BTCUSDT",
           algorithm: "legacy-valley-peak",
           startingQuote: 10_000,
@@ -157,9 +158,7 @@ async function createBrowserStrategyBundle(): Promise<string> {
           longBorrowDepth: 999,
           shortBorrowDepth: 999,
           legacyValleyPeak,
-        },
-        maxReturnedOrders: 0,
-        maxReturnedFills: Number.POSITIVE_INFINITY,
+        }),
         maxEquityPoints: 1,
         maxChartCandles: 1,
       });
@@ -1233,7 +1232,7 @@ function renderHtml(cases: RenderedCase[], browserBundle: string): string {
         }
         entryStatus.textContent =
           "Computing strategy overlay " + (index + 1).toLocaleString() + "/" + chartCases.length.toLocaleString() + "...";
-        latestEntries[index] = TradingStrategyBrowser.runEntryOverlayCase(testCase, settings);
+        latestEntries[index] = await TradingStrategyBrowser.runEntryOverlayCase(testCase, settings);
         drawLatestEntries();
         await new Promise((resolve) => setTimeout(resolve, 0));
       }

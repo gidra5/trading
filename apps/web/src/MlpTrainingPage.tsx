@@ -106,6 +106,9 @@ interface MetricsResponse {
     updatedAt?: string;
     epochs?: number;
     patience?: number;
+    archived?: boolean;
+    bestValidationKl?: number;
+    bestValidationKlEpoch?: number;
   }>;
   selectedRunKey: string;
   plan: {
@@ -115,6 +118,10 @@ interface MetricsResponse {
     patience?: number;
     samplingIntervalMs?: number;
     predictionDelayMs?: number;
+    archived?: boolean;
+    archivedAt?: string;
+    bestValidationKl?: number;
+    bestValidationKlEpoch?: number;
     dropout?: number;
     dropoutRate?: number;
     lossWeights?: Record<string, number>;
@@ -441,7 +448,7 @@ export function MlpTrainingPage() {
       const total = snapshot()?.plan.epochs;
       return total ? (current?.epoch ?? 0) / total : 0;
     }
-    return stage() === "complete" ? 1 : 0;
+    return stage() === "complete" || stage() === "archived" ? 1 : 0;
   });
   const updatedAgo = createMemo(() => {
     const timestamp = Date.parse(snapshot()?.status?.updatedAt ?? "");
@@ -477,8 +484,11 @@ export function MlpTrainingPage() {
                 </Show>
                 <For each={runs()}>
                   {(run) => (
-                    <option value={run.key}>
-                      {run.running ? "LIVE · " : ""}{run.label} · {stageLabel(run.stage ?? "idle")}
+                    <option
+                      value={run.key}
+                      selected={run.key === selectedRunKey()}
+                    >
+                      {runSummaryLabel(run)}
                     </option>
                   )}
                 </For>
@@ -524,12 +534,22 @@ export function MlpTrainingPage() {
             </Show>
             <Show when={snapshot()?.finalizeRequested}><span class="text-warn">Finalize requested</span></Show>
           </div>
+          <Show when={snapshot()?.plan.archived && snapshot()?.plan.bestValidationKl !== undefined}>
+            <div class="rounded border border-accent/30 bg-accent/5 px-3 py-2 text-sm text-ink-200">
+              Best logged validation forward KL: <span class="font-semibold text-accent">
+                {snapshot()!.plan.bestValidationKl!.toFixed(5)}
+              </span> at epoch {(snapshot()!.plan.bestValidationKlEpoch ?? 0) + 1}
+              <span class="text-ink-400"> (stored epoch {snapshot()!.plan.bestValidationKlEpoch ?? 0})</span>
+            </div>
+          </Show>
         </section>
 
         <section class="flex flex-col gap-3">
           <SectionHeading
             title="Network optimization"
-            subtitle={stage() === "training"
+            subtitle={stage() === "archived"
+              ? `${trainSteps().length} historical updates · ${epochs().length} completed epochs`
+              : stage() === "training"
               ? `${trainSteps().length} logged updates · updating live`
               : trainSteps().length > 0
                 ? `${trainSteps().length} updates from the most recent training attempt; live updates resume after refinement`
@@ -1529,8 +1549,16 @@ function stageLabel(stage: string): string {
     "cuda-build": "Building CUDA kernels", dataset: "Preparing dataset",
     "dataset-refinement": "Refining teacher fits", "dataset-features": "Refreshing features",
     training: "Training network weights", verification: "Verifying model artifact",
-    complete: "Complete", paused: "Paused", failed: "Failed", starting: "Starting",
+    complete: "Complete", archived: "Archived", paused: "Paused", failed: "Failed", starting: "Starting",
   } as Record<string, string>)[stage] ?? stage;
+}
+
+function runSummaryLabel(run: MetricsResponse["runs"][number]): string {
+  const prefix = run.running ? "LIVE · " : run.archived ? "ARCHIVE · " : "";
+  const best = run.bestValidationKl === undefined
+    ? ""
+    : ` · best KL ${run.bestValidationKl.toFixed(5)} @ epoch ${(run.bestValidationKlEpoch ?? 0) + 1}`;
+  return `${prefix}${run.label}${best} · ${stageLabel(run.stage ?? "idle")}`;
 }
 
 function progressLabel(stage: string, dataset: DatasetPoint | undefined, step: TrainStepPoint | undefined, totalEpochs: number | undefined): string {

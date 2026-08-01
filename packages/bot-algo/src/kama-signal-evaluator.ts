@@ -284,6 +284,7 @@ export interface VwKamaValueDistillationConfig extends ExposureValueDistillation
   initialExposure: number;
   holdingPeriodMode: VwKamaHoldingPeriodMode;
   holdingPeriodMs: number;
+  decisionDelayMs?: number;
   valueHorizonMode?: VwKamaValueHorizonMode;
   valueHorizonMs: number;
   horizonEndMode: VwKamaValueHorizonEndMode;
@@ -483,6 +484,7 @@ export interface VwKamaAccuracyMetrics extends VwKamaPathAccuracyMetrics {
 
 export interface VwKamaValueDistillationMetrics extends ExposureValueDistillationMetrics {
   holdingPeriodMs: number;
+  decisionDelayMs: number;
   valueHorizonMs: number;
   returns: {
     /** Coherent full-window Bellman/DP optimum. */
@@ -1808,6 +1810,7 @@ export function evaluateVwKamaOracle(
       ? { valueDistillation: {
           ...finalizeExposureValueDistillation(valueDistillation),
           holdingPeriodMs: options.valueDistillation!.oracle.holdingPeriodSteps * options.intervalMs,
+          decisionDelayMs: options.valueDistillation!.oracle.decisionDelaySteps * options.intervalMs,
           valueHorizonMs: options.valueDistillation!.oracle.valueHorizonSteps * options.intervalMs,
           returns: {
             oracle: exposureValueOraclePathMetrics(options.valueDistillation!.oracle),

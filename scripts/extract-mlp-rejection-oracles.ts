@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   prepareExposureValueOracleCuda,
   vwKamaCudaStatus,
@@ -41,6 +41,7 @@ interface TrainingPlan {
     gridSize: number;
     temperature: number;
     holdingPeriodSteps: number;
+    decisionDelaySteps?: number;
     valueHorizonSteps: number;
   };
 }
@@ -66,11 +67,13 @@ async function main(): Promise<void> {
   const plan = JSON.parse(fs.readFileSync(planFile, "utf8")) as TrainingPlan;
   const queueFile = path.resolve(
     repoRoot,
-    argument("queue") ?? path.join("data/ml-datasets", plan.id, "teacher-refinement-queue.json"),
+    argument("queue") ?? path.join(
+      "data/training/datasets", plan.id, "state", "teacher-refinement-queue.json",
+    ),
   );
   const output = path.resolve(
     repoRoot,
-    argument("output") ?? "data/ml-analysis/mlp-rejection-oracles",
+    argument("output") ?? "data/training/analysis/mlp-rejection-oracles",
   );
   const dateCount = positiveInteger(argument("dates") ?? "12", "dates");
   const casesPerDate = positiveInteger(argument("cases-per-date") ?? "16", "cases-per-date");
@@ -94,7 +97,7 @@ async function main(): Promise<void> {
   const sourceRoot = path.resolve(
     repoRoot,
     plan.dataDir,
-    "historical/spot-btcusdt/btcusdt/1s",
+    "market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
   );
   const probabilityParts: Buffer[] = [];
   const outputCases: SelectedCase[] = [];
@@ -108,6 +111,7 @@ async function main(): Promise<void> {
     const prepared = await prepareExposureValueOracleCuda(candles.map((candle) => candle.close), {
       scoreStartIndex: 0,
       holdingPeriodSteps: plan.execution.holdingPeriodSteps,
+      decisionDelaySteps: plan.execution.decisionDelaySteps ?? 1,
       valueHorizonSteps: plan.execution.valueHorizonSteps,
       friction: feeRate,
       gridSize,
@@ -237,12 +241,7 @@ function summarizeQueue(cases: RejectionCase[]): Record<string, number> {
 }
 
 function readCandles(root: string, date: string): Candle[] {
-  const plain = path.join(root, `${date}.jsonl`);
-  const compressed = `${plain}.gz`;
-  const content = fs.existsSync(plain)
-    ? fs.readFileSync(plain, "utf8")
-    : gunzipSync(fs.readFileSync(compressed)).toString("utf8");
-  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Candle);
+  return readCandleShardReferenceSync(path.join(root, `${date}.json`));
 }
 
 function inspectCompleteDay(candles: Candle[], date: string): void {

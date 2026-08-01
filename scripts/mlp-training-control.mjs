@@ -8,8 +8,8 @@ const planIndex = process.argv.indexOf("--plan");
 const planFile = path.resolve(repoRoot, planIndex >= 0 ? process.argv[planIndex + 1] : "ml/training-plan.json");
 const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
 const runDir = path.resolve(repoRoot, plan.runDir);
-const statusFile = path.join(runDir, "status.json");
-const finalizeFile = path.join(runDir, "FINALIZE");
+const statusFile = path.join(runDir, "state", "status.json");
+const finalizeFile = path.join(runDir, "control", "FINALIZE");
 
 if (action === "finalize") {
   fs.mkdirSync(runDir, { recursive: true });
@@ -102,8 +102,10 @@ function format(status) {
     );
   }
   if (status.stage === "dataset-refinement" && status.datasetDir) {
-    const progress = readOptionalJson(path.join(status.datasetDir, "progress.json"));
-    const queue = readOptionalJson(path.join(status.datasetDir, "teacher-refinement-queue.json"));
+    const progress = readOptionalJson(path.join(status.datasetDir, "state", "progress.json"));
+    const queue = readOptionalJson(path.join(
+      status.datasetDir, "state", "teacher-refinement-queue.json",
+    ));
     const refinedShards = Array.isArray(progress?.shards)
       ? progress.shards.filter((shard) => (shard.refinementPass ?? 0) > 0).length
       : undefined;

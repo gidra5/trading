@@ -7,12 +7,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import {
-  constants as zlibConstants,
-  gunzipSync,
-  zstdCompressSync,
-  zstdDecompressSync,
-} from "node:zlib";
-import {
   conditionalCutoffRawParameters,
   exposureHoldingFeasibleInterval,
   MLP_FEATURE_SCHEMA_VERSION,
@@ -20,12 +14,20 @@ import {
   prepareExposureValueOracleCuda,
   type Candle,
 } from "@trading/bot-algo";
+import {
+  readCandleShardReference,
+  readReferencedPayload,
+  SequentialShardStore,
+  TradingStorageLayout,
+  type PutSequentialShardResult,
+} from "@trading/storage";
 import { fetchBinanceSpotDailyShard } from "../apps/server/src/binance-history-cache.js";
 import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 
 const DAY_MS = 86_400_000;
 const MINUTE_MS = 60_000;
 const SECOND_MS = 1_000;
+const STORAGE_ZSTD_LEVEL = 9;
 const RAW_ORACLE_SCHEMA_VERSION = 5;
 const TEACHER_PARAMETER_COUNT = 8;
 const TEACHER_METRIC_NAMES = [
@@ -108,11 +110,6 @@ interface TrainingPlan {
     outputDatasetDir: string;
     outputPlanFile: string;
   };
-  componentCompression?: {
-    features?: "zstd";
-    rawOracleProbabilities?: "zstd";
-    minuteOracleProbabilities?: "zstd";
-  };
   featurePreparationWorkers?: number;
   runtimeMinuteOracleTargets?: boolean;
   execution: {
@@ -125,6 +122,7 @@ interface TrainingPlan {
     gridSize: number;
     temperature: number;
     holdingPeriodSteps: number;
+    decisionDelaySteps?: number;
     valueHorizonSteps: number;
     horizonEndMode: "extend";
   };
@@ -225,13 +223,42 @@ interface DatasetShard {
   teacherMetricVisibleUpper?: number;
 }
 
+interface ImplicitTimeSequence {
+  encoding: "implicit-linear";
+  startTimeMs: number;
+  stepMs: number;
+  count: number;
+}
+
+interface SequentialStorageTarget {
+  store: SequentialShardStore;
+  namespace: string;
+  key: string;
+  sequence: {
+    start: number;
+    step: number;
+    count: number;
+    unit: "unix-ms" | "index";
+  };
+  layout: {
+    encoding: string;
+    [key: string]: unknown;
+  };
+  metadata?: {
+    [key: string]: unknown;
+  };
+}
+
 interface FeatureComponent {
   date: string;
   count: number;
   features: string;
   featuresCompression?: "zstd";
   featuresUncompressedBytes?: number;
-  times: string;
+  contentHash?: string;
+  canonicalReference?: string;
+  materializedWithHardLink?: boolean;
+  timeSequence?: ImplicitTimeSequence;
   featureSchemaVersion: number;
   rowSelectionSignature?: string;
   materializedRowRanges?: Array<[number, number]>;
@@ -242,12 +269,16 @@ interface OracleComponent {
   count: number;
   teacherBackend: "cuda";
   teacherParameters: string;
+  teacherParametersCompression?: "zstd";
+  teacherParametersUncompressedBytes?: number;
   teacherMetrics: string;
+  teacherMetricsCompression?: "zstd";
+  teacherMetricsUncompressedBytes?: number;
   rawOracleProbabilities: string;
   rawOracleProbabilitiesCompression?: "zstd";
   rawOracleProbabilitiesUncompressedBytes?: number;
   rawOracleSchemaVersion?: number;
-  times: string;
+  timeSequence?: ImplicitTimeSequence;
   rejectedCount?: number;
   refinementPass?: number;
   teacherMetricVisibleLower: number;
@@ -468,13 +499,12 @@ async function main(): Promise<void> {
   const directDiagnostics = plan.teacherFit.representation === "direct-diagnostics"
     || preparationMode === "frozen-study-source";
   const currentTeacherFitSignature = teacherFitSignature(plan);
-  const compatibleTeacherFitSignatures = new Set([
-    currentTeacherFitSignature,
-    ...(directDiagnostics ? [legacyTeacherFitSignature(plan)] : []),
-  ]);
+  const compatibleTeacherFitSignatures = new Set([currentTeacherFitSignature]);
   const componentStoreId = plan.componentStoreId;
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const dataDir = path.resolve(repoRoot, plan.dataDir);
+  const storageLayout = new TradingStorageLayout(dataDir);
+  const shardStore = new SequentialShardStore(storageLayout.trainingStore);
   const output = path.resolve(
     repoRoot,
     outputOverride
@@ -483,7 +513,14 @@ async function main(): Promise<void> {
           ?? plan.frozenStudySampling!.sourceDatasetDir
         : plan.datasetDir),
   );
-  const oneSecondRoot = path.join(dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
+  const oneSecondRoot = path.join(
+    storageLayout.marketStore,
+    "refs",
+    "candles",
+    "spot-btcusdt",
+    "btcusdt",
+    "1s",
+  );
   const oneSecondStore = new OneSecondCandleStore(dataDir);
   const latestCompleteDay = await findLatestCompleteDay(oneSecondRoot);
   const splitAnchorDay = plan.splitAnchorDate
@@ -533,8 +570,9 @@ async function main(): Promise<void> {
     fs.mkdir(path.join(output, "components", "inputs"), { recursive: true }),
     fs.mkdir(path.join(output, "components", "oracle"), { recursive: true }),
     fs.mkdir(path.join(output, "pairs"), { recursive: true }),
+    fs.mkdir(path.join(output, "state"), { recursive: true }),
   ]);
-  const progressFile = path.join(output, "progress.json");
+  const progressFile = path.join(output, "state", "progress.json");
   const progress = await loadProgress(progressFile, componentStoreId, splitAnchorDay);
   const componentSeedDatasetDirs = [...new Set([
     ...(plan.componentSeedDatasetDirs ?? []),
@@ -573,12 +611,12 @@ async function main(): Promise<void> {
     || minuteOracleComponentSeedDatasetDirs.length > 0) {
     await atomicWriteJson(progressFile, progress);
   }
-  const refinementQueueFile = path.join(output, "teacher-refinement-queue.json");
+  const refinementQueueFile = path.join(output, "state", "teacher-refinement-queue.json");
   const refinementQueue = await loadRefinementQueue(refinementQueueFile, componentStoreId);
   const refinementCases = new Map(refinementQueue.cases.map((item) => [
     refinementCaseKey(item.date, item.time), item,
   ]));
-  const sourceRejectionQueueFile = path.join(output, "source-rejection-queue.json");
+  const sourceRejectionQueueFile = path.join(output, "state", "source-rejection-queue.json");
   const sourceRejectionQueue = await loadSourceRejectionQueue(
     sourceRejectionQueueFile, componentStoreId,
   );
@@ -652,6 +690,7 @@ async function main(): Promise<void> {
   ): Parameters<typeof prepareExposureValueOracleCuda>[1] => ({
     scoreStartIndex: 0,
     holdingPeriodSteps: plan.execution.holdingPeriodSteps,
+    decisionDelaySteps: plan.execution.decisionDelaySteps ?? 1,
     valueHorizonSteps: plan.execution.valueHorizonSteps,
     friction: feeRate,
     gridSize: plan.execution.gridSize,
@@ -965,6 +1004,7 @@ async function main(): Promise<void> {
         : await persistMinuteOracleDay(
             output,
             plan,
+            shardStore,
             source,
             day,
             date,
@@ -1166,48 +1206,40 @@ async function main(): Promise<void> {
         // Rejections are a refinement signal, not a reason to remove a market
         // regime from MLP training. Oracle components remain complete UTC days
         // so alternate delay manifests can reuse them without refitting.
-        const persistedIndexes = persistedRows.map((_, index) => index);
         const prefix = path.join(
           "components",
           "oracle",
           `${date}${refinementPass > 0 ? `.refined-${refinementPass}` : ""}`,
         );
-        const rawOracleCompression = plan.componentCompression?.rawOracleProbabilities;
         const rawOracleUncompressedBytes = (DAY_MS / SECOND_MS)
           * oracle.grid.length * Float32Array.BYTES_PER_ELEMENT;
         const oracleComponent: OracleComponent = {
           date,
           count: DAY_MS / SECOND_MS,
           teacherBackend: "cuda",
-          teacherParameters: `${prefix}.teacher-parameters.f32`,
-          teacherMetrics: `${prefix}.teacher-metrics.f32`,
+          teacherParameters: `${prefix}.teacher-parameters.json`,
+          teacherParametersCompression: "zstd",
+          teacherParametersUncompressedBytes:
+            (DAY_MS / SECOND_MS) * TEACHER_PARAMETER_COUNT * 4,
+          teacherMetrics: `${prefix}.teacher-metrics.json`,
+          teacherMetricsCompression: "zstd",
+          teacherMetricsUncompressedBytes:
+            (DAY_MS / SECOND_MS) * TEACHER_METRIC_COUNT * 4,
           rawOracleProbabilities: reuseOracleFactor
             ? existingComponent!.rawOracleProbabilities
-            : `${prefix}.raw-oracle-probabilities.f32`
-              + (rawOracleCompression === "zstd" ? ".zst" : ""),
+            : `${prefix}.raw-oracle-probabilities.json`,
           ...(reuseOracleFactor
             ? {
-                ...(existingComponent!.rawOracleProbabilitiesCompression
-                  ? {
-                      rawOracleProbabilitiesCompression:
-                        existingComponent!.rawOracleProbabilitiesCompression,
-                    }
-                  : {}),
-                ...(existingComponent!.rawOracleProbabilitiesUncompressedBytes
-                  ? {
-                      rawOracleProbabilitiesUncompressedBytes:
-                        existingComponent!.rawOracleProbabilitiesUncompressedBytes,
-                    }
-                  : {}),
+                rawOracleProbabilitiesCompression: "zstd" as const,
+                rawOracleProbabilitiesUncompressedBytes:
+                  existingComponent!.rawOracleProbabilitiesUncompressedBytes,
               }
-            : rawOracleCompression === "zstd"
-              ? {
-                  rawOracleProbabilitiesCompression: "zstd" as const,
-                  rawOracleProbabilitiesUncompressedBytes: rawOracleUncompressedBytes,
-                }
-              : {}),
+            : {
+                rawOracleProbabilitiesCompression: "zstd" as const,
+                rawOracleProbabilitiesUncompressedBytes: rawOracleUncompressedBytes,
+              }),
           rawOracleSchemaVersion: RAW_ORACLE_SCHEMA_VERSION,
-          times: reuseOracleFactor ? existingComponent!.times : `${prefix}.times.i64`,
+          timeSequence: implicitUtcDayTimeSequence(date),
           teacherMetricVisibleLower: plan.execution.minimumUsableExposure,
           teacherMetricVisibleUpper: plan.execution.maximumUsableExposure,
           teacherFitSignature: currentTeacherFitSignature,
@@ -1223,7 +1255,6 @@ async function main(): Promise<void> {
               ...featureComponentForDate(
                 date,
                 requiredFeatureSignature,
-                plan.componentCompression?.features,
               ),
               ...(requiredFeatureSignature === "full"
                 ? {}
@@ -1235,37 +1266,75 @@ async function main(): Promise<void> {
           writeTeacherParametersComponentAtomic(
             path.join(output, oracleComponent.teacherParameters), teacher,
             requiredOracleRows,
+            utcDayTensorStorage(
+              shardStore,
+              "training/teacher-parameters",
+              [
+                componentStoreId,
+                `delay-${plan.predictionDelayMs}`,
+                `fit-${currentTeacherFitSignature}`,
+                date,
+                `refinement-${refinementPass}`,
+                requiredOracleSignature,
+              ].join("/"),
+              date,
+              TEACHER_PARAMETER_COUNT,
+              "float32-le",
+              { teacherFitSignature: currentTeacherFitSignature },
+            ),
           ),
           writeTeacherMetricsComponentAtomic(
             path.join(output, oracleComponent.teacherMetrics), teacher, requiredOracleRows,
+            utcDayTensorStorage(
+              shardStore,
+              "training/teacher-metrics",
+              [
+                componentStoreId,
+                `delay-${plan.predictionDelayMs}`,
+                `fit-${currentTeacherFitSignature}`,
+                date,
+                `refinement-${refinementPass}`,
+                requiredOracleSignature,
+              ].join("/"),
+              date,
+              TEACHER_METRIC_COUNT,
+              "float32-le",
+              { teacherFitSignature: currentTeacherFitSignature },
+            ),
           ),
           reuseOracleFactor ? Promise.resolve() : writeRawOracleProbabilitiesAtomic(
             path.join(output, oracleComponent.rawOracleProbabilities),
             oracle.probabilities,
             oracle.grid.length,
-            rawOracleCompression === "zstd"
-              ? Array.from({ length: DAY_MS / SECOND_MS }, (_, index) => index)
-              : persistedIndexes.map((index) => persistedRows[index]!),
-            rawOracleCompression === "zstd" ? undefined : requiredOracleRows,
-            oracleComponent.rawOracleProbabilitiesCompression,
-          ),
-          reuseOracleFactor
-            ? Promise.resolve()
-            : writeTimesComponentAtomic(
-              path.join(output, oracleComponent.times), persistedTimes, requiredOracleRows,
+            Array.from({ length: DAY_MS / SECOND_MS }, (_, index) => index),
+            utcDayTensorStorage(
+              shardStore,
+              `oracle/1s/raw-v${RAW_ORACLE_SCHEMA_VERSION}`,
+              `${componentStoreId}/${date}`,
+              date,
+              oracle.grid.length,
+              "float32-le",
+              {
+                actionCount: oracle.grid.length,
+                normalized: true,
+              },
             ),
+          ),
           featureComponent && encodedFeatureRows
-            ? Promise.all([
-                writeFeatureRowsAtomic(
-                  path.join(output, featureComponent.features),
-                  encodedFeatureRows,
-                  requiredFeatureRows,
-                  featureComponent.featuresCompression,
+            ? writeFeatureRowsAtomic(
+                path.join(output, featureComponent.features),
+                encodedFeatureRows,
+                requiredFeatureRows,
+                utcDayTensorStorage(
+                  shardStore,
+                  `features/mlp-${MLP_FEATURE_SCHEMA_VERSION}`,
+                  date,
+                  date,
+                  MLP_INPUT_FEATURE_COUNT,
+                  "float16-le",
+                  { featureSchemaVersion: MLP_FEATURE_SCHEMA_VERSION },
                 ),
-                writeTimesComponentAtomic(
-                  path.join(output, featureComponent.times), times, requiredFeatureRows,
-                ),
-              ])
+              )
             : Promise.resolve(),
           rejectedCount > 0 || refinementPass > 0 || teacherContractChanged
             ? atomicWriteJson(refinementQueueFile, {
@@ -1300,8 +1369,7 @@ async function main(): Promise<void> {
             date,
             file: minuteOracleComponent,
             rows: 1_441,
-            compression:
-              plan.componentCompression?.minuteOracleProbabilities ?? "none",
+            compression: "zstd",
           })}\n`);
         }
         process.stdout.write(`${JSON.stringify({
@@ -1345,7 +1413,6 @@ async function main(): Promise<void> {
     // selected rows.
     if (preparationMode !== "frozen-study-source") {
       if ((plan.featurePreparationWorkers ?? 1) > 1
-        && plan.componentCompression?.features === "zstd"
         && [...featureRowsByDay.values()].every((rows) =>
           rowSelectionSignature(rows) === "full")) {
         await materializeFullFeatureDaysParallel(
@@ -1412,23 +1479,25 @@ async function main(): Promise<void> {
         ...featureComponentForDate(
           date,
           requiredFeatureSignature,
-          plan.componentCompression?.features,
         ),
         ...(requiredFeatureSignature === "full"
           ? {}
           : { materializedRowRanges: rowsToRanges(requiredFeatureRows) }),
       };
-      await Promise.all([
-        writeFeatureRowsAtomic(
-          path.join(output, component.features),
-          encoded,
-          requiredFeatureRows,
-          component.featuresCompression,
+      await writeFeatureRowsAtomic(
+        path.join(output, component.features),
+        encoded,
+        requiredFeatureRows,
+        utcDayTensorStorage(
+          shardStore,
+          `features/mlp-${MLP_FEATURE_SCHEMA_VERSION}`,
+          date,
+          date,
+          MLP_INPUT_FEATURE_COUNT,
+          "float16-le",
+          { featureSchemaVersion: MLP_FEATURE_SCHEMA_VERSION },
         ),
-        writeTimesComponentAtomic(
-          path.join(output, component.times), times, requiredFeatureRows,
-        ),
-      ]);
+      );
       replaceByDate(progress.featureComponents, component);
       progress.updatedAt = new Date().toISOString();
       await atomicWriteJson(progressFile, progress);
@@ -1488,6 +1557,7 @@ async function main(): Promise<void> {
       output,
       progress,
       plan,
+      shardStore,
       oneSecondStore,
       expectedGrid,
       { persistProbabilities: false },
@@ -1500,8 +1570,8 @@ async function main(): Promise<void> {
     await persistExampleTimeWeights(
       output,
       progress,
-      plan.samplingIntervalMs,
-      plan.training.timeWeighting,
+      plan,
+      shardStore,
     );
     const generatedPlan = plan.productionTraining
       ? await writeProductionTrainingPlan(
@@ -1580,6 +1650,7 @@ async function main(): Promise<void> {
     output,
     progress,
     plan,
+    shardStore,
     oneSecondStore,
     expectedGrid,
     { persistProbabilities: !plan.runtimeMinuteOracleTargets },
@@ -1600,12 +1671,13 @@ async function main(): Promise<void> {
         progress,
         plan,
         plan.exampleSelection,
+        shardStore,
       )
     : await persistExampleTimeWeights(
         output,
         progress,
-        plan.samplingIntervalMs,
-        plan.training.timeWeighting,
+        plan,
+        shardStore,
       );
   progress.updatedAt = new Date().toISOString();
   await atomicWriteJson(progressFile, progress);
@@ -1628,11 +1700,9 @@ async function main(): Promise<void> {
       version: 1,
       storeId: componentStoreId,
       compression: {
-        features: plan.componentCompression?.features ?? "none",
-        rawOracleProbabilities:
-          plan.componentCompression?.rawOracleProbabilities ?? "none",
-        minuteOracleProbabilities:
-          plan.componentCompression?.minuteOracleProbabilities ?? "none",
+        features: "zstd",
+        rawOracleProbabilities: "zstd",
+        minuteOracleProbabilities: "zstd",
       },
       inputRows: plan.exampleSelection
         ? "sparse row-addressable UTC day files containing selected prediction-time blocks"
@@ -1680,8 +1750,7 @@ async function main(): Promise<void> {
       factorLayout: "row-major [example, targetExposure]",
       factorShape: [expectedGrid.length],
       factorFileField: "rawOracleProbabilities",
-      factorCompression:
-        plan.componentCompression?.rawOracleProbabilities ?? "none",
+      factorCompression: "zstd",
       factorBytesPerExample: expectedGrid.length * Float32Array.BYTES_PER_ELEMENT,
       factorBytesBySplit: Object.fromEntries(SPLITS.map((split) => [
         split,
@@ -1698,8 +1767,7 @@ async function main(): Promise<void> {
       factorLayout: "row-major [example, targetExposure]",
       factorShape: [expectedGrid.length],
       factorFileField: "minuteOracleProbabilities",
-      factorCompression:
-        plan.componentCompression?.minuteOracleProbabilities ?? "none",
+      factorCompression: "zstd",
       storage: plan.runtimeMinuteOracleTargets
         ? "computed-directly-at-training-startup"
         : "persisted-per-minute-day",
@@ -2079,10 +2147,10 @@ function bufferFloat32(buffer: Buffer): Float32Array {
 }
 
 async function readFloat32Component(file: string, expectedBytes: number): Promise<Float32Array> {
-  const encoded = await fs.readFile(file);
-  const decoded = file.endsWith(".zst")
-    ? zstdDecompressSync(encoded, { maxOutputLength: expectedBytes })
-    : encoded;
+  if (!file.endsWith(".json")) {
+    throw new Error(`Dataset components must be canonical reference JSON: ${file}.`);
+  }
+  const decoded = (await readReferencedPayload(file)).payload;
   if (decoded.byteLength !== expectedBytes) {
     throw new Error(
       `Float32 component ${file} decoded to ${decoded.byteLength} bytes; `
@@ -2245,17 +2313,14 @@ function datasetShardForSegment(
     teacherMetrics: oracle.teacherMetrics,
     oracleRowOffset: segment.oracleRowOffset,
     oracleRowStride: segment.rowStride,
-    baseTimeWeights: path.join("pairs", `${pairPrefix}.base-time-weights.f32`),
-    timeWeights: path.join("pairs", `${pairPrefix}.time-weights.f32`),
+    baseTimeWeights: path.join("pairs", `${pairPrefix}.base-time-weights.json`),
+    timeWeights: path.join("pairs", `${pairPrefix}.time-weights.json`),
     rawOracleProbabilities: oracle.rawOracleProbabilities,
-    minuteOracleProbabilities: minuteOracleComponentFile(
-      oracleDate,
-      plan.componentCompression?.minuteOracleProbabilities,
-    ),
+    minuteOracleProbabilities: minuteOracleComponentFile(oracleDate),
     resolutionDivergence: path.join(
       "pairs",
       `${pairPrefix}.delay-${plan.predictionDelayMs}`
-        + ".completed-minute-resolution-jsd.f32",
+        + ".completed-minute-resolution-jsd.json",
     ),
     predictionTimeStart: segment.predictionTimeStart,
     oracleTargetTimeStart: segment.oracleTargetTimeStart,
@@ -2571,7 +2636,6 @@ function encodeFeatureRows(
 function featureComponentForDate(
   date: string,
   rowSelection = "full",
-  compression?: "zstd",
 ): FeatureComponent {
   const prefix = path.join("components", "inputs", date);
   const uncompressedBytes = (DAY_MS / SECOND_MS)
@@ -2579,12 +2643,10 @@ function featureComponentForDate(
   return {
     date,
     count: DAY_MS / SECOND_MS,
-    features: `${prefix}.features.f16${compression === "zstd" ? ".zst" : ""}`,
-    ...(compression === "zstd" ? {
-      featuresCompression: compression,
-      featuresUncompressedBytes: uncompressedBytes,
-    } : {}),
-    times: `${prefix}.times.i64`,
+    features: `${prefix}.features.json`,
+    featuresCompression: "zstd",
+    featuresUncompressedBytes: uncompressedBytes,
+    timeSequence: implicitUtcDayTimeSequence(date),
     featureSchemaVersion: MLP_FEATURE_SCHEMA_VERSION,
     rowSelectionSignature: rowSelection,
     ...(rowSelection === "full" ? {} : { materializedRowRanges: [] }),
@@ -2600,15 +2662,14 @@ async function featureComponentComplete(
     && component.count === DAY_MS / SECOND_MS
     && componentCoversRows(component.rowSelectionSignature, requiredRowSelection)
     && component.featureSchemaVersion === MLP_FEATURE_SCHEMA_VERSION
-    && (component.featuresCompression === "zstd"
-      ? component.featuresUncompressedBytes
-          === component.count * MLP_INPUT_FEATURE_COUNT * 2
-        && await nonEmptyFile(path.join(output, component.features))
-      : await fileHasBytes(
-          path.join(output, component.features),
-          component.count * MLP_INPUT_FEATURE_COUNT * 2,
-        ))
-    && await fileHasBytes(path.join(output, component.times), component.count * 8));
+    && component.featuresCompression === "zstd"
+    && component.featuresUncompressedBytes
+      === component.count * MLP_INPUT_FEATURE_COUNT * 2
+    && await referenceHasBytes(
+      path.join(output, component.features),
+      component.count * MLP_INPUT_FEATURE_COUNT * 2,
+    )
+    && await componentTimeAxisComplete(output, component));
 }
 
 async function oracleComponentComplete(
@@ -2620,23 +2681,22 @@ async function oracleComponentComplete(
   return component.count === DAY_MS / SECOND_MS
     && component.rawOracleSchemaVersion === RAW_ORACLE_SCHEMA_VERSION
     && componentCoversRows(component.rowSelectionSignature, requiredRowSelection)
-    && await fileHasBytes(
+    && await componentPayloadComplete(
       path.join(output, component.teacherParameters),
       component.count * TEACHER_PARAMETER_COUNT * 4,
     )
-    && await fileHasBytes(
+    && await componentPayloadComplete(
       path.join(output, component.teacherMetrics),
       component.count * TEACHER_METRIC_COUNT * 4,
     )
-    && (component.rawOracleProbabilitiesCompression === "zstd"
-      ? component.rawOracleProbabilitiesUncompressedBytes
-          === component.count * actionCount * 4
-        && await nonEmptyFile(path.join(output, component.rawOracleProbabilities))
-      : await fileHasBytes(
-          path.join(output, component.rawOracleProbabilities),
-          component.count * actionCount * 4,
-        ))
-    && await fileHasBytes(path.join(output, component.times), component.count * 8);
+    && component.rawOracleProbabilitiesCompression === "zstd"
+    && component.rawOracleProbabilitiesUncompressedBytes
+      === component.count * actionCount * 4
+    && await referenceHasBytes(
+      path.join(output, component.rawOracleProbabilities),
+      component.count * actionCount * 4,
+    )
+    && await componentTimeAxisComplete(output, component);
 }
 
 async function rawOracleFactorComplete(
@@ -2648,33 +2708,177 @@ async function rawOracleFactorComplete(
   return component.count === DAY_MS / SECOND_MS
     && component.rawOracleSchemaVersion === RAW_ORACLE_SCHEMA_VERSION
     && componentCoversRows(component.rowSelectionSignature, requiredRowSelection)
-    && (component.rawOracleProbabilitiesCompression === "zstd"
-      ? component.rawOracleProbabilitiesUncompressedBytes
-          === component.count * actionCount * 4
-        && await nonEmptyFile(path.join(output, component.rawOracleProbabilities))
-      : await fileHasBytes(
-          path.join(output, component.rawOracleProbabilities),
-          component.count * actionCount * 4,
-        ))
-    && await fileHasBytes(path.join(output, component.times), component.count * 8);
+    && component.rawOracleProbabilitiesCompression === "zstd"
+    && component.rawOracleProbabilitiesUncompressedBytes
+      === component.count * actionCount * 4
+    && await referenceHasBytes(
+      path.join(output, component.rawOracleProbabilities),
+      component.count * actionCount * 4,
+    )
+    && await componentTimeAxisComplete(output, component);
 }
 
-async function fileHasBytes(file: string, expectedBytes: number): Promise<boolean> {
+function implicitUtcDayTimeSequence(date: string): ImplicitTimeSequence {
+  return {
+    encoding: "implicit-linear",
+    startTimeMs: parseDay(date) + SECOND_MS - 1,
+    stepMs: SECOND_MS,
+    count: DAY_MS / SECOND_MS,
+  };
+}
+
+function utcDayTensorStorage(
+  store: SequentialShardStore,
+  namespace: string,
+  key: string,
+  date: string,
+  columns: number,
+  dtype: string,
+  metadata?: Record<string, unknown>,
+): SequentialStorageTarget {
+  const time = implicitUtcDayTimeSequence(date);
+  return {
+    store,
+    namespace,
+    key,
+    sequence: {
+      start: time.startTimeMs,
+      step: time.stepMs,
+      count: time.count,
+      unit: "unix-ms",
+    },
+    layout: {
+      encoding: "row-major",
+      dtype,
+      rows: time.count,
+      columns,
+    },
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function minuteOracleStorageTarget(
+  store: SequentialShardStore,
+  componentStoreId: string,
+  planId: string,
+  date: string,
+  day: number,
+  rows: number,
+  columns: number,
+): SequentialStorageTarget {
+  return {
+    store,
+    namespace: "oracle/1m/completed",
+    key: `${componentStoreId}/${planId}/${date}`,
+    sequence: {
+      // Row zero represents the completed minute immediately before the UTC day.
+      start: day - 1,
+      step: MINUTE_MS,
+      count: rows,
+      unit: "unix-ms",
+    },
+    layout: {
+      encoding: "row-major",
+      dtype: "float32-le",
+      rows,
+      columns,
+    },
+    metadata: {
+      actionCount: columns,
+      normalized: true,
+      sampling: "completed close-only one-minute path",
+    },
+  };
+}
+
+function datasetPairStorageTarget(
+  store: SequentialShardStore,
+  plan: TrainingPlan,
+  shard: DatasetShard,
+  kind: "base-time-weights" | "time-weights" | "resolution-divergence",
+): SequentialStorageTarget {
+  return {
+    store,
+    namespace: `training/dataset-pairs/${kind}`,
+    key: [
+      plan.componentStoreId,
+      plan.id,
+      shard.split,
+      shard.date,
+      `segment-${shard.segment}-${shard.predictionTimeStart}`,
+    ].join("/"),
+    sequence: {
+      start: shard.predictionTimeStart,
+      step: plan.samplingIntervalMs,
+      count: shard.count,
+      unit: "unix-ms",
+    },
+    layout: {
+      encoding: "row-major",
+      dtype: "float32-le",
+      rows: shard.count,
+      columns: 1,
+    },
+    metadata: {
+      split: shard.split,
+      date: shard.date,
+      segment: shard.segment,
+      semantic: kind,
+    },
+  };
+}
+
+async function componentTimeAxisComplete(
+  output: string,
+  component: FeatureComponent | OracleComponent,
+): Promise<boolean> {
+  const sequence = component.timeSequence;
+  if (sequence) {
+    const expected = implicitUtcDayTimeSequence(component.date);
+    return sequence.encoding === expected.encoding
+      && sequence.startTimeMs === expected.startTimeMs
+      && sequence.stepMs === expected.stepMs
+      && sequence.count === component.count;
+  }
+  return false;
+}
+
+async function referenceHasBytes(file: string, expectedBytes: number): Promise<boolean> {
   try {
-    return (await fs.stat(file)).size === expectedBytes;
+    const reference = JSON.parse(await fs.readFile(file, "utf8")) as {
+      kind?: unknown;
+      object?: { file?: unknown; uncompressedBytes?: unknown; compressedBytes?: unknown };
+    };
+    if (reference.kind !== "trading-sequential-shard"
+      || reference.object?.uncompressedBytes !== expectedBytes
+      || typeof reference.object.file !== "string"
+      || typeof reference.object.compressedBytes !== "number") return false;
+    const objectFile = path.resolve(trainingStoreForDatasetFile(file), reference.object.file);
+    return (await fs.stat(objectFile)).size === reference.object.compressedBytes;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT"
+      || error instanceof SyntaxError) return false;
     throw error;
   }
 }
 
-async function nonEmptyFile(file: string): Promise<boolean> {
-  try {
-    return (await fs.stat(file)).size > 0;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
+function trainingStoreForDatasetFile(file: string): string {
+  let current = path.dirname(path.resolve(file));
+  while (path.dirname(current) !== current) {
+    if (path.basename(current).toLowerCase() === "datasets"
+      && path.basename(path.dirname(current)).toLowerCase() === "training") {
+      return path.join(path.dirname(current), "immutable");
+    }
+    current = path.dirname(current);
   }
+  throw new Error(`Dataset reference is outside data/training/datasets: ${file}.`);
+}
+
+async function componentPayloadComplete(
+  file: string,
+  expectedUncompressedBytes: number,
+): Promise<boolean> {
+  return referenceHasBytes(file, expectedUncompressedBytes);
 }
 
 async function importReusableComponents(
@@ -2692,7 +2896,10 @@ async function importReusableComponents(
   if (path.resolve(sourceOutput) === path.resolve(output)) return;
   let source: Progress;
   try {
-    source = JSON.parse(await fs.readFile(path.join(sourceOutput, "progress.json"), "utf8")) as Progress;
+    source = JSON.parse(await fs.readFile(
+      path.join(sourceOutput, "state", "progress.json"),
+      "utf8",
+    )) as Progress;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
     throw error;
@@ -2712,7 +2919,9 @@ async function importReusableComponents(
     const targetRows = materializedComponentRows(target);
     const sourceRows = materializedComponentRows(component);
     if (targetRows.length > 0 && targetRows.length >= sourceRows.length) continue;
-    await linkComponentFiles(sourceOutput, output, [component!.features, component!.times]);
+    await copyComponentReferences(sourceOutput, output, [
+      component!.features,
+    ]);
     replaceByDate(progress.featureComponents, {
       ...component!,
       rowSelectionSignature: component!.rowSelectionSignature ?? "full",
@@ -2745,11 +2954,10 @@ async function importReusableComponents(
       const targetRows = materializedComponentRows(target);
       const sourceRows = materializedComponentRows(component);
       if (targetRows.length > 0 && targetRows.length >= sourceRows.length) continue;
-      await linkComponentFiles(sourceOutput, output, [
+      await copyComponentReferences(sourceOutput, output, [
         component.teacherParameters,
         component.teacherMetrics,
         component.rawOracleProbabilities,
-        component.times,
       ]);
       replaceByDate(progress.oracleComponents, {
         ...component,
@@ -2782,7 +2990,7 @@ async function importReusableMinuteOracleComponents(
   let source: Progress;
   try {
     source = JSON.parse(
-      await fs.readFile(path.join(sourceOutput, "progress.json"), "utf8"),
+      await fs.readFile(path.join(sourceOutput, "state", "progress.json"), "utf8"),
     ) as Progress;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -2791,22 +2999,17 @@ async function importReusableMinuteOracleComponents(
   if (source.planId !== plan.componentStoreId) return;
   const actionCount = source.grid?.length ?? plan.execution.gridSize;
   if (actionCount !== plan.execution.gridSize) return;
-  const compression = plan.componentCompression?.minuteOracleProbabilities;
   const expectedBytes = 1_441 * actionCount * Float32Array.BYTES_PER_ELEMENT;
   let importedMinuteOracles = 0;
   for (const day of oracleDays) {
-    const relativeFile = minuteOracleComponentFile(isoDate(day), compression);
+    const relativeFile = minuteOracleComponentFile(isoDate(day));
     const sourceFile = path.join(sourceOutput, relativeFile);
     const targetFile = path.join(output, relativeFile);
-    const targetComplete = compression === "zstd"
-      ? await nonEmptyFile(targetFile)
-      : await fileHasBytes(targetFile, expectedBytes);
+    const targetComplete = await referenceHasBytes(targetFile, expectedBytes);
     if (targetComplete) continue;
-    const sourceComplete = compression === "zstd"
-      ? await nonEmptyFile(sourceFile)
-      : await fileHasBytes(sourceFile, expectedBytes);
+    const sourceComplete = await referenceHasBytes(sourceFile, expectedBytes);
     if (!sourceComplete) continue;
-    await linkComponentFiles(sourceOutput, output, [relativeFile]);
+    await copyComponentReferences(sourceOutput, output, [relativeFile]);
     importedMinuteOracles += 1;
   }
   if (importedMinuteOracles > 0) {
@@ -2827,7 +3030,7 @@ async function importReusableResolutionMetadata(
   let source: Progress;
   try {
     source = JSON.parse(
-      await fs.readFile(path.join(sourceOutput, "progress.json"), "utf8"),
+      await fs.readFile(path.join(sourceOutput, "state", "progress.json"), "utf8"),
     ) as Progress;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -2840,16 +3043,19 @@ async function importReusableResolutionMetadata(
   let imported = 0;
   for (const target of targetShards) {
     const existing = path.join(output, target.resolutionDivergence);
-    if (await fileHasBytes(existing, target.count * Float32Array.BYTES_PER_ELEMENT)) {
+    if (await referenceHasBytes(
+      existing,
+      target.count * Float32Array.BYTES_PER_ELEMENT,
+    )) {
       continue;
     }
     const reusable = sourceByPairing.get(shardPairingKey(target));
     if (!reusable || reusable.resolutionDivergence !== target.resolutionDivergence
-      || !await fileHasBytes(
+      || !await referenceHasBytes(
         path.join(sourceOutput, reusable.resolutionDivergence),
         reusable.count * Float32Array.BYTES_PER_ELEMENT,
       )) continue;
-    await linkComponentFiles(
+    await copyComponentReferences(
       sourceOutput,
       output,
       [reusable.resolutionDivergence],
@@ -2881,7 +3087,7 @@ function shardPairingKey(shard: DatasetShard): string {
   ].join(":");
 }
 
-async function linkComponentFiles(
+async function copyComponentReferences(
   sourceOutput: string,
   output: string,
   relativeFiles: readonly string[],
@@ -2889,14 +3095,8 @@ async function linkComponentFiles(
   for (const relativeFile of relativeFiles) {
     const source = path.join(sourceOutput, relativeFile);
     const destination = path.join(output, relativeFile);
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.rm(destination, { force: true });
-    try {
-      await fs.link(source, destination);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-      await fs.copyFile(source, destination);
-    }
+    const reference = JSON.parse(await fs.readFile(source, "utf8")) as unknown;
+    await atomicWriteJson(destination, reference);
   }
 }
 
@@ -2923,62 +3123,41 @@ function teacherFitSignature(plan: TrainingPlan): string {
   return createHash("sha256").update(JSON.stringify(contract)).digest("hex");
 }
 
-function legacyTeacherFitSignature(plan: TrainingPlan): string {
-  const { representation: _, ...legacyTeacherFit } = plan.teacherFit;
-  const contract = {
-    teacherFit: legacyTeacherFit,
-    support: {
-      latentLower: plan.execution.minimumEffectiveExposure,
-      latentUpper: plan.execution.maximumEffectiveExposure,
-      metricVisibleLower: plan.execution.minimumUsableExposure,
-      metricVisibleUpper: plan.execution.maximumUsableExposure,
-      friction: plan.execution.feeBps / 10_000,
-      temperature: plan.execution.temperature,
-      gridSize: plan.execution.gridSize,
-    },
-  };
-  return createHash("sha256").update(JSON.stringify(contract)).digest("hex");
-}
-
-async function writeTeacherParametersAtomic(file: string, rows: TeacherResult[]): Promise<void> {
-  const values = new Float32Array(rows.length * TEACHER_PARAMETER_COUNT);
-  rows.forEach((row, index) => values.set(row.rawParameters, index * TEACHER_PARAMETER_COUNT));
-  await writeTypedArrayAtomic(file, Buffer.from(values.buffer));
-}
-
 async function writeTeacherParametersComponentAtomic(
   file: string,
   rows: TeacherResult[],
   componentRows: readonly number[],
+  storage: SequentialStorageTarget,
 ): Promise<void> {
   const values = new Float32Array(rows.length * TEACHER_PARAMETER_COUNT);
   rows.forEach((row, index) => values.set(row.rawParameters, index * TEACHER_PARAMETER_COUNT));
-  await writeComponentRowsAtomic(
+  await writeContentAddressedCompressed(
     file,
-    Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-    TEACHER_PARAMETER_COUNT * Float32Array.BYTES_PER_ELEMENT,
-    componentRows,
+    materializeComponentRows(
+      Buffer.from(values.buffer, values.byteOffset, values.byteLength),
+      TEACHER_PARAMETER_COUNT * Float32Array.BYTES_PER_ELEMENT,
+      componentRows,
+    ),
+    storage,
   );
-}
-
-async function writeTeacherMetricsAtomic(file: string, rows: TeacherResult[]): Promise<void> {
-  const values = new Float32Array(rows.length * TEACHER_METRIC_COUNT);
-  rows.forEach((row, index) => values.set(row.metrics, index * TEACHER_METRIC_COUNT));
-  await writeTypedArrayAtomic(file, Buffer.from(values.buffer));
 }
 
 async function writeTeacherMetricsComponentAtomic(
   file: string,
   rows: TeacherResult[],
   componentRows: readonly number[],
+  storage: SequentialStorageTarget,
 ): Promise<void> {
   const values = new Float32Array(rows.length * TEACHER_METRIC_COUNT);
   rows.forEach((row, index) => values.set(row.metrics, index * TEACHER_METRIC_COUNT));
-  await writeComponentRowsAtomic(
+  await writeContentAddressedCompressed(
     file,
-    Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-    TEACHER_METRIC_COUNT * Float32Array.BYTES_PER_ELEMENT,
-    componentRows,
+    materializeComponentRows(
+      Buffer.from(values.buffer, values.byteOffset, values.byteLength),
+      TEACHER_METRIC_COUNT * Float32Array.BYTES_PER_ELEMENT,
+      componentRows,
+    ),
+    storage,
   );
 }
 
@@ -2993,12 +3172,16 @@ async function mergeTeacherResults(
   if (fittedRows.length !== fitted.length) {
     throw new Error("Fitted teacher rows do not match the returned CUDA results.");
   }
-  const [parameterBuffer, metricBuffer] = await Promise.all([
-    fs.readFile(path.join(output, existing.teacherParameters)),
-    fs.readFile(path.join(output, existing.teacherMetrics)),
+  const [parameters, metrics] = await Promise.all([
+    readFloat32Component(
+      path.join(output, existing.teacherParameters),
+      (DAY_MS / SECOND_MS) * TEACHER_PARAMETER_COUNT * 4,
+    ),
+    readFloat32Component(
+      path.join(output, existing.teacherMetrics),
+      (DAY_MS / SECOND_MS) * TEACHER_METRIC_COUNT * 4,
+    ),
   ]);
-  const parameters = bufferFloat32(parameterBuffer);
-  const metrics = bufferFloat32(metricBuffer);
   const existingSet = new Set(existingRows);
   const fittedIndex = new Map(fittedRows.map((row, index) => [row, index]));
   return outputRows.map((row) => {
@@ -3022,32 +3205,28 @@ async function mergeTeacherResults(
 
 function minuteOracleComponentFile(
   date: string,
-  compression?: "zstd",
 ): string {
   return path.join(
     "components",
     "oracle-minute",
-    `${date}.completed-minute-oracle-probabilities.f32`
-      + (compression === "zstd" ? ".zst" : ""),
+    `${date}.completed-minute-oracle-probabilities.json`,
   );
 }
 
 async function persistMinuteOracleDay(
   output: string,
   plan: TrainingPlan,
+  shardStore: SequentialShardStore,
   source: readonly Candle[],
   day: number,
   date: string,
   actionGrid: ArrayLike<number>,
 ): Promise<string> {
-  const compression = plan.componentCompression?.minuteOracleProbabilities;
-  const relativeFile = minuteOracleComponentFile(date, compression);
+  const relativeFile = minuteOracleComponentFile(date);
   const file = path.join(output, relativeFile);
   const minuteRows = 1_441;
   const expectedBytes = minuteRows * actionGrid.length * Float32Array.BYTES_PER_ELEMENT;
-  const complete = compression === "zstd"
-    ? await nonEmptyFile(file)
-    : await fileHasBytes(file, expectedBytes);
+  const complete = await referenceHasBytes(file, expectedBytes);
   if (complete) return relativeFile;
 
   const required = source.filter((candle) =>
@@ -3111,10 +3290,19 @@ async function persistMinuteOracleDay(
     throw new Error(`One-minute oracle returned an invalid stored shape for ${date}.`);
   }
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await writeMaybeCompressedAtomic(
+  const payload = Buffer.from(values.buffer, values.byteOffset, values.byteLength);
+  await writeContentAddressedCompressed(
     file,
-    Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-    compression,
+    payload,
+    minuteOracleStorageTarget(
+      shardStore,
+      plan.componentStoreId,
+      plan.id,
+      date,
+      day,
+      minuteRows,
+      actionGrid.length,
+    ),
   );
   return relativeFile;
 }
@@ -3123,6 +3311,7 @@ async function persistMinuteOraclePairs(
   output: string,
   progress: Progress,
   plan: TrainingPlan,
+  shardStore: SequentialShardStore,
   oneSecondStore: OneSecondCandleStore,
   actionGrid: readonly number[],
   options: { persistProbabilities: boolean } = { persistProbabilities: true },
@@ -3131,7 +3320,6 @@ async function persistMinuteOraclePairs(
   meanResolutionJsd: number;
   maximumResolutionJsd: number;
 }>> {
-  const minuteCompression = plan.componentCompression?.minuteOracleProbabilities;
   const visibleIndexes = actionGrid
     .map((action, index) => ({ action, index }))
     .filter(({ action }) =>
@@ -3151,11 +3339,10 @@ async function persistMinuteOraclePairs(
     const minuteFile = path.join(output, shards[0]!.minuteOracleProbabilities);
     const minuteRows = 1_441;
     const minuteBytes = minuteRows * actionGrid.length * Float32Array.BYTES_PER_ELEMENT;
-    const minuteIncomplete = options.persistProbabilities && !(minuteCompression === "zstd"
-      ? await nonEmptyFile(minuteFile)
-      : await fileHasBytes(minuteFile, minuteBytes));
+    const minuteIncomplete = options.persistProbabilities
+      && !await referenceHasBytes(minuteFile, minuteBytes);
     const divergenceIncomplete = await Promise.all(shards.map(async (shard) =>
-      !await fileHasBytes(
+      !await referenceHasBytes(
         path.join(output, shard.resolutionDivergence),
         shard.count * Float32Array.BYTES_PER_ELEMENT,
       )));
@@ -3261,21 +3448,35 @@ async function persistMinuteOraclePairs(
       minuteRows * actionGrid.length,
     );
     await Promise.all([
-      ...(minuteIncomplete ? [writeMaybeCompressedAtomic(
-        minuteFile,
-        Buffer.from(
-          storedMinuteProbabilities.buffer,
-          storedMinuteProbabilities.byteOffset,
-          storedMinuteProbabilities.byteLength,
-        ),
-        minuteCompression,
-      )] : []),
-      ...[...outputs].map(([shard, divergence]) => writeTypedArrayAtomic(
+      ...(minuteIncomplete ? [writeContentAddressedCompressed(
+          minuteFile,
+          Buffer.from(
+            storedMinuteProbabilities.buffer,
+            storedMinuteProbabilities.byteOffset,
+            storedMinuteProbabilities.byteLength,
+          ),
+          minuteOracleStorageTarget(
+            shardStore,
+            plan.componentStoreId,
+            plan.id,
+            date,
+            day,
+            minuteRows,
+            actionGrid.length,
+          ),
+        )] : []),
+      ...[...outputs].map(([shard, divergence]) => writeContentAddressedCompressed(
         path.join(output, shard.resolutionDivergence),
         Buffer.from(
           divergence.buffer,
           divergence.byteOffset,
           divergence.byteLength,
+        ),
+        datasetPairStorageTarget(
+          shardStore,
+          plan,
+          shard,
+          "resolution-divergence",
         ),
       )),
     ]);
@@ -3298,8 +3499,9 @@ async function persistMinuteOraclePairs(
     let total = 0;
     let maximum = 0;
     for (const shard of progress.shards.filter((item) => item.split === split)) {
-      const divergence = bufferFloat32(
-        await fs.readFile(path.join(output, shard.resolutionDivergence)),
+      const divergence = await readFloat32Component(
+        path.join(output, shard.resolutionDivergence),
+        shard.count * Float32Array.BYTES_PER_ELEMENT,
       );
       if (divergence.length !== shard.count) {
         throw new Error(`Resolution divergence rows are misaligned for ${shard.date}.`);
@@ -3347,8 +3549,8 @@ function visibleJensenShannonDivergence(
 async function persistExampleTimeWeights(
   output: string,
   progress: Progress,
-  samplingIntervalMs: number,
-  weighting: TrainingPlan["training"]["timeWeighting"],
+  plan: TrainingPlan,
+  shardStore: SequentialShardStore,
 ): Promise<Record<Split, {
   examples: number;
   meanAbsoluteDistanceImbalance: number;
@@ -3357,6 +3559,8 @@ async function persistExampleTimeWeights(
   maximumUnnormalizedWeight: number;
   effectiveSampleRatio: number;
 }>> {
+  const samplingIntervalMs = plan.samplingIntervalMs;
+  const weighting = plan.training.timeWeighting;
   const summary = {} as Record<Split, {
     examples: number;
     meanAbsoluteDistanceImbalance: number;
@@ -3382,19 +3586,20 @@ async function persistExampleTimeWeights(
     let weightSquareTotal = 0;
     let maximumWeight = 0;
     for (const shard of shards) {
-      const resolutionDivergence = bufferFloat32(
-        await fs.readFile(path.join(output, shard.resolutionDivergence)),
+      const resolutionDivergence = await readFloat32Component(
+        path.join(output, shard.resolutionDivergence),
+        shard.count * Float32Array.BYTES_PER_ELEMENT,
       );
       if (resolutionDivergence.length !== shard.count) {
         throw new Error(`Resolution divergence rows are misaligned for ${shard.date}.`);
       }
       let metrics = metricCache.get(shard.teacherMetrics);
       if (!metrics) {
-        const metricBuffer = await fs.readFile(path.join(output, shard.teacherMetrics));
-        if (metricBuffer.byteLength % (TEACHER_METRIC_COUNT * 4) !== 0) {
-          throw new Error(`MLP oracle metric component ${shard.teacherMetrics} is misaligned.`);
-        }
-        metrics = bufferFloat32(metricBuffer);
+        metrics = await readFloat32Component(
+          path.join(output, shard.teacherMetrics),
+          (DAY_MS / SECOND_MS) * TEACHER_METRIC_COUNT
+            * Float32Array.BYTES_PER_ELEMENT,
+        );
         metricCache.set(shard.teacherMetrics, metrics);
         while (metricCache.size > 4) metricCache.delete(metricCache.keys().next().value!);
       }
@@ -3455,17 +3660,19 @@ async function persistExampleTimeWeights(
         previousTime = time;
       }
       await Promise.all([
-        writeTypedArrayAtomic(
+        writeContentAddressedCompressed(
           path.join(output, shard.baseTimeWeights),
           Buffer.from(
             baseWeights.buffer,
             baseWeights.byteOffset,
             baseWeights.byteLength,
           ),
+          datasetPairStorageTarget(shardStore, plan, shard, "base-time-weights"),
         ),
-        writeTypedArrayAtomic(
+        writeContentAddressedCompressed(
           path.join(output, shard.timeWeights),
           Buffer.from(weights.buffer, weights.byteOffset, weights.byteLength),
+          datasetPairStorageTarget(shardStore, plan, shard, "time-weights"),
         ),
       ]);
     }
@@ -3494,6 +3701,7 @@ async function persistFrozenStudyWeights(
   progress: Progress,
   plan: TrainingPlan,
   selection: FrozenWeightedExampleSelection,
+  shardStore: SequentialShardStore,
 ): Promise<Record<Split, {
   examples: number;
   meanAbsoluteDistanceImbalance: number;
@@ -3504,7 +3712,7 @@ async function persistFrozenStudyWeights(
 }>> {
   const sourceRoot = path.resolve(repoRoot, selection.sourceDatasetDir);
   const source = JSON.parse(
-    await fs.readFile(path.join(sourceRoot, "progress.json"), "utf8"),
+    await fs.readFile(path.join(sourceRoot, "state", "progress.json"), "utf8"),
   ) as Progress;
   const summary = {} as Record<Split, {
     examples: number;
@@ -3551,7 +3759,15 @@ async function persistFrozenStudyWeights(
       const readSourceWeights = async (file: string): Promise<Float32Array> => {
         let values = sourceWeightCache.get(file);
         if (!values) {
-          values = bufferFloat32(await fs.readFile(path.join(sourceRoot, file)));
+          const sourceWeightShard = source.shards.find((item) =>
+            item.baseTimeWeights === file || item.timeWeights === file);
+          if (!sourceWeightShard) {
+            throw new Error(`Frozen source weight is not declared: ${file}.`);
+          }
+          values = await readFloat32Component(
+            path.join(sourceRoot, file),
+            sourceWeightShard.count * Float32Array.BYTES_PER_ELEMENT,
+          );
           sourceWeightCache.set(file, values);
           while (sourceWeightCache.size > 8) {
             sourceWeightCache.delete(sourceWeightCache.keys().next().value!);
@@ -3569,22 +3785,27 @@ async function persistFrozenStudyWeights(
         throw new Error(`Frozen source weight range is incomplete for ${shard.date}.`);
       }
       await Promise.all([
-        writeTypedArrayAtomic(
+        writeContentAddressedCompressed(
           path.join(output, shard.baseTimeWeights),
           Buffer.from(baseWeights.buffer, baseWeights.byteOffset, baseWeights.byteLength),
+          datasetPairStorageTarget(shardStore, plan, shard, "base-time-weights"),
         ),
-        writeTypedArrayAtomic(
+        writeContentAddressedCompressed(
           path.join(output, shard.timeWeights),
           Buffer.from(weights.buffer, weights.byteOffset, weights.byteLength),
+          datasetPairStorageTarget(shardStore, plan, shard, "time-weights"),
         ),
       ]);
-      const divergence = bufferFloat32(
-        await fs.readFile(path.join(output, shard.resolutionDivergence)),
+      const divergence = await readFloat32Component(
+        path.join(output, shard.resolutionDivergence),
+        shard.count * Float32Array.BYTES_PER_ELEMENT,
       );
       let metrics = metricCache.get(shard.teacherMetrics);
       if (!metrics) {
-        metrics = bufferFloat32(
-          await fs.readFile(path.join(output, shard.teacherMetrics)),
+        metrics = await readFloat32Component(
+          path.join(output, shard.teacherMetrics),
+          (DAY_MS / SECOND_MS) * TEACHER_METRIC_COUNT
+            * Float32Array.BYTES_PER_ELEMENT,
         );
         metricCache.set(shard.teacherMetrics, metrics);
         while (metricCache.size > 4) metricCache.delete(metricCache.keys().next().value!);
@@ -3648,14 +3869,15 @@ async function freezeWeightedStudyPlan(
   for (const split of SPLITS) {
     const candidates: Omit<WeightedStudyCandidate, "samplingKey">[] = [];
     const shards = JSON.parse(
-      await fs.readFile(path.join(sourceOutput, "progress.json"), "utf8"),
+      await fs.readFile(path.join(sourceOutput, "state", "progress.json"), "utf8"),
     ).shards as DatasetShard[];
     for (const shard of shards
       .filter((item) => item.split === split)
       .sort((left, right) =>
         left.date.localeCompare(right.date) || left.segment - right.segment)) {
-      const weights = bufferFloat32(
-        await fs.readFile(path.join(sourceOutput, shard.timeWeights)),
+      const weights = await readFloat32Component(
+        path.join(sourceOutput, shard.timeWeights),
+        shard.count * Float32Array.BYTES_PER_ELEMENT,
       );
       for (
         let localStart = 0;
@@ -3784,11 +4006,6 @@ async function writeProductionTrainingPlan(
     config.sourceDatasetDir,
     ...(plan.componentSeedDatasetDirs ?? []),
   ];
-  generated.componentCompression = {
-    features: "zstd",
-    rawOracleProbabilities: "zstd",
-    minuteOracleProbabilities: "zstd",
-  };
   generated.featurePreparationWorkers = 3;
   generated.runtimeMinuteOracleTargets = false;
   generated.training = {
@@ -3846,8 +4063,7 @@ async function writeRawOracleProbabilitiesAtomic(
   probabilities: Float32Array,
   actionCount: number,
   indexes: readonly number[],
-  componentRows?: readonly number[],
-  compression?: "zstd",
+  storage: SequentialStorageTarget,
 ): Promise<void> {
   if (!Number.isInteger(actionCount) || actionCount < 1
     || probabilities.length % actionCount !== 0
@@ -3855,144 +4071,61 @@ async function writeRawOracleProbabilitiesAtomic(
       || index < 0 || (index + 1) * actionCount > probabilities.length)) {
     throw new Error("Raw oracle grid rows do not match the CUDA oracle output.");
   }
-  if (componentRows && componentRows.length !== indexes.length) {
-    throw new Error("Raw oracle component rows do not match selected probability rows.");
-  }
-  if (compression === "zstd") {
-    if (componentRows && rowSelectionSignature(componentRows) !== "full") {
-      throw new Error("Zstandard raw-oracle components require complete UTC-day rows.");
-    }
-    const values = new Float32Array(indexes.length * actionCount);
-    indexes.forEach((sourceIndex, destinationIndex) => {
-      const sourceStart = sourceIndex * actionCount;
-      values.set(
-        probabilities.subarray(sourceStart, sourceStart + actionCount),
-        destinationIndex * actionCount,
-      );
-    });
-    await writeMaybeCompressedAtomic(
-      file,
-      Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-      compression,
+  const values = new Float32Array(indexes.length * actionCount);
+  indexes.forEach((sourceIndex, destinationIndex) => {
+    const sourceStart = sourceIndex * actionCount;
+    values.set(
+      probabilities.subarray(sourceStart, sourceStart + actionCount),
+      destinationIndex * actionCount,
     );
-    return;
-  }
-  if (componentRows && rowSelectionSignature(componentRows) !== "full") {
-    const values = new Float32Array(indexes.length * actionCount);
-    indexes.forEach((sourceIndex, destinationIndex) => {
-      const sourceStart = sourceIndex * actionCount;
-      values.set(
-        probabilities.subarray(sourceStart, sourceStart + actionCount),
-        destinationIndex * actionCount,
-      );
-    });
-    await writeComponentRowsAtomic(
-      file,
-      Buffer.from(values.buffer, values.byteOffset, values.byteLength),
-      actionCount * Float32Array.BYTES_PER_ELEMENT,
-      componentRows,
-    );
-    return;
-  }
-  const temporary = `${file}.tmp`;
-  const handle = await fs.open(temporary, "w");
-  try {
-    const rowsPerChunk = 4_096;
-    for (let start = 0; start < indexes.length; start += rowsPerChunk) {
-      const end = Math.min(indexes.length, start + rowsPerChunk);
-      const values = new Float32Array((end - start) * actionCount);
-      for (let destinationIndex = start; destinationIndex < end; destinationIndex += 1) {
-        const sourceIndex = indexes[destinationIndex]!;
-        const sourceStart = sourceIndex * actionCount;
-        values.set(
-          probabilities.subarray(sourceStart, sourceStart + actionCount),
-          (destinationIndex - start) * actionCount,
-        );
-      }
-      await handle.writeFile(Buffer.from(
-        values.buffer,
-        values.byteOffset,
-        values.byteLength,
-      ));
-    }
-  } catch (error) {
-    await handle.close();
-    await fs.rm(temporary, { force: true });
-    throw error;
-  }
-  await handle.close();
-  await fs.rename(temporary, file);
-}
-
-async function writeTimesAtomic(file: string, times: readonly number[]): Promise<void> {
-  const buffer = Buffer.allocUnsafe(times.length * 8);
-  for (let index = 0; index < times.length; index += 1) {
-    buffer.writeBigInt64LE(BigInt(times[index]!), index * 8);
-  }
-  await writeTypedArrayAtomic(file, buffer);
-}
-
-async function writeTimesComponentAtomic(
-  file: string,
-  times: readonly number[],
-  componentRows: readonly number[],
-): Promise<void> {
-  const buffer = Buffer.allocUnsafe(times.length * 8);
-  for (let index = 0; index < times.length; index += 1) {
-    buffer.writeBigInt64LE(BigInt(times[index]!), index * 8);
-  }
-  await writeComponentRowsAtomic(file, buffer, 8, componentRows);
+  });
+  await writeContentAddressedCompressed(
+    file,
+    Buffer.from(values.buffer, values.byteOffset, values.byteLength),
+    storage,
+  );
 }
 
 async function writeFeatureRowsAtomic(
   file: string,
   rows: Buffer,
   componentRows: readonly number[],
-  compression?: "zstd",
+  storage: SequentialStorageTarget,
 ): Promise<void> {
-  if (compression !== "zstd") {
-    await writeComponentRowsAtomic(
-      file,
+  await writeContentAddressedCompressed(
+    file,
+    materializeComponentRows(
       rows,
       MLP_INPUT_FEATURE_COUNT * 2,
       componentRows,
-    );
-    return;
-  }
-  if (rowSelectionSignature(componentRows) !== "full") {
-    throw new Error("Zstandard feature components require complete UTC-day rows.");
-  }
-  const compressed = zstdCompressSync(rows, {
-    params: {
-      [zlibConstants.ZSTD_c_compressionLevel]: 3,
-    },
-  });
-  await writeTypedArrayAtomic(file, compressed);
+    ),
+    storage,
+  );
 }
 
-async function writeMaybeCompressedAtomic(
+async function writeContentAddressedCompressed(
   file: string,
   rows: Buffer,
-  compression?: "zstd",
-): Promise<void> {
-  if (compression !== "zstd") {
-    await writeTypedArrayAtomic(file, rows);
-    return;
-  }
-  const compressed = zstdCompressSync(rows, {
-    params: {
-      [zlibConstants.ZSTD_c_compressionLevel]: 3,
-    },
+  target: SequentialStorageTarget,
+): Promise<PutSequentialShardResult> {
+  const result = await target.store.put({
+    namespace: target.namespace,
+    key: target.key,
+    payload: rows,
+    sequence: target.sequence,
+    layout: target.layout,
+    ...(target.metadata ? { metadata: target.metadata } : {}),
+    compressionLevel: STORAGE_ZSTD_LEVEL,
   });
-  await writeTypedArrayAtomic(file, compressed);
+  await atomicWriteJson(file, result.reference);
+  return result;
 }
 
-async function writeComponentRowsAtomic(
-  file: string,
+function materializeComponentRows(
   rows: Buffer,
   rowBytes: number,
   componentRows: readonly number[],
-): Promise<void> {
+): Buffer {
   const totalRows = DAY_MS / SECOND_MS;
   if (!Number.isInteger(rowBytes) || rowBytes < 1
     || rows.byteLength !== componentRows.length * rowBytes
@@ -4000,44 +4133,17 @@ async function writeComponentRowsAtomic(
       || row < 0 || row >= totalRows || (index > 0 && row <= componentRows[index - 1]!))) {
     throw new Error("Sparse dataset component rows are invalid or unsorted.");
   }
-  if (rowSelectionSignature(componentRows) === "full") {
-    await writeTypedArrayAtomic(file, rows);
-    return;
-  }
-  const temporary = `${file}.tmp`;
-  const handle = await fs.open(temporary, "w");
-  try {
-    await handle.truncate(totalRows * rowBytes);
-    let selectedStart = 0;
-    while (selectedStart < componentRows.length) {
-      let selectedEnd = selectedStart + 1;
-      while (selectedEnd < componentRows.length
-        && componentRows[selectedEnd] === componentRows[selectedEnd - 1]! + 1) {
-        selectedEnd += 1;
-      }
-      const sourceStart = selectedStart * rowBytes;
-      const sourceEnd = selectedEnd * rowBytes;
-      await handle.write(
-        rows.subarray(sourceStart, sourceEnd),
-        0,
-        sourceEnd - sourceStart,
-        componentRows[selectedStart]! * rowBytes,
-      );
-      selectedStart = selectedEnd;
-    }
-  } catch (error) {
-    await handle.close();
-    await fs.rm(temporary, { force: true });
-    throw error;
-  }
-  await handle.close();
-  await fs.rename(temporary, file);
-}
-
-async function writeTypedArrayAtomic(file: string, buffer: Buffer): Promise<void> {
-  const temporary = `${file}.tmp`;
-  await fs.writeFile(temporary, buffer);
-  await fs.rename(temporary, file);
+  if (rowSelectionSignature(componentRows) === "full") return rows;
+  const materialized = Buffer.alloc(totalRows * rowBytes);
+  componentRows.forEach((row, sourceIndex) => {
+    rows.copy(
+      materialized,
+      row * rowBytes,
+      sourceIndex * rowBytes,
+      (sourceIndex + 1) * rowBytes,
+    );
+  });
+  return materialized;
 }
 
 class OneSecondCandleStore {
@@ -4047,7 +4153,14 @@ class OneSecondCandleStore {
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
-    this.root = path.join(dataDir, "historical", "spot-btcusdt", "btcusdt", "1s");
+    this.root = path.join(
+      new TradingStorageLayout(dataDir).marketStore,
+      "refs",
+      "candles",
+      "spot-btcusdt",
+      "btcusdt",
+      "1s",
+    );
   }
 
   async loadRange(start: number, end: number): Promise<Candle[]> {
@@ -4108,34 +4221,17 @@ class OneSecondCandleStore {
 
   private async readDay(day: number): Promise<Candle[]> {
     const date = isoDate(day);
-    const failures: string[] = [];
-    for (const source of [
-      { file: path.join(this.root, `${date}.jsonl`), compressed: false },
-      { file: path.join(this.root, `${date}.jsonl.gz`), compressed: true },
-    ]) {
-      try {
-        const bytes = await fs.readFile(source.file);
-        const content = source.compressed
-          ? gunzipSync(bytes).toString("utf8")
-          : bytes.toString("utf8");
-        const result: Candle[] = [];
-        for (const line of content.split("\n")) {
-          if (line) result.push(JSON.parse(line) as Candle);
-        }
-        const issue = inspectScoredDay(result, day, date, []);
-        if (issue) throw new Error(issue.detail);
-        return result;
-      } catch (error) {
-        failures.push(`${path.basename(source.file)}: ${errorMessage(error)}`);
-      }
-    }
-    throw new Error(`${date}: no complete validated local one-second shard; ${failures.join("; ")}`);
+    const file = path.join(this.root, `${date}.json`);
+    const result = await readCandleShardReference(file);
+    const issue = inspectScoredDay(result, day, date, []);
+    if (issue) throw new Error(issue.detail);
+    return result;
   }
 }
 
 async function findLatestCompleteDay(root: string): Promise<number> {
   const dates = (await fs.readdir(root))
-    .map((file) => /^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.gz)?$/.exec(file)?.[1])
+    .map((file) => /^(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1])
     .filter((value): value is string => Boolean(value))
     .sort();
   if (dates.length === 0) throw new Error("No cached one-second history is available for testing.");
@@ -4532,6 +4628,8 @@ function validatePlan(plan: TrainingPlan): void {
     || !(execution.minimumUsableExposure < execution.maximumUsableExposure)
     || execution.horizonEndMode !== "extend"
     || !Number.isInteger(execution.holdingPeriodSteps) || execution.holdingPeriodSteps < 1
+    || !Number.isInteger(execution.decisionDelaySteps ?? 1)
+    || (execution.decisionDelaySteps ?? 1) < 1
     || !Number.isInteger(execution.valueHorizonSteps)
     || execution.valueHorizonSteps < execution.holdingPeriodSteps
     || !(execution.temperature > 0)

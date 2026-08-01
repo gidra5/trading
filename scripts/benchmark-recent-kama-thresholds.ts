@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   defaultLegacyValleyPeakConfig,
-  runBacktestFromCandles,
   type BacktestResult,
   type Candle,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 interface Args {
   outputPath?: string;
@@ -79,7 +80,7 @@ interface ThresholdSummary {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const candleDir = path.join(repoRoot, "data/historical/spot-btcusdt/btcusdt/1m");
+const candleDir = path.join(repoRoot, "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m");
 
 const args = parseArgs(process.argv.slice(2));
 const stamp = new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 17);
@@ -92,9 +93,14 @@ const reportPath = path.resolve(
   args.reportPath ?? `docs/recent-kama-thresholds-${stamp}.md`,
 );
 
-runBenchmark(args, outputPath, reportPath);
+runBenchmark(args, outputPath, reportPath).catch(fail);
 
-function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPath: string): void {
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
+
+async function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPath: string): Promise<void> {
   const startedAt = Date.now();
   const files = listCandleFiles();
   const maxDays = Math.max(...configArgs.windowsDays);
@@ -140,7 +146,7 @@ function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPa
     for (const window of windows) {
       const market = summarizeMarket(candles, window.startIndex, window.endIndex);
       const started = Date.now();
-      const result = runBacktestFromCandles(candles, {
+      const result = await runCanonicalBacktestFromCandles(candles, {
         config: benchmarkConfig(configArgs, multiplier),
         startIndex: window.startIndex,
         endIndex: window.endIndex,
@@ -389,7 +395,7 @@ function listCandleFiles(): string[] {
   }
   return fs
     .readdirSync(candleDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 }
@@ -397,12 +403,7 @@ function listCandleFiles(): string[] {
 function loadCandles(files: string[]): Candle[] {
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(candleDir, file), "utf8");
-    for (const line of content.split("\n")) {
-      if (line.trim()) {
-        candles.push(JSON.parse(line) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(candleDir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
 import {
   MLP_CANDLE_FEATURE_COUNT,
   MLP_CANDLE_WINDOWS,
@@ -10,6 +9,7 @@ import {
   type MlpHalfFeatureAssembler,
   type Candle,
 } from "@trading/bot-algo";
+import { readCandleShardReference, TradingStorageLayout } from "@trading/storage";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
@@ -517,15 +517,7 @@ export class MlpFeatureStore {
 
   private async buildAggregateArchive(): Promise<MlpAggregateArchive> {
     const root = this.minuteRoot();
-    const filesByDate = new Map<string, string>();
-    for (const file of (await fs.readdir(root)).filter(isDailyCandleShard).sort()) {
-      const date = file.slice(0, 10);
-      const existing = filesByDate.get(date);
-      if (!existing || existing.endsWith(".gz") && !file.endsWith(".gz")) {
-        filesByDate.set(date, file);
-      }
-    }
-    const files = [...filesByDate.values()].sort();
+    const files = (await fs.readdir(root)).filter(isDailyCandleShard).sort();
     if (files.length === 0) throw new Error("MLP feature archive has no BTCUSDT 1m candles.");
     const hour = new CompleteCandleAggregator(hourBounds, "1h");
     const day = new CompleteCandleAggregator(dayBounds, "1d");
@@ -570,18 +562,8 @@ export class MlpFeatureStore {
     const result: Candle[] = [];
     for (let day = utcDay(startTime); day < endTime; day += DAY_MS) {
       const date = new Date(day).toISOString().slice(0, 10);
-      let candles: Candle[];
-      try {
-        candles = await readCandleShard(path.join(root, `${date}.jsonl`));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        try {
-          candles = await readCandleShard(path.join(root, `${date}.jsonl.gz`));
-        } catch (compressedError) {
-          if ((compressedError as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw compressedError;
-        }
-      }
+      const candles = await readFirstCandleShard(root, date);
+      if (!candles) continue;
       for (const candle of candles) {
         if (candle.openTime >= startTime && candle.openTime < endTime) result.push(candle);
       }
@@ -591,22 +573,15 @@ export class MlpFeatureStore {
   }
 
   async loadSecondRange(startTime: number, endTime: number): Promise<Candle[]> {
-    const root = path.join(
-      this.dataDir,
-      "historical",
-      "spot-btcusdt",
-      "btcusdt",
-      "1s",
-    );
+    const root = this.candleRoot("1s");
     const result: Candle[] = [];
     for (let day = utcDay(startTime); day < endTime; day += DAY_MS) {
       const date = new Date(day).toISOString().slice(0, 10);
-      let candles: Candle[];
-      try {
-        candles = await readCandleShard(path.join(root, `${date}.jsonl`));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        candles = await readCandleShard(path.join(root, `${date}.jsonl.gz`));
+      const candles = await readFirstCandleShard(root, date);
+      if (!candles) {
+        const error = new Error(`Missing one-second candle shard for ${date}.`);
+        (error as NodeJS.ErrnoException).code = "ENOENT";
+        throw error;
       }
       for (const candle of candles) {
         if (candle.openTime >= startTime && candle.openTime < endTime) result.push(candle);
@@ -617,12 +592,17 @@ export class MlpFeatureStore {
   }
 
   private minuteRoot(): string {
+    return this.candleRoot("1m");
+  }
+
+  private candleRoot(interval: string): string {
     return path.join(
-      this.dataDir,
-      "historical",
+      new TradingStorageLayout(this.dataDir).marketStore,
+      "refs",
+      "candles",
       "spot-btcusdt",
       "btcusdt",
-      "1m",
+      interval,
     );
   }
 }
@@ -1412,18 +1392,23 @@ class CompleteCandleAggregator {
 }
 
 async function readCandleShard(file: string): Promise<Candle[]> {
-  const content = file.endsWith(".gz")
-    ? gunzipSync(await fs.readFile(file)).toString("utf8")
-    : await fs.readFile(file, "utf8");
-  const result: Candle[] = [];
-  for (const line of content.split("\n")) {
-    if (line) result.push(JSON.parse(line) as Candle);
-  }
-  return result;
+  return readCandleShardReference(file);
 }
 
 function isDailyCandleShard(file: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}\.jsonl(?:\.gz)?$/.test(file);
+  return /^\d{4}-\d{2}-\d{2}\.json$/.test(file);
+}
+
+async function readFirstCandleShard(
+  root: string,
+  date: string,
+): Promise<Candle[] | undefined> {
+  try {
+    return await readCandleShard(path.join(root, `${date}.json`));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
 }
 
 function candleOpenLowerBound(candles: readonly Candle[], time: number): number {

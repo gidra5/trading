@@ -16,13 +16,14 @@ export type InternalBorrowAccounting = "active" | "inactive";
 
 export type BacktestPreset =
   | "saved-candles"
-  | "saved-orderbook"
   | "last-x"
   | "week"
   | "month"
   | "year"
   | "random-windows"
   | "random-length-windows";
+
+export type BacktestStrategy = "peak-valley" | "learned-oracle-1s" | "hindsight-oracle-1s";
 
 export type BacktestRunStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
 
@@ -755,7 +756,8 @@ export interface BacktestSummary {
   symbol: string;
   marketId?: string;
   displaySymbol?: string;
-  source: "candles" | "orderbook-mid";
+  source: "candles";
+  strategy?: BacktestStrategy;
   startTime: number;
   endTime: number;
   targetStartTime?: number;
@@ -813,6 +815,8 @@ export interface BacktestSummary {
   maxEntryLeverage?: number;
   maxEffectiveLeverage?: number;
   tradeCount: number;
+  feesPaid?: number;
+  maintenancePaid?: number;
   winRate: number;
   closedPositionCount: number;
   profitableClosedPositionCount: number;
@@ -852,6 +856,8 @@ export interface BacktestSampleSummary {
   maxEntryLeverage?: number;
   maxEffectiveLeverage?: number;
   tradeCount: number;
+  feesPaid?: number;
+  maintenancePaid?: number;
   winRate: number;
   closedPositionCount: number;
   profitableClosedPositionCount: number;
@@ -950,7 +956,8 @@ export interface BacktestProgressSnapshot {
   id: string;
   preset: BacktestPreset;
   status: BacktestRunStatus;
-  source: "candles" | "orderbook-mid";
+  source: "candles";
+  strategy?: BacktestStrategy;
   startedAt: number;
   updatedAt: number;
   targetStartTime: number;

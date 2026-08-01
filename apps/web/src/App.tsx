@@ -26,6 +26,7 @@ import type {
   BacktestTrace,
   BacktestTraceFrame,
   BacktestReplayFrame,
+  BacktestStrategy,
   BacktestExtremaOrderMassSideSummary,
   BotEvent,
   Candle,
@@ -95,6 +96,7 @@ function websocketUrl(basePath: string, socketPath: string): string {
 }
 
 interface BacktestSettings {
+  strategy: BacktestStrategy;
   extremaSmaWindowMinutes: number;
   historicalDays: number;
   randomSampleCount: number;
@@ -106,6 +108,7 @@ interface BacktestSettings {
 }
 
 const defaultBacktestSettings: BacktestSettings = {
+  strategy: "peak-valley",
   extremaSmaWindowMinutes: 30,
   historicalDays: 30,
   randomSampleCount: 40,
@@ -346,6 +349,7 @@ export function App() {
     const settings = backtestSettings();
     const body: {
       preset: BacktestSelection;
+      strategy: BacktestStrategy;
       limit: number;
       historicalStartTime?: number;
       historicalDays?: number;
@@ -358,7 +362,8 @@ export function App() {
       extremaSmaWindowMinutes?: number;
     } = {
       preset,
-      limit: preset === "saved-orderbook" ? 3_000 : 1_000,
+      strategy: settings.strategy,
+      limit: 1_000,
       extremaSmaWindowMinutes: settings.extremaSmaWindowMinutes,
     };
 
@@ -596,7 +601,8 @@ export function App() {
         [key]: value,
       };
 
-      if (key === "randomMinWindowDays" && next.randomMaxWindowDays < value) {
+      if (key === "randomMinWindowDays" && typeof value === "number"
+        && next.randomMaxWindowDays < value) {
         next.randomMaxWindowDays = value;
       }
       if (
@@ -3865,6 +3871,24 @@ function BacktestPanel(props: {
           <h2 class="text-lg font-semibold">Market Replay</h2>
         </div>
         <div class="flex flex-wrap gap-2">
+          <select
+            class="rounded-2 border border-line bg-ink-800 px-3 py-2 text-sm text-ink-100"
+            value={props.settings.strategy}
+            onInput={(event) => {
+              const strategy = event.currentTarget.value as BacktestStrategy;
+              props.onSettingChange("strategy", strategy);
+              if (strategy === "hindsight-oracle-1s"
+                && props.preset === "saved-candles") {
+                props.onPresetChange("last-x");
+              }
+            }}
+            disabled={isRunning()}
+            aria-label="Backtest strategy"
+            title="Strategy used by the replay bot"
+          >
+            <option value="peak-valley">Peak / valley</option>
+            <option value="hindsight-oracle-1s">1s hindsight oracle · 1h horizon</option>
+          </select>
           <button
             class={buttonPanelClass}
             disabled={isRunning() || !canRunFromLiveStart()}
@@ -3887,8 +3911,10 @@ function BacktestPanel(props: {
             }
             disabled={isRunning()}
           >
-            <option value="saved-candles">Saved candles</option>
-            <option value="saved-orderbook">Saved order book</option>
+            <option
+              value="saved-candles"
+              disabled={props.settings.strategy === "hindsight-oracle-1s"}
+            >Saved candles</option>
             <option value="last-x">Last X days</option>
             <option value="week">Last week</option>
             <option value="month">Last month</option>

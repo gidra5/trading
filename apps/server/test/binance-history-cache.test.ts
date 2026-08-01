@@ -6,6 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import AdmZip from "adm-zip";
+import {
+  readCandleShardReference,
+  SequentialShardStore,
+  TradingStorageLayout,
+} from "@trading/storage";
 import { fetchBinanceSpotDailyShard } from "../src/binance-history-cache.js";
 
 const DAY_MS = 86_400_000;
@@ -32,14 +37,24 @@ test("daily shard recovery installs a complete checksum-verified archive", async
       intervalMs: INTERVAL_MS,
       archiveRoot: source.root,
     });
-    const target = path.join(
-      dataDir,
-      "historical/spot-btcusdt/btcusdt",
-      INTERVAL,
-      `${DATE}.jsonl.gz`,
+    const store = new SequentialShardStore(
+      new TradingStorageLayout(dataDir).marketStore,
     );
-    const compressed = await fs.readFile(target);
-    assert.ok(compressed.length > 0);
+    const target = store.referenceFile(
+      `candles/spot-btcusdt/btcusdt/${INTERVAL}`,
+      DATE,
+    );
+    const candles = await readCandleShardReference(target);
+    assert.deepEqual(candles.map((candle) => candle.openTime), [
+      DAY,
+      DAY + INTERVAL_MS,
+      DAY + 2 * INTERVAL_MS,
+      DAY + 3 * INTERVAL_MS,
+    ]);
+    const audit = await store.audit();
+    assert.equal(audit.references, 1);
+    assert.equal(audit.objects, 1);
+    assert.equal(audit.orphanObjects.length, 0);
   } finally {
     await source.close();
     await fs.rm(dataDir, { recursive: true, force: true });

@@ -13,6 +13,7 @@ import {
   createExposureConditionalBinScratch,
   createExposureValueOracleStorage,
   normalizeExposureValueDistillationLossConfig,
+  prepareExposureValueOraclePath,
   strategyExposureTemperatures,
   type ExposureExecutionOptions,
   type ExposureValueDistillationLossConfig,
@@ -109,6 +110,7 @@ interface NativeCuda {
     priceCount: number,
     scoreStart: number,
     holdingPeriodSteps: number,
+    decisionDelaySteps: number,
     valueHorizonSteps: number,
     gridSize: number,
     minimumExposure: number,
@@ -824,6 +826,7 @@ export async function prepareExposureValueOracleCuda(
     source.length,
     options.scoreStartIndex,
     oracle.holdingPeriodSteps,
+    oracle.decisionDelaySteps,
     oracle.valueHorizonSteps,
     options.gridSize,
     oracle.execution.minExposure,
@@ -836,7 +839,7 @@ export async function prepareExposureValueOracleCuda(
     oracle.execution.assetBorrowRate,
     options.initialExposure ?? 0,
     terminalIndex,
-    options.includePath === false ? 0 : 1,
+    options.includePath === false || oracle.decisionDelaySteps !== oracle.holdingPeriodSteps ? 0 : 1,
     options.distributionOnly ? 1 : 0,
     oracle.means,
     oracle.secondMoments,
@@ -859,20 +862,24 @@ export async function prepareExposureValueOracleCuda(
   if (status !== 0) {
     throw new Error(`Exposure-value CUDA oracle failed: ${native.lastError()}`);
   }
-  oracle.path = {
-    startIndex: options.scoreStartIndex,
-    terminalIndex,
-    initialExposure: options.initialExposure ?? 0,
-    terminalExposure: 0,
-    logReturn: pathMetrics[0]!,
-    totalReturn: Math.expm1(pathMetrics[0]!),
-    exposures: oracle.path.exposures,
-    equities: oracle.path.equities,
-    maxDrawdown: pathMetrics[1]!,
-    turnover: pathMetrics[2]!,
-    rebalanceCount: pathMetrics[3]!,
-    liquidationCount: pathMetrics[4]!,
-  };
+  if (options.includePath !== false && oracle.decisionDelaySteps !== oracle.holdingPeriodSteps) {
+    prepareExposureValueOraclePath(source, options, oracle);
+  } else {
+    oracle.path = {
+      startIndex: options.scoreStartIndex,
+      terminalIndex,
+      initialExposure: options.initialExposure ?? 0,
+      terminalExposure: 0,
+      logReturn: pathMetrics[0]!,
+      totalReturn: Math.expm1(pathMetrics[0]!),
+      exposures: oracle.path.exposures,
+      equities: oracle.path.equities,
+      maxDrawdown: pathMetrics[1]!,
+      turnover: pathMetrics[2]!,
+      rebalanceCount: pathMetrics[3]!,
+      liquidationCount: pathMetrics[4]!,
+    };
+  }
   if (!Number.isFinite(oracle.path.logReturn)
     || ((options.initialExposure ?? 0) === 0 && oracle.path.totalReturn < -1e-10)) {
     throw new Error("CUDA exposure-value Q0 violated the cash-baseline invariant.");
@@ -928,8 +935,8 @@ async function loadNative(): Promise<NativeCuda> {
         "double vw_kama_cuda_fitness_case_device_bytes(uint64_t)",
       ),
       destroyFitnessCase: library.func("int vw_kama_cuda_destroy_fitness_case(uint64_t)"),
-      prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle_v2", "int", [
-        pointer, "int", "int", "int", "int", "int",
+      prepareValueOracle: library.func("vw_kama_cuda_prepare_value_oracle_v3", "int", [
+        pointer, "int", "int", "int", "int", "int", "int",
         "double", "double", "double", "double", "double", "double", "double", "double",
         "double", "int", "int", "int",
         pointer, pointer, pointer, pointer, pointer, pointer, pointer, pointer,

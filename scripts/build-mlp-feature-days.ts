@@ -2,12 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { constants as zlibConstants, zstdCompressSync } from "node:zlib";
 import {
   MLP_FEATURE_SCHEMA_VERSION,
   MLP_INPUT_FEATURE_COUNT,
   type Candle,
 } from "@trading/bot-algo";
+import { SequentialShardStore, TradingStorageLayout } from "@trading/storage";
 import { MlpFeatureStore } from "../apps/server/src/mlp-feature-store.js";
 
 const DAY_MS = 86_400_000;
@@ -32,6 +32,9 @@ async function main(): Promise<void> {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const dataDir = path.resolve(repoRoot, plan.dataDir);
   const store = new MlpFeatureStore(dataDir);
+  const shardStore = new SequentialShardStore(
+    new TradingStorageLayout(dataDir).trainingStore,
+  );
   const input = readline.createInterface({ input: process.stdin });
 
   for await (const line of input) {
@@ -50,20 +53,41 @@ async function main(): Promise<void> {
     const encoded = encodeFeatureRows(times, features);
     const encodingMs = performance.now() - encodingStarted;
     const compressionStarted = performance.now();
-    const compressed = zstdCompressSync(encoded, {
-      params: {
-        [zlibConstants.ZSTD_c_compressionLevel]: 3,
-      },
-    });
-    const compressionMs = performance.now() - compressionStarted;
     const prefix = path.join("components", "inputs", request.date);
-    const featureFile = `${prefix}.features.f16.zst`;
-    const timeFile = `${prefix}.times.i64`;
+    const featureFile = `${prefix}.features.json`;
+    const stored = await shardStore.put({
+      namespace: `features/mlp-${MLP_FEATURE_SCHEMA_VERSION}`,
+      key: request.date,
+      payload: encoded,
+      sequence: {
+        start: times[0]!,
+        step: SECOND_MS,
+        count: times.length,
+        unit: "unix-ms",
+      },
+      layout: {
+        encoding: "row-major",
+        dtype: "float16-le",
+        rows: times.length,
+        columns: MLP_INPUT_FEATURE_COUNT,
+        featureSchemaVersion: MLP_FEATURE_SCHEMA_VERSION,
+      },
+      metadata: {
+        symbol: "BTCUSDT",
+        interval: "1s",
+        role: "model-input-features",
+      },
+      compressionLevel: 9,
+    });
+    const datasetReference = path.join(output, featureFile);
+    await fs.mkdir(path.dirname(datasetReference), { recursive: true });
+    await fs.writeFile(
+      datasetReference,
+      `${JSON.stringify(stored.reference, null, 2)}\n`,
+      { flag: "wx" },
+    );
+    const compressionMs = performance.now() - compressionStarted;
     const persistStarted = performance.now();
-    await Promise.all([
-      writeAtomic(path.join(output, featureFile), compressed),
-      writeAtomic(path.join(output, timeFile), encodeTimes(times)),
-    ]);
     const persistMs = performance.now() - persistStarted;
     process.stdout.write(`${JSON.stringify({
       event: "dataset-component",
@@ -73,7 +97,12 @@ async function main(): Promise<void> {
       features: featureFile,
       featuresCompression: "zstd",
       featuresUncompressedBytes: encoded.byteLength,
-      times: timeFile,
+      timeSequence: {
+        encoding: "implicit-linear",
+        startTimeMs: times[0]!,
+        stepMs: SECOND_MS,
+        count: times.length,
+      },
       featureSchemaVersion: MLP_FEATURE_SCHEMA_VERSION,
       rowSelectionSignature: "full",
       day: request.day,
@@ -81,7 +110,9 @@ async function main(): Promise<void> {
       encodingMs,
       compressionMs,
       persistMs,
-      compressedBytes: compressed.byteLength,
+      compressedBytes: stored.reference.object.compressedBytes,
+      contentHash: stored.reference.object.contentHash,
+      canonicalReference: path.relative(dataDir, stored.referenceFile),
     })}\n`);
   }
 }
@@ -127,19 +158,4 @@ function encodeFeatureRows(
     }
   }
   return Buffer.from(half.buffer, half.byteOffset, half.byteLength);
-}
-
-function encodeTimes(times: readonly number[]): Buffer {
-  const buffer = Buffer.allocUnsafe(times.length * 8);
-  for (let index = 0; index < times.length; index += 1) {
-    buffer.writeBigInt64LE(BigInt(times[index]!), index * 8);
-  }
-  return buffer;
-}
-
-async function writeAtomic(file: string, value: Uint8Array): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.tmp`;
-  await fs.writeFile(temporary, value);
-  await fs.rename(temporary, file);
 }

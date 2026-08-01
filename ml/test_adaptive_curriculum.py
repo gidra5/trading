@@ -418,10 +418,10 @@ class AdaptiveCurriculumTest(unittest.TestCase):
     def test_retention_sweep_preserves_active_and_selected_models(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "branches"
-            obsolete = root / "r001-obsolete" / "best-model.pt"
-            selected = root / "r001-selected" / "best-model.pt"
-            active = root / "r002-active" / "best-model.pt"
-            outside = Path(temporary) / "best-model.pt"
+            obsolete = root / "r001-obsolete" / "checkpoints" / "best.json"
+            selected = root / "r001-selected" / "checkpoints" / "best.json"
+            active = root / "r002-active" / "checkpoints" / "best.json"
+            outside = Path(temporary) / "checkpoints" / "best.json"
             for model in (obsolete, selected, active, outside):
                 model.parent.mkdir(parents=True, exist_ok=True)
                 model.write_bytes(b"checkpoint")

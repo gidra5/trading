@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   directOracleDiagnosticsCuda,
   exposureHoldingCutoffsCuda,
@@ -32,6 +32,10 @@ async function main(): Promise<void> {
     argument("holding-steps") ?? String(execution.holdingPeriodSteps),
     "holding-steps",
   );
+  const decisionDelaySteps = positiveInteger(
+    argument("decision-delay-steps") ?? String(execution.decisionDelaySteps ?? 1),
+    "decision-delay-steps",
+  );
   const valueHorizonSteps = positiveInteger(
     argument("horizon-steps") ?? String(execution.valueHorizonSteps),
     "horizon-steps",
@@ -48,16 +52,10 @@ async function main(): Promise<void> {
   const gridSizes = (argument("grid-sizes") ?? String(execution.gridSize))
     .split(",")
     .map((value) => positiveInteger(value.trim(), "grid-sizes"));
-  const sourceRoot = path.resolve(repoRoot, plan.dataDir, "historical/spot-btcusdt/btcusdt/1s");
-  const plainFile = path.join(sourceRoot, `${date}.jsonl`);
-  const compressedFile = `${plainFile}.gz`;
-  const content = fs.existsSync(plainFile)
-    ? fs.readFileSync(plainFile, "utf8")
-    : gunzipSync(fs.readFileSync(compressedFile)).toString("utf8");
-  const candles = content.split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Candle)
-    .slice(0, candleLimit);
+  const sourceRoot = path.resolve(repoRoot, plan.dataDir, "market/immutable/refs/candles/spot-btcusdt/btcusdt/1s");
+  const candles = readCandleShardReferenceSync(
+    path.join(sourceRoot, `${date}.json`),
+  ).slice(0, candleLimit);
   if (candles.length !== candleLimit) {
     throw new Error(`${date} supplies ${candles.length}/${candleLimit} requested candles.`);
   }
@@ -87,6 +85,7 @@ async function main(): Promise<void> {
       const result = await prepareExposureValueOracleCuda(candles.map((candle) => candle.close), {
         scoreStartIndex: 0,
         holdingPeriodSteps,
+        decisionDelaySteps,
         valueHorizonSteps,
         friction: feeRate,
         gridSize,
@@ -201,6 +200,7 @@ async function main(): Promise<void> {
     referenceGridSize,
     execution,
     holdingPeriodSteps,
+    decisionDelaySteps,
     valueHorizonSteps,
     maintenanceBps,
     samples,

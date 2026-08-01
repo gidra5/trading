@@ -7,7 +7,7 @@ them to a shared corrected 1% optimizer-update gate.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-continuous-skew-sharpness-w1-baseline-20260729-184300
+data/training/runs/return-oracle-ce-shrinking-v1-continuous-skew-sharpness-w1-baseline-20260729-184300
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

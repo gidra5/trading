@@ -58,10 +58,23 @@ export interface TradingOrderCapacity {
   leverage: number;
 }
 
+export interface TradingEquitySnapshot {
+  quoteAvailable: number;
+  quoteReserved: number;
+  quoteUnleveraged: number;
+  assetAvailable: number;
+  assetReserved: number;
+  assetUnleveraged: number;
+}
+
 interface TradingOrderInput {
   side: TradingSide;
   /** Asset/base quantity. */
   size: number;
+  /** Requested leverage for exposure-increasing fills. */
+  leverage?: number;
+  /** Closing orders may reduce exposure even when no entry capacity remains. */
+  reduceOnly?: boolean;
 }
 
 export interface CreateMarketOrderInput extends TradingOrderInput {}
@@ -89,6 +102,8 @@ export interface TradingOrderSnapshot {
   size: number;
   price: number | null;
   stopPrice: number | null;
+  leverage?: number;
+  reduceOnly?: boolean;
 }
 
 export interface TradingOrderResult {
@@ -101,13 +116,30 @@ export interface TradingFill {
   filledAsset: number;
   /** Absolute net quote amount, including fees and execution friction. */
   filledQuote: number;
+  /** Gross execution price before fees/friction, when supplied by the venue. */
+  price?: number;
+  /** Fee or modeled execution friction charged in quote units. */
+  feeQuote?: number;
   remaining: number;
 }
 
 export type TradingOrderEvent =
   | { type: "open"; order: TradingOrderSnapshot }
   | { type: "rejected"; orderId: string }
-  | { type: "partial-fill" | "fill"; orderId: string; fill: TradingFill };
+  | { type: "partial-fill" | "fill"; orderId: string; fill: TradingFill }
+  | {
+      type: "maintenance";
+      elapsedMs: number;
+      quoteCharge: number;
+      assetCharge: number;
+    }
+  | {
+      type: "liquidation";
+      at: number;
+      price: number;
+      equity: number;
+      reason: "insolvent" | "effective-leverage";
+    };
 
 export interface TradingApi {
   createStopMarketOrder(input: CreateStopMarketOrderInput): Promise<TradingOrderResult>;
@@ -118,6 +150,7 @@ export interface TradingApi {
   getHistory(input: TradingHistoryRequest): Promise<TradingCandle[]>;
   getMarketRules(): Promise<TradingMarketRules>;
   getOrderCapacity(input: TradingOrderCapacityRequest): Promise<TradingOrderCapacity>;
+  getEquity(): Promise<TradingEquitySnapshot>;
   /** Expected proportional execution cost, e.g. 0.001 means 0.1%. */
   getFriction(): Promise<number>;
 }

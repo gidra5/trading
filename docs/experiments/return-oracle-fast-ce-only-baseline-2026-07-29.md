@@ -6,7 +6,7 @@ reverse KL to the objective.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-fast-ce-only-baseline-20260729-163122
+data/training/runs/return-oracle-ce-shrinking-v1-fast-ce-only-baseline-20260729-163122
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

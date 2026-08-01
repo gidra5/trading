@@ -10,6 +10,7 @@ import {
   type BacktestPreset,
   type BacktestProgressSnapshot,
   type BacktestResult,
+  type BacktestStrategy,
   type BotMetrics,
   type Candle,
   type EquityPoint,
@@ -22,7 +23,11 @@ import {
   type HistoricalCandleCacheStats,
 } from "./historical-candle-cache.js";
 import type { StreamVenue } from "./binance-markets.js";
-import { runBotBacktestFromCandles } from "./bot-backtest.js";
+import {
+  HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
+  runBotBacktestFromCandles,
+} from "./bot-backtest.js";
+import { JointPriceOracleRuntime } from "./joint-price-oracle-runtime.js";
 
 const MAX_EQUITY_POINTS = 800;
 const REPLAY_PROGRESS_CANDLES = 10_000;
@@ -79,6 +84,7 @@ export interface HistoricalBacktestOptions {
   maxLeverage?: number;
   interval: string;
   config: StrategyConfig;
+  strategy?: BacktestStrategy;
   cache: HistoricalCacheOptions;
   historicalStartTime?: number;
   historicalRangeMs?: number;
@@ -305,10 +311,11 @@ async function runRandomHistoricalCandleBacktest(
         );
       },
     );
+    const futureMs = oracleFutureMs(options.strategy);
     const replayWindows: RandomReplayWindow[] = preloadedCandles
       ? windows.map((window) => ({
           ...window,
-          replayEndIndex: upperBoundCandleOpenTime(preloadedCandles, window.endTime),
+          replayEndIndex: upperBoundCandleOpenTime(preloadedCandles, window.endTime + futureMs),
         }))
       : windows;
 
@@ -381,6 +388,7 @@ async function runRandomHistoricalCandleBacktest(
     preset: options.preset,
     status: "completed",
     source: "candles",
+    strategy: options.strategy ?? "peak-valley",
     startedAt,
     updatedAt: Date.now(),
     targetStartTime,
@@ -473,6 +481,7 @@ async function runRandomHistoricalCandleBacktest(
       preset: options.preset,
       status: "running",
       source: "candles",
+      strategy: options.strategy ?? "peak-valley",
       startedAt,
       updatedAt: Date.now(),
       targetStartTime,
@@ -531,7 +540,7 @@ async function ensureRandomWindowCache(
   });
   const ranges: CandleTimeRange[] = windows.map((window) => ({
     startTime: window.startTime - warmupMs,
-    endTime: window.endTime,
+    endTime: window.endTime + oracleFutureMs(options.strategy),
   }));
 
   return cache.ensureRanges(
@@ -563,7 +572,7 @@ async function preloadRandomWindowCandles(
 ): Promise<readonly Candle[] | undefined> {
   const ranges = mergeCandleTimeRanges(windows.map((window) => ({
     startTime: window.startTime - warmupMs,
-    endTime: window.endTime,
+    endTime: window.endTime + oracleFutureMs(options.strategy),
   })), intervalMs);
   const estimatedCandles = sumDefined(
     ranges.map((range) => estimateRangeCandles(range.startTime, range.endTime, intervalMs)),
@@ -621,6 +630,10 @@ async function runBotHistoricalRangeBacktest(
   const warmupSamples = historicalWarmupSamples(config, intervalMs);
   const firstTargetTime = alignUp(targetStartTime, intervalMs);
   const warmupStartTime = firstTargetTime - warmupSamples * intervalMs;
+  const oracleEndTime = Math.min(
+    alignDown(Date.now() - intervalMs, intervalMs),
+    targetEndTime + oracleFutureMs(options.strategy),
+  );
   const cache = new HistoricalCandleCache({
     dataDir: options.cache.dataDir,
     marketKey: options.marketKey,
@@ -634,12 +647,13 @@ async function runBotHistoricalRangeBacktest(
   const startedAt = Date.now();
   const warmup: Candle[] = [];
   const candles: Candle[] = [];
+  const oracleFuture: Candle[] = [];
 
   emit("Checking historical candle cache");
   if (!options.cacheAlreadyEnsured) {
     cacheStats = await cache.ensureRange(
       warmupStartTime,
-      targetEndTime,
+      oracleEndTime,
       (request) => fetchKlines({
         venue: options.venue,
         symbol: options.symbol,
@@ -665,7 +679,7 @@ async function runBotHistoricalRangeBacktest(
       collect(candle);
     }
   } else {
-    for await (const batch of cache.readRangeBatches(warmupStartTime, targetEndTime, REPLAY_PROGRESS_CANDLES)) {
+    for await (const batch of cache.readRangeBatches(warmupStartTime, oracleEndTime, REPLAY_PROGRESS_CANDLES)) {
       for (const candle of batch) collect(candle);
       throwIfCancelled(options.cancelSignal);
       emit(`Loaded ${candles.length.toLocaleString()} candles`);
@@ -673,10 +687,31 @@ async function runBotHistoricalRangeBacktest(
   }
   if (candles.length === 0) throw new Error("Historical backtest loaded no candles.");
 
+  let learnedOracleDistributionAt:
+    | NonNullable<Parameters<typeof runBotBacktestFromCandles>[1]["learnedOracleDistributionAt"]>
+    | undefined;
+  if (options.strategy === "learned-oracle-1s") {
+    emit("Running causal joint price-oracle inference");
+    const inferenceCandles = [...warmup, ...candles];
+    const decisionTimes = candles
+      .map((candle) => candle.closeTime)
+      .filter((time) => (time + 1) % 60_000 === 0);
+    const distributions = await new JointPriceOracleRuntime(
+      options.cache.dataDir,
+    ).predictDistributions(inferenceCandles, decisionTimes);
+    const byTime = new Map(
+      decisionTimes.map((time, index) => [time, distributions[index]!] as const),
+    );
+    learnedOracleDistributionAt = (timestamp) => byTime.get(timestamp) ?? null;
+  }
+
   emit(`Replaying ${candles.length.toLocaleString()} candles`);
   const result = await runBotBacktestFromCandles(candles, {
     config,
+    strategy: options.strategy,
     warmup,
+    oracleFuture,
+    learnedOracleDistributionAt,
     extremaSmaWindowMs: options.extremaSmaWindowMs,
   });
   Object.assign(result.summary, {
@@ -701,6 +736,8 @@ async function runBotHistoricalRangeBacktest(
       warmup.push(candle);
     } else if (candle.openTime >= targetStartTime && candle.openTime <= targetEndTime) {
       candles.push(candle);
+    } else if (candle.openTime > targetEndTime && candle.openTime <= oracleEndTime) {
+      oracleFuture.push(candle);
     }
   }
 
@@ -711,6 +748,7 @@ async function runBotHistoricalRangeBacktest(
       preset: options.preset,
       status: result ? "completed" : "running",
       source: "candles",
+      strategy: options.strategy ?? "peak-valley",
       startedAt,
       updatedAt: Date.now(),
       targetStartTime,
@@ -861,6 +899,7 @@ function buildRandomAggregateResult(input: {
       marketId: options.marketId,
       displaySymbol: options.displaySymbol,
       source: "candles",
+      strategy: options.strategy ?? "peak-valley",
       startTime: Math.min(...samples.map((sample) => sample.startTime)),
       endTime: Math.max(...samples.map((sample) => sample.endTime)),
       targetStartTime,
@@ -1437,6 +1476,10 @@ export function intervalToMs(interval: string): number {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function oracleFutureMs(strategy: BacktestStrategy | undefined): number {
+  return strategy === "hindsight-oracle-1s" ? HINDSIGHT_ORACLE_VALUE_HORIZON_MS : 0;
 }
 
 function emptyCacheStats(): HistoricalCandleCacheStats {

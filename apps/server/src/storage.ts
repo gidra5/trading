@@ -1,5 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  DailyCandleRecorder,
+  SequentialShardStore,
+  TradingStorageLayout,
+} from "@trading/storage";
 import type {
   BacktestResult,
   Candle,
@@ -35,18 +40,41 @@ export interface TradingRuntimeSettings {
 }
 
 export class TradingStorage {
+  private readonly layout: TradingStorageLayout;
+  private readonly candleRecorder: DailyCandleRecorder;
+
   constructor(
-    private readonly dataDir: string,
+    dataDir: string,
     private readonly marketKey: string,
     private readonly symbol: string,
-    private readonly interval: string,
-  ) {}
+    interval: string,
+  ) {
+    this.layout = new TradingStorageLayout(dataDir);
+    const market = safePathPart(marketKey);
+    const normalizedSymbol = symbol.toLowerCase();
+    this.candleRecorder = new DailyCandleRecorder({
+      store: new SequentialShardStore(this.layout.marketStore),
+      namespace: `candles/${market}/${normalizedSymbol}/${safePathPart(interval)}`,
+      stagingDirectory: path.join(
+        this.layout.marketMutable,
+        "candles",
+        market,
+        normalizedSymbol,
+        safePathPart(interval),
+      ),
+      symbol,
+      interval,
+      stepMs: candleIntervalMilliseconds(interval),
+      metadata: { market },
+    });
+  }
 
   async ensureReady(): Promise<void> {
     await Promise.all([
       fs.mkdir(this.marketDir, { recursive: true }),
       fs.mkdir(this.stateDir, { recursive: true }),
       fs.mkdir(this.backtestDir, { recursive: true }),
+      this.candleRecorder.ensureReady(),
     ]);
   }
 
@@ -91,11 +119,11 @@ export class TradingStorage {
   }
 
   async loadCandles(limit = 500): Promise<Candle[]> {
-    return readJsonLines<Candle>(this.candlePath, limit);
+    return this.candleRecorder.readRecent(limit);
   }
 
   async appendCandle(candle: Candle): Promise<void> {
-    await appendJsonLine(this.candlePath, candle);
+    await this.candleRecorder.append(candle);
   }
 
   async loadOrderBookSnapshots(limit = 2_000): Promise<OrderBookSnapshot[]> {
@@ -114,22 +142,15 @@ export class TradingStorage {
   }
 
   private get marketDir(): string {
-    return path.join(this.dataDir, "market", safePathPart(this.marketKey));
+    return path.join(this.layout.marketMutable, "streams", safePathPart(this.marketKey));
   }
 
   private get stateDir(): string {
-    return path.join(this.dataDir, "state");
+    return this.layout.runtimeState;
   }
 
   private get backtestDir(): string {
-    return path.join(this.dataDir, "backtests", safePathPart(this.marketKey));
-  }
-
-  private get candlePath(): string {
-    return path.join(
-      this.marketDir,
-      `${this.symbol.toLowerCase()}-${this.interval}-candles.jsonl`,
-    );
+    return path.join(this.layout.runtimeBacktests, safePathPart(this.marketKey));
   }
 
   private get orderBookPath(): string {
@@ -163,6 +184,25 @@ export class TradingStorage {
       `runtime-${safePathPart(this.marketKey)}-${this.symbol.toLowerCase()}.json`,
     );
   }
+}
+
+function candleIntervalMilliseconds(interval: string): number {
+  const match = /^(\d+)([smhdw])$/.exec(interval);
+  if (!match) throw new Error(`Unsupported live candle interval: ${interval}.`);
+  const value = Number(match[1]);
+  const units: Record<string, number> = {
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+    w: 604_800_000,
+  };
+  const unit = units[match[2]!]!;
+  const milliseconds = value * unit;
+  if (!Number.isSafeInteger(milliseconds) || milliseconds < 1) {
+    throw new Error(`Invalid live candle interval: ${interval}.`);
+  }
+  return milliseconds;
 }
 
 interface StateFile<T> {

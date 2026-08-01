@@ -6,6 +6,7 @@ import staticFiles from "@fastify/static";
 import { WebSocketServer, type WebSocket } from "ws";
 import type {
   BacktestPreset,
+  BacktestStrategy,
   ManualTradeInput,
   PartialStrategyConfig,
   VwKamaCandleRangeRequest,
@@ -365,7 +366,7 @@ server.post("/api/exchange/leverage", async (request, reply) => {
 server.post("/api/backtest", async (request, reply) => {
   const body = (request.body ?? {}) as {
     preset?: BacktestPreset;
-    source?: "candles" | "orderbook-mid";
+    strategy?: BacktestStrategy;
     limit?: number;
     historicalStartTime?: number;
     startingQuote?: number;
@@ -378,9 +379,7 @@ server.post("/api/backtest", async (request, reply) => {
     randomPairCount?: number;
     extremaSmaWindowMinutes?: number;
   };
-  const preset =
-    body.preset ??
-    (body.source === "orderbook-mid" ? "saved-orderbook" : "saved-candles");
+  const preset = body.preset ?? "saved-candles";
 
   try {
     const randomPairCount =
@@ -394,6 +393,10 @@ server.post("/api/backtest", async (request, reply) => {
 
     runtime.startBacktest({
       preset,
+      strategy: body.strategy === "hindsight-oracle-1s"
+        || body.strategy === "learned-oracle-1s"
+        ? body.strategy
+        : "peak-valley",
       limit: clampInt(Number(body.limit ?? 1_000), 10, 10_000),
       historicalStartTime:
         body.historicalStartTime === undefined || !Number.isFinite(Number(body.historicalStartTime))

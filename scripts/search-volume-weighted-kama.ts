@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { fork } from "node:child_process";
 import { availableParallelism, cpus } from "node:os";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   isMainThread,
   parentPort,
@@ -104,6 +104,7 @@ interface Args {
   initialExposure: number;
   valueHoldingPeriodMode: VwKamaHoldingPeriodMode;
   valueHoldingPeriodMs: number;
+  valueDecisionDelayMs: number;
   valueHorizonMs: number;
   valueHorizonEndMode: VwKamaValueHorizonEndMode;
   oracleTemperature: number;
@@ -2631,6 +2632,9 @@ async function buildCases(
         let valueHorizonMs: number | undefined;
         if (config.objective === "value-distillation") {
           let holdingPeriodSteps = Math.max(1, Math.round(config.valueHoldingPeriodMs / scaleMs));
+          const decisionDelaySteps = Math.max(1, Math.round(
+            config.valueDecisionDelayMs / scaleMs,
+          ));
           const valueHorizonSteps = Math.max(1, Math.round(config.valueHorizonMs / scaleMs));
           if (config.valueHoldingPeriodMode === "fixed"
             && valueHorizonSteps < holdingPeriodSteps) {
@@ -2691,6 +2695,7 @@ async function buildCases(
           const options = {
             ...baseOptions,
             holdingPeriodSteps,
+            decisionDelaySteps,
             includeProbabilities: config.oracleMutualInformationLambda > 0
               && config.oracleMutualInformationMode === "precise"
               || config.strategyNormalMixture.max > 0,
@@ -3412,16 +3417,9 @@ function* loadSourceSegments(
   let found = false;
   for (let time = utcDay(range.start); time < range.end; time += DAY) {
     const date = new Date(time).toISOString().slice(0, 10);
-    const plainFile = path.join(sourceDir, `${date}.jsonl`);
-    const compressedFile = `${plainFile}.gz`;
-    const file = fs.existsSync(plainFile) ? plainFile : compressedFile;
+    const file = path.join(sourceDir, `${date}.json`);
     if (!fs.existsSync(file)) continue;
-    const content = file.endsWith(".gz")
-      ? gunzipSync(fs.readFileSync(file)).toString("utf8")
-      : fs.readFileSync(file, "utf8");
-    for (const line of content.split("\n")) {
-      if (!line.trim()) continue;
-      const parsed = JSON.parse(line) as TradingCandle & { interval?: string; closed?: boolean };
+    for (const parsed of readCandleShardReferenceSync(file)) {
       if (!validCandle(parsed) || parsed.closed === false) continue;
       if (parsed.openTime < range.start || parsed.openTime >= range.end) continue;
       if (parsed.interval && parseDuration(parsed.interval) !== intervalMs) {
@@ -3458,10 +3456,10 @@ function* loadSourceSegments(
 
 function sourceBounds(sourceDir: string): { start: number; end: number } {
   const dates = [...new Set(fs.readdirSync(sourceDir)
-    .map((file) => /^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.gz)?$/.exec(file)?.[1])
+    .map((file) => /^(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1])
     .filter((date): date is string => Boolean(date))
   )].sort();
-  if (dates.length === 0) throw new Error(`No daily JSONL shards in ${sourceDir}.`);
+  if (dates.length === 0) throw new Error(`No canonical daily candle shards in ${sourceDir}.`);
   const start = Date.parse(`${dates[0]}T00:00:00Z`);
   const shardEnd = Date.parse(`${dates.at(-1)}T00:00:00Z`) + DAY;
   const lastCompletedDay = utcDay(Date.now());
@@ -3521,7 +3519,7 @@ function parseArgs(argv: string[]): Args {
     "differential-weight", "crossover-rate", "immigrant-rate", "screen-windows",
     "screen-scales", "workers", "accelerator", "objective", "score-version",
     "exposure-grid-size", "exposure-min", "exposure-max", "max-effective-exposure", "initial-exposure",
-    "value-holding-period-mode", "value-holding-period", "value-horizon",
+    "value-holding-period-mode", "value-holding-period", "value-decision-delay", "value-horizon",
     "value-horizon-end-mode", "oracle-temperature",
     "strategy-temperature-range", "strategy-quadratic-scale-range",
     "strategy-quadratic-volatility-window-range",
@@ -3543,7 +3541,7 @@ function parseArgs(argv: string[]): Args {
     values.set(rawKey, value);
   }
   const get = (key: string, fallback: string) => values.get(key) ?? fallback;
-  const sourceDir = path.resolve(repoRoot, get("source-dir", "data/historical/spot-btcusdt/btcusdt/1m"));
+  const sourceDir = path.resolve(repoRoot, get("source-dir", "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m"));
   const outputPath = path.resolve(repoRoot, get("output", `data/benchmarks/volume-weighted-kama-${stamp}.jsonl`));
   const reportPath = path.resolve(repoRoot, get("report", `docs/volume-weighted-kama-${stamp}.md`));
   const algorithm = get("algorithm", "de");
@@ -3552,6 +3550,7 @@ function parseArgs(argv: string[]): Args {
   const objective = get("objective", "signal");
   const valueHoldingPeriodMode = get("value-holding-period-mode", "fixed");
   const valueHoldingPeriodMs = parseDuration(get("value-holding-period", "60s"));
+  const valueDecisionDelayMs = parseDuration(get("value-decision-delay", "1s"));
   const valueHorizonMs = parseDuration(get("value-horizon", "1h"));
   const valueHorizonEndMode = get("value-horizon-end-mode", "truncate");
   const oracleMutualInformationMode = get("oracle-mi-mode", "approximate");
@@ -3659,6 +3658,7 @@ function parseArgs(argv: string[]): Args {
     initialExposure,
     valueHoldingPeriodMode,
     valueHoldingPeriodMs,
+    valueDecisionDelayMs,
     valueHorizonMs,
     valueHorizonEndMode,
     oracleTemperature: positive(get("oracle-temperature", "0.01"), "oracle-temperature"),
@@ -3974,7 +3974,7 @@ function report(
     "- Matching is one chronological one-to-one alignment by resulting state. It maximizes total timing credit, so extra candidate transitions reduce precision and uncovered oracle transitions reduce recall.",
     `- Search objective: ${config.objective}; ${scoreWeightsDescription(config)}. Cleanliness is matched / (matched + extra); the displayed noise/signal ratio is extra / matched.`,
     config.objective === "value-distillation"
-    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} holding period H and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}, target-normal mixture ${formatRange(config.strategyNormalMixture)}, and target-normal sigma ${formatRange(config.strategyNormalSigma)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; loss mix λH=${config.entropyGapLambda}, λS=${config.stateMutualInformationLambda}, λO=${config.oracleMutualInformationLambda}, oracle MI ${config.oracleMutualInformationMode}${config.oracleMutualInformationMode === "precise" ? ` at ${config.mutualInformationBins} bins` : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
+    ? `- Oracle exposures: ${config.exposureGridSize} tradable targets over [${config.exposureMinimum}, ${config.exposureMaximum}] with |effective exposure| <= ${config.maxEffectiveExposure}; ${config.valueHoldingPeriodMode === "fixed" ? `${formatDuration(config.valueHoldingPeriodMs)} fixed` : `half the average time between consecutive oracle trades (${formatDuration(config.valueHoldingPeriodMs)} fallback)`} mandatory initial hold H, ${formatDuration(config.valueDecisionDelayMs)} continuation decision delay D, and ${formatDuration(config.valueHorizonMs)} value horizon T−t; window-end mode ${config.valueHorizonEndMode}; value temperature ${config.oracleTemperature}; candidate strategy temperature ${formatRange(config.strategyTemperature)}, quadratic scale ${formatRange(config.strategyQuadraticScale)}, quadratic volatility window ${formatRange(config.strategyQuadraticVolatility, formatDuration)}, target-normal mixture ${formatRange(config.strategyNormalMixture)}, and target-normal sigma ${formatRange(config.strategyNormalSigma)}${config.strategyVolatilityScaling ? "; temperature also scales by trailing-H volatility" : ""}; loss mix λH=${config.entropyGapLambda}, λS=${config.stateMutualInformationLambda}, λO=${config.oracleMutualInformationLambda}, oracle MI ${config.oracleMutualInformationMode}${config.oracleMutualInformationMode === "precise" ? ` at ${config.mutualInformationBins} bins` : ""}; opportunity weight is max(Q)-min(Q)+${config.opportunityEpsilon}.`
       : "- The signal score remains available as a diagnostic beside the selected objective.",
     config.objective === "value-distillation"
       ? "- Candidate fitness is the negative of the equally weighted median and P90 mixed loss; every scale/window case has equal weight."
@@ -4138,6 +4138,7 @@ function help(): void {
   --exposure-grid-size 255 --exposure-min -100 --exposure-max 100
   --value-holding-period-mode fixed fixed or oracle-half-average-trade
   --value-holding-period 60s        Fixed H, or adaptive fallback
+  --value-decision-delay 1s         Continuation decision delay D
   --value-horizon 1h                Final-equity horizon T−t; must be at least H
   --value-horizon-end-mode truncate truncate at window end, or extend into future candles
   --max-effective-exposure 250      Liquidate only after drift exceeds this absolute exposure

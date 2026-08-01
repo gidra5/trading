@@ -1,10 +1,15 @@
 import {
   GridTradingBot,
   PeakValleyStrategy,
+  SimulatedTradingApi,
+  DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+  DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
   calculateRiskAdjustedMetrics,
+  conditionalExposureProbabilities,
   createExtremaOrderMassCollector,
   createInitialBotState,
   createPeakValleyBotConfig,
+  exposureValueOracleActionDistribution,
   observeExtremaOrderMassCandle,
   perfectMarginOracle,
   summarizeExtremaOrderMass,
@@ -21,9 +26,11 @@ import {
   type BacktestChartAnnotation,
   type BacktestChartSmaSeries,
   type BacktestResult,
+  type BacktestStrategy,
   type BotSnapshot,
   type Candle,
   type EquityPoint,
+  type ExposureValueOracleActionDistribution,
   type PeakValleyBotConfig,
   type PeakValleyStrategyConfig,
   type PeakValleyStrategySnapshot,
@@ -37,17 +44,51 @@ import {
   type TradingPosition,
   type TradingStrategyEntrySignal,
   type TradingStrategyExitSignal,
+  type TradingStrategyTargetExposureContext,
+  type TradingStrategyTargetExposureSignal,
   type PositionSide,
 } from "@trading/bot-algo";
-import { PaperTradingApi } from "./trading-api/paper-api.js";
 
 export interface BotBacktestOptions {
   config: StrategyConfig;
+  strategy?: BacktestStrategy;
   warmup?: readonly Candle[];
+  oracleFuture?: readonly Candle[];
   maxEquityPoints?: number;
   maxChartCandles?: number;
   extremaSmaWindowMs?: number;
+  summaryOnly?: boolean;
+  /** Optional precomputed base oracle rows, used by long historical suite runs. */
+  hindsightOracleDistributionAt?: (
+    timestamp: number,
+  ) => ExposureValueOracleActionDistribution | null;
+  /** Causal learned-policy rows. Unlike the hindsight provider, this must never read future candles. */
+  learnedOracleDistributionAt?: (
+    timestamp: number,
+  ) => ExposureValueOracleActionDistribution | null;
+  /** Scales modal target exposure by confidence^power. Zero preserves raw modal exposure. */
+  hindsightOracleConfidenceExposurePower?: number;
+  /** Minimum fraction of max leverage available to the confidence-conditioned ceiling. */
+  hindsightOracleConfidenceLeverageFloor?: number;
+  onProgress?: (progress: {
+    candlesProcessed: number;
+    totalCandles: number;
+    elapsedMs: number;
+  }) => void;
 }
+
+export const HINDSIGHT_ORACLE_INTERVAL_MS = 1_000;
+export const HINDSIGHT_ORACLE_HOLDING_PERIOD_MS = 60_000;
+export const HINDSIGHT_ORACLE_DECISION_DELAY_MS = 60_000;
+export const HINDSIGHT_ORACLE_VALUE_HORIZON_MS = 60 * 60_000;
+export const HINDSIGHT_ORACLE_MAX_EXPOSURE = 100;
+export const HINDSIGHT_ORACLE_GRID_SIZE = 255;
+export const HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE = 250;
+export const HINDSIGHT_ORACLE_TEMPERATURE = 0.01;
+export const HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER = 0;
+export const HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR = 0.75;
+const HINDSIGHT_ORACLE_MIN_CONFIDENCE = 0.05;
+export const HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR = 10;
 
 interface OrderRecord {
   order: TradingOrderSnapshot;
@@ -71,18 +112,80 @@ export async function runBotBacktestFromCandles(
   if (candles.length === 0) throw new Error("Backtest requires at least one candle.");
   const startedAt = Date.now();
   const config = options.config;
-  const botConfig = createPeakValleyBotConfig(config, candleIntervalMs(candles));
+  const summaryOnly = options.summaryOnly ?? false;
+  const backtestStrategy = options.strategy ?? "peak-valley";
+  const intervalMs = candleIntervalMs(candles);
+  const oracleStrategy = backtestStrategy === "hindsight-oracle-1s"
+    || backtestStrategy === "learned-oracle-1s";
+  if (oracleStrategy && intervalMs !== HINDSIGHT_ORACLE_INTERVAL_MS) {
+    throw new Error("The one-second oracle policy strategies require one-second candles.");
+  }
+  const baseBotConfig = createPeakValleyBotConfig(config, intervalMs);
+  const botConfig = oracleStrategy
+    ? {
+        ...baseBotConfig,
+        maxTargetLeverage: HINDSIGHT_ORACLE_MAX_EXPOSURE,
+        // The exposure target is the risk cap; a second fixed quote cap would
+        // prevent 100x targets after account equity changes.
+        maxTradeQuote: Number.POSITIVE_INFINITY,
+        cooldownMs: HINDSIGHT_ORACLE_HOLDING_PERIOD_MS,
+      }
+    : baseBotConfig;
   const history = (options.warmup ?? []).map(tradingCandle);
-  const api = new PaperTradingApi({
+  const api = new SimulatedTradingApi({
     startingQuote: config.startingQuote,
     friction: (config.feeBps + config.positionRisk.marketSlippageBps) / 10_000,
     rules: marketRules(botConfig),
     getHistory: async ({ count }) => history.slice(-count),
+    quoteBorrowBpsHour: oracleStrategy
+      ? HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
+      : DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+    assetBorrowBpsHour: oracleStrategy
+      ? HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
+      : DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+    maxEffectiveLeverage: oracleStrategy
+      ? HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE
+      : DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
   });
-  const strategy = new TracingPeakValleyStrategy({
+  const oracleDistributionAt = backtestStrategy === "hindsight-oracle-1s"
+    ? options.hindsightOracleDistributionAt ?? createHindsightOracleDistributionProvider(
+      candles,
+      options.oracleFuture ?? [],
+      config,
+      intervalMs,
+    )
+    : backtestStrategy === "learned-oracle-1s"
+      ? options.learnedOracleDistributionAt
+      : undefined;
+  if (backtestStrategy === "learned-oracle-1s" && !oracleDistributionAt) {
+    throw new Error("The learned oracle strategy requires causal model distributions.");
+  }
+  const confidenceExposurePower = options.hindsightOracleConfidenceExposurePower
+    ?? HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER;
+  if (!(confidenceExposurePower >= 0) || !Number.isFinite(confidenceExposurePower)) {
+    throw new Error("Hindsight oracle confidence exposure power must be finite and non-negative.");
+  }
+  const confidenceLeverageFloor = options.hindsightOracleConfidenceLeverageFloor
+    ?? HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR;
+  if (
+    !(confidenceLeverageFloor >= 0 && confidenceLeverageFloor <= 1)
+    || !Number.isFinite(confidenceLeverageFloor)
+  ) {
+    throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
+  }
+  const strategyOptions = {
     config: botConfig.strategy,
     getHistory: api.getHistory.bind(api),
-  });
+  };
+  const strategy = oracleDistributionAt
+    ? new TracingOraclePolicyStrategy(
+        strategyOptions,
+        oracleDistributionAt,
+        apiFriction(config),
+        confidenceExposurePower,
+        confidenceLeverageFloor,
+      )
+    : new TracingPeakValleyStrategy(strategyOptions);
   const bot = new GridTradingBot({ api, strategy, config: botConfig });
   const orders = new Map<string, OrderRecord>();
   const positions = new Map<string, PositionAccounting>();
@@ -99,6 +202,7 @@ export async function runBotBacktestFromCandles(
   const series = averageSeries(botConfig);
   const equityEvery = Math.max(1, Math.ceil(candles.length / (options.maxEquityPoints ?? 800)));
   const chartEvery = Math.max(1, Math.ceil(candles.length / (options.maxChartCandles ?? 2_000)));
+  const progressEvery = Math.max(1, Math.ceil(candles.length / 100));
   let peakEquity = config.startingQuote;
   let maxDrawdownPct = 0;
   let maxEffectiveLeverage = 0;
@@ -107,75 +211,120 @@ export async function runBotBacktestFromCandles(
   let realizedPnl = 0;
   let closedPositionCount = 0;
   let profitableClosedPositionCount = 0;
+  let summaryFillCount = 0;
+  let processedCandles = 0;
+  let processedMarketEvents = 0;
+  let lastProcessed = candles[0]!;
   let latestDecision: BacktestSignalTrace | null = null;
+  let latestBotSnapshot:
+    BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot> | undefined;
 
   await bot.warmup();
-  for (let index = 0; index < candles.length; index += 1) {
+  replay: for (let index = 0; index < candles.length; index += 1) {
     const candle = candles[index];
-    for (const tick of executionTicks(candle)) {
+    processedCandles += 1;
+    lastProcessed = candle;
+    const balancesBefore = api.getUnleveragedBalances();
+    const replayTicks = api.hasOpenOrders() || api.hasExposure()
+      ? executionTicks(candle, balancesBefore.asset)
+      : [candleTick(candle)];
+    for (const tick of replayTicks) {
       currentTime = tick.timestamp;
       await api.onTick(tick);
-      await deliver();
+      processedMarketEvents += 1;
+      observeRisk(api.status().equity, api.status().effectiveLeverage);
+      if (api.isLiquidated()) break;
     }
-    const closeTick = candleTick(candle);
-    currentTime = closeTick.timestamp;
-    await bot.onTick(closeTick);
-    await capturePositions();
+    // Apply all fills from the candle as one atomic interval. Orders created in
+    // response to an intrabar fill cannot use a later, unknowable OHLC extreme.
     await deliver();
-    captureSignal((index + 1) % chartEvery === 0 || index === candles.length - 1);
-    observeExtremaOrderMassCandle(extremaCollector, candle);
+    const closeTick = candleTick(candle);
+    if (!api.isLiquidated()) {
+      currentTime = closeTick.timestamp;
+      await bot.onTick(closeTick);
+      if (!summaryOnly) await capturePositions();
+      await deliver();
+      observeRisk(api.status().equity, api.status().effectiveLeverage);
+    }
+    if (!summaryOnly) {
+      captureSignal((index + 1) % chartEvery === 0 || index === candles.length - 1);
+      observeExtremaOrderMassCandle(extremaCollector, candle);
+    }
 
-    const account = await api.getEquity();
-    const equity = account.quoteUnleveraged + account.assetUnleveraged * candle.close;
-    const botSnapshot = await bot.snapshot();
-    peakEquity = Math.max(peakEquity, equity);
-    maxDrawdownPct = Math.max(maxDrawdownPct, peakEquity > 0 ? (peakEquity - equity) / peakEquity * 100 : 0);
-    maxEffectiveLeverage = Math.max(maxEffectiveLeverage, effectiveLeverage(botSnapshot, candle.close, equity));
-    if (index % equityEvery === 0 || index === candles.length - 1) {
-      equityCurve.push({ time: candle.closeTime, equity, price: candle.close });
+    const simulation = api.status();
+    const equity = simulation.equity;
+    const markTime = simulation.liquidatedAt ?? candle.closeTime;
+    const markPrice = simulation.liquidationPrice ?? candle.close;
+    const account = summaryOnly ? undefined : await api.getEquity();
+    if (index % equityEvery === 0 || index === candles.length - 1 || simulation.liquidated) {
+      equityCurve.push({ time: markTime, equity, price: markPrice });
     }
-    if (index % chartEvery === 0) {
-      chartCandles.push({ ...candle });
-    } else {
-      mergeChartCandle(chartCandles.at(-1)!, candle);
-    }
-    if ((index + 1) % chartEvery === 0 || index === candles.length - 1) {
-      frames.push(traceFrame(candle.closeTime, candle.close, account, botSnapshot, equity));
-      const diagnostics = strategy.getDiagnostics();
-      for (const item of series) {
-        const value = diagnostics.indicators[item.index < 0 ? "kama" : `average.${item.windowSec}`];
-        if (Number.isFinite(value)) item.points.push({ time: candle.closeTime, value: value as number });
+    if (!summaryOnly) {
+      if (index % chartEvery === 0) {
+        chartCandles.push({ ...candle });
+      } else {
+        mergeChartCandle(chartCandles.at(-1)!, candle);
+      }
+      if ((index + 1) % chartEvery === 0 || index === candles.length - 1) {
+        frames.push(traceFrame(markTime, markPrice, account!, latestBotSnapshot!, equity));
+        const diagnostics = strategy.getDiagnostics();
+        for (const item of series) {
+          const value = diagnostics.indicators[item.index < 0 ? "kama" : `average.${item.windowSec}`];
+          if (Number.isFinite(value)) item.points.push({ time: candle.closeTime, value: value as number });
+        }
       }
     }
+    if (
+      options.onProgress
+      && (processedCandles % progressEvery === 0 || processedCandles === candles.length)
+    ) {
+      options.onProgress({
+        candlesProcessed: processedCandles,
+        totalCandles: candles.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
+    if (simulation.liquidated) break replay;
   }
 
-  const last = candles.at(-1)!;
+  const last = lastProcessed;
   const equity = await api.getEquity();
-  const finalEquity = equity.quoteUnleveraged + equity.assetUnleveraged * last.close;
+  const simulation = api.status();
+  maxEffectiveLeverage = Math.max(
+    maxEffectiveLeverage,
+    simulation.maxEffectiveLeverage,
+  );
+  const finalPrice = simulation.liquidationPrice ?? last.close;
+  const finalTime = simulation.liquidatedAt ?? last.closeTime;
+  const finalEquity = simulation.equity;
   const netPnl = finalEquity - config.startingQuote;
   const returnPct = config.startingQuote > 0 ? netPnl / config.startingQuote * 100 : 0;
   const risk = calculateRiskAdjustedMetrics(equityCurve, returnPct, maxDrawdownPct);
-  const oracle = perfectMarginOracle(candles, {
+  const oracle = perfectMarginOracle(candles.slice(0, processedCandles), {
     startingQuote: config.startingQuote,
-    leverage: config.maxLeverage,
+    leverage: botConfig.maxTargetLeverage,
     friction: apiFriction(config),
     eventMode: "close",
     maxPathCandles: options.maxChartCandles ?? 2_000,
   });
   const snapshots = [...orders.values()].map(({ order, trace }) => legacyOrder(order, trace.createdAt));
-  const extremaOrderMass = summarizeExtremaOrderMass(extremaCollector, fills);
+  const extremaOrderMass = summaryOnly
+    ? undefined
+    : summarizeExtremaOrderMass(extremaCollector, fills);
   const trace: BacktestTrace = {
     positions: [...positionTraces.values()],
     grids: [...gridTraces.values()],
     orders: [...orders.values()].map(({ trace }) => trace),
     signals,
-    extrema: buildExtremaTrace(extremaCollector, [...orders.values()].map(({ trace }) => trace), extremaOrderMass),
+    extrema: summaryOnly
+      ? []
+      : buildExtremaTrace(extremaCollector, [...orders.values()].map(({ trace }) => trace), extremaOrderMass!),
     oracle: oracle.path,
     frames,
   };
   const finalState = createInitialBotState(config);
-  finalState.lastPrice = last.close;
-  finalState.updatedAt = last.closeTime;
+  finalState.lastPrice = finalPrice;
+  finalState.updatedAt = finalTime;
   finalState.quoteFree = equity.quoteAvailable;
   finalState.quoteReserved = equity.quoteReserved;
   finalState.baseFree = equity.assetUnleveraged;
@@ -192,8 +341,8 @@ export async function runBotBacktestFromCandles(
     returnPct,
     peakEquity,
     maxDrawdownPct,
-    tradeCount: fills.length,
-    feesPaid: fills.reduce((sum, fill) => sum + fill.feeQuote, 0),
+    tradeCount: summaryOnly ? summaryFillCount : fills.length,
+    feesPaid: simulation.feesPaid,
     realizedPnl,
     winningTrades: profitableClosedPositionCount,
     losingTrades: closedPositionCount - profitableClosedPositionCount,
@@ -206,12 +355,13 @@ export async function runBotBacktestFromCandles(
     summary: {
       symbol: config.symbol,
       source: "candles",
+      strategy: backtestStrategy,
       startTime: candles[0].openTime,
-      endTime: last.closeTime,
-      eventsProcessed: candles.length * 4,
-      candlesProcessed: candles.length,
-      stoppedEarly: false,
-      stopReason: "completed",
+      endTime: finalTime,
+      eventsProcessed: processedMarketEvents,
+      candlesProcessed: processedCandles,
+      stoppedEarly: simulation.liquidated,
+      stopReason: simulation.liquidated ? "liquidated" : "completed",
       durationMs: Date.now() - startedAt,
       replayDurationMs: Date.now() - startedAt,
       finalEquity,
@@ -232,14 +382,16 @@ export async function runBotBacktestFromCandles(
       maxDrawdownPct,
       maxEntryLeverage: botConfig.maxTargetLeverage,
       maxEffectiveLeverage,
-      tradeCount: fills.length,
+      tradeCount: summaryOnly ? summaryFillCount : fills.length,
+      feesPaid: simulation.feesPaid,
+      maintenancePaid: simulation.maintenancePaid,
       winRate: closedPositionCount > 0 ? profitableClosedPositionCount / closedPositionCount * 100 : 0,
       closedPositionCount,
       profitableClosedPositionCount,
       profitableClosedPositionRate: closedPositionCount > 0
         ? profitableClosedPositionCount / closedPositionCount * 100
         : 0,
-      liquidatedPositionCount: 0,
+      liquidatedPositionCount: simulation.liquidationCount,
       extremaOrderMass,
     },
     equityCurve,
@@ -256,16 +408,23 @@ export async function runBotBacktestFromCandles(
 
   async function deliver(): Promise<void> {
     for (const event of api.drainEvents()) {
-      recordFill(event);
+      if (summaryOnly && (event.type === "fill" || event.type === "partial-fill")) {
+        summaryFillCount += 1;
+      } else {
+        recordFill(event);
+      }
       await bot.onOrder(event);
-      captureCause = "fill";
-      await capturePositions();
-      captureCause = "tick";
+      if (!summaryOnly) {
+        captureCause = "fill";
+        await capturePositions();
+        captureCause = "tick";
+      }
     }
   }
 
   async function capturePositions(): Promise<void> {
     const snapshot = await bot.snapshot();
+    latestBotSnapshot = snapshot;
     const currentIds = new Set(snapshot.positions.map((position) => position.id));
     const liveOrderIds = new Set<string>();
     for (const position of snapshot.positions) {
@@ -449,8 +608,9 @@ export async function runBotBacktestFromCandles(
     if (!record) return;
     const { order } = record;
     order.status = event.type === "fill" ? "filled" : "partially-filled";
-    const price = event.fill.filledAsset > 0 ? event.fill.filledQuote / event.fill.filledAsset : 0;
-    const feeQuote = event.fill.filledQuote * apiFriction(config);
+    const price = event.fill.price
+      ?? (event.fill.filledAsset > 0 ? event.fill.filledQuote / event.fill.filledAsset : 0);
+    const feeQuote = event.fill.feeQuote ?? event.fill.filledQuote * apiFriction(config);
     const fillPnl = accountFill(record, event.fill.filledAsset, event.fill.filledQuote);
     realizedPnl += fillPnl;
     fills.push({
@@ -463,7 +623,7 @@ export async function runBotBacktestFromCandles(
       feeQuote,
       realizedPnl: fillPnl,
       filledAt: currentTime,
-      reason: "peak-valley",
+      reason: backtestStrategy,
     });
     record.trace.fills.push({
       id: fills.at(-1)!.id,
@@ -514,10 +674,19 @@ export async function runBotBacktestFromCandles(
     return pnl;
   }
 
+  function observeRisk(equity: number, effective: number): void {
+    peakEquity = Math.max(peakEquity, equity);
+    maxDrawdownPct = Math.max(
+      maxDrawdownPct,
+      peakEquity > 0 ? (peakEquity - equity) / peakEquity * 100 : 0,
+    );
+    maxEffectiveLeverage = Math.max(maxEffectiveLeverage, effective);
+  }
+
   function traceFrame(
     time: number,
     price: number,
-    account: Awaited<ReturnType<PaperTradingApi["getEquity"]>>,
+    account: Awaited<ReturnType<SimulatedTradingApi["getEquity"]>>,
     snapshot: BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>,
     equity: number,
   ): BacktestTraceFrame {
@@ -563,7 +732,7 @@ export async function runBotBacktestFromCandles(
         maxDrawdownPct,
         exposurePct: equity > 0 ? grossExposureQuote / equity * 100 : 0,
         maxEffectiveLeverage,
-        feesPaid: fills.reduce((sum, fill) => sum + fill.feeQuote, 0),
+        feesPaid: api.status().feesPaid,
         tradeCount: fills.length,
         winRate: closedPositionCount > 0 ? profitableClosedPositionCount / closedPositionCount * 100 : 0,
       },
@@ -605,12 +774,15 @@ function marketRules(config: PeakValleyBotConfig) {
   };
 }
 
-function executionTicks(candle: Candle): TradingTick[] {
+function executionTicks(candle: Candle, signedAsset: number): TradingTick[] {
   const span = Math.max(1, candle.closeTime - candle.openTime);
+  const adverse = signedAsset > 0
+    ? [[candle.low, 0.33], [candle.high, 0.66]] as const
+    : [[candle.high, 0.33], [candle.low, 0.66]] as const;
   return [
     tick(candle.openTime, candle.open, candle.volume / 4),
-    tick(candle.openTime + span * 0.33, candle.high, candle.volume / 4),
-    tick(candle.openTime + span * 0.66, candle.low, candle.volume / 4),
+    tick(candle.openTime + span * adverse[0][1], adverse[0][0], candle.volume / 4),
+    tick(candle.openTime + span * adverse[1][1], adverse[1][0], candle.volume / 4),
     tick(candle.closeTime, candle.close, candle.volume / 4),
   ];
 }
@@ -675,18 +847,18 @@ function legacyOrder(order: TradingOrderSnapshot, createdAt: number): TradingOrd
 }
 
 class TracingPeakValleyStrategy extends PeakValleyStrategy {
-  private tick: TradingTick | null = null;
+  protected tick: TradingTick | null = null;
   private entry: TradingStrategyEntrySignal | null = null;
   private exit: TradingStrategyExitSignal | null = null;
-
-  constructor(options: StrategyOptions<PeakValleyStrategyConfig>) {
-    super(options);
-  }
+  protected targetActive: { type: "entry" | "exit"; side: PositionSide }[] = [];
+  protected targetIndicators: Record<string, number | null> = {};
 
   override async onTick(tick: TradingTick): Promise<void> {
     this.tick = tick;
     this.entry = null;
     this.exit = null;
+    this.targetActive = [];
+    this.targetIndicators = {};
     await super.onTick(tick);
   }
 
@@ -707,10 +879,15 @@ class TracingPeakValleyStrategy extends PeakValleyStrategy {
     const active = [
       ...(this.entry ? [{ type: "entry" as const, side: this.entry.side }] : []),
       ...(this.exit ? [{ type: "exit" as const, side: this.exit.side }] : []),
+      ...this.targetActive,
     ];
     const confirmationActive = diagnostics.gates.some((gate) =>
       gate.passed && (gate.code.includes(".confirmation.") || gate.code.includes(".source.")));
-    if (active.length === 0 && (!includeConfirmations || !confirmationActive)) return null;
+    if (
+      active.length === 0
+      && Object.keys(this.targetIndicators).length === 0
+      && (!includeConfirmations || !confirmationActive)
+    ) return null;
     return {
       time: this.tick.timestamp,
       price: this.tick.price,
@@ -718,17 +895,312 @@ class TracingPeakValleyStrategy extends PeakValleyStrategy {
       active,
       gates: structuredClone(diagnostics.gates),
       blockers: [...diagnostics.blockers],
-      indicators: structuredClone(diagnostics.indicators),
+      indicators: {
+        ...structuredClone(diagnostics.indicators),
+        ...this.targetIndicators,
+      },
     };
   }
 
   hasExitDecision(side: PositionSide): boolean {
-    return this.exit?.side === side;
+    return this.exit?.side === side
+      || this.targetActive.some((action) => action.type === "exit" && action.side === side);
   }
 
   currentPrice(): number {
     return this.tick?.price ?? 0;
   }
+}
+
+interface HindsightOracleTargetDecision {
+  targetExposure: number;
+  confidence: number;
+  entropy: number;
+  feasibleActionCount: number;
+}
+
+export function hindsightOracleTargetDecision(
+  distribution: ExposureValueOracleActionDistribution,
+  currentExposure: number,
+  friction: number,
+  temperature = HINDSIGHT_ORACLE_TEMPERATURE,
+): HindsightOracleTargetDecision {
+  const probabilities = conditionalExposureProbabilities(
+    distribution.probabilities,
+    distribution.grid,
+    currentExposure,
+    friction,
+    1 / temperature,
+  );
+  let modalIndex = 0;
+  let entropy = 0;
+  for (let index = 0; index < probabilities.length; index += 1) {
+    const probability = probabilities[index]!;
+    if (probability > probabilities[modalIndex]!) modalIndex = index;
+    if (probability > 0) entropy -= probability * Math.log(probability);
+  }
+  const feasibleActionCount = Math.max(1, distribution.feasibleActionCount);
+  const maximumEntropy = Math.log(feasibleActionCount);
+  const confidence = maximumEntropy > 0
+    ? Math.max(0, Math.min(1, 1 - entropy / maximumEntropy))
+    : 1;
+  return {
+    targetExposure: distribution.grid[modalIndex]!,
+    confidence,
+    entropy,
+    feasibleActionCount,
+  };
+}
+
+export function confidenceScaledHindsightOracleExposure(
+  modalExposure: number,
+  confidence: number,
+  power = HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
+): number {
+  if (!(power >= 0) || !Number.isFinite(power)) {
+    throw new Error("Hindsight oracle confidence exposure power must be finite and non-negative.");
+  }
+  return modalExposure * Math.max(0, Math.min(1, confidence)) ** power;
+}
+
+export function confidenceConditionedHindsightOracleExposure(
+  modalExposure: number,
+  confidence: number,
+  maximumLeverage: number,
+  power = HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
+  leverageFloor = HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+): number {
+  if (!(maximumLeverage >= 0) || !Number.isFinite(maximumLeverage)) {
+    throw new Error("Hindsight oracle maximum leverage must be finite and non-negative.");
+  }
+  if (!(leverageFloor >= 0 && leverageFloor <= 1) || !Number.isFinite(leverageFloor)) {
+    throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
+  }
+  const boundedConfidence = Math.max(0, Math.min(1, confidence));
+  const scaled = confidenceScaledHindsightOracleExposure(
+    modalExposure,
+    boundedConfidence,
+    power,
+  );
+  const cap = maximumLeverage * (leverageFloor + (1 - leverageFloor) * boundedConfidence);
+  return Math.max(-cap, Math.min(cap, scaled));
+}
+
+export function hindsightOracleUsableDistribution(
+  distribution: ExposureValueOracleActionDistribution,
+  maximumExposure = HINDSIGHT_ORACLE_MAX_EXPOSURE,
+): ExposureValueOracleActionDistribution {
+  const indexes: number[] = [];
+  for (let index = 0; index < distribution.grid.length; index += 1) {
+    if (Math.abs(distribution.grid[index]!) <= maximumExposure) indexes.push(index);
+  }
+  if (indexes.length < 2) {
+    throw new Error("Hindsight oracle distribution has no usable exposure interval.");
+  }
+  const grid = Float64Array.from(indexes, (index) => distribution.grid[index]!);
+  const probabilities = Float64Array.from(
+    indexes,
+    (index) => distribution.probabilities[index]!,
+  );
+  const total = probabilities.reduce((sum, probability) => sum + probability, 0);
+  if (!(total > 0)) throw new Error("Hindsight oracle usable interval has no probability mass.");
+  let feasibleActionCount = 0;
+  let modalIndex = 0;
+  let mean = 0;
+  let secondMoment = 0;
+  let entropy = 0;
+  for (let index = 0; index < probabilities.length; index += 1) {
+    probabilities[index] /= total;
+    const probability = probabilities[index]!;
+    if (probability > probabilities[modalIndex]!) modalIndex = index;
+    if (probability > 0) {
+      feasibleActionCount += 1;
+      entropy -= probability * Math.log(probability);
+    }
+    mean += probability * grid[index]!;
+    secondMoment += probability * grid[index]! ** 2;
+  }
+  return {
+    grid,
+    probabilities,
+    mean,
+    secondMoment,
+    modalExposure: grid[modalIndex]!,
+    entropy,
+    opportunity: distribution.opportunity,
+    feasibleActionCount,
+  };
+}
+
+class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
+  constructor(
+    options: StrategyOptions<PeakValleyStrategyConfig>,
+    private readonly distributionAt: (
+      timestamp: number,
+    ) => ExposureValueOracleActionDistribution | null,
+    private readonly friction: number,
+    private readonly confidenceExposurePower: number,
+    private readonly confidenceLeverageFloor: number,
+  ) {
+    super(options);
+  }
+
+  async targetExposureSignal(
+    context: TradingStrategyTargetExposureContext,
+  ): Promise<TradingStrategyTargetExposureSignal | null> {
+    const distribution = this.distributionAt(context.timestamp);
+    if (!distribution || !this.tick) return null;
+    const decision = hindsightOracleTargetDecision(
+      distribution,
+      context.currentExposure,
+      this.friction,
+    );
+    const targetExposure = confidenceConditionedHindsightOracleExposure(
+      decision.targetExposure,
+      decision.confidence,
+      context.maxLeverage,
+      this.confidenceExposurePower,
+      this.confidenceLeverageFloor,
+    );
+    const confidenceLeverageFraction = this.confidenceLeverageFloor
+      + (1 - this.confidenceLeverageFloor) * decision.confidence;
+    const confidenceLeverageCap = context.maxLeverage * confidenceLeverageFraction;
+    const confidenceScale = decision.targetExposure !== 0
+      ? targetExposure / decision.targetExposure
+      : decision.confidence ** this.confidenceExposurePower;
+    const gridStep = Math.abs(distribution.grid[1]! - distribution.grid[0]!);
+    const delta = targetExposure - context.currentExposure;
+    this.targetIndicators = {
+      "oracle.currentExposure": context.currentExposure,
+      "oracle.modalExposure": decision.targetExposure,
+      "oracle.targetExposure": targetExposure,
+      "oracle.deltaExposure": delta,
+      "oracle.confidence": decision.confidence,
+      "oracle.confidenceExposureScale": confidenceScale,
+      "oracle.confidenceExposurePower": this.confidenceExposurePower,
+      "oracle.confidenceLeverageFloor": this.confidenceLeverageFloor,
+      "oracle.confidenceLeverageCap": confidenceLeverageCap,
+      "oracle.entropy": decision.entropy,
+      "oracle.feasibleActions": decision.feasibleActionCount,
+    };
+    if (
+      decision.confidence < HINDSIGHT_ORACLE_MIN_CONFIDENCE
+      || Math.abs(delta) < gridStep / 2
+    ) return null;
+    this.targetActive = targetExposureActions(context.currentExposure, targetExposure);
+    return {
+      targetExposure,
+      price: this.tick.price,
+      confidence: decision.confidence,
+    };
+  }
+}
+
+function targetExposureActions(
+  currentExposure: number,
+  targetExposure: number,
+): { type: "entry" | "exit"; side: PositionSide }[] {
+  if (targetExposure > 0) {
+    return currentExposure < 0
+      ? [{ type: "exit", side: "short" }, { type: "entry", side: "long" }]
+      : [{ type: targetExposure > currentExposure ? "entry" : "exit", side: "long" }];
+  }
+  if (targetExposure < 0) {
+    return currentExposure > 0
+      ? [{ type: "exit", side: "long" }, { type: "entry", side: "short" }]
+      : [{ type: targetExposure < currentExposure ? "entry" : "exit", side: "short" }];
+  }
+  return currentExposure > 0
+    ? [{ type: "exit", side: "long" }]
+    : currentExposure < 0
+      ? [{ type: "exit", side: "short" }]
+      : [];
+}
+
+function createHindsightOracleDistributionProvider(
+  candles: readonly Candle[],
+  future: readonly Candle[],
+  config: StrategyConfig,
+  intervalMs: number,
+): (timestamp: number) => ExposureValueOracleActionDistribution | null {
+  const source = continuousOracleCandles(candles, future, intervalMs);
+  const prices = Float64Array.from(source, (candle) => candle.close);
+  const scoredLength = candles.length;
+  const holdingPeriodSteps = Math.max(1, Math.round(
+    HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / intervalMs,
+  ));
+  const decisionDelaySteps = Math.max(1, Math.round(
+    HINDSIGHT_ORACLE_DECISION_DELAY_MS / intervalMs,
+  ));
+  const valueHorizonSteps = Math.max(holdingPeriodSteps, Math.round(
+    HINDSIGHT_ORACLE_VALUE_HORIZON_MS / intervalMs,
+  ));
+  const quoteBorrowRate = hourlyRatePerCandle(
+    HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR,
+    intervalMs,
+  );
+
+  return (timestamp) => {
+    const candleIndex = candleIndexAtClose(candles, timestamp);
+    if (
+      candleIndex < 0
+      || candleIndex >= scoredLength - 1
+      || candleIndex % holdingPeriodSteps !== 0
+    ) return null;
+    const terminalIndex = Math.min(prices.length - 1, candleIndex + valueHorizonSteps);
+    if (terminalIndex <= candleIndex) return null;
+    const horizonPrices = prices.subarray(candleIndex, terminalIndex + 1);
+    return hindsightOracleUsableDistribution(exposureValueOracleActionDistribution(horizonPrices, {
+      scoreStartIndex: 0,
+      holdingPeriodSteps: Math.min(holdingPeriodSteps, horizonPrices.length - 1),
+      decisionDelaySteps,
+      valueHorizonSteps,
+      terminalIndex: horizonPrices.length - 1,
+      friction: apiFriction(config),
+      gridSize: HINDSIGHT_ORACLE_GRID_SIZE,
+      minExposure: -HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE,
+      maxExposure: HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE,
+      maxEffectiveExposure: HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE,
+      initialExposure: 0,
+      temperature: HINDSIGHT_ORACLE_TEMPERATURE,
+      opportunityEpsilon: 0,
+      quoteBorrowRate,
+      assetBorrowRate: quoteBorrowRate,
+      distributionOnly: true,
+      includePath: false,
+    }));
+  };
+}
+
+function continuousOracleCandles(
+  candles: readonly Candle[],
+  future: readonly Candle[],
+  intervalMs: number,
+): Candle[] {
+  const result = [...candles];
+  let expected = result.at(-1)!.openTime + intervalMs;
+  for (const candle of future) {
+    if (candle.openTime < expected) continue;
+    if (candle.openTime !== expected) break;
+    result.push(candle);
+    expected += intervalMs;
+  }
+  return result;
+}
+
+function candleIndexAtClose(candles: readonly Candle[], timestamp: number): number {
+  let low = 0;
+  let high = candles.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (candles[middle]!.closeTime < timestamp) low = middle + 1;
+    else high = middle;
+  }
+  return candles[low]?.closeTime === timestamp ? low : -1;
+}
+
+function hourlyRatePerCandle(hourlyRateBps: number, intervalMs: number): number {
+  return Math.expm1(Math.log1p(hourlyRateBps / 10_000) * intervalMs / 3_600_000);
 }
 
 function mergeChartCandle(target: Candle, candle: Candle): void {

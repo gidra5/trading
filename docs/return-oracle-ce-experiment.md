@@ -170,12 +170,12 @@ preserved in
 [`experiments/return-oracle-shared-c-sharpness-p1-baseline-2026-07-29.md`](experiments/return-oracle-shared-c-sharpness-p1-baseline-2026-07-29.md).
 The directly preceding exact-RMS run with independent centering matrices and
 10% reverse-KL/10% entropy-sharpness gates is archived at
-`data/ml-runs/return-oracle-ce-shrinking-v1-hard-rms-reverse-p1-sharpness-p1-baseline-20260729-235300`.
+`data/training/runs/return-oracle-ce-shrinking-v1-hard-rms-reverse-p1-sharpness-p1-baseline-20260729-235300`.
 The subsequent tanh-family soft-RMS run is archived at
-`data/ml-runs/return-oracle-ce-shrinking-v1-tanh-soft-rms-baseline-20260730-002736`.
+`data/training/runs/return-oracle-ce-shrinking-v1-tanh-soft-rms-baseline-20260730-002736`.
 The following square-root-family run that used
 `C x / sqrt(1 + (r/s)^2)` with `s = 1` is archived at
-`data/ml-runs/return-oracle-ce-shrinking-v1-sqrt-output-scale-baseline-20260730-002937`.
+`data/training/runs/return-oracle-ce-shrinking-v1-sqrt-output-scale-baseline-20260730-002937`.
 That form learned slowly because it bounded branch RMS by `s` and did not
 reproduce the amplification of the preceding hard RMS operation.
 The directly preceding learned-radius run with hidden widths shrinking from

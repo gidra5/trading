@@ -9,7 +9,7 @@ the activation-regularizer ablation.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-learnable-c-full-regularization-baseline-20260729-144909
+data/training/runs/return-oracle-ce-shrinking-v1-learnable-c-full-regularization-baseline-20260729-144909
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,21 +9,14 @@ import {
   type Candle,
 } from "@trading/bot-algo";
 import { MlpFeatureStore } from "../src/mlp-feature-store.js";
+import { writeCanonicalCandleDay } from "./canonical-storage-fixture.js";
 
 const MINUTE_MS = 60_000;
 
 test("MLP features end every coarse window in a causal partial candle", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "mlp-features-"));
   const start = Date.parse("2026-01-01T00:00:00.000Z");
-  const minuteRoot = path.join(
-    dataDir,
-    "historical",
-    "spot-btcusdt",
-    "btcusdt",
-    "1m",
-  );
-  await mkdir(minuteRoot, { recursive: true });
-  await writeFile(path.join(minuteRoot, "2026-01-01.jsonl"), `${JSON.stringify({
+  await writeCanonicalCandleDay(dataDir, [{
     symbol: "BTCUSDT",
     interval: "1m",
     openTime: start,
@@ -34,7 +27,7 @@ test("MLP features end every coarse window in a causal partial candle", async ()
     close: 160,
     volume: 60,
     closed: true,
-  } satisfies Candle)}\n`);
+  } satisfies Candle], { stepMs: MINUTE_MS });
   const seconds = Array.from({ length: 30 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -69,18 +62,6 @@ test("MLP features end every coarse window in a causal partial candle", async ()
 test("completed minute loading reconstructs a missing archive day from seconds", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "mlp-minute-recovery-"));
   const start = Date.parse("2026-01-02T00:00:00.000Z");
-  const historicalRoot = path.join(
-    dataDir,
-    "historical",
-    "spot-btcusdt",
-    "btcusdt",
-  );
-  const minuteRoot = path.join(historicalRoot, "1m");
-  const secondRoot = path.join(historicalRoot, "1s");
-  await Promise.all([
-    mkdir(minuteRoot, { recursive: true }),
-    mkdir(secondRoot, { recursive: true }),
-  ]);
   const seconds = Array.from({ length: 60 }, (_, index): Candle => ({
     symbol: "BTCUSDT",
     interval: "1s",
@@ -93,10 +74,7 @@ test("completed minute loading reconstructs a missing archive day from seconds",
     volume: index + 1,
     closed: true,
   }));
-  await writeFile(
-    path.join(secondRoot, "2026-01-02.jsonl"),
-    `${seconds.map((candle) => JSON.stringify(candle)).join("\n")}\n`,
-  );
+  await writeCanonicalCandleDay(dataDir, seconds, { stepMs: 1_000 });
   try {
     const store = new MlpFeatureStore(dataDir);
     const [minute] = await store.loadCompletedMinuteRange(
@@ -121,14 +99,6 @@ test("deployment warmup depth does not change canonical MLP features", async () 
   const currentDay = Date.parse("2026-01-01T00:00:00.000Z");
   const previousDay = currentDay - 86_400_000;
   const extraDay = previousDay - 86_400_000;
-  const minuteRoot = path.join(
-    dataDir,
-    "historical",
-    "spot-btcusdt",
-    "btcusdt",
-    "1m",
-  );
-  await mkdir(minuteRoot, { recursive: true });
   const minute = (openTime: number, price: number): Candle => ({
     symbol: "BTCUSDT",
     interval: "1m",
@@ -142,14 +112,8 @@ test("deployment warmup depth does not change canonical MLP features", async () 
     closed: true,
   });
   await Promise.all([
-    writeFile(
-      path.join(minuteRoot, "2025-12-30.jsonl"),
-      `${JSON.stringify(minute(extraDay, 90))}\n`,
-    ),
-    writeFile(
-      path.join(minuteRoot, "2025-12-31.jsonl"),
-      `${JSON.stringify(minute(previousDay, 95))}\n`,
-    ),
+    writeCanonicalCandleDay(dataDir, [minute(extraDay, 90)], { stepMs: MINUTE_MS }),
+    writeCanonicalCandleDay(dataDir, [minute(previousDay, 95)], { stepMs: MINUTE_MS }),
   ]);
   const seconds = (start: number, count: number, price: number) =>
     Array.from({ length: count }, (_, index): Candle => ({
@@ -187,14 +151,6 @@ test("deployment warmup depth does not change canonical MLP features", async () 
 test("cumulative feature queries preserve the reference EMA encoding", async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), "mlp-cumulative-features-"));
   const start = Date.parse("2026-01-01T00:00:00.000Z");
-  const minuteRoot = path.join(
-    dataDir,
-    "historical",
-    "spot-btcusdt",
-    "btcusdt",
-    "1m",
-  );
-  await mkdir(minuteRoot, { recursive: true });
   const archivedMinute: Candle = {
     symbol: "BTCUSDT",
     interval: "1m",
@@ -207,10 +163,7 @@ test("cumulative feature queries preserve the reference EMA encoding", async () 
     volume: 60,
     closed: true,
   };
-  await writeFile(
-    path.join(minuteRoot, "2026-01-01.jsonl"),
-    `${JSON.stringify(archivedMinute)}\n`,
-  );
+  await writeCanonicalCandleDay(dataDir, [archivedMinute], { stepMs: MINUTE_MS });
   const seconds = Array.from({ length: 300 }, (_, index): Candle => {
     const open = 100 + index * 0.01;
     const close = open + (index % 7 - 3) * 0.001;

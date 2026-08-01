@@ -13,6 +13,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from trading_storage import checkpoint_exists, require_under, training_storage_layout
+
 from adaptive_curriculum import (
     LOSS_TERMS,
     DelayContinuation,
@@ -152,11 +154,12 @@ def finite_validation(candidate: dict[str, Any]) -> float:
 
 
 def unlink_branch_model(branches_dir: Path, model_file: Path) -> int:
-    """Delete only a materialized adaptive branch checkpoint."""
+    """Delete only a canonical adaptive branch checkpoint pointer."""
     root = branches_dir.resolve()
     model = model_file.resolve()
     if (
-        model.name != "best-model.pt"
+        model.name != "best.json"
+        or model.parent.name != "checkpoints"
         or not model.is_relative_to(root)
         or not model.is_file()
     ):
@@ -176,16 +179,16 @@ def sweep_branch_models(
     retained = {
         model.resolve()
         for model in retained_models
-        if model.name == "best-model.pt"
+        if model.name == "best.json" and model.parent.name == "checkpoints"
     }
     removed_models = 0
     removed_bytes = 0
     retained_count = 0
-    for model in root.glob("*/best-model.pt"):
+    for model in root.glob("*/checkpoints/best.json"):
         resolved = model.resolve()
         active = (
             active_round_prefix is not None
-            and model.parent.name.startswith(active_round_prefix)
+            and model.parent.parent.name.startswith(active_round_prefix)
         )
         if resolved in retained or active:
             retained_count += 1
@@ -277,7 +280,12 @@ class AdaptiveCurriculumRunner:
                 configured,
             )
             self.config.pop("extends", None)
-        self.output = (self.repo / self.config["outputDir"]).resolve()
+        storage = training_storage_layout(self.repo)
+        self.output = require_under(
+            self.repo / self.config["outputDir"],
+            storage.runs,
+            "adaptive study outputDir",
+        )
         self.run_dir = (self.repo / self.config["runDir"]).resolve()
         self.dataset = (self.repo / self.config["datasetDir"]).resolve()
         self.source_summary_file = (
@@ -294,8 +302,10 @@ class AdaptiveCurriculumRunner:
         )
         self.source = read_json(self.source_summary_file)
         self.summary_file = self.output / "summary.json"
-        self.status_file = self.run_dir / "status.json"
-        self.log_file = self.run_dir / "study.log"
+        self.status_file = self.run_dir / "state" / "status.json"
+        self.log_file = self.run_dir / "logs" / "study.jsonl"
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self.plans_dir = self.output / "plans"
         self.jobs_dir = self.run_dir / "population-jobs"
         self.projections_dir = self.output / "projections"
@@ -1439,7 +1449,7 @@ class AdaptiveCurriculumRunner:
         return {
             "key": job["key"],
             "delayMs": delay_seconds * 1_000,
-            "model": str(job["_directory"] / "best-model.pt"),
+            "model": str(job["_directory"] / "checkpoints" / "best.json"),
             "directory": str(job["_directory"]),
             "resultFile": str(result_file),
             "parentKey": initialize["key"],
@@ -1580,11 +1590,13 @@ class AdaptiveCurriculumRunner:
         retained = {
             Path(candidate["model"]).resolve()
             for candidate in candidates
-            if str(candidate.get("model", "")).endswith("best-model.pt")
+            if str(candidate.get("model", "")).replace("\\", "/").endswith(
+                "/checkpoints/best.json"
+            )
         }
         for artifact in summary.get("artifacts", []):
             retained.add(
-                (Path(artifact["directory"]) / "best-model.pt").resolve()
+                (Path(artifact["directory"]) / "checkpoints" / "best.json").resolve()
             )
         return sorted(retained)
 
@@ -2390,12 +2402,10 @@ class AdaptiveCurriculumRunner:
                 accepted["survivors"],
                 key=candidate_score,
             )[: int(self.config["finalModelsPerAcceptedDelay"])]:
-                if (
-                    str(candidate["model"]).endswith(".pt")
-                    and not (
-                        Path(candidate["directory"]) / "manifest.json"
-                    ).is_file()
-                ):
+                model = Path(candidate["model"])
+                if model.suffix == ".json" and checkpoint_exists(model) and not (
+                    Path(candidate["directory"]) / "manifest.json"
+                ).is_file():
                     return True
         return False
 
@@ -2411,7 +2421,8 @@ class AdaptiveCurriculumRunner:
         artifacts = []
         training = self.plan["training"]
         for candidate in finalists:
-            if not str(candidate["model"]).endswith(".pt"):
+            model = Path(candidate["model"])
+            if model.suffix != ".json" or not checkpoint_exists(model):
                 continue
             delay_seconds = int(candidate["delayMs"]) // 1_000
             directory = Path(candidate["directory"])

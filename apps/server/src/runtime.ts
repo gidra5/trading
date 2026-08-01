@@ -1,14 +1,18 @@
 import {
   GridTradingBot,
   PeakValleyStrategy,
+  SimulatedTradingApi,
+  DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+  DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
+  type SimulatedTradingSnapshot,
   createPeakValleyBotConfig,
   createPeakValleyStrategyConfig,
   rescalePeakValleyStrategyConfig,
   createStrategyConfig,
-  runBacktestFromOrderBook,
   type BacktestPreset,
   type BacktestProgressSnapshot,
   type BacktestResult,
+  type BacktestStrategy,
   type BotDiagnostics,
   type BotEntryRiskReport,
   type BotMetricsSnapshot,
@@ -30,6 +34,12 @@ import {
 } from "@trading/bot-algo";
 import type { MarketStreamStatus } from "./binance-stream.js";
 import { runBotBacktestFromCandles } from "./bot-backtest.js";
+import {
+  HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR,
+  HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE,
+} from "./bot-backtest.js";
+import { JointPriceOracleRuntime } from "./joint-price-oracle-runtime.js";
+import { LearnedOracleStrategy } from "./learned-oracle-strategy.js";
 import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
 import {
   BacktestCancelledError,
@@ -49,10 +59,6 @@ import {
   type BinanceTradingApiSnapshot,
 } from "./trading-api/binance-api.js";
 import { BinanceExchangeClient } from "./trading-api/binance-client.js";
-import {
-  PaperTradingApi,
-  type PaperTradingSnapshot,
-} from "./trading-api/paper-api.js";
 import type { EquitySnapshot, RuntimeTradingApi } from "./trading-api/runtime-api.js";
 import type {
   TradingExchangeCredentials,
@@ -64,6 +70,7 @@ import type {
 
 interface BacktestStartOptions {
   preset: BacktestPreset;
+  strategy?: BacktestStrategy;
   limit: number;
   historicalStartTime?: number;
   startingQuote?: number;
@@ -88,12 +95,12 @@ interface StoredRuntimeState {
   status: "running" | "stopped";
   runStartedAt: number;
   bot: BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>;
-  paper?: PaperTradingSnapshot;
+  simulation?: SimulatedTradingSnapshot;
   binance?: BinanceTradingApiSnapshot;
 }
 
 export interface RuntimeBotEvent {
-  type: "open" | "partial-fill" | "fill" | "rejected" | "status" | "reset";
+  type: "open" | "partial-fill" | "fill" | "rejected" | "maintenance" | "liquidation" | "status" | "reset";
   at: number;
   message: string;
   order?: TradingOrderSnapshot;
@@ -183,6 +190,7 @@ export class TradingRuntime {
     updatedAt: 0,
   };
   private executionMode: TradingExecutionMode = "simulated";
+  private readonly learnedOracleRuntime?: JointPriceOracleRuntime;
 
   constructor(
     private storage: TradingStorage,
@@ -198,6 +206,18 @@ export class TradingRuntime {
     _exchangeAccountGuard?: { hardStop: boolean; onWarning?: (message: string) => void },
   ) {
     this.botConfig = createPeakValleyBotConfig(legacyConfig, intervalToMs(interval));
+    const learnedOracleModel = process.env.TRADING_JOINT_PRICE_ORACLE_MODEL?.trim();
+    if (learnedOracleModel) {
+      if (intervalToMs(interval) !== 1_000) {
+        throw new Error(
+          "TRADING_JOINT_PRICE_ORACLE_MODEL requires TRADING_INTERVAL=1s.",
+        );
+      }
+      this.learnedOracleRuntime = new JointPriceOracleRuntime(
+        historicalCache.dataDir,
+        learnedOracleModel === "latest" ? undefined : learnedOracleModel,
+      );
+    }
   }
 
   async init(): Promise<void> {
@@ -581,7 +601,8 @@ export class TradingRuntime {
       id,
       preset: options.preset,
       status: "running",
-      source: options.preset === "saved-orderbook" ? "orderbook-mid" : "candles",
+      source: "candles",
+      strategy: options.strategy ?? "peak-valley",
       startedAt: now,
       updatedAt: now,
       targetStartTime: 0,
@@ -626,7 +647,7 @@ export class TradingRuntime {
       status: this.status,
       runStartedAt: this.runStartedAt,
       bot: this.botState,
-      paper: this.api instanceof PaperTradingApi ? this.api.snapshot() : undefined,
+      simulation: this.api instanceof SimulatedTradingApi ? this.api.snapshot() : undefined,
       binance: this.api instanceof BinanceTradingApi ? this.api.state() : undefined,
     };
     const save = () => this.storage.saveTradingState(state);
@@ -646,6 +667,13 @@ export class TradingRuntime {
           intervalToMs(this.interval),
         )
       : createPeakValleyBotConfig(this.legacyConfig, intervalToMs(this.interval));
+    if (this.learnedOracleRuntime) {
+      this.botConfig = {
+        ...this.botConfig,
+        cooldownMs: 60_000,
+        maxTradeQuote: Number.POSITIVE_INFINITY,
+      };
+    }
     this.api = this.executionMode === "binance" && this.exchangeTrading
       ? new BinanceTradingApi({
           market: this.market,
@@ -653,17 +681,34 @@ export class TradingRuntime {
           getHistory: (request) => this.getHistory(request.count),
           snapshot: restored?.binance,
         })
-      : new PaperTradingApi({
+      : new SimulatedTradingApi({
           startingQuote: this.legacyConfig.startingQuote,
           friction: (this.legacyConfig.feeBps + this.legacyConfig.positionRisk.marketSlippageBps) / 10_000,
+          quoteBorrowBpsHour: this.learnedOracleRuntime
+            ? HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
+            : DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+          assetBorrowBpsHour: this.learnedOracleRuntime
+            ? HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
+            : DEFAULT_SIMULATED_BORROW_BPS_HOUR,
+          maxEffectiveLeverage: this.learnedOracleRuntime
+            ? HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE
+            : DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
           rules: marketRules(this.market, this.exchangeTrading?.snapshot(this.market)),
           getHistory: (request) => this.getHistory(request.count),
-          snapshot: restored?.paper,
+          snapshot: restored?.simulation,
         });
-    const strategy = new PeakValleyStrategy({
+    const strategyOptions = {
       config: this.botConfig.strategy,
       getHistory: this.api.getHistory.bind(this.api),
-    });
+    };
+    const strategy = this.learnedOracleRuntime
+      ? new LearnedOracleStrategy(
+          strategyOptions,
+          this.learnedOracleRuntime,
+          (count) => this.getHistory(count),
+          (this.legacyConfig.feeBps + this.legacyConfig.positionRisk.marketSlippageBps) / 10_000,
+        )
+      : new PeakValleyStrategy(strategyOptions);
     this.bot = new GridTradingBot({
       api: this.api,
       strategy,
@@ -696,6 +741,7 @@ export class TradingRuntime {
     const events = this.api.drainEvents();
     for (const event of events) {
       await this.bot.onOrder(event);
+      if (event.type === "liquidation") this.status = "stopped";
     }
     const runtimeEvents = events.map(toRuntimeEvent);
     this.recordEvents(runtimeEvents);
@@ -756,7 +802,7 @@ export class TradingRuntime {
       live: exchange?.live ?? false,
       message: exchangeDriven
         ? "Bot orders use the Binance trading adapter"
-        : "Bot orders use the local paper trading adapter",
+        : "Bot orders use the canonical local trading simulator",
     };
   }
 
@@ -844,6 +890,10 @@ export class TradingRuntime {
       if (!this.market.supportsHistoricalCandles || !isHistoricalVenue(this.market.venue)) {
         throw new Error(`${this.market.displaySymbol} does not support candle backtests.`);
       }
+      const backtestInterval = options.strategy === "hindsight-oracle-1s"
+        || options.strategy === "learned-oracle-1s"
+        ? "1s"
+        : this.interval;
       return runHistoricalCandleBacktest({
         id: this.backtest.id,
         preset: options.preset,
@@ -855,8 +905,9 @@ export class TradingRuntime {
         baseAsset: this.market.baseAsset,
         quoteAsset: this.market.quoteAsset,
         maxLeverage: this.market.maxLeverage,
-        interval: this.interval,
+        interval: backtestInterval,
         config,
+        strategy: options.strategy,
         cache: this.historicalCache,
         historicalStartTime: options.historicalStartTime,
         historicalRangeMs: days(options.historicalDays),
@@ -876,14 +927,19 @@ export class TradingRuntime {
         onUpdate();
       });
     }
-    const result = options.preset === "saved-orderbook"
-      ? runBacktestFromOrderBook(await this.storage.loadOrderBookSnapshots(options.limit), { config })
-      : await runBotBacktestFromCandles(await this.storage.loadCandles(options.limit), {
-          config,
-          extremaSmaWindowMs: options.extremaSmaWindowMinutes === undefined
-            ? undefined
-            : options.extremaSmaWindowMinutes * 60_000,
-        });
+    if (options.strategy === "hindsight-oracle-1s") {
+      throw new Error("The one-second hindsight oracle strategy requires a historical candle preset.");
+    }
+    const result = await runBotBacktestFromCandles(
+      await this.storage.loadCandles(options.limit),
+      {
+        config,
+        strategy: options.strategy,
+        extremaSmaWindowMs: options.extremaSmaWindowMinutes === undefined
+          ? undefined
+          : options.extremaSmaWindowMinutes * 60_000,
+      },
+    );
     throwIfCancelled(signal);
     return result;
   }
@@ -937,6 +993,20 @@ function toRuntimeEvent(event: TradingOrderEvent): RuntimeBotEvent {
   if (event.type === "rejected") {
     return { type: "rejected", at, message: "Order rejected", orderId: event.orderId };
   }
+  if (event.type === "maintenance") {
+    return {
+      type: "maintenance",
+      at,
+      message: `Borrow maintenance charged ${event.quoteCharge.toFixed(6)} quote and ${event.assetCharge.toFixed(8)} asset`,
+    };
+  }
+  if (event.type === "liquidation") {
+    return {
+      type: "liquidation",
+      at: event.at,
+      message: `Account liquidated at ${event.price} (${event.reason})`,
+    };
+  }
   return {
     type: event.type,
     at,
@@ -947,7 +1017,11 @@ function toRuntimeEvent(event: TradingOrderEvent): RuntimeBotEvent {
 }
 
 function hasFill(events: RuntimeBotEvent[]): boolean {
-  return events.some((event) => event.type === "fill" || event.type === "partial-fill");
+  return events.some((event) =>
+    event.type === "fill"
+    || event.type === "partial-fill"
+    || event.type === "maintenance"
+    || event.type === "liquidation");
 }
 
 function marketRules(

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_STUDY_ROOT = "data/ml-joint-studies";
+const DEFAULT_STUDY_ROOT = "data/training/runs/studies";
 
 export function pruneCompletedTrainingState(directory, { dryRun = false } = {}) {
   const manifestFile = path.join(directory, "manifest.json");
@@ -16,11 +16,8 @@ export function pruneCompletedTrainingState(directory, { dryRun = false } = {}) 
   }
 
   const candidates = new Set([
-    path.join(directory, manifest.checkpointFile ?? "checkpoint.pt"),
-    path.join(directory, "best-model.pt"),
-    ...fs.readdirSync(directory)
-      .filter((file) => file.startsWith("checkpoint.pt.corrupt-"))
-      .map((file) => path.join(directory, file)),
+    path.join(directory, "checkpoints", "last.json"),
+    path.join(directory, "checkpoints", "best.json"),
   ]);
   const removedFiles = [];
   let removedBytes = 0;
@@ -201,11 +198,8 @@ function regularNonemptyFile(file) {
 
 function trainingStateFiles(directory) {
   return new Set([
-    path.join(directory, "checkpoint.pt"),
-    path.join(directory, "best-model.pt"),
-    ...fs.readdirSync(directory)
-      .filter((file) => file.startsWith("checkpoint.pt.corrupt-"))
-      .map((file) => path.join(directory, file)),
+    path.join(directory, "checkpoints", "last.json"),
+    path.join(directory, "checkpoints", "best.json"),
   ]);
 }
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from mlp_model import ParameterExposureMlp as ExposureMlp, PolicySupport
+from trading_storage import load_torch_checkpoint
 from train_mlp import (
     FittedPolicyDataset,
     atomic_json,
@@ -56,7 +57,11 @@ def main() -> None:
     manifest = json.loads((args.dataset / "dataset.json").read_text())
     validate_dataset_manifest(manifest, args.dataset)
     study = json.loads(args.study_file.read_text())
-    state = torch.load(args.output / "best-model.pt", map_location="cpu", weights_only=True)
+    state = load_torch_checkpoint(
+        args.output / "checkpoints" / "best.json",
+        map_location="cpu",
+        weights_only=True,
+    )
     train = FittedPolicyDataset(
         manifest, args.dataset, "train", target="teacherParameters",
     )

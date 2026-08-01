@@ -6,19 +6,23 @@ import type { ExposureValueOracleOptions } from "../src/exposure-value-distillat
  * optimized CPU and CUDA implementations are tested against it.
  *
  * The canonical recurrence separates the initially forced H-step hold from a
- * one-candle continuation policy:
+ * continuation policy whose decisions are delayed by D candles:
  *
  *   V(t, 0, x) = log rebalance(x -> 0)
+ *   d = min(D, k)
  *   V(t, k, x) = max_b [
  *     log rebalance(x -> b)
- *     + hold(t, t + 1, b)
- *     + V(t + 1, k - 1, drift(t, t + 1, b))
+ *     + hold(t, t + d, b)
+ *     + V(t + d, k - d, drift(t, t + d, b))
  *   ]
  *   F(t, H, T, a) = hold(t, t + H, a)
  *     + V(t + H, T - H, drift(t, t + H, a))
  *
- * Complexity is O(timestamps * continuation steps * actionGrid²). It is
- * intended only for small correctness fixtures.
+ * With C = T - H continuation candles, the policy makes ceil(C / D)
+ * continuation decisions. The literal search costs
+ * O(timestamps * ceil(C / D) * actionGrid²), plus the candle-by-candle holding
+ * simulations, so this implementation is intended only for small correctness
+ * fixtures.
  */
 export interface BruteForceExposureValueOracle {
   grid: Float64Array;
@@ -43,6 +47,7 @@ export function prepareBruteForceExposureValueOracle(
 ): BruteForceExposureValueOracle {
   if (prices.length < 2) throw new Error("Reference oracle requires at least two prices.");
   const holdingPeriodSteps = options.holdingPeriodSteps ?? 1;
+  const decisionDelaySteps = options.decisionDelaySteps ?? 1;
   const valueHorizonSteps = options.valueHorizonSteps ?? holdingPeriodSteps;
   const minimumExposure = options.minExposure ?? -1;
   const maximumExposure = options.maxExposure ?? 1;
@@ -60,7 +65,7 @@ export function prepareBruteForceExposureValueOracle(
   const actionValues = new Float64Array(prices.length * grid.length);
   const probabilities = new Float64Array(actionValues.length);
   const finalTime = prices.length - 1;
-  const memoizedOneStepForcedValues = new Map<string, number>();
+  const memoizedDecisionForcedValues = new Map<string, number>();
 
   const continuationValue = (
     time: number,
@@ -90,38 +95,39 @@ export function prepareBruteForceExposureValueOracle(
       if (!rebalanced) continue;
       const rebalancedEquity = portfolioEquity(rebalanced, prices[time]!);
       if (!(rebalancedEquity > 0)) continue;
-      const forced = oneStepForcedValue(time, targetIndex, remainingSteps);
+      const forced = decisionForcedValue(time, targetIndex, remainingSteps);
       if (!Number.isFinite(forced)) continue;
       best = Math.max(best, Math.log(rebalancedEquity) + forced);
     }
     return best;
   };
 
-  const oneStepForcedValue = (
+  const decisionForcedValue = (
     time: number,
     targetIndex: number,
     remainingSteps: number,
   ): number => {
-    const key = `${time}:${targetIndex}:${remainingSteps}`;
-    const memoized = memoizedOneStepForcedValues.get(key);
+    const duration = Math.min(decisionDelaySteps, remainingSteps, finalTime - time);
+    const key = `${time}:${targetIndex}:${remainingSteps}:${duration}`;
+    const memoized = memoizedDecisionForcedValues.get(key);
     if (memoized !== undefined) return memoized;
     const holding = holdPortfolio(
       prices,
       time,
-      time + 1,
+      time + duration,
       portfolioAtExposure(1, grid[targetIndex]!, prices[time]!),
       execution,
     );
     if (!holding) {
-      memoizedOneStepForcedValues.set(key, Number.NEGATIVE_INFINITY);
+      memoizedDecisionForcedValues.set(key, Number.NEGATIVE_INFINITY);
       return Number.NEGATIVE_INFINITY;
     }
     const result = continuationValue(
-      time + 1,
+      time + duration,
       holding.portfolio,
-      remainingSteps - 1,
+      remainingSteps - duration,
     );
-    memoizedOneStepForcedValues.set(key, result);
+    memoizedDecisionForcedValues.set(key, result);
     return result;
   };
 

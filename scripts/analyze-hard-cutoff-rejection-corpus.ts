@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   conditionalCutoffRawParameters,
   conditionalExposureProbabilities,
@@ -45,11 +45,11 @@ async function main(): Promise<void> {
   const planFile = path.resolve(repoRoot, argument("plan") ?? "ml/training-plan.json");
   const sourceFile = path.resolve(
     repoRoot,
-    argument("source") ?? "data/ml-analysis/mlp-rejection-oracles-grid151-control/metadata.json",
+    argument("source") ?? "data/training/analysis/mlp-rejection-oracles-grid151-control/metadata.json",
   );
   const output = path.resolve(
     repoRoot,
-    argument("output") ?? "data/ml-analysis/hard-cutoff-rejection-corpus.json",
+    argument("output") ?? "data/training/analysis/hard-cutoff-rejection-corpus.json",
   );
   const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
   const source = JSON.parse(fs.readFileSync(sourceFile, "utf8")) as {
@@ -68,7 +68,7 @@ async function main(): Promise<void> {
   const sourceRoot = path.resolve(
     repoRoot,
     plan.dataDir,
-    "historical/spot-btcusdt/btcusdt/1s",
+    "market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
   );
   const grouped = Map.groupBy(source.cases, (item) => item.date);
   const prepared: PreparedCase[] = [];
@@ -81,6 +81,7 @@ async function main(): Promise<void> {
     const oracle = await prepareExposureValueOracleCuda(prices, {
       scoreStartIndex: 0,
       holdingPeriodSteps: plan.execution.holdingPeriodSteps,
+      decisionDelaySteps: plan.execution.decisionDelaySteps ?? 1,
       valueHorizonSteps: plan.execution.valueHorizonSteps,
       friction: feeRate,
       gridSize: plan.execution.gridSize,
@@ -465,11 +466,7 @@ function float32File(file: string): Float32Array {
 }
 
 function readCandles(root: string, date: string): Candle[] {
-  const plain = path.join(root, `${date}.jsonl`);
-  const content = fs.existsSync(plain)
-    ? fs.readFileSync(plain, "utf8")
-    : gunzipSync(fs.readFileSync(`${plain}.gz`)).toString("utf8");
-  return content.split("\n").filter(Boolean).map((line) => JSON.parse(line) as Candle);
+  return readCandleShardReferenceSync(path.join(root, `${date}.json`));
 }
 
 function inspectCompleteDay(candles: Candle[], date: string): void {

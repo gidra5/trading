@@ -1,15 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   defaultStrategyConfig,
-  runBacktestFromCandles,
   type BacktestResult,
   type Candle,
   type PartialStrategyConfig,
   type ShortMarginModel,
   type StrategyAlgorithm,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 type Mode = "collect" | "rerun";
 
@@ -150,24 +151,22 @@ const STRATEGY_LABEL = "Legacy Valley/Peak Long/Short";
 const STRATEGY_ALGORITHM: StrategyAlgorithm = "legacy-valley-peak";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-try {
-  main();
-} catch (error) {
+main().catch((error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   process.exitCode = 1;
-}
+});
 
-function main(): void {
+async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.mode === "rerun") {
-    rerunSavedPathologies(args);
+    await rerunSavedPathologies(args);
     return;
   }
 
-  collectPathologies(args);
+  await collectPathologies(args);
 }
 
-function collectPathologies(args: PathologyArgs): void {
+async function collectPathologies(args: PathologyArgs): Promise<void> {
   const source = historicalCandleSource(args);
   if (source.files.length === 0) {
     throw new Error(
@@ -189,9 +188,10 @@ function collectPathologies(args: PathologyArgs): void {
     `Running ${windows.length.toLocaleString()} sampled windows across ${args.durations.length} buckets...`,
   );
   const startedAt = Date.now();
-  const samples = windows.map((window, index) => {
+  const samples: PathologyCase[] = [];
+  for (const [index, window] of windows.entries()) {
     const sampleStartedAt = Date.now();
-    const result = runPathologyBacktest(candles, window, args, settings);
+    const result = await runPathologyBacktest(candles, window, args, settings);
     const sample = caseFromResult(window, result, [], args.interval);
     console.error(
       [
@@ -203,8 +203,8 @@ function collectPathologies(args: PathologyArgs): void {
         `${(Date.now() - sampleStartedAt).toLocaleString()}ms`,
       ].join(", "),
     );
-    return sample;
-  });
+    samples.push(sample);
+  }
 
   const selected = selectPathologies(samples, args.minCases);
   const suite: PathologySuite = {
@@ -241,7 +241,7 @@ function collectPathologies(args: PathologyArgs): void {
   console.log(`Rerun with: ${suite.rerunCommand}`);
 }
 
-function rerunSavedPathologies(args: PathologyArgs): void {
+async function rerunSavedPathologies(args: PathologyArgs): Promise<void> {
   const suite = readPathologySuite(args.caseFile);
   const sourceArgs: PathologyArgs = {
     ...args,
@@ -265,7 +265,8 @@ function rerunSavedPathologies(args: PathologyArgs): void {
   const candles = loadHistoricalCandles(sourceArgs, source.dir, source.files);
   assertCandles(candles);
   const settings = suite.strategy.settings;
-  const reruns = suite.pathologies.map((savedCase, index) => {
+  const reruns = [];
+  for (const [index, savedCase] of suite.pathologies.entries()) {
     const startIndex = lowerBoundCandleOpenTime(candles, savedCase.startTime);
     const endIndex = upperBoundCandleOpenTime(candles, savedCase.endTime);
     if (endIndex <= startIndex) {
@@ -285,28 +286,28 @@ function rerunSavedPathologies(args: PathologyArgs): void {
       startIndex,
       endIndex,
     };
-    const result = runPathologyBacktest(candles, window, sourceArgs, settings);
-    return {
+    const result = await runPathologyBacktest(candles, window, sourceArgs, settings);
+    reruns.push({
       ...caseFromResult(window, result, savedCase.reasons, sourceArgs.interval),
       id: savedCase.id,
       oracleCaptureRank: savedCase.oracleCaptureRank,
       savedReturnPct: savedCase.metrics.returnPct,
       savedCapturePct: savedCase.metrics.perfectMarginCapturePct,
-    };
-  });
+    });
+  }
 
   console.log(`Reran ${reruns.length.toLocaleString()} saved pathological windows.`);
   console.log("");
   console.log(rerunTable(reruns));
 }
 
-function runPathologyBacktest(
+async function runPathologyBacktest(
   candles: Candle[],
   window: SampleWindow,
   args: Pick<PathologyArgs, "symbol">,
   settings: StrategySettings,
-): BacktestResult {
-  return runBacktestFromCandles(candles, {
+): Promise<BacktestResult> {
+  return runCanonicalBacktestFromCandles(candles, {
     config: strategyConfig(args.symbol, settings),
     startIndex: window.startIndex,
     endIndex: window.endIndex,
@@ -533,13 +534,7 @@ function loadHistoricalCandles(
 ): Candle[] {
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        candles.push(JSON.parse(trimmed) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
 
   return resampleCandles(
@@ -572,7 +567,7 @@ function historicalCandleSource(
 function historicalCandleDirCandidates(
   args: Pick<PathologyArgs, "marketKey" | "symbol" | "interval">,
 ): string[] {
-  const root = path.join(repoRoot, "data", "historical");
+  const root = path.join(repoRoot, "data", "market", "immutable", "refs", "candles");
   const symbol = safePathPart(args.symbol);
   const interval = safePathPart(args.interval);
   const dirs = new Set<string>();
@@ -583,16 +578,6 @@ function historicalCandleDirCandidates(
 
   dirs.add(fallbackHistoricalCandleDir(args));
 
-  if (!fs.existsSync(root)) {
-    return [...dirs];
-  }
-
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      dirs.add(path.join(root, entry.name, symbol, interval));
-    }
-  }
-
   return [...dirs];
 }
 
@@ -602,7 +587,11 @@ function fallbackHistoricalCandleDir(
   return path.join(
     repoRoot,
     "data",
-    "historical",
+    "market",
+    "immutable",
+    "refs",
+    "candles",
+    `spot-${safePathPart(args.symbol)}`,
     safePathPart(args.symbol),
     safePathPart(args.interval),
   );
@@ -614,7 +603,7 @@ function listHistoricalCandleFiles(dir: string): string[] {
   }
   return fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 }

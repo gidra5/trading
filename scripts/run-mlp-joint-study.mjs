@@ -4,6 +4,7 @@ import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { assertInside, trainingStorageLayout } from "./training-storage.mjs";
 import {
   pruneCompletedMetricsOnlyTrainingState,
   pruneCompletedTrainingState,
@@ -136,8 +137,12 @@ const productionDatasetDir = path.resolve(repoRoot, basePlan.datasetDir);
 const datasetDir = path.resolve(repoRoot, study.datasetDir);
 const outputRoot = path.resolve(repoRoot, study.outputDir);
 const runDir = path.resolve(repoRoot, study.runDir);
-const statusFile = path.join(runDir, "status.json");
-const logFile = path.join(runDir, "study.log");
+const storageLayout = trainingStorageLayout(repoRoot);
+assertInside(runDir, storageLayout.runs, "study runDir");
+assertInside(outputRoot, storageLayout.runs, "study outputDir");
+assertInside(datasetDir, storageLayout.datasets, "study datasetDir");
+const statusFile = path.join(runDir, "state", "status.json");
+const logFile = path.join(runDir, "logs", "study.jsonl");
 const plansDir = path.join(outputRoot, "plans");
 const priorityPlanFile = path.join(plansDir, "priority-dataset.json");
 const exampleSelectionFile = path.join(plansDir, "example-selection.json");
@@ -174,6 +179,8 @@ if (process.argv.includes("--dry-run")) {
   process.exit(0);
 }
 fs.mkdirSync(runDir, { recursive: true });
+fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+fs.mkdirSync(path.dirname(logFile), { recursive: true });
 fs.mkdirSync(plansDir, { recursive: true });
 atomicWrite(exampleSelectionFile, `${JSON.stringify(exampleSelection, null, 2)}\n`);
 atomicWrite(priorityPlanFile, `${JSON.stringify(priorityPlan, null, 2)}\n`);
@@ -880,6 +887,7 @@ function trainingArguments({
   return [
     "--dataset", datasetDir,
     "--output", directory,
+    "--run-dir", directory,
     "--model-id", `${variant.id}-${weightVariant.key}`,
     "--label", `${variant.label} · weights ${weightVariant.key}`,
     "--plan", variantPlanFile,
@@ -963,7 +971,11 @@ async function ensureAndVerifyStudyArtifact({
   targetStatisticsCache,
 }) {
   const manifest = readJson(path.join(item.directory, "manifest.json"));
-  if (!manifest && !fs.existsSync(path.join(item.directory, "best-model.pt"))) {
+  if (!manifest && !fs.existsSync(path.join(
+    item.directory,
+    "checkpoints",
+    "best.json",
+  ))) {
     throw new Error(
       `Winning result ${item.key} has neither a retained artifact nor PyTorch best weights.`,
     );
@@ -1500,6 +1512,7 @@ async function trainPromotion(
       path.join(repoRoot, "ml/train_mlp.py"),
       "--dataset", promotionDatasetDir,
       "--output", directory,
+      "--run-dir", directory,
       "--model-id", `${plan.id}-${weightVariant.key}`,
       "--label", `${plan.label} · weights ${weightVariant.key}`,
       "--plan", planPath,
@@ -1769,9 +1782,9 @@ function selectStratifiedDays(candidates, ranges, count) {
 
 function findLatestCompleteHistoryDay() {
   const root = path.resolve(repoRoot, basePlan.dataDir,
-    "historical/spot-btcusdt/btcusdt/1s");
+    "market/immutable/refs/candles/spot-btcusdt/btcusdt/1s");
   const dates = fs.readdirSync(root)
-    .map((file) => /^(\d{4}-\d{2}-\d{2})\.jsonl(?:\.gz)?$/.exec(file)?.[1])
+    .map((file) => /^(\d{4}-\d{2}-\d{2})\.json$/.exec(file)?.[1])
     .filter(Boolean)
     .sort();
   if (dates.length === 0) throw new Error("No complete one-second history is available.");

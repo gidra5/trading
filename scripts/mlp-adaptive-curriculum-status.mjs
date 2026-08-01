@@ -19,9 +19,9 @@ const configuration = configured.extends
   : configured;
 const runDir = path.resolve(repoRoot, configuration.runDir);
 const outputDir = path.resolve(repoRoot, configuration.outputDir);
-const statusFile = path.join(runDir, "status.json");
+const statusFile = path.join(runDir, "state", "status.json");
 const summaryFile = path.join(outputDir, "summary.json");
-const logFile = path.join(runDir, "study.log");
+const logFile = path.join(runDir, "logs", "study.jsonl");
 const watch = process.argv.includes("--watch");
 
 function readJson(file) {

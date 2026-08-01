@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReference } from "@trading/storage";
 import {
   columnarVwKamaCandles,
   evaluateVwKamaOracle,
@@ -28,7 +28,7 @@ const DAY = 86_400_000;
 const MAX_WARMUP_MS = 3 * DAY;
 const CANDIDATE_IDS = ["global-clean-v0182", "global-clean-k0050"] as const;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const sourceDir = path.join(repoRoot, "data/historical/spot-btcusdt/btcusdt/1s");
+const sourceDir = path.join(repoRoot, "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s");
 const stamp = new Date().toISOString().slice(0, 10);
 const defaultJson = path.join(repoRoot, `data/benchmarks/vw-kama-cuda-7d-v2-comparison-${stamp}.json`);
 const defaultReport = path.join(repoRoot, `docs/vw-kama-cuda-7d-v2-comparison-${stamp}.md`);
@@ -521,17 +521,9 @@ async function loadSource(start: number, end: number): Promise<TradingCandle[]> 
   const candles: TradingCandle[] = [];
   for (let day = utcDay(start); day < end; day += DAY) {
     const date = new Date(day).toISOString().slice(0, 10);
-    const plainFile = path.join(sourceDir, `${date}.jsonl`);
-    let content: string;
-    try {
-      content = await fs.readFile(plainFile, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      content = gunzipSync(await fs.readFile(`${plainFile}.gz`)).toString("utf8");
-    }
-    for (const line of content.split("\n")) {
-      if (!line) continue;
-      const candle = JSON.parse(line) as TradingCandle;
+    for (const candle of await readCandleShardReference(
+      path.join(sourceDir, `${date}.json`),
+    )) {
       if (candle.openTime >= start && candle.openTime < end) candles.push(candle);
     }
   }

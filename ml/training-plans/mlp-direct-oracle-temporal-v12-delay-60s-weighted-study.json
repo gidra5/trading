@@ -4,13 +4,13 @@
   "label": "Direct 255-action MLP v12 · one-minute oracle learnability · 60-second policy delay · 1-second examples · one-minute oracle · frozen production-wide sample",
   "dataDir": "data",
   "componentStoreId": "mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s",
-  "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-weighted-study",
+  "datasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-60s-weighted-study",
   "componentSeedDatasetDirs": [
-    "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
-    "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset"
+    "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
+    "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset"
   ],
   "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
-  "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
+  "runDir": "data/training/runs/mlp-direct-oracle-temporal-v12-delay-60s-minute-oracle-weighted-study",
   "oraclePreparation": {
     "backend": "cuda"
   },
@@ -200,6 +200,7 @@
     "gridSize": 255,
     "temperature": 0.01,
     "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
     "valueHorizonSteps": 3600,
     "horizonEndMode": "extend"
   },
@@ -274,9 +275,9 @@
     }
   },
   "lossWeightStudy": {
-    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
-    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-joint-study",
-    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "outputDir": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-joint-study",
+    "datasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
     "dataset": {
       "selection": "one-per-disjoint-regime-then-maximin",
       "calendarDays": {
@@ -306,7 +307,7 @@
     },
     "promotion": {
       "mode": "manual-review",
-      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-full-days",
+      "fullDayDatasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-full-days",
       "finalistsPerDelay": 2,
       "productionFinalists": 2
     },
@@ -334,9 +335,9 @@
     ]
   },
   "exhaustiveLossWeightStudy": {
-    "outputDir": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive",
-    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-study",
-    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "outputDir": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive",
+    "runDir": "data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-study",
+    "datasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
     "dataset": {
       "selection": "one-per-disjoint-regime-then-maximin",
       "calendarDays": {
@@ -366,7 +367,7 @@
     },
     "promotion": {
       "mode": "manual-review",
-      "fullDayDatasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-full-days",
+      "fullDayDatasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-exhaustive-full-days",
       "finalistsPerDelay": 1,
       "productionFinalists": 1
     },
@@ -406,11 +407,11 @@
     ]
   },
   "dynamicCurriculumStudy": {
-    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
-    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
-    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
-    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-dynamic-study",
-    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "sourceSummary": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/training/runs/studies/dynamic/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11",
+    "runDir": "data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-dynamic-study",
+    "datasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
     "initialDelayMinutes": 60,
     "delayScheduleMinutes": [
       30,
@@ -441,11 +442,11 @@
     }
   },
   "adaptiveCurriculumStudy": {
-    "sourceSummary": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
-    "sourcePriorityPlan": "data/ml-joint-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
-    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive",
-    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-study",
-    "datasetDir": "data/ml-datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
+    "sourceSummary": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/summary.json",
+    "sourcePriorityPlan": "data/training/runs/studies/joint/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11/plans/priority-dataset.json",
+    "outputDir": "data/training/runs/studies/dynamic/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive",
+    "runDir": "data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-study",
+    "datasetDir": "data/training/datasets/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-study-subset",
     "initialDelaySeconds": 3600,
     "minimumDelaySeconds": 1,
     "initialStepSeconds": 1800,
@@ -525,8 +526,8 @@
       "initialProbeCount": 32,
       "adaptiveProbeCount": 8
     },
-    "outputDir": "data/ml-dynamic-studies/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy",
-    "runDir": "data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy-study",
+    "outputDir": "data/training/runs/studies/dynamic/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy",
+    "runDir": "data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-adaptive-no-entropy-study",
     "fixedLossWeights": {
       "excessEntropy": 0
     },
@@ -3381,7 +3382,7 @@
     "componentCoveragePredictionDelaysMs": [
       60000
     ],
-    "sourceDatasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
+    "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-60s-production-components",
     "seed": 1337,
     "blockExamples": 3600,
     "sourceCounts": {

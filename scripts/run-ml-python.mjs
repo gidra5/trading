@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { prepareTrainingCache } from "./training-storage.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const python = path.join(
@@ -23,20 +24,21 @@ while (args[0] === "--env") {
 if (args.length === 0) throw new Error("Python arguments are required.");
 const toolchainEnvironment =
   process.platform === "win32" ? visualStudioEnvironment() : {};
-
-const runtimeRoot = path.join(repoRoot, "data", "runtime-cache");
-const temporaryDirectory = path.join(runtimeRoot, "tmp");
-const tritonCacheDirectory = path.join(runtimeRoot, "triton");
-const torchInductorCacheDirectory = path.join(runtimeRoot, "torchinductor");
-const cudaCacheDirectory = path.join(runtimeRoot, "cuda");
-for (const directory of [
-  temporaryDirectory,
-  tritonCacheDirectory,
-  torchInductorCacheDirectory,
-  cudaCacheDirectory,
-]) {
-  fs.mkdirSync(directory, { recursive: true });
+if (process.platform === "win32") {
+  // Triton's generated CUDA driver shim uses the POSIX `alloca` spelling.
+  // MSVC otherwise treats it as an undeclared external symbol and fails at link time.
+  toolchainEnvironment.CL = [
+    toolchainEnvironment.CL,
+    "/FImalloc.h",
+    "/Dalloca=_alloca",
+  ].filter(Boolean).join(" ");
 }
+
+const cache = prepareTrainingCache(repoRoot);
+const temporaryDirectory = cache.temporary;
+const tritonCacheDirectory = cache.triton;
+const torchInductorCacheDirectory = cache.torchinductor;
+const cudaCacheDirectory = cache.cuda;
 
 const child = spawn(python, args, {
   cwd: repoRoot,
@@ -67,6 +69,11 @@ child.once("error", (error) => {
   process.exitCode = 1;
 });
 child.once("exit", (code) => {
+  try {
+    prepareTrainingCache(repoRoot);
+  } catch (error) {
+    console.error(`Post-training storage maintenance failed: ${error}`);
+  }
   process.exitCode = code ?? 1;
 });
 

@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   calculateRiskAdjustedMetrics,
   defaultStrategyConfig,
   legacyValleyPeakAsymmetricShortFavoringConfig,
   legacyValleyPeakStrictSymmetricConfig,
-  runBacktestFromCandles,
   type BacktestResult,
   type Candle,
   type EquityPoint,
@@ -16,6 +16,7 @@ import {
   type ShortMarginModel,
   type StrategyAlgorithm,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 type BenchmarkMode =
   | "days"
@@ -203,10 +204,13 @@ const BORROW_DEPTH_MATRIX: Array<[number, number]> = [
 ];
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+main().catch(fail);
+
+async function main(): Promise<void> {
 const args = parseArgs(process.argv.slice(2));
 if (args.mode === "synthetic") {
   const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
-  runSyntheticMode(args, cases);
+  await runSyntheticMode(args, cases);
 } else {
   const files = historicalCandleFiles(args);
 
@@ -221,23 +225,29 @@ if (args.mode === "synthetic") {
 
   if (args.mode === "random-lengths") {
     const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
-    runRandomLengthMode(args, files, cases);
+    await runRandomLengthMode(args, files, cases);
   } else if (args.mode === "grid-search") {
-    runGridSearchMode(args, files);
+    await runGridSearchMode(args, files);
   } else if (args.mode === "portfolio") {
     const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
-    runPortfolioMode(args, files, cases);
+    await runPortfolioMode(args, files, cases);
   } else {
     const cases = selectBenchmarkCases(args.only, args.borrowDepthMatrix);
-    runSingleWindowMode(args, files, cases);
+    await runSingleWindowMode(args, files, cases);
   }
 }
+}
 
-function runSyntheticMode(options: BenchmarkArgs, cases: BenchmarkCase[]): void {
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
+
+async function runSyntheticMode(options: BenchmarkArgs, cases: BenchmarkCase[]): Promise<void> {
   const candles = createSyntheticCandles(options);
   assertCandles(candles);
 
-  const results = cases.map((benchmark) => runBenchmark(benchmark, candles, options));
+  const results = await Promise.all(cases.map((benchmark) => runBenchmark(benchmark, candles, options)));
   const rows = results.map((result) => ({
     strategy: result.label,
     ...metricsFromResult(result.result),
@@ -248,11 +258,11 @@ function runSyntheticMode(options: BenchmarkArgs, cases: BenchmarkCase[]): void 
   console.log(singleBenchmarkTable(rows));
 }
 
-function runSingleWindowMode(
+async function runSingleWindowMode(
   options: BenchmarkArgs,
   allFiles: string[],
   cases: BenchmarkCase[],
-): void {
+): Promise<void> {
   const selectedFiles =
     options.mode === "year"
       ? allFiles.slice(-YEAR_DAYS)
@@ -260,7 +270,7 @@ function runSingleWindowMode(
   const candles = loadHistoricalCandles(options, selectedFiles);
   assertCandles(candles);
 
-  const results = cases.map((benchmark) => runBenchmark(benchmark, candles, options));
+  const results = await Promise.all(cases.map((benchmark) => runBenchmark(benchmark, candles, options)));
   const rows = results.map((result) => ({
     strategy: result.label,
     ...metricsFromResult(result.result),
@@ -271,11 +281,11 @@ function runSingleWindowMode(
   console.log(singleBenchmarkTable(rows));
 }
 
-function runRandomLengthMode(
+async function runRandomLengthMode(
   options: BenchmarkArgs,
   allFiles: string[],
   cases: BenchmarkCase[],
-): void {
+): Promise<void> {
   const lookbackFiles = allFiles.slice(
     -Math.ceil(options.randomLookbackDays + options.randomMaxWindowDays + 2),
   );
@@ -283,25 +293,25 @@ function runRandomLengthMode(
   assertCandles(candles);
 
   const windows = createRandomLengthWindows(candles, options);
-  const rows = cases.map((benchmark) =>
+  const rows = await Promise.all(cases.map((benchmark) =>
     runRandomLengthBenchmark(benchmark, candles, windows, options),
-  );
+  ));
 
   console.log(randomLengthHeader(options, candles, windows));
   console.log("");
   console.log(randomBenchmarkTable(rows));
 }
 
-function runGridSearchMode(options: BenchmarkArgs, allFiles: string[]): void {
+async function runGridSearchMode(options: BenchmarkArgs, allFiles: string[]): Promise<void> {
   const selectedFiles = allFiles.slice(-options.days);
   const candles = loadHistoricalCandles(options, selectedFiles);
   assertCandles(candles);
 
   const folds = splitCandlesIntoFolds(candles, options.gridFolds);
   const candidates = selectGridCandidates(options.only);
-  const rows = candidates
-    .map((candidate) => runGridCandidate(candidate, folds, options))
-    .sort(compareGridRows)
+  const rows = (await Promise.all(
+    candidates.map((candidate) => runGridCandidate(candidate, folds, options)),
+  )).sort(compareGridRows)
     .map((row, index) => ({ ...row, rank: index + 1 }));
 
   console.log(gridSearchHeader(options, candles, folds, candidates.length));
@@ -309,13 +319,13 @@ function runGridSearchMode(options: BenchmarkArgs, allFiles: string[]): void {
   console.log(gridSearchTable(rows.slice(0, options.gridLimit)));
 }
 
-function runGridCandidate(
+async function runGridCandidate(
   candidate: GridCandidate,
   folds: Candle[][],
   options: BenchmarkArgs,
-): GridSearchRow {
+): Promise<GridSearchRow> {
   console.error(`Grid candidate ${candidate.label} on ${folds.length} folds...`);
-  const results = folds.map((fold) =>
+  const results = await Promise.all(folds.map((fold) =>
     runBenchmark(
       {
         label: candidate.label,
@@ -326,7 +336,7 @@ function runGridCandidate(
       options,
       false,
     ),
-  );
+  ));
   const metrics = results.map((result) => metricsFromResult(result.result));
 
   return {
@@ -493,16 +503,16 @@ function splitCandlesIntoFolds(candles: Candle[], requestedFolds: number): Candl
   return folds;
 }
 
-function runPortfolioMode(
+async function runPortfolioMode(
   options: BenchmarkArgs,
   allFiles: string[],
   cases: BenchmarkCase[],
-): void {
+): Promise<void> {
   const selectedFiles = allFiles.slice(-options.days);
   const candles = loadHistoricalCandles(options, selectedFiles);
   assertCandles(candles);
 
-  const strategyRows = runStrategyPortfolioExperiments(options, candles, cases);
+  const strategyRows = await runStrategyPortfolioExperiments(options, candles, cases);
   console.log(portfolioHeader(options, candles, "strategy ensemble"));
   console.log("");
   console.log(portfolioTable(strategyRows));
@@ -521,18 +531,18 @@ function runPortfolioMode(
   }
 }
 
-function runStrategyPortfolioExperiments(
+async function runStrategyPortfolioExperiments(
   options: BenchmarkArgs,
   candles: Candle[],
   cases: BenchmarkCase[],
-): PortfolioRow[] {
-  const series: PortfolioSeries[] = cases.map((benchmark) => {
-    const result = runBenchmark(benchmark, candles, options, true, candles.length).result;
+): Promise<PortfolioRow[]> {
+  const series: PortfolioSeries[] = await Promise.all(cases.map(async (benchmark) => {
+    const result = (await runBenchmark(benchmark, candles, options, true, candles.length)).result;
     return {
       label: benchmark.label,
       points: result.equityCurve,
     };
-  });
+  }));
   const returns = portfolioSeriesToReturns(series);
   if (returns.length === 0) {
     return [];
@@ -817,14 +827,14 @@ function volTargetEqualWeights(
   return baseWeights.map((weight) => weight * scale);
 }
 
-function runBenchmark(
+async function runBenchmark(
   benchmark: BenchmarkCase,
   sourceCandles: Candle[],
   options: BenchmarkArgs,
   log = true,
   maxEquityPoints?: number,
   candleRange?: CandleReplayRange,
-): { label: string; result: BacktestResult; elapsedMs: number } {
+): Promise<{ label: string; result: BacktestResult; elapsedMs: number }> {
   const maxPositionQuote = options.maxPositionQuote;
   const startedAt = Date.now();
   const candleCount = candleRange
@@ -849,7 +859,7 @@ function runBenchmark(
       : {}),
   };
 
-  const result = runBacktestFromCandles(sourceCandles, {
+  const result = await runCanonicalBacktestFromCandles(sourceCandles, {
     config: {
       symbol: options.symbol.toUpperCase(),
       algorithm: benchmark.algorithm,
@@ -886,12 +896,12 @@ function runBenchmark(
   };
 }
 
-function runRandomLengthBenchmark(
+async function runRandomLengthBenchmark(
   benchmark: BenchmarkCase,
   candles: Candle[],
   windows: CandleWindow[],
   options: BenchmarkArgs,
-): RandomBenchmarkRow {
+): Promise<RandomBenchmarkRow> {
   const startedAt = Date.now();
   console.error(`Running ${benchmark.label} on ${windows.length.toLocaleString()} random windows...`);
   let profitableSamples = 0;
@@ -919,14 +929,14 @@ function runRandomLengthBenchmark(
   const returnSamples: number[] = [];
 
   for (const window of windows) {
-    const result = runBenchmark(
+    const result = (await runBenchmark(
       benchmark,
       candles,
       options,
       false,
       undefined,
       { startIndex: window.startIndex, endIndex: window.endIndex },
-    ).result;
+    )).result;
     const metrics = metricsFromResult(result);
     if (result.summary.netPnl > 0) {
       profitableSamples += 1;
@@ -1078,14 +1088,7 @@ function loadHistoricalCandles(options: BenchmarkArgs, files: string[]): Candle[
   const dir = historicalCandleSource(options).dir;
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-      candles.push(JSON.parse(trimmed) as Candle);
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
 
   const sorted = candles.sort((left, right) => left.openTime - right.openTime);
@@ -1226,7 +1229,7 @@ function historicalCandleSource(
 function historicalCandleDirCandidates(
   options: Pick<BenchmarkArgs, "marketKey" | "symbol" | "interval">,
 ): string[] {
-  const root = path.join(repoRoot, "data", "historical");
+  const root = path.join(repoRoot, "data", "market", "immutable", "refs", "candles");
   const symbol = safePathPart(options.symbol);
   const interval = safePathPart(options.interval);
   const dirs = new Set<string>();
@@ -1237,17 +1240,6 @@ function historicalCandleDirCandidates(
 
   dirs.add(fallbackHistoricalCandleDir(options));
 
-  if (!fs.existsSync(root)) {
-    return [...dirs];
-  }
-
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    dirs.add(path.join(root, entry.name, symbol, interval));
-  }
-
   return [...dirs];
 }
 
@@ -1255,7 +1247,11 @@ function fallbackHistoricalCandleDir(options: Pick<BenchmarkArgs, "symbol" | "in
   return path.join(
     repoRoot,
     "data",
-    "historical",
+    "market",
+    "immutable",
+    "refs",
+    "candles",
+    `spot-${safePathPart(options.symbol)}`,
     safePathPart(options.symbol),
     safePathPart(options.interval),
   );
@@ -1267,7 +1263,7 @@ function listHistoricalCandleFiles(dir: string): string[] {
   }
   return fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 }
@@ -2133,7 +2129,14 @@ function formatGridConfig(config: PartialStrategyConfig): string {
 }
 
 function discoverHistoricalSymbols(interval: string): string[] {
-  const root = path.join(repoRoot, "data", "historical");
+  const root = path.join(
+    repoRoot,
+    "data",
+    "market",
+    "immutable",
+    "refs",
+    "candles",
+  );
   if (!fs.existsSync(root)) {
     return [];
   }

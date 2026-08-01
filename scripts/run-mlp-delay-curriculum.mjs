@@ -3,6 +3,11 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  assertInside,
+  prepareTrainingCache,
+  trainingStorageLayout,
+} from "./training-storage.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const planFile = path.resolve(repoRoot, argument("plan")
@@ -14,29 +19,36 @@ const basePlan = readJsonRequired(basePlanFile);
 const curriculum = validateCurriculum(curriculumPlan, basePlan);
 const delaysMinutes = delaySchedule(curriculum);
 const runDir = path.resolve(repoRoot, curriculumPlan.runDir);
+const storageLayout = trainingStorageLayout(repoRoot);
+assertInside(runDir, storageLayout.runs, "runDir");
+assertInside(
+  path.resolve(repoRoot, curriculumPlan.datasetDir),
+  storageLayout.datasets,
+  "datasetDir",
+);
 const plansDir = path.join(runDir, "plans");
 const phasesRunDir = path.join(runDir, "phases");
-const statusFile = path.join(runDir, "status.json");
-const summaryFile = path.join(runDir, "curriculum.json");
-const logFile = path.join(runDir, "training.log");
-const finalizeFile = path.join(runDir, "FINALIZE");
+const statusFile = path.join(runDir, "state", "status.json");
+const summaryFile = path.join(runDir, "state", "curriculum.json");
+const logFile = path.join(runDir, "logs", "curriculum.log");
+const finalizeFile = path.join(runDir, "control", "FINALIZE");
 const nativeDir = path.join(runDir, "native");
 const nativeLibrary = path.join(
   nativeDir,
   process.platform === "win32" ? "vw_kama_cuda.dll" : "libvw_kama_cuda.so",
 );
-const runtimeRoot = path.join(repoRoot, "data", "runtime-cache");
+const cache = prepareTrainingCache(repoRoot);
 const environment = {
   ...process.env,
   PYTHONUTF8: process.env.PYTHONUTF8 || "1",
   PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
-  TMPDIR: process.env.TRADING_ML_TMP_DIR || path.join(runtimeRoot, "tmp"),
-  TEMP: process.env.TRADING_ML_TMP_DIR || path.join(runtimeRoot, "tmp"),
-  TMP: process.env.TRADING_ML_TMP_DIR || path.join(runtimeRoot, "tmp"),
-  TRITON_CACHE_DIR: process.env.TRITON_CACHE_DIR || path.join(runtimeRoot, "triton"),
+  TMPDIR: process.env.TRADING_ML_TMP_DIR || cache.temporary,
+  TEMP: process.env.TRADING_ML_TMP_DIR || cache.temporary,
+  TMP: process.env.TRADING_ML_TMP_DIR || cache.temporary,
+  TRITON_CACHE_DIR: process.env.TRITON_CACHE_DIR || cache.triton,
   TORCHINDUCTOR_CACHE_DIR:
-    process.env.TORCHINDUCTOR_CACHE_DIR || path.join(runtimeRoot, "torchinductor"),
-  CUDA_CACHE_PATH: process.env.CUDA_CACHE_PATH || path.join(runtimeRoot, "cuda"),
+    process.env.TORCHINDUCTOR_CACHE_DIR || cache.torchinductor,
+  CUDA_CACHE_PATH: process.env.CUDA_CACHE_PATH || cache.cuda,
   VW_KAMA_CUDA_OUTPUT: nativeLibrary,
   VW_KAMA_CUDA_LIBRARY: nativeLibrary,
 };
@@ -65,6 +77,9 @@ if (dryRun) {
 
 for (const directory of [
   runDir,
+  path.dirname(statusFile),
+  path.dirname(logFile),
+  path.dirname(finalizeFile),
   plansDir,
   phasesRunDir,
   nativeDir,
@@ -180,11 +195,10 @@ try {
     const previousDelaySeconds = phaseIndex === 0
       ? undefined
       : delaysMinutes[phaseIndex - 1] * 60;
-    stageParentCheckpoint(phaseIndex, phase, previousDelaySeconds);
     let phaseEpochLimit = Math.max(
       curriculum.epochsPerPhase,
       readJson(phase.planFile)?.training?.epochs ?? 0,
-      readJson(path.join(phase.runDir, "status.json"))?.epochs ?? 0,
+      readJson(path.join(phase.runDir, "state", "status.json"))?.epochs ?? 0,
     );
     let generatedPlan = generatePhasePlan(
       phaseIndex,
@@ -194,7 +208,7 @@ try {
       phaseEpochLimit,
     );
     atomicJson(phase.planFile, generatedPlan);
-    activePhaseFinalizeFile = path.join(phase.runDir, "FINALIZE");
+    activePhaseFinalizeFile = path.join(phase.runDir, "control", "FINALIZE");
     clearPhaseMetrics();
     status = {
       ...status,
@@ -419,13 +433,13 @@ function phasePaths(delaySeconds) {
     datasetDir: path.join(
       repoRoot,
       "data",
-      "ml-datasets",
+      "training",
+      "datasets",
       curriculumPlan.id,
       suffix,
     ),
     artifactDir: path.join(repoRoot, "data", "models", "mlp", modelId),
     runDir: path.join(phasesRunDir, suffix),
-    parentCheckpointFile: path.join(phasesRunDir, suffix, "parent-best-model.pt"),
   };
 }
 
@@ -462,7 +476,11 @@ function generatePhasePlan(
   delete training.initializeFromCheckpoint;
   delete training.inheritedBestEpoch;
   if (previousDelaySeconds !== undefined) {
-    training.initializeFromCheckpoint = relative(phase.parentCheckpointFile);
+    training.initializeFromCheckpoint = relative(path.join(
+      phasePaths(previousDelaySeconds).runDir,
+      "checkpoints",
+      "best.json",
+    ));
   }
   return {
     ...basePlan,
@@ -579,7 +597,7 @@ function consume(stream, stderr) {
 function recoverCompletedPhase(phaseIndex, delayMinutes, phase) {
   const recorded = summary.completedPhases.find((entry) => entry.stage === phaseIndex + 1);
   if (phaseCompletionReached(recorded, phaseIndex)) return recorded;
-  const phaseStatus = readJson(path.join(phase.runDir, "status.json"));
+  const phaseStatus = readJson(path.join(phase.runDir, "state", "status.json"));
   if (phaseStatus?.stage === "complete" && phaseFilesComplete(phase)) {
     patchManifestCurriculum(phaseIndex, delayMinutes, phase);
     const completed = completedPhase(phaseIndex, delayMinutes, phase);
@@ -592,29 +610,11 @@ function phaseFilesComplete(phase) {
   return [
     path.join(phase.datasetDir, "dataset.json"),
     ...[
-      "best-model.pt",
       "model.onnx",
       "manifest.json",
     ].map((file) => path.join(phase.artifactDir, file)),
+    path.join(phase.runDir, "checkpoints", "best.json"),
   ].every((file) => fs.existsSync(file));
-}
-
-function stageParentCheckpoint(phaseIndex, phase, previousDelaySeconds) {
-  if (phaseIndex === 0 || previousDelaySeconds === undefined) return;
-  if (fs.existsSync(phase.parentCheckpointFile)) return;
-  const source = path.join(
-    phasePaths(previousDelaySeconds).artifactDir,
-    "best-model.pt",
-  );
-  if (!fs.existsSync(source)) {
-    throw new Error(`Missing parent best model for delay curriculum: ${source}`);
-  }
-  fs.mkdirSync(path.dirname(phase.parentCheckpointFile), { recursive: true });
-  try {
-    fs.linkSync(source, phase.parentCheckpointFile);
-  } catch {
-    fs.copyFileSync(source, phase.parentCheckpointFile);
-  }
 }
 
 function retainOnlyPhaseModel(phase) {
@@ -643,12 +643,7 @@ function retainOnlyPhaseModel(phase) {
 }
 
 function pruneCompletedPhaseCheckpoint(phase) {
-  for (const file of [
-    path.join(phase.artifactDir, "checkpoint.pt"),
-    phase.parentCheckpointFile,
-  ]) {
-    fs.rmSync(file, { force: true });
-  }
+  fs.rmSync(path.join(phase.runDir, "checkpoints", "last.json"), { force: true });
 }
 
 function pruneCompletedPhaseDataset(phaseIndex, phase) {
@@ -684,7 +679,7 @@ function ensureMinimumFreeSpace() {
 }
 
 function completedPhase(phaseIndex, delayMinutes, phase) {
-  const phaseStatus = readJson(path.join(phase.runDir, "status.json"));
+  const phaseStatus = readJson(path.join(phase.runDir, "state", "status.json"));
   const manifest = readJsonRequired(path.join(phase.artifactDir, "manifest.json"));
   return {
     stage: phaseIndex + 1,

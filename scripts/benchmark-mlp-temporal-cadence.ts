@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { gunzipSync } from "node:zlib";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   conditionalCutoffRawParameters,
   exposureHoldingFeasibleInterval,
@@ -26,13 +26,13 @@ async function main(): Promise<void> {
   const count = positiveInteger(argument("examples") ?? "4096", "examples");
   const output = path.resolve(
     repoRoot,
-    argument("output") ?? "data/ml-analysis/mlp-temporal-cadence-1s",
+    argument("output") ?? "data/training/analysis/mlp-temporal-cadence-1s",
   );
   const execution = plan.execution;
   const sourceRoot = path.resolve(
     repoRoot,
     plan.dataDir,
-    "historical/spot-btcusdt/btcusdt/1s",
+    "market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
   );
   const candles = readCandleDay(sourceRoot, date);
   const required = count + execution.valueHorizonSteps;
@@ -54,6 +54,7 @@ async function main(): Promise<void> {
   const prepared = await prepareExposureValueOracleCuda(prices, {
     scoreStartIndex: 0,
     holdingPeriodSteps: execution.holdingPeriodSteps,
+    decisionDelaySteps: execution.decisionDelaySteps ?? 1,
     valueHorizonSteps: execution.valueHorizonSteps,
     friction: feeRate,
     gridSize: execution.gridSize,
@@ -179,13 +180,7 @@ async function main(): Promise<void> {
 }
 
 function readCandleDay(root: string, date: string): Candle[] {
-  const plain = path.join(root, `${date}.jsonl`);
-  const content = fs.existsSync(plain)
-    ? fs.readFileSync(plain, "utf8")
-    : gunzipSync(fs.readFileSync(`${plain}.gz`)).toString("utf8");
-  const candles = content.split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as Candle);
+  const candles = readCandleShardReferenceSync(path.join(root, `${date}.json`));
   if (candles.length !== 86_400) {
     throw new Error(`${date} has ${candles.length}/86400 one-second candles.`);
   }

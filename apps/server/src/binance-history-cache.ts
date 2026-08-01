@@ -1,14 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { once } from "node:events";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createGzip } from "node:zlib";
 import AdmZip from "adm-zip";
 import type { Candle } from "@trading/bot-algo";
+import {
+  putCandleShard,
+  SequentialShardStore,
+  TradingStorageLayout,
+} from "@trading/storage";
 
 const DAY_MS = 86_400_000;
 const BINANCE_SPOT_ARCHIVE_ROOT = "https://data.binance.vision/data/spot/daily/klines";
@@ -25,8 +26,7 @@ export interface BinanceSpotDailyShardRequest {
 
 /**
  * Downloads one complete Binance spot UTC-day kline archive and installs it as
- * a compressed JSONL shard. The target is renamed into place only after the
- * checksum, archive extraction, ordering, and full-day boundary checks pass.
+ * an immutable content-addressed sequential shard under data/market.
  */
 export async function fetchBinanceSpotDailyShard(
   request: BinanceSpotDailyShardRequest,
@@ -38,53 +38,59 @@ export async function fetchBinanceSpotDailyShard(
     throw new Error(`Daily shard interval must divide one UTC day exactly; received ${intervalMs}ms.`);
   }
   const archiveRoot = request.archiveRoot ?? BINANCE_SPOT_ARCHIVE_ROOT;
-  const outputDir = path.join(
-    request.dataDir,
-    "historical",
-    `spot-${symbol.toLowerCase()}`,
-    symbol.toLowerCase(),
-    interval,
-  );
-  const target = path.join(outputDir, `${request.date}.jsonl.gz`);
+  const layout = new TradingStorageLayout(request.dataDir);
+  const temporaryDir = new TradingStorageLayout(request.dataDir).marketTmp;
   const temporarySuffix = `${process.pid}-${randomUUID()}`;
-  const archive = path.join(outputDir, `.${request.date}.${temporarySuffix}.zip`);
-  const temporary = path.join(outputDir, `.${request.date}.${temporarySuffix}.jsonl.gz`);
+  const archive = path.join(temporaryDir, `.${request.date}.${temporarySuffix}.zip`);
   const archiveUrl = [archiveRoot, symbol, interval, `${symbol}-${interval}-${request.date}.zip`]
     .map((part, index) => index === 0 ? part.replace(/\/$/, "") : encodeURIComponent(part))
     .join("/");
 
-  await fs.mkdir(outputDir, { recursive: true });
+  await fs.mkdir(temporaryDir, { recursive: true });
   try {
     const bytes = await requestBuffer(archiveUrl);
     await fs.writeFile(archive, bytes);
     await verifyChecksum(archiveUrl, bytes);
-    await extractDailyShard({
+    const candles = await extractDailyShard({
       archive,
-      temporary,
       symbol,
       interval,
       intervalMs,
       day: request.day,
       date: request.date,
     });
-    await fs.rename(temporary, target);
+    const store = new SequentialShardStore(layout.marketStore);
+    await putCandleShard(store, {
+      namespace: [
+        "candles",
+        `spot-${symbol.toLowerCase()}`,
+        symbol.toLowerCase(),
+        interval,
+      ].join("/"),
+      key: request.date,
+      candles,
+      stepMs: intervalMs,
+      metadata: {
+        source: "data.binance.vision",
+        market: "spot",
+        symbol,
+        interval,
+        completeUtcDay: true,
+      },
+    });
   } finally {
-    await Promise.all([
-      fs.rm(archive, { force: true }),
-      fs.rm(temporary, { force: true }),
-    ]);
+    await fs.rm(archive, { force: true });
   }
 }
 
 async function extractDailyShard(options: {
   archive: string;
-  temporary: string;
   symbol: string;
   interval: string;
   intervalMs: number;
   day: number;
   date: string;
-}): Promise<void> {
+}): Promise<Candle[]> {
   const entries = new AdmZip(options.archive)
     .getEntries()
     .filter((entry) => !entry.isDirectory);
@@ -95,39 +101,31 @@ async function extractDailyShard(options: {
     input: Readable.from([entries[0]!.getData()]),
     crlfDelay: Infinity,
   });
-  const gzip = createGzip({ level: 6 });
-  const outputDone = pipeline(gzip, createWriteStream(options.temporary));
+  const candles: Candle[] = [];
   let count = 0;
   let firstTime: number | undefined;
   let previousTime: number | undefined;
-  try {
-    for await (const line of lines) {
-      if (!line) continue;
-      const row = line.split(",");
-      const candle = parseArchiveCandle(options.symbol, options.interval, row);
-      if (!validCandle(candle, options.day, options.intervalMs)) {
-        throw new Error(`${options.date}: invalid Binance candle at ${candle.openTime}`);
-      }
-      if (previousTime !== undefined && candle.openTime !== previousTime + options.intervalMs) {
-        throw new Error(`${options.date}: Binance candles are missing, duplicated, or out of order`);
-      }
-      firstTime ??= candle.openTime;
-      previousTime = candle.openTime;
-      count += 1;
-      if (!gzip.write(`${JSON.stringify(candle)}\n`)) await once(gzip, "drain");
+  for await (const line of lines) {
+    if (!line) continue;
+    const row = line.split(",");
+    const candle = parseArchiveCandle(options.symbol, options.interval, row);
+    if (!validCandle(candle, options.day, options.intervalMs)) {
+      throw new Error(`${options.date}: invalid Binance candle at ${candle.openTime}`);
     }
-    gzip.end();
-    await outputDone;
-    const expectedLastTime = options.day + DAY_MS - options.intervalMs;
-    const expectedCount = DAY_MS / options.intervalMs;
-    if (count !== expectedCount || firstTime !== options.day || previousTime !== expectedLastTime) {
-      throw new Error(`${options.date}: Binance archive does not cover the complete UTC day`);
+    if (previousTime !== undefined && candle.openTime !== previousTime + options.intervalMs) {
+      throw new Error(`${options.date}: Binance candles are missing, duplicated, or out of order`);
     }
-  } catch (error) {
-    gzip.destroy();
-    await Promise.allSettled([outputDone]);
-    throw error;
+    firstTime ??= candle.openTime;
+    previousTime = candle.openTime;
+    count += 1;
+    candles.push(candle);
   }
+  const expectedLastTime = options.day + DAY_MS - options.intervalMs;
+  const expectedCount = DAY_MS / options.intervalMs;
+  if (count !== expectedCount || firstTime !== options.day || previousTime !== expectedLastTime) {
+    throw new Error(`${options.date}: Binance archive does not cover the complete UTC day`);
+  }
+  return candles;
 }
 
 function parseArchiveCandle(symbol: string, interval: string, row: string[]): Candle {

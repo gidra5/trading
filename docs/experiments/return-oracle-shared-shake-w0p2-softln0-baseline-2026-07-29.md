@@ -8,7 +8,7 @@ intentionally stopped after completing epoch 64 on 2026-07-29.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-shared-shake-w0p2-softln0-baseline-20260729-191415
+data/training/runs/return-oracle-ce-shrinking-v1-shared-shake-w0p2-softln0-baseline-20260729-191415
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

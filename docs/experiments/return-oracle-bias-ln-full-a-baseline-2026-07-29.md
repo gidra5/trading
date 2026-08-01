@@ -8,7 +8,7 @@ changing the LayerNorm centering operator.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-bias-ln-full-a-baseline-20260729-132700
+data/training/runs/return-oracle-ce-shrinking-v1-bias-ln-full-a-baseline-20260729-132700
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

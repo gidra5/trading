@@ -8,7 +8,7 @@ The fit ranking never reads validation or holdout scores. The best validated vol
 
 ## Data and objective
 
-- Source: `data/historical/spot-btcusdt/btcusdt/1s` (1s); target scales: 1s.
+- Source: `data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s` (1s); target scales: 1s.
 - Windows: fit 2021-09-08..2021-12-20, 2022-05-14..2022-08-03, 2023-03-03..2023-12-05; validation 2024-01-02..2024-02-26, 2024-07-07..2024-11-11; test 2025-02-14..2025-07-06, 2026-04-22..2026-07-10.
 - Each continuous segment reserves 3d before scoring.
 - Candidate evaluation uses 12 persistent shared-memory worker threads, dynamic batching, cross-generation score caching, and stage-wide prepared candle/oracle caching.

@@ -41,6 +41,7 @@ const FIXTURES: readonly OracleFixture[] = [
     options: {
       scoreStartIndex: 2,
       holdingPeriodSteps: 2,
+      decisionDelaySteps: 2,
       valueHorizonSteps: 5,
       friction: 0.0025,
       gridSize: 7,

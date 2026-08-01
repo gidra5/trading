@@ -7,7 +7,7 @@ count, and eliminating redundant validation regularizer calculations.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-batch65536-muon5-baseline-20260729-160152
+data/training/runs/return-oracle-ce-shrinking-v1-batch65536-muon5-baseline-20260729-160152
 ```
 
 The model and objective match the active learnable-centering diagnostic-loss

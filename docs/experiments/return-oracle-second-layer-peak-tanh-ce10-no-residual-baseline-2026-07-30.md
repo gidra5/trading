@@ -3,7 +3,7 @@
 ## Preserved run
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-secondlayerpeak-tanh-ce10-noresidual-baseline-20260730-174907
+data/training/runs/return-oracle-ce-shrinking-v1-secondlayerpeak-tanh-ce10-noresidual-baseline-20260730-174907
 ```
 
 The run was stopped intentionally while healthy to test learned projections

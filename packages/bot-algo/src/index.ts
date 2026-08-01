@@ -1,11 +1,11 @@
 export {
-  SimulatedExecutionEngine,
   createInitialBotState,
   createStrategyConfig,
   defaultStrategyConfig,
   type PartialStrategyConfig,
-} from "./legacy/execution-simulator.js";
+} from "./strategy-config.js";
 export * from "./bot.js";
+export * from "./simulated-trading-api.js";
 export * from "./peak-valley-strategy.js";
 export type * from "./strategy.js";
 export type * from "./trading-api.js";
@@ -23,16 +23,7 @@ export * from "./vw-kama-cuda.js";
 export * from "./signal-memory.js";
 export * from "./kama-rate-noise.js";
 export * from "./peak-valley-kama-signal.js";
-export {
-  compactBacktestState,
-  createBacktestChartCollector,
-  finalizeBacktestCandleChart,
-  observeBacktestChartCandle,
-  runBacktestFromCandles,
-  runBacktestFromOrderBook,
-  runBacktestFromTicks,
-  type BacktestChartCollector,
-} from "./legacy/backtest.js";
+export { compactBacktestState } from "./backtest-state.js";
 export {
   aggregateExtremaOrderMassSummaries,
   createExtremaOrderMassCollector,

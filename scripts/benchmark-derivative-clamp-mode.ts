@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
-  runBacktestFromCandles,
   type BacktestResult,
   type Candle,
   type LegacyDerivativeClampMode,
   type LegacyDerivativeSource,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 interface BenchmarkCase {
   group: string;
@@ -55,7 +56,7 @@ interface ResultRow {
 }
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const candleDir = path.join(repoRoot, "data/historical/spot-btcusdt/btcusdt/1m");
+const candleDir = path.join(repoRoot, "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m");
 const clampModes: LegacyDerivativeClampMode[] = ["deadband", "hysteresis"];
 const cases: BenchmarkCase[] = [
   { group: "choppy-week", label: "highest OHLC churn", startDate: "2022-07-28", endDate: "2022-08-03" },
@@ -99,9 +100,14 @@ const reportPath = path.resolve(
   args.reportPath ?? `docs/derivative-clamp-mode-benchmark-${stamp}.md`,
 );
 
-runBenchmark(args, outputPath, reportPath);
+runBenchmark(args, outputPath, reportPath).catch(fail);
 
-function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPath: string): void {
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
+
+async function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPath: string): Promise<void> {
   const startedAt = Date.now();
   const rows: ResultRow[] = [];
   fs.mkdirSync(path.dirname(targetOutputPath), { recursive: true });
@@ -130,7 +136,7 @@ function runBenchmark(configArgs: Args, targetOutputPath: string, targetReportPa
     const market = summarizeMarket(candles);
     for (const clampMode of clampModes) {
       const started = Date.now();
-      const result = runBacktestFromCandles(candles, {
+      const result = await runCanonicalBacktestFromCandles(candles, {
         config: benchmarkConfig(configArgs, clampMode),
         maxReturnedOrders: 0,
         maxReturnedFills: 0,
@@ -360,17 +366,12 @@ function loadCandles(testCase: BenchmarkCase): Candle[] {
     timestamp <= Date.parse(`${testCase.endDate}T00:00:00Z`);
     timestamp += 24 * 60 * 60 * 1000
   ) {
-    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.jsonl`;
+    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.json`;
     const filePath = path.join(candleDir, file);
     if (!fs.existsSync(filePath)) {
       throw new Error(`Missing candle file: ${path.relative(repoRoot, filePath)}`);
     }
-    const content = fs.readFileSync(filePath, "utf8");
-    for (const line of content.split("\n")) {
-      if (line.trim()) {
-        candles.push(JSON.parse(line) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(filePath));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

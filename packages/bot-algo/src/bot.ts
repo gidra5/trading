@@ -9,6 +9,7 @@ import type {
   StrategyDiagnostics,
   StrategySnapshot,
   TradingStrategy,
+  TradingStrategyTargetExposureSignal,
 } from "./strategy.js";
 
 export type GridSizeDistribution = "linear" | "geometric";
@@ -164,6 +165,22 @@ export class GridTradingBot<
     this.lastTickAt = tick.timestamp;
     await this.options.strategy.onTick(tick);
     await this.applyLifecycle(tick);
+    if (this.options.strategy.targetExposureSignal) {
+      const account = await this.options.api.getEquity();
+      const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
+      const currentExposure = equity > 0
+        ? this.signedPositionNotional(tick.price) / equity
+        : 0;
+      const target = await this.options.strategy.targetExposureSignal({
+        timestamp: tick.timestamp,
+        price: tick.price,
+        equity,
+        currentExposure,
+        maxLeverage: this.config.maxTargetLeverage,
+      });
+      if (target) await this.rebalanceToTargetExposure(target, tick);
+      return;
+    }
     const exit = await this.options.strategy.exitSignal();
     if (exit) {
       await this.createExit(exit.side, exit.size, exit.price, exit.confidence);
@@ -189,6 +206,14 @@ export class GridTradingBot<
   }
 
   async onOrder(event: TradingOrderEvent): Promise<void> {
+    if (event.type === "liquidation") {
+      this.positions = [];
+      return;
+    }
+    if (event.type === "maintenance") {
+      this.applyMaintenance(event.quoteCharge, event.assetCharge);
+      return;
+    }
     const found = this.findOrder(event.type === "open" ? event.order.id : event.orderId);
     if (!found) {
       return;
@@ -462,6 +487,83 @@ export class GridTradingBot<
     this.lastEntryAt = tick.timestamp;
   }
 
+  private async rebalanceToTargetExposure(
+    signal: TradingStrategyTargetExposureSignal,
+    tick: TradingTick,
+  ): Promise<void> {
+    if (!(tick.price > 0) || !Number.isFinite(signal.targetExposure)) return;
+    await this.cancelOpenOrders();
+    const account = await this.options.api.getEquity();
+    const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
+    if (!(equity > 0)) return;
+
+    const target = Math.max(
+      -this.config.maxTargetLeverage,
+      Math.min(this.config.maxTargetLeverage, signal.targetExposure),
+    );
+    const targetSide: PositionSide | null = target > 0 ? "long" : target < 0 ? "short" : null;
+    const oppositeSide: PositionSide | null = targetSide === "long"
+      ? "short"
+      : targetSide === "short"
+        ? "long"
+        : null;
+
+    if (oppositeSide && this.sidePositionNotional(oppositeSide, tick.price) > 0) {
+      // A reversal must release the old side before the new entry consumes capacity.
+      await this.createExit(oppositeSide, 1, null, signal.confidence);
+    }
+    if (targetSide === null) {
+      await this.createExit("long", 1, signal.price, signal.confidence);
+      await this.createExit("short", 1, signal.price, signal.confidence);
+      return;
+    }
+
+    const refreshed = await this.options.api.getEquity();
+    const refreshedEquity = refreshed.quoteUnleveraged + refreshed.assetUnleveraged * tick.price;
+    if (!(refreshedEquity > 0)) return;
+    const currentSideQuote = this.sidePositionNotional(targetSide, tick.price);
+    const desiredSideQuote = Math.abs(target) * refreshedEquity;
+    const difference = desiredSideQuote - currentSideQuote;
+    const minimum = Math.max(this.config.minTradeQuote, Number.EPSILON);
+    if (difference < -minimum) {
+      await this.createExit(
+        targetSide,
+        Math.min(1, -difference / currentSideQuote),
+        signal.price,
+        signal.confidence,
+      );
+      return;
+    }
+    if (difference < minimum) return;
+
+    const requestedLeverage = Math.max(1, Math.abs(target));
+    const capacity = await this.options.api.getOrderCapacity({
+      side: targetSide === "long" ? "buy" : "sell",
+      price: tick.price,
+      leverage: requestedLeverage,
+    });
+    if (!(capacity.quote > 0)) return;
+    await this.createEntry(
+      targetSide,
+      Math.min(1, difference / capacity.quote),
+      requestedLeverage,
+      signal.price,
+      signal.confidence,
+      tick,
+    );
+  }
+
+  private signedPositionNotional(price: number): number {
+    return this.sidePositionNotional("long", price) - this.sidePositionNotional("short", price);
+  }
+
+  private sidePositionNotional(side: PositionSide, price: number): number {
+    return this.positions.reduce(
+      (sum, position) => sum + (position.side === side ? position.asset * price : 0),
+      0,
+    );
+  }
+
   private async createExit(
     side: PositionSide,
     size: number,
@@ -504,6 +606,8 @@ export class GridTradingBot<
       signalPrice,
       this.config.exitGrid,
       confidence,
+      null,
+      true,
     );
     if (grid.orders.length === 0) {
       position.exitGrid = null;
@@ -519,6 +623,7 @@ export class GridTradingBot<
     config: GridConfig,
     confidence: number | null = null,
     quoteLimit: number | null = null,
+    reduceOnly = false,
   ): Promise<void> {
     const market = signalPrice === null;
     const count = market ? 1 : Math.max(1, Math.round(config.orderCount));
@@ -560,9 +665,15 @@ export class GridTradingBot<
         continue;
       }
       const price = prices[index];
+      const orderInput = {
+        side,
+        size,
+        leverage: position.leverage,
+        reduceOnly,
+      };
       const result = price === null
-        ? await this.options.api.createMarketOrder({ side, size })
-        : await this.options.api.createLimitOrder({ side, size, price });
+        ? await this.options.api.createMarketOrder(orderInput)
+        : await this.options.api.createLimitOrder({ ...orderInput, price });
       if (result.accepted) {
         grid.orders.push({ order: result.order, filled: 0 });
       }
@@ -624,6 +735,19 @@ export class GridTradingBot<
       const borrowed = fill.filledAsset * borrowedRate;
       position.externalBorrow.asset += borrowed - this.allocateInternal(position, borrowed, 0);
     }
+  }
+
+  private applyMaintenance(quoteCharge: number, assetCharge: number): void {
+    distributeMaintenance(
+      this.positions.filter((position) => position.side === "long"),
+      quoteCharge,
+      "quote",
+    );
+    distributeMaintenance(
+      this.positions.filter((position) => position.side === "short"),
+      assetCharge,
+      "asset",
+    );
   }
 
   private reducePositionAmount(
@@ -778,6 +902,35 @@ function plannedOrdersOf(positions: readonly TradingPosition[]): TradingOrderSna
 
 function sumSide(positions: readonly TradingPosition[], side: PositionSide): number {
   return positions.reduce((sum, position) => sum + (position.side === side ? position.asset : 0), 0);
+}
+
+function distributeMaintenance(
+  positions: readonly TradingPosition[],
+  charge: number,
+  unit: "asset" | "quote",
+): void {
+  if (!(charge > 0) || positions.length === 0) return;
+  const externalTotal = positions.reduce(
+    (sum, position) => sum + Math.max(0, position.externalBorrow[unit]),
+    0,
+  );
+  const amountTotal = positions.reduce(
+    (sum, position) => sum + Math.max(0, position[unit]),
+    0,
+  );
+  let remaining = charge;
+  for (let index = 0; index < positions.length; index += 1) {
+    const position = positions[index]!;
+    const weight = externalTotal > 0
+      ? Math.max(0, position.externalBorrow[unit]) / externalTotal
+      : amountTotal > 0
+        ? Math.max(0, position[unit]) / amountTotal
+        : 1 / positions.length;
+    const allocated = index === positions.length - 1 ? remaining : charge * weight;
+    position[unit] += allocated;
+    position.externalBorrow[unit] += allocated;
+    remaining -= allocated;
+  }
 }
 
 function gridWeights(

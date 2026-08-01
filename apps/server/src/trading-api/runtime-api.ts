@@ -1,20 +1,13 @@
 import type {
   TradingApi,
+  TradingEquitySnapshot,
   TradingOrderEvent,
   TradingTick,
 } from "@trading/bot-algo";
 
-export interface EquitySnapshot {
-  quoteAvailable: number;
-  quoteReserved: number;
-  quoteUnleveraged: number;
-  assetAvailable: number;
-  assetReserved: number;
-  assetUnleveraged: number;
-}
+export type EquitySnapshot = TradingEquitySnapshot;
 
 export interface RuntimeTradingApi extends TradingApi {
-  getEquity(): Promise<EquitySnapshot>;
   onTick(tick: TradingTick): Promise<void>;
   drainEvents(): TradingOrderEvent[];
 }

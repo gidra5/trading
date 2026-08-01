@@ -530,7 +530,7 @@ than constructing and sharing one tensor tuple per example. On the current
 from about 616 seconds to 47.3 seconds; the complete one-epoch process took 52.7
 seconds. A tested 512/2,048 configuration was slower on its cold compiled pass,
 halved optimizer updates, and had worse one-epoch validation KL, so it is not the
-default. `data/ml-runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s/training.log`
+default. `data/training/runs/mlp-conservative-quadratic-cutoff-temporal-matmul-cuda-v11-delay-60s/training.log`
 contains the complete append-only event stream. The status display includes loss,
 conditional/base KL divergence, probability MSE, excess entropy, oracle MI,
 learning rate, gradient norm, throughput, and GPU memory.

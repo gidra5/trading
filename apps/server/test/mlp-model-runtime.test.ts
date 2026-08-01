@@ -22,7 +22,10 @@ test("joint and dynamic-study artifacts remain recursively discoverable by the U
   context.after(() => fs.rm(dataDir, { recursive: true, force: true }));
   const artifact = path.join(
     dataDir,
-    "ml-joint-studies",
+    "training",
+    "runs",
+    "studies",
+    "joint",
     "study",
     "delay-60s",
     "factorial-00-e6-p2-fingerprint",
@@ -48,7 +51,10 @@ test("joint and dynamic-study artifacts remain recursively discoverable by the U
   }));
   const dynamicArtifact = path.join(
     dataDir,
-    "ml-dynamic-studies",
+    "training",
+    "runs",
+    "studies",
+    "dynamic",
     "study",
     "branches",
     "selected-curriculum",

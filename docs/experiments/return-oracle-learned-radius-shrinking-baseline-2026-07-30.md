@@ -3,7 +3,7 @@
 ## Preserved run
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-learned-radius-shrinking-baseline-20260730-104920
+data/training/runs/return-oracle-ce-shrinking-v1-learned-radius-shrinking-baseline-20260730-104920
 ```
 
 The run was stopped intentionally while still healthy so the next experiment

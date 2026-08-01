@@ -15,6 +15,7 @@
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.0.1",
     "@trading/bot-algo": "*",
+    "@trading/storage": "*",
     "adm-zip": "0.6.0",
     "fastify": "^5.1.0",
     "onnxruntime-node": "^1.27.0",

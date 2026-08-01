@@ -7,7 +7,7 @@ enabled.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-batch86400-muon3-no-accum-baseline-20260729-160827
+data/training/runs/return-oracle-ce-shrinking-v1-batch86400-muon3-no-accum-baseline-20260729-160827
 ```
 
 Its controlled speed settings were:

@@ -7,7 +7,7 @@ The fit ranking never reads validation or holdout scores. The best validated vol
 
 ## Data and objective
 
-- Source: `data/historical/spot-btcusdt/btcusdt/1s` (1s); target scales: 1s, 15s, 1m.
+- Source: `data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s` (1s); target scales: 1s, 15s, 1m.
 - Windows: fit 2022-06-13..2022-06-15; validation 2024-02-24..2024-02-26; test 2025-02-14..2025-02-16.
 - Each continuous segment reserves 3d before scoring.
 - Signal: completed-candle volume-weighted KAMA derivative rate; candidates either go flat inside the deadband or hold their prior exposure until the opposite threshold.

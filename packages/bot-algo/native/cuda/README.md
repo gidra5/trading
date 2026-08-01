@@ -26,8 +26,9 @@ PTX.
 
 The exposure-value distribution path factors each target into a precomputed
 mandatory initial hold and a fee-separable continuation. The initial target is
-held for `H` candles; continuation then advances one candle per Bellman layer
-until the total `T`-candle horizon, followed by an exact closeout to cash.
+held for `H` candles; continuation decisions then advance by the separately
+configured delay `D` (with a shorter final block when necessary) until the
+total `T`-candle horizon, followed by an exact closeout to cash.
 Buy/sell prefix and suffix scans make each continuation layer linear in the
 action-grid size and query each passively drifted exposure exactly, without
 interpolating a sampled continuation row. For the production rolling horizon,

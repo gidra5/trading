@@ -53,6 +53,10 @@ async function run(): Promise<void> {
   if (mutualInformationBins < 2 || mutualInformationBins > Math.min(32, gridSize)) {
     throw new Error("MI bins must be from 2 through min(32, grid size).");
   }
+  const decisionDelaySteps = positiveInteger(
+    process.argv[11] ?? "1",
+    "decision-delay steps",
+  );
   const lossConfig = {
     ...DEFAULT_EXPOSURE_VALUE_DISTILLATION_LOSS,
     entropyGapLambda: lossMode === "disabled" ? 0 : 1,
@@ -72,6 +76,7 @@ async function run(): Promise<void> {
   const oracleOptions = {
     scoreStartIndex,
     holdingPeriodSteps,
+    decisionDelaySteps,
     valueHorizonSteps,
     friction: 0.00175,
     gridSize,
@@ -174,6 +179,7 @@ async function run(): Promise<void> {
       candleCount,
       gridSize,
       holdingPeriodSteps,
+      decisionDelaySteps,
       valueHorizonSteps,
       caseCount,
       scoreStartIndex,

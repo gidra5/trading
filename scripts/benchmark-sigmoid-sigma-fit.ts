@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   defaultLegacyValleyPeakConfig,
-  runBacktestFromCandles,
   type Candle,
   type PartialStrategyConfig,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 interface BenchmarkCase {
   label: string;
@@ -80,6 +81,9 @@ const defaultWindowsSec = [
 const defaultSlopeAValues = [0, 10, 25, 50, 100, 200, 400, 800];
 const defaultSlopeBValues = [0, 25, 50, 100, 200, 400, 800, 1600];
 
+main().catch(fail);
+
+async function main(): Promise<void> {
 const args = parseArgs(process.argv.slice(2));
 const selectedCases =
   args.caseIndex === undefined ? cases : [caseByIndex(args.caseIndex)];
@@ -89,8 +93,9 @@ const summaries: CandidateSummary[] = [];
 for (const trendWindowSec of args.windowsSec) {
   for (const slopeA of args.slopeAValues) {
     for (const slopeB of args.slopeBValues) {
-      const results = selectedCases.map((testCase, index) =>
-        runCase({
+      const results: RunResult[] = [];
+      for (const [index, testCase] of selectedCases.entries()) {
+        results.push(await runCase({
           testCase,
           caseIndex: cases.indexOf(testCase),
           candles: candleSets[index] ?? [],
@@ -99,8 +104,8 @@ for (const trendWindowSec of args.windowsSec) {
           slopeB,
           sigmaLow: args.sigmaLow,
           sigmaHigh: args.sigmaHigh,
-        }),
-      );
+        }));
+      }
       const summary = summarizeCandidate({
         trendWindowSec,
         slopeA,
@@ -124,8 +129,14 @@ summaries.sort(
 for (const summary of summaries.slice(0, args.top)) {
   console.log(JSON.stringify(summary));
 }
+}
 
-function runCase(input: {
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
+
+async function runCase(input: {
   testCase: BenchmarkCase;
   caseIndex: number;
   candles: Candle[];
@@ -134,8 +145,8 @@ function runCase(input: {
   slopeB: number;
   sigmaLow: number;
   sigmaHigh: number;
-}): RunResult {
-  const result = runBacktestFromCandles(input.candles, {
+}): Promise<RunResult> {
+  const result = await runCanonicalBacktestFromCandles(input.candles, {
     config: {
       symbol: "BTCUSDT",
       algorithm: "legacy-valley-peak",
@@ -336,20 +347,15 @@ function positiveNumber(value: string, label: string): number {
 }
 
 function loadCandles(testCase: BenchmarkCase): Candle[] {
-  const dir = "data/historical/spot-btcusdt/btcusdt/1m";
+  const dir = "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m";
   const candles: Candle[] = [];
   for (
     let timestamp = Date.parse(`${testCase.startDate}T00:00:00Z`);
     timestamp <= Date.parse(`${testCase.endDate}T00:00:00Z`);
     timestamp += 24 * 60 * 60 * 1000
   ) {
-    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.jsonl`;
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      if (line.trim()) {
-        candles.push(JSON.parse(line) as Candle);
-      }
-    }
+    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.json`;
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

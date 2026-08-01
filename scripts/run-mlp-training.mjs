@@ -3,6 +3,11 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  assertInside,
+  prepareTrainingCache,
+  trainingStorageLayout,
+} from "./training-storage.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const planArgument = argument("plan") ?? "ml/training-plan.json";
@@ -22,6 +27,7 @@ if ([trainingOnly, datasetOnly, verificationOnly, frozenStudyOnly, productionMin
 }
 const planFile = path.resolve(repoRoot, planArgument);
 const plan = JSON.parse(fs.readFileSync(planFile, "utf8"));
+const storageLayout = trainingStorageLayout(repoRoot);
 const runDir = path.resolve(repoRoot, plan.runDir);
 const datasetDir = path.resolve(
   repoRoot,
@@ -32,19 +38,24 @@ const datasetDir = path.resolve(
     : plan.datasetDir,
 );
 const artifactDir = path.resolve(repoRoot, plan.artifactDir);
+assertInside(runDir, storageLayout.runs, "runDir");
+assertInside(datasetDir, storageLayout.datasets, "datasetDir");
 let trainingPlan = plan;
 let trainingPlanFile = planFile;
 let trainingDatasetDir = datasetDir;
 let trainingArtifactDir = artifactDir;
-const statusFile = path.join(runDir, "status.json");
-const logFile = path.join(runDir, "training.log");
-const finalizeFile = path.join(runDir, "FINALIZE");
-const runtimeRoot = path.join(repoRoot, "data", "runtime-cache");
-const temporaryDirectory = path.join(runtimeRoot, "tmp");
-const tritonCacheDirectory = path.join(runtimeRoot, "triton");
-const torchInductorCacheDirectory = path.join(runtimeRoot, "torchinductor");
-const cudaCacheDirectory = path.join(runtimeRoot, "cuda");
+const statusFile = path.join(runDir, "state", "status.json");
+const logFile = path.join(runDir, "logs", "runner.log");
+const finalizeFile = path.join(runDir, "control", "FINALIZE");
+const cache = prepareTrainingCache(repoRoot);
+const temporaryDirectory = cache.temporary;
+const tritonCacheDirectory = cache.triton;
+const torchInductorCacheDirectory = cache.torchinductor;
+const cudaCacheDirectory = cache.cuda;
 fs.mkdirSync(runDir, { recursive: true });
+fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+fs.mkdirSync(path.dirname(logFile), { recursive: true });
+fs.mkdirSync(path.dirname(finalizeFile), { recursive: true });
 for (const directory of [
   temporaryDirectory,
   tritonCacheDirectory,
@@ -199,6 +210,7 @@ try {
     path.join(repoRoot, "ml/train_mlp.py"),
     "--dataset", trainingDatasetDir,
     "--output", trainingArtifactDir,
+    "--run-dir", runDir,
     "--model-id", trainingPlan.id,
     "--label", trainingPlan.label,
     "--plan", trainingPlanFile,
@@ -368,7 +380,7 @@ function consume(stream, stderr) {
             count: event.rejectedDays,
             latestDate: event.date,
             latestDetail: event.detail,
-            queue: path.join(datasetDir, "source-rejection-queue.json"),
+            queue: path.join(datasetDir, "state", "source-rejection-queue.json"),
           },
         };
       } else if (event.event === "dataset-source-recovered") {

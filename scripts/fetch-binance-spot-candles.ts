@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import fs from "node:fs/promises";
-import { createReadStream, createWriteStream } from "node:fs";
 import https from "node:https";
 import path from "node:path";
 import readline from "node:readline";
-import { PassThrough, Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createGunzip, createGzip } from "node:zlib";
+import { Readable } from "node:stream";
 import AdmZip from "adm-zip";
+import {
+  putCandleShard,
+  readCandleShardReference,
+  SequentialShardStore,
+  TradingStorageLayout,
+} from "@trading/storage";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const args = process.argv.slice(2);
@@ -20,7 +22,6 @@ if (args.includes("--help")) {
   --days 30 --end YYYY-MM-DD       Rolling UTC day range; end is inclusive
   --ranges START..END,...          Sparse UTC date ranges; ends are inclusive
   --warmup-days 0                  Prepend this many days to every range
-  --compression none|gzip         Store daily shards as JSONL or JSONL.GZ
   --fill-gaps                     Fill no-trade intervals with zero-volume carry candles
   --quiet                          Only print the final total
   --data-dir data`);
@@ -32,7 +33,6 @@ const value = (name: string): string | undefined => {
 };
 const symbol = (value("--symbol") ?? "BTCUSDT").toUpperCase();
 const interval = value("--interval") ?? "1s";
-const compression = value("--compression") ?? "none";
 const fillGaps = args.includes("--fill-gaps");
 const quiet = args.includes("--quiet");
 const days = Number(value("--days") ?? 30);
@@ -45,22 +45,23 @@ const ranges = mergeRanges(
   (value("--ranges") ? parseRanges(value("--ranges")!) : [{ start, end }])
     .map((range) => ({ ...range, start: range.start - warmupDays * DAY_MS })),
 );
-const outputDir = path.resolve(
-  value("--data-dir") ?? "data",
-  "historical",
+const dataDir = path.resolve(value("--data-dir") ?? "data");
+const storageLayout = new TradingStorageLayout(dataDir);
+const shardStore = new SequentialShardStore(storageLayout.marketStore);
+const namespace = [
+  "candles",
   `spot-${symbol.toLowerCase()}`,
   symbol.toLowerCase(),
   interval,
-);
+].join("/");
+const outputDir = path.dirname(shardStore.referenceFile(namespace, "placeholder"));
+const temporaryDir = new TradingStorageLayout(dataDir).marketTmp;
 
 if (!Number.isInteger(days) || days <= 0) throw new Error("--days must be a positive integer");
 if (!Number.isInteger(warmupDays) || warmupDays < 0) {
   throw new Error("--warmup-days must be a non-negative integer");
 }
 if (DAY_MS % intervalMs !== 0) throw new Error(`${interval} does not divide a UTC day`);
-if (compression !== "none" && compression !== "gzip") {
-  throw new Error("--compression must be none or gzip");
-}
 
 main().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : error);
@@ -69,23 +70,15 @@ main().catch((error: unknown) => {
 
 async function main(): Promise<void> {
   await fs.mkdir(outputDir, { recursive: true });
+  await fs.mkdir(temporaryDir, { recursive: true });
   if (!quiet) console.log(`Ranges: ${ranges.map(formatRange).join(", ")}`);
   let total = 0;
   for (const { start, end } of ranges) for (let day = start; day <= end; day += DAY_MS) {
     const date = new Date(day).toISOString().slice(0, 10);
-    const target = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? ".gz" : ""}`);
-    const alternate = path.join(outputDir, `${date}.jsonl${compression === "gzip" ? "" : ".gz"}`);
+    const target = shardStore.referenceFile(namespace, date);
     const expected = DAY_MS / intervalMs;
-    let cachedFile = target;
-    let cached = await validatedCount(target, day, expected);
-    if (cached === 0) {
-      cachedFile = alternate;
-      cached = await validatedCount(alternate, day, expected);
-    }
+    const cached = await validatedCount(target, day, expected);
     if (cached > 0) {
-      if (fillGaps && cached < expected) {
-        cached = await fillCachedGaps(cachedFile, day, expected);
-      }
       total += cached;
       if (!quiet) console.log(
         `${date}: cached (${cached.toLocaleString()} candles${fillGaps ? "; dense" : ""})`,
@@ -93,8 +86,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const archive = path.join(outputDir, `.${date}.zip`);
-    const temporary = `${target}.tmp`;
+    const archive = path.join(temporaryDir, `.${date}.zip`);
     try {
       const url = [
         "https://data.binance.vision/data/spot/daily/klines",
@@ -143,8 +135,7 @@ async function main(): Promise<void> {
       let gaps = 0;
       let previousTime = day - intervalMs;
       const ordered = [...candles.values()].sort((a, b) => a.openTime - b.openTime);
-      const output = compression === "gzip" ? createGzip({ level: 6 }) : new PassThrough();
-      const outputDone = pipeline(output, createWriteStream(temporary));
+      const storedCandles: Candle[] = [];
       let previous: Candle | undefined;
       let written = 0;
       if (fillGaps && ordered[0] && ordered[0].openTime > day) {
@@ -162,14 +153,12 @@ async function main(): Promise<void> {
             time += intervalMs
           ) {
             const filled = carryCandle(previous, time);
-            if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+            storedCandles.push(filled);
             previous = filled;
             written += 1;
           }
         }
-        if (!output.write(`${JSON.stringify(candle)}\n`)) {
-          await once(output, "drain");
-        }
+        storedCandles.push(candle);
         written += 1;
         previous = candle;
         previousTime = candle.openTime;
@@ -181,114 +170,62 @@ async function main(): Promise<void> {
           time += intervalMs
         ) {
           const filled = carryCandle(previous, time);
-          if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
+          storedCandles.push(filled);
           previous = filled;
           written += 1;
         }
       }
-      output.end();
-      await outputDone;
       gaps += (day + DAY_MS - intervalMs - previousTime) / intervalMs;
       const count = fillGaps ? written : ordered.length;
       if (count === 0 || ordered.length + gaps !== expected || (fillGaps && count !== expected)) {
         throw new Error(`${date}: invalid archive coverage`);
       }
-      await fs.rename(temporary, target);
+      if (count !== expected) {
+        throw new Error(
+          `${date}: sequential storage requires a dense UTC day; re-run with --fill-gaps`,
+        );
+      }
+      await putCandleShard(shardStore, {
+          namespace,
+          key: date,
+          candles: storedCandles,
+          stepMs: intervalMs,
+          metadata: {
+            source: "data.binance.vision",
+            market: "spot",
+            symbol,
+            interval,
+            completeUtcDay: count === expected,
+            gapFilled: fillGaps,
+          },
+        });
       total += count;
       const notes = [gaps && `${gaps.toLocaleString()} missing intervals`, duplicates && `${duplicates} duplicate rows`]
         .filter(Boolean).join(", ");
       if (!quiet) console.log(`${date}: fetched (${count.toLocaleString()} candles${notes ? `; ${notes}` : ""})`);
     } finally {
-      await Promise.all([fs.rm(archive, { force: true }), fs.rm(temporary, { force: true })]);
+      await fs.rm(archive, { force: true });
     }
   }
 
   console.log(`Stored ${total.toLocaleString()} candles in ${outputDir}`);
 }
 
-async function fillCachedGaps(file: string, day: number, expected: number): Promise<number> {
-  const temporary = `${file}.fill-${process.pid}.tmp`;
-  const source = createReadStream(file);
-  const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
-  const output = file.endsWith(".gz") ? createGzip({ level: 6 }) : new PassThrough();
-  const outputDone = pipeline(output, createWriteStream(temporary));
-  let previous: Candle | undefined;
-  let count = 0;
-  try {
-    for await (const line of lines) {
-      if (!line) continue;
-      const candle = JSON.parse(line) as Candle;
-      if (!validCandle(candle, day)) throw new Error(`${file}: invalid cached candle`);
-      if (!previous && candle.openTime !== day) {
-        previous = await loadPreviousCandle(day);
-        if (!previous) {
-          throw new Error(`${file}: cannot fill a missing leading interval without a prior close`);
-        }
-      }
-      if (previous && candle.openTime <= previous.openTime) {
-        throw new Error(`${file}: cached candles are duplicated or out of order`);
-      }
-      if (previous) {
-        for (let time = previous.openTime + intervalMs; time < candle.openTime; time += intervalMs) {
-          const filled = carryCandle(previous, time);
-          if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
-          previous = filled;
-          count += 1;
-        }
-      }
-      if (!output.write(`${JSON.stringify(candle)}\n`)) await once(output, "drain");
-      previous = candle;
-      count += 1;
-    }
-    if (previous) {
-      for (
-        let time = Math.max(day, previous.openTime + intervalMs);
-        time < day + DAY_MS;
-        time += intervalMs
-      ) {
-        const filled = carryCandle(previous, time);
-        if (!output.write(`${JSON.stringify(filled)}\n`)) await once(output, "drain");
-        previous = filled;
-        count += 1;
-      }
-    }
-    output.end();
-    await outputDone;
-    if (count !== expected || previous?.openTime !== day + DAY_MS - intervalMs) {
-      throw new Error(`${file}: gap filling did not produce a complete UTC day`);
-    }
-    await fs.rename(temporary, file);
-    return count;
-  } catch (error) {
-    output.destroy();
-    await Promise.allSettled([outputDone, fs.rm(temporary, { force: true })]);
-    throw error;
-  }
-}
-
 async function loadPreviousCandle(day: number): Promise<Candle | undefined> {
   const date = new Date(day - DAY_MS).toISOString().slice(0, 10);
-  for (const file of [
-    path.join(outputDir, `${date}.jsonl.gz`),
-    path.join(outputDir, `${date}.jsonl`),
-  ]) {
-    try {
-      await fs.access(file);
-      const source = createReadStream(file);
-      const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
-      const lines = readline.createInterface({ input, crlfDelay: Infinity });
-      let last: Candle | undefined;
-      for await (const line of lines) {
-        if (line) last = JSON.parse(line) as Candle;
-      }
-      if (last && validCandle(last, day - DAY_MS)
-        && last.openTime === day - intervalMs) return last;
-    } catch {
-      // Try the alternate compression.
-    }
+  try {
+    const candles = await readCandleShardReference(
+      shardStore.referenceFile(namespace, date),
+    );
+    const last = candles.at(-1);
+    return last && validCandle(last, day - DAY_MS)
+      && last.openTime === day - intervalMs
+      ? last
+      : undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
-  return undefined;
 }
 
 function carryCandle(previous: Candle, openTime: number): Candle {
@@ -350,24 +287,16 @@ function milliseconds(input: string): number {
 
 async function validatedCount(file: string, day: number, expected: number): Promise<number> {
   try {
-    await fs.access(file);
-    const source = createReadStream(file);
-    const input = file.endsWith(".gz") ? source.pipe(createGunzip()) : source;
-    const lines = readline.createInterface({ input, crlfDelay: Infinity });
-    let count = 0;
+    const candles = await readCandleShardReference(file);
+    if (candles.length === 0 || candles.length > expected) return 0;
     let previousTime = day - intervalMs;
-    let firstTime = -1;
-    for await (const line of lines) {
-      if (!line) continue;
-      const candle = JSON.parse(line) as Candle;
+    for (const candle of candles) {
       if (!validCandle(candle, day) || candle.openTime <= previousTime) return 0;
-      if (count === 0) firstTime = candle.openTime;
       previousTime = candle.openTime;
-      count += 1;
     }
-    const lastTime = day + DAY_MS - intervalMs;
-    return count > 0 && count <= expected && firstTime === day && previousTime === lastTime
-      ? count
+    return candles[0]!.openTime === day
+      && previousTime === day + DAY_MS - intervalMs
+      ? candles.length
       : 0;
   } catch {
     return 0;
@@ -429,8 +358,8 @@ function formatRange(range: { start: number; end: number }): string {
 }
 
 interface Candle {
-  symbol?: string;
-  interval?: string;
+  symbol: string;
+  interval: string;
   openTime: number;
   closeTime: number;
   open: number;
@@ -438,7 +367,7 @@ interface Candle {
   low: number;
   close: number;
   volume: number;
-  closed?: boolean;
+  closed: boolean;
 }
 
 function validCandle(candle: Candle, day: number): boolean {

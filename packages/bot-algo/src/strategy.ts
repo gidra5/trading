@@ -27,6 +27,25 @@ export interface TradingStrategyExitSignal {
   confidence: number | null;
 }
 
+export interface TradingStrategyTargetExposureContext {
+  timestamp: number;
+  price: number;
+  /** Current unleveraged account equity, marked at price. */
+  equity: number;
+  /** Filled net notional divided by equity; long is positive and short is negative. */
+  currentExposure: number;
+  maxLeverage: number;
+}
+
+export interface TradingStrategyTargetExposureSignal {
+  /** Desired signed net notional divided by equity. */
+  targetExposure: number;
+  /** Null means execute at the current market price. */
+  price: number | null;
+  /** 0 is uniform grid sizing; 1 concentrates sizing at price. */
+  confidence: number | null;
+}
+
 export interface StrategyDiagnostics {
   indicators: Readonly<Record<string, number | null>>;
   gates: readonly {
@@ -57,6 +76,10 @@ export interface TradingStrategy<
   onTick(tick: TradingTick): Promise<void>;
   entrySignal(): Promise<TradingStrategyEntrySignal | null>;
   exitSignal(): Promise<TradingStrategyExitSignal | null>;
+  /** Optional absolute-exposure contract; the bot translates its delta into exits and entries. */
+  targetExposureSignal?(
+    context: TradingStrategyTargetExposureContext,
+  ): Promise<TradingStrategyTargetExposureSignal | null>;
   snapshot(): Promise<TSnapshot>;
   restore(snapshot: TSnapshot): Promise<void>;
   updateConfig(config: TConfig): Promise<void>;

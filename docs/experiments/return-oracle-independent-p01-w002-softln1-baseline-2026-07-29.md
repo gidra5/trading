@@ -7,7 +7,7 @@ intentionally stopped after completing epoch 91 on 2026-07-29.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-independent-p01-w002-softln1-baseline-20260729-195620
+data/training/runs/return-oracle-ce-shrinking-v1-independent-p01-w002-softln1-baseline-20260729-195620
 ```
 
 The directory contains `best.pt`, `last.pt`, `status.json`, the complete

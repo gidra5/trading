@@ -6,7 +6,7 @@ prediction-mixture epsilon was increased from `1e-4` to `1e-2`.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-skew-reverse-kl-eps1e4-w1-baseline-20260729-173400
+data/training/runs/return-oracle-ce-shrinking-v1-skew-reverse-kl-eps1e4-w1-baseline-20260729-173400
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

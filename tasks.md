@@ -223,12 +223,13 @@ Alternatives:
 4.  encoder(-decoder)s
 5.  LSTM
 6.  DLinear
-7.  TiDE
+7.  TiDE https://arxiv.org/abs/2304.08424
 8.  DUET
-9.  TQNet
-10.  MoE
-11.  FITS
-12.  TSMixer
+9.  TLOB https://arxiv.org/html/2502.15757v3
+10.  TQNet https://arxiv.org/abs/2505.12917?utm_source=chatgpt.com
+11.  MoE
+12.  FITS
+13.  TSMixer
 
 Insufficient margin trades should not happen
 
@@ -403,3 +404,10 @@ Lets try this arch:
 7. Try adding PatchTST-like elements to create learned aggregates instead of MAs
 8. It will predict the next price movement, that will then be passed into an oracle/learned policy predictor
 9. For activation/normalization/residuals use same design as in current return-oracle prediction model
+
+Implemented as the separate causal experiment documented in
+`docs/joint-price-oracle.md`: exact zero-delay 1s pairing, 3,600-close causal
+context and forecast horizon, hybrid learned trailing patches/MA, reversible
+trend and residual normalization, DLinear plus separate TiDE streams, and a
+forecast-only learned 255-action oracle-policy head. The existing return-oracle
+training/checkpoint contract remains unchanged.

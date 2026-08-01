@@ -324,17 +324,6 @@ class ReturnOracleMlp(nn.Module):
                 strict=True,
             )
         ])
-        self.residual_glu_layers = nn.ModuleList([
-            nn.Linear(INPUT_RETURN_COUNT, output_width * 2)
-            for output_width in HIDDEN_WIDTHS
-        ])
-        self.dense_residual_layers = nn.ModuleList([
-            nn.ModuleList([
-                nn.Linear(source_width, output_width * 2)
-                for source_width in HIDDEN_WIDTHS[:max(layer_index - 1, 0)]
-            ])
-            for layer_index, output_width in enumerate(HIDDEN_WIDTHS)
-        ])
         self.value_centering_normalizers = nn.ModuleList([
             LearnableCenteringNorm(
                 output_width,
@@ -353,76 +342,13 @@ class ReturnOracleMlp(nn.Module):
             )
             for output_width in HIDDEN_WIDTHS
         ])
-        self.residual_value_centering_normalizers = nn.ModuleList([
-            LearnableCenteringNorm(
-                output_width,
-                denominator_family=normalization_family,
-                initial_scale=normalization_initial_scale,
-                minimum_scale=normalization_minimum_scale,
-            )
-            for output_width in HIDDEN_WIDTHS
-        ])
-        self.residual_gate_centering_normalizers = nn.ModuleList([
-            LearnableCenteringNorm(
-                output_width,
-                denominator_family=normalization_family,
-                initial_scale=normalization_initial_scale,
-                minimum_scale=normalization_minimum_scale,
-            )
-            for output_width in HIDDEN_WIDTHS
-        ])
-        self.dense_residual_value_centering_normalizers = nn.ModuleList([
-            nn.ModuleList([
-                LearnableCenteringNorm(
-                    output_width,
-                    denominator_family=normalization_family,
-                    initial_scale=normalization_initial_scale,
-                    minimum_scale=normalization_minimum_scale,
-                )
-                for _ in HIDDEN_WIDTHS[:max(layer_index - 1, 0)]
-            ])
-            for layer_index, output_width in enumerate(HIDDEN_WIDTHS)
-        ])
-        self.dense_residual_gate_centering_normalizers = nn.ModuleList([
-            nn.ModuleList([
-                LearnableCenteringNorm(
-                    output_width,
-                    denominator_family=normalization_family,
-                    initial_scale=normalization_initial_scale,
-                    minimum_scale=normalization_minimum_scale,
-                )
-                for _ in HIDDEN_WIDTHS[:max(layer_index - 1, 0)]
-            ])
-            for layer_index, output_width in enumerate(HIDDEN_WIDTHS)
-        ])
-        # All four branches share one learned C per layer.
-        for value_normalizer, gate_normalizer, residual_value, residual_gate in zip(
+        # Value and gate branches share one centering matrix per layer.
+        for value_normalizer, gate_normalizer in zip(
             self.value_centering_normalizers,
             self.gate_centering_normalizers,
-            self.residual_value_centering_normalizers,
-            self.residual_gate_centering_normalizers,
             strict=True,
         ):
             gate_normalizer.weight = value_normalizer.weight
-            residual_value.weight = value_normalizer.weight
-            residual_gate.weight = value_normalizer.weight
-        for (
-            value_normalizer,
-            dense_value_normalizers,
-            dense_gate_normalizers,
-        ) in zip(
-            self.value_centering_normalizers,
-            self.dense_residual_value_centering_normalizers,
-            self.dense_residual_gate_centering_normalizers,
-            strict=True,
-        ):
-            for dense_value, dense_gate in zip(
-                dense_value_normalizers,
-                dense_gate_normalizers,
-                strict=True,
-            ):
-                dense_value.weight = value_normalizer.weight
-                dense_gate.weight = value_normalizer.weight
         if not self.learnable_centering:
             for normalizer in self.value_centering_normalizers:
                 normalizer.weight.requires_grad_(False)
@@ -433,28 +359,6 @@ class ReturnOracleMlp(nn.Module):
         self.gate_norm_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(output_width))
             for output_width in HIDDEN_WIDTHS
-        ])
-        self.residual_value_norm_biases = nn.ParameterList([
-            nn.Parameter(torch.zeros(output_width))
-            for output_width in HIDDEN_WIDTHS
-        ])
-        self.residual_gate_norm_biases = nn.ParameterList([
-            nn.Parameter(torch.zeros(output_width))
-            for output_width in HIDDEN_WIDTHS
-        ])
-        self.dense_residual_value_norm_biases = nn.ModuleList([
-            nn.ParameterList([
-                nn.Parameter(torch.zeros(output_width))
-                for _ in HIDDEN_WIDTHS[:max(layer_index - 1, 0)]
-            ])
-            for layer_index, output_width in enumerate(HIDDEN_WIDTHS)
-        ])
-        self.dense_residual_gate_norm_biases = nn.ModuleList([
-            nn.ParameterList([
-                nn.Parameter(torch.zeros(output_width))
-                for _ in HIDDEN_WIDTHS[:max(layer_index - 1, 0)]
-            ])
-            for layer_index, output_width in enumerate(HIDDEN_WIDTHS)
         ])
         self.value_transforms = nn.ModuleList([
             nn.Linear(output_width, output_width, bias=False)
@@ -475,52 +379,13 @@ class ReturnOracleMlp(nn.Module):
                 nonlinearity="linear",
             )
             nn.init.zeros_(layer.bias)
-        for residual_layer in self.residual_glu_layers:
-            residual_value_weight, residual_gate_weight = (
-                residual_layer.weight.chunk(2, dim=0)
-            )
-            nn.init.kaiming_normal_(
-                residual_gate_weight,
-                nonlinearity="linear",
-            )
-            nn.init.zeros_(residual_value_weight)
-            nn.init.zeros_(residual_layer.bias)
-        for dense_layers in self.dense_residual_layers:
-            for dense_layer in dense_layers:
-                nn.init.kaiming_normal_(
-                    dense_layer.weight,
-                    nonlinearity="linear",
-                )
-                nn.init.zeros_(dense_layer.bias)
         for normalizer in self.value_centering_normalizers:
             normalizer.reset_parameters()
-        for normalizer in (
-            *self.gate_centering_normalizers,
-            *self.residual_value_centering_normalizers,
-            *self.residual_gate_centering_normalizers,
-            *(
-                normalizer
-                for layer_normalizers in (
-                    *self.dense_residual_value_centering_normalizers,
-                    *self.dense_residual_gate_centering_normalizers,
-                )
-                for normalizer in layer_normalizers
-            ),
-        ):
+        for normalizer in self.gate_centering_normalizers:
             normalizer.reset_scale()
         for bias in (
             *self.value_norm_biases,
             *self.gate_norm_biases,
-            *self.residual_value_norm_biases,
-            *self.residual_gate_norm_biases,
-            *(
-                bias
-                for layer_biases in (
-                    *self.dense_residual_value_norm_biases,
-                    *self.dense_residual_gate_norm_biases,
-                )
-                for bias in layer_biases
-            ),
         ):
             nn.init.zeros_(bias)
         for transform in (
@@ -554,7 +419,6 @@ class ReturnOracleMlp(nn.Module):
         variance_penalties: list[Tensor] = []
         distribution_sum_penalties: list[Tensor] = []
         distribution_negative_penalties: list[Tensor] = []
-        hidden_history: list[Tensor] = []
         for (
             layer,
             value_centering_normalizer,
@@ -563,16 +427,6 @@ class ReturnOracleMlp(nn.Module):
             gate_norm_bias,
             value_transform,
             gate_transform,
-            residual_glu_layer,
-            residual_value_centering_normalizer,
-            residual_gate_centering_normalizer,
-            residual_value_norm_bias,
-            residual_gate_norm_bias,
-            dense_residual_layers,
-            dense_value_normalizers,
-            dense_gate_normalizers,
-            dense_value_biases,
-            dense_gate_biases,
         ) in zip(
             self.layers,
             self.value_centering_normalizers,
@@ -581,21 +435,10 @@ class ReturnOracleMlp(nn.Module):
             self.gate_norm_biases,
             self.value_transforms,
             self.gate_transforms,
-            self.residual_glu_layers,
-            self.residual_value_centering_normalizers,
-            self.residual_gate_centering_normalizers,
-            self.residual_value_norm_biases,
-            self.residual_gate_norm_biases,
-            self.dense_residual_layers,
-            self.dense_residual_value_centering_normalizers,
-            self.dense_residual_gate_centering_normalizers,
-            self.dense_residual_value_norm_biases,
-            self.dense_residual_gate_norm_biases,
             strict=True,
         ):
-            layer_input = hidden
             hidden, value, gate_logits = fused_glu(
-                layer(layer_input),
+                layer(hidden),
                 value_centering_normalizer,
                 gate_centering_normalizer,
                 value_norm_bias,
@@ -603,52 +446,9 @@ class ReturnOracleMlp(nn.Module):
                 value_transform,
                 gate_transform,
             )
-            residual_hidden, residual_value, residual_gate = fused_glu(
-                residual_glu_layer(model_input),
-                residual_value_centering_normalizer,
-                residual_gate_centering_normalizer,
-                residual_value_norm_bias,
-                residual_gate_norm_bias,
-                value_transform,
-                gate_transform,
-            )
-            hidden = hidden + residual_hidden
-            raw_branches = [
-                value,
-                gate_logits,
-                residual_value,
-                residual_gate,
-            ]
-            for (
-                source_hidden,
-                dense_layer,
-                dense_value_normalizer,
-                dense_gate_normalizer,
-                dense_value_bias,
-                dense_gate_bias,
-            ) in zip(
-                hidden_history[:-1],
-                dense_residual_layers,
-                dense_value_normalizers,
-                dense_gate_normalizers,
-                dense_value_biases,
-                dense_gate_biases,
-                strict=True,
-            ):
-                dense_hidden, dense_value, dense_gate = fused_glu(
-                    dense_layer(source_hidden),
-                    dense_value_normalizer,
-                    dense_gate_normalizer,
-                    dense_value_bias,
-                    dense_gate_bias,
-                    value_transform,
-                    gate_transform,
-                )
-                hidden = hidden + dense_hidden
-                raw_branches.extend((dense_value, dense_gate))
             branch_components = [
                 soft_layer_norm_components(branch)
-                for branch in raw_branches
+                for branch in (value, gate_logits)
             ]
             mean_penalties.append(
                 torch.stack([
@@ -678,7 +478,6 @@ class ReturnOracleMlp(nn.Module):
                         self.dropout(hidden),
                         hidden,
                     )
-            hidden_history.append(hidden)
         return (
             self.output(hidden),
             torch.stack(mean_penalties).mean(dim=0),
@@ -707,38 +506,10 @@ class ReturnOracleExportMlp(nn.Module):
         self.gate_norm_biases = folded_model.gate_norm_biases
         self.value_transforms = folded_model.value_transforms
         self.gate_transforms = folded_model.gate_transforms
-        self.residual_glu_layers = folded_model.residual_glu_layers
-        self.residual_value_centering_normalizers = (
-            folded_model.residual_value_centering_normalizers
-        )
-        self.residual_gate_centering_normalizers = (
-            folded_model.residual_gate_centering_normalizers
-        )
-        self.residual_value_norm_biases = (
-            folded_model.residual_value_norm_biases
-        )
-        self.residual_gate_norm_biases = (
-            folded_model.residual_gate_norm_biases
-        )
-        self.dense_residual_layers = folded_model.dense_residual_layers
-        self.dense_residual_value_centering_normalizers = (
-            folded_model.dense_residual_value_centering_normalizers
-        )
-        self.dense_residual_gate_centering_normalizers = (
-            folded_model.dense_residual_gate_centering_normalizers
-        )
-        self.dense_residual_value_norm_biases = (
-            folded_model.dense_residual_value_norm_biases
-        )
-        self.dense_residual_gate_norm_biases = (
-            folded_model.dense_residual_gate_norm_biases
-        )
         self.output = folded_model.output
 
     def forward(self, raw_features: Tensor) -> Tensor:
-        model_input = raw_features.float()
-        hidden = model_input
-        hidden_history: list[Tensor] = []
+        hidden = raw_features.float()
         for (
             layer,
             value_centering_normalizer,
@@ -747,16 +518,6 @@ class ReturnOracleExportMlp(nn.Module):
             gate_norm_bias,
             value_transform,
             gate_transform,
-            residual_glu_layer,
-            residual_value_centering_normalizer,
-            residual_gate_centering_normalizer,
-            residual_value_norm_bias,
-            residual_gate_norm_bias,
-            dense_residual_layers,
-            dense_value_normalizers,
-            dense_gate_normalizers,
-            dense_value_biases,
-            dense_gate_biases,
         ) in zip(
             self.layers,
             self.value_centering_normalizers,
@@ -765,21 +526,10 @@ class ReturnOracleExportMlp(nn.Module):
             self.gate_norm_biases,
             self.value_transforms,
             self.gate_transforms,
-            self.residual_glu_layers,
-            self.residual_value_centering_normalizers,
-            self.residual_gate_centering_normalizers,
-            self.residual_value_norm_biases,
-            self.residual_gate_norm_biases,
-            self.dense_residual_layers,
-            self.dense_residual_value_centering_normalizers,
-            self.dense_residual_gate_centering_normalizers,
-            self.dense_residual_value_norm_biases,
-            self.dense_residual_gate_norm_biases,
             strict=True,
         ):
-            layer_input = hidden
             hidden, _raw_value, _raw_gate = fused_glu(
-                layer(layer_input),
+                layer(hidden),
                 value_centering_normalizer,
                 gate_centering_normalizer,
                 value_norm_bias,
@@ -787,43 +537,6 @@ class ReturnOracleExportMlp(nn.Module):
                 value_transform,
                 gate_transform,
             )
-            residual_hidden, _residual_value, _residual_gate = fused_glu(
-                residual_glu_layer(model_input),
-                residual_value_centering_normalizer,
-                residual_gate_centering_normalizer,
-                residual_value_norm_bias,
-                residual_gate_norm_bias,
-                value_transform,
-                gate_transform,
-            )
-            hidden = hidden + residual_hidden
-            for (
-                source_hidden,
-                dense_layer,
-                dense_value_normalizer,
-                dense_gate_normalizer,
-                dense_value_bias,
-                dense_gate_bias,
-            ) in zip(
-                hidden_history[:-1],
-                dense_residual_layers,
-                dense_value_normalizers,
-                dense_gate_normalizers,
-                dense_value_biases,
-                dense_gate_biases,
-                strict=True,
-            ):
-                dense_hidden, _dense_value, _dense_gate = fused_glu(
-                    dense_layer(source_hidden),
-                    dense_value_normalizer,
-                    dense_gate_normalizer,
-                    dense_value_bias,
-                    dense_gate_bias,
-                    value_transform,
-                    gate_transform,
-                )
-                hidden = hidden + dense_hidden
-            hidden_history.append(hidden)
         return self.output(hidden)
 
 
@@ -847,14 +560,6 @@ def fold_input_normalization_for_export(
     export_bias = first_layer.bias - export_weight @ mean
     first_layer.weight.copy_(export_weight)
     first_layer.bias.copy_(export_bias)
-    for residual_layer in folded_model.residual_glu_layers:
-        residual_weight = residual_layer.weight
-        residual_export_weight = residual_weight / std.unsqueeze(0)
-        residual_export_bias = (
-            residual_layer.bias - residual_export_weight @ mean
-        )
-        residual_layer.weight.copy_(residual_export_weight)
-        residual_layer.bias.copy_(residual_export_bias)
     return ReturnOracleExportMlp(folded_model).eval()
 
 

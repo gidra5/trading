@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ort from "onnxruntime-node";
+import { TradingStorageLayout } from "@trading/storage";
 import {
   MLP_INPUT_FEATURE_COUNT,
   validateMlpModelManifest,
@@ -65,11 +66,12 @@ export function mlpInferenceTimes(
 
 export function discoverMlpModels(dataDir: string): DiscoveredMlpModel[] {
   const result = new Map<string, DiscoveredMlpModel>();
+  const layout = new TradingStorageLayout(dataDir);
   const roots: Array<{ directory: string; depth: number }> = [
     { directory: path.join(REPO_ROOT, "models", "mlp"), depth: 1 },
     { directory: path.join(dataDir, "models", "mlp"), depth: 1 },
-    { directory: path.join(dataDir, "ml-joint-studies"), depth: 5 },
-    { directory: path.join(dataDir, "ml-dynamic-studies"), depth: 5 },
+    { directory: path.join(layout.trainingRuns, "studies", "joint"), depth: 5 },
+    { directory: path.join(layout.trainingRuns, "studies", "dynamic"), depth: 5 },
   ];
   for (const root of roots) {
     for (const directory of artifactDirectories(root.directory, root.depth)) {

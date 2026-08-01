@@ -5753,11 +5753,12 @@ VW_KAMA_EXPORT int vw_kama_cuda_direct_oracle_diagnostics_v1(
   }
 }
 
-VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
+VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v3(
   const double* prices,
   int price_count,
   int score_start,
   int holding_period_steps,
+  int decision_delay_steps,
   int value_horizon_steps,
   int grid_size,
   double minimum_exposure,
@@ -5800,7 +5801,8 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
       throw std::runtime_error("Exposure-value CUDA oracle received a null pointer");
     }
     if (price_count < 2 || score_start < 0 || score_start >= price_count
-      || holding_period_steps < 1 || value_horizon_steps < holding_period_steps
+      || holding_period_steps < 1 || decision_delay_steps < 1
+      || value_horizon_steps < holding_period_steps
       || grid_size < 3 || grid_size > 1024 || terminal_index <= score_start
       || terminal_index >= price_count) {
       throw std::runtime_error("Exposure-value CUDA oracle received invalid dimensions");
@@ -5818,12 +5820,14 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
 
     DeviceBuffer<double> device_prices(price_count);
     holding_period_steps = std::min(holding_period_steps, price_count - 1);
+    decision_delay_steps = std::min(decision_delay_steps, price_count - 1);
     value_horizon_steps = std::min(value_horizon_steps, price_count - 1);
     const int scored_count = price_count - score_start;
     const size_t oracle_cells = static_cast<size_t>(scored_count) * grid_size;
     const bool separable_rebalance_costs = 1.0 - friction * maximum_exposure > 0.0
       && 1.0 - friction + friction * minimum_exposure > 0.0;
-    const bool compact_distribution = distribution_only && separable_rebalance_costs
+    const bool compact_distribution = decision_delay_steps == 1
+      && distribution_only && separable_rebalance_costs
       && grid_size <= 256 && !action_values && !include_path
       && value_horizon_steps < price_count - 1 - score_start;
     const bool fused_compact_distribution = compact_distribution;
@@ -6161,7 +6165,7 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
           oracle_cells * sizeof(float),
           cudaMemcpyDeviceToDevice
         ), "retain compact initial exposure-value endpoints");
-        prepare_holds(price_count, 1);
+        prepare_holds(price_count, decision_delay_steps);
         constexpr int distribution_threads = 256;
         constexpr int distribution_warps = distribution_threads / 32;
         const int distribution_blocks =
@@ -6275,13 +6279,20 @@ VW_KAMA_EXPORT int vw_kama_cuda_prepare_value_oracle_v2(
           continuations.get()
         );
         cuda_check(cudaGetLastError(), "initialize rolling oracle closeout rows");
-        prepare_holds(price_count, 1);
         prior = continuations.get();
         double* current = alternate_continuations.get();
-        for (int step = 0; step < continuation_steps; ++step) {
+        std::vector<int> continuation_durations;
+        for (int remaining = continuation_steps; remaining > 0;) {
+          const int duration = std::min(decision_delay_steps, remaining);
+          continuation_durations.push_back(duration);
+          remaining -= duration;
+        }
+        for (auto duration = continuation_durations.rbegin();
+          duration != continuation_durations.rend(); ++duration) {
+          prepare_holds(price_count, *duration);
           launch_chains(
             std::false_type{}, std::true_type{}, std::true_type{},
-            scored_count, price_count, 1,
+            scored_count, price_count, *duration,
             prior, current, nullptr, true
           );
           prior = current;

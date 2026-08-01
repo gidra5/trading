@@ -8,7 +8,7 @@ epoch 19.
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-batch8192-diagnostic-activations-baseline-20260729-155008
+data/training/runs/return-oracle-ce-shrinking-v1-batch8192-diagnostic-activations-baseline-20260729-155008
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

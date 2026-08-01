@@ -579,9 +579,9 @@ def main() -> None:
     plan = json.loads(arguments.plan.read_text())
     study = plan["lossWeightStudy"]
     summary_file = arguments.summary or Path(study["outputDir"]) / "summary.json"
-    log_file = arguments.log or Path(study["runDir"]) / "study.log"
+    log_file = arguments.log or Path(study["runDir"]) / "logs" / "study.jsonl"
     output = arguments.output or (
-        Path("data/ml-dynamic-studies") / plan["id"] / "offline-analysis.json"
+        Path("data/training/runs/studies/dynamic") / plan["id"] / "offline-analysis.json"
     )
     summary = json.loads(summary_file.read_text())
     trajectories = parse_training_trajectories(log_file.open())

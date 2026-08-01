@@ -3,9 +3,9 @@
   "id": "mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch",
   "label": "Direct 255-action MLP v12 · 1-minute candles/oracle · 60m→0m delay curriculum · scratch",
   "basePlanFile": "ml/training-plans/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle-oracle-mi-half-scratch.json",
-  "datasetDir": "data/ml-datasets/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch/delay-3600s",
+  "datasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch/delay-3600s",
   "artifactDir": "data/models/mlp/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch-delay-0s",
-  "runDir": "data/ml-runs/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch",
+  "runDir": "data/training/runs/mlp-direct-oracle-temporal-v12-minute-curriculum-60m-to-0m-oracle-mi-half-scratch",
   "samplingIntervalMs": 60000,
   "predictionDelayMs": 3600000,
   "training": {

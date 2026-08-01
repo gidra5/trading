@@ -1,0 +1,114 @@
+{
+  "runs": [
+    {
+      "id": "return-oracle-no-hard-ln-pre-rank3-20260728-214656",
+      "label": "2026-07-28 21:46 · No hard LN before rank-3 latent normalization",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-no-hard-ln-pre-rank3-latent-20260728-214656",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-28T21:46:56+03:00",
+      "bestValidationKl": 0.08655659251079778,
+      "bestValidationKlEpoch": 260
+    },
+    {
+      "id": "return-oracle-bias-ln-full-a-20260729-132700",
+      "label": "2026-07-29 13:27 · Branch LN with bias and full A",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-bias-ln-full-a-baseline-20260729-132700",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T13:27:00+03:00",
+      "bestValidationKl": 0.11250634458361738,
+      "bestValidationKlEpoch": 39
+    },
+    {
+      "id": "return-oracle-learnable-c-full-regularization-20260729-144909",
+      "label": "2026-07-29 14:49 · Learnable shared C with full regularization",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-learnable-c-full-regularization-baseline-20260729-144909",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T14:49:09+03:00",
+      "bestValidationKl": 0.11321715464827434,
+      "bestValidationKlEpoch": 24
+    },
+    {
+      "id": "return-oracle-smoothed-reverse-kl-w005-20260729-170500",
+      "label": "2026-07-29 17:05 · Smoothed reverse KL, weight 0.05",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-smoothed-reverse-kl-w005-baseline-20260729-170500",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T17:05:00+03:00",
+      "bestValidationKl": 0.11874246701011933,
+      "bestValidationKlEpoch": 72
+    },
+    {
+      "id": "return-oracle-continuous-skew-sharpness-w1-20260729-184300",
+      "label": "2026-07-29 18:43 · Continuous reverse KL and entropy sharpness",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-continuous-skew-sharpness-w1-baseline-20260729-184300",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T18:43:00+03:00",
+      "bestValidationKl": 0.11092877909915139,
+      "bestValidationKlEpoch": 128
+    },
+    {
+      "id": "return-oracle-independent-p01-w002-softln1-20260729-195620",
+      "label": "2026-07-29 19:56 · Independent 1% gates, weight 0.02, soft LN 1",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-independent-p01-w002-softln1-baseline-20260729-195620",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T19:56:20+03:00",
+      "bestValidationKl": 0.10890265828737401,
+      "bestValidationKlEpoch": 87
+    },
+    {
+      "id": "return-oracle-shared-c-sharpness-p1-20260729-205615",
+      "label": "2026-07-29 20:56 · Shared C with sharpness always active",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-shared-c-sharpness-p1-baseline-20260729-205615",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T20:56:15+03:00",
+      "bestValidationKl": 0.09278308785658138,
+      "bestValidationKlEpoch": 133
+    },
+    {
+      "id": "return-oracle-independent-c-reverse-p01-sharpness-p1-20260729-231900",
+      "label": "2026-07-29 23:19 · Independent C, reverse KL 1%, sharpness 100%",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-independent-c-reverse-p01-sharpness-p1-baseline-20260729-231900",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T23:19:00+03:00",
+      "bestValidationKl": 0.09062405062755455,
+      "bestValidationKlEpoch": 158
+    },
+    {
+      "id": "return-oracle-hard-rms-reverse-p1-sharpness-p1-20260729-235300",
+      "label": "2026-07-29 23:53 · Hard RMS, reverse KL and sharpness always active",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-hard-rms-reverse-p1-sharpness-p1-baseline-20260729-235300",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-29T23:53:00+03:00",
+      "bestValidationKl": 0.118552930662228,
+      "bestValidationKlEpoch": 74
+    },
+    {
+      "id": "return-oracle-learned-radius-shrinking-20260730-104920",
+      "label": "2026-07-30 10:49 · Learned-radius 16-layer shrinking model",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-learned-radius-shrinking-baseline-20260730-104920",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-30T10:49:20+03:00",
+      "bestValidationKl": 0.0711950351548919,
+      "bestValidationKlEpoch": 1345
+    },
+    {
+      "id": "return-oracle-earlypeak3-ce10-20260730-171419",
+      "label": "2026-07-30 17:14 · Early 60→1024→255 peak with CE weight 10",
+      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-earlypeak3-ce10-baseline-20260730-171419",
+      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+      "archived": true,
+      "archivedAt": "2026-07-30T17:14:19+03:00",
+      "bestValidationKl": 0.10365110823413617,
+      "bestValidationKlEpoch": 107
+    }
+  ]
+}

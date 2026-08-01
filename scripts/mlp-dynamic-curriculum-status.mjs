@@ -7,7 +7,7 @@ const plan = JSON.parse(fs.readFileSync(path.join(repoRoot, "ml/training-plan.js
 const configuration = plan.dynamicCurriculumStudy;
 const runDir = path.resolve(repoRoot, configuration.runDir);
 const outputDir = path.resolve(repoRoot, configuration.outputDir);
-const statusFile = path.join(runDir, "status.json");
+const statusFile = path.join(runDir, "state", "status.json");
 const summaryFile = path.join(outputDir, "summary.json");
 const watch = process.argv.includes("--watch");
 
@@ -66,7 +66,7 @@ function render() {
   }
   if (status?.message) lines.push(status.message);
   if (status?.error) lines.push(`ERROR: ${status.error}`);
-  lines.push(`Summary: ${summaryFile}`, `Log: ${path.join(runDir, "study.log")}`);
+  lines.push(`Summary: ${summaryFile}`, `Log: ${path.join(runDir, "logs", "study.jsonl")}`);
   process.stdout.write(`${watch ? "\x1b[2J\x1b[H" : ""}${lines.join("\n")}\n`);
 }
 

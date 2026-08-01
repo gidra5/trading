@@ -1,6 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Candle } from "@trading/bot-algo";
+import {
+  putCandleShard,
+  readCandleShardReference,
+  SequentialShardStore,
+  TradingStorageLayout,
+} from "@trading/storage";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -40,11 +46,21 @@ export type CandleRangeFetcher = (request: CandleFetchRequest) => Promise<Candle
 
 export class HistoricalCandleCache {
   private readonly rootDir: string;
+  private readonly store: SequentialShardStore;
+  private readonly namespace: string;
 
   constructor(private readonly options: HistoricalCandleCacheOptions) {
+    const layout = new TradingStorageLayout(options.dataDir);
+    this.store = new SequentialShardStore(layout.marketStore);
+    this.namespace = [
+      "candles",
+      safePathPart(options.marketKey),
+      safePathPart(options.symbol),
+      safePathPart(options.interval),
+    ].join("/");
     this.rootDir = path.join(
-      options.dataDir,
-      "historical",
+      layout.marketTmp,
+      "historical-cache",
       safePathPart(options.marketKey),
       safePathPart(options.symbol),
       safePathPart(options.interval),
@@ -127,36 +143,14 @@ export class HistoricalCandleCache {
     let batch: Candle[] = [];
 
     for (const filePath of this.filePathsForRange(startTime, endTime)) {
-      let content: string;
-      try {
-        content = await fs.readFile(filePath, "utf8");
-      } catch (error) {
-        if (isMissingFile(error)) {
-          continue;
-        }
-
-        throw error;
-      }
-
-      let lineStart = 0;
-      while (lineStart < content.length) {
-        let lineEnd = content.indexOf("\n", lineStart);
-        if (lineEnd === -1) {
-          lineEnd = content.length;
-        }
-
-        if (lineEnd > lineStart) {
-          const candle = JSON.parse(content.slice(lineStart, lineEnd)) as Candle;
-          if (candle.openTime >= startTime && candle.openTime <= endTime) {
-            batch.push(candle);
-            if (batch.length >= batchSize) {
-              yield batch;
-              batch = [];
-            }
+      for (const candle of await this.readDay(filePath)) {
+        if (candle.openTime >= startTime && candle.openTime <= endTime) {
+          batch.push(candle);
+          if (batch.length >= batchSize) {
+            yield batch;
+            batch = [];
           }
         }
-
-        lineStart = lineEnd + 1;
       }
     }
 
@@ -208,7 +202,7 @@ export class HistoricalCandleCache {
         const fullDayRange = rangeStart === dayStart && rangeEnd === dayEnd;
         const fullDayComplete =
           fullDayRange &&
-          (await fileHasCompleteRange(
+          (await this.fileHasCompleteRange(
             filePath,
             dayStart,
             dayEnd,
@@ -248,7 +242,7 @@ export class HistoricalCandleCache {
   ): Promise<Set<number>> {
     const openTimes = new Set<number>();
 
-    for (const candle of await readJsonLines<Candle>(filePath)) {
+    for (const candle of await this.readDay(filePath)) {
       if (candle.openTime >= startTime && candle.openTime <= endTime) {
         openTimes.add(candle.openTime);
       }
@@ -269,7 +263,7 @@ export class HistoricalCandleCache {
 
     for (const [filePath, newCandles] of candlesByFile) {
       const byOpenTime = new Map<number, Candle>();
-      for (const candle of await readJsonLines<Candle>(filePath)) {
+      for (const candle of await this.readDay(filePath)) {
         byOpenTime.set(candle.openTime, candle);
       }
       for (const candle of newCandles) {
@@ -277,7 +271,23 @@ export class HistoricalCandleCache {
       }
 
       const sorted = [...byOpenTime.values()].sort((a, b) => a.openTime - b.openTime);
-      await writeJsonLinesAtomic(filePath, sorted);
+      if (completeUtcDay(sorted, this.options.intervalMs)) {
+        const date = path.basename(filePath, ".jsonl");
+        await putCandleShard(this.store, {
+          namespace: this.namespace,
+          key: date,
+          candles: sorted,
+          stepMs: this.options.intervalMs,
+          metadata: {
+            source: "historical-candle-cache",
+            marketKey: this.options.marketKey,
+            completeUtcDay: true,
+          },
+        });
+        await fs.rm(filePath, { force: true });
+      } else {
+        await writeJsonLinesAtomic(filePath, sorted);
+      }
     }
   }
 
@@ -365,69 +375,34 @@ export class HistoricalCandleCache {
     const day = new Date(utcDayStart(time)).toISOString().slice(0, 10);
     return path.join(this.rootDir, `${day}.jsonl`);
   }
-}
 
-async function fileHasCompleteRange(
-  filePath: string,
-  startTime: number,
-  endTime: number,
-  expectedCandles: number,
-): Promise<boolean> {
-  let content: string;
-  try {
-    content = await fs.readFile(filePath, "utf8");
-  } catch (error) {
-    if (isMissingFile(error)) {
-      return false;
+  private canonicalFileForStaging(filePath: string): string {
+    return this.store.referenceFile(
+      this.namespace,
+      path.basename(filePath, ".jsonl"),
+    );
+  }
+
+  private async readDay(filePath: string): Promise<Candle[]> {
+    try {
+      return await readCandleShardReference(this.canonicalFileForStaging(filePath));
+    } catch (error) {
+      if (!isMissingFile(error)) throw error;
+      return readJsonLines<Candle>(filePath);
     }
-
-    throw error;
   }
 
-  if (content.length === 0 || expectedCandles <= 0) {
-    return false;
+  private async fileHasCompleteRange(
+    filePath: string,
+    startTime: number,
+    endTime: number,
+    expectedCandles: number,
+  ): Promise<boolean> {
+    const candles = await this.readDay(filePath);
+    return candles.length === expectedCandles
+      && candles[0]?.openTime === startTime
+      && candles.at(-1)?.openTime === endTime;
   }
-
-  const firstLineEnd = content.indexOf("\n");
-  if (firstLineEnd <= 0) {
-    return false;
-  }
-
-  const lastLineEnd =
-    content.charCodeAt(content.length - 1) === 10 ? content.length - 1 : content.length;
-  const lastLineStart = content.lastIndexOf("\n", lastLineEnd - 1) + 1;
-  if (lastLineStart < 0 || lastLineStart >= lastLineEnd) {
-    return false;
-  }
-
-  const lineCount = countNonEmptyLines(content);
-  if (lineCount !== expectedCandles) {
-    return false;
-  }
-
-  const first = JSON.parse(content.slice(0, firstLineEnd)) as Candle;
-  const last = JSON.parse(content.slice(lastLineStart, lastLineEnd)) as Candle;
-  return first.openTime === startTime && last.openTime === endTime;
-}
-
-function countNonEmptyLines(content: string): number {
-  let count = 0;
-  let lineStart = 0;
-
-  while (lineStart < content.length) {
-    let lineEnd = content.indexOf("\n", lineStart);
-    if (lineEnd === -1) {
-      lineEnd = content.length;
-    }
-
-    if (lineEnd > lineStart) {
-      count += 1;
-    }
-
-    lineStart = lineEnd + 1;
-  }
-
-  return count;
 }
 
 function appendMissingRanges(
@@ -475,6 +450,13 @@ function countCandlesInRange(
   intervalMs: number,
 ): number {
   return Math.max(0, Math.floor((endTime - startTime) / intervalMs) + 1);
+}
+
+function completeUtcDay(candles: readonly Candle[], intervalMs: number): boolean {
+  if (DAY_MS % intervalMs !== 0 || candles.length !== DAY_MS / intervalMs) return false;
+  const start = utcDayStart(candles[0]!.openTime);
+  return candles.every((candle, index) =>
+    candle.openTime === start + index * intervalMs);
 }
 
 function mergeTimeRanges(ranges: CandleTimeRange[], intervalMs: number): CandleTimeRange[] {

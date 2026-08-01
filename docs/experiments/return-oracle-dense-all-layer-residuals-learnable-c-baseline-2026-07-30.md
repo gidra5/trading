@@ -6,7 +6,7 @@ Recorded on 2026-07-30 before the fixed-centering ablation.
 
 The complete run directory, logs, status, and best/last checkpoints are in:
 
-`data/ml-runs/return-oracle-ce-shrinking-v1-dense-all-layer-residuals-learnable-c-baseline-20260730-224319`
+`data/training/runs/return-oracle-ce-shrinking-v1-dense-all-layer-residuals-learnable-c-baseline-20260730-224319`
 
 Architecture contract:
 

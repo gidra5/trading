@@ -7,7 +7,7 @@ centering matrices. It was intentionally stopped during epoch 136 on
 The complete run is archived at:
 
 ```text
-data/ml-runs/return-oracle-ce-shrinking-v1-shared-c-sharpness-p1-baseline-20260729-205615
+data/training/runs/return-oracle-ce-shrinking-v1-shared-c-sharpness-p1-baseline-20260729-205615
 ```
 
 `best.pt`, `last.pt`, `status.json`, and the complete append-only

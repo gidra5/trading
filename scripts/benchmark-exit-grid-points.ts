@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
-  runBacktestFromCandles,
   type BacktestResult,
   type Candle,
   type PartialStrategyConfig,
   type ShortMarginModel,
 } from "../packages/bot-algo/src/index.js";
+import { runCanonicalBacktestFromCandles } from "./lib/canonical-backtest.js";
 
 interface Args {
   marketKey?: string;
@@ -105,6 +106,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_GRIDS = [1, 2, 5, 10, 20, 50, 100, 200, 500];
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+main().catch(fail);
+
+async function main(): Promise<void> {
 const args = parseArgs(process.argv.slice(2));
 const source = historicalCandleSource(args);
 if (source.files.length === 0) {
@@ -137,7 +141,7 @@ for (const candidate of candidates) {
     console.error(
       `Running ${window.label}, ${candidate.label} on ${window.candles.length.toLocaleString()} candles...`,
     );
-    const result = runGridBacktest(window.candles, args, candidate);
+    const result = await runGridBacktest(window.candles, args, candidate);
     fixedRows.push({
       window: window.label,
       range: rangeLabel(window.candles),
@@ -149,10 +153,11 @@ for (const candidate of candidates) {
   console.error(
     `Running ${args.samples.toLocaleString()} random ${args.randomWindowDays}d samples, ${candidate.label}...`,
   );
-  const sampleMetrics = randomWindows.map((window) => {
-    const result = runGridBacktest(randomCandles, args, candidate, window);
-    return metricsFromResult(result, args);
-  });
+  const sampleMetrics: Metrics[] = [];
+  for (const window of randomWindows) {
+    const result = await runGridBacktest(randomCandles, args, candidate, window);
+    sampleMetrics.push(metricsFromResult(result, args));
+  }
   randomRows.push(aggregateRandomRow(candidate.label, sampleMetrics));
 }
 
@@ -164,6 +169,12 @@ if (args.output) {
   console.error(`Wrote ${path.relative(repoRoot, outputPath)}`);
 }
 console.log(report);
+}
+
+function fail(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+  process.exitCode = 1;
+}
 
 function createFixedFileWindow(
   label: string,
@@ -177,13 +188,13 @@ function createFixedFileWindow(
   return { label, candles };
 }
 
-function runGridBacktest(
+async function runGridBacktest(
   candles: Candle[],
   options: Args,
   candidate: GridCandidate,
   window?: CandleWindow,
-): BacktestResult {
-  return runBacktestFromCandles(candles, {
+): Promise<BacktestResult> {
+  return runCanonicalBacktestFromCandles(candles, {
     config: {
       symbol: options.symbol.toUpperCase(),
       startingQuote: options.startingQuote,
@@ -497,7 +508,7 @@ function historicalCandleSource(
 function historicalCandleDirCandidates(
   options: Pick<Args, "marketKey" | "symbol" | "interval">,
 ): string[] {
-  const root = path.join(repoRoot, "data", "historical");
+  const root = path.join(repoRoot, "data", "market", "immutable", "refs", "candles");
   const symbol = safePathPart(options.symbol);
   const interval = safePathPart(options.interval);
   const dirs = new Set<string>();
@@ -507,15 +518,6 @@ function historicalCandleDirCandidates(
   }
 
   dirs.add(fallbackHistoricalCandleDir(options));
-  if (!fs.existsSync(root)) {
-    return [...dirs];
-  }
-
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      dirs.add(path.join(root, entry.name, symbol, interval));
-    }
-  }
   return [...dirs];
 }
 
@@ -525,7 +527,11 @@ function fallbackHistoricalCandleDir(
   return path.join(
     repoRoot,
     "data",
-    "historical",
+    "market",
+    "immutable",
+    "refs",
+    "candles",
+    `spot-${safePathPart(options.symbol)}`,
     safePathPart(options.symbol),
     safePathPart(options.interval),
   );
@@ -537,7 +543,7 @@ function listHistoricalCandleFiles(dir: string): string[] {
   }
   return fs
     .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}\.json$/.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 }
@@ -545,13 +551,7 @@ function listHistoricalCandleFiles(dir: string): string[] {
 function loadHistoricalCandles(dir: string, files: string[]): Candle[] {
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        candles.push(JSON.parse(trimmed) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }

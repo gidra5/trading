@@ -29,6 +29,16 @@ try:
 except ImportError:
     zstandard = None
 
+from trading_storage import (
+    checkpoint_exists,
+    is_storage_reference,
+    load_torch_checkpoint,
+    read_shard_array,
+    require_under,
+    save_torch_checkpoint,
+    training_storage_layout,
+)
+
 if os.name == "posix" and os.environ.get("TMPDIR", "").startswith("/mnt/"):
     os.environ["TMPDIR"] = "/tmp"
     tempfile.tempdir = "/tmp"
@@ -643,7 +653,7 @@ class FittedPolicyDataset(
                         shard.count,
                         total_rows=compact_feature.total_rows,
                     )
-                    if compact_feature.file.name.endswith(".zst")
+                    if is_compressed_component(compact_feature.file)
                     else component_rows(
                         compact_feature.file,
                         "<f2",
@@ -689,7 +699,7 @@ class FittedPolicyDataset(
                                 1_441,
                                 total_rows=1_441,
                             )
-                            if minute_file.name.endswith(".zst")
+                            if is_compressed_component(minute_file)
                             else np.memmap(
                                 minute_file,
                                 mode="r",
@@ -705,7 +715,7 @@ class FittedPolicyDataset(
                     )
                 else:
                     minute_file = root / shard.minute_oracle_probabilities
-                    if minute_file.name.endswith(".zst"):
+                    if is_compressed_component(minute_file):
                         direct_target_probabilities = CompressedComponentRows(
                             minute_file,
                             "<f4",
@@ -742,9 +752,11 @@ class FittedPolicyDataset(
             self.offsets.append(total)
             self.storage_runs.append((total - shard.count, total, feature_storage))
             self.group_batches_by_storage = self.group_batches_by_storage \
-                or shard.features.endswith(".zst") \
-                or shard.raw_oracle_probabilities.endswith(".zst") \
-                or shard.minute_oracle_probabilities.endswith(".zst")
+                or compressed_component_name(shard.features) \
+                or compressed_component_name(shard.teacher_parameters) \
+                or compressed_component_name(shard.teacher_metrics) \
+                or compressed_component_name(shard.raw_oracle_probabilities) \
+                or compressed_component_name(shard.minute_oracle_probabilities)
             previous_prediction_time = shard.prediction_time_start \
                 + (shard.count - 1) * self.manifest_sampling_interval_ms
         if total > run_start:
@@ -922,6 +934,14 @@ def passthrough_batch(batch):
     return batch
 
 
+def compressed_component_name(file: str) -> bool:
+    return file.endswith(".json")
+
+
+def is_compressed_component(file: Path) -> bool:
+    return is_storage_reference(file)
+
+
 def component_rows(
     file: Path,
     dtype: str,
@@ -930,26 +950,16 @@ def component_rows(
     row_stride: int,
     count: int,
 ) -> np.ndarray:
-    if file.name.endswith(".zst"):
-        return CompressedComponentRows(
-            file, dtype, columns, row_offset, row_stride, count
-        )
-    item_size = np.dtype(dtype).itemsize
-    row_bytes = columns * item_size
-    file_bytes = file.stat().st_size
-    if row_bytes <= 0 or file_bytes % row_bytes != 0:
-        raise ValueError(f"component file is not row aligned: {file}")
-    component_count = file_bytes // row_bytes
-    final_row = row_offset + max(0, count - 1) * row_stride
-    if min(row_offset, row_stride, count) < 0 or row_stride < 1 or final_row >= component_count:
-        raise ValueError(f"component row view is outside {file}")
-    values = np.memmap(file, mode="r", dtype=dtype, shape=(component_count, columns))
-    return values[row_offset:row_offset + count * row_stride:row_stride]
+    if not is_compressed_component(file):
+        raise ValueError(f"dataset component is not a canonical reference: {file}")
+    return CompressedComponentRows(
+        file, dtype, columns, row_offset, row_stride, count
+    )
 
 
 _COMPRESSED_COMPONENT_CACHE: OrderedDict[Path, np.ndarray] = OrderedDict()
-_COMPRESSED_COMPONENT_CACHE_DAYS = max(
-    1, int(os.environ.get("MLP_FEATURE_CACHE_DAYS", "2"))
+_COMPRESSED_COMPONENT_CACHE_ENTRIES = max(
+    4, int(os.environ.get("MLP_FEATURE_CACHE_DAYS", "2")) * 2
 )
 
 
@@ -1019,17 +1029,13 @@ def load_compressed_component(
             "run `npm run mlp:bootstrap`"
         )
     expected_bytes = total_rows * columns * np.dtype(dtype).itemsize
-    decoded = zstandard.ZstdDecompressor().decompress(
-        file.read_bytes(), max_output_size=expected_bytes
+    if not is_storage_reference(file):
+        raise ValueError(f"dataset component is not a canonical reference: {file}")
+    _shard, values = read_shard_array(
+        file, dtype, (total_rows, columns)
     )
-    if len(decoded) != expected_bytes:
-        raise ValueError(
-            f"compressed component has {len(decoded)} decoded bytes, "
-            f"expected {expected_bytes}: {file}"
-        )
-    values = np.frombuffer(decoded, dtype=dtype).reshape(total_rows, columns)
     _COMPRESSED_COMPONENT_CACHE[file] = values
-    while len(_COMPRESSED_COMPONENT_CACHE) > _COMPRESSED_COMPONENT_CACHE_DAYS:
+    while len(_COMPRESSED_COMPONENT_CACHE) > _COMPRESSED_COMPONENT_CACHE_ENTRIES:
         _COMPRESSED_COMPONENT_CACHE.popitem(last=False)
     return values
 
@@ -1053,7 +1059,7 @@ def prepare_compact_minute_features(
     source_phases: dict[Path, int] = {}
     for value in manifest["shards"]:
         source = dataset_root / value["features"]
-        if not source.name.endswith(".zst"):
+        if not is_compressed_component(source):
             continue
         row_stride = int(value["featureRowStride"])
         if row_stride != 60:
@@ -1098,16 +1104,11 @@ def prepare_compact_minute_features(
         except FileNotFoundError:
             pass
 
-        decoded = zstandard.ZstdDecompressor().decompress(
-            source.read_bytes(),
-            max_output_size=source_bytes,
+        if not is_storage_reference(source):
+            raise ValueError(f"feature component is not a canonical reference: {source}")
+        _shard, values = read_shard_array(
+            source, "<f2", (86_400, columns)
         )
-        if len(decoded) != source_bytes:
-            raise ValueError(
-                f"compressed feature component has {len(decoded)} decoded bytes, "
-                f"expected {source_bytes}: {source}"
-            )
-        values = np.frombuffer(decoded, dtype="<f2").reshape(86_400, columns)
         compact = np.ascontiguousarray(values[phase::60])
         if compact.nbytes != expected_bytes:
             raise ValueError(
@@ -1291,6 +1292,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--label", default="Direct oracle-distribution MLP")
     parser.add_argument("--plan", type=Path)
@@ -1555,6 +1557,10 @@ def utc_date(time_ms: int) -> str:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    repo_root = Path(__file__).resolve().parent.parent
+    storage_layout = training_storage_layout(repo_root)
+    args.dataset = require_under(args.dataset, storage_layout.datasets, "dataset")
+    args.run_dir = require_under(args.run_dir, storage_layout.runs, "run directory")
     training_epochs = target_only_training_epoch_limit(args)
     set_determinism(args.seed)
     manifest = json.loads((args.dataset / "dataset.json").read_text())
@@ -1580,7 +1586,7 @@ def main() -> None:
     minute_feature_cache_root = (
         args.feature_statistics_cache.parent / "minute-feature-components"
         if args.feature_statistics_cache is not None
-        else args.dataset / ".training-cache" / "minute-feature-components"
+        else storage_layout.cache / "minute-feature-components"
     )
     compact_minute_features = (
         prepare_compact_minute_features(
@@ -1629,7 +1635,7 @@ def main() -> None:
     )
     model = ExposureMlp(feature_mean, feature_std, args.dropout).to(device)
     if args.initialize_from_checkpoint is not None:
-        parent = torch.load(
+        parent = load_torch_checkpoint(
             args.initialize_from_checkpoint,
             map_location=device,
             # Project checkpoints also contain NumPy RNG/optimizer metadata. PyTorch
@@ -1782,12 +1788,13 @@ def main() -> None:
     # Target-only continuation extends process lifetime, not the requested
     # schedule. Past this horizon the cosine lambda remains at its 5% floor.
     total_steps = max(1, steps_per_epoch * args.epochs)
-    checkpoint_file = args.output / "checkpoint.pt"
-    best_model_file = args.output / "best-model.pt"
+    checkpoint_file = args.run_dir / "checkpoints" / "last.json"
+    best_model_file = args.run_dir / "checkpoints" / "best.json"
     args.output.mkdir(parents=True, exist_ok=True)
+    args.run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = (
-        torch.load(checkpoint_file, map_location=device, weights_only=False)
-        if args.resume and checkpoint_file.exists()
+        load_torch_checkpoint(checkpoint_file, map_location=device, weights_only=False)
+        if args.resume and checkpoint_exists(checkpoint_file)
         else None
     )
     resume_contract_extended = False
@@ -2033,7 +2040,7 @@ def main() -> None:
         }),
     })
 
-    if not best_model_file.exists() and not args.skip_baseline:
+    if not checkpoint_exists(best_model_file) and not args.skip_baseline:
         baseline = evaluate(
             model, validation_data, actions, current, support,
             loss_weights, device, sampling_interval_ms,
@@ -2045,7 +2052,7 @@ def main() -> None:
         best_epoch = args.inherited_best_epoch
         atomic_torch_save(model.state_dict(), best_model_file)
         emit({"event": "baseline", "validation": baseline})
-    elif not best_model_file.exists():
+    elif not checkpoint_exists(best_model_file):
         emit({
             "event": "baseline-skipped",
             "reason": "study variants select among trained epochs only",
@@ -2255,9 +2262,11 @@ def main() -> None:
     finally:
         checkpoint_writer.close()
 
-    if not best_model_file.exists():
+    if not checkpoint_exists(best_model_file):
         raise RuntimeError("training finished without a validated checkpoint")
-    model.load_state_dict(torch.load(best_model_file, map_location=device, weights_only=True))
+    model.load_state_dict(load_torch_checkpoint(
+        best_model_file, map_location=device, weights_only=True
+    ))
     # Re-evaluate the materialized best state so persisted metrics always
     # describe the actual checkpoint under the current metric definitions,
     # including metrics added after a resumable checkpoint was written.
@@ -3158,7 +3167,9 @@ def export_artifact(model, args, dataset_manifest, train_count, validation_count
         "hiddenLayerCount": HIDDEN_LAYER_COUNT,
         "hiddenWidth": HIDDEN_WIDTH,
         "modelFile": "model.onnx",
-        **({} if args.evaluation_only else {"checkpointFile": "checkpoint.pt"}),
+        **({} if args.evaluation_only else {
+            "checkpointPointer": str(checkpoint_file)
+        }),
         "predictionDelayMs": int(dataset_manifest["predictionDelayMs"]),
         "verificationFixture": {
             "batchSize": verification_batch_size,
@@ -3358,13 +3369,13 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
             oracle_component = oracle_components.get(
                 shard["rawOracleProbabilities"], {}
             )
-            if file.name.endswith(".zst") \
+            if is_compressed_component(file) \
                     or raw_oracle.get("factorCompression", "none") == "zstd":
                 expected_decoded_bytes = 86_400 * expected_row_bytes
                 invalid_raw_oracle = (
                     not file.is_file()
                     or file.stat().st_size < 1
-                    or not file.name.endswith(".zst")
+                    or not is_compressed_component(file)
                     or raw_oracle.get("factorCompression") != "zstd"
                     or oracle_component.get(
                         "rawOracleProbabilitiesCompression"
@@ -3390,7 +3401,7 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
             minimum_feature_rows = feature_offset + (count - 1) * feature_stride + 1
             feature_component = input_components.get(shard["features"], {})
             if feature_component.get("featuresCompression") == "zstd" \
-                    or feature_file.name.endswith(".zst"):
+                    or is_compressed_component(feature_file):
                 expected_decoded_bytes = 86_400 * feature_row_bytes
                 if not feature_file.is_file() \
                         or feature_file.stat().st_size < 1 \
@@ -3433,7 +3444,7 @@ def validate_dataset_manifest(manifest: dict, root: Path | None = None) -> None:
                 invalid_minute_oracle = (
                     not minute_file.is_file()
                     or minute_file.stat().st_size < 1
-                    or not minute_file.name.endswith(".zst")
+                    or not is_compressed_component(minute_file)
                 )
             else:
                 invalid_minute_oracle = (
@@ -3597,9 +3608,7 @@ def cpu_rng_state(value) -> Tensor:
 
 
 def atomic_torch_save(value, target: Path) -> None:
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    torch.save(value, temporary)
-    temporary.replace(target)
+    save_torch_checkpoint(value, target)
 
 
 def atomic_json(value: dict, target: Path) -> None:

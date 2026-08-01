@@ -21,8 +21,8 @@ from mlp_model import PolicySupport, conditional_policy_logits, scaled_softplus
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze cutoff-aware teacher-fit rejection shapes.")
-    parser.add_argument("--input", type=Path, default=Path("data/ml-analysis/mlp-rejection-oracles"))
-    parser.add_argument("--output", type=Path, default=Path("data/ml-analysis/mlp-rejection-analysis.json"))
+    parser.add_argument("--input", type=Path, default=Path("data/training/analysis/mlp-rejection-oracles"))
+    parser.add_argument("--output", type=Path, default=Path("data/training/analysis/mlp-rejection-analysis.json"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--steps", type=int, default=320)
     return parser.parse_args()

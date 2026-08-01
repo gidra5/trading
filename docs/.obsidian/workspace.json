@@ -178,6 +178,8 @@
   },
   "active": "2e06481950b61c7e",
   "lastOpenFiles": [
+    "storage.md",
+    "joint-price-oracle.md",
     "experiments/return-oracle-dense-all-layer-residuals-fixed-c-baseline-2026-07-30.md",
     "return-oracle-ce-experiment.md",
     "experiments/return-oracle-dense-all-layer-residuals-learnable-c-baseline-2026-07-30.md",

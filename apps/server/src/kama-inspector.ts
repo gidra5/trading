@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import { gunzipSync } from "node:zlib";
 import {
   evaluateVwKamaOracle,
   noiseSignalRatio,
@@ -55,6 +54,7 @@ import {
   type HandcraftedIndicatorPredictorParameters,
   type DirectIndicatorPredictorParameters,
 } from "@trading/bot-algo";
+import { readCandleShardReference, TradingStorageLayout } from "@trading/storage";
 import { fetchBinanceSpotDailyShard } from "./binance-history-cache.js";
 import { HANDCRAFTED_PREDICTOR_PRESETS } from "./handcrafted-predictor-presets.js";
 import { DIRECT_INDICATOR_PREDICTOR_PRESETS } from "./direct-indicator-predictor-presets.js";
@@ -185,6 +185,7 @@ const DEFAULT_REQUEST: VwKamaInspectorRequest = {
     initialExposure: 0,
     holdingPeriodMode: "fixed",
     holdingPeriodMs: 60_000,
+    decisionDelayMs: 1_000,
     valueHorizonMode: "fixed",
     valueHorizonMs: 60 * 60_000,
     horizonEndMode: "extend",
@@ -726,6 +727,9 @@ export class KamaInspectorEngine {
         ? Math.max(1, Math.round(request.valueDistillation!.valueHorizonMs / request.intervalMs))
         : Math.max(1, scoreEndIndex - scoreStartIndex - 1);
       const holdingPeriodSteps = Math.max(1, Math.round(input.holdingPeriodMs / request.intervalMs));
+      const decisionDelaySteps = Math.max(1, Math.round(
+        (request.valueDistillation!.decisionDelayMs ?? request.intervalMs) / request.intervalMs,
+      ));
       const valueHorizonSteps = Math.max(1, Math.round(input.valueHorizonMs / request.intervalMs));
       if (holdingPeriodSteps > mainHoldingSteps || valueHorizonSteps > mainHorizonSteps) {
         throw new Error("Historical oracle H and T cannot exceed the main oracle's resolved H and T.");
@@ -757,6 +761,7 @@ export class KamaInspectorEngine {
       const oracle = prepareSparseExposureValueOracle(prices, {
         scoreStartIndex: 0,
         holdingPeriodSteps,
+        decisionDelaySteps,
         valueHorizonSteps,
         friction: request.oracleFriction,
         gridSize: config.gridSize,
@@ -1064,6 +1069,9 @@ export class KamaInspectorEngine {
       cancelFlag,
     };
     let holdingPeriodSteps = Math.max(1, Math.round(config.holdingPeriodMs / request.intervalMs));
+    const decisionDelaySteps = Math.max(1, Math.round(
+      (config.decisionDelayMs ?? request.intervalMs) / request.intervalMs,
+    ));
     if (config.holdingPeriodMode === "oracle-half-average-trade") {
       const oneStepBellman = prepareExposureValueOracle(prices, {
         ...baseOptions,
@@ -1086,6 +1094,7 @@ export class KamaInspectorEngine {
     const options = {
       ...baseOptions,
       holdingPeriodSteps,
+      decisionDelaySteps,
       // Opportunity epsilon only offsets per-row weights. Keep the expensive
       // oracle neutral so epsilon edits can reuse its exact values/statistics.
       includeProbabilities: true,
@@ -1104,6 +1113,8 @@ export class KamaInspectorEngine {
       config.holdingPeriodMode,
       config.holdingPeriodMs,
       holdingPeriodSteps,
+      config.decisionDelayMs ?? request.intervalMs,
+      decisionDelaySteps,
       config.valueHorizonMode,
       config.valueHorizonMs,
       valueHorizonSteps,
@@ -1191,7 +1202,14 @@ export class KamaInspectorEngine {
   private async loadSource(selected: VwKamaInspectorWindow, sourceEndTime: number): Promise<Candle[]> {
     const start = selected.startTime - MAX_WARMUP_MS;
     const sourceLabel = duration(selected.sourceIntervalMs);
-    const root = path.join(this.dataDir, "historical", "spot-btcusdt", "btcusdt", sourceLabel);
+    const root = path.join(
+      new TradingStorageLayout(this.dataDir).marketStore,
+      "refs",
+      "candles",
+      "spot-btcusdt",
+      "btcusdt",
+      sourceLabel,
+    );
     const candles: Candle[] = [];
     for (let day = utcDay(start); day < sourceEndTime; day += DAY_MS) {
       const date = new Date(day).toISOString().slice(0, 10);
@@ -1633,6 +1651,10 @@ function combineMetrics(
       valueDistillation: {
         holdingPeriodMs: valueParts.reduce(
           (sum, item) => sum + item.holdingPeriodMs * item.sampleCount,
+          0,
+        ) / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
+        decisionDelayMs: valueParts.reduce(
+          (sum, item) => sum + item.decisionDelayMs * item.sampleCount,
           0,
         ) / Math.max(1, valueParts.reduce((sum, item) => sum + item.sampleCount, 0)),
         valueHorizonMs: valueParts.reduce(
@@ -2077,6 +2099,8 @@ function normalizeRequest(input: VwKamaInspectorRequest): VwKamaInspectorRequest
   }
   if (!["fixed", "oracle-half-average-trade"].includes(valueConfig.holdingPeriodMode)
     || !Number.isFinite(valueConfig.holdingPeriodMs) || valueConfig.holdingPeriodMs <= 0
+    || !Number.isFinite(valueConfig.decisionDelayMs ?? request.intervalMs)
+    || (valueConfig.decisionDelayMs ?? request.intervalMs) <= 0
     || !["full-window", "fixed"].includes(valueConfig.valueHorizonMode ?? "full-window")
     || !Number.isFinite(valueConfig.valueHorizonMs)
     || (valueConfig.valueHorizonMode === "fixed"
@@ -2450,13 +2474,8 @@ function validateWindowScale(window: VwKamaInspectorWindow, intervalMs: number):
 }
 
 async function readDailyShard(root: string, date: string): Promise<string> {
-  try {
-    return await fs.readFile(path.join(root, `${date}.jsonl`), "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const compressed = await fs.readFile(path.join(root, `${date}.jsonl.gz`));
-  return gunzipSync(compressed).toString("utf8");
+  const candles = await readCandleShardReference(path.join(root, `${date}.json`));
+  return `${candles.map((candle) => JSON.stringify(candle)).join("\n")}\n`;
 }
 
 function duration(ms: number): string {

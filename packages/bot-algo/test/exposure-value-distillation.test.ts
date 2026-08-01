@@ -7,7 +7,9 @@ import {
   createExposureReturnAccumulator,
   createExposureValueDistillationAccumulator,
   exposureHoldingFeasibleInterval,
+  exposureValueOracleActionDistribution,
   exposureValueOracleProbabilities,
+  exposureValueOraclePreferredExposure,
   finalizeExposureReturn,
   finalizeExposureValueDistillation,
   fitConditionalQuadraticPolicy,
@@ -269,6 +271,7 @@ test("CUDA exposure-value oracle matches the CPU Bellman recurrence", async (con
     const options = {
       scoreStartIndex: 300,
       holdingPeriodSteps: 17,
+      decisionDelaySteps: 29,
       valueHorizonSteps: prices.length - 1 - 300,
       friction: 0.00175,
       gridSize,
@@ -430,6 +433,39 @@ test("exposure value oracle prefers the sign of the next price move", () => {
   assert.ok(Math.abs(up.means[1]!) < 1e-7);
 });
 
+test("preferred-exposure shortcut matches the complete oracle policy", () => {
+  const prices = [100, 101, 99, 103, 102, 106, 104];
+  const options = {
+    scoreStartIndex: 0,
+    holdingPeriodSteps: 2,
+    decisionDelaySteps: 3,
+    valueHorizonSteps: 6,
+    terminalIndex: prices.length - 1,
+    friction: 0.00175,
+    gridSize: 9,
+    minExposure: -4,
+    maxExposure: 4,
+    maxEffectiveExposure: 8,
+    temperature: 0.01,
+    quoteBorrowRate: 0.000001,
+    assetBorrowRate: 0.000001,
+    includeProbabilities: true,
+  };
+  const complete = prepareExposureValueOracle(prices, options);
+  const distribution = exposureValueOracleActionDistribution(prices, options);
+  assert.equal(
+    exposureValueOraclePreferredExposure(prices, options),
+    complete.modalExposures[0],
+  );
+  assert.equal(distribution.modalExposure, complete.modalExposures[0]);
+  assert.ok(Math.abs(distribution.mean - complete.means[0]!) < 1e-6);
+  assert.ok(Math.abs(distribution.entropy - complete.entropies[0]!) < 1e-6);
+  const completeProbabilities = exposureValueOracleProbabilities(complete, 0);
+  assert.ok(distribution.probabilities.every((probability, index) =>
+    Math.abs(probability - completeProbabilities[index]!) < 1e-6));
+  assert.ok(distribution.feasibleActionCount > 0);
+});
+
 test("full-window oracle reports Q0 at the input exposure and liquidates at T", () => {
   const friction = 0.001;
   const oracle = prepareExposureValueOracle([100, 110, 121, 133.1], {
@@ -553,6 +589,7 @@ test("exposure value oracle retains selected H when the segment tail truncates t
   });
 
   assert.equal(oracle.holdingPeriodSteps, 10);
+  assert.equal(oracle.decisionDelaySteps, 1);
   assert.equal(oracle.valueHorizonSteps, 10);
 });
 
@@ -1118,6 +1155,7 @@ test("sparse rolling-horizon oracle rows and later population match the dense or
   const options = {
     scoreStartIndex: 3,
     holdingPeriodSteps: 2,
+    decisionDelaySteps: 4,
     valueHorizonSteps: 8,
     friction: 0.00175,
     gridSize: 11,

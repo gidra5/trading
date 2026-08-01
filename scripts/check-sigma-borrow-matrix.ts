@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { readCandleShardReferenceSync } from "@trading/storage";
 import {
   createStrategyConfig,
   type BacktestExtremaOrderMassSummary,
@@ -386,19 +387,15 @@ function nonNegativeInteger(value: string, label: string): number {
 }
 
 function loadCandles(args: Args): Candle[] {
-  const dir = "data/historical/spot-btcusdt/btcusdt/1m";
+  const dir = "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m";
   const files =
     args.startDate || args.endDate
       ? historicalFilesForDateRange(dir, args.startDate, args.endDate)
-      : fs.readdirSync(dir).filter((file) => file.endsWith(".jsonl")).sort().slice(-args.days);
+      : fs.readdirSync(dir).filter((file) => /^\d{4}-\d{2}-\d{2}\.json$/.test(file))
+        .sort().slice(-args.days);
   const candles: Candle[] = [];
   for (const file of files) {
-    const content = fs.readFileSync(path.join(dir, file), "utf8");
-    for (const line of content.split("\n")) {
-      if (line.trim()) {
-        candles.push(JSON.parse(line) as Candle);
-      }
-    }
+    candles.push(...readCandleShardReferenceSync(path.join(dir, file)));
   }
   return candles.sort((left, right) => left.openTime - right.openTime);
 }
@@ -421,7 +418,7 @@ function historicalFilesForDateRange(
     timestamp <= Date.parse(`${endDate}T00:00:00Z`);
     timestamp += 24 * 60 * 60 * 1000
   ) {
-    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.jsonl`;
+    const file = `${new Date(timestamp).toISOString().slice(0, 10)}.json`;
     const fullPath = path.join(dir, file);
     if (!fs.existsSync(fullPath)) {
       throw new Error(`Missing historical candle file: ${fullPath}`);

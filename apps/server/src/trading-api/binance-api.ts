@@ -174,7 +174,13 @@ export class BinanceTradingApi implements RuntimeTradingApi {
       this.events.push({
         type: remaining > 0 ? "partial-fill" : "fill",
         orderId: item.order.id,
-        fill: { filledAsset: trade.quantity, filledQuote, remaining },
+        fill: {
+          filledAsset: trade.quantity,
+          filledQuote,
+          price: trade.quantity > 0 ? trade.quoteQuantity / trade.quantity : undefined,
+          feeQuote: trade.feeQuote,
+          remaining,
+        },
       });
       if (remaining === 0) {
         this.orders.delete(item.order.id);
@@ -219,6 +225,8 @@ export class BinanceTradingApi implements RuntimeTradingApi {
           filledQuote: fill.side === "buy"
             ? fill.quoteQuantity + fill.feeQuote
             : fill.quoteQuantity - fill.feeQuote,
+          price: fill.quantity > 0 ? fill.quoteQuantity / fill.quantity : undefined,
+          feeQuote: fill.feeQuote,
           remaining,
         },
       });

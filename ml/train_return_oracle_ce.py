@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
-import gzip
 import json
 import math
 import os
 import queue
 import random
-import re
 import threading
 import time
 from collections import OrderedDict
@@ -22,7 +20,18 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
-import zstandard
+from trading_storage import (
+    checkpoint_exists,
+    is_storage_reference,
+    load_torch_checkpoint,
+    read_candle_column,
+    read_shard_array,
+    require_under,
+    resolve_shard,
+    save_torch_checkpoint,
+    training_storage_layout,
+    write_shard_payload,
+)
 
 from return_oracle_ce import (
     BRANCH_NORMALIZATION_EPSILON,
@@ -44,17 +53,13 @@ INPUT_HORIZON_SECONDS = INPUT_RETURN_COUNT * MINUTE_SECONDS
 DAY_SECONDS = 86_400
 MINUTE_ROWS_PER_DAY = 1_441
 TEST_EXAMPLES = 1_000_000
-DENSE_RESIDUAL_PATH_COUNT = sum(
-    max(layer_index - 1, 0)
-    for layer_index in range(HIDDEN_LAYER_COUNT)
-)
 FEATURE_CONTRACT = (
     "train-position-standardized-completed-minute-close-only-simple-returns-v2"
 )
 ARCHITECTURE_CONTRACT = (
     "eight-uniform-256-fused-glu-shared-layer-centering-"
-    "tanh-learned-radius-full-a-post-bias-full-normalized-global-input-glu-"
-    "dense-all-prior-layer-residuals-fixed-c-path-shared-value-gate-a-v38"
+    "tanh-learned-radius-full-a-post-bias-sequential-no-residuals-fixed-c-"
+    "shared-value-gate-c-v40"
 )
 OBJECTIVE_CONTRACT = (
     "soft-target-ce-plus-independent-skew-reverse-kl-p1-entropy-sharpness-"
@@ -64,10 +69,9 @@ RUNNER_CONTRACT = (
     "compact-minute-multiplicity-weighted-bf16-hybrid-muon-adamw-v10"
 )
 RETURN_COMPONENT_SUFFIX = (
-    ".completed-minute-simple-returns-60.compact.f16.zst"
+    ".json"
 )
 FLOAT16_ROW_BYTES = INPUT_RETURN_COUNT * np.dtype("<f2").itemsize
-CLOSE_PATTERN = re.compile(rb'"close":([-+0-9.eE]+),')
 METRIC_NAMES = (
     "loss",
     "crossEntropy",
@@ -99,12 +103,6 @@ def hybrid_optimizer_parameters(
     """Route projection/A matrices to Muon and constrained C to AdamW."""
     muon_parameters = (
         tuple(layer.weight for layer in model.layers)
-        + tuple(layer.weight for layer in model.residual_glu_layers)
-        + tuple(
-            layer.weight
-            for target_layers in model.dense_residual_layers
-            for layer in target_layers
-        )
         + tuple(transform.weight for transform in model.value_transforms)
         + tuple(transform.weight for transform in model.gate_transforms)
     )
@@ -465,13 +463,34 @@ class RunReporter:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = run_dir / "training.log"
-        self.status_file = run_dir / "status.json"
+        self.log_file = run_dir / "logs" / "training.jsonl"
+        self.status_file = run_dir / "state" / "status.json"
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(self, event: dict) -> None:
         line = json.dumps(event, separators=(",", ":"), allow_nan=False)
-        with self.log_file.open("a", encoding="utf-8", newline="\n") as output:
-            output.write(line + "\n")
+        for attempt in range(40):
+            try:
+                with self.log_file.open(
+                    "a",
+                    encoding="utf-8",
+                    newline="\n",
+                ) as output:
+                    output.write(line + "\n")
+                break
+            except PermissionError:
+                if attempt == 39:
+                    warning = json.dumps({
+                        "event": "log-write-warning",
+                        "droppedEvent": event.get("event"),
+                        "error": (
+                            "training log remained locked after 40 retries"
+                        ),
+                    }, separators=(",", ":"))
+                    print(warning, flush=True)
+                    return
+                time.sleep(min(0.01 * (attempt + 1), 0.25))
         print(line, flush=True)
 
     def status(self, stage: str, **values) -> None:
@@ -499,7 +518,6 @@ class ComponentCache:
         self.values: OrderedDict[
             tuple[Path, str, tuple[int, int]], np.ndarray
         ] = OrderedDict()
-        self.decompressor = zstandard.ZstdDecompressor()
 
     def load(
         self,
@@ -512,22 +530,9 @@ class ComponentCache:
         if cached is not None:
             self.values[key] = cached
             return cached
-        expected_bytes = math.prod(shape) * np.dtype(dtype).itemsize
-        if file.name.endswith(".zst"):
-            decoded = self.decompressor.decompress(
-                file.read_bytes(),
-                max_output_size=expected_bytes,
-            )
-            if len(decoded) != expected_bytes:
-                raise ValueError(
-                    f"decoded component has invalid size: {file} "
-                    f"({len(decoded)} != {expected_bytes})"
-                )
-            value = np.frombuffer(decoded, dtype=dtype).reshape(shape)
-        else:
-            if file.stat().st_size != expected_bytes:
-                raise ValueError(f"component has invalid size: {file}")
-            value = np.memmap(file, mode="r", dtype=dtype, shape=shape)
+        if not is_storage_reference(file):
+            raise ValueError(f"dataset component is not a canonical reference: {file}")
+        _shard, value = read_shard_array(file, dtype, shape)
         self.values[key] = value
         while len(self.values) > self.max_entries:
             self.values.popitem(last=False)
@@ -960,11 +965,23 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     plan_file = resolve(repo_root, args.plan)
     plan = json.loads(plan_file.read_text(encoding="utf-8"))
+    storage_layout = training_storage_layout(repo_root)
     source_root = resolve(repo_root, Path(plan["sourceDatasetDir"]))
     dataset_root = resolve(repo_root, Path(plan["datasetDir"]))
     run_dir = resolve(repo_root, Path(plan["runDir"]))
     history_root = resolve(repo_root, Path(plan["historyDir"]))
-    feature_root = dataset_root / "components" / "returns"
+    source_root = require_under(source_root, storage_layout.datasets, "sourceDatasetDir")
+    dataset_root = require_under(dataset_root, storage_layout.datasets, "datasetDir")
+    run_dir = require_under(run_dir, storage_layout.runs, "runDir")
+    history_root = require_under(
+        history_root,
+        repo_root / "data" / "market" / "immutable" / "refs" / "candles",
+        "historyDir",
+    )
+    feature_root = (
+        storage_layout.immutable / "refs" / "features"
+        / "return-oracle-simple-returns-v1" / plan["id"]
+    )
     reporter = RunReporter(run_dir)
     training = plan["training"]
     validate_plan(plan)
@@ -996,6 +1013,8 @@ def main() -> None:
             feature_root,
             feature_dates,
             reporter,
+            storage_layout.immutable,
+            plan["id"],
         )
         progress = {
             "featureComponents": [
@@ -1008,7 +1027,7 @@ def main() -> None:
                 for segment in values
             }),
         }
-        atomic_json(progress, dataset_root / "progress.json")
+        atomic_json(progress, dataset_root / "state" / "progress.json")
         dataset = ExperimentDataset(
             feature_root,
             selected_segments,
@@ -1155,10 +1174,7 @@ def main() -> None:
                 "scale": {
                     "learnable": True,
                     "sharing": "one-scalar-per-value-or-gate-branch",
-                    "count": (
-                        4 * HIDDEN_LAYER_COUNT
-                        + 2 * DENSE_RESIDUAL_PATH_COUNT
-                    ),
+                    "count": 2 * HIDDEN_LAYER_COUNT,
                     "role": training["branchNormalization"]["scaleRole"],
                     "initialValue": float(
                         training["branchNormalization"]["initialScale"]
@@ -1177,8 +1193,8 @@ def main() -> None:
                 },
                 "learnablePostTransformBias": True,
                 "centering": (
-                    "one fixed full C per target layer, shared across every "
-                    "incoming value/gate path at I - 11^T / d"
+                    "one fixed full C per layer, shared by its value and "
+                    "gate branches at I - 11^T / d"
                 ),
                 "normalization": (
                     "C h / (s g(r/s)), r=sqrt(mean((C h)^2)), "
@@ -1189,36 +1205,11 @@ def main() -> None:
                     "B is absorbed into both halves of the fused projection"
                 ),
                 "postNormalizationTransform": (
-                    "one value A and one gate A, each shared across the main "
-                    "and residual paths, initialized to identity, followed by "
-                    "branch-specific learnable bias vectors"
+                    "one value A and one gate A per sequential layer, "
+                    "initialized to identity, followed by branch-specific "
+                    "learnable bias vectors"
                 ),
-                "globalInputResidual": {
-                    "formula": (
-                        "hidden=GLU(main_projection)+GLU(input_projection)"
-                    ),
-                    "source": "shared-standardized-60-return-model-input",
-                    "matrixCount": HIDDEN_LAYER_COUNT,
-                    "initialization": (
-                        "zero-value-half; kaiming-gate-half; zero-bias"
-                    ),
-                    "normalization": (
-                        "independent-branches-sharing-layer-C-and-A"
-                    ),
-                    "optimizer": "Muon-matrix-AdamW-bias",
-                },
-                "denseLayerResiduals": {
-                    "formula": (
-                        "hidden_l=main_l(previous)+input_l(x0)+"
-                        "sum_{j<l-1} residual_{l,j}(hidden_j)"
-                    ),
-                    "pathCount": DENSE_RESIDUAL_PATH_COUNT,
-                    "aggregation": "additive",
-                    "normalization": (
-                        "path-specific-radius-and-bias; target-layer-shared-"
-                        "C-value-A-gate-A"
-                    ),
-                },
+                "residualConnections": "disabled",
                 "centeringConstraints": {
                     "idempotence": "mean((C^2 - C)^2)",
                     "symmetry": "mean((C^T - C)^2)",
@@ -1291,7 +1282,7 @@ def main() -> None:
             startedAt=started_at,
             pausedAt=iso_now(),
             planId=plan["id"],
-            message="Training was interrupted and can resume from last.pt.",
+            message="Training was interrupted and can resume from checkpoints/last.json.",
         )
         raise
     except Exception as error:
@@ -1587,18 +1578,18 @@ def prepare_return_components(
     feature_root: Path,
     feature_dates: list[str],
     reporter: RunReporter,
+    storage_root: Path,
+    plan_id: str,
 ) -> None:
     feature_root.mkdir(parents=True, exist_ok=True)
     close_cache: OrderedDict[str, np.ndarray] = OrderedDict()
-    compressor = zstandard.ZstdCompressor(level=7, threads=0)
     total = len(feature_dates)
     started = time.monotonic()
     completed = 0
     for index, component_date in enumerate(feature_dates, start=1):
         output_file = feature_root / f"{component_date}{RETURN_COMPONENT_SUFFIX}"
-        if valid_zstd_component(
-            output_file,
-            MINUTE_ROWS_PER_DAY * FLOAT16_ROW_BYTES,
+        if valid_reference_component(
+            output_file, MINUTE_ROWS_PER_DAY * FLOAT16_ROW_BYTES
         ):
             completed += 1
         else:
@@ -1618,12 +1609,26 @@ def prepare_return_components(
                 previous_close,
                 current_close,
             )
-            temporary = output_file.with_suffix(output_file.suffix + ".tmp")
-            with temporary.open("wb") as raw_output:
-                raw_output.write(compressor.compress(
-                    minute_features.astype("<f2", copy=False).tobytes()
-                ))
-            os.replace(temporary, output_file)
+            write_shard_payload(
+                storage_root,
+                "features/return-oracle-simple-returns-v1",
+                f"{plan_id}/{component_date}",
+                minute_features.astype("<f2", copy=False).tobytes(),
+                sequence={
+                    "start": int(datetime.fromisoformat(
+                        component_date
+                    ).replace(tzinfo=timezone.utc).timestamp() * 1000) - 1,
+                    "step": 60_000,
+                    "count": MINUTE_ROWS_PER_DAY,
+                    "unit": "unix-ms",
+                },
+                layout={
+                    "encoding": "row-major",
+                    "dtype": "float16-le",
+                    "columns": INPUT_RETURN_COUNT,
+                },
+                metadata={"planId": plan_id},
+            )
             completed += 1
         elapsed = max(time.monotonic() - started, 1e-6)
         if index == 1 or index % 10 == 0 or index == total:
@@ -1657,15 +1662,10 @@ def load_daily_close(
     if cached is not None:
         cache[component_date] = cached
         return cached
-    file = history_root / f"{component_date}.jsonl.gz"
+    file = history_root / f"{component_date}.json"
     if not file.is_file():
         raise FileNotFoundError(f"missing one-second history: {file}")
-    with gzip.open(file, "rb") as source:
-        decoded = source.read()
-    values = np.fromiter(
-        (float(match.group(1)) for match in CLOSE_PATTERN.finditer(decoded)),
-        dtype=np.float64,
-    )
+    values = read_candle_column(file, "close")
     if values.shape != (DAY_SECONDS,) or not np.isfinite(values).all() \
             or bool((values <= 0).any()):
         raise ValueError(
@@ -1678,19 +1678,13 @@ def load_daily_close(
     return values
 
 
-def valid_zstd_component(file: Path, expected_bytes: int) -> bool:
-    if not file.is_file() or file.stat().st_size < 1:
+def valid_reference_component(file: Path, expected_bytes: int) -> bool:
+    if not file.is_file():
         return False
     try:
-        value = zstandard.frame_content_size(file.read_bytes())
-        # python-zstandard returns -1 for a streaming frame with unknown
-        # content size even though its exported constant is unsigned.
-        return value in (
-            expected_bytes,
-            -1,
-            zstandard.CONTENTSIZE_UNKNOWN,
-        )
-    except zstandard.ZstdError:
+        shard = resolve_shard(file)
+        return int(shard.reference["object"]["uncompressedBytes"]) == expected_bytes
+    except (OSError, ValueError, json.JSONDecodeError):
         return False
 
 
@@ -1820,10 +1814,10 @@ def train(
     centering_is_learnable = any(
         matrix.requires_grad for matrix in centering_matrices
     )
-    last_checkpoint = reporter.run_dir / "last.pt"
-    best_checkpoint = reporter.run_dir / "best.pt"
-    if last_checkpoint.is_file():
-        checkpoint = torch.load(
+    last_checkpoint = reporter.run_dir / "checkpoints" / "last.json"
+    best_checkpoint = reporter.run_dir / "checkpoints" / "best.json"
+    if checkpoint_exists(last_checkpoint):
+        checkpoint = load_torch_checkpoint(
             last_checkpoint,
             map_location=device,
             weights_only=False,
@@ -2157,10 +2151,9 @@ def train(
             f"{HIDDEN_WIDTHS[0]} fused-GLU MLP in "
             f"{batch_size:,}-example "
             "batches "
-            "with fully normalized additive GLU residuals from the original "
-            "input and every earlier hidden layer, sharing one C and "
-            "separate value/gate A matrices across paths at each target, "
-            "separate post-projection learned-radius tanh "
+            "with a strictly sequential path and no residual connections, "
+            "sharing one fixed C between the value and gate branches at each "
+            "layer, with separate post-projection learned-radius tanh "
             "normalizers initialized with radius sqrt(1e-5), with "
             "learnable value/gate radius s and fixed canonical C per layer, "
             "then "
@@ -2212,10 +2205,7 @@ def train(
             "scale": {
                 "learnable": True,
                 "sharing": "one-scalar-per-value-or-gate-branch",
-                "count": (
-                    4 * HIDDEN_LAYER_COUNT
-                    + 2 * DENSE_RESIDUAL_PATH_COUNT
-                ),
+                "count": 2 * HIDDEN_LAYER_COUNT,
                 "role": training["branchNormalization"]["scaleRole"],
                 "initialValue": float(
                     training["branchNormalization"]["initialScale"]
@@ -2233,7 +2223,7 @@ def train(
             "learnablePostTransformBias": True,
             "centeringMatrix": {
                 "learnable": False,
-                "sharing": "one-shared-matrix-across-four-paths-per-layer",
+                "sharing": "one-shared-matrix-across-value-gate-per-layer",
                 "matrixCount": HIDDEN_LAYER_COUNT,
                 "shape": "full-square-at-each-hidden-width",
                 "initialization": "I-minus-11T-over-width",
@@ -2245,37 +2235,12 @@ def train(
                 "B-absorbed-into-fused-value-gate-projection"
             ),
             "postNormalizationTransform": {
-                "branches": (
-                    "value-shared-main-residual-and-separate-gate-shared-"
-                    "main-residual"
-                ),
+                "branches": "separate-value-and-gate-per-layer",
                 "shape": "full-square-at-each-hidden-width",
                 "bias": "separate-post-A-vector",
                 "initialization": "identity",
             },
-            "globalInputResidual": {
-                "formula": (
-                    "hidden=GLU(main_projection)+GLU(input_projection)"
-                ),
-                "source": "shared-standardized-60-return-model-input",
-                "matrixCount": HIDDEN_LAYER_COUNT,
-                "initialization": (
-                    "zero-value-half; kaiming-gate-half; zero-bias"
-                ),
-                "normalization": "independent-branches-sharing-layer-C-and-A",
-            },
-            "denseLayerResiduals": {
-                "formula": (
-                    "hidden_l=main_l(previous)+input_l(x0)+"
-                    "sum_{j<l-1} residual_{l,j}(hidden_j)"
-                ),
-                "pathCount": DENSE_RESIDUAL_PATH_COUNT,
-                "aggregation": "additive",
-                "normalization": (
-                    "path-specific-radius-and-bias; target-layer-shared-"
-                    "C-value-A-gate-A"
-                ),
-            },
+            "residualConnections": "disabled",
             "centeringConstraints": {
                 "idempotence": "mean-square-C2-minus-C",
                 "symmetry": "mean-square-CT-minus-C",
@@ -2297,9 +2262,7 @@ def train(
                 ),
                 "routing": (
                     f"all-{HIDDEN_LAYER_COUNT}-fused-value-gate-"
-                    f"projection-{HIDDEN_LAYER_COUNT}-global-input-GLU-"
-                    f"residual-{DENSE_RESIDUAL_PATH_COUNT}-dense-residual-"
-                    f"projections-and-{2 * HIDDEN_LAYER_COUNT}-path-shared-"
+                    f"projections-and-{2 * HIDDEN_LAYER_COUNT}-"
                     "post-normalization-A-matrices"
                 ),
             },
@@ -2309,9 +2272,9 @@ def train(
                     parameter.numel() for parameter in adamw_parameters
                 ),
                 "routing": (
-                    "output-head-all-affine-and-residual-biases-"
-                    f"{4 * HIDDEN_LAYER_COUNT + 2 * DENSE_RESIDUAL_PATH_COUNT}"
-                    "-post-A-offsets-and-soft-normalization-scales; "
+                    "output-head-all-affine-biases-"
+                    f"{2 * HIDDEN_LAYER_COUNT}-post-A-offsets-and-soft-"
+                    "normalization-scales; "
                     "fixed-C-matrices-excluded"
                 ),
             },
@@ -2824,7 +2787,11 @@ def train(
         raise RuntimeError(
             "maximum epochs were exhausted before validation staleness exceeded 1024"
         )
-    best = torch.load(best_checkpoint, map_location=device, weights_only=False)
+    best = load_torch_checkpoint(
+        best_checkpoint,
+        map_location=device,
+        weights_only=False,
+    )
     model.load_state_dict(best["model"])
     test_metrics = evaluate(
         evaluation_objective,
@@ -2848,7 +2815,7 @@ def train(
         "checkpoint": str(best_checkpoint),
         "deployed": False,
     }
-    atomic_json(result, reporter.run_dir / "result.json")
+    atomic_json(result, reporter.run_dir / "state" / "result.json")
     reporter.emit({
         "event": "training-complete",
         **result,
@@ -2918,10 +2885,7 @@ def gpu_memory(device: torch.device) -> dict[str, float]:
 
 
 def atomic_torch_save(value: dict, file: Path) -> None:
-    file.parent.mkdir(parents=True, exist_ok=True)
-    temporary = file.with_suffix(file.suffix + ".tmp")
-    torch.save(value, temporary)
-    replace_file_with_retry(temporary, file)
+    save_torch_checkpoint(value, file)
 
 
 def atomic_json(value: dict, file: Path) -> None:
