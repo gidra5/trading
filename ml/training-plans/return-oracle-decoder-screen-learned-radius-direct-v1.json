@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "id": "return-oracle-decoder-screen-learned-radius-direct-v1",
+  "label": "Decoder capability screen: recovered 16-layer learned-radius shrinking GLU, direct production-temperature targets",
+  "dataset": {
+    "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+    "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+    "featureSetId": "return-oracle-ce-shrinking-v1",
+    "featureContract": "train-position-standardized-completed-minute-close-only-simple-returns-v2",
+    "datasetSha256": "cc5bddd8948390713e68505236a0db8b17510c4cf01b960f0fd6df19b0a4fbd8",
+    "sourceDatasetSha256": "215888a941a8888bc3b3ceb85d979092b94ee273c844c81a179d2f0e3308f85f",
+    "expectedCounts": {
+      "train": 33195600,
+      "validation": 15418800,
+      "test": 1000000
+    },
+    "oracleTemperature": 0.01,
+    "testPolicy": "sealed-never-load"
+  },
+  "runDir": "data/training/runs/return-oracle-decoder-screen-learned-radius-direct-v1",
+  "architecture": {
+    "type": "learned-radius-shrinking",
+    "contract": "shrinking-fused-glu-independent-branch-centering-sqrt-learned-radius-full-a-post-bias-v16",
+    "widths": [512, 496, 480, 464, 448, 432, 416, 400, 384, 368, 352, 336, 320, 304, 288, 272],
+    "dropout": 0.05,
+    "dropoutRate": 0.5,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001
+  },
+  "curriculum": {
+    "type": "target-probability-temperature-power",
+    "sourceTemperature": 0.01,
+    "stages": [
+      {"startEpoch": 0, "temperature": 0.01}
+    ]
+  },
+  "objective": {
+    "type": "soft-target-cross-entropy",
+    "trainingTargets": "curriculum-temperature",
+    "validationTargets": "stored-production-0.01",
+    "regularizers": []
+  },
+  "selection": {
+    "split": "validation",
+    "metric": "rawBaseActionKl",
+    "mode": "min",
+    "oracleTemperature": 0.01,
+    "predictionCalibration": "none",
+    "contract": "raw-uncalibrated-base-action-validation-kl-at-0.01-v1"
+  },
+  "training": {
+    "epochs": 24,
+    "batchSize": 86400,
+    "evaluationBatchSize": 86400,
+    "gradientAccumulationSteps": 2,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "learningRateSchedule": {
+      "type": "reduce-on-raw-validation-kl-plateau",
+      "startEpoch": 0,
+      "factor": 0.5,
+      "patience": 8,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "workers": 4,
+    "prefetchFactor": 2,
+    "compile": true
+  }
+}

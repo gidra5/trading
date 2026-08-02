@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import unittest
 import tempfile
 from pathlib import Path
@@ -16,6 +17,7 @@ from joint_price_oracle import (
     ReversibleInstanceStandardizer,
     causal_moving_average,
     joint_price_oracle_objective,
+    joint_price_oracle_policy_only_objective,
 )
 from train_joint_price_oracle import (
     SECOND_MS,
@@ -23,9 +25,13 @@ from train_joint_price_oracle import (
     PrefetchedBatchIterator,
     causal_close_windows,
     atomic_torch_save,
+    configuration_fingerprint,
     load_resume_checkpoint,
     purge_cross_split_windows,
+    resolve_training_config,
+    snapshot_resolved_plan,
     take_tail,
+    validate_experiment_arguments,
 )
 
 
@@ -249,6 +255,89 @@ class JointPriceOracleTest(unittest.TestCase):
             1.0,
         )
 
+    def test_policy_only_raw_metrics_match_full_objective_exactly(self) -> None:
+        torch.manual_seed(12)
+        model = self.model().eval()
+        closes = torch.rand(4, 12, 1) * 20 + 100
+        output = model.forward_with_forecast(closes)
+        target_policy = torch.rand(4, OUTPUT_ACTION_COUNT)
+        example_weights = torch.tensor([0.5, 1.0, 2.0, 4.0])
+        weights = JointLossWeights(
+            policy_cross_entropy=1,
+            conditioned_policy_cross_entropy=0,
+            forecast=0,
+            soft_layer_norm=0,
+        )
+        full = joint_price_oracle_objective(
+            output,
+            closes,
+            output.predicted_closes.detach(),
+            target_policy,
+            weights,
+            example_weights=example_weights,
+        )
+        policy_only = joint_price_oracle_policy_only_objective(
+            output.policy_logits,
+            target_policy,
+            weights,
+            example_weights=example_weights,
+        )
+        for name in (
+            "loss",
+            "crossEntropy",
+            "klDivergence",
+            "probabilityMse",
+        ):
+            self.assertTrue(torch.equal(full[name], policy_only[name]), name)
+        for name in (
+            "conditionedCrossEntropy",
+            "conditionedKlDivergence",
+            "forecastLoss",
+            "nextMovementRmse",
+            "directionAccuracy",
+            "softLayerNorm",
+            "softLayerNormMeanPenalty",
+            "softLayerNormVariancePenalty",
+        ):
+            self.assertEqual(float(policy_only[name]), 0.0, name)
+
+        with self.assertRaisesRegex(ValueError, "weights to be zero"):
+            joint_price_oracle_policy_only_objective(
+                output.policy_logits,
+                target_policy,
+                JointLossWeights(forecast=1, soft_layer_norm=0),
+            )
+
+    def test_conditioned_policy_objective_matches_exact_policy(self) -> None:
+        torch.manual_seed(13)
+        model = self.model().eval()
+        closes = torch.linspace(100, 101, 24).reshape(2, 12, 1)
+        output = model.forward_with_forecast(closes)
+        target_policy = torch.softmax(
+            output.policy_logits.detach(),
+            dim=-1,
+        )
+        metrics = joint_price_oracle_objective(
+            output,
+            closes,
+            output.predicted_closes.detach(),
+            target_policy,
+            JointLossWeights(
+                policy_cross_entropy=1,
+                conditioned_policy_cross_entropy=1,
+                forecast=1,
+                soft_layer_norm=0,
+            ),
+            action_grid=torch.linspace(-98, 98, OUTPUT_ACTION_COUNT),
+            policy_friction=0.00175,
+            policy_temperature=0.01,
+        )
+        self.assertAlmostEqual(
+            float(metrics["conditionedKlDivergence"].detach()),
+            0.0,
+            places=5,
+        )
+
     def test_causal_windows_end_input_at_t_and_begin_label_at_t_plus_one(
         self,
     ) -> None:
@@ -331,6 +420,7 @@ class JointPriceOracleTest(unittest.TestCase):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
         model_config = {"test": "small"}
         plan = {"id": "joint-test"}
+        training_fingerprint = configuration_fingerprint({"epochs": 8})
         from joint_price_oracle import (
             ARCHITECTURE_CONTRACT,
             parameter_count,
@@ -352,6 +442,7 @@ class JointPriceOracleTest(unittest.TestCase):
             "datasetFingerprint": "dataset-a",
             "modelConfig": model_config,
             "planId": plan["id"],
+            "trainingConfigFingerprint": training_fingerprint,
             "rng": {},
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -375,6 +466,7 @@ class JointPriceOracleTest(unittest.TestCase):
                 "dataset-a",
                 parameter_count(model),
                 torch.device("cpu"),
+                training_config_fingerprint=training_fingerprint,
             )
             self.assertEqual(resumed, (4, 17, 0.4, 2, 1))
             with self.assertRaises(ValueError):
@@ -388,6 +480,202 @@ class JointPriceOracleTest(unittest.TestCase):
                     "changed-dataset",
                     parameter_count(model),
                     torch.device("cpu"),
+                    training_config_fingerprint=training_fingerprint,
+                )
+            with self.assertRaises(ValueError):
+                load_resume_checkpoint(
+                    file,
+                    model,
+                    optimizer,
+                    scheduler,
+                    plan,
+                    model_config,
+                    "dataset-a",
+                    parameter_count(model),
+                    torch.device("cpu"),
+                    training_config_fingerprint="changed-training",
+                )
+
+    def test_resume_allows_only_known_unfingerprinted_joint_runs(
+        self,
+    ) -> None:
+        model = self.model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+        model_config = {"test": "small"}
+        from joint_price_oracle import (
+            ARCHITECTURE_CONTRACT,
+            parameter_count,
+        )
+        from train_joint_price_oracle import DATA_CONTRACT
+
+        plan = {
+            "id": (
+                "joint-price-oracle-tide-rlinear-dlinear-v2-1h-1m-1m"
+            ),
+        }
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": 16,
+            "globalStep": 8556,
+            "bestValidation": 0.989,
+            "bestEpoch": 15,
+            "staleEpochs": 1,
+            "parameterCount": parameter_count(model),
+            "architectureContract": ARCHITECTURE_CONTRACT,
+            "dataContract": DATA_CONTRACT,
+            "datasetFingerprint": "dataset-a",
+            "modelConfig": model_config,
+            "planId": plan["id"],
+            "rng": {},
+            "interrupted": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            file = (
+                Path(directory)
+                / "data"
+                / "training"
+                / "runs"
+                / plan["id"]
+                / "checkpoints"
+                / "last.json"
+            )
+            atomic_torch_save(checkpoint, file)
+            resumed = load_resume_checkpoint(
+                file,
+                model,
+                optimizer,
+                scheduler,
+                plan,
+                model_config,
+                "dataset-a",
+                parameter_count(model),
+                torch.device("cpu"),
+                training_config_fingerprint="new-fingerprint",
+            )
+            self.assertEqual(resumed, (17, 8556, 0.989, 15, 1))
+
+            checkpoint["planId"] = "unknown-legacy-run"
+            plan["id"] = "unknown-legacy-run"
+            atomic_torch_save(checkpoint, file)
+            with self.assertRaises(ValueError):
+                load_resume_checkpoint(
+                    file,
+                    model,
+                    optimizer,
+                    scheduler,
+                    plan,
+                    model_config,
+                    "dataset-a",
+                    parameter_count(model),
+                    torch.device("cpu"),
+                    training_config_fingerprint="new-fingerprint",
+                )
+
+    def test_training_config_resolution_and_plan_snapshot_are_stable(
+        self,
+    ) -> None:
+        training = {
+            "epochs": 8,
+            "lossWeights": {
+                "policyCrossEntropy": 1,
+                "forecast": 1,
+                "softLayerNorm": 0.01,
+            },
+        }
+        resolved = resolve_training_config(training)
+        self.assertEqual(
+            resolved["lossWeights"]["conditionedPolicyCrossEntropy"],
+            0.0,
+        )
+        fingerprint = configuration_fingerprint(resolved)
+        self.assertEqual(fingerprint, configuration_fingerprint(resolved))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "data" / "training" / "runs" / "run-a"
+            plan_file = root / "plans" / "run-a.json"
+            plan = {
+                "id": "run-a",
+                "runDir": "data/training/runs/run-a",
+                "historyDir": "data/history",
+                "training": training,
+            }
+            snapshot = snapshot_resolved_plan(
+                run_dir,
+                plan_file,
+                plan,
+                root,
+                resolved,
+                fingerprint,
+            )
+            self.assertTrue(snapshot.is_file())
+            self.assertEqual(
+                snapshot_resolved_plan(
+                    run_dir,
+                    plan_file,
+                    plan,
+                    root,
+                    resolved,
+                    fingerprint,
+                ),
+                snapshot,
+            )
+            changed = resolve_training_config({**training, "epochs": 9})
+            with self.assertRaises(ValueError):
+                snapshot_resolved_plan(
+                    run_dir,
+                    plan_file,
+                    {**plan, "training": {**training, "epochs": 9}},
+                    root,
+                    changed,
+                    configuration_fingerprint(changed),
+                )
+
+    def test_maximum_batches_requires_isolated_disposable_smoke_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runs = Path(directory) / "data" / "training" / "runs"
+            normal = runs / "normal"
+            smoke = runs / "disposable-smoke" / "smoke-a"
+
+            def arguments(**overrides):
+                values = {
+                    "maximum_batches": None,
+                    "disposable_smoke": False,
+                    "stop_after_epoch": None,
+                    "evaluate_test": False,
+                    "check_data": False,
+                }
+                values.update(overrides)
+                return argparse.Namespace(**values)
+
+            validate_experiment_arguments(arguments(), normal, runs)
+            with self.assertRaises(ValueError):
+                validate_experiment_arguments(
+                    arguments(maximum_batches=2),
+                    normal,
+                    runs,
+                )
+            validate_experiment_arguments(
+                arguments(maximum_batches=2, disposable_smoke=True),
+                smoke,
+                runs,
+            )
+            with self.assertRaises(ValueError):
+                validate_experiment_arguments(
+                    arguments(maximum_batches=2, disposable_smoke=True),
+                    normal,
+                    runs,
+                )
+            with self.assertRaises(ValueError):
+                validate_experiment_arguments(
+                    arguments(stop_after_epoch=3, evaluate_test=True),
+                    normal,
+                    runs,
                 )
 
     def test_cpu_batch_prefetch_preserves_order(self) -> None:

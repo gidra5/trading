@@ -1,10 +1,42 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import * as ort from "onnxruntime-node";
 import type { ExposureValueOracleActionDistribution } from "@trading/bot-algo";
 
 const DEFAULT_BATCH_SIZE = 512;
+export const JOINT_PRICE_ORACLE_CONTEXT_LENGTH = 3_600;
+export const JOINT_PRICE_ORACLE_DECISION_INTERVAL_MS = 60_000;
+export const JOINT_PRICE_ORACLE_DECISION_PHASE_MS = 999;
+export const JOINT_PRICE_ORACLE_DATA_CONTRACT =
+  "causal-1s-close-context-ending-at-minute-t-future-closes-t-plus-1-through-1h-verified-oracle-policy-at-t-hold-60-delay-60-v2";
+export const JOINT_PRICE_ORACLE_FRICTION = 0.00175;
+export const JOINT_PRICE_ORACLE_TEACHER_TEMPERATURE = 0.01;
+export const JOINT_PRICE_ORACLE_ACTION_CALIBRATION_OBJECTIVE =
+  "actions.signedTransitionF1";
+export const JOINT_PRICE_ORACLE_EXACT_STATE_CALIBRATION_OBJECTIVE =
+  "exactStateActions.signedTransitionF1";
+export const JOINT_PRICE_ORACLE_ACTION_CALIBRATION_TIE_BREAKERS = [
+  "actions.signedTransitionPrecision:maximize",
+  "actions.signedTransitionRecall:maximize",
+  "actions.exactTransitionF1:maximize",
+  "actions.pathDirectionalAgreement:maximize",
+  "actions.pathMeanAbsoluteError:minimize",
+  "actions.turnoverRatioDistanceFromOne:minimize",
+  "logitTemperatureLogDistanceFromIdentity:minimize",
+  "logitTemperature:minimize",
+] as const;
+export const JOINT_PRICE_ORACLE_EXACT_STATE_CALIBRATION_TIE_BREAKERS = [
+  "exactStateActions.signedTransitionPrecision:maximize",
+  "exactStateActions.signedTransitionRecall:maximize",
+  "exactStateActions.exactTransitionF1:maximize",
+  "exactStateActions.executableTargetDirectionalAgreement:maximize",
+  "exactStateActions.executableTargetMeanAbsoluteError:minimize",
+  "exactStateActions.turnoverRelativeError:minimize",
+  "logitTemperatureLogDistanceFromIdentity:minimize",
+  "logitTemperature:minimize",
+] as const;
 
 export interface OneSecondClose {
   closeTime: number;
@@ -12,7 +44,7 @@ export interface OneSecondClose {
 }
 
 export interface JointPriceOracleManifest {
-  version: 1;
+  version: 2 | 3;
   kind: "joint-price-oracle";
   id: string;
   label: string;
@@ -37,6 +69,7 @@ export interface JointPriceOracleManifest {
   oracle: {
     intervalMs: 1_000;
     decisionIntervalMs: 60_000;
+    decisionPhaseMs: 999;
     options: {
       holdingPeriodSteps: 60;
       decisionDelaySteps: 60;
@@ -48,10 +81,50 @@ export interface JointPriceOracleManifest {
   training: {
     bestEpoch: number;
     globalStep: number;
-    validation: Record<string, number>;
-    test?: Record<string, number>;
+    validation: Record<string, number | boolean | null>;
+    test?: Record<string, number | boolean | null>;
     datasetFingerprint: string;
   };
+  calibration: {
+    method: "identity" | "validation-kl-temperature-scaling"
+      | "validation-action-temperature-scaling";
+    logitTemperature: number;
+    validationKlBefore?: number;
+    validationKlAfter?: number;
+    calibratedAt?: string;
+    objective?: typeof JOINT_PRICE_ORACLE_ACTION_CALIBRATION_OBJECTIVE
+      | typeof JOINT_PRICE_ORACLE_EXACT_STATE_CALIBRATION_OBJECTIVE;
+    tieBreakers?: string[];
+    validationReportFile?: string;
+    validationReportSha256?: string;
+    validationReportVersion?: number;
+    validationExamples?: number;
+    candidateCount?: number;
+    checkpoint?: {
+      kind: "best";
+      epoch: number;
+      globalStep: number;
+    };
+    datasetFingerprint?: string;
+    executionPolicy?: JointPriceOracleExecutionPolicy | null;
+    rolloutScoreVersion?: 1 | 2;
+    rolloutResetPolicy?: "reset-only-at-true-timeline-gaps";
+    selectedMetrics?: JointPriceOracleCalibrationMetrics;
+    identityMetrics?: JointPriceOracleCalibrationMetrics;
+  };
+}
+
+export interface JointPriceOracleCalibrationMetrics {
+  raw: Record<string, number | null>;
+  actions: Record<string, number | null>;
+}
+
+export interface JointPriceOracleExecutionPolicy {
+  version: 2;
+  maximumLeverage: number;
+  minimumConfidence: number;
+  confidenceExposurePower: number;
+  confidenceLeverageFloor: number;
 }
 
 interface JointPriceOracleArtifact {
@@ -69,6 +142,7 @@ export class JointPriceOracleRuntime {
   constructor(
     private readonly dataDir: string,
     private readonly artifactId?: string,
+    private readonly logitTemperatureOverride?: number,
   ) {}
 
   models(): JointPriceOracleManifest[] {
@@ -83,6 +157,11 @@ export class JointPriceOracleRuntime {
     const artifact = await this.model();
     const contextLength = artifact.manifest.input.contextLength;
     const actionCount = artifact.manifest.output.actionCount;
+    const logitTemperature = this.logitTemperatureOverride
+      ?? artifact.manifest.calibration.logitTemperature;
+    if (!(logitTemperature > 0) || !Number.isFinite(logitTemperature)) {
+      throw new Error("Joint price-oracle logit temperature must be finite and positive.");
+    }
     const indexes = candleIndexes(oneSecondCandles, times, contextLength);
     const result: ExposureValueOracleActionDistribution[] = new Array(times.length);
     const requestedBatch = Number(
@@ -125,6 +204,7 @@ export class JointPriceOracleRuntime {
         result[start + row] = logitsDistribution(
           output.data.subarray(row * actionCount, (row + 1) * actionCount),
           artifact.manifest.output.actionGrid,
+          logitTemperature,
         );
       }
     }
@@ -135,7 +215,7 @@ export class JointPriceOracleRuntime {
     oneSecondCandles: readonly OneSecondClose[],
   ): Promise<ExposureValueOracleActionDistribution | null> {
     const latest = oneSecondCandles.at(-1);
-    if (!latest || (latest.closeTime + 1) % 60_000 !== 0) return null;
+    if (!latest || !isJointPriceOracleDecisionTime(latest.closeTime)) return null;
     return (await this.predictDistributions(
       oneSecondCandles,
       [latest.closeTime],
@@ -223,6 +303,7 @@ export function discoverJointPriceOracleArtifacts(
       fs.readFileSync(manifestFile, "utf8"),
     ) as JointPriceOracleManifest;
     validateJointPriceOracleManifest(manifest);
+    validateJointPriceOracleCalibrationArtifact(directory, manifest);
     artifacts.push({ directory, manifest });
   }
   return artifacts.sort((left, right) =>
@@ -232,29 +313,200 @@ export function discoverJointPriceOracleArtifacts(
 export function validateJointPriceOracleManifest(
   manifest: JointPriceOracleManifest,
 ): void {
-  if (manifest.version !== 1 || manifest.kind !== "joint-price-oracle"
+  if ((manifest.version !== 2 && manifest.version !== 3)
+    || manifest.kind !== "joint-price-oracle"
     || !manifest.id || !manifest.modelFile || !/^[a-f0-9]{64}$/.test(manifest.modelSha256)
+    || !manifest.architectureContract?.trim()
+    || manifest.dataContract !== JOINT_PRICE_ORACLE_DATA_CONTRACT
     || manifest.input?.name !== "closes" || manifest.input.dtype !== "float32"
-    || manifest.input.intervalMs !== 1_000 || manifest.input.contextLength !== 3_600
+    || manifest.input.intervalMs !== 1_000
+    || manifest.input.contextLength !== JOINT_PRICE_ORACLE_CONTEXT_LENGTH
     || manifest.input.variableCount !== 1
     || manifest.output?.name !== "action_logits" || manifest.output.dtype !== "float32"
     || manifest.output.actionCount !== 101
-    || manifest.output.actionGrid?.length !== manifest.output.actionCount
+    || !validJointPriceOracleGrid(manifest.output.actionGrid)
     || manifest.oracle?.intervalMs !== 1_000
-    || manifest.oracle.decisionIntervalMs !== 60_000
+    || manifest.oracle.decisionIntervalMs !== JOINT_PRICE_ORACLE_DECISION_INTERVAL_MS
+    || manifest.oracle.decisionPhaseMs !== JOINT_PRICE_ORACLE_DECISION_PHASE_MS
     || manifest.oracle.options?.holdingPeriodSteps !== 60
     || manifest.oracle.options.decisionDelaySteps !== 60
-    || manifest.oracle.options.valueHorizonSteps !== 3_600) {
+    || manifest.oracle.options.valueHorizonSteps !== 3_600
+    || manifest.oracle.options.friction !== JOINT_PRICE_ORACLE_FRICTION
+    || manifest.oracle.options.temperature !== JOINT_PRICE_ORACLE_TEACHER_TEMPERATURE
+    || !(manifest.calibration?.logitTemperature > 0)
+    || !Number.isFinite(manifest.calibration.logitTemperature)
+    || !validCalibrationManifest(manifest)) {
     throw new Error("Joint price-oracle manifest does not satisfy the 1h/1m/1m contract.");
   }
+}
+
+function validJointPriceOracleGrid(value: readonly number[] | undefined): boolean {
+  if (value?.length !== 101) return false;
+  const step = 500 / 254;
+  return value.every((item, index) =>
+    Number.isFinite(item) && Math.abs(item - (index - 50) * step) <= 1e-10);
+}
+
+function validCalibrationManifest(manifest: JointPriceOracleManifest): boolean {
+  const calibration = manifest.calibration;
+  if (calibration.method === "identity") {
+    return calibration.logitTemperature === 1;
+  }
+  if (calibration.method === "validation-kl-temperature-scaling") {
+    return manifest.version === 2
+      && Number.isFinite(calibration.validationKlBefore)
+      && Number.isFinite(calibration.validationKlAfter)
+      && typeof calibration.calibratedAt === "string";
+  }
+  const expectedTieBreakers = actionCalibrationTieBreakers(
+    calibration.objective,
+  );
+  return manifest.version === 3
+    && calibration.method === "validation-action-temperature-scaling"
+    && expectedTieBreakers !== undefined
+    && isDeepStrictEqual(
+      calibration.tieBreakers,
+      expectedTieBreakers,
+    )
+    && typeof calibration.calibratedAt === "string"
+    && Boolean(calibration.calibratedAt)
+    && typeof calibration.validationReportFile === "string"
+    && Boolean(calibration.validationReportFile)
+    && typeof calibration.validationReportSha256 === "string"
+    && /^[a-f0-9]{64}$/.test(calibration.validationReportSha256)
+    && calibration.validationReportVersion === 3
+    && Number.isInteger(calibration.validationExamples)
+    && calibration.validationExamples! > 1
+    && Number.isInteger(calibration.candidateCount)
+    && calibration.candidateCount! > 0
+    && calibration.checkpoint?.kind === "best"
+    && Number.isInteger(calibration.checkpoint.epoch)
+    && calibration.checkpoint.epoch > 0
+    && Number.isInteger(calibration.checkpoint.globalStep)
+    && calibration.checkpoint.globalStep >= 0
+    && calibration.datasetFingerprint === manifest.training.datasetFingerprint
+    && validExecutionPolicy(calibration.executionPolicy)
+    && (calibration.rolloutScoreVersion === 1
+      || calibration.rolloutScoreVersion === 2
+        && calibration.executionPolicy !== null)
+    && calibration.rolloutResetPolicy === "reset-only-at-true-timeline-gaps"
+    && isCalibrationMetrics(calibration.selectedMetrics)
+    && isCalibrationMetrics(calibration.identityMetrics);
+}
+
+function actionCalibrationTieBreakers(
+  objective: JointPriceOracleManifest["calibration"]["objective"],
+): string[] | undefined {
+  if (objective === JOINT_PRICE_ORACLE_ACTION_CALIBRATION_OBJECTIVE) {
+    return [...JOINT_PRICE_ORACLE_ACTION_CALIBRATION_TIE_BREAKERS];
+  }
+  if (objective === JOINT_PRICE_ORACLE_EXACT_STATE_CALIBRATION_OBJECTIVE) {
+    return [...JOINT_PRICE_ORACLE_EXACT_STATE_CALIBRATION_TIE_BREAKERS];
+  }
+  return undefined;
+}
+
+function validExecutionPolicy(
+  value: JointPriceOracleExecutionPolicy | null | undefined,
+): boolean {
+  if (value === null) return true;
+  return value !== undefined
+    && value.version === 2
+    && Number.isFinite(value.maximumLeverage)
+    && value.maximumLeverage > 0
+    && Number.isFinite(value.minimumConfidence)
+    && value.minimumConfidence >= 0
+    && value.minimumConfidence <= 1
+    && Number.isFinite(value.confidenceExposurePower)
+    && value.confidenceExposurePower >= 0
+    && Number.isFinite(value.confidenceLeverageFloor)
+    && value.confidenceLeverageFloor >= 0
+    && value.confidenceLeverageFloor <= 1;
+}
+
+function isCalibrationMetrics(
+  value: JointPriceOracleCalibrationMetrics | undefined,
+): value is JointPriceOracleCalibrationMetrics {
+  return Boolean(value)
+    && isMetricRecord(value!.raw)
+    && isMetricRecord(value!.actions);
+}
+
+function isMetricRecord(value: unknown): value is Record<string, number | null> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && Object.values(value).every((item) =>
+      item === null || typeof item === "number" && Number.isFinite(item));
+}
+
+function validateJointPriceOracleCalibrationArtifact(
+  directory: string,
+  manifest: JointPriceOracleManifest,
+): void {
+  const calibration = manifest.calibration;
+  if (calibration.method !== "validation-action-temperature-scaling") return;
+  const reportFile = path.resolve(directory, calibration.validationReportFile!);
+  const expectedRoot = `${path.resolve(directory)}${path.sep}`;
+  const reportStat = fs.existsSync(reportFile) ? fs.lstatSync(reportFile) : undefined;
+  if (!reportFile.startsWith(expectedRoot) || !reportStat?.isFile()
+    || reportStat.isSymbolicLink()) {
+    throw new Error("Joint price-oracle calibration report leaves its artifact directory.");
+  }
+  const bytes = fs.readFileSync(reportFile);
+  const actualHash = crypto.createHash("sha256").update(bytes).digest("hex");
+  if (actualHash !== calibration.validationReportSha256) {
+    throw new Error("Joint price-oracle calibration report hash does not match its manifest.");
+  }
+  const report = JSON.parse(bytes.toString("utf8")) as Record<string, any>;
+  const selection = report.actionTemperatureCalibration as Record<string, any> | undefined;
+  const expectedTieBreakers = actionCalibrationTieBreakers(calibration.objective);
+  if (report.version !== calibration.validationReportVersion
+    || report.plan?.id !== manifest.id
+    || report.split?.name !== "validation"
+    || report.split.examples !== calibration.validationExamples
+    || report.checkpoint?.kind !== "best"
+    || report.checkpoint.epoch !== calibration.checkpoint?.epoch
+    || report.checkpoint.globalStep !== calibration.checkpoint?.globalStep
+    || report.datasetFingerprint !== calibration.datasetFingerprint
+    || !isDeepStrictEqual(
+      report.actionEvaluation?.executionPolicy,
+      calibration.executionPolicy,
+    )
+    || report.actionEvaluation?.rolloutScoreVersion !== calibration.rolloutScoreVersion
+    || report.actionEvaluation?.rolloutResetPolicy !== calibration.rolloutResetPolicy
+    || selection?.method !== "validation-action-temperature-scaling-v1"
+    || selection.objective?.metric !== calibration.objective
+    || selection.objective?.direction !== "maximize"
+    || !isDeepStrictEqual(
+      selection.tieBreakers,
+      expectedTieBreakers,
+    )
+    || selection.candidateCount !== calibration.candidateCount
+    || selection.selectedLogitTemperature !== calibration.logitTemperature
+    || !isDeepStrictEqual(selection.selectedMetrics, calibration.selectedMetrics)
+    || !isDeepStrictEqual(selection.identityMetrics, calibration.identityMetrics)) {
+    throw new Error("Joint price-oracle calibration report provenance is incompatible.");
+  }
+}
+
+export function isJointPriceOracleDecisionTime(timestamp: number): boolean {
+  return positiveModulo(timestamp, JOINT_PRICE_ORACLE_DECISION_INTERVAL_MS)
+    === JOINT_PRICE_ORACLE_DECISION_PHASE_MS;
+}
+
+function positiveModulo(value: number, divisor: number): number {
+  return ((value % divisor) + divisor) % divisor;
 }
 
 export function logitsDistribution(
   logits: ArrayLike<number>,
   actionGrid: readonly number[],
+  logitTemperature = 1,
 ): ExposureValueOracleActionDistribution {
   if (logits.length !== actionGrid.length || logits.length < 2) {
     throw new Error("Joint price-oracle logits and action grid are incompatible.");
+  }
+  if (!(logitTemperature > 0) || !Number.isFinite(logitTemperature)) {
+    throw new Error("Logit temperature must be finite and positive.");
   }
   let maximum = Number.NEGATIVE_INFINITY;
   for (let index = 0; index < logits.length; index += 1) {
@@ -263,7 +515,7 @@ export function logitsDistribution(
   const probabilities = new Float32Array(logits.length);
   let total = 0;
   for (let index = 0; index < logits.length; index += 1) {
-    const value = Math.exp(logits[index]! - maximum);
+    const value = Math.exp((logits[index]! - maximum) / logitTemperature);
     probabilities[index] = value;
     total += value;
   }

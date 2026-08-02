@@ -1,0 +1,36 @@
+{
+  "id": "future-price-resolution-6h-5m-next-5m-ridge-v3",
+  "corpusId": "future-price-resolution-6h-5m-next-5m-v1",
+  "baseComponentCorpusId": "future-price-predictor-6h-feature-screen-v1",
+  "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "decoderDatasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+  "datasetDir": "data/training/datasets/future-price-resolution-6h-5m-next-5m-v1",
+  "runDir": "data/training/runs/future-price-resolution-6h-5m-next-5m-ridge-v3",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "resolution": {
+    "historyMinutes": 360,
+    "candleMinutes": 5,
+    "targetSteps": 1
+  },
+  "expectedDatasetFingerprint": "0756d93ce95262718b0064506d5c4faf36f67d73936e021e91a1f4c35d6df3f0",
+  "featureContract": "causal-6h-5m-audited-linear-features-v1:recent-12x5m-plus-trailing-2h-3h-6h",
+  "internalValidation": {
+    "method": "chronological-tail-with-example-span-embargo",
+    "fitFraction": 0.8
+  },
+  "ridgeLambdas": [0.0, 1e-8, 1e-7, 1e-6, 1e-5, 0.0001, 0.001, 0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0],
+  "ridgeLimit": "training-mean",
+  "batchSize": 8192,
+  "huberDelta": 1.0,
+  "artifact": {
+    "namespace": "models/future-price-resolution",
+    "key": "future-price-resolution-6h-5m-next-5m-ridge-v3/model"
+  },
+  "referencePatchTcn": {
+    "planId": "future-price-resolution-6h-5m-next-5m-patch-tcn-v1",
+    "checkpoint": "data/training/runs/future-price-resolution-6h-5m-next-5m-patch-tcn-v1/checkpoints/best.json",
+    "contentHash": "81f36cbc0d97766f6746f8966b0a47d80b304ca0e8a3973ce4eb98e9e0a63b8b",
+    "epoch": 11,
+    "normalizedMse": 0.9530584788166152
+  }
+}

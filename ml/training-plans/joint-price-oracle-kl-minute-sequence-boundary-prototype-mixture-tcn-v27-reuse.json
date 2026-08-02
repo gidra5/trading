@@ -1,0 +1,88 @@
+{
+  "version": 27,
+  "id": "joint-price-oracle-kl-minute-sequence-boundary-prototype-mixture-tcn-v27-reuse-1h-1m-1m",
+  "label": "Causal 1s oracle policy - exact v18 sequence-core reuse - fixed train-only K16 soft-policy prototype mixture - raw oracle KL",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "runDir": "data/training/runs/joint-price-oracle-kl-minute-sequence-boundary-prototype-mixture-tcn-v27-reuse-1h-1m-1m",
+  "artifactDir": "data/models/joint-price-oracle/joint-price-oracle-kl-minute-sequence-boundary-prototype-mixture-tcn-v27-reuse-1h-1m-1m",
+  "testPolicy": "sealed-never-load",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 0,
+  "oracleTarget": {
+    "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
+    "valueHorizonSteps": 3600,
+    "options": {
+      "friction": 0.00175,
+      "minExposure": -250,
+      "maxExposure": 250,
+      "maxEffectiveExposure": 250,
+      "temperature": 0.01,
+      "quoteBorrowRate": 2.776390199537981e-7,
+      "assetBorrowRate": 2.776390199537981e-7
+    }
+  },
+  "dataSplit": {
+    "validationDays": 30,
+    "testDays": 30
+  },
+  "model": {
+    "variant": "minute_sequence_boundary_prototype_mixture_tcn",
+    "contextLength": 3601,
+    "forecastHorizon": 3600,
+    "actionCount": 101,
+    "variableCount": 1,
+    "receptiveFieldMinutes": 60,
+    "tokenWidth": 128,
+    "policyHiddenWidth": 192,
+    "dropout": 0,
+    "featureEpsilon": 1e-8,
+    "prototypeCount": 16,
+    "prototypeBasisFile": "data/training/immutable/refs/models/joint-price-oracle/prototype-basis/forward-kl-k16-v1.json",
+    "prototypeBasisContentSha256": "1135e2e35e1e8cbfbf8709a8f792f30c6a153427d53cf9d6431217c6b56b5946",
+    "prototypeBasisReferenceSha256": "a69c0e2dc1e0623950320b02461c3c865ee0d1e35d279ff16eca8cf4683e9dcd",
+    "prototypeSourceTrainFingerprintSha256": "66d1ef226d629eb9ef1721e7b8ef0b790b952a62bcbb91aa3f5c25581e6d66c4"
+  },
+  "training": {
+    "targetRepresentation": "verifiedOracleProbabilities",
+    "policyOnly": true,
+    "sequenceCoreTraining": {
+      "contract": "minute-sequence-core-with-rf-halo-padded-batch-raw-kl-v1",
+      "coreRows": 1440
+    },
+    "epochs": 384,
+    "batchSize": 1440,
+    "evaluationBatchSize": 1440,
+    "gradientAccumulationSteps": 1,
+    "learningRate": 0.0002,
+    "betas": [0.9, 0.999],
+    "epsilon": 1e-8,
+    "weightDecay": 0.01,
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 48,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "gradientClip": 5,
+    "patience": 160,
+    "seed": 20260801,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 25,
+    "closeCacheDays": 512,
+    "targetCacheDays": 512,
+    "prefetchBatches": 2,
+    "selectionMetric": "klDivergence",
+    "forecastHuberDelta": 1,
+    "volatilityFloor": 0.00001,
+    "lossWeights": {
+      "policyCrossEntropy": 1,
+      "conditionedPolicyCrossEntropy": 0,
+      "forecast": 0,
+      "softLayerNorm": 0
+    }
+  }
+}

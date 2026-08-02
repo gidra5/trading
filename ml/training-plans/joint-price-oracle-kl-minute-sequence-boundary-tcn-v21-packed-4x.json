@@ -1,0 +1,82 @@
+{
+  "version": 21,
+  "id": "joint-price-oracle-kl-minute-sequence-boundary-tcn-v21-packed-4x-1h-1m-1m",
+  "label": "Causal 1s oracle policy - boundary TCN packed contiguous cores - 5760-row optimizer batch - raw oracle KL",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "runDir": "data/training/runs/joint-price-oracle-kl-minute-sequence-boundary-tcn-v21-packed-4x-1h-1m-1m",
+  "artifactDir": "data/models/joint-price-oracle/joint-price-oracle-kl-minute-sequence-boundary-tcn-v21-packed-4x-1h-1m-1m",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 0,
+  "oracleTarget": {
+    "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
+    "valueHorizonSteps": 3600,
+    "options": {
+      "friction": 0.00175,
+      "minExposure": -250,
+      "maxExposure": 250,
+      "maxEffectiveExposure": 250,
+      "temperature": 0.01,
+      "quoteBorrowRate": 2.776390199537981e-7,
+      "assetBorrowRate": 2.776390199537981e-7
+    }
+  },
+  "dataSplit": {
+    "validationDays": 30,
+    "testDays": 30
+  },
+  "model": {
+    "variant": "minute_sequence_boundary_tcn",
+    "contextLength": 3601,
+    "forecastHorizon": 3600,
+    "actionCount": 101,
+    "variableCount": 1,
+    "receptiveFieldMinutes": 60,
+    "tokenWidth": 128,
+    "policyHiddenWidth": 192,
+    "dropout": 0,
+    "featureEpsilon": 1e-8
+  },
+  "training": {
+    "targetRepresentation": "verifiedOracleProbabilities",
+    "policyOnly": true,
+    "sequenceCoreTraining": {
+      "contract": "minute-sequence-core-with-rf-halo-contiguous-packed-raw-kl-v2",
+      "coreRows": 5760
+    },
+    "epochs": 384,
+    "batchSize": 5760,
+    "evaluationBatchSize": 5760,
+    "gradientAccumulationSteps": 1,
+    "learningRate": 0.0002,
+    "betas": [0.9, 0.999],
+    "epsilon": 1e-8,
+    "weightDecay": 0.01,
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 48,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "gradientClip": 5,
+    "patience": 160,
+    "seed": 20260801,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 10,
+    "closeCacheDays": 512,
+    "targetCacheDays": 512,
+    "prefetchBatches": 2,
+    "selectionMetric": "klDivergence",
+    "forecastHuberDelta": 1,
+    "volatilityFloor": 0.00001,
+    "lossWeights": {
+      "policyCrossEntropy": 1,
+      "conditionedPolicyCrossEntropy": 0,
+      "forecast": 0,
+      "softLayerNorm": 0
+    }
+  }
+}

@@ -7,14 +7,23 @@ import test from "node:test";
 import { promisify } from "node:util";
 import {
   DailyCandleRecorder,
+  DailyTradeFlowAccumulator,
   decodeCandles,
+  decodeDerivativesMetrics,
+  decodeTradeFlow,
   deduplicateFilesWithHardLinks,
   encodeCandles,
+  encodeTradeFlow,
   putCandleShard,
+  putDerivativesMetricsShard,
+  putTradeFlowShard,
   readCandleShardReference,
+  readDerivativesMetricsShardReference,
+  readTradeFlowShardReference,
   SequentialShardStore,
   TradingStorageLayout,
   type SequentialCandle,
+  type SequentialDerivativesMetricRow,
 } from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -191,6 +200,151 @@ test("canonical candle references are read directly", async () => {
       stepMs: 60_000,
     });
     assert.deepEqual(await readCandleShardReference(stored.referenceFile), candles);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("trade-flow accumulator preserves aggressor direction, timing, and raw-trade counts", () => {
+  const day = Date.parse("2026-01-01T00:00:00.000Z");
+  const accumulator = new DailyTradeFlowAccumulator(day);
+  accumulator.append({
+    timeMicros: day * 1_000 + 100_000,
+    price: 100,
+    quantity: 2,
+    tradeCount: 3,
+    aggressorSide: 1,
+  });
+  accumulator.append({
+    timeMicros: day * 1_000 + 300_000,
+    price: 101,
+    quantity: 1,
+    tradeCount: 2,
+    aggressorSide: -1,
+  });
+  accumulator.append({
+    timeMicros: day * 1_000 + 900_000,
+    price: 102,
+    quantity: 3,
+    tradeCount: 1,
+    aggressorSide: 1,
+  });
+  const first = accumulator.finish()[0]!;
+  assert.equal(first.aggressiveBuyBaseVolume, 5);
+  assert.equal(first.aggressiveSellBaseVolume, 1);
+  assert.equal(first.aggressiveBuyQuoteVolume, 506);
+  assert.equal(first.aggressiveSellQuoteVolume, 101);
+  assert.equal(first.aggressiveBuyAggregateQuantitySquared, 13);
+  assert.equal(first.aggressiveSellAggregateQuantitySquared, 1);
+  assert.equal(first.aggressiveBuyMaxAggregateQuantity, 3);
+  assert.equal(first.aggressiveSellMaxAggregateQuantity, 1);
+  assert.ok(Math.abs(first.aggressiveBuyBaseVolumeTimeMoment - 2.9) < 1e-12);
+  assert.ok(Math.abs(first.aggressiveSellBaseVolumeTimeMoment - 0.3) < 1e-12);
+  assert.equal(first.aggressiveBuyAggregateTradeCount, 2);
+  assert.equal(first.aggressiveSellAggregateTradeCount, 1);
+  assert.equal(first.aggressiveBuyTradeCount, 4);
+  assert.equal(first.aggressiveSellTradeCount, 2);
+  assert.equal(first.aggressorSideFlipCount, 2);
+  assert.equal(first.firstAggressorSide, 1);
+  assert.equal(first.lastAggressorSide, 1);
+  assert.equal(first.firstTradeOffsetMicros, 100_000);
+  assert.equal(first.lastTradeOffsetMicros, 900_000);
+  assert.equal(accumulator.finish()[1]!.firstAggressorSide, 0);
+});
+
+test("trade-flow codec round-trips a dense UTC day through immutable storage", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "trading-trade-flow-"));
+  try {
+    const day = Date.parse("2026-01-01T00:00:00.000Z");
+    const accumulator = new DailyTradeFlowAccumulator(day, 43_200_000);
+    accumulator.append({
+      timeMicros: day * 1_000 + 123_456,
+      price: 100.25,
+      quantity: 0.125,
+      tradeCount: 4,
+      aggressorSide: -1,
+    });
+    const encoded = encodeTradeFlow(accumulator.finish(), 43_200_000);
+    const fakeReference = {
+      version: 1,
+      kind: "trading-sequential-shard",
+      namespace: "trade-flow/spot-btcusdt/btcusdt/12h",
+      key: "2026-01-01",
+      createdAt: new Date().toISOString(),
+      object: {
+        algorithm: "sha256",
+        contentHash: "0".repeat(64),
+        file: "objects/sha256/00/fake.zst",
+        compression: "zstd",
+        compressionLevel: 9,
+        uncompressedBytes: encoded.payload.byteLength,
+        compressedBytes: 0,
+      },
+      sequence: encoded.sequence,
+      layout: encoded.layout,
+    } as const;
+    assert.deepEqual(decodeTradeFlow(fakeReference, encoded.payload), accumulator.finish());
+
+    const store = new SequentialShardStore(path.join(root, "immutable"));
+    const stored = await putTradeFlowShard(store, {
+      namespace: "trade-flow/spot-btcusdt/btcusdt/12h",
+      key: "2026-01-01",
+      seconds: accumulator.finish(),
+      stepMs: 43_200_000,
+    });
+    assert.deepEqual(
+      await readTradeFlowShardReference(stored.referenceFile),
+      accumulator.finish(),
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("derivatives-metrics codec round-trips dense positive 5m rows", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "trading-derivatives-metrics-"));
+  try {
+    const start = Date.parse("2026-01-01T00:00:00.000Z");
+    const rows: SequentialDerivativesMetricRow[] = Array.from(
+      { length: 288 },
+      (_, index) => ({
+        openTime: start + index * 300_000,
+        sumOpenInterest: 100_000 + index,
+        sumOpenInterestValue: 6_000_000_000 + index * 100,
+        topTraderAccountLongShortRatio: 1.8 + index / 10_000,
+        topTraderPositionLongShortRatio: 1.1 + index / 20_000,
+        globalLongShortRatio: 1.7 + index / 30_000,
+        takerBuySellVolumeRatio: 0.9 + index / 40_000,
+      }),
+    );
+    const store = new SequentialShardStore(path.join(root, "storage"));
+    const stored = await putDerivativesMetricsShard(store, {
+      namespace: "derivatives-metrics/usdm-futures/btcusdt/5m",
+      key: "2026-01-01",
+      rows,
+      stepMs: 300_000,
+    });
+    assert.deepEqual(
+      decodeDerivativesMetrics(
+        stored.reference,
+        await store.readPayload(stored.reference),
+      ),
+      rows,
+    );
+    assert.deepEqual(
+      await readDerivativesMetricsShardReference(stored.referenceFile),
+      rows,
+    );
+    const invalid = rows.slice();
+    invalid[2] = { ...invalid[2]!, globalLongShortRatio: 0 };
+    await assert.rejects(
+      putDerivativesMetricsShard(store, {
+        namespace: "derivatives-metrics/usdm-futures/btcusdt/5m",
+        key: "invalid",
+        rows: invalid,
+      }),
+      /invalid value/,
+    );
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

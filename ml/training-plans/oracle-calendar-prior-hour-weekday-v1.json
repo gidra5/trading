@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "id": "oracle-calendar-prior-hour-weekday-v1-1h-1m-1m-t001",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "artifact": {
+    "namespace": "models/joint-price-oracle-calendar",
+    "key": "oracle-calendar-prior-hour-weekday-v1/model"
+  },
+  "testPolicy": "sealed-never-load",
+  "oracleTarget": {
+    "valueHorizonSteps": 3600,
+    "decisionDelaySteps": 60,
+    "holdingPeriodSteps": 60,
+    "temperature": 0.01,
+    "actionCount": 101
+  },
+  "calendarEstimator": {
+    "spec": "hour-by-weekday",
+    "fields": ["dayOfWeek", "hourOfDay"],
+    "backoffFields": ["hourOfDay"],
+    "finePriorStrength": 16.0,
+    "backoffPriorStrength": 1024.0
+  },
+  "selectionEvidence": {
+    "method": "chronological-80pct-fit-20pct-calibration-on-training-only",
+    "internalCalibrationKl": 1.0103849097725144,
+    "effectiveCells": 168,
+    "fullTrainMeanRowsPerCell": 3188.214285714286,
+    "minuteOfWeekInternalCalibrationKl": 1.010200897116798,
+    "minuteOfWeekEffectiveCells": 10080,
+    "reason": "retain nearly all train-only calendar signal with 60x fewer cells"
+  }
+}

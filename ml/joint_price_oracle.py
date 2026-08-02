@@ -21,11 +21,90 @@ ARCHITECTURE_CONTRACT = (
     "causal-log-close-hybrid-patch-trend-rlinear-low-rank-dlinear-dual-tide-"
     "forecast-to-verified-1h-1m-1m-oracle-glu-policy-v2"
 )
+FIXED_DCT_ORDINAL_DECODER_CONTRACT = "fixed-dct-ordinal-logit-decoder-v1"
+
+
+def architecture_contract_with_policy_decoder(
+    base_contract: str,
+    policy_logit_rank: int | None,
+) -> str:
+    """Bind an opt-in policy decoder shape into the checkpoint contract."""
+    if policy_logit_rank is None:
+        return base_contract
+    if isinstance(policy_logit_rank, bool) \
+            or not isinstance(policy_logit_rank, int) \
+            or policy_logit_rank < 1:
+        raise ValueError("policy logit rank must be a positive integer")
+    return (
+        f"{base_contract}-{FIXED_DCT_ORDINAL_DECODER_CONTRACT}-"
+        f"rank{policy_logit_rank}"
+    )
+
+
+def fixed_dct_ordinal_logit_basis(
+    action_count: int,
+    rank: int,
+) -> Tensor:
+    """Return the zero-mean orthonormal DCT-II action-logit basis.
+
+    The constant DCT component is deliberately omitted because adding one
+    constant to every action logit cannot change a softmax distribution.
+    """
+    if isinstance(action_count, bool) or not isinstance(action_count, int) \
+            or isinstance(rank, bool) or not isinstance(rank, int) \
+            or action_count < 2 or not 1 <= rank < action_count:
+        raise ValueError(
+            "DCT policy rank must be positive and smaller than action count"
+        )
+    positions = torch.arange(action_count, dtype=torch.float32) + 0.5
+    frequencies = torch.arange(1, rank + 1, dtype=torch.float32)
+    return (
+        torch.cos(
+            math.pi
+            * frequencies.unsqueeze(1)
+            * positions.unsqueeze(0)
+            / action_count
+        )
+        * math.sqrt(2.0 / action_count)
+    )
+
+
+class FixedDctOrdinalLogitProjection(nn.Module):
+    """Predict smooth ordered-action logits through a fixed DCT basis."""
+
+    def __init__(self, input_width: int, action_count: int, rank: int) -> None:
+        super().__init__()
+        if isinstance(input_width, bool) or not isinstance(input_width, int) \
+                or input_width < 1:
+            raise ValueError("policy projection input width must be positive")
+        self.input_width = int(input_width)
+        self.action_count = int(action_count)
+        self.rank = int(rank)
+        self.coefficient_projection = nn.Linear(input_width, rank)
+        self.action_bias = nn.Parameter(torch.zeros(action_count))
+        self.register_buffer(
+            "basis",
+            fixed_dct_ordinal_logit_basis(action_count, rank),
+            persistent=True,
+        )
+        nn.init.normal_(
+            self.coefficient_projection.weight,
+            mean=0.0,
+            std=0.01,
+        )
+        nn.init.zeros_(self.coefficient_projection.bias)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        if hidden.ndim != 2 or hidden.shape[1] != self.input_width:
+            raise ValueError("policy projection input width is incompatible")
+        coefficients = self.coefficient_projection(hidden)
+        return coefficients @ self.basis + self.action_bias
 
 
 @dataclass(frozen=True)
 class JointLossWeights:
     policy_cross_entropy: float = 1.0
+    conditioned_policy_cross_entropy: float = 0.0
     forecast: float = 1.0
     soft_layer_norm: float = 0.01
 
@@ -98,11 +177,10 @@ class CausalPatchAggregate(nn.Module):
             (self.patch_length - 1, 0),
             mode="replicate",
         )
-        patches = padded.unfold(-1, self.patch_length, 1)
-        aggregate = torch.einsum(
-            "bvtp,vp->bvt",
-            patches,
-            self.weights().to(dtype=patches.dtype),
+        aggregate = functional.conv1d(
+            padded,
+            self.weights().to(dtype=padded.dtype).unsqueeze(1),
+            groups=self.variable_count,
         )
         return aggregate.transpose(1, 2)
 
@@ -646,6 +724,7 @@ class MovementPolicyHead(nn.Module):
         action_count: int,
         dropout: float,
         *,
+        policy_logit_rank: int | None = None,
         normalization_family: str,
         normalization_initial_scale: float,
         normalization_minimum_scale: float,
@@ -677,9 +756,18 @@ class MovementPolicyHead(nn.Module):
             for index in range(layer_count)
         ])
         self.dropout = nn.Dropout(dropout)
-        self.output = nn.Linear(hidden_width, self.action_count)
-        nn.init.normal_(self.output.weight, std=0.01)
-        nn.init.zeros_(self.output.bias)
+        if policy_logit_rank is None:
+            # Keep the legacy module and state-dict names byte-for-byte when
+            # the structured decoder is not requested.
+            self.output = nn.Linear(hidden_width, self.action_count)
+            nn.init.normal_(self.output.weight, std=0.01)
+            nn.init.zeros_(self.output.bias)
+        else:
+            self.output = FixedDctOrdinalLogitProjection(
+                hidden_width,
+                self.action_count,
+                policy_logit_rank,
+            )
 
     def forward_with_regularizers(
         self,
@@ -729,6 +817,7 @@ class JointPriceOracleModel(nn.Module):
         action_count: int = OUTPUT_ACTION_COUNT,
         dropout: float = 0.05,
         *,
+        policy_logit_rank: int | None = None,
         normalization_epsilon: float = 1e-12,
         normalization_family: str = "tanh",
         normalization_initial_scale: float = (
@@ -741,6 +830,10 @@ class JointPriceOracleModel(nn.Module):
         self.forecast_horizon = int(forecast_horizon)
         self.variable_count = int(variable_count)
         self.action_count = int(action_count)
+        self.architecture_contract = architecture_contract_with_policy_decoder(
+            ARCHITECTURE_CONTRACT,
+            policy_logit_rank,
+        )
         common_normalization = dict(
             normalization_family=normalization_family,
             normalization_initial_scale=normalization_initial_scale,
@@ -767,6 +860,7 @@ class JointPriceOracleModel(nn.Module):
             policy_layer_count,
             action_count,
             dropout,
+            policy_logit_rank=policy_logit_rank,
             **common_normalization,
         )
 
@@ -811,6 +905,9 @@ def joint_price_oracle_objective(
     weights: JointLossWeights = JointLossWeights(),
     *,
     example_weights: Tensor | None = None,
+    action_grid: Tensor | None = None,
+    policy_friction: float = 0.0,
+    policy_temperature: float = 1.0,
     forecast_huber_delta: float = 1.0,
     volatility_floor: float = 1e-5,
 ) -> dict[str, Tensor]:
@@ -826,44 +923,80 @@ def joint_price_oracle_objective(
     if forecast_huber_delta <= 0 or volatility_floor <= 0:
         raise ValueError("forecast loss scales must be positive")
     batch_size = input_closes.shape[0]
-    if example_weights is None:
-        normalized_weights = torch.ones(
-            batch_size,
-            device=input_closes.device,
-            dtype=torch.float32,
-        )
-    else:
-        if example_weights.shape != (batch_size,) \
-                or not bool(torch.isfinite(example_weights).all()) \
-                or bool((example_weights <= 0).any()):
-            raise ValueError(
-                "example weights must be finite positive batch weights"
-            )
-        normalized_weights = example_weights.float()
-    normalized_weights = (
-        normalized_weights / normalized_weights.mean().clamp_min(1e-12)
+    (
+        normalized_weights,
+        target_policy_float,
+        predicted_log_probabilities,
+        cross_entropy_per_example,
+        kl_per_example,
+    ) = _raw_policy_distribution_terms(
+        output.policy_logits,
+        target_policy,
+        example_weights,
     )
 
-    target_policy_float = target_policy.float()
-    target_policy_float = target_policy_float / (
-        target_policy_float.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    conditioned_cross_entropy_per_example = torch.zeros_like(
+        cross_entropy_per_example
     )
-    predicted_log_probabilities = functional.log_softmax(
-        output.policy_logits.float(),
-        dim=-1,
-    )
-    cross_entropy_per_example = -(
-        target_policy_float * predicted_log_probabilities
-    ).sum(dim=-1)
-    target_log_probabilities = torch.where(
-        target_policy_float > 0,
-        target_policy_float.clamp_min(1e-12).log(),
-        torch.zeros_like(target_policy_float),
-    )
-    kl_per_example = (
-        target_policy_float
-        * (target_log_probabilities - predicted_log_probabilities)
-    ).sum(dim=-1)
+    conditioned_kl_per_example = torch.zeros_like(kl_per_example)
+    if weights.conditioned_policy_cross_entropy > 0:
+        if action_grid is None \
+                or action_grid.shape != (target_policy.shape[1],) \
+                or not bool(torch.isfinite(action_grid).all()):
+            raise ValueError(
+                "conditioned policy loss requires a finite action grid"
+            )
+        if policy_friction < 0 or policy_temperature <= 0 \
+                or not math.isfinite(policy_friction) \
+                or not math.isfinite(policy_temperature):
+            raise ValueError(
+                "conditioned policy friction/temperature are invalid"
+            )
+        grid = action_grid.float()
+        anchors = torch.stack((-grid[-1], grid.new_zeros(()), grid[-1]))
+        difference = grid.unsqueeze(0) - anchors.unsqueeze(1)
+        buy_denominator = 1 - policy_friction + policy_friction * grid
+        sell_denominator = 1 - policy_friction * grid
+        buy_factor = 1 - policy_friction * difference / buy_denominator
+        sell_factor = 1 - policy_friction * (-difference) / sell_denominator
+        rebalance_factor = torch.where(
+            difference > 0,
+            buy_factor,
+            torch.where(difference < 0, sell_factor, torch.ones_like(difference)),
+        )
+        if bool((rebalance_factor <= 0).any()):
+            raise ValueError("conditioned policy grid has infeasible transitions")
+        transition_logits = rebalance_factor.log() / policy_temperature
+        base_target_logits = torch.where(
+            target_policy_float > 0,
+            target_policy_float.clamp_min(1e-12).log(),
+            torch.full_like(target_policy_float, -torch.inf),
+        )
+        conditioned_target_logits = (
+            base_target_logits.unsqueeze(1)
+            + transition_logits.unsqueeze(0)
+        )
+        conditioned_target = torch.softmax(
+            conditioned_target_logits,
+            dim=-1,
+        )
+        conditioned_predicted_log = torch.log_softmax(
+            output.policy_logits.float().unsqueeze(1)
+            + transition_logits.unsqueeze(0),
+            dim=-1,
+        )
+        conditioned_cross_entropy_per_example = -(
+            conditioned_target * conditioned_predicted_log
+        ).sum(dim=-1).mean(dim=-1)
+        conditioned_target_log = torch.where(
+            conditioned_target > 0,
+            conditioned_target.clamp_min(1e-12).log(),
+            torch.zeros_like(conditioned_target),
+        )
+        conditioned_kl_per_example = (
+            conditioned_target
+            * (conditioned_target_log - conditioned_predicted_log)
+        ).sum(dim=-1).mean(dim=-1)
 
     input_log_closes = input_closes.float().log()
     future_log_closes = future_closes.float().log()
@@ -909,6 +1042,12 @@ def joint_price_oracle_objective(
 
     cross_entropy = weighted_mean(cross_entropy_per_example)
     kl_divergence = weighted_mean(kl_per_example)
+    conditioned_cross_entropy = weighted_mean(
+        conditioned_cross_entropy_per_example
+    )
+    conditioned_kl_divergence = weighted_mean(
+        conditioned_kl_per_example
+    )
     forecast_loss = weighted_mean(forecast_per_example)
     soft_layer_norm = (
         output.soft_layer_norm_mean
@@ -916,6 +1055,8 @@ def joint_price_oracle_objective(
     )
     loss = (
         cross_entropy * weights.policy_cross_entropy
+        + conditioned_cross_entropy
+        * weights.conditioned_policy_cross_entropy
         + forecast_loss * weights.forecast
         + soft_layer_norm * weights.soft_layer_norm
     )
@@ -942,6 +1083,8 @@ def joint_price_oracle_objective(
         "loss": loss,
         "crossEntropy": cross_entropy,
         "klDivergence": kl_divergence,
+        "conditionedCrossEntropy": conditioned_cross_entropy,
+        "conditionedKlDivergence": conditioned_kl_divergence,
         "probabilityMse": probability_mse,
         "forecastLoss": forecast_loss,
         "nextMovementRmse": next_movement_rmse,
@@ -952,6 +1095,137 @@ def joint_price_oracle_objective(
             output.soft_layer_norm_variance
         ),
     }
+
+
+def joint_price_oracle_policy_only_objective(
+    policy_logits: Tensor,
+    target_policy: Tensor,
+    weights: JointLossWeights = JointLossWeights(
+        forecast=0.0,
+        soft_layer_norm=0.0,
+    ),
+    *,
+    example_weights: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """Score raw oracle probabilities without constructing forecast tensors.
+
+    The raw cross-entropy, forward KL, and probability MSE use the exact same
+    implementation as :func:`joint_price_oracle_objective`.  Metrics that do
+    not exist in an explicitly policy-only run remain zero-valued so training
+    logs and checkpoint validation metadata retain one stable schema.
+    """
+    incompatible_weights = (
+        weights.conditioned_policy_cross_entropy,
+        weights.forecast,
+        weights.soft_layer_norm,
+    )
+    if any(value != 0 for value in incompatible_weights):
+        raise ValueError(
+            "policy-only objective requires conditioned, forecast, and "
+            "soft-layernorm weights to be zero"
+        )
+    if not math.isfinite(weights.policy_cross_entropy) \
+            or weights.policy_cross_entropy <= 0:
+        raise ValueError(
+            "policy-only cross-entropy weight must be finite and positive"
+        )
+    (
+        normalized_weights,
+        target_policy_float,
+        predicted_log_probabilities,
+        cross_entropy_per_example,
+        kl_per_example,
+    ) = _raw_policy_distribution_terms(
+        policy_logits,
+        target_policy,
+        example_weights,
+    )
+
+    def weighted_mean(values: Tensor) -> Tensor:
+        return (values.float() * normalized_weights).mean()
+
+    cross_entropy = weighted_mean(cross_entropy_per_example)
+    kl_divergence = weighted_mean(kl_per_example)
+    probability_mse = weighted_mean(
+        (
+            predicted_log_probabilities.exp() - target_policy_float
+        ).square().mean(dim=-1)
+    )
+    zero = cross_entropy.new_zeros(())
+    return {
+        "loss": cross_entropy * weights.policy_cross_entropy,
+        "crossEntropy": cross_entropy,
+        "klDivergence": kl_divergence,
+        "conditionedCrossEntropy": zero,
+        "conditionedKlDivergence": zero,
+        "probabilityMse": probability_mse,
+        "forecastLoss": zero,
+        "nextMovementRmse": zero,
+        "directionAccuracy": zero,
+        "softLayerNorm": zero,
+        "softLayerNormMeanPenalty": zero,
+        "softLayerNormVariancePenalty": zero,
+    }
+
+
+def _raw_policy_distribution_terms(
+    policy_logits: Tensor,
+    target_policy: Tensor,
+    example_weights: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return shared raw-policy terms for joint and policy-only objectives."""
+    if policy_logits.ndim != 2 \
+            or target_policy.ndim != 2 \
+            or target_policy.shape != policy_logits.shape:
+        raise ValueError("target policy must match the model action logits")
+    batch_size = policy_logits.shape[0]
+    if batch_size < 1:
+        raise ValueError("policy objective requires a non-empty batch")
+    if example_weights is None:
+        normalized_weights = torch.ones(
+            batch_size,
+            device=policy_logits.device,
+            dtype=torch.float32,
+        )
+    else:
+        if example_weights.shape != (batch_size,) \
+                or not bool(torch.isfinite(example_weights).all()) \
+                or bool((example_weights <= 0).any()):
+            raise ValueError(
+                "example weights must be finite positive batch weights"
+            )
+        normalized_weights = example_weights.float()
+    normalized_weights = (
+        normalized_weights / normalized_weights.mean().clamp_min(1e-12)
+    )
+
+    target_policy_float = target_policy.float()
+    target_policy_float = target_policy_float / (
+        target_policy_float.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    )
+    predicted_log_probabilities = functional.log_softmax(
+        policy_logits.float(),
+        dim=-1,
+    )
+    cross_entropy_per_example = -(
+        target_policy_float * predicted_log_probabilities
+    ).sum(dim=-1)
+    target_log_probabilities = torch.where(
+        target_policy_float > 0,
+        target_policy_float.clamp_min(1e-12).log(),
+        torch.zeros_like(target_policy_float),
+    )
+    kl_per_example = (
+        target_policy_float
+        * (target_log_probabilities - predicted_log_probabilities)
+    ).sum(dim=-1)
+    return (
+        normalized_weights,
+        target_policy_float,
+        predicted_log_probabilities,
+        cross_entropy_per_example,
+        kl_per_example,
+    )
 
 
 def parameter_count(model: nn.Module) -> int:

@@ -36,7 +36,9 @@ import type { MarketStreamStatus } from "./binance-stream.js";
 import { runBotBacktestFromCandles } from "./bot-backtest.js";
 import {
   HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR,
-  HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE,
+  HINDSIGHT_ORACLE_MAX_EXPOSURE,
+  LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE,
+  oracleMaximumEffectiveLeverage,
 } from "./bot-backtest.js";
 import { JointPriceOracleRuntime } from "./joint-price-oracle-runtime.js";
 import { LearnedOracleStrategy } from "./learned-oracle-strategy.js";
@@ -191,6 +193,10 @@ export class TradingRuntime {
   };
   private executionMode: TradingExecutionMode = "simulated";
   private readonly learnedOracleRuntime?: JointPriceOracleRuntime;
+  private readonly learnedOracleModelId?: string;
+  private readonly learnedOracleMaximumLeverage: number = (
+    LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE
+  );
 
   constructor(
     private storage: TradingStorage,
@@ -216,6 +222,22 @@ export class TradingRuntime {
       this.learnedOracleRuntime = new JointPriceOracleRuntime(
         historicalCache.dataDir,
         learnedOracleModel === "latest" ? undefined : learnedOracleModel,
+      );
+      this.learnedOracleModelId = learnedOracleModel === "latest"
+        ? undefined
+        : learnedOracleModel;
+      const maximumLeverage = Number(
+        process.env.TRADING_JOINT_PRICE_ORACLE_MAX_LEVERAGE
+        ?? LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE,
+      );
+      if (!(maximumLeverage > 0) || !Number.isFinite(maximumLeverage)) {
+        throw new Error(
+          "TRADING_JOINT_PRICE_ORACLE_MAX_LEVERAGE must be finite and positive.",
+        );
+      }
+      this.learnedOracleMaximumLeverage = Math.min(
+        HINDSIGHT_ORACLE_MAX_EXPOSURE,
+        maximumLeverage,
       );
     }
   }
@@ -672,6 +694,7 @@ export class TradingRuntime {
         ...this.botConfig,
         cooldownMs: 60_000,
         maxTradeQuote: Number.POSITIVE_INFINITY,
+        maxTargetLeverage: this.learnedOracleMaximumLeverage,
       };
     }
     this.api = this.executionMode === "binance" && this.exchangeTrading
@@ -691,7 +714,7 @@ export class TradingRuntime {
             ? HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
             : DEFAULT_SIMULATED_BORROW_BPS_HOUR,
           maxEffectiveLeverage: this.learnedOracleRuntime
-            ? HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE
+            ? oracleMaximumEffectiveLeverage(this.learnedOracleMaximumLeverage)
             : DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
           rules: marketRules(this.market, this.exchangeTrading?.snapshot(this.market)),
           getHistory: (request) => this.getHistory(request.count),
@@ -908,6 +931,8 @@ export class TradingRuntime {
         interval: backtestInterval,
         config,
         strategy: options.strategy,
+        learnedOracleModelId: this.learnedOracleModelId,
+        learnedOracleMaximumLeverage: this.learnedOracleMaximumLeverage,
         cache: this.historicalCache,
         historicalStartTime: options.historicalStartTime,
         historicalRangeMs: days(options.historicalDays),

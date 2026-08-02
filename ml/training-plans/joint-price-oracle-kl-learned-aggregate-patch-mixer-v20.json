@@ -1,0 +1,86 @@
+{
+  "version": 20,
+  "id": "joint-price-oracle-kl-learned-aggregate-patch-mixer-v20-1h-1m-1m",
+  "label": "Causal 1s oracle policy - compute-matched learned 30s/120s/600s aggregates with causal patch TCN queries - raw oracle KL",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "runDir": "data/training/runs/joint-price-oracle-kl-learned-aggregate-patch-mixer-v20-1h-1m-1m",
+  "artifactDir": "data/models/joint-price-oracle/joint-price-oracle-kl-learned-aggregate-patch-mixer-v20-1h-1m-1m",
+  "testPolicy": "sealed-never-load",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 0,
+  "oracleTarget": {
+    "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
+    "valueHorizonSteps": 3600,
+    "options": {
+      "friction": 0.00175,
+      "minExposure": -250,
+      "maxExposure": 250,
+      "maxEffectiveExposure": 250,
+      "temperature": 0.01,
+      "quoteBorrowRate": 2.776390199537981e-7,
+      "assetBorrowRate": 2.776390199537981e-7
+    }
+  },
+  "dataSplit": {
+    "validationDays": 30,
+    "testDays": 30
+  },
+  "model": {
+    "variant": "learned_aggregate_patch_mixer",
+    "contextLength": 3600,
+    "forecastHorizon": 3600,
+    "actionCount": 101,
+    "variableCount": 1,
+    "patchSizes": [30, 120, 600],
+    "encoderWidth": 40,
+    "kernelSize": 3,
+    "dilations": [1, 2, 4, 8, 16, 32],
+    "queryCount": 3,
+    "fusionWidth": 128,
+    "policyHiddenWidth": 128,
+    "dropout": 0.05,
+    "forecastCoarseSteps": 1,
+    "forecastRank": 1,
+    "maximumLogMovement": 1,
+    "featureEpsilon": 1e-8
+  },
+  "training": {
+    "targetRepresentation": "verifiedOracleProbabilities",
+    "policyOnly": true,
+    "epochs": 384,
+    "batchSize": 1440,
+    "evaluationBatchSize": 1440,
+    "gradientAccumulationSteps": 1,
+    "learningRate": 0.0002,
+    "betas": [0.9, 0.999],
+    "epsilon": 1e-8,
+    "weightDecay": 0.01,
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 48,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "gradientClip": 5,
+    "patience": 160,
+    "seed": 20260801,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 25,
+    "closeCacheDays": 512,
+    "targetCacheDays": 512,
+    "prefetchBatches": 2,
+    "selectionMetric": "klDivergence",
+    "forecastHuberDelta": 1,
+    "volatilityFloor": 0.00001,
+    "lossWeights": {
+      "policyCrossEntropy": 1,
+      "conditionedPolicyCrossEntropy": 0,
+      "forecast": 0,
+      "softLayerNorm": 0
+    }
+  }
+}

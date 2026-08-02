@@ -394,20 +394,124 @@ x
 train a joint model with predictor-oracle policy.
 
 Lets try this arch:
-1. A mix of TiDE, RLinear and DLinear for multivariate prediction
-2. Take input candle closes
-3. compute MA and pass it as another input
-3. compute "residual" of the candle and MA and pass it as another input
-4. Normalize both streams to have mean 0 and variance 1, like in RLinear
-5. Pass through separate TiDEs both streams
-6. Combine, then undo normalization
-7. Try adding PatchTST-like elements to create learned aggregates instead of MAs
-8. It will predict the next price movement, that will then be passed into an oracle/learned policy predictor
-9. For activation/normalization/residuals use same design as in current return-oracle prediction model
+1. Split into 2-3 parts: (encoder ->) predictor -> (adapter ->) decoder to oracle policy
+2. Encoder accepts the input, transforms it into some latent representation, which is used by the predictor to predict next market state in it, then adapter translates into something that decoder can use for oracle policy.
+3. Encoder and adapter might be unnecessary, if predictor and decoder perform better by taking these tasks on their own.
+4. input basis is still unclear.
+5. For decoder i think we found quite good arch. based on the oracle modelling.
+6. Predictor is probably what will be the harder part, based on existing, possibly modifier, arch.
+7. We can search for it by similarly testing direct predition of the market - give it some input and only require it to predict x candles/closes. If we find accurate model that generalizes to validation, then we can join decoder and predictor together and train them better.
+8. We still need to check other training strategies besides simple backpropagation training on direct examples.
 
-Implemented as the separate causal experiment documented in
-`docs/joint-price-oracle.md`: exact zero-delay 1s pairing, 3,600-close causal
-context and forecast horizon, hybrid learned trailing patches/MA, reversible
-trend and residual normalization, DLinear plus separate TiDE streams, and a
-forecast-only learned 255-action oracle-policy head. The existing return-oracle
-training/checkpoint contract remains unchanged.
+The plan can be something like this:
+1. For decoder:
+   1. Simple MLP seems to suffice when given already sufficient information.
+   2. There are many experiments I've ran and some of them are still unfinished, because i wanted to run all of them up to 200 epochs and then decide which of them are worth keeping based on if they genuenly plateaued/diverged/overfit or they are still improving at a similar pace to the training improvements. if they diverged/overfit then we can be sure to drop them, and choose a few of the best from the other ones.
+   3. Maybe can train faster/better on simplified distributions - higher temp (smoother distribution), larger oracle's delay/hold timing (less actions per horizon -> smoother distribution).
+   4. For this one the most important metric is validation base-action KL, which measures how well the model fits the oracle policy. The lower the better, and preferably at least 0.1 +- 0.01
+   5. The input for it is basically 60 normalized closes for the window that the oracle used, in the interval (t, t+60]. The oracle is 1h horizon / 1m delay / 1m hold / temperature 0.01 at some time t.
+3. For predictor:
+   1. Simpler tasks - prediction delay, bigger input candle scaling (less noisy information), smaller prediction horizon.
+   2. Arch that will manage prediction is much harder to determine, so we probably need to try each separately
+   3. Analyze performance and think of improvements.
+   4. The task for this part is simple - given sequence of closes predict next fixed horizon of closes.
+   5. At this layer we should also decide which features are worth passing into the predictor, in which amounts and formats. Open/close/high/low/volume, averages, indicators, etc. It is not obvious which of these are useful for the model to learn based on, since indicators/averages are usually derived from them. But on the other hand we might actually benefit from decomposing into them so that they provide some unique and clear information instead of it being "aggregated" into one price movement. But they should be actual non interfering decompositions that add up precisely to reconstruct the original price movement. Lets try these:
+      1. Plain history of closes. Certainly must be converted into returns to keep the model abstracted from the scale.
+         1. possibly log returns
+         2. then these (log) returns can be normalized further in time to have mean 0 and variance 1.
+         3. then these time-normalized (log) returns can be train dataset/batch-normalized further to have mean 0 and variance 1.
+      2. Decompose history of closes into multiple MA as additive features.
+         1. Pass in a history of slowest MA directly. Then the difference between it and the next slowest MA, then the difference between that and the next slowest MA after it, and so on, until last MA and direct candle close.
+         2. How many MAs to use? Lets try 1-5.
+         3. we can make these convolutions initialized to match each sequence kind so that these are learnable parameters.
+      3. History of candles. Not only the closes, but also high and low relative to it.
+      4. History of full OHLCV candles. Volumes probably also need to be normalized into relative values.
+      5. Multiple candle sizes similar to what we tried before.
+      6. lengths of histories similar to what we tried before.
+      7. Maybe some other signal if its available. Like for limit order book
+      8. Some more complex decomposition into indicators for trend, volatility, etc that is equivalent to direct candles. Maybe FFT of the sequence, its supposed to be equivalent to the original sequence.
+      9. Combinations of all of the above. For each signal we can pass multiple candle sizes, MAs, OHLCV, normalize.
+   6. It should probably simply predict the same thing that the decoder accepted as input - next 60 1m candle closes/returns.
+   7. And probably should optimize square error loss
+4. Check best candidates in a joint e2e training. The predictor can pass its results into the decoder though some adapter.
+   1. Just like with the modules, we have some choices for adapter, inputs and outputs (these are the same as for separate modules).
+   2. The adapter can be a simple MLP, or non existent, or something more complex.
+   3. There are also multiple choices in how to train joint model:
+     1. Train from scratch end to end to facilitate task specific latent representation
+     2. Train in stages:
+        1. Train decoder on true future paths until saturated.
+        2. Freeze decoder.
+        3. Train predictor using path loss plus decoder-policy KL.
+        4. Train decoder on noisy and predictor-generated paths to address distribution shift.
+        5. Jointly fine-tune with a smaller decoder learning rate.
+        6. Retain the best raw-validation-KL checkpoint throughout.
+5. All training should happen over the same dataset used for decoder currently, around 553k training examples and 256k validation examples.
+6. Each element may also benefit from residual connections as well, possibly with attention like mechanisms.
+7. In general we want to decide which arch best suits decoder and predictor, and then try to combine them into a single model. these are a kind of proof of capability, which are then combined to learn together.
+
+Implemented as the causal experiment documented in
+`docs/joint-price-oracle.md`: exact same-timestamp 1s input pairing against the
+verified 1h-horizon/1m-delay/1m-hold target, 3,600-close context and forecast,
+hybrid learned trailing patches/MA, reversible trend/residual normalization,
+DLinear plus separate TiDE streams, and a forecast-only 101-usable-action
+policy head. The learned policy is available to the regular bot as
+`learned-oracle-1s`; chronological holdout acceptance gates live opt-in.
+
+Training result (2026-08-01): v3 is durably paused after epoch 17, with epoch
+10 selected by transition-conditioned validation KL. The exported ONNX matches
+PyTorch within `6.68e-6` logits. Validation-only calibration selected a safe
+flat policy; forced active calibration lost `28.87%` over five validation days
+because turnover costs dominated its small gross directional edge. Keep live
+activation opt-in and capped at 1x; this model is integrated but not accepted
+as profitable. The untouched 30-day test confirmed the rejection: 43,200
+decisions, zero conditioned learned actions/trades, `0%` return, versus 4,470
+nonzero conditioned hindsight decisions.
+
+Capability-screen result (2026-08-02, finalized): completed matched decoder,
+predictor, feature, resolution, objective, causal-architecture, and curriculum
+screens without reading sealed test payloads. Promote only
+`return-oracle-decoder-learned-radius-direct-long-v1` for a saturation run;
+its 1,600-epoch ceiling and 160-stale-epoch stop cover the late-convergence
+regime demonstrated by the preserved epoch-1,345 / KL-0.071195 decoder.
+
+Do not promote a candle-only predictor or joint causal policy. The strongest
+one, v28's exact six-hour TCN, reached raw validation KL 0.967229 at epoch 7,
+but its exact-row gain over v18 was only 0.001848 and it diverged through
+epoch 39. Train-selected six-hour close summaries improved the untouched
+validation half by only 0.000827; intraminute one-second OHLCV improved it by
+only 0.000239, versus the 0.002 feature-integration gate. Direct learning of
+the original soft oracle distribution remains the correct objective;
+prototype assignments, softened-then-sharpened targets, and clustering do not
+add future information. Full evidence and next gates are in
+`docs/joint-price-oracle-capability-screen-2026-08-02.md`.
+
+Spot aggressor-flow information gate (2026-08-02): ingested 420 immutable,
+checksum-attributed Binance BTCUSDT `aggTrades` days covering all train/
+validation targets and predecessor context, with zero sealed-test dates.
+Across 85 causal buy/sell-flow features plus matched OHLCV/activity controls,
+the frozen-v18 residual audit selected zero validation fusion weight: embargoed
+within-audit holdout KL remained 1.002405121 and the gain was 0.000000 versus
+the 0.002 gate. Do not train a neural Spot trade-flow branch. The next bounded
+information screen must use a genuinely distinct causal source such as futures
+positioning/basis/liquidation or related-market context.
+
+USD-M positioning information gate (2026-08-02): ingested the exact 420
+checksum-pinned Binance BTCUSDT five-minute metrics days with a full-bin causal
+lag, independent nullable-field masks/ages, zero backward timestamp rounding,
+and zero sealed-test references. The frozen-v18 paired residual audit selected
+zero validation fusion weight: holdout KL remained 1.002405121 and full
+validation KL remained 0.969834926, for 0.000000 gain versus the 0.002 gate.
+Do not train a neural open-interest/crowding branch. Screen completed USD-M
+perp price/volume versus Spot basis/flow next; continue to optimize direct raw
+oracle KL rather than prototype or cluster assignments.
+
+USD-M/Spot basis-flow information gate (2026-08-02): joined the exact 420
+checksum-pinned USD-M one-minute kline days with the exact 420 Spot aggTrade
+days using completed minute k-1, explicit missing/no-trade/live state, causal
+ages, and zero sealed-test references. The paired frozen-v18 residual audit
+selected basis change, but its train-selected signed-table backoff was zero;
+holdout KL remained 1.002405121 and full validation KL remained 0.969834926,
+for 0.000000 gain versus the 0.002 gate. Do not train a neural basis/flow
+branch. Screen strictly validated USD-M historical order-book depth next;
+continue to train directly against the original oracle distribution with raw
+KL, never cluster assignments.

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "return-oracle-decoder-capability-screen-v1",
+  "purpose": "Short architecture and target-curriculum capability screen on the frozen final compact decoder corpus",
+  "plans": [
+    "ml/training-plans/return-oracle-decoder-screen-residual-glu-direct-v1.json",
+    "ml/training-plans/return-oracle-decoder-screen-learned-radius-direct-v1.json",
+    "ml/training-plans/return-oracle-decoder-screen-learned-radius-curriculum-v1.json"
+  ],
+  "comparison": {
+    "split": "validation",
+    "metric": "rawBaseActionKl",
+    "oracleTemperature": 0.01,
+    "predictionCalibration": "none",
+    "lowerIsBetter": true,
+    "testPolicy": "sealed-never-load"
+  },
+  "interpretation": "The 24-epoch budget is an early-convergence screen, not evidence of saturation. Promote candidates to long runs using a new immutable plan."
+}

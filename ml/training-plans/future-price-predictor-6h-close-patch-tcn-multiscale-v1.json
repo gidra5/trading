@@ -1,0 +1,29 @@
+{
+  "id": "future-price-predictor-6h-close-patch-tcn-multiscale-v1",
+  "corpusId": "future-price-predictor-6h-feature-screen-v1",
+  "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "decoderDatasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+  "datasetDir": "data/training/datasets/future-price-predictor-6h-close-v1",
+  "runDir": "data/training/runs/future-price-predictor-6h-close-patch-tcn-multiscale-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "featureFormat": {"format": "close", "historyMinutes": 360},
+  "architecture": "causal_patch_tcn",
+  "architectureConfig": {"patchSize": 10, "width": 48, "dilations": [1, 2, 4, 8, 4], "kernelSize": 3, "dropout": 0.05},
+  "training": {
+    "epochs": 200, "batchSize": 2048, "evaluationBatchSize": 4096,
+    "objective": "huber", "huberDelta": 1.0, "selectionMetric": "forecastObjectiveLoss",
+    "forecastObjective": {
+      "type": "multiscale_reconstruction", "loss": "huber", "huberDelta": 1.0,
+      "weights": {
+        "hour": 1.0, "quarterHourContrast": 0.75,
+        "fiveMinuteContrast": 0.5, "minuteResidual": 0.25,
+        "path": 0.5, "return": 0.1
+      }
+    },
+    "learningRate": 0.0005,
+    "optimizer": {"type": "adamw", "betas": [0.9, 0.999], "epsilon": 1e-8, "weightDecay": 0.0001},
+    "learningRateSchedule": {"type": "reduce-on-validation-plateau", "factor": 0.5, "patience": 12, "threshold": 0.000001, "minimumLearningRate": 0.000001},
+    "gradientClip": 10.0, "patience": 48, "seed": 1337,
+    "device": "cuda", "mixedPrecision": "bfloat16", "compile": false
+  }
+}

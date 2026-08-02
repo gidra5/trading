@@ -1,0 +1,86 @@
+{
+  "version": 13,
+  "id": "joint-price-oracle-kl-tide-rlinear-dlinear-dct-rank16-v13-1h-1m-1m",
+  "label": "Causal 1s joint price/oracle - hybrid learned patch trend + RLinear/DLinear + dual TiDE - fixed DCT rank-16 logits - verified 1h/1m/1m oracle",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "runDir": "data/training/runs/joint-price-oracle-kl-tide-rlinear-dlinear-dct-rank16-v13-1h-1m-1m",
+  "artifactDir": "data/models/joint-price-oracle/joint-price-oracle-kl-tide-rlinear-dlinear-dct-rank16-v13-1h-1m-1m",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 0,
+  "oracleTarget": {
+    "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
+    "valueHorizonSteps": 3600,
+    "options": {
+      "friction": 0.00175,
+      "minExposure": -250,
+      "maxExposure": 250,
+      "maxEffectiveExposure": 250,
+      "temperature": 0.01,
+      "quoteBorrowRate": 2.776390199537981e-7,
+      "assetBorrowRate": 2.776390199537981e-7
+    }
+  },
+  "dataSplit": {
+    "validationDays": 30,
+    "testDays": 30
+  },
+  "model": {
+    "contextLength": 3600,
+    "forecastHorizon": 3600,
+    "actionCount": 101,
+    "variableCount": 1,
+    "movingAverageWindow": 60,
+    "patchLength": 60,
+    "linearRank": 64,
+    "aggregateMode": "hybrid",
+    "tideHiddenWidth": 128,
+    "tideLayerCount": 4,
+    "policyHiddenWidth": 192,
+    "policyLayerCount": 4,
+    "policyLogitRank": 16,
+    "dropout": 0.05,
+    "normalizationEpsilon": 1e-12,
+    "branchNormalization": {
+      "family": "tanh",
+      "initialScale": 0.0031622776601683794,
+      "minimumScale": 0.0001
+    }
+  },
+  "training": {
+    "targetRepresentation": "verifiedOracleProbabilities",
+    "epochs": 256,
+    "batchSize": 1440,
+    "evaluationBatchSize": 1440,
+    "gradientAccumulationSteps": 1,
+    "learningRate": 0.0001,
+    "betas": [0.9, 0.999],
+    "epsilon": 1e-8,
+    "weightDecay": 0.01,
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 4,
+      "threshold": 0.00001,
+      "minimumLearningRate": 0.000001
+    },
+    "gradientClip": 100,
+    "patience": 32,
+    "seed": 20260731,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 100,
+    "closeCacheDays": 10,
+    "targetCacheDays": 3,
+    "prefetchBatches": 2,
+    "selectionMetric": "klDivergence",
+    "forecastHuberDelta": 1,
+    "volatilityFloor": 0.00001,
+    "lossWeights": {
+      "policyCrossEntropy": 1,
+      "forecast": 1,
+      "softLayerNorm": 0.01
+    }
+  }
+}

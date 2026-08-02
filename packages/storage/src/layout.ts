@@ -74,6 +74,60 @@ export class TradingStorageLayout {
     );
   }
 
+  tradeFlowReferences(market: string, symbol: string, interval: string): string {
+    return path.join(
+      this.marketStore,
+      "refs",
+      "trade-flow",
+      identifier(market),
+      identifier(symbol),
+      identifier(interval),
+    );
+  }
+
+  derivativesMetricsReferences(
+    market: string,
+    symbol: string,
+    interval: string,
+  ): string {
+    return path.join(
+      this.marketStore,
+      "refs",
+      "derivatives-metrics",
+      identifier(market),
+      identifier(symbol),
+      identifier(interval),
+    );
+  }
+
+  derivativesKlinesReferences(
+    market: string,
+    symbol: string,
+    interval: string,
+  ): string {
+    return path.join(
+      this.marketStore,
+      "refs",
+      "derivatives-klines",
+      identifier(market),
+      identifier(symbol),
+      identifier(interval),
+    );
+  }
+
+  derivativesBookDepthReferences(
+    market: string,
+    symbol: string,
+  ): string {
+    return path.join(
+      this.marketStore,
+      "refs",
+      "derivatives-book-depth",
+      identifier(market),
+      identifier(symbol),
+    );
+  }
+
   dataset(id: string): string {
     return path.join(this.trainingDatasets, identifier(id));
   }

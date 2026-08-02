@@ -302,7 +302,25 @@ function parseJsonLine<T>(line: string): T | undefined {
 
 async function appendJsonLine(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.appendFile(filePath, `${JSON.stringify(value)}\n`);
+  const line = `${JSON.stringify(value)}\n`;
+  const retryDelaysMs = [10, 25, 50, 100, 200, 400, 800];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.appendFile(filePath, line);
+      return;
+    } catch (error) {
+      if (!isTransientFileContention(error) || attempt >= retryDelaysMs.length) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
+    }
+  }
+}
+
+function isTransientFileContention(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EBUSY" || code === "EPERM" || code === "EACCES";
 }
 
 function isMissingFile(error: unknown): boolean {

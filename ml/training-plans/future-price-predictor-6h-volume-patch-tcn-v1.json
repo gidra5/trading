@@ -1,0 +1,21 @@
+{
+  "id": "future-price-predictor-6h-volume-patch-tcn-v1",
+  "corpusId": "future-price-predictor-6h-feature-screen-v1",
+  "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "decoderDatasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
+  "datasetDir": "data/training/datasets/future-price-predictor-6h-volume-v1",
+  "runDir": "data/training/runs/future-price-predictor-6h-volume-patch-tcn-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "featureFormat": {"format": "close_volume_residual", "historyMinutes": 360, "volumeLookback": 60, "volumeEpsilon": 0.000001},
+  "architecture": "causal_patch_tcn",
+  "architectureConfig": {"patchSize": 10, "width": 48, "dilations": [1, 2, 4, 8, 4], "kernelSize": 3, "dropout": 0.05},
+  "training": {
+    "epochs": 96, "batchSize": 2048, "evaluationBatchSize": 4096,
+    "objective": "huber", "huberDelta": 1.0, "selectionMetric": "normalizedHuber",
+    "learningRate": 0.0005,
+    "optimizer": {"type": "adamw", "betas": [0.9, 0.999], "epsilon": 1e-8, "weightDecay": 0.0001},
+    "learningRateSchedule": {"type": "reduce-on-validation-plateau", "factor": 0.5, "patience": 8, "threshold": 0.000001, "minimumLearningRate": 0.000001},
+    "gradientClip": 10.0, "patience": 24, "seed": 1337,
+    "device": "cuda", "mixedPrecision": "bfloat16", "compile": false
+  }
+}

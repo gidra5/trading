@@ -21,6 +21,26 @@ import numpy as np
 import zstandard
 
 
+DERIVATIVES_KLINE_COLUMNS = (
+    "open",
+    "high",
+    "low",
+    "close",
+    "baseVolume",
+    "quoteVolume",
+    "tradeCount",
+    "takerBuyBaseVolume",
+    "takerBuyQuoteVolume",
+)
+DERIVATIVES_BOOK_DEPTH_BANDS = (0.2, 1.0, 2.0, 3.0, 4.0, 5.0)
+DERIVATIVES_BOOK_DEPTH_MATRIX_COLUMNS = (
+    "bidDepth",
+    "askDepth",
+    "bidNotional",
+    "askNotional",
+)
+
+
 @dataclass(frozen=True)
 class SequentialAxis:
     start: int
@@ -284,6 +304,381 @@ def read_candle_column(reference_file: Path, name: str) -> np.ndarray:
     return values
 
 
+def read_trade_flow_columns(
+    reference_file: Path,
+    names: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    """Decode selected columns from one canonical trade-flow shard."""
+    shard, payload = read_shard_payload(reference_file)
+    layout = shard.reference["layout"]
+    if layout.get("encoding") != "trade-flow-columnar-v1":
+        raise ValueError(f"unsupported trade-flow encoding: {reference_file}")
+    columns = layout.get("columns")
+    if not isinstance(columns, list) or len(columns) == 0:
+        raise ValueError(f"trade-flow columns are missing: {reference_file}")
+    by_name: dict[str, dict[str, Any]] = {}
+    occupied: list[tuple[int, int]] = []
+    for column in columns:
+        if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+            raise ValueError(f"invalid trade-flow column: {reference_file}")
+        column_name = str(column["name"])
+        if column_name in by_name:
+            raise ValueError(f"duplicate trade-flow column: {column_name}")
+        start = int(column.get("offset", -1))
+        size = int(column.get("bytes", -1))
+        end = start + size
+        if start < 0 or size < 0 or end > len(payload):
+            raise ValueError(f"invalid trade-flow column bounds: {column_name}")
+        occupied.append((start, end))
+        by_name[column_name] = column
+    if any(right_start < left_end for (_, left_end), (right_start, _) in zip(
+        sorted(occupied), sorted(occupied)[1:], strict=False,
+    )):
+        raise ValueError(f"overlapping trade-flow columns: {reference_file}")
+
+    result: dict[str, np.ndarray] = {}
+    for name in names:
+        column = by_name.get(name)
+        if column is None:
+            raise ValueError(
+                f"trade-flow column {name!r} is missing: {reference_file}"
+            )
+        encoding = column.get("encoding")
+        dtype = {
+            "float64-le": "<f8",
+            "uint32-le": "<u4",
+            "int8": "i1",
+        }.get(encoding)
+        if dtype is None:
+            raise ValueError(
+                f"unsupported trade-flow column encoding {encoding!r}"
+            )
+        start = int(column["offset"])
+        end = start + int(column["bytes"])
+        values = np.frombuffer(payload[start:end], dtype=dtype)
+        if values.shape != (shard.axis.count,):
+            raise ValueError(f"trade-flow column is truncated: {name}")
+        result[name] = values
+    return result
+
+
+def read_derivatives_metrics_columns(
+    reference_file: Path,
+    names: tuple[str, ...],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Decode nullable float columns and their per-field validity masks."""
+    shard, payload = read_shard_payload(reference_file)
+    layout = shard.reference["layout"]
+    if layout.get("encoding") != "derivatives-metrics-columnar-v1":
+        raise ValueError(
+            f"unsupported derivatives-metrics encoding: {reference_file}"
+        )
+    columns = layout.get("columns")
+    if not isinstance(columns, list) or len(columns) < 2:
+        raise ValueError(
+            f"derivatives-metrics columns are missing: {reference_file}"
+        )
+    by_name = {
+        str(column.get("name")): column
+        for column in columns
+        if isinstance(column, dict) and isinstance(column.get("name"), str)
+    }
+    if len(by_name) != len(columns):
+        raise ValueError(
+            f"invalid or duplicate derivatives-metrics columns: {reference_file}"
+        )
+    mask_column = by_name.get("validMask")
+    if mask_column is None or mask_column.get("encoding") != "uint8":
+        raise ValueError(
+            f"derivatives-metrics validity mask is missing: {reference_file}"
+        )
+    mask_start = int(mask_column.get("offset", -1))
+    mask_end = mask_start + int(mask_column.get("bytes", -1))
+    if mask_start < 0 or mask_end > len(payload):
+        raise ValueError(
+            f"invalid derivatives-metrics validity mask: {reference_file}"
+        )
+    masks = np.frombuffer(payload[mask_start:mask_end], dtype="u1")
+    if masks.shape != (shard.axis.count,):
+        raise ValueError(
+            f"truncated derivatives-metrics validity mask: {reference_file}"
+        )
+    canonical_names = [
+        str(column["name"]) for column in columns if column.get("name") != "validMask"
+    ]
+    values: dict[str, np.ndarray] = {}
+    validity: dict[str, np.ndarray] = {}
+    for name in names:
+        column = by_name.get(name)
+        if column is None or column.get("encoding") != "float64-le":
+            raise ValueError(
+                f"derivatives-metrics column {name!r} is missing: {reference_file}"
+            )
+        try:
+            bit = canonical_names.index(name)
+        except ValueError as error:
+            raise ValueError(
+                f"derivatives-metrics column order is invalid: {name}"
+            ) from error
+        start = int(column.get("offset", -1))
+        end = start + int(column.get("bytes", -1))
+        if start < 0 or end > len(payload):
+            raise ValueError(
+                f"invalid derivatives-metrics column bounds: {name}"
+            )
+        decoded = np.frombuffer(payload[start:end], dtype="<f8")
+        if decoded.shape != (shard.axis.count,):
+            raise ValueError(f"derivatives-metrics column is truncated: {name}")
+        valid = (masks & (1 << bit)) != 0
+        if not np.isfinite(decoded).all() \
+                or bool((decoded[valid] <= 0).any()) \
+                or bool((decoded[~valid] != 0).any()):
+            raise ValueError(f"invalid nullable derivatives-metrics values: {name}")
+        values[name] = decoded
+        validity[name] = valid
+    return values, validity
+
+
+def read_derivatives_kline_columns(
+    reference_file: Path,
+    names: tuple[str, ...] = DERIVATIVES_KLINE_COLUMNS,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Decode complete USD-M 1m kline rows and their shared row validity."""
+    shard, payload = read_shard_payload(reference_file)
+    layout = shard.reference["layout"]
+    if layout.get("encoding") != "derivatives-klines-columnar-v1":
+        raise ValueError(
+            f"unsupported derivatives-klines encoding: {reference_file}"
+        )
+    if shard.axis.unit != "unix-ms" \
+            or shard.axis.step != 60_000 \
+            or shard.axis.start % 60_000 != 0 \
+            or layout.get("closeTimeOffsetMs") != 59_999 \
+            or layout.get("closed") is not True:
+        raise ValueError(f"invalid derivatives-klines time layout: {reference_file}")
+    columns = layout.get("columns")
+    if not isinstance(columns, list) \
+            or len(columns) != len(DERIVATIVES_KLINE_COLUMNS) + 1:
+        raise ValueError(f"derivatives-klines columns are missing: {reference_file}")
+    if len(names) != len(set(names)) \
+            or any(name not in DERIVATIVES_KLINE_COLUMNS for name in names):
+        raise ValueError("invalid or duplicate requested derivatives-klines columns")
+
+    expected_offset = 0
+    decoded: dict[str, np.ndarray] = {}
+    for index, name in enumerate(DERIVATIVES_KLINE_COLUMNS):
+        column = columns[index]
+        encoding = "uint64-le" if name == "tradeCount" else "float64-le"
+        size = shard.axis.count * 8
+        if not isinstance(column, dict) \
+                or column.get("name") != name \
+                or column.get("encoding") != encoding \
+                or column.get("offset") != expected_offset \
+                or column.get("bytes") != size:
+            raise ValueError(f"invalid derivatives-klines column layout: {name}")
+        dtype = "<u8" if name == "tradeCount" else "<f8"
+        values = np.frombuffer(
+            payload[expected_offset:expected_offset + size],
+            dtype=dtype,
+        )
+        if values.shape != (shard.axis.count,):
+            raise ValueError(f"derivatives-klines column is truncated: {name}")
+        decoded[name] = values
+        expected_offset += size
+
+    mask_column = columns[-1]
+    if not isinstance(mask_column, dict) \
+            or mask_column.get("name") != "validMask" \
+            or mask_column.get("encoding") != "uint8" \
+            or mask_column.get("offset") != expected_offset \
+            or mask_column.get("bytes") != shard.axis.count \
+            or len(payload) != expected_offset + shard.axis.count:
+        raise ValueError(f"invalid derivatives-klines validity layout: {reference_file}")
+    masks = np.frombuffer(payload[expected_offset:], dtype="u1")
+    if masks.shape != (shard.axis.count,) \
+            or bool(((masks != 0) & (masks != 1)).any()):
+        raise ValueError(f"invalid derivatives-klines validity mask: {reference_file}")
+    valid = masks == 1
+
+    for name, values in decoded.items():
+        if bool((values[~valid] != 0).any()):
+            raise ValueError(
+                f"missing derivatives-klines rows contain data in {name}"
+            )
+    float_names = tuple(
+        name for name in DERIVATIVES_KLINE_COLUMNS if name != "tradeCount"
+    )
+    if any(not np.isfinite(decoded[name]).all() for name in float_names):
+        raise ValueError(f"non-finite derivatives-klines values: {reference_file}")
+    if valid.any():
+        open_values = decoded["open"][valid]
+        high_values = decoded["high"][valid]
+        low_values = decoded["low"][valid]
+        close_values = decoded["close"][valid]
+        volume_names = (
+            "baseVolume",
+            "quoteVolume",
+            "takerBuyBaseVolume",
+            "takerBuyQuoteVolume",
+        )
+        if bool((open_values <= 0).any()) \
+                or bool((high_values <= 0).any()) \
+                or bool((low_values <= 0).any()) \
+                or bool((close_values <= 0).any()) \
+                or any(bool((decoded[name][valid] < 0).any()) for name in volume_names) \
+                or bool((high_values < np.maximum(open_values, close_values)).any()) \
+                or bool((low_values > np.minimum(open_values, close_values)).any()) \
+                or bool((low_values > high_values).any()) \
+                or bool((decoded["takerBuyBaseVolume"][valid]
+                         > decoded["baseVolume"][valid]).any()) \
+                or bool((decoded["takerBuyQuoteVolume"][valid]
+                         > decoded["quoteVolume"][valid]).any()) \
+                or bool((decoded["tradeCount"][valid]
+                         > np.uint64(9_007_199_254_740_991)).any()):
+            raise ValueError(f"invalid derivatives-klines row values: {reference_file}")
+        trade_counts = decoded["tradeCount"][valid]
+        no_trade = trade_counts == 0
+        live = ~no_trade
+        if bool((open_values[no_trade] != high_values[no_trade]).any()) \
+                or bool((open_values[no_trade] != low_values[no_trade]).any()) \
+                or bool((open_values[no_trade] != close_values[no_trade]).any()) \
+                or any(
+                    bool((decoded[name][valid][no_trade] != 0).any())
+                    for name in volume_names
+                ) \
+                or bool((decoded["baseVolume"][valid][live] == 0).any()) \
+                or bool((decoded["quoteVolume"][valid][live] == 0).any()):
+            raise ValueError(
+                f"invalid derivatives-klines no-trade semantics: {reference_file}"
+            )
+    return {name: decoded[name] for name in names}, valid
+
+
+def read_derivatives_book_depth_columns(
+    reference_file: Path,
+) -> dict[str, np.ndarray]:
+    """Decode one irregular USD-M book-depth day into fixed-band matrices."""
+    shard, payload = read_shard_payload(reference_file)
+    layout = shard.reference["layout"]
+    if layout.get("encoding") != "derivatives-book-depth-columnar-v1" \
+            or shard.axis.start != 0 \
+            or shard.axis.step != 1 \
+            or shard.axis.unit != "index" \
+            or shard.axis.count < 1 \
+            or layout.get("timestampResolutionMs") != 1_000 \
+            or layout.get("timestampStorage") != "utc-day-second-offset" \
+            or layout.get("bandPercentages") \
+            != list(DERIVATIVES_BOOK_DEPTH_BANDS) \
+            or layout.get("percentageSemantics") \
+            != "negative-bid-positive-ask" \
+            or layout.get("valuesAreCumulative") is not True \
+            or layout.get("matrixOrder") != "snapshot-major-band-minor":
+        raise ValueError(
+            f"invalid derivatives-book-depth layout: {reference_file}"
+        )
+    utc_day_start = layout.get("utcDayStartMs")
+    if not isinstance(utc_day_start, int) \
+            or isinstance(utc_day_start, bool) \
+            or utc_day_start % 86_400_000 != 0:
+        raise ValueError(
+            f"invalid derivatives-book-depth UTC day: {reference_file}"
+        )
+
+    count = shard.axis.count
+    band_count = len(DERIVATIVES_BOOK_DEPTH_BANDS)
+    expected = (
+        ("timestampOffsetSeconds", "uint32-le", (count,), count * 4),
+        ("schemaBandCount", "uint8", (count,), count),
+        *((
+            name,
+            "float64-le",
+            (count, band_count),
+            count * band_count * 8,
+        ) for name in DERIVATIVES_BOOK_DEPTH_MATRIX_COLUMNS),
+        ("bandAvailable", "uint8", (count, band_count), count * band_count),
+    )
+    columns = layout.get("columns")
+    if not isinstance(columns, list) or len(columns) != len(expected):
+        raise ValueError(
+            f"invalid derivatives-book-depth columns: {reference_file}"
+        )
+    offset = 0
+    decoded: dict[str, np.ndarray] = {}
+    for column, (name, encoding, shape, size) in zip(
+        columns, expected, strict=True,
+    ):
+        if not isinstance(column, dict) \
+                or column.get("name") != name \
+                or column.get("encoding") != encoding \
+                or column.get("offset") != offset \
+                or column.get("bytes") != size \
+                or column.get("shape") != list(shape):
+            raise ValueError(
+                f"invalid derivatives-book-depth column layout: {name}"
+            )
+        dtype = {
+            "uint32-le": "<u4",
+            "uint8": "u1",
+            "float64-le": "<f8",
+        }[encoding]
+        values = np.frombuffer(payload[offset:offset + size], dtype=dtype)
+        if values.size != math.prod(shape):
+            raise ValueError(
+                f"truncated derivatives-book-depth column: {name}"
+            )
+        decoded[name] = values.reshape(shape)
+        offset += size
+    if offset != len(payload):
+        raise ValueError(
+            f"derivatives-book-depth payload has trailing bytes: {reference_file}"
+        )
+
+    timestamps = decoded["timestampOffsetSeconds"]
+    schema = decoded["schemaBandCount"]
+    availability_bytes = decoded["bandAvailable"]
+    timestamp_differences = np.diff(timestamps.astype(np.int64, copy=False))
+    if bool((timestamps >= 86_400).any()) \
+            or bool((timestamp_differences <= 0).any()) \
+            or bool(((schema != 10) & (schema != 12)).any()) \
+            or bool(((availability_bytes != 0) & (availability_bytes != 1)).any()):
+        raise ValueError(
+            f"invalid derivatives-book-depth snapshot axis: {reference_file}"
+        )
+    availability = availability_bytes == 1
+    expected_availability = np.ones((count, band_count), dtype=bool)
+    expected_availability[schema == 10, 0] = False
+    if not np.array_equal(availability, expected_availability):
+        raise ValueError(
+            f"invalid derivatives-book-depth availability: {reference_file}"
+        )
+
+    for name in DERIVATIVES_BOOK_DEPTH_MATRIX_COLUMNS:
+        values = decoded[name]
+        if not np.isfinite(values).all() \
+                or bool((values[availability] <= 0).any()) \
+                or bool((values[~availability] != 0).any()):
+            raise ValueError(
+                f"invalid derivatives-book-depth values: {name}"
+            )
+        for row in range(count):
+            available_values = values[row, availability[row]]
+            if available_values.size > 1 \
+                    and bool((np.diff(available_values) < 0).any()):
+                raise ValueError(
+                    f"non-monotone derivatives-book-depth values: {name}"
+                )
+
+    return {
+        "timestampOffsetSeconds": timestamps,
+        "schemaBandCount": schema,
+        **{
+            name: decoded[name]
+            for name in DERIVATIVES_BOOK_DEPTH_MATRIX_COLUMNS
+        },
+        "bandAvailable": availability,
+    }
+
+
 def is_storage_reference(file: Path) -> bool:
     try:
         value = json.loads(file.read_text(encoding="utf-8"))
@@ -503,22 +898,31 @@ def _maybe_prune_checkpoint_orphans(store_root: Path) -> None:
 
 
 def _prune_checkpoint_orphans(store_root: Path) -> None:
-    """Bound checkpoint growth while preserving a commit-race grace period."""
+    """Bound checkpoint growth while preserving a commit-race grace period.
+
+    Checkpoint GC is deliberately checkpoint-only: ``.bin`` objects can only
+    be retained by canonical artifact pointers below
+    ``data/training/runs/**/checkpoints``. Sequential-shard references retain
+    ``.zst`` objects and must never be traversed by this hot-path maintenance.
+    The grace period still protects an object committed concurrently before
+    its pointer becomes visible to this scan.
+    """
     training_root = store_root.parent
     referenced: set[Path] = set()
     invalid = False
-    for root in (store_root / "refs", training_root / "runs"):
-        if not root.exists():
-            continue
-        for file in root.rglob("*.json"):
+    runs_root = training_root / "runs"
+    if runs_root.exists():
+        for file in runs_root.rglob("checkpoints/*.json"):
             try:
                 value = json.loads(file.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            if value.get("kind") not in (
-                "trading-sequential-shard",
-                "trading-immutable-artifact",
-            ):
+            if value.get("kind") != "trading-immutable-artifact":
+                continue
+            try:
+                _validate_artifact_reference(value)
+            except ValueError:
+                invalid = True
                 continue
             relative = value.get("object", {}).get("file")
             if not isinstance(relative, str):
@@ -542,10 +946,12 @@ def _prune_checkpoint_orphans(store_root: Path) -> None:
             "TRADING_STORAGE_ORPHAN_GRACE_HOURS must be positive"
         )
     cutoff = time.time() - grace_hours * 60 * 60
-    object_root = store_root / "objects" / "sha256"
-    if not object_root.exists():
+    checkpoint_object_root = store_root / "objects" / "sha256"
+    if not checkpoint_object_root.exists():
         return
-    for object_file in object_root.glob("*/*.bin"):
+    # The candidate set is explicitly limited to checkpoint payloads. Never
+    # broaden this to sequential-shard ``.zst`` objects.
+    for object_file in checkpoint_object_root.glob("*/*.bin"):
         try:
             if object_file.resolve() not in referenced \
                     and object_file.stat().st_mtime <= cutoff:

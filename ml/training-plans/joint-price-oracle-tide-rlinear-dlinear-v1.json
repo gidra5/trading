@@ -50,8 +50,8 @@
   "training": {
     "targetRepresentation": "verifiedOracleProbabilities",
     "epochs": 256,
-    "batchSize": 1024,
-    "evaluationBatchSize": 1024,
+    "batchSize": 1440,
+    "evaluationBatchSize": 1440,
     "gradientAccumulationSteps": 1,
     "learningRate": 0.0001,
     "betas": [

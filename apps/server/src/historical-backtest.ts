@@ -27,7 +27,11 @@ import {
   HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
   runBotBacktestFromCandles,
 } from "./bot-backtest.js";
-import { JointPriceOracleRuntime } from "./joint-price-oracle-runtime.js";
+import {
+  JOINT_PRICE_ORACLE_CONTEXT_LENGTH,
+  JointPriceOracleRuntime,
+  isJointPriceOracleDecisionTime,
+} from "./joint-price-oracle-runtime.js";
 
 const MAX_EQUITY_POINTS = 800;
 const REPLAY_PROGRESS_CANDLES = 10_000;
@@ -85,6 +89,10 @@ export interface HistoricalBacktestOptions {
   interval: string;
   config: StrategyConfig;
   strategy?: BacktestStrategy;
+  /** Pins learned-policy inference to the same exported artifact as live use. */
+  learnedOracleModelId?: string;
+  /** Uses the same execution leverage projection as live learned-policy use. */
+  learnedOracleMaximumLeverage?: number;
   cache: HistoricalCacheOptions;
   historicalStartTime?: number;
   historicalRangeMs?: number;
@@ -246,7 +254,11 @@ async function runRandomHistoricalCandleBacktest(
     quoteAsset: primaryMarket.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, primaryMarket.maxLeverage),
   });
-  const warmupMs = historicalWarmupSamples(config, intervalMs) * intervalMs;
+  const warmupMs = historicalStrategyWarmupSamples(
+    config,
+    intervalMs,
+    options.strategy,
+  ) * intervalMs;
   const targetEndTime = Date.now();
   const targetStartTime = targetEndTime - sampleLookbackMs;
   const windows = buildRandomWindows({
@@ -627,7 +639,11 @@ async function runBotHistoricalRangeBacktest(
     quoteAsset: options.quoteAsset ?? options.config.quoteAsset,
     maxLeverage: cappedMaxLeverage(options.config.maxLeverage, options.maxLeverage),
   });
-  const warmupSamples = historicalWarmupSamples(config, intervalMs);
+  const warmupSamples = historicalStrategyWarmupSamples(
+    config,
+    intervalMs,
+    options.strategy,
+  );
   const firstTargetTime = alignUp(targetStartTime, intervalMs);
   const warmupStartTime = firstTargetTime - warmupSamples * intervalMs;
   const oracleEndTime = Math.min(
@@ -695,9 +711,10 @@ async function runBotHistoricalRangeBacktest(
     const inferenceCandles = [...warmup, ...candles];
     const decisionTimes = candles
       .map((candle) => candle.closeTime)
-      .filter((time) => (time + 1) % 60_000 === 0);
+      .filter(isJointPriceOracleDecisionTime);
     const distributions = await new JointPriceOracleRuntime(
       options.cache.dataDir,
+      options.learnedOracleModelId,
     ).predictDistributions(inferenceCandles, decisionTimes);
     const byTime = new Map(
       decisionTimes.map((time, index) => [time, distributions[index]!] as const),
@@ -712,6 +729,7 @@ async function runBotHistoricalRangeBacktest(
     warmup,
     oracleFuture,
     learnedOracleDistributionAt,
+    learnedOracleMaximumLeverage: options.learnedOracleMaximumLeverage,
     extremaSmaWindowMs: options.extremaSmaWindowMs,
   });
   Object.assign(result.summary, {
@@ -1453,6 +1471,19 @@ function klineEndpointForVenue(venue: StreamVenue): string {
 
 export function historicalWarmupSamples(config: StrategyConfig, intervalMs: number): number {
   return peakValleyWarmupSamples(createPeakValleyBotConfig(config, intervalMs).strategy);
+}
+
+export function historicalStrategyWarmupSamples(
+  config: StrategyConfig,
+  intervalMs: number,
+  strategy: BacktestStrategy | undefined,
+): number {
+  const indicatorSamples = historicalWarmupSamples(config, intervalMs);
+  if (strategy !== "learned-oracle-1s") return indicatorSamples;
+  const modelSamples = Math.ceil(
+    JOINT_PRICE_ORACLE_CONTEXT_LENGTH * 1_000 / intervalMs,
+  );
+  return Math.max(indicatorSamples, modelSamples);
 }
 
 export function intervalToMs(interval: string): number {

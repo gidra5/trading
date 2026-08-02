@@ -4,24 +4,48 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createPeakValleyBotConfig,
   createStrategyConfig,
   type Candle,
   type ExposureValueOracleActionDistribution,
+  type TradingCandle,
 } from "@trading/bot-algo";
 import {
   confidenceConditionedHindsightOracleExposure,
   confidenceScaledHindsightOracleExposure,
   hindsightOracleTargetDecision,
   hindsightOracleUsableDistribution,
+  oracleExecutionExposureScale,
+  oracleMaximumEffectiveLeverage,
   runBotBacktestFromCandles,
+  type OracleBacktestDecision,
 } from "../src/bot-backtest.js";
 import { HistoricalCandleCache } from "../src/historical-candle-cache.js";
-import { intervalToMs, runHistoricalCandleBacktest } from "../src/historical-backtest.js";
+import {
+  historicalStrategyWarmupSamples,
+  intervalToMs,
+  runHistoricalCandleBacktest,
+} from "../src/historical-backtest.js";
 import { logitsDistribution } from "../src/joint-price-oracle-runtime.js";
+import { LearnedOracleStrategy } from "../src/learned-oracle-strategy.js";
 
 test("historical intervals include one-second candles", () => {
   assert.equal(intervalToMs("1s"), 1_000);
   assert.equal(intervalToMs("5m"), 300_000);
+});
+
+test("historical learned-oracle replay always loads a full model context", () => {
+  const config = createStrategyConfig({
+    legacyValleyPeak: {
+      averagingRangesSec: [2],
+      derivativeSource: "price",
+    },
+  });
+  assert.equal(
+    historicalStrategyWarmupSamples(config, 1_000, "learned-oracle-1s"),
+    3_600,
+  );
+  assert.equal(historicalStrategyWarmupSamples(config, 1_000, "peak-valley"), 2);
 });
 
 test("hindsight oracle derives its target mode and confidence from the distribution", () => {
@@ -226,8 +250,10 @@ test("one-second hindsight oracle drives the regular bot execution path", async 
   const warmup = [103, 102, 101].map((price, index) =>
     timedCandle((index - 3) * intervalMs, price, intervalMs));
   const prices = [100, 99, 101, 101, 150];
+  const candles = prices.map((price, index) =>
+    timedCandle(index * intervalMs, price, intervalMs));
   const result = await runBotBacktestFromCandles(
-    prices.map((price, index) => timedCandle(index * intervalMs, price, intervalMs)),
+    candles,
     { config, strategy: "hindsight-oracle-1s", warmup },
   );
 
@@ -240,6 +266,16 @@ test("one-second hindsight oracle drives the regular bot execution path", async 
   assert.ok((oracleSignal.indicators["oracle.confidence"] ?? 0) > 0);
   assert.equal(result.summary.maxEntryLeverage, 100);
   assert.equal(result.summary.perfectMarginLeverage, 100);
+
+  const capped = await runBotBacktestFromCandles(candles, {
+    config,
+    strategy: "hindsight-oracle-1s",
+    warmup,
+    hindsightOracleMaximumLeverage: 1,
+  });
+  assert.equal(capped.summary.maxEntryLeverage, 1);
+  assert.equal(capped.summary.perfectMarginLeverage, 1);
+  assert.equal(capped.summary.tradeCount > 0, true);
 });
 
 test("causal learned oracle drives the regular bot without future candles", async () => {
@@ -261,6 +297,7 @@ test("causal learned oracle drives the regular bot without future candles", asyn
       1_000,
     ));
   let predictions = 0;
+  const oracleDecisions: { currentExposure: number; targetExposure: number }[] = [];
   const result = await runBotBacktestFromCandles(candles, {
     config,
     strategy: "learned-oracle-1s",
@@ -269,11 +306,111 @@ test("causal learned oracle drives the regular bot without future candles", asyn
       predictions += 1;
       return oracleDistribution([0, 0, 1]);
     },
+    onOracleDecision: ({ currentExposure, targetExposure }) => {
+      oracleDecisions.push({ currentExposure, targetExposure });
+    },
   });
 
   assert.equal(result.summary.strategy, "learned-oracle-1s");
   assert.equal(predictions, 2);
+  assert.equal(oracleDecisions.length, 2);
+  assert.equal(oracleDecisions[0]?.currentExposure, 0);
+  assert.ok((oracleDecisions[0]?.targetExposure ?? 0) > 0);
   assert.ok(result.summary.tradeCount > 0);
+  assert.equal(result.summary.maxEntryLeverage, 1);
+  assert.equal(result.summary.perfectMarginLeverage, 1);
+});
+
+test("capped oracle replay scales filled exposure back to the native policy state", async () => {
+  const config = createStrategyConfig({
+    startingQuote: 10_000,
+    maxLeverage: 1,
+    cooldownMs: 0,
+    legacyValleyPeak: {
+      averagingRangesSec: [2],
+      trendSigmaWindowSec: 2,
+      anticipatoryGridOrderCount: 1,
+      exitGridOrderCount: 1,
+    },
+  });
+  const candles = Array.from({ length: 62 }, (_, index) =>
+    timedCandle(index * 1_000, 100, 1_000));
+  const firstTime = candles[0]!.closeTime;
+  const secondTime = candles[60]!.closeTime;
+  const enterLong = nativeOracleDistribution([0, 0, 1]);
+  const preferShortWithoutNativeState = nativeOracleDistribution([0.9, 0, 0.1]);
+  const decisions: OracleBacktestDecision[] = [];
+
+  await runBotBacktestFromCandles(candles, {
+    config,
+    strategy: "learned-oracle-1s",
+    learnedOracleMaximumLeverage: 1,
+    learnedOracleDistributionAt: (timestamp) => timestamp === firstTime
+      ? enterLong
+      : timestamp === secondTime
+        ? preferShortWithoutNativeState
+        : null,
+    onOracleDecision: (decision) => decisions.push(decision),
+  });
+
+  assert.equal(oracleExecutionExposureScale(enterLong, 1), 0.01);
+  assert.equal(oracleMaximumEffectiveLeverage(1), 2.5);
+  assert.equal(decisions.length, 2);
+  assert.ok((decisions[1]?.currentExposure ?? 0) > 0.9);
+  // A filled +1x execution position is native +100x policy state.  Native
+  // transition friction therefore keeps the existing long despite a 9:1 base
+  // preference for short; conditioning on the unscaled +1 would reverse it.
+  assert.equal(decisions[1]?.conditionedModalExposure, 100);
+  assert.ok(Math.abs((decisions[1]?.targetExposure ?? 0) - 1) < 1e-6);
+  assert.equal(decisions[1]?.signalEmitted, false);
+});
+
+test("live learned-oracle strategy uses the scaled native-grid deadband", async () => {
+  const config = createStrategyConfig({
+    maxLeverage: 1,
+    legacyValleyPeak: {
+      averagingRangesSec: [2],
+      derivativeSource: "price",
+    },
+  });
+  const history: TradingCandle[] = Array.from({ length: 3_600 }, (_, index) => ({
+    openTime: -3_599_000 + index * 1_000,
+    closeTime: -3_598_001 + index * 1_000,
+    open: 100,
+    high: 100,
+    low: 100,
+    close: 100,
+    volume: 1,
+  }));
+  const distribution = nativeOracleDistribution([0, 0, 1]);
+  const runtime = {
+    predictLatest: async () => distribution,
+  } as unknown as ConstructorParameters<typeof LearnedOracleStrategy>[1];
+  const strategy = new LearnedOracleStrategy(
+    {
+      config: createPeakValleyBotConfig(config, 1_000).strategy,
+      getHistory: async () => history,
+    },
+    runtime,
+    async () => history,
+    0.00175,
+  );
+  await strategy.onTick({
+    timestamp: 999,
+    price: 100,
+    quantity: 1,
+    candle: history.at(-1)!,
+  });
+
+  const signal = await strategy.targetExposureSignal({
+    timestamp: 999,
+    price: 100,
+    equity: 10_000,
+    currentExposure: 0,
+    maxLeverage: 1,
+  });
+  assert.ok(signal);
+  assert.equal(signal.targetExposure, 1);
 });
 
 test("one-second hindsight oracle evaluates once per 60-second holding block", async () => {
@@ -470,5 +607,28 @@ function oracleDistribution(probabilities: readonly number[]): ExposureValueOrac
     entropy,
     opportunity: 1,
     feasibleActionCount: values.filter((probability) => probability > 0).length,
+  };
+}
+
+function nativeOracleDistribution(
+  probabilities: readonly number[],
+): ExposureValueOracleActionDistribution {
+  const distribution = oracleDistribution(probabilities);
+  const grid = Float64Array.from([-100, 0, 100]);
+  return {
+    ...distribution,
+    grid,
+    mean: probabilities.reduce(
+      (sum, probability, index) => sum + probability * grid[index]!,
+      0,
+    ),
+    secondMoment: probabilities.reduce(
+      (sum, probability, index) => sum + probability * grid[index]! ** 2,
+      0,
+    ),
+    modalExposure: grid[probabilities.reduce(
+      (best, probability, index) => probability > probabilities[best]! ? index : best,
+      0,
+    )]!,
   };
 }

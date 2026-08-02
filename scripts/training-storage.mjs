@@ -76,34 +76,25 @@ function pruneCache(root, { maximumBytes, reserveBytes }) {
 export function pruneTrainingOrphans(layout, { minimumAgeMs }) {
   const referenced = new Set();
   let invalidReferences = 0;
-  for (const root of [
-    path.join(layout.immutable, "refs"),
-    layout.datasets,
-    layout.runs,
-  ]) {
-    for (const file of walkFilesIfPresent(root)) {
-      if (!file.path.endsWith(".json")) continue;
-      let value;
-      try {
-        value = JSON.parse(fs.readFileSync(file.path, "utf8"));
-      } catch {
-        continue;
-      }
-      if (value?.kind !== "trading-sequential-shard"
-        && value?.kind !== "trading-immutable-artifact") continue;
-      const relative = value?.object?.file;
-      if (typeof relative !== "string") {
-        invalidReferences += 1;
-        continue;
-      }
-      const object = path.resolve(layout.immutable, relative);
-      const inside = path.relative(layout.immutable, object);
-      if (!inside || inside.startsWith("..") || path.isAbsolute(inside)) {
-        invalidReferences += 1;
-        continue;
-      }
-      referenced.add(object.toLowerCase());
+  for (const file of checkpointPointerFiles(layout.runs)) {
+    let value;
+    try {
+      value = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      continue;
     }
+    if (value?.kind !== "trading-immutable-artifact") continue;
+    if (!isCheckpointReference(value)) {
+      invalidReferences += 1;
+      continue;
+    }
+    const object = path.resolve(layout.immutable, value.object.file);
+    const inside = path.relative(layout.immutable, object);
+    if (!inside || inside.startsWith("..") || path.isAbsolute(inside)) {
+      invalidReferences += 1;
+      continue;
+    }
+    referenced.add(object.toLowerCase());
   }
   if (invalidReferences > 0) {
     return { files: 0, bytes: 0, invalidReferences, skipped: true };
@@ -111,7 +102,9 @@ export function pruneTrainingOrphans(layout, { minimumAgeMs }) {
   const cutoff = Date.now() - minimumAgeMs;
   let removedFiles = 0;
   let removedBytes = 0;
-  for (const file of walkFilesIfPresent(path.join(layout.immutable, "objects"))) {
+  for (const file of checkpointObjectFiles(
+    path.join(layout.immutable, "objects", "sha256"),
+  )) {
     if (referenced.has(path.resolve(file.path).toLowerCase())
       || file.modifiedAtMs > cutoff) continue;
     try {
@@ -123,6 +116,65 @@ export function pruneTrainingOrphans(layout, { minimumAgeMs }) {
     }
   }
   return { files: removedFiles, bytes: removedBytes, invalidReferences, skipped: false };
+}
+
+function checkpointPointerFiles(runsRoot) {
+  if (!fs.existsSync(runsRoot)) return [];
+  const result = [];
+  const pending = [runsRoot];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const child = path.join(directory, entry.name);
+      if (entry.name === "checkpoints") {
+        for (const pointer of fs.readdirSync(child, { withFileTypes: true })) {
+          if (pointer.isFile() && pointer.name.endsWith(".json")) {
+            result.push(path.join(child, pointer.name));
+          }
+        }
+      } else {
+        pending.push(child);
+      }
+    }
+  }
+  return result;
+}
+
+function checkpointObjectFiles(objectRoot) {
+  if (!fs.existsSync(objectRoot)) return [];
+  const result = [];
+  for (const prefix of fs.readdirSync(objectRoot, { withFileTypes: true })) {
+    if (!prefix.isDirectory()) continue;
+    const directory = path.join(objectRoot, prefix.name);
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".bin")) continue;
+      const file = path.join(directory, entry.name);
+      const stat = fs.statSync(file);
+      result.push({ path: file, bytes: stat.size, modifiedAtMs: stat.mtimeMs });
+    }
+  }
+  return result;
+}
+
+function isCheckpointReference(value) {
+  const object = value?.object;
+  if (value?.version !== 1
+    || value?.kind !== "trading-immutable-artifact"
+    || value?.mediaType !== "application/x-pytorch-checkpoint"
+    || !object
+    || typeof object !== "object"
+    || object.algorithm !== "sha256"
+    || object.compression !== "none"
+    || typeof object.contentHash !== "string"
+    || object.contentHash.length !== 64) return false;
+  const expected = path.posix.join(
+    "objects",
+    "sha256",
+    object.contentHash.slice(0, 2),
+    `${object.contentHash}.bin`,
+  );
+  return String(object.file ?? "").replaceAll("\\", "/") === expected;
 }
 
 function walkFiles(root) {
@@ -140,10 +192,6 @@ function walkFiles(root) {
     }
   }
   return result;
-}
-
-function walkFilesIfPresent(root) {
-  return fs.existsSync(root) ? walkFiles(root) : [];
 }
 
 function positiveGiB(name, fallback) {

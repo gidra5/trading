@@ -123,7 +123,7 @@ export class BinanceMarketStream {
     ) {
       const tick = parseTrade(data);
       if (tick) {
-        void this.handlers.onTick(tick);
+        this.dispatch("trade", () => this.handlers.onTick(tick));
       }
       return;
     }
@@ -131,7 +131,7 @@ export class BinanceMarketStream {
     if (stream.includes("@kline")) {
       const candle = parseKline(data);
       if (candle) {
-        void this.handlers.onCandle(candle);
+        this.dispatch("kline", () => this.handlers.onCandle(candle));
       }
       return;
     }
@@ -139,8 +139,18 @@ export class BinanceMarketStream {
     if (stream.includes("@depth")) {
       const snapshot = parseDepth(this.symbol, data);
       if (snapshot) {
-        void this.handlers.onOrderBook(snapshot);
+        this.dispatch("depth", () => this.handlers.onOrderBook(snapshot));
       }
+    }
+  }
+
+  private dispatch(label: string, handler: () => void | Promise<void>): void {
+    try {
+      void Promise.resolve(handler()).catch((error: unknown) => {
+        this.emitStatus(`Binance ${label} handler error: ${errorMessage(error)}`);
+      });
+    } catch (error) {
+      this.emitStatus(`Binance ${label} handler error: ${errorMessage(error)}`);
     }
   }
 
@@ -283,6 +293,10 @@ export class BinanceMarketStream {
       },
     ];
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function parseTrade(data: Record<string, unknown>): PriceTick | undefined {

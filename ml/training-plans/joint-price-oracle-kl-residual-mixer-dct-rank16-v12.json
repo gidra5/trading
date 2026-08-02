@@ -1,0 +1,84 @@
+{
+  "version": 12,
+  "id": "joint-price-oracle-kl-residual-mixer-dct-rank16-v12-1h-1m-1m",
+  "label": "Causal 1s joint price/oracle - learned multiscale trend/residual mixer - fixed DCT rank-16 logits - direct oracle KL - verified 1h/1m/1m oracle",
+  "targetReferenceDir": "data/training/immutable/refs/oracle/1s/hindsight-bot-71391c44b323e044e6ab",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "runDir": "data/training/runs/joint-price-oracle-kl-residual-mixer-dct-rank16-v12-1h-1m-1m",
+  "artifactDir": "data/models/joint-price-oracle/joint-price-oracle-kl-residual-mixer-dct-rank16-v12-1h-1m-1m",
+  "samplingIntervalMs": 1000,
+  "predictionDelayMs": 0,
+  "oracleTarget": {
+    "holdingPeriodSteps": 60,
+    "decisionDelaySteps": 60,
+    "valueHorizonSteps": 3600,
+    "options": {
+      "friction": 0.00175,
+      "minExposure": -250,
+      "maxExposure": 250,
+      "maxEffectiveExposure": 250,
+      "temperature": 0.01,
+      "quoteBorrowRate": 2.776390199537981e-7,
+      "assetBorrowRate": 2.776390199537981e-7
+    }
+  },
+  "dataSplit": {
+    "validationDays": 30,
+    "testDays": 30
+  },
+  "model": {
+    "variant": "multiscale_residual_mixer",
+    "contextLength": 3600,
+    "forecastHorizon": 3600,
+    "actionCount": 101,
+    "variableCount": 1,
+    "aggregateScales": [60, 300, 900],
+    "streamWidth": 64,
+    "streamMixerLayers": 2,
+    "streamFeedForwardWidth": 128,
+    "fusionWidth": 192,
+    "policyHiddenWidth": 192,
+    "policyLogitRank": 16,
+    "dropout": 0.05,
+    "forecastCoarseSteps": 60,
+    "forecastRank": 32,
+    "maximumLogMovement": 1,
+    "featureEpsilon": 1e-8
+  },
+  "training": {
+    "targetRepresentation": "verifiedOracleProbabilities",
+    "epochs": 128,
+    "batchSize": 512,
+    "evaluationBatchSize": 1024,
+    "gradientAccumulationSteps": 1,
+    "learningRate": 0.0001,
+    "betas": [0.9, 0.999],
+    "epsilon": 1e-8,
+    "weightDecay": 0.01,
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 3,
+      "threshold": 0.0001,
+      "minimumLearningRate": 0.000003
+    },
+    "gradientClip": 5,
+    "patience": 16,
+    "seed": 20260801,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16",
+    "logEverySteps": 100,
+    "closeCacheDays": 10,
+    "targetCacheDays": 3,
+    "prefetchBatches": 2,
+    "selectionMetric": "klDivergence",
+    "forecastHuberDelta": 1,
+    "volatilityFloor": 0.00001,
+    "lossWeights": {
+      "policyCrossEntropy": 1,
+      "conditionedPolicyCrossEntropy": 0,
+      "forecast": 0.01,
+      "softLayerNorm": 0.001
+    }
+  }
+}

@@ -4,3 +4,7 @@ export * from "./candles.js";
 export * from "./candle-recorder.js";
 export * from "./deduplicate.js";
 export * from "./layout.js";
+export * from "./trade-flow.js";
+export * from "./derivatives-metrics.js";
+export * from "./derivatives-klines.js";
+export * from "./derivatives-book-depth.js";

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "targetContract": "hindsight-bot-71391c44b323e044e6ab",
+  "referenceCount": 432,
+  "referenceFilenameSha256": "c84fa22b718c433544bfcf28cb2494b37b2bdd7d4b4ad2b18a24b2198f3d2beb",
+  "filenameHashEncoding": "utf8-lf-with-trailing-lf",
+  "train": {
+    "count": 372,
+    "first": "2021-09-08",
+    "last": "2026-05-24"
+  },
+  "validation": {
+    "count": 30,
+    "first": "2026-05-25",
+    "last": "2026-06-23"
+  },
+  "test": {
+    "count": 30,
+    "first": "2026-06-24",
+    "last": "2026-07-23",
+    "policy": "sealed-never-load"
+  }
+}

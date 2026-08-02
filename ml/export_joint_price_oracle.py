@@ -8,11 +8,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import onnx
+from onnx.reference import ReferenceEvaluator
+import numpy as np
 import torch
 
-from joint_price_oracle import ARCHITECTURE_CONTRACT
 from trading_storage import load_torch_checkpoint, require_under
-from train_joint_price_oracle import DATA_CONTRACT, build_model, resolve
+from train_joint_price_oracle import (
+    DATA_CONTRACT,
+    architecture_contract_for_model_config,
+    build_model,
+    configuration_fingerprint,
+    resolve,
+    resolve_training_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +35,9 @@ def export_best_artifact(plan_file: Path) -> dict:
     repo_root = Path(__file__).resolve().parents[1]
     resolved_plan = resolve(repo_root, plan_file)
     plan = json.loads(resolved_plan.read_text(encoding="utf-8"))
+    architecture_contract = architecture_contract_for_model_config(
+        plan["model"]
+    )
     run_dir = require_under(
         resolve(repo_root, Path(plan["runDir"])),
         repo_root / "data" / "training" / "runs",
@@ -43,11 +54,7 @@ def export_best_artifact(plan_file: Path) -> dict:
         map_location="cpu",
         weights_only=False,
     )
-    if checkpoint.get("planId") != plan["id"] \
-            or checkpoint.get("architectureContract") != ARCHITECTURE_CONTRACT \
-            or checkpoint.get("dataContract") != DATA_CONTRACT \
-            or checkpoint.get("modelConfig") != plan["model"]:
-        raise ValueError("best checkpoint does not match the export plan")
+    validate_export_checkpoint(checkpoint, plan)
     model = build_model(plan["model"])
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -73,6 +80,20 @@ def export_best_artifact(plan_file: Path) -> dict:
     )
     exported = onnx.load(temporary, load_external_data=True)
     onnx.checker.check_model(exported, full_check=True)
+    with torch.no_grad():
+        torch_logits = model(example).numpy()
+    onnx_logits = ReferenceEvaluator(exported).run(
+        ["action_logits"],
+        {"closes": example.numpy()},
+    )[0]
+    maximum_export_error = float(np.max(np.abs(
+        torch_logits - onnx_logits
+    )))
+    if not np.isfinite(onnx_logits).all() or maximum_export_error > 1e-3:
+        raise ValueError(
+            "ONNX output does not match the PyTorch checkpoint: "
+            f"max abs error {maximum_export_error}"
+        )
     os.replace(temporary, output_file)
     target_files = sorted(resolve(
         repo_root,
@@ -82,6 +103,16 @@ def export_best_artifact(plan_file: Path) -> dict:
         raise FileNotFoundError("verified oracle target references are missing")
     target_reference = json.loads(target_files[0].read_text(encoding="utf-8"))
     contract = target_reference["metadata"]["contract"]
+    decision_interval_ms = int(contract["decisionIntervalMs"])
+    decision_phase_ms = int(
+        target_reference["sequence"]["start"]
+    ) % decision_interval_ms
+    if any(
+        int(json.loads(file.read_text(encoding="utf-8"))["sequence"]["start"])
+        % decision_interval_ms != decision_phase_ms
+        for file in target_files[1:]
+    ):
+        raise ValueError("verified oracle targets do not share a decision phase")
     model_hash = hashlib.sha256(output_file.read_bytes()).hexdigest()
     status_file = run_dir / "state" / "status.json"
     status = (
@@ -90,14 +121,14 @@ def export_best_artifact(plan_file: Path) -> dict:
         else {}
     )
     manifest = {
-        "version": 1,
+        "version": 3,
         "kind": "joint-price-oracle",
         "id": plan["id"],
         "label": plan["label"],
         "createdAt": iso_now(),
         "modelFile": output_file.name,
         "modelSha256": model_hash,
-        "architectureContract": ARCHITECTURE_CONTRACT,
+        "architectureContract": architecture_contract,
         "dataContract": DATA_CONTRACT,
         "input": {
             "name": "closes",
@@ -112,7 +143,10 @@ def export_best_artifact(plan_file: Path) -> dict:
             "actionCount": plan["model"]["actionCount"],
             "actionGrid": contract["usableGrid"],
         },
-        "oracle": contract,
+        "oracle": {
+            **contract,
+            "decisionPhaseMs": decision_phase_ms,
+        },
         "training": {
             "bestEpoch": checkpoint["epoch"],
             "globalStep": checkpoint["globalStep"],
@@ -120,9 +154,34 @@ def export_best_artifact(plan_file: Path) -> dict:
             "test": status.get("test"),
             "datasetFingerprint": checkpoint["datasetFingerprint"],
         },
+        "calibration": {
+            "method": "identity",
+            "logitTemperature": 1.0,
+        },
+        "verification": {
+            "maximumAbsoluteLogitError": maximum_export_error,
+        },
     }
     atomic_json(manifest, artifact_dir / "manifest.json")
     return manifest
+
+
+def validate_export_checkpoint(checkpoint: dict, plan: dict) -> None:
+    """Reject artifacts whose model or resolved training contract drifted."""
+    architecture_contract = architecture_contract_for_model_config(
+        plan["model"]
+    )
+    training_fingerprint = configuration_fingerprint(
+        resolve_training_config(plan["training"])
+    )
+    if checkpoint.get("planId") != plan["id"] \
+            or checkpoint.get("architectureContract") \
+            != architecture_contract \
+            or checkpoint.get("dataContract") != DATA_CONTRACT \
+            or checkpoint.get("modelConfig") != plan["model"] \
+            or checkpoint.get("trainingConfigFingerprint") \
+            != training_fingerprint:
+        raise ValueError("best checkpoint does not match the export plan")
 
 
 def atomic_json(value: dict, file: Path) -> None:
