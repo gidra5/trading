@@ -143,18 +143,19 @@ ML model based on MLP:
       3. max deviation down from middle
       4. relative log volume over slow volume EMA 
    3. for each candle size last candle is the latest candle that may be partially complete
-   4. last 64 1s candles
-   5. no last 1s candle fill fraction, assume its the finest granularity
-   6. last 64 1m candles
-   7. last 1m candle fill fraction
-   8. last 32 1h candles
-   9. last 1h candle fill fraction
-   10. last 32 1d candles
-   11. last 1d candle fill fraction
-   12. last 16 1M candles
-   13. last 1M candle fill fraction
-   14. last 16 3M candles
-   15. last 3M candle fill fraction
+   4. We cover multiple scales of candle sizes: 1s, 1m, 1h, 1d, 1M, 3M
+   5. last 64 1s candles
+   6. no last 1s candle fill fraction, assume its the finest granularity
+   7. last 64 1m candles
+   8. last 1m candle fill fraction
+   9. last 32 1h candles
+   10. last 1h candle fill fraction
+   11. last 32 1d candles
+   12. last 1d candle fill fraction
+   13. last 16 1M candles
+   14. last 1M candle fill fraction
+   15. last 16 3M candles
+   16. last 3M candle fill fraction
 2. teacher and execution configuration, fixed for the current model and not
    included in its network inputs:
    1. fee rate
@@ -218,27 +219,22 @@ ML model based on MLP:
 
 Alternatives:
 1.  PatchTST
-2.  Decision Transformer
-3.  iTransformer
+3.  iTransformer, ipatch
 4.  encoder(-decoder)s
 5.  LSTM
-6.  DLinear
+6.  DLinear https://arxiv.org/html/2606.27282v1?utm_source=chatgpt.com https://arxiv.org/abs/2305.10721?utm_source=chatgpt.com https://arxiv.org/html/2403.14587v2 https://arxiv.org/pdf/2205.13504
 7.  TiDE https://arxiv.org/abs/2304.08424
 8.  DUET
 9.  TLOB https://arxiv.org/html/2502.15757v3
 10.  TQNet https://arxiv.org/abs/2505.12917?utm_source=chatgpt.com
-11.  MoE
-12.  FITS
-13.  TSMixer
+11.  MoE https://proceedings.mlr.press/v238/ni24a.html
+12.  FITS https://arxiv.org/abs/2307.03756?utm_source=chatgpt.com
+13.  TSMixer (https://arxiv.org/pdf/2303.06053, https://arxiv.org/abs/2405.14616?utm_source=chatgpt.com)
+14.  cmos https://proceedings.mlr.press/v267/si25a.html
+15.  sparsetsf https://proceedings.mlr.press/v235/lin24n.html?utm_source=chatgpt.com
+16.  GTR
 
 Insufficient margin trades should not happen
-
-Timestamp (UTC)	Usable-range KL after deep fitting	Action-mean RMSE
-2022-06-15 06:39:59	0.147	6.98×
-2022-06-16 16:58:59	0.045	3.01×
-2022-06-16 16:59:59	0.032	2.04×
-2025-06-05 02:11:59	0.058	5.89×
-2025-11-05 16:16:59	0.072	3.24×
 
 measure confidence as entropy of the predicted distribution - the more uniform it is, the more uncertain it is. that means confidence corresponds to lower entropy. since entropy is in range 0-inf, we should convert it to 0-1 range with exp(-entropy/temperature).
 

@@ -120,6 +120,18 @@ $$$$
 \left(Qh_t(e),\ \frac{e^+-(1+r_a)e^-}{h_t(e)}\right)
 $$
 
+
+$$
+\operatorname{maint}(\Phi_t^{-1}(Q,e))=
+\left(Q((1-e)^+-(1+r_q)(1-e)^-),\ \frac{Q}{p_t}(e^+-(1+r_a)e^-)\right)
+$$
+$$
+h_t(e)=((1-e)^++e^+-(1+r_q)(e^--(1-e)^-))
+$$$$
+\Phi_t
+\left(\operatorname{maint}(\Phi_t^{-1}(Q,e))\right)=
+\left(Qh_t(e),\ \frac{e^+-(1+r_a)e^-}{h_t(e)}\right)
+$$
 Now collapse passive holding after the target exposure has already been reached. With unit post-rebalance equity, target exposure $e$ corresponds to quote amount $1-e$ and base amount $e/p_t$ at $p_t$. During holding these amounts are not rebalanced. Owned amounts stay constant, borrowed amounts grow by maintenance, and exposure is re-marked at every intermediate price. For $j$ passive price moves define maintenance factors:
 $$
 \rho^q_{t,j}=\prod_{i=0}^{j-1}(1+r^q_{t+i}),

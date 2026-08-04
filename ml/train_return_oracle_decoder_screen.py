@@ -182,6 +182,48 @@ def persist_validated_epoch(
     return completed_epoch_limit_reached(stop_after_epoch, completed_epoch)
 
 
+def branch_checkpoint_from_best(
+    best_checkpoint: dict[str, Any],
+    evaluated_checkpoint: dict[str, Any],
+    *,
+    reduced_learning_rate: float,
+) -> dict[str, Any]:
+    """Restore the best trajectory while preserving monotonic run progress."""
+    if reduced_learning_rate <= 0 or not math.isfinite(reduced_learning_rate):
+        raise ValueError("reduced learning rate must be finite and positive")
+    if "validation" not in best_checkpoint:
+        raise ValueError("best checkpoint lacks validation metrics")
+    if best_checkpoint.get("planSha256") \
+            != evaluated_checkpoint.get("planSha256") \
+            or best_checkpoint.get("architectureContract") \
+            != evaluated_checkpoint.get("architectureContract") \
+            or best_checkpoint.get("selectionContract") \
+            != evaluated_checkpoint.get("selectionContract") \
+            or best_checkpoint.get("runnerContract") \
+            != evaluated_checkpoint.get("runnerContract"):
+        raise ValueError("best checkpoint is incompatible with current run")
+    branch = frozen_cpu_copy(best_checkpoint)
+    branch["epoch"] = int(evaluated_checkpoint["epoch"])
+    branch["globalStep"] = int(evaluated_checkpoint["globalStep"])
+    branch["trajectoryEpoch"] = int(best_checkpoint.get(
+        "trajectoryEpoch", best_checkpoint["epoch"]
+    ))
+    branch["staleEpochs"] = 0
+    branch["learningRateStaleEpochs"] = 0
+    branch["learningRateDecaySteps"] = int(
+        evaluated_checkpoint.get("learningRateDecaySteps", 0)
+    )
+    branch["restoreBestCount"] = int(
+        evaluated_checkpoint.get("restoreBestCount", 0)
+    ) + 1
+    branch["restoredFromBestEpoch"] = int(best_checkpoint["epoch"])
+    branch["restoredAtRunEpoch"] = int(evaluated_checkpoint["epoch"])
+    for optimizer_state in branch["optimizers"]:
+        for group in optimizer_state["param_groups"]:
+            group["lr"] = reduced_learning_rate
+    return branch
+
+
 def load_context(plan_path: Path) -> ScreenContext:
     repo_root = Path(__file__).resolve().parent.parent
     plan_file = resolve(repo_root, plan_path).resolve()
@@ -488,7 +530,8 @@ def restore_checkpoint(
     model_parameters: int,
     device: torch.device,
 ) -> tuple[
-    int, int, float, int, int, int | None, float | None, float | None, int, int
+    int, int, float, int, int, int | None, float | None, float | None, int, int,
+    int,
 ]:
     if checkpoint.get("planSha256") != context.plan_fingerprint \
             or checkpoint.get("architectureContract") \
@@ -544,6 +587,7 @@ def restore_checkpoint(
             "staleEpochs",
             max(0, int(checkpoint["epoch"]) - int(checkpoint["bestEpoch"])),
         ))),
+        int(checkpoint.get("trajectoryEpoch", checkpoint["epoch"])) + 1,
     )
 
 
@@ -554,6 +598,7 @@ def make_checkpoint(
     optimizers: tuple[torch.optim.Optimizer, torch.optim.Optimizer],
     schedulers: tuple[torch.optim.lr_scheduler.ReduceLROnPlateau, ...],
     epoch: int,
+    trajectory_epoch: int,
     global_step: int,
     best_raw_validation_kl: float,
     best_epoch: int,
@@ -573,6 +618,7 @@ def make_checkpoint(
         "optimizers": [optimizer.state_dict() for optimizer in optimizers],
         "schedulers": [scheduler.state_dict() for scheduler in schedulers],
         "epoch": epoch,
+        "trajectoryEpoch": trajectory_epoch,
         "globalStep": global_step,
         "bestRawValidationKl": best_raw_validation_kl,
         "bestEpoch": best_epoch,
@@ -637,6 +683,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
     curriculum_start_validation_entropy: float | None = None
     learning_rate_decay_steps = 0
     learning_rate_stale_epochs = 0
+    trajectory_epoch = 0
     last_checkpoint = context.run_dir / "checkpoints" / "last.json"
     best_checkpoint = context.run_dir / "checkpoints" / "best.json"
     if checkpoint_exists(last_checkpoint):
@@ -654,6 +701,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
             curriculum_start_validation_entropy,
             learning_rate_decay_steps,
             learning_rate_stale_epochs,
+            trajectory_epoch,
         ) = restore_checkpoint(
             checkpoint,
             context=context,
@@ -810,8 +858,10 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
         )
         return
     try:
-        for epoch in range(start_epoch, maximum_epochs):
+        epoch = start_epoch
+        while trajectory_epoch < maximum_epochs:
             epoch_started = time.monotonic()
+            evaluated_trajectory_epoch = trajectory_epoch
             per_epoch_gate = plan["curriculum"].get("gate", {}).get(
                 "evaluation"
             ) == "every-epoch"
@@ -823,12 +873,15 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 train_temperature = stateful_train_temperature
             else:
                 train_temperature = target_temperature(
-                    plan, epoch, curriculum_gate_epoch
+                    plan, evaluated_trajectory_epoch, curriculum_gate_epoch
                 )
             model.train()
             accumulator = MetricAccumulator()
             batches = dataset.iter_batches(
-                "train", batch_size, shuffle=True, seed=seed + epoch
+                "train",
+                batch_size,
+                shuffle=True,
+                seed=seed + evaluated_trajectory_epoch,
             )
             for batch_group in group_batches(
                 pipeline.batches(batches), accumulation
@@ -943,7 +996,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                     and curriculum_gate_epoch is None \
                     and gate_value is not None \
                     and gate_value <= float(gate["threshold"]):
-                curriculum_gate_epoch = epoch
+                curriculum_gate_epoch = evaluated_trajectory_epoch
                 gate_reached_now = True
             raw_kl = validation["rawBaseActionKl"]
             if not math.isfinite(raw_kl):
@@ -958,6 +1011,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 stale_epochs += 1
                 learning_rate_stale_epochs += 1
             learning_rate_before = float(optimizers[0].param_groups[0]["lr"])
+            learning_rate_reduced = False
             if learning_rate_schedule["type"] \
                     == "decay-every-prod-kl-stale-block":
                 learning_rate = next_stale_learning_rate(
@@ -970,10 +1024,14 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                         for group in optimizer.param_groups:
                             group["lr"] = learning_rate
                     learning_rate_decay_steps += 1
-            elif epoch >= schedule_start:
+                    learning_rate_reduced = True
+            elif evaluated_trajectory_epoch >= schedule_start:
                 for scheduler in schedulers:
                     scheduler.step(raw_kl)
                 learning_rate = float(optimizers[0].param_groups[0]["lr"])
+                learning_rate_reduced = learning_rate < learning_rate_before
+                if learning_rate_reduced:
+                    learning_rate_decay_steps += 1
             else:
                 learning_rate = learning_rate_before
             checkpoint = make_checkpoint(
@@ -982,6 +1040,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 optimizers=optimizers,
                 schedulers=schedulers,
                 epoch=epoch,
+                trajectory_epoch=evaluated_trajectory_epoch,
                 global_step=global_step,
                 best_raw_validation_kl=best_raw_validation_kl,
                 best_epoch=best_epoch,
@@ -998,6 +1057,52 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 learning_rate_stale_epochs=learning_rate_stale_epochs,
                 device=device,
             )
+            restored_from_best_epoch = None
+            pre_restore_stale_epochs = stale_epochs
+            pre_restore_learning_rate_stale_epochs = (
+                learning_rate_stale_epochs
+            )
+            if learning_rate_reduced:
+                if not checkpoint_exists(best_checkpoint):
+                    raise FileNotFoundError(
+                        "LR reduction requires a durable best checkpoint"
+                    )
+                durable_best = load_torch_checkpoint(
+                    best_checkpoint, map_location=device, weights_only=False
+                )
+                checkpoint = branch_checkpoint_from_best(
+                    durable_best,
+                    checkpoint,
+                    reduced_learning_rate=learning_rate,
+                )
+                (
+                    _next_run_epoch,
+                    _restored_global_step,
+                    best_raw_validation_kl,
+                    best_epoch,
+                    stale_epochs,
+                    curriculum_gate_epoch,
+                    next_train_temperature,
+                    curriculum_start_validation_entropy,
+                    learning_rate_decay_steps,
+                    learning_rate_stale_epochs,
+                    trajectory_epoch,
+                ) = restore_checkpoint(
+                    checkpoint,
+                    context=context,
+                    model=model,
+                    optimizers=optimizers,
+                    schedulers=schedulers,
+                    model_parameters=model_parameters,
+                    device=device,
+                )
+                restored_from_best_epoch = int(durable_best["epoch"])
+                gate_reached_now = False
+                next_entropy_goal = checkpoint["validation"][
+                    "curriculumTargetEntropy"
+                ]
+            else:
+                trajectory_epoch = evaluated_trajectory_epoch + 1
             pause_for_epoch_limit = persist_validated_epoch(
                 checkpoint,
                 last_checkpoint=last_checkpoint,
@@ -1009,6 +1114,8 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
             event = {
                 "event": "epoch",
                 "epoch": epoch,
+                "trajectoryEpoch": evaluated_trajectory_epoch,
+                "nextTrajectoryEpoch": trajectory_epoch,
                 "epochs": maximum_epochs,
                 "seconds": time.monotonic() - epoch_started,
                 "globalStep": global_step,
@@ -1034,7 +1141,17 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 "staleEpochs": stale_epochs,
                 "improved": improved,
                 "learningRate": learning_rate,
-                "learningRateReduced": learning_rate < learning_rate_before,
+                "learningRateReduced": learning_rate_reduced,
+                "learningRateReductionAction": (
+                    "restore-best-checkpoint"
+                    if learning_rate_reduced
+                    else None
+                ),
+                "restoredFromBestEpoch": restored_from_best_epoch,
+                "preRestoreStaleEpochs": pre_restore_stale_epochs,
+                "preRestoreLearningRateStaleEpochs": (
+                    pre_restore_learning_rate_stale_epochs
+                ),
                 "learningRateDecaySteps": learning_rate_decay_steps,
                 "learningRateScheduleMetric": (
                     learning_rate_schedule.get("metric")
@@ -1107,6 +1224,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                     "sealedTestEvaluated": False,
                 })
                 break
+            epoch += 1
     except KeyboardInterrupt:
         reporter.status(
             "paused",

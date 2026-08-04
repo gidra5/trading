@@ -32,6 +32,7 @@ from return_oracle_decoder_screen import (  # noqa: E402
 from trading_storage import load_torch_checkpoint  # noqa: E402
 from train_return_oracle_decoder_screen import (  # noqa: E402
     batch_metrics,
+    branch_checkpoint_from_best,
     completed_epoch_limit_reached,
     early_stopping_limit_reached,
     persist_validated_epoch,
@@ -56,6 +57,64 @@ PRESERVED_BEST = (
 
 
 class TemperatureCurriculumTests(unittest.TestCase):
+    def test_lr_reduction_branches_from_best_and_resets_trajectory(self) -> None:
+        shared = {
+            "planSha256": "a" * 64,
+            "architectureContract": "architecture-v1",
+            "selectionContract": "selection-v1",
+            "runnerContract": "runner-v1",
+        }
+        best = {
+            **shared,
+            "model": {"weight": torch.tensor([1.0])},
+            "optimizers": [{
+                "state": {},
+                "param_groups": [{"lr": 1e-4}],
+            }],
+            "schedulers": [],
+            "epoch": 12,
+            "globalStep": 120,
+            "bestRawValidationKl": 0.4,
+            "bestEpoch": 12,
+            "staleEpochs": 0,
+            "learningRateDecaySteps": 1,
+            "learningRateStaleEpochs": 0,
+            "validation": {"rawBaseActionKl": 0.4},
+        }
+        evaluated = {
+            **shared,
+            "model": {"weight": torch.tensor([2.0])},
+            "optimizers": [{
+                "state": {},
+                "param_groups": [{"lr": 5e-5}],
+            }],
+            "epoch": 28,
+            "globalStep": 280,
+            "learningRateDecaySteps": 2,
+            "restoreBestCount": 3,
+        }
+        branch = branch_checkpoint_from_best(
+            best,
+            evaluated,
+            reduced_learning_rate=5e-5,
+        )
+        torch.testing.assert_close(
+            branch["model"]["weight"], best["model"]["weight"]
+        )
+        self.assertEqual(branch["epoch"], 28)
+        self.assertEqual(branch["trajectoryEpoch"], 12)
+        self.assertEqual(branch["globalStep"], 280)
+        self.assertEqual(branch["staleEpochs"], 0)
+        self.assertEqual(branch["learningRateStaleEpochs"], 0)
+        self.assertEqual(branch["learningRateDecaySteps"], 2)
+        self.assertEqual(branch["restoreBestCount"], 4)
+        self.assertEqual(branch["restoredFromBestEpoch"], 12)
+        self.assertEqual(branch["restoredAtRunEpoch"], 28)
+        self.assertEqual(
+            branch["optimizers"][0]["param_groups"][0]["lr"], 5e-5
+        )
+        self.assertEqual(best["optimizers"][0]["param_groups"][0]["lr"], 1e-4)
+
     def test_production_entropy_confidence_weighting_prefers_sharper_targets(
         self,
     ) -> None:

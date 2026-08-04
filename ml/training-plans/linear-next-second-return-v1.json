@@ -1,0 +1,30 @@
+{
+  "id": "linear-next-second-return-v1",
+  "label": "Linear ridge baseline: 120x1s returns to next 1s return",
+  "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "datasetDir": "data/training/datasets/linear-next-second-return-v1",
+  "runDir": "data/training/runs/linear-next-second-return-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "testExamples": 1000000,
+  "expectedCorpusFingerprint": "879aaeaa955e077dd44a29bf67003871de94e73ac6db9a3446c9b0cd9f597a85",
+  "fit": {
+    "contract": "train-standardized-120-second-log-returns-to-next-standardized-second-return-linear-ridge-v1",
+    "device": "cuda",
+    "statisticsBatchSize": 86400,
+    "evaluationBatchSize": 86400,
+    "ridgeLambdas": [
+      0,
+      1e-8,
+      1e-7,
+      0.000001,
+      0.00001,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1,
+      10,
+      100
+    ]
+  }
+}
