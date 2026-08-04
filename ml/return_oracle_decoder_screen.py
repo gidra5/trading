@@ -15,8 +15,11 @@ from return_oracle_ce import (
     INPUT_RETURN_COUNT,
     LearnableCenteringNorm,
     OUTPUT_ACTION_COUNT,
+    centering_matrix_constraint_components,
     dropout_gate_probability,
     fused_glu,
+    soft_layer_norm_components,
+    soft_weight_bound_penalty,
 )
 
 
@@ -90,6 +93,87 @@ def training_temperature(plan: dict[str, Any], epoch: int) -> float:
     return selected.temperature
 
 
+def target_temperature(
+    plan: dict[str, Any],
+    epoch: int,
+    gate_epoch: int | None = None,
+) -> float:
+    curriculum_type = plan["curriculum"].get("type")
+    if curriculum_type == "target-probability-temperature-power":
+        return training_temperature(plan, epoch)
+    raise ValueError(f"unsupported temperature curriculum: {curriculum_type}")
+
+
+def next_equal_entropy_step_training_temperature(
+    plan: dict[str, Any],
+    current_temperature: float,
+    validation_kl: float,
+    validation_target_entropy: float,
+    production_target_entropy: float,
+    start_target_entropy: float,
+    entropy_log_temperature_derivative: float,
+) -> tuple[float, float]:
+    """Take one fixed validation-entropy step after the KL gate passes."""
+    curriculum = plan["curriculum"]
+    final_temperature = float(curriculum["finalTemperature"])
+    entropy_intervals = int(curriculum["entropySchedulePoints"]) - 1
+    entropy_decrease = (
+        start_target_entropy - production_target_entropy
+    ) / entropy_intervals
+    next_target_entropy = max(
+        production_target_entropy,
+        validation_target_entropy - entropy_decrease,
+    )
+    threshold = float(curriculum["gate"]["threshold"])
+    if validation_kl > threshold:
+        return current_temperature, validation_target_entropy
+    if next_target_entropy >= validation_target_entropy \
+            or current_temperature <= final_temperature:
+        return current_temperature, production_target_entropy
+    minimum_derivative = float(
+        curriculum["solver"]["minimumEntropyDerivative"]
+    )
+    derivative = max(
+        entropy_log_temperature_derivative,
+        minimum_derivative,
+    )
+    log_temperature_change = (
+        next_target_entropy - validation_target_entropy
+    ) / derivative
+    next_temperature = current_temperature * math.exp(log_temperature_change)
+    return (
+        max(final_temperature, min(current_temperature, next_temperature)),
+        next_target_entropy,
+    )
+
+
+def next_stale_learning_rate(
+    schedule: dict[str, Any],
+    current_learning_rate: float,
+    stale_epochs: int,
+) -> float:
+    """Decay after each complete block of stale production-KL epochs."""
+    if current_learning_rate <= 0 or not math.isfinite(current_learning_rate):
+        raise ValueError("current learning rate must be finite and positive")
+    stale_block = int(schedule["staleEpochsPerReduction"])
+    qualifying_stale_epochs = int(schedule["qualifyingStaleEpochs"])
+    if stale_epochs <= 0 or stale_epochs > qualifying_stale_epochs:
+        return current_learning_rate
+    if stale_epochs == qualifying_stale_epochs:
+        final_block = qualifying_stale_epochs % stale_block
+        if final_block == 0:
+            final_block = stale_block
+        decay_factor = float(schedule["perEpochDecayFactor"]) ** final_block
+    elif stale_epochs % stale_block == 0:
+        decay_factor = float(schedule["decayFactor"])
+    else:
+        return current_learning_rate
+    return max(
+        float(schedule["finalLearningRate"]),
+        current_learning_rate * decay_factor,
+    )
+
+
 def smooth_oracle_probabilities(
     probabilities: Tensor,
     *,
@@ -123,6 +207,72 @@ def smooth_oracle_probabilities(
     return torch.softmax(log_probabilities * exponent, dim=-1)
 
 
+def production_entropy_confidence_weights(
+    target_probabilities: Tensor,
+    example_weights: Tensor,
+    strength: float,
+) -> Tensor:
+    """Upweight sharper production targets without dropping examples."""
+    if target_probabilities.ndim != 2:
+        raise ValueError("target probabilities must be [example, action]")
+    if example_weights.shape != (target_probabilities.shape[0],):
+        raise ValueError("example weights must contain one value per example")
+    if not math.isfinite(strength) or strength < 0:
+        raise ValueError("confidence-weighting strength must be finite and nonnegative")
+    target = target_probabilities.float().clamp_min(0)
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    target_log = torch.where(
+        target > 0,
+        target.clamp_min(torch.finfo(torch.float32).tiny).log(),
+        torch.zeros_like(target),
+    )
+    target_entropy = -(target * target_log).sum(dim=-1)
+    return example_weights.float().clamp_min(0) * torch.exp(
+        -float(strength) * target_entropy
+    )
+
+
+def weighted_target_entropy_log_temperature_derivative(
+    source_probabilities: Tensor,
+    target_probabilities: Tensor,
+    example_weights: Tensor,
+    *,
+    source_temperature: float,
+    target_temperature: float,
+) -> Tensor:
+    """Derivative of mean target entropy with respect to log temperature."""
+    if source_probabilities.ndim != 2 \
+            or target_probabilities.shape != source_probabilities.shape:
+        raise ValueError("source and target probabilities must match")
+    if example_weights.shape != (source_probabilities.shape[0],):
+        raise ValueError("example weights must contain one value per example")
+    source = source_probabilities.float().clamp_min(0)
+    source = source / source.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    target = target_probabilities.float().clamp_min(0)
+    target = target / target.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    source_log = torch.where(
+        source > 0,
+        source.clamp_min(torch.finfo(torch.float32).tiny).log(),
+        torch.zeros_like(source),
+    )
+    expected_log = (target * source_log).sum(dim=-1, keepdim=True)
+    log_variance = (
+        target * (source_log - expected_log).square()
+    ).sum(dim=-1)
+    exponent = source_temperature / target_temperature
+    per_example_derivative = exponent * exponent * log_variance
+    weights = example_weights.float().clamp_min(0)
+    return (per_example_derivative * weights).sum() / weights.sum().clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+
+
 def weighted_policy_metrics(
     predicted_logits: Tensor,
     target_probabilities: Tensor,
@@ -141,6 +291,7 @@ def weighted_policy_metrics(
         torch.finfo(torch.float32).tiny
     )
     predicted_log = torch.log_softmax(predicted_logits.float(), dim=-1)
+    predicted_probabilities = predicted_log.exp()
     cross_entropy = -(target * predicted_log).sum(dim=-1)
     target_log = torch.where(
         target > 0,
@@ -148,7 +299,8 @@ def weighted_policy_metrics(
         torch.zeros_like(target),
     )
     target_entropy = -(target * target_log).sum(dim=-1)
-    probability_mse = (predicted_log.exp() - target).square().mean(dim=-1)
+    predicted_entropy = -(predicted_probabilities * predicted_log).sum(dim=-1)
+    probability_mse = (predicted_probabilities - target).square().mean(dim=-1)
     weights = example_weights.float().clamp_min(0)
     weight_sum = weights.sum().clamp_min(torch.finfo(torch.float32).tiny)
 
@@ -160,6 +312,7 @@ def weighted_policy_metrics(
         "rawBaseActionKl": mean(cross_entropy - target_entropy),
         "rawProbabilityMse": mean(probability_mse),
         "rawTargetEntropy": mean(target_entropy),
+        "rawPredictedEntropy": mean(predicted_entropy),
     }
 
 
@@ -314,7 +467,10 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
             *(layer.weight for layer in self.gate_transforms),
         )
 
-    def forward(self, features: Tensor) -> Tensor:
+    def forward_with_regularizers(
+        self,
+        features: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         hidden = (features.float() - self.feature_mean) / self.feature_std
         intermittent_dropout = (
             self.training
@@ -327,6 +483,8 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
             if intermittent_dropout
             else None
         )
+        mean_penalties: list[Tensor] = []
+        variance_penalties: list[Tensor] = []
         for (
             layer,
             value_normalizer,
@@ -345,7 +503,7 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
             self.gate_transforms,
             strict=True,
         ):
-            hidden, _raw_value, _raw_gate = fused_glu(
+            hidden, raw_value, raw_gate = fused_glu(
                 layer(hidden),
                 value_normalizer,
                 gate_normalizer,
@@ -354,6 +512,16 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
                 value_transform,
                 gate_transform,
             )
+            branch_components = tuple(
+                soft_layer_norm_components(branch)
+                for branch in (raw_value, raw_gate)
+            )
+            mean_penalties.append(torch.stack(tuple(
+                mean for mean, _variance in branch_components
+            )).mean(dim=0))
+            variance_penalties.append(torch.stack(tuple(
+                variance for _mean, variance in branch_components
+            )).mean(dim=0))
             if self.training and self.dropout.p > 0:
                 if self.dropout_rate >= 1:
                     hidden = self.dropout(hidden)
@@ -367,7 +535,48 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
                         self.dropout(hidden),
                         hidden,
                     )
-        return self.output(hidden)
+        return (
+            self.output(hidden),
+            torch.stack(mean_penalties).mean(dim=0),
+            torch.stack(variance_penalties).mean(dim=0),
+        )
+
+    def regularizer_parameter_penalties(
+        self,
+        *,
+        desired_weight_magnitude: float,
+        weight_bound_sharpness: float,
+        absolute_epsilon: float,
+        include_centering_constraint: bool,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        bounded_weights = tuple(
+            parameter
+            for parameter in self.parameters()
+            if parameter.requires_grad and parameter.ndim == 2
+        )
+        weight_bound = soft_weight_bound_penalty(
+            bounded_weights,
+            desired_magnitude=desired_weight_magnitude,
+            sharpness=weight_bound_sharpness,
+            absolute_epsilon=absolute_epsilon,
+        )
+        if not include_centering_constraint:
+            zero = weight_bound.new_zeros(())
+            return weight_bound, zero, zero
+        centering_matrices = tuple(
+            normalizer.weight
+            for normalizer in (
+                *self.value_centering_normalizers,
+                *self.gate_centering_normalizers,
+            )
+        )
+        idempotence, symmetry = centering_matrix_constraint_components(
+            centering_matrices
+        )
+        return weight_bound, idempotence, symmetry
+
+    def forward(self, features: Tensor) -> Tensor:
+        return self.forward_with_regularizers(features)[0]
 
 
 DecoderModel = ResidualGluDecoder | LearnedRadiusShrinkingDecoder
@@ -450,27 +659,92 @@ def validate_screen_plan(plan: dict[str, Any]) -> None:
         "contract": SELECTION_CONTRACT,
     }:
         raise ValueError("decoder screen selection must be raw exact-temperature KL")
-    if plan["objective"] != {
+    objective = plan["objective"]
+    objective_base = {
         "type": "soft-target-cross-entropy",
         "trainingTargets": "curriculum-temperature",
         "validationTargets": "stored-production-0.01",
-        "regularizers": [],
-    }:
-        raise ValueError("decoder screen objective must be plain soft-target CE")
+    }
+    if any(objective.get(key) != value for key, value in objective_base.items()):
+        raise ValueError("decoder screen objective contract is invalid")
+    training_weighting = objective.get("trainingExampleWeighting")
+    if training_weighting is not None:
+        strength = training_weighting.get("lambda")
+        if training_weighting.get("type") \
+                != "production-target-entropy-confidence" \
+                or training_weighting.get("validationWeights") != "unchanged" \
+                or isinstance(strength, bool) \
+                or not isinstance(strength, (int, float)) \
+                or not math.isfinite(float(strength)) \
+                or float(strength) <= 0:
+            raise ValueError("decoder training example weighting is invalid")
+    regularizers = objective.get("regularizers")
+    restored_regularizers = {
+        "softLayerNorm": {
+            "weight": 1,
+            "varianceWeight": 1,
+            "measurement": "raw-value-and-gate-projections",
+        },
+        "softWeightBound": {
+            "weight": 0.01,
+            "desiredMagnitude": 1,
+            "sharpness": 10,
+            "absoluteEpsilon": 1e-8,
+        },
+        "centeringConstraint": {
+            "idempotenceWeight": 1,
+            "symmetryWeight": 1,
+            "matrices": "independent-value-and-gate",
+        },
+    }
+    restored_without_centering = {
+        key: value
+        for key, value in restored_regularizers.items()
+        if key != "centeringConstraint"
+    }
+    if regularizers not in (
+        [], restored_regularizers, restored_without_centering
+    ):
+        raise ValueError("decoder screen regularizer contract is invalid")
     curriculum = plan["curriculum"]
-    if curriculum.get("type") != "target-probability-temperature-power" \
-            or float(curriculum.get("sourceTemperature", -1)) \
+    curriculum_type = curriculum.get("type")
+    if curriculum_type not in {
+        "target-probability-temperature-power",
+        "kl-gated-equal-validation-entropy-steps-target-probability-temperature",
+    } or float(curriculum.get("sourceTemperature", -1)) \
             != PRODUCTION_ORACLE_TEMPERATURE:
         raise ValueError("decoder temperature curriculum contract is invalid")
-    stages = temperature_stages(plan)
-    if not stages or stages[0].start_epoch != 0 \
-            or any(stage.start_epoch < 0 or stage.temperature <= 0
-                   for stage in stages) \
-            or any(right.start_epoch <= left.start_epoch
-                   for left, right in zip(stages, stages[1:])) \
-            or stages[-1].temperature != PRODUCTION_ORACLE_TEMPERATURE:
-        raise ValueError("curriculum stages must end at production temperature")
     training = plan["training"]
+    if curriculum_type == "target-probability-temperature-power":
+        stages = temperature_stages(plan)
+        if not stages or stages[0].start_epoch != 0 \
+                or any(stage.start_epoch < 0 or stage.temperature <= 0
+                       for stage in stages) \
+                or any(right.start_epoch <= left.start_epoch
+                       for left, right in zip(stages, stages[1:])) \
+                or stages[-1].temperature != PRODUCTION_ORACLE_TEMPERATURE:
+            raise ValueError(
+                "curriculum stages must end at production temperature"
+            )
+        final_temperature_epoch = stages[-1].start_epoch
+    else:
+        gate = curriculum.get("gate", {})
+        entropy_schedule_points = curriculum.get("entropySchedulePoints")
+        solver = curriculum.get("solver", {})
+        if isinstance(entropy_schedule_points, bool) \
+                or not isinstance(entropy_schedule_points, int) \
+                or entropy_schedule_points < 2 \
+                or float(curriculum.get("startTemperature", 0)) \
+                <= PRODUCTION_ORACLE_TEMPERATURE \
+                or float(curriculum.get("finalTemperature", -1)) \
+                != PRODUCTION_ORACLE_TEMPERATURE \
+                or gate.get("metric") != "curriculumTargetKl" \
+                or gate.get("evaluation") != "every-epoch" \
+                or not 0 < float(gate.get("threshold", 0)) < 1 \
+                or solver.get("type") != "log-temperature-newton" \
+                or float(solver.get("minimumEntropyDerivative", 0)) <= 0:
+            raise ValueError("KL-gated temperature curriculum is invalid")
+        final_temperature_epoch = entropy_schedule_points - 1
     positive = (
         "epochs", "batchSize", "evaluationBatchSize",
         "gradientAccumulationSteps", "learningRate", "gradientClip",
@@ -478,7 +752,7 @@ def validate_screen_plan(plan: dict[str, Any]) -> None:
     )
     if any(float(training.get(field, 0)) <= 0 for field in positive):
         raise ValueError("decoder screen training settings are invalid")
-    if stages[-1].start_epoch >= int(training["epochs"]):
+    if final_temperature_epoch >= int(training["epochs"]):
         raise ValueError("screen must train at production temperature")
     if training.get("mixedPrecision") != "bfloat16":
         raise ValueError("decoder screen requires bfloat16 mixed precision")
@@ -486,13 +760,55 @@ def validate_screen_plan(plan: dict[str, Any]) -> None:
     if optimizer.get("type") != "hybrid-muon-adamw":
         raise ValueError("decoder screen optimizer contract is invalid")
     schedule = training.get("learningRateSchedule", {})
-    if schedule.get("type") != "reduce-on-raw-validation-kl-plateau" \
-            or int(schedule.get("startEpoch", -1)) < 0 \
-            or not 0 < float(schedule.get("factor", 0)) < 1 \
-            or int(schedule.get("patience", 0)) < 1 \
-            or float(schedule.get("threshold", -1)) < 0 \
-            or not 0 < float(schedule.get("minimumLearningRate", 0)) \
-            <= float(training["learningRate"]):
+    schedule_type = schedule.get("type")
+    if schedule_type == "reduce-on-raw-validation-kl-plateau":
+        valid_schedule = (
+            int(schedule.get("startEpoch", -1)) >= 0
+            and 0 < float(schedule.get("factor", 0)) < 1
+            and int(schedule.get("patience", 0)) >= 1
+            and float(schedule.get("threshold", -1)) >= 0
+            and 0 < float(schedule.get("minimumLearningRate", 0))
+            <= float(training["learningRate"])
+        )
+    elif schedule_type == "decay-every-prod-kl-stale-block":
+        qualifying_stale_epochs = int(schedule.get("qualifyingStaleEpochs", 0))
+        stale_epochs_per_reduction = int(
+            schedule.get("staleEpochsPerReduction", 0)
+        )
+        start_learning_rate = float(schedule.get("startLearningRate", 0))
+        final_learning_rate = float(schedule.get("finalLearningRate", 0))
+        per_epoch_decay_factor = float(schedule.get("perEpochDecayFactor", 0))
+        decay_factor = float(schedule.get("decayFactor", 0))
+        valid_schedule = (
+            schedule.get("metric") == "rawBaseActionKl"
+            and math.isclose(
+                start_learning_rate,
+                float(training["learningRate"]),
+                rel_tol=0,
+                abs_tol=1e-15,
+            )
+            and 0 < final_learning_rate < start_learning_rate
+            and qualifying_stale_epochs >= 1
+            and 1 <= stale_epochs_per_reduction <= qualifying_stale_epochs
+            and 0 < per_epoch_decay_factor < 1
+            and 0 < decay_factor < 1
+            and math.isclose(
+                start_learning_rate
+                * per_epoch_decay_factor ** qualifying_stale_epochs,
+                final_learning_rate,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+            and math.isclose(
+                per_epoch_decay_factor ** stale_epochs_per_reduction,
+                decay_factor,
+                rel_tol=1e-12,
+                abs_tol=1e-15,
+            )
+        )
+    else:
+        valid_schedule = False
+    if not valid_schedule:
         raise ValueError("decoder screen LR schedule is invalid")
     early_stopping_patience = training.get("earlyStoppingPatience")
     if early_stopping_patience is not None \
@@ -505,6 +821,8 @@ def validate_screen_plan(plan: dict[str, Any]) -> None:
             "decoder earlyStoppingPatience must be a positive integer"
         )
     architecture = plan["architecture"]
+    if regularizers and architecture.get("type") != "learned-radius-shrinking":
+        raise ValueError("restored regularizers require learned-radius architecture")
     if architecture.get("type") == "residual-glu":
         if architecture.get("contract") != RESIDUAL_GLU_ARCHITECTURE \
                 or int(architecture.get("width", 0)) <= 0 \

@@ -268,10 +268,7 @@ try finding simpler learning tasks and then gradually move to the full model:
 2. add oracle moving average
 3. freezing inner layers after/before some layer.
 4. add candle size scaling - the larger the candle, the more of a "rough" idea the oracle has about optimal path. That is basically a proxy for oracle transition path - the more opportunities oracle has for transitions, the more intricate distribution becomes. If oracle only can do one action for the full value horizon, then its decision policy is very simple - depending on the next candle either enter, exit or stay, depending on current position. The candle span tells us how uncertain it is going to be.
-5. add temperature scaling - the higher means more diffuse and even distribution
-   1. Lets add gradual temperature learning. Start training with high temperature (like 0.1-0.5) and once we saturate scale it down with some factor (like 0.75) until we hit target temperature of 0.01. Then on each new delay set it proportional to initial KL loss in some way, such that we will have the distributions much closer overall (within the target KL). Thus a condition for reducing delay becomes KL<0.15 and temp=0.01. Note that setting initial temp to already equal target temp
 
-6. test a simple kind of encoder - get full minute candle data and encode into PDF of actions that should match the oracle distribution.
 7. make a joint model with encoder and diffusion model. the encoder will condition the diffusion model, and diffusion model will generate the oracle distribution. We can use temperature as our "noise" parameter, since it evens out the distributions.
 8. codex suggests freezing the parameters of hidden layers, and only train the output layer for a while, when we move to the next delay.
 9. Maybe it makes sense to design architecture around trading intuition? Like for example main elements of a strategy are trend estimator, mean-reversion estimator, (anticipatory) entry estimator, volatility estimator (direct or through er, volume), and confidence estimator (position sizing and entry), which are used to determine overall market dynamics and what should we do exactly. The idea for using them is mostly as follows:
@@ -407,7 +404,6 @@ The plan can be something like this:
 1. For decoder:
    1. Simple MLP seems to suffice when given already sufficient information.
    2. There are many experiments I've ran and some of them are still unfinished, because i wanted to run all of them up to 200 epochs and then decide which of them are worth keeping based on if they genuenly plateaued/diverged/overfit or they are still improving at a similar pace to the training improvements. if they diverged/overfit then we can be sure to drop them, and choose a few of the best from the other ones.
-   3. Maybe can train faster/better on simplified distributions - higher temp (smoother distribution), larger oracle's delay/hold timing (less actions per horizon -> smoother distribution).
    4. For this one the most important metric is validation base-action KL, which measures how well the model fits the oracle policy. The lower the better, and preferably at least 0.1 +- 0.01
    5. The input for it is basically 60 normalized closes for the window that the oracle used, in the interval (t, t+60]. The oracle is 1h horizon / 1m delay / 1m hold / temperature 0.01 at some time t.
 3. For predictor:

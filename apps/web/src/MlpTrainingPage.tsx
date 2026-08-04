@@ -42,6 +42,15 @@ interface MetricValues {
   centeringSymmetry?: number;
   distanceImbalanceWeight?: number;
   timeWeightEffectiveSampleRatio?: number;
+  curriculumTargetKl?: number;
+  curriculumTargetProbabilityMse?: number;
+  curriculumTargetEntropy?: number;
+  trainingCrossEntropy?: number;
+  rawCrossEntropy?: number;
+  rawBaseActionKl?: number;
+  rawProbabilityMse?: number;
+  rawTargetEntropy?: number;
+  regularizationLoss?: number;
 }
 
 interface TrainingEvent {
@@ -194,6 +203,10 @@ interface EpochPoint {
   validation: MetricValues;
   bestValidation?: number;
   staleEpochs?: number;
+  trainingTargetTemperature?: number;
+  curriculumTargetKl?: number;
+  learningRate?: number;
+  seconds?: number;
 }
 
 interface PlotPoint {
@@ -364,8 +377,16 @@ export function MlpTrainingPage() {
           globalStep: numberValue(event.globalStep) ?? epoch,
           train: metricValues(event.train),
           validation: metricValues(event.validation),
-          bestValidation: numberValue(event.bestValidation),
+          bestValidation: numberValue(event.bestValidation)
+            ?? numberValue(event.bestRawValidationKl),
           staleEpochs: numberValue(event.staleEpochs),
+          trainingTargetTemperature: numberValue(
+            event.trainingTargetTemperature,
+          ),
+          curriculumTargetKl: numberValue(event.curriculumValidationKl)
+            ?? metricValues(event.validation).curriculumTargetKl,
+          learningRate: numberValue(event.learningRate),
+          seconds: numberValue(event.seconds),
         });
       }
     }
@@ -437,6 +458,10 @@ export function MlpTrainingPage() {
   });
   const latestStep = createMemo(() => trainSteps().at(-1));
   const latestEpoch = createMemo(() => epochs().at(-1));
+  const hasCurriculumEpochs = createMemo(() => epochs().some(
+    (point) => point.trainingTargetTemperature !== undefined
+      && point.curriculumTargetKl !== undefined,
+  ));
   const stage = createMemo(() => snapshot()?.status?.stage ?? "idle");
   const stageProgress = createMemo(() => {
     if (stage().startsWith("dataset")) {
@@ -528,7 +553,13 @@ export function MlpTrainingPage() {
             />
           </div>
           <div class="flex flex-wrap justify-between gap-2 text-xs text-ink-300">
-            <span>{progressLabel(stage(), latestDataset(), latestStep(), snapshot()?.plan.epochs)}</span>
+            <span>{progressLabel(
+              stage(),
+              latestDataset(),
+              latestStep(),
+              latestEpoch(),
+              snapshot()?.plan.epochs,
+            )}</span>
             <Show when={snapshot()?.plan.patience !== undefined}>
               <span>Early-stop patience: {snapshot()?.plan.patience} epochs</span>
             </Show>
@@ -550,13 +581,84 @@ export function MlpTrainingPage() {
             subtitle={stage() === "archived"
               ? `${trainSteps().length} historical updates · ${epochs().length} completed epochs`
               : stage() === "training"
-              ? `${trainSteps().length} logged updates · updating live`
+              ? epochs().length > 0
+                ? `${epochs().length} completed epochs · updating live`
+                : `${trainSteps().length} logged updates · updating live`
               : trainSteps().length > 0
                 ? `${trainSteps().length} updates from the most recent training attempt; live updates resume after refinement`
                 : "Plots will populate when refinement hands off to weight training"}
           />
           <Show when={trainSteps().length > 0 || epochs().length > 0} fallback={<WaitingForTraining stage={stage()} />}>
             <div class="grid min-w-0 gap-3 xl:grid-cols-2">
+              <Show when={hasCurriculumEpochs()}>
+                <MetricChart title="Gate: curriculum target KL" subtitle="Temperature takes one downward step only when validation KL is at or below 0.05" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "curriculumTargetKl"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "curriculumTargetKl"),
+                  constantEpochPlot("Gate threshold", "#fb7185", epochs(), 0.05),
+                ]} />
+              </Show>
+              <Show when={epochs().some((point) => point.trainingTargetTemperature !== undefined)}>
+                <MetricChart title="Curriculum target temperature" subtitle="Held when validation KL exceeds 0.05; every allowed change targets one equal validation-entropy decrease toward 0.01" scale="log" xLabel="epoch" series={[
+                  directEpochPlot("Target temperature", "#fb7185", epochs(), "trainingTargetTemperature"),
+                ]} />
+              </Show>
+              <Show when={hasCurriculumEpochs()}>
+                <MetricChart title="Curriculum target cross-entropy" subtitle="The optimization objective at the current target temperature" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "trainingCrossEntropy"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "trainingCrossEntropy"),
+                ]} />
+                <MetricChart title="Combined training objective" subtitle="Curriculum cross-entropy plus restored regularizers" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "loss"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "loss"),
+                ]} />
+                <MetricChart title="Soft-layer normalization" subtitle="Weight 1 · raw value and gate projections" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "softLayerNorm"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "softLayerNorm"),
+                ]} />
+                <MetricChart title="Soft weight bound" subtitle="Displayed before its 0.01 loss weight" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "softWeightBound"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "softWeightBound"),
+                ]} />
+                <MetricChart title="Soft-target cross-entropy" subtitle="Validation distribution at the current curriculum temperature" xLabel="epoch" series={[
+                  epochPlot("Cross entropy", "#f5b84b", epochs(), "validation", "trainingCrossEntropy"),
+                  epochPlot("Oracle entropy", "#22c55e", epochs(), "validation", "curriculumTargetEntropy"),
+                  epochPlot("Predicted entropy", "#38bdf8", epochs(), "validation", "predictedEntropy"),
+                ]} />
+                <MetricChart title="Raw production-temperature KL" subtitle="At target temperature 0.01, this becomes identical to curriculum target KL" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "rawBaseActionKl"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "rawBaseActionKl"),
+                  directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
+                ]} />
+                <MetricChart title="Raw production-temperature cross-entropy" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "rawCrossEntropy"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "rawCrossEntropy"),
+                ]} />
+                <MetricChart title="Production-temperature entropy" subtitle="Validation distribution against the production oracle at temperature 0.01" xLabel="epoch" series={[
+                  epochPlot("Cross entropy", "#f5b84b", epochs(), "validation", "rawCrossEntropy"),
+                  epochPlot("Oracle entropy", "#22c55e", epochs(), "validation", "rawTargetEntropy"),
+                  epochPlot("Predicted entropy", "#38bdf8", epochs(), "validation", "predictedEntropy"),
+                ]} />
+                <MetricChart title="Raw production-temperature probability MSE" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "rawProbabilityMse"),
+                  epochPlot("Validation", "#f05252", epochs(), "validation", "rawProbabilityMse"),
+                ]} />
+                <MetricChart title="Curriculum target probability MSE" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "curriculumTargetProbabilityMse"),
+                  epochPlot("Validation", "#f05252", epochs(), "validation", "curriculumTargetProbabilityMse"),
+                ]} />
+                <MetricChart title="Curriculum target entropy" subtitle="Every allowed temperature change targets the same validation-entropy decrease; KL-gate holds create plateaus" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "curriculumTargetEntropy"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "curriculumTargetEntropy"),
+                ]} />
+                <MetricChart title="Learning rate" subtitle="Rate calibrated from 1e-4 toward 1e-6 over 300 stale epochs, applied in 24-epoch blocks; an improvement resets the plateau counter" scale="log" xLabel="epoch" series={[
+                  directEpochPlot("Learning rate", "#38bdf8", epochs(), "learningRate"),
+                ]} />
+                <MetricChart title="Epoch duration" unit="seconds" xLabel="epoch" series={[
+                  directEpochPlot("Duration", "#a78bfa", epochs(), "seconds"),
+                ]} />
+              </Show>
+              <Show when={!hasCurriculumEpochs()}>
+                <>
               <MetricChart title="Latest batch loss" scale="log" xLabel="global step" series={[
                 metricPlot("Total", "#38bdf8", trainSteps(), "loss"),
               ]} />
@@ -666,6 +768,8 @@ export function MlpTrainingPage() {
                 directStepPlot("PyTorch reserved", "#38bdf8", trainSteps(), "gpuReservedMiB"),
                 directStepPlot("Whole device", "#f5b84b", trainSteps(), "gpuDeviceUsedMiB"),
               ]} />
+                </>
+              </Show>
             </div>
           </Show>
         </section>
@@ -744,6 +848,8 @@ export function MlpTrainingPage() {
           <MetricCard label="Last global step" value={integer(latestStep()?.globalStep)} />
           <MetricCard label="Last batch loss" value={formatMetric(latestStep()?.latest.loss)} />
           <MetricCard label="Last best validation" value={formatMetric(latestEpoch()?.bestValidation)} />
+          <MetricCard label="Curriculum KL" value={formatMetric(latestEpoch()?.curriculumTargetKl)} />
+          <MetricCard label="Target temperature" value={formatMetric(latestEpoch()?.trainingTargetTemperature)} />
           <MetricCard label="Learning rate" value={formatMetric(latestStep()?.learningRate)} />
           <MetricCard label="Activation dropout" value={formatUnit(
             snapshot()?.plan.dropout === undefined ? undefined : snapshot()!.plan.dropout! * 100,
@@ -806,11 +912,14 @@ export function MlpTrainingPage() {
             <table class="w-full">
               <thead><tr>
                 <th class="table-head">Epoch</th><th class="table-head">Step</th>
-                <th class="table-head">Train loss</th><th class="table-head">Validation loss</th>
-                <th class="table-head">Conditional KL</th><th class="table-head">Base KL</th>
+                <th class="table-head">{hasCurriculumEpochs() ? "Train target CE" : "Train loss"}</th>
+                <th class="table-head">{hasCurriculumEpochs() ? "Validation target CE" : "Validation loss"}</th>
+                <th class="table-head">{hasCurriculumEpochs() ? "Curriculum KL" : "Conditional KL"}</th>
+                <th class="table-head">{hasCurriculumEpochs() ? "Raw 0.01 KL" : "Base KL"}</th>
                 <th class="table-head">Reverse KL</th><th class="table-head">Entropy gap</th>
                 <th class="table-head">pMSE mean</th><th class="table-head">pMSE variance</th>
-                <th class="table-head">Best</th><th class="table-head">Stale</th>
+                <Show when={hasCurriculumEpochs()}><th class="table-head">Temperature</th></Show>
+                <th class="table-head">{hasCurriculumEpochs() ? "Best raw KL" : "Best"}</th><th class="table-head">Stale</th>
               </tr></thead>
               <tbody><For each={epochs().slice(-12).reverse()}>{(item) => <tr>
                 <td class="td-cell">{item.epoch + 1}</td><td class="td-cell">{item.globalStep}</td>
@@ -822,6 +931,7 @@ export function MlpTrainingPage() {
                 <td class="td-cell">{formatMetric(item.validation.entropyGap)}</td>
                 <td class="td-cell">{formatMetric(item.validation.probabilityMse)}</td>
                 <td class="td-cell">{formatMetric(item.validation.probabilityMseVariance)}</td>
+                <Show when={hasCurriculumEpochs()}><td class="td-cell">{formatMetric(item.trainingTargetTemperature)}</td></Show>
                 <td class="td-cell text-gain">{formatMetric(item.bestValidation)}</td>
                 <td class="td-cell">{integer(item.staleEpochs)}</td>
               </tr>}</For></tbody>
@@ -1216,23 +1326,34 @@ function directEpochPlot(label: string, color: string, points: EpochPoint[], key
   return { label, color, values: points.flatMap((point) => typeof point[key] === "number" ? [{ x: point.epoch + 1, y: point[key] as number }] : []) };
 }
 
+function constantEpochPlot(label: string, color: string, points: EpochPoint[], value: number): PlotSeries {
+  return { label, color, values: points.map((point) => ({ x: point.epoch + 1, y: value })) };
+}
+
 function metricValues(value: unknown): MetricValues {
   if (!value || typeof value !== "object") return {};
   const record = value as Record<string, unknown>;
   return {
-    loss: numberValue(record.loss),
-    crossEntropy: numberValue(record.crossEntropy),
-    klDivergence: numberValue(record.klDivergence),
+    loss: numberValue(record.loss) ?? numberValue(record.trainingCrossEntropy),
+    crossEntropy: numberValue(record.crossEntropy)
+      ?? numberValue(record.trainingCrossEntropy)
+      ?? numberValue(record.rawCrossEntropy),
+    klDivergence: numberValue(record.klDivergence)
+      ?? numberValue(record.curriculumTargetKl),
     klDivergenceVariance: numberValue(record.klDivergenceVariance),
     klDivergenceStdDev: numberValue(record.klDivergenceStdDev),
-    baseKlDivergence: numberValue(record.baseKlDivergence),
+    baseKlDivergence: numberValue(record.baseKlDivergence)
+      ?? numberValue(record.rawBaseActionKl),
     reverseKlDivergence: numberValue(record.reverseKlDivergence),
-    probabilityMse: numberValue(record.probabilityMse),
+    probabilityMse: numberValue(record.probabilityMse)
+      ?? numberValue(record.rawProbabilityMse),
     probabilityMseVariance: numberValue(record.probabilityMseVariance),
     probabilityMseStdDev: numberValue(record.probabilityMseStdDev),
     excessEntropy: numberValue(record.excessEntropy),
     oracleMutualInformation: numberValue(record.oracleMutualInformation),
-    targetEntropy: numberValue(record.targetEntropy),
+    targetEntropy: numberValue(record.targetEntropy)
+      ?? numberValue(record.curriculumTargetEntropy)
+      ?? numberValue(record.rawTargetEntropy),
     predictedEntropy: numberValue(record.predictedEntropy),
     entropyGap: numberValue(record.entropyGap),
     entropySharpness: numberValue(record.entropySharpness),
@@ -1250,6 +1371,17 @@ function metricValues(value: unknown): MetricValues {
     centeringSymmetry: numberValue(record.centeringSymmetry),
     distanceImbalanceWeight: numberValue(record.distanceImbalanceWeight),
     timeWeightEffectiveSampleRatio: numberValue(record.timeWeightEffectiveSampleRatio),
+    curriculumTargetKl: numberValue(record.curriculumTargetKl),
+    curriculumTargetProbabilityMse: numberValue(
+      record.curriculumTargetProbabilityMse,
+    ),
+    curriculumTargetEntropy: numberValue(record.curriculumTargetEntropy),
+    trainingCrossEntropy: numberValue(record.trainingCrossEntropy),
+    rawCrossEntropy: numberValue(record.rawCrossEntropy),
+    rawBaseActionKl: numberValue(record.rawBaseActionKl),
+    rawProbabilityMse: numberValue(record.rawProbabilityMse),
+    rawTargetEntropy: numberValue(record.rawTargetEntropy),
+    regularizationLoss: numberValue(record.regularizationLoss),
   };
 }
 
@@ -1274,6 +1406,15 @@ function convolveLinearChartOnGeometricGrid(
   scale: "linear" | "log",
 ): PlotPoint[] {
   if (points.length === 0) return [];
+  const constantY = points[0]!.y;
+  if (points.every((point) => point.y === constantY)) {
+    const left = Math.max(xMin, points[0]!.x);
+    const right = Math.min(xMax, points.at(-1)!.x);
+    if (right < left) return [];
+    return right === left
+      ? [{ x: left, y: constantY }]
+      : [{ x: left, y: constantY }, { x: right, y: constantY }];
+  }
   if (points.length === 1) {
     const point = points[0]!;
     return point.x >= xMin && point.x <= xMax ? [point] : [];
@@ -1561,8 +1702,15 @@ function runSummaryLabel(run: MetricsResponse["runs"][number]): string {
   return `${prefix}${run.label}${best} · ${stageLabel(run.stage ?? "idle")}`;
 }
 
-function progressLabel(stage: string, dataset: DatasetPoint | undefined, step: TrainStepPoint | undefined, totalEpochs: number | undefined): string {
+function progressLabel(
+  stage: string,
+  dataset: DatasetPoint | undefined,
+  step: TrainStepPoint | undefined,
+  epoch: EpochPoint | undefined,
+  totalEpochs: number | undefined,
+): string {
   if (stage.startsWith("dataset") && dataset) return `Day ${dataset.x} / ${dataset.days ?? "—"} · ${dataset.date} ${dataset.split}`;
   if (stage === "training" && step) return `Epoch ${step.epoch + 1} / ${totalEpochs ?? "—"} · global step ${step.globalStep.toLocaleString()}`;
+  if (stage === "training" && epoch) return `Epoch ${epoch.epoch + 1} / ${totalEpochs ?? "—"} · global step ${epoch.globalStep.toLocaleString()}`;
   return stageLabel(stage);
 }

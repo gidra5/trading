@@ -20,14 +20,19 @@ from return_oracle_decoder_screen import (
     RUNNER_CONTRACT,
     SELECTION_CONTRACT,
     DecoderModel,
+    LearnedRadiusShrinkingDecoder,
     build_decoder,
     canonical_plan_fingerprint,
     file_sha256,
+    next_equal_entropy_step_training_temperature,
+    next_stale_learning_rate,
     optimizer_parameter_groups,
+    production_entropy_confidence_weights,
     smooth_oracle_probabilities,
-    training_temperature,
+    target_temperature,
     validate_screen_plan,
     weighted_policy_metrics,
+    weighted_target_entropy_log_temperature_derivative,
 )
 from trading_storage import (
     checkpoint_exists,
@@ -51,7 +56,8 @@ from train_return_oracle_ce import (
 )
 
 
-MetricFunction = Callable[[Tensor], Tensor]
+ModelForwardResult = tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
+MetricFunction = Callable[[Tensor], ModelForwardResult]
 
 
 @dataclass
@@ -73,19 +79,19 @@ class ScreenContext:
 
 @dataclass
 class MetricAccumulator:
-    examples: int = 0
+    examples: float = 0
     sums: dict[str, float] | None = None
 
-    def add(self, metrics: dict[str, Tensor], count: int) -> None:
-        if count <= 0:
-            raise ValueError("metric count must be positive")
+    def add(self, metrics: dict[str, Tensor], weight: float) -> None:
+        if weight <= 0 or not math.isfinite(weight):
+            raise ValueError("metric weight must be finite and positive")
         if self.sums is None:
             self.sums = {name: 0.0 for name in metrics}
         if set(metrics) != set(self.sums):
             raise ValueError("metric fields changed during an epoch")
-        self.examples += count
+        self.examples += weight
         for name, value in metrics.items():
-            self.sums[name] += float(value.detach()) * count
+            self.sums[name] += float(value.detach()) * weight
 
     def result(self) -> dict[str, float]:
         if self.examples <= 0 or self.sums is None:
@@ -305,6 +311,8 @@ def build_schedulers(
     training: dict[str, Any],
 ) -> tuple[torch.optim.lr_scheduler.ReduceLROnPlateau, ...]:
     schedule = training["learningRateSchedule"]
+    if schedule["type"] == "decay-every-prod-kl-stale-block":
+        return ()
     return tuple(
         torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
@@ -319,39 +327,100 @@ def build_schedulers(
     )
 
 
-def soft_target_cross_entropy(
-    logits: Tensor,
-    targets: Tensor,
-    weights: Tensor,
-) -> Tensor:
-    target = targets.float().clamp_min(0)
-    target = target / target.sum(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(torch.float32).tiny
-    )
-    per_example = -(target * torch.log_softmax(logits.float(), dim=-1)).sum(
-        dim=-1
-    )
-    weights = weights.float().clamp_min(0)
-    return (per_example * weights).sum() / weights.sum().clamp_min(
-        torch.finfo(torch.float32).tiny
-    )
-
-
 def batch_metrics(
-    logits: Tensor,
+    forward_result: ModelForwardResult,
     raw_targets: Tensor,
     weights: Tensor,
     train_temperature: float,
+    regularizers: dict[str, Any] | list[Any],
+    *,
+    include_entropy_temperature_derivative: bool = False,
 ) -> dict[str, Tensor]:
+    (
+        logits,
+        mean_penalties,
+        variance_penalties,
+        soft_weight_bound,
+        centering_idempotence,
+        centering_symmetry,
+    ) = forward_result
     curriculum_targets = smooth_oracle_probabilities(
         raw_targets,
         source_temperature=PRODUCTION_ORACLE_TEMPERATURE,
         target_temperature=train_temperature,
     )
     metrics = weighted_policy_metrics(logits, raw_targets, weights)
-    metrics["trainingCrossEntropy"] = soft_target_cross_entropy(
+    curriculum_metrics = weighted_policy_metrics(
         logits, curriculum_targets, weights
     )
+    metrics.update({
+        "trainingCrossEntropy": curriculum_metrics["rawCrossEntropy"],
+        "curriculumTargetKl": curriculum_metrics["rawBaseActionKl"],
+        "curriculumTargetProbabilityMse": (
+            curriculum_metrics["rawProbabilityMse"]
+        ),
+        "curriculumTargetEntropy": curriculum_metrics["rawTargetEntropy"],
+        "predictedEntropy": curriculum_metrics["rawPredictedEntropy"],
+    })
+    if include_entropy_temperature_derivative:
+        metrics["curriculumTargetEntropyLogTemperatureDerivative"] = (
+            weighted_target_entropy_log_temperature_derivative(
+                raw_targets,
+                curriculum_targets,
+                weights,
+                source_temperature=PRODUCTION_ORACLE_TEMPERATURE,
+                target_temperature=train_temperature,
+            )
+        )
+    normalized_weights = weights.float().clamp_min(0)
+    weight_sum = normalized_weights.sum().clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    mean_penalty = (
+        mean_penalties.float() * normalized_weights
+    ).sum() / weight_sum
+    variance_penalty = (
+        variance_penalties.float() * normalized_weights
+    ).sum() / weight_sum
+    if regularizers:
+        soft_layer_norm_config = regularizers["softLayerNorm"]
+        centering_config = regularizers.get("centeringConstraint")
+        soft_layer_norm = (
+            mean_penalty
+            + float(soft_layer_norm_config["varianceWeight"])
+            * variance_penalty
+        )
+        centering_constraint = (
+            logits.new_zeros((), dtype=torch.float32)
+            if centering_config is None
+            else (
+                float(centering_config["idempotenceWeight"])
+                * centering_idempotence.float()
+                + float(centering_config["symmetryWeight"])
+                * centering_symmetry.float()
+            )
+        )
+        regularization_loss = (
+            float(soft_layer_norm_config["weight"]) * soft_layer_norm
+            + float(regularizers["softWeightBound"]["weight"])
+            * soft_weight_bound.float()
+            + centering_constraint
+        )
+    else:
+        soft_layer_norm = logits.new_zeros((), dtype=torch.float32)
+        centering_constraint = logits.new_zeros((), dtype=torch.float32)
+        regularization_loss = logits.new_zeros((), dtype=torch.float32)
+    metrics.update({
+        "softLayerNormMeanPenalty": mean_penalty,
+        "softLayerNormVariancePenalty": variance_penalty,
+        "softLayerNorm": soft_layer_norm,
+        "softWeightBound": soft_weight_bound.float(),
+        "centeringIdempotence": centering_idempotence.float(),
+        "centeringSymmetry": centering_symmetry.float(),
+        "centeringConstraint": centering_constraint,
+        "regularizationLoss": regularization_loss,
+        "loss": metrics["trainingCrossEntropy"] + regularization_loss,
+    })
     return metrics
 
 
@@ -364,9 +433,24 @@ def evaluate_validation(
     device: torch.device,
     amp_dtype: torch.dtype,
     pipeline: DeviceBatchPipeline,
+    train_temperature: float,
+    regularizers: dict[str, Any] | list[Any],
 ) -> dict[str, float]:
     model.eval()
     accumulator = MetricAccumulator()
+    parameter_penalties: tuple[Tensor, Tensor, Tensor] | None = None
+    if regularizers:
+        if not isinstance(model, LearnedRadiusShrinkingDecoder):
+            raise TypeError("restored regularizers require learned-radius decoder")
+        weight_config = regularizers["softWeightBound"]
+        parameter_penalties = model.regularizer_parameter_penalties(
+            desired_weight_magnitude=float(weight_config["desiredMagnitude"]),
+            weight_bound_sharpness=float(weight_config["sharpness"]),
+            absolute_epsilon=float(weight_config["absoluteEpsilon"]),
+            include_centering_constraint=(
+                "centeringConstraint" in regularizers
+            ),
+        )
     batches = dataset.iter_batches(
         "validation", batch_size, shuffle=False, seed=0
     )
@@ -376,8 +460,20 @@ def evaluate_validation(
             dtype=amp_dtype,
             enabled=device.type == "cuda",
         ):
-            logits = forward(features)
-            metrics = weighted_policy_metrics(logits, targets, weights)
+            forward_result = forward(features)
+            if parameter_penalties is not None:
+                forward_result = (
+                    *forward_result[:3],
+                    *parameter_penalties,
+                )
+            metrics = batch_metrics(
+                forward_result,
+                targets,
+                weights,
+                train_temperature,
+                regularizers,
+                include_entropy_temperature_derivative=True,
+            )
         accumulator.add(metrics, original_count)
     return accumulator.result()
 
@@ -391,7 +487,9 @@ def restore_checkpoint(
     schedulers: tuple[torch.optim.lr_scheduler.ReduceLROnPlateau, ...],
     model_parameters: int,
     device: torch.device,
-) -> tuple[int, int, float, int, int]:
+) -> tuple[
+    int, int, float, int, int, int | None, float | None, float | None, int, int
+]:
     if checkpoint.get("planSha256") != context.plan_fingerprint \
             or checkpoint.get("architectureContract") \
             != model.architecture_contract \
@@ -426,6 +524,26 @@ def restore_checkpoint(
             "staleEpochs",
             max(0, int(checkpoint["epoch"]) - int(checkpoint["bestEpoch"])),
         )),
+        (
+            None
+            if checkpoint.get("curriculumGateEpoch") is None
+            else int(checkpoint["curriculumGateEpoch"])
+        ),
+        (
+            None
+            if checkpoint.get("nextTrainingTargetTemperature") is None
+            else float(checkpoint["nextTrainingTargetTemperature"])
+        ),
+        (
+            None
+            if checkpoint.get("curriculumStartValidationEntropy") is None
+            else float(checkpoint["curriculumStartValidationEntropy"])
+        ),
+        int(checkpoint.get("learningRateDecaySteps", 0)),
+        int(checkpoint.get("learningRateStaleEpochs", checkpoint.get(
+            "staleEpochs",
+            max(0, int(checkpoint["epoch"]) - int(checkpoint["bestEpoch"])),
+        ))),
     )
 
 
@@ -443,6 +561,11 @@ def make_checkpoint(
     validation: dict[str, float],
     model_parameters: int,
     train_temperature: float,
+    next_train_temperature: float,
+    curriculum_gate_epoch: int | None,
+    curriculum_start_validation_entropy: float | None,
+    learning_rate_decay_steps: int,
+    learning_rate_stale_epochs: int,
     device: torch.device,
 ) -> dict[str, Any]:
     return frozen_cpu_copy({
@@ -456,6 +579,11 @@ def make_checkpoint(
         "staleEpochs": stale_epochs,
         "validation": validation,
         "trainingTargetTemperature": train_temperature,
+        "nextTrainingTargetTemperature": next_train_temperature,
+        "curriculumGateEpoch": curriculum_gate_epoch,
+        "curriculumStartValidationEntropy": curriculum_start_validation_entropy,
+        "learningRateDecaySteps": learning_rate_decay_steps,
+        "learningRateStaleEpochs": learning_rate_stale_epochs,
         "parameterCount": model_parameters,
         "planSha256": context.plan_fingerprint,
         "architectureContract": model.architecture_contract,
@@ -504,6 +632,11 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
     best_raw_validation_kl = math.inf
     best_epoch = -1
     stale_epochs = 0
+    curriculum_gate_epoch: int | None = None
+    stateful_train_temperature: float | None = None
+    curriculum_start_validation_entropy: float | None = None
+    learning_rate_decay_steps = 0
+    learning_rate_stale_epochs = 0
     last_checkpoint = context.run_dir / "checkpoints" / "last.json"
     best_checkpoint = context.run_dir / "checkpoints" / "best.json"
     if checkpoint_exists(last_checkpoint):
@@ -516,6 +649,11 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
             best_raw_validation_kl,
             best_epoch,
             stale_epochs,
+            curriculum_gate_epoch,
+            stateful_train_temperature,
+            curriculum_start_validation_entropy,
+            learning_rate_decay_steps,
+            learning_rate_stale_epochs,
         ) = restore_checkpoint(
             checkpoint,
             context=context,
@@ -526,12 +664,71 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
             device=device,
         )
     amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    regularizers = plan["objective"]["regularizers"]
+    training_weighting = plan["objective"].get("trainingExampleWeighting")
+    confidence_weighting_strength = (
+        None
+        if training_weighting is None
+        else float(training_weighting["lambda"])
+    )
 
-    def training_forward(features: Tensor) -> Tensor:
-        return model(features)
+    def activation_forward(
+        features: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if regularizers:
+            if not isinstance(model, LearnedRadiusShrinkingDecoder):
+                raise TypeError(
+                    "restored regularizers require learned-radius decoder"
+                )
+            logits, mean_penalties, variance_penalties = (
+                model.forward_with_regularizers(features)
+            )
+            return logits, mean_penalties, variance_penalties
+        logits = model(features)
+        per_example_zero = logits.new_zeros(
+            (logits.shape[0],), dtype=torch.float32
+        )
+        return logits, per_example_zero, per_example_zero
 
-    def validation_forward(features: Tensor) -> Tensor:
-        return model(features)
+    def training_forward(features: Tensor) -> ModelForwardResult:
+        logits, mean_penalties, variance_penalties = activation_forward(features)
+        if regularizers:
+            if not isinstance(model, LearnedRadiusShrinkingDecoder):
+                raise TypeError(
+                    "restored regularizers require learned-radius decoder"
+                )
+            weight_config = regularizers["softWeightBound"]
+            parameter_penalties = model.regularizer_parameter_penalties(
+                desired_weight_magnitude=float(
+                    weight_config["desiredMagnitude"]
+                ),
+                weight_bound_sharpness=float(weight_config["sharpness"]),
+                absolute_epsilon=float(weight_config["absoluteEpsilon"]),
+                include_centering_constraint=(
+                    "centeringConstraint" in regularizers
+                ),
+            )
+        else:
+            scalar_zero = logits.new_zeros((), dtype=torch.float32)
+            parameter_penalties = (scalar_zero, scalar_zero, scalar_zero)
+        return (
+            logits,
+            mean_penalties,
+            variance_penalties,
+            *parameter_penalties,
+        )
+
+    def validation_forward(features: Tensor) -> ModelForwardResult:
+        logits, mean_penalties, variance_penalties = activation_forward(features)
+        scalar_zero = logits.new_zeros((), dtype=torch.float32)
+        return (
+            logits,
+            mean_penalties,
+            variance_penalties,
+            scalar_zero,
+            scalar_zero,
+            scalar_zero,
+        )
 
     if bool(training.get("compile", False)):
         options = {"triton.cudagraphs": False}
@@ -551,7 +748,8 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
     early_stopping_patience = training.get("earlyStoppingPatience")
     if early_stopping_patience is not None:
         early_stopping_patience = int(early_stopping_patience)
-    schedule_start = int(training["learningRateSchedule"]["startEpoch"])
+    learning_rate_schedule = training["learningRateSchedule"]
+    schedule_start = int(learning_rate_schedule.get("startEpoch", 0))
     pipeline = DeviceBatchPipeline(device)
     started_at = iso_now()
     reporter.status(
@@ -578,6 +776,7 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
         "parameters": model_parameters,
         "selectionContract": SELECTION_CONTRACT,
         "curriculum": plan["curriculum"],
+        "learningRateSchedule": learning_rate_schedule,
         "stopAfterEpoch": stop_after_epoch,
         "earlyStoppingPatience": early_stopping_patience,
         "sealedTestEvaluated": False,
@@ -613,7 +812,19 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
     try:
         for epoch in range(start_epoch, maximum_epochs):
             epoch_started = time.monotonic()
-            train_temperature = training_temperature(plan, epoch)
+            per_epoch_gate = plan["curriculum"].get("gate", {}).get(
+                "evaluation"
+            ) == "every-epoch"
+            if per_epoch_gate:
+                if stateful_train_temperature is None:
+                    stateful_train_temperature = float(
+                        plan["curriculum"]["startTemperature"]
+                    )
+                train_temperature = stateful_train_temperature
+            else:
+                train_temperature = target_temperature(
+                    plan, epoch, curriculum_gate_epoch
+                )
             model.train()
             accumulator = MetricAccumulator()
             batches = dataset.iter_batches(
@@ -624,24 +835,54 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
             ):
                 for optimizer in optimizers:
                     optimizer.zero_grad(set_to_none=True)
-                group_count = sum(batch[3] for batch in batch_group)
+                weighted_batch_group = []
                 for features, targets, weights, original_count in batch_group:
+                    training_weights = (
+                        weights
+                        if confidence_weighting_strength is None
+                        else production_entropy_confidence_weights(
+                            targets,
+                            weights,
+                            confidence_weighting_strength,
+                        )
+                    )
+                    weighted_batch_group.append((
+                        features,
+                        targets,
+                        training_weights,
+                        original_count,
+                        training_weights.sum(),
+                    ))
+                group_weight = sum(
+                    batch[4] for batch in weighted_batch_group
+                )
+                for (
+                    features,
+                    targets,
+                    training_weights,
+                    _original_count,
+                    batch_weight,
+                ) in weighted_batch_group:
                     with torch.autocast(
                         device_type=device.type,
                         dtype=amp_dtype,
                         enabled=device.type == "cuda",
                     ):
-                        logits = compiled_train_forward(features)
+                        forward_result = compiled_train_forward(features)
                         metrics = batch_metrics(
-                            logits, targets, weights, train_temperature
+                            forward_result,
+                            targets,
+                            training_weights,
+                            train_temperature,
+                            regularizers,
                         )
-                    loss = metrics["trainingCrossEntropy"]
+                    loss = metrics["loss"]
                     if not bool(torch.isfinite(loss)):
                         raise FloatingPointError(
                             f"non-finite decoder loss at epoch {epoch}"
                         )
-                    (loss * (original_count / group_count)).backward()
-                    accumulator.add(metrics, original_count)
+                    (loss * (batch_weight / group_weight)).backward()
+                    accumulator.add(metrics, float(batch_weight.detach()))
                 gradient_norm = clip_grad_norm_(
                     model.parameters(),
                     float(training["gradientClip"]),
@@ -665,7 +906,45 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 device,
                 amp_dtype,
                 pipeline,
+                train_temperature,
+                regularizers,
             )
+            curriculum_kl = validation["curriculumTargetKl"]
+            if curriculum_start_validation_entropy is None:
+                curriculum_start_validation_entropy = validation[
+                    "curriculumTargetEntropy"
+                ]
+            gate = plan["curriculum"].get("gate")
+            gate_metric = None if gate is None else str(gate["metric"])
+            gate_value = (
+                None if gate_metric is None else validation[gate_metric]
+            )
+            gate_reached_now = False
+            entropy_goal = validation["curriculumTargetEntropy"]
+            if per_epoch_gate and gate_value is not None:
+                next_train_temperature, next_entropy_goal = (
+                    next_equal_entropy_step_training_temperature(
+                        plan,
+                        train_temperature,
+                        gate_value,
+                        validation["curriculumTargetEntropy"],
+                        validation["rawTargetEntropy"],
+                        curriculum_start_validation_entropy,
+                        validation[
+                            "curriculumTargetEntropyLogTemperatureDerivative"
+                        ],
+                    )
+                )
+                gate_reached_now = next_train_temperature < train_temperature
+            else:
+                next_train_temperature = train_temperature
+                next_entropy_goal = entropy_goal
+            if not per_epoch_gate and gate is not None \
+                    and curriculum_gate_epoch is None \
+                    and gate_value is not None \
+                    and gate_value <= float(gate["threshold"]):
+                curriculum_gate_epoch = epoch
+                gate_reached_now = True
             raw_kl = validation["rawBaseActionKl"]
             if not math.isfinite(raw_kl):
                 raise FloatingPointError("raw validation KL is non-finite")
@@ -674,13 +953,29 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 best_raw_validation_kl = raw_kl
                 best_epoch = epoch
                 stale_epochs = 0
+                learning_rate_stale_epochs = 0
             else:
                 stale_epochs += 1
+                learning_rate_stale_epochs += 1
             learning_rate_before = float(optimizers[0].param_groups[0]["lr"])
-            if epoch >= schedule_start:
+            if learning_rate_schedule["type"] \
+                    == "decay-every-prod-kl-stale-block":
+                learning_rate = next_stale_learning_rate(
+                    learning_rate_schedule,
+                    learning_rate_before,
+                    learning_rate_stale_epochs,
+                )
+                if learning_rate < learning_rate_before:
+                    for optimizer in optimizers:
+                        for group in optimizer.param_groups:
+                            group["lr"] = learning_rate
+                    learning_rate_decay_steps += 1
+            elif epoch >= schedule_start:
                 for scheduler in schedulers:
                     scheduler.step(raw_kl)
-            learning_rate = float(optimizers[0].param_groups[0]["lr"])
+                learning_rate = float(optimizers[0].param_groups[0]["lr"])
+            else:
+                learning_rate = learning_rate_before
             checkpoint = make_checkpoint(
                 context=context,
                 model=model,
@@ -694,6 +989,13 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 validation=validation,
                 model_parameters=model_parameters,
                 train_temperature=train_temperature,
+                next_train_temperature=next_train_temperature,
+                curriculum_gate_epoch=curriculum_gate_epoch,
+                curriculum_start_validation_entropy=(
+                    curriculum_start_validation_entropy
+                ),
+                learning_rate_decay_steps=learning_rate_decay_steps,
+                learning_rate_stale_epochs=learning_rate_stale_epochs,
                 device=device,
             )
             pause_for_epoch_limit = persist_validated_epoch(
@@ -711,6 +1013,19 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 "seconds": time.monotonic() - epoch_started,
                 "globalStep": global_step,
                 "trainingTargetTemperature": train_temperature,
+                "nextTrainingTargetTemperature": next_train_temperature,
+                "curriculumTemperatureDecreased": gate_reached_now,
+                "curriculumValidationKl": curriculum_kl,
+                "curriculumGateMetric": gate_metric,
+                "curriculumGateValue": gate_value,
+                "curriculumGateReached": (
+                    gate_reached_now
+                    if per_epoch_gate
+                    else curriculum_gate_epoch is not None
+                ),
+                "curriculumGateReachedNow": gate_reached_now,
+                "curriculumGateEpoch": curriculum_gate_epoch,
+                "nextCurriculumTargetEntropyGoal": next_entropy_goal,
                 "train": train_metrics,
                 "validation": validation,
                 "selectionMetric": "rawBaseActionKl",
@@ -720,6 +1035,15 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 "improved": improved,
                 "learningRate": learning_rate,
                 "learningRateReduced": learning_rate < learning_rate_before,
+                "learningRateDecaySteps": learning_rate_decay_steps,
+                "learningRateScheduleMetric": (
+                    learning_rate_schedule.get("metric")
+                ),
+                "learningRateScheduleValue": raw_kl,
+                "learningRateStaleEpochs": learning_rate_stale_epochs,
+                "learningRateStaleEpochsPerReduction": (
+                    learning_rate_schedule.get("staleEpochsPerReduction")
+                ),
                 "sealedTestEvaluated": False,
             }
             reporter.emit(event)
@@ -733,6 +1057,8 @@ def train(context: ScreenContext, stop_after_epoch: int | None) -> None:
                 stopAfterEpoch=stop_after_epoch,
                 testPolicy="sealed-never-load",
             )
+            if per_epoch_gate:
+                stateful_train_temperature = next_train_temperature
             # This check is intentionally after validation and the synchronous
             # canonical last/best checkpoint writes above. Returning here can
             # only expose a fully resumable epoch boundary.

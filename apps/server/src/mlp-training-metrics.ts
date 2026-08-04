@@ -28,7 +28,14 @@ interface TrainingPlan {
   id: string;
   label: string;
   runDir: string;
-  datasetDir: string;
+  datasetDir?: string;
+  dataset?: {
+    datasetDir?: string;
+  };
+  architecture?: {
+    dropout?: number;
+    dropoutRate?: number;
+  };
   samplingIntervalMs?: number;
   predictionDelayMs?: number;
   archived?: boolean;
@@ -274,12 +281,20 @@ export class MlpTrainingMetricsReader {
         ...(files.plan.bestValidationKlEpoch === undefined
           ? {}
           : { bestValidationKlEpoch: files.plan.bestValidationKlEpoch }),
-        ...(files.plan.training?.dropout === undefined
+        ...((files.plan.training?.dropout
+          ?? files.plan.architecture?.dropout) === undefined
           ? {}
-          : { dropout: files.plan.training.dropout }),
-        ...(files.plan.training?.dropoutRate === undefined
+          : {
+              dropout: files.plan.training?.dropout
+                ?? files.plan.architecture?.dropout,
+            }),
+        ...((files.plan.training?.dropoutRate
+          ?? files.plan.architecture?.dropoutRate) === undefined
           ? {}
-          : { dropoutRate: files.plan.training.dropoutRate }),
+          : {
+              dropoutRate: files.plan.training?.dropoutRate
+                ?? files.plan.architecture?.dropoutRate,
+            }),
         ...(files.plan.training?.lossWeights
           ? { lossWeights: files.plan.training.lossWeights }
           : {}),
@@ -393,11 +408,12 @@ export class MlpTrainingMetricsReader {
 
   private async loadPlan(planFile: string): Promise<LoadedTrainingPlan> {
     const plan = JSON.parse(await fs.readFile(planFile, "utf8")) as TrainingPlan;
-    if (!plan.id || !plan.label || !plan.runDir || !plan.datasetDir) {
+    const configuredDatasetDir = plan.datasetDir ?? plan.dataset?.datasetDir;
+    if (!plan.id || !plan.label || !plan.runDir || !configuredDatasetDir) {
       throw new Error(`Invalid MLP training plan: ${planFile}`);
     }
     const runDir = path.resolve(this.repoRoot, plan.runDir);
-    const datasetDir = path.resolve(this.repoRoot, plan.datasetDir);
+    const datasetDir = path.resolve(this.repoRoot, configuredDatasetDir);
     const statusFile = path.join(runDir, "state", "status.json");
     const [status, planStat] = await Promise.all([
       readOptionalJson<TrainingStatus>(statusFile),

@@ -248,6 +248,60 @@ test("MLP training metrics discovers plans and defaults to the live run", async 
   }
 });
 
+test("MLP training metrics discovers decoder plans with nested datasets", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mlp-training-decoder-"));
+  const defaultPlanFile = path.join(root, "ml", "training-plan.json");
+  const decoderPlanFile = path.join(root, "ml", "training-plans", "decoder.json");
+  const datasetDir = path.join(root, "data", "training", "datasets", "decoder");
+  const runDir = path.join(root, "data", "training", "runs", "decoder");
+  await Promise.all([
+    mkdir(path.dirname(defaultPlanFile), { recursive: true }),
+    mkdir(path.dirname(decoderPlanFile), { recursive: true }),
+    mkdir(datasetDir, { recursive: true }),
+    mkdir(path.join(runDir, "logs"), { recursive: true }),
+    mkdir(path.join(runDir, "state"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(defaultPlanFile, JSON.stringify({
+      id: "default",
+      label: "Default",
+      runDir: "data/training/runs/default",
+      datasetDir: "data/training/datasets/decoder",
+    })),
+    writeFile(decoderPlanFile, JSON.stringify({
+      id: "decoder",
+      label: "Decoder curriculum",
+      runDir: "data/training/runs/decoder",
+      dataset: { datasetDir: "data/training/datasets/decoder" },
+      architecture: { dropout: 0.05, dropoutRate: 0.5 },
+      training: { epochs: 200 },
+    })),
+    writeFile(path.join(runDir, "state", "status.json"), JSON.stringify({
+      pid: process.pid,
+      stage: "training",
+      updatedAt: "2026-08-02T06:00:00.000Z",
+    })),
+    writeFile(path.join(runDir, "logs", "training.log"), `${JSON.stringify({
+      event: "epoch",
+      epoch: 0,
+      trainingTargetTemperature: 0.5,
+      curriculumValidationKl: 0.08,
+    })}\n`),
+  ]);
+
+  try {
+    const reader = new MlpTrainingMetricsReader(defaultPlanFile, root);
+    const decoder = await reader.read(0);
+    assert.equal(decoder.plan.id, "decoder");
+    assert.equal(decoder.plan.epochs, 200);
+    assert.equal(decoder.plan.dropout, 0.05);
+    assert.equal(decoder.plan.dropoutRate, 0.5);
+    assert.equal(decoder.events[0]?.trainingTargetTemperature, 0.5);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("MLP training metrics exposes catalogued archived training.log runs", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mlp-training-archive-"));
   const planFile = path.join(root, "ml", "training-plan.json");

@@ -1,56 +1,6 @@
 {
   "runs": [
     {
-      "id": "return-oracle-no-hard-ln-pre-rank3-20260728-214656",
-      "label": "2026-07-28 21:46 · No hard LN before rank-3 latent normalization",
-      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-no-hard-ln-pre-rank3-latent-20260728-214656",
-      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
-      "archived": true,
-      "archivedAt": "2026-07-28T21:46:56+03:00",
-      "bestValidationKl": 0.08655659251079778,
-      "bestValidationKlEpoch": 260
-    },
-    {
-      "id": "return-oracle-bias-ln-full-a-20260729-132700",
-      "label": "2026-07-29 13:27 · Branch LN with bias and full A",
-      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-bias-ln-full-a-baseline-20260729-132700",
-      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
-      "archived": true,
-      "archivedAt": "2026-07-29T13:27:00+03:00",
-      "bestValidationKl": 0.11250634458361738,
-      "bestValidationKlEpoch": 39
-    },
-    {
-      "id": "return-oracle-learnable-c-full-regularization-20260729-144909",
-      "label": "2026-07-29 14:49 · Learnable shared C with full regularization",
-      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-learnable-c-full-regularization-baseline-20260729-144909",
-      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
-      "archived": true,
-      "archivedAt": "2026-07-29T14:49:09+03:00",
-      "bestValidationKl": 0.11321715464827434,
-      "bestValidationKlEpoch": 24
-    },
-    {
-      "id": "return-oracle-smoothed-reverse-kl-w005-20260729-170500",
-      "label": "2026-07-29 17:05 · Smoothed reverse KL, weight 0.05",
-      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-smoothed-reverse-kl-w005-baseline-20260729-170500",
-      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
-      "archived": true,
-      "archivedAt": "2026-07-29T17:05:00+03:00",
-      "bestValidationKl": 0.11874246701011933,
-      "bestValidationKlEpoch": 72
-    },
-    {
-      "id": "return-oracle-continuous-skew-sharpness-w1-20260729-184300",
-      "label": "2026-07-29 18:43 · Continuous reverse KL and entropy sharpness",
-      "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-continuous-skew-sharpness-w1-baseline-20260729-184300",
-      "datasetDir": "data/training/datasets/return-oracle-ce-shrinking-v1",
-      "archived": true,
-      "archivedAt": "2026-07-29T18:43:00+03:00",
-      "bestValidationKl": 0.11092877909915139,
-      "bestValidationKlEpoch": 128
-    },
-    {
       "id": "return-oracle-independent-p01-w002-softln1-20260729-195620",
       "label": "2026-07-29 19:56 · Independent 1% gates, weight 0.02, soft LN 1",
       "runDir": "data/training/runs/return-oracle-ce-shrinking-v1-independent-p01-w002-softln1-baseline-20260729-195620",

@@ -36,38 +36,6 @@ class ArchiveRun:
 
 RUNS = (
     ArchiveRun(
-        "return-oracle-bias-ln-full-a-20260729-132700",
-        "5bccb9393674ae211b909e537fbb20cf4b8d83dc",
-        "return-oracle-ce-shrinking-v1-bias-ln-full-a-baseline-20260729-132700",
-        58,
-        "shrinking-fused-glu-post-projection-bias-ln-full-a-16-layer-v11",
-        "soft-target-ce-plus-width-normalized-distribution-regularizers-v4",
-    ),
-    ArchiveRun(
-        "return-oracle-learnable-c-full-regularization-20260729-144909",
-        "2a301c7c2ee8cfbeaacd9862bd8417ba653f4799",
-        "return-oracle-ce-shrinking-v1-learnable-c-full-regularization-baseline-20260729-144909",
-        24,
-        "shrinking-fused-glu-learnable-shared-centering-bias-ln-full-a-v12",
-        "soft-target-ce-plus-centering-and-width-normalized-regularizers-v5",
-    ),
-    ArchiveRun(
-        "return-oracle-smoothed-reverse-kl-w005-20260729-170500",
-        "93cce079ac7374e8803e6a7fdcb9ba909738c400",
-        "return-oracle-ce-shrinking-v1-smoothed-reverse-kl-w005-baseline-20260729-170500",
-        74,
-        "shrinking-fused-glu-learnable-shared-centering-bias-ln-full-a-v12",
-        "soft-target-ce-plus-smoothed-reverse-kl-centering-and-weight-regularizers-diagnostic-activations-v7",
-    ),
-    ArchiveRun(
-        "return-oracle-continuous-skew-sharpness-w1-20260729-184300",
-        "c3b600452fd41f725d0c6640dacd1a693b335876",
-        "return-oracle-ce-shrinking-v1-continuous-skew-sharpness-w1-baseline-20260729-184300",
-        131,
-        "shrinking-fused-glu-learnable-shared-centering-bias-ln-full-a-v12",
-        "soft-target-ce-plus-skew-reverse-kl-one-sided-entropy-sharpness-centering-and-weight-regularizers-diagnostic-activations-v10",
-    ),
-    ArchiveRun(
         "return-oracle-independent-p01-w002-softln1-20260729-195620",
         "8b81271bfff42881835d40f2c6fc5576e9976323",
         "return-oracle-ce-shrinking-v1-independent-p01-w002-softln1-baseline-20260729-195620",
