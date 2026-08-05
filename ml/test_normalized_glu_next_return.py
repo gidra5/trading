@@ -17,6 +17,9 @@ from next_return_dataset import (
 )
 from normalized_glu_next_return import (
     NormalizedGluNextReturn,
+    PER_SEQUENCE_INPUT_NORMALIZATION,
+    PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
+    PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
     optimizer_parameter_groups,
 )
 
@@ -154,6 +157,89 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
                 torch.tensor(1.0),
                 widths=(),
             )
+
+    def test_per_sequence_input_normalization_uses_each_history_only(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.full((HISTORY_RETURN_COUNT,), 100.0),
+            torch.full((HISTORY_RETURN_COUNT,), 7.0),
+            torch.tensor(0.0),
+            torch.tensor(1.0),
+            widths=(16,),
+            input_normalization=PER_SEQUENCE_INPUT_NORMALIZATION,
+            dropout=0,
+        )
+        features = torch.stack((
+            torch.arange(HISTORY_RETURN_COUNT, dtype=torch.float32),
+            3 * torch.arange(HISTORY_RETURN_COUNT, dtype=torch.float32) + 17,
+            torch.full((HISTORY_RETURN_COUNT,), 5.0),
+        ))
+        normalized = model.normalize_features(features)
+        torch.testing.assert_close(
+            normalized[:2].mean(dim=1), torch.zeros(2), atol=1e-6, rtol=0
+        )
+        torch.testing.assert_close(
+            normalized[:2].square().mean(dim=1),
+            torch.ones(2),
+            atol=1e-6,
+            rtol=0,
+        )
+        torch.testing.assert_close(normalized[2], torch.zeros(HISTORY_RETURN_COUNT))
+
+    def test_reversible_per_sequence_output_uses_input_mean_and_std(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.full((HISTORY_RETURN_COUNT,), 100.0),
+            torch.full((HISTORY_RETURN_COUNT,), 7.0),
+            torch.full((3,), -50.0),
+            torch.full((3,), 20.0),
+            widths=(16,),
+            input_normalization=PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
+            dropout=0,
+        )
+        with torch.no_grad():
+            model.output.bias.fill_(2.0)
+        features = torch.stack((
+            torch.arange(HISTORY_RETURN_COUNT, dtype=torch.float32),
+            3 * torch.arange(HISTORY_RETURN_COUNT, dtype=torch.float32) + 17,
+        ))
+        sequence_mean = features.mean(dim=1, keepdim=True)
+        sequence_std = (
+            (features - sequence_mean).square().mean(dim=1, keepdim=True).sqrt()
+        )
+        prediction = model(features)
+        expected = (sequence_mean + 2 * sequence_std).expand(-1, 3)
+        torch.testing.assert_close(prediction, expected)
+
+    def test_reversible_sequence_stats_are_explicit_side_features(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.zeros(HISTORY_RETURN_COUNT),
+            torch.full((HISTORY_RETURN_COUNT,), 2.0),
+            torch.zeros(3),
+            torch.ones(3),
+            widths=(16,),
+            input_normalization=(
+                PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION
+            ),
+            dropout=0,
+        )
+        features = torch.arange(
+            HISTORY_RETURN_COUNT, dtype=torch.float32
+        ).unsqueeze(0)
+        normalized = model.normalize_features(features)
+        sequence_mean = features.mean()
+        sequence_std = (features - sequence_mean).square().mean().sqrt()
+        self.assertEqual(normalized.shape, (1, HISTORY_RETURN_COUNT + 2))
+        self.assertEqual(model.layers[0].in_features, HISTORY_RETURN_COUNT + 2)
+        torch.testing.assert_close(
+            normalized[0, -2], sequence_mean / 2.0
+        )
+        torch.testing.assert_close(
+            normalized[0, -1], sequence_std / 2.0 - 1.0
+        )
+        prediction = model(features)
+        torch.testing.assert_close(
+            prediction,
+            sequence_mean.expand(1, 3),
+        )
 
 
 if __name__ == "__main__":

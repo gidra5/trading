@@ -37,7 +37,6 @@ import { historicalWarmupSamples } from "../apps/server/src/historical-backtest.
 
 const DAY_MS = 86_400_000;
 const INTERVAL_MS = 1_000;
-const ORACLE_FUTURE_MS = 60 * 60_000;
 const HISTORY_ROOT = path.resolve(
   "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
 );
@@ -142,10 +141,18 @@ const STATIC_WINDOWS = [
 ] satisfies SuiteWindow[];
 
 async function main(): Promise<void> {
+  const valueHorizonMinutes = integerArgument(
+    "value-horizon-minutes",
+    HINDSIGHT_ORACLE_VALUE_HORIZON_MS / 60_000,
+  );
+  if (valueHorizonMinutes < HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / 60_000) {
+    throw new Error("--value-horizon-minutes must cover at least one holding period.");
+  }
+  const valueHorizonMs = valueHorizonMinutes * 60_000;
   const latestAvailableDay = availableDays().at(-1);
   if (!latestAvailableDay) throw new Error(`No one-second history found in ${HISTORY_ROOT}.`);
   const latestEndTime = parseDay(latestAvailableDay) + DAY_MS;
-  const latestMeasuredEndTime = latestEndTime - ORACLE_FUTURE_MS;
+  const latestMeasuredEndTime = latestEndTime - valueHorizonMs;
   const windows = [
     ...STATIC_WINDOWS,
     {
@@ -155,12 +162,19 @@ async function main(): Promise<void> {
     },
   ];
   const only = argument("only")?.split(",").map((value) => value.trim()).filter(Boolean);
-  const selected = only?.length
+  const excludePrefixes = argument("exclude-prefix")
+    ?.split(",")
+    .map((value) => value.trim())
+    .filter(Boolean) ?? [];
+  const included = only?.length
     ? windows.filter((window) => only.includes(window.id))
     : windows;
+  const selected = included.filter((window) =>
+    !excludePrefixes.some((prefix) => window.id.startsWith(prefix)));
   if (selected.length === 0) throw new Error(`No suite windows matched --only ${only?.join(",")}.`);
 
   const output = path.resolve(argument("output") ?? DEFAULT_OUTPUT);
+  const oracleOnly = flag("oracle-only");
   const oracleWorkers = Math.max(1, Math.min(
     availableParallelism(),
     Number.parseInt(argument("oracle-workers") ?? "1", 10) || 1,
@@ -179,8 +193,11 @@ async function main(): Promise<void> {
     || requestedOracleBackend === "auto" && cudaStatus?.available
     ? "cuda"
     : "cpu";
-  console.log(`BACKEND oracle=${oracleBackend}${cudaStatus?.device ? ` device=${cudaStatus.device}` : ""}`);
-  const existing = readReport(output);
+  console.log(
+    `BACKEND oracle=${oracleBackend} horizonMinutes=${valueHorizonMinutes}`
+    + `${cudaStatus?.device ? ` device=${cudaStatus.device}` : ""}`,
+  );
+  const existing = readReport(output, valueHorizonMs);
   const report: SuiteReport = existing ?? {
     strategy: "hindsight-oracle-1s",
     summaryOnly: true,
@@ -188,7 +205,7 @@ async function main(): Promise<void> {
       intervalMs: INTERVAL_MS,
       holdingPeriodMs: HINDSIGHT_ORACLE_HOLDING_PERIOD_MS,
       decisionDelayMs: HINDSIGHT_ORACLE_DECISION_DELAY_MS,
-      valueHorizonMs: HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
+      valueHorizonMs,
       maximumExposure: HINDSIGHT_ORACLE_MAX_EXPOSURE,
       confidenceExposurePower: HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
       confidenceLeverageFloor: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
@@ -212,7 +229,7 @@ async function main(): Promise<void> {
       `START ${window.id} (${index + 1}/${selected.length}) `
       + `${isoDay(window.startTime)}..${isoDay(window.endTime - 1)}`,
     );
-    const loaded = loadWindow(window, warmupMs);
+    const loaded = loadWindow(window, warmupMs, valueHorizonMs);
     console.log(
       `LOADED ${window.id} measured=${loaded.candles.length} `
       + `warmup=${loaded.warmup.length} future=${loaded.oracleFuture.length}`,
@@ -227,11 +244,18 @@ async function main(): Promise<void> {
           oracleWorkers,
           window.id,
           oracleBackend,
+          valueHorizonMs,
         );
     if (precomputed === reusableFitOracle) {
       console.log(`REUSE ${window.id} oracle=fit-full`);
     } else if (window.id === "fit-full") {
       reusableFitOracle = precomputed;
+    }
+    if (oracleOnly) {
+      console.log(`ORACLE-ONLY ${window.id} complete`);
+      if (window.id === "fit-4") reusableFitOracle = undefined;
+      global.gc?.();
+      continue;
     }
     const result = await runBotBacktestFromCandles(loaded.candles, {
       config: appConfig.strategy,
@@ -268,6 +292,10 @@ async function main(): Promise<void> {
     global.gc?.();
   }
 
+  if (oracleOnly) {
+    console.log(`ORACLE-ONLY-COMPLETE horizonMinutes=${valueHorizonMinutes}`);
+    return;
+  }
   console.log(`AGGREGATE ${JSON.stringify(aggregate(report.results))}`);
   console.log(`REPORT ${output}`);
 }
@@ -284,6 +312,7 @@ async function precomputeOracleDistributions(
   workerCount: number,
   windowId: string,
   backend: OracleBackend,
+  valueHorizonMs: number,
 ): Promise<PrecomputedOracleDistributions> {
   const holdingPeriodSteps = Math.max(1, Math.round(
     HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / INTERVAL_MS,
@@ -292,7 +321,7 @@ async function precomputeOracleDistributions(
     HINDSIGHT_ORACLE_DECISION_DELAY_MS / INTERVAL_MS,
   ));
   const valueHorizonSteps = Math.max(holdingPeriodSteps, Math.round(
-    HINDSIGHT_ORACLE_VALUE_HORIZON_MS / INTERVAL_MS,
+    valueHorizonMs / INTERVAL_MS,
   ));
   const priceCount = candles.length + future.length;
   const prices = new Float64Array(new SharedArrayBuffer(priceCount * Float64Array.BYTES_PER_ELEMENT));
@@ -303,7 +332,7 @@ async function precomputeOracleDistributions(
   const decisionCount = candles.length > 1
     ? Math.floor((candles.length - 2) / holdingPeriodSteps) + 1
     : 0;
-  const storedOracle = storedOracleDefinition(config);
+  const storedOracle = storedOracleDefinition(config, valueHorizonSteps);
   const outputColumns = storedOracle.grid.length;
   const probabilities = new Float32Array(new SharedArrayBuffer(
     decisionCount * outputColumns * Float32Array.BYTES_PER_ELEMENT,
@@ -775,7 +804,10 @@ interface StoredOracleDefinition {
   compatible: boolean;
 }
 
-function storedOracleDefinition(config: StrategyConfig): StoredOracleDefinition {
+function storedOracleDefinition(
+  config: StrategyConfig,
+  valueHorizonSteps: number,
+): StoredOracleDefinition {
   const manifest = JSON.parse(fs.readFileSync(STORED_ORACLE_DATASET, "utf8"));
   const execution = manifest.execution;
   const frictionBps = config.feeBps + config.positionRisk.marketSlippageBps;
@@ -790,7 +822,7 @@ function storedOracleDefinition(config: StrategyConfig): StoredOracleDefinition 
     || execution?.temperature !== HINDSIGHT_ORACLE_TEMPERATURE
     || execution?.holdingPeriodSteps !== HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / INTERVAL_MS
     || execution?.decisionDelaySteps !== HINDSIGHT_ORACLE_DECISION_DELAY_MS / INTERVAL_MS
-    || execution?.valueHorizonSteps !== HINDSIGHT_ORACLE_VALUE_HORIZON_MS / INTERVAL_MS
+    || execution?.valueHorizonSteps !== valueHorizonSteps
     || execution?.maintenanceBpsHour?.quoteBorrow !== HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
     || execution?.maintenanceBpsHour?.assetBorrow !== HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR
   );
@@ -918,13 +950,13 @@ function range(id: string, start: string, end: string): SuiteWindow {
   };
 }
 
-function loadWindow(window: SuiteWindow, warmupMs: number): {
+function loadWindow(window: SuiteWindow, warmupMs: number, valueHorizonMs: number): {
   warmup: Candle[];
   candles: Candle[];
   oracleFuture: Candle[];
 } {
   const loadStart = window.startTime - warmupMs;
-  const loadEnd = window.endTime + ORACLE_FUTURE_MS;
+  const loadEnd = window.endTime + valueHorizonMs;
   const warmup: Candle[] = [];
   const candles: Candle[] = [];
   const oracleFuture: Candle[] = [];
@@ -1009,7 +1041,7 @@ function aggregate(results: readonly SuiteResult[]): Record<string, unknown> {
   };
 }
 
-function readReport(file: string): SuiteReport | undefined {
+function readReport(file: string, valueHorizonMs: number): SuiteReport | undefined {
   if (!fs.existsSync(file)) return undefined;
   const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as SuiteReport;
   if (
@@ -1017,7 +1049,7 @@ function readReport(file: string): SuiteReport | undefined {
     || parsed.oracle?.intervalMs !== INTERVAL_MS
     || parsed.oracle?.holdingPeriodMs !== HINDSIGHT_ORACLE_HOLDING_PERIOD_MS
     || parsed.oracle?.decisionDelayMs !== HINDSIGHT_ORACLE_DECISION_DELAY_MS
-    || parsed.oracle?.valueHorizonMs !== HINDSIGHT_ORACLE_VALUE_HORIZON_MS
+    || parsed.oracle?.valueHorizonMs !== valueHorizonMs
     || parsed.oracle?.maximumExposure !== HINDSIGHT_ORACLE_MAX_EXPOSURE
     || parsed.oracle?.confidenceExposurePower !== HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER
     || parsed.oracle?.confidenceLeverageFloor !== HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR
@@ -1030,12 +1062,27 @@ function readReport(file: string): SuiteReport | undefined {
 
 function writeReport(file: string, report: SuiteReport): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  fs.renameSync(temporary, file);
 }
 
 function argument(name: string): string | undefined {
   const prefix = `--${name}=`;
   return process.argv.find((value) => value.startsWith(prefix))?.slice(prefix.length);
+}
+
+function flag(name: string): boolean {
+  return process.argv.includes(`--${name}`);
+}
+
+function integerArgument(name: string, fallback: number): number {
+  const raw = argument(name);
+  if (raw === undefined) return fallback;
+  if (!/^\d+$/.test(raw)) throw new Error(`--${name} must be an integer.`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) throw new Error(`--${name} is out of range.`);
+  return value;
 }
 
 function parseDay(value: string): number {

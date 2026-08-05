@@ -13,6 +13,23 @@ from return_oracle_ce import (
 
 
 DEFAULT_WIDTHS = (512,)
+TRAINING_POSITION_INPUT_NORMALIZATION = "training-position"
+PER_SEQUENCE_INPUT_NORMALIZATION = "per-sequence"
+PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION = "per-sequence-reversible"
+PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION = (
+    "per-sequence-reversible-with-stats"
+)
+INPUT_NORMALIZATION_MODES = frozenset({
+    TRAINING_POSITION_INPUT_NORMALIZATION,
+    PER_SEQUENCE_INPUT_NORMALIZATION,
+    PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
+    PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
+})
+REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES = frozenset({
+    PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
+    PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
+})
+MINIMUM_SEQUENCE_STD = 1e-8
 ARCHITECTURE_CONTRACT = (
     "next-return-fused-glu-stack-independent-branch-centering-sqrt-"
     "learned-radius-full-a-post-bias-v2"
@@ -32,6 +49,7 @@ class NormalizedGluNextReturn(nn.Module):
         target_std: Tensor,
         *,
         widths: tuple[int, ...] = DEFAULT_WIDTHS,
+        input_normalization: str = TRAINING_POSITION_INPUT_NORMALIZATION,
         dropout: float = 0.05,
         dropout_rate: float = 0.5,
         initial_radius: float = BRANCH_NORMALIZATION_INITIAL_RADIUS,
@@ -55,9 +73,14 @@ class NormalizedGluNextReturn(nn.Module):
                 "next-return predictor requires one or more GLU layers "
                 "with width at least two"
             )
+        if input_normalization not in INPUT_NORMALIZATION_MODES:
+            raise ValueError(
+                f"unsupported input normalization: {input_normalization}"
+            )
         if not 0 <= dropout < 1 or not 0 <= dropout_rate <= 1:
             raise ValueError("dropout settings are invalid")
         self.widths = tuple(int(width) for width in widths)
+        self.input_normalization = input_normalization
         self.horizon_return_count = int(target_mean.numel())
         self.dropout_rate = float(dropout_rate)
         self.dropout_gate_probability = dropout_gate_probability(dropout_rate)
@@ -71,7 +94,12 @@ class NormalizedGluNextReturn(nn.Module):
             "target_std", target_std.float().reshape(target_shape).clone()
         )
 
-        all_widths = (HISTORY_RETURN_COUNT, *self.widths)
+        input_width = HISTORY_RETURN_COUNT + (
+            2 if input_normalization
+            == PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION
+            else 0
+        )
+        all_widths = (input_width, *self.widths)
         self.layers = nn.ModuleList([
             nn.Linear(input_width, 2 * output_width)
             for input_width, output_width in zip(
@@ -139,10 +167,47 @@ class NormalizedGluNextReturn(nn.Module):
             *(layer.weight for layer in self.gate_transforms),
         )
 
-    def forward_standardized(self, features: Tensor) -> Tensor:
+    def _normalize_features_with_sequence_stats(
+        self, features: Tensor
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         if features.ndim != 2 or features.shape[-1] != HISTORY_RETURN_COUNT:
             raise ValueError("normalized GLU expects [example, 120] returns")
-        hidden = (features.float() - self.feature_mean) / self.feature_std
+        values = features.float()
+        if self.input_normalization in {
+            PER_SEQUENCE_INPUT_NORMALIZATION,
+            *REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES,
+        }:
+            sequence_mean = values.mean(dim=-1, keepdim=True)
+            centered = values - sequence_mean
+            sequence_std = centered.square().mean(
+                dim=-1, keepdim=True
+            ).sqrt().clamp_min(MINIMUM_SEQUENCE_STD)
+            normalized = centered / sequence_std
+            if self.input_normalization \
+                    == PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION:
+                training_mean = self.feature_mean.mean()
+                training_std = self.feature_std.mean()
+                side_features = torch.cat((
+                    (sequence_mean - training_mean) / training_std,
+                    sequence_std / training_std - 1.0,
+                ), dim=-1)
+                normalized = torch.cat((normalized, side_features), dim=-1)
+            return normalized, sequence_mean, sequence_std
+        return (
+            (values - self.feature_mean) / self.feature_std,
+            None,
+            None,
+        )
+
+    def normalize_features(self, features: Tensor) -> Tensor:
+        return self._normalize_features_with_sequence_stats(features)[0]
+
+    def _forward_standardized_with_sequence_stats(
+        self, features: Tensor
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        hidden, sequence_mean, sequence_std = (
+            self._normalize_features_with_sequence_stats(features)
+        )
         intermittent_dropout = (
             self.training
             and self.dropout.p > 0
@@ -193,13 +258,28 @@ class NormalizedGluNextReturn(nn.Module):
                         self.dropout(hidden),
                         hidden,
                     )
-        result = self.output(hidden)
-        return result.squeeze(-1) \
-            if self.horizon_return_count == 1 else result
+        return self.output(hidden), sequence_mean, sequence_std
+
+    def forward_standardized(self, features: Tensor) -> Tensor:
+        standardized, _sequence_mean, _sequence_std = (
+            self._forward_standardized_with_sequence_stats(features)
+        )
+        return standardized.squeeze(-1) \
+            if self.horizon_return_count == 1 else standardized
 
     def forward(self, features: Tensor) -> Tensor:
-        standardized = self.forward_standardized(features)
-        return standardized * self.target_std + self.target_mean
+        standardized, sequence_mean, sequence_std = (
+            self._forward_standardized_with_sequence_stats(features)
+        )
+        if self.input_normalization \
+                in REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES:
+            if sequence_mean is None or sequence_std is None:
+                raise RuntimeError("reversible sequence statistics are missing")
+            prediction = standardized * sequence_std + sequence_mean
+        else:
+            prediction = standardized * self.target_std + self.target_mean
+        return prediction.squeeze(-1) \
+            if self.horizon_return_count == 1 else prediction
 
 
 def optimizer_parameter_groups(

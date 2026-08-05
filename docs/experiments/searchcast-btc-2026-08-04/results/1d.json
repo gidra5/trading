@@ -1,0 +1,1379 @@
+{
+  "scale": "1d",
+  "label": "one day",
+  "profile": {
+    "candles": 1826,
+    "sourceRowsRead": 2629440,
+    "expectedSourceRows": 2629440,
+    "sourceCoveragePercent": 100.0,
+    "start": "2021-07-25T00:00:00Z",
+    "end": "2026-07-24T00:00:00Z",
+    "samplingNote": "Derived from all common-window 1m candles in complete 1d UTC bins.",
+    "priceMinimum": 15476.0,
+    "priceMaximum": 126199.63,
+    "endingClose": 64139.99,
+    "meanLogReturnBps": 3.259685042151281,
+    "medianLogReturnBps": -1.5727263695453075,
+    "returnStdBps": 275.2426741701372,
+    "meanAbsoluteReturnBps": 190.41149801697506,
+    "annualizedVolatilityPercent": 52.60304455751674,
+    "skewness": -0.20896047077721067,
+    "excessKurtosis": 4.0108238886606475,
+    "meanCandleRangeBps": 401.49410756979495,
+    "medianVolumeBtc": 32804.474774999995,
+    "returnAcf": {
+      "1": -0.01766538943236488,
+      "2": 0.007799863441047516,
+      "7": 0.01305299540572609,
+      "14": 0.006323503270979977,
+      "30": -0.00468182885577779,
+      "90": -0.001850374048391721,
+      "365": -0.02476932955999676
+    },
+    "absoluteReturnAcf": {
+      "1": 0.16339128154982424,
+      "2": 0.08257708924053812,
+      "7": 0.10263663747848639,
+      "14": 0.12372276234880691,
+      "30": 0.033139740120650435,
+      "90": 0.011242544179864093,
+      "365": -0.0035173108893761045
+    }
+  },
+  "split": {
+    "startMs": 1627171200000,
+    "fold1TrainEndMs": 1706054400000,
+    "fold1ValidationEndMs": 1721779200000,
+    "fold2ValidationEndMs": 1737590400000,
+    "developmentEndMs": 1753315200000,
+    "endMs": 1784937600000,
+    "developmentRows": 1460,
+    "testRows": 366
+  },
+  "projectLookback": 32,
+  "horizons": [
+    {
+      "horizonCandles": 1,
+      "cvFolds": 3,
+      "validLookbacks": [
+        3,
+        7,
+        14,
+        30,
+        60,
+        90,
+        180,
+        365
+      ],
+      "fixedBaselineLookback": 30,
+      "trainWindows": 1095,
+      "testWindows": 366,
+      "bestTrial": {
+        "lookback": 3,
+        "normalization_scope": "global",
+        "normalization_method": "standard",
+        "local_ratio": 1.0,
+        "augmentation": "none",
+        "augmentation_sigma": 0.0,
+        "alpha": 0.08912509381337459,
+        "cvNormalizedMse": 0.005448439946268534,
+        "foldNormalizedMse": [
+          0.01090560253794769,
+          0.003547238802758503,
+          0.0018924784980994085
+        ],
+        "effectiveLocalPoints": null
+      },
+      "nearBestLookbackIqr": {
+        "q25": 3.0,
+        "median": 3.0,
+        "q75": 3.0
+      },
+      "models": {
+        "persistence": {
+          "normalizedMse": 0.001946261076707309,
+          "rmseBps": 226.3507390752432,
+          "maeBps": 160.95598024417149,
+          "endpointDirectionAccuracy": 0.0
+        },
+        "tuned_ridge": {
+          "normalizedMse": 0.0019798635859193513,
+          "rmseBps": 228.29636799648532,
+          "maeBps": 162.9203175556097,
+          "endpointDirectionAccuracy": 0.49453551912568305,
+          "gainVsPersistencePercent": -1.726516016488966
+        },
+        "global_ridge": {
+          "normalizedMse": 0.0020964919009944737,
+          "rmseBps": 234.92431151176962,
+          "maeBps": 168.7747116197915,
+          "endpointDirectionAccuracy": 0.5081967213114754
+        },
+        "local_full_ridge": {
+          "normalizedMse": 0.002009851904706403,
+          "rmseBps": 230.01883373812134,
+          "maeBps": 164.7676730395554,
+          "endpointDirectionAccuracy": 0.505464480874317
+        }
+      },
+      "baselineCv": {
+        "global_ridge": {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.006117867581907518,
+          "foldNormalizedMse": [
+            0.012512372573932597,
+            0.0038204752903696813,
+            0.0020207548814202775
+          ],
+          "effectiveLocalPoints": null
+        },
+        "local_full_ridge": {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 44.668359215096345,
+          "cvNormalizedMse": 0.006069789134407727,
+          "foldNormalizedMse": [
+            0.012407901781520942,
+            0.0037728341274108138,
+            0.002028631494291422
+          ],
+          "effectiveLocalPoints": 30
+        }
+      },
+      "topTrials": [
+        {
+          "lookback": 3,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.005448439946268534,
+          "foldNormalizedMse": [
+            0.01090560253794769,
+            0.003547238802758503,
+            0.0018924784980994085
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.005505630064703573,
+          "foldNormalizedMse": [
+            0.01099797540124858,
+            0.003626462552051436,
+            0.0018924522408107027
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.005695719917102579,
+          "foldNormalizedMse": [
+            0.011515460428575711,
+            0.0036830597451319447,
+            0.0018886395776000799
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.006117867581907518,
+          "foldNormalizedMse": [
+            0.012512372573932597,
+            0.0038204752903696813,
+            0.0020207548814202775
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.00687721288827253,
+          "foldNormalizedMse": [
+            0.014394784363099185,
+            0.004060169778066699,
+            0.002176684523651707
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 365,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.0074884199759002205,
+          "foldNormalizedMse": [
+            0.010111535573321876,
+            0.00796543943061922,
+            0.004388284923759565
+          ],
+          "effectiveLocalPoints": 365
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.08483428982440722,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 125.89254117941663,
+          "cvNormalizedMse": 0.007586814798653928,
+          "foldNormalizedMse": [
+            0.016226682352117223,
+            0.004287201807909534,
+            0.002246560235935025
+          ],
+          "effectiveLocalPoints": 6
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.007705967116432352,
+          "foldNormalizedMse": [
+            0.01588106184017914,
+            0.004872992470671215,
+            0.0023638470384467025
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.19306977288832505,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 125.89254117941663,
+          "cvNormalizedMse": 0.007976100247081173,
+          "foldNormalizedMse": [
+            0.016702689164969618,
+            0.004984437415893596,
+            0.0022411741603803074
+          ],
+          "effectiveLocalPoints": 18
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.3301778399171274,
+          "augmentation": "frequency",
+          "augmentation_sigma": 0.05690441815244029,
+          "alpha": 44.668359215096345,
+          "cvNormalizedMse": 0.008224875568032228,
+          "foldNormalizedMse": [
+            0.01712840860805569,
+            0.005123833458365526,
+            0.0024223846376754715
+          ],
+          "effectiveLocalPoints": 30
+        }
+      ]
+    },
+    {
+      "horizonCandles": 3,
+      "cvFolds": 3,
+      "validLookbacks": [
+        3,
+        7,
+        14,
+        30,
+        60,
+        90,
+        180,
+        365
+      ],
+      "fixedBaselineLookback": 30,
+      "trainWindows": 1093,
+      "testWindows": 364,
+      "bestTrial": {
+        "lookback": 3,
+        "normalization_scope": "global",
+        "normalization_method": "standard",
+        "local_ratio": 1.0,
+        "augmentation": "none",
+        "augmentation_sigma": 0.0,
+        "alpha": 0.08912509381337459,
+        "cvNormalizedMse": 0.010441146844341153,
+        "foldNormalizedMse": [
+          0.02049661192326837,
+          0.00750707585644693,
+          0.003319752753308158
+        ],
+        "effectiveLocalPoints": null
+      },
+      "nearBestLookbackIqr": {
+        "q25": 3.0,
+        "median": 3.0,
+        "q75": 3.0
+      },
+      "models": {
+        "persistence": {
+          "normalizedMse": 0.003792987557684848,
+          "rmseBps": 315.48967895598327,
+          "maeBps": 229.86479358190851,
+          "endpointDirectionAccuracy": 0.0
+        },
+        "tuned_ridge": {
+          "normalizedMse": 0.0039045666489152227,
+          "rmseBps": 320.0964571101541,
+          "maeBps": 231.67633541203816,
+          "endpointDirectionAccuracy": 0.5027472527472527,
+          "gainVsPersistencePercent": -2.9417204652914863
+        },
+        "global_ridge": {
+          "normalizedMse": 0.004051427999231831,
+          "rmseBps": 326.0607398787373,
+          "maeBps": 235.36379849395783,
+          "endpointDirectionAccuracy": 0.5274725274725275
+        },
+        "local_full_ridge": {
+          "normalizedMse": 0.003889659616955466,
+          "rmseBps": 319.48483338177186,
+          "maeBps": 233.8226196034674,
+          "endpointDirectionAccuracy": 0.5274725274725275
+        }
+      },
+      "baselineCv": {
+        "global_ridge": {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.011587092179152084,
+          "foldNormalizedMse": [
+            0.023516869175166013,
+            0.007675112968647331,
+            0.003569294393642908
+          ],
+          "effectiveLocalPoints": null
+        },
+        "local_full_ridge": {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 125.89254117941663,
+          "cvNormalizedMse": 0.011819934839512207,
+          "foldNormalizedMse": [
+            0.023981042116740445,
+            0.007822510862710831,
+            0.003656251539085348
+          ],
+          "effectiveLocalPoints": 30
+        }
+      },
+      "topTrials": [
+        {
+          "lookback": 3,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.010441146844341153,
+          "foldNormalizedMse": [
+            0.02049661192326837,
+            0.00750707585644693,
+            0.003319752753308158
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.010576065389606495,
+          "foldNormalizedMse": [
+            0.020807416192587747,
+            0.007604539947795785,
+            0.0033162400284359544
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.9656694180069891,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.010954365838285305,
+          "foldNormalizedMse": [
+            0.021396277107080107,
+            0.008020890142419175,
+            0.003445930265356634
+          ],
+          "effectiveLocalPoints": 14
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.010961711084567305,
+          "foldNormalizedMse": [
+            0.021830380113048622,
+            0.007740189569696297,
+            0.003314563570956998
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.011587092179152084,
+          "foldNormalizedMse": [
+            0.023516869175166013,
+            0.007675112968647331,
+            0.003569294393642908
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.012772896555766128,
+          "foldNormalizedMse": [
+            0.026404653979744258,
+            0.00800728886344906,
+            0.003906746824105067
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.01418999915415012,
+          "foldNormalizedMse": [
+            0.0292000160376844,
+            0.009267492624252473,
+            0.004102488800513489
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.08483428982440722,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.01422859902126617,
+          "foldNormalizedMse": [
+            0.02939148053791994,
+            0.009443154793126117,
+            0.0038511617327524465
+          ],
+          "effectiveLocalPoints": 6
+        },
+        {
+          "lookback": 365,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.014793420734342295,
+          "foldNormalizedMse": [
+            0.019401997165553513,
+            0.015798013885091704,
+            0.009180251152381668
+          ],
+          "effectiveLocalPoints": 365
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.19306977288832505,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 125.89254117941663,
+          "cvNormalizedMse": 0.015761562247023894,
+          "foldNormalizedMse": [
+            0.032195056595190036,
+            0.010924702435138465,
+            0.004164927710743182
+          ],
+          "effectiveLocalPoints": 18
+        }
+      ]
+    },
+    {
+      "horizonCandles": 7,
+      "cvFolds": 3,
+      "validLookbacks": [
+        3,
+        7,
+        14,
+        30,
+        60,
+        90,
+        180,
+        365
+      ],
+      "fixedBaselineLookback": 30,
+      "trainWindows": 1089,
+      "testWindows": 360,
+      "bestTrial": {
+        "lookback": 7,
+        "normalization_scope": "local",
+        "normalization_method": "standard",
+        "local_ratio": 0.6764707055254325,
+        "augmentation": "time",
+        "augmentation_sigma": 0.08779685249927398,
+        "alpha": 1e-06,
+        "cvNormalizedMse": 0.02181756818156699,
+        "foldNormalizedMse": [
+          0.04361954319036172,
+          0.015480820550950295,
+          0.006352340803388954
+        ],
+        "effectiveLocalPoints": 5
+      },
+      "nearBestLookbackIqr": {
+        "q25": 4.0,
+        "median": 5.0,
+        "q75": 6.0
+      },
+      "models": {
+        "persistence": {
+          "normalizedMse": 0.007358711000179359,
+          "rmseBps": 438.04676883328125,
+          "maeBps": 317.1130817262074,
+          "endpointDirectionAccuracy": 0.0
+        },
+        "tuned_ridge": {
+          "normalizedMse": 0.008169151453619536,
+          "rmseBps": 461.5386565028569,
+          "maeBps": 329.839910354552,
+          "endpointDirectionAccuracy": 0.4722222222222222,
+          "gainVsPersistencePercent": -11.01334803636702
+        },
+        "global_ridge": {
+          "normalizedMse": 0.008233834554466314,
+          "rmseBps": 463.36227852510336,
+          "maeBps": 329.15837055700985,
+          "endpointDirectionAccuracy": 0.49166666666666664
+        },
+        "local_full_ridge": {
+          "normalizedMse": 0.00833566864738516,
+          "rmseBps": 466.2188501372214,
+          "maeBps": 334.9644579013327,
+          "endpointDirectionAccuracy": 0.48055555555555557
+        }
+      },
+      "baselineCv": {
+        "global_ridge": {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.023908456436586123,
+          "foldNormalizedMse": [
+            0.050519849395858,
+            0.01482599302239633,
+            0.006379526891504039
+          ],
+          "effectiveLocalPoints": null
+        },
+        "local_full_ridge": {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.026117352702544328,
+          "foldNormalizedMse": [
+            0.055783241975730605,
+            0.015472562076029693,
+            0.007096254055872692
+          ],
+          "effectiveLocalPoints": 30
+        }
+      },
+      "topTrials": [
+        {
+          "lookback": 7,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.6764707055254325,
+          "augmentation": "time",
+          "augmentation_sigma": 0.08779685249927398,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.02181756818156699,
+          "foldNormalizedMse": [
+            0.04361954319036172,
+            0.015480820550950295,
+            0.006352340803388954
+          ],
+          "effectiveLocalPoints": 5
+        },
+        {
+          "lookback": 3,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.021864267279536036,
+          "foldNormalizedMse": [
+            0.04454295635796703,
+            0.014982460279577012,
+            0.006067385201064058
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.022138981944873102,
+          "foldNormalizedMse": [
+            0.04520936044324599,
+            0.01510860735463797,
+            0.006098978036735353
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.02294507031894341,
+          "foldNormalizedMse": [
+            0.04746925396032263,
+            0.01529644155660403,
+            0.006069515439903567
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.023908456436586123,
+          "foldNormalizedMse": [
+            0.050519849395858,
+            0.01482599302239633,
+            0.006379526891504039
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.02602821267749376,
+          "foldNormalizedMse": [
+            0.05551783978893288,
+            0.015378984472273064,
+            0.007187813771275341
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.08483428982440722,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.029151635489015112,
+          "foldNormalizedMse": [
+            0.06111601838826747,
+            0.019103839700474568,
+            0.007235048378303302
+          ],
+          "effectiveLocalPoints": 6
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.02954923810715331,
+          "foldNormalizedMse": [
+            0.06368772271626401,
+            0.017661440325429552,
+            0.007298551279766356
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 365,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 5.623413251903491,
+          "cvNormalizedMse": 0.02979104639198636,
+          "foldNormalizedMse": [
+            0.041675639120998836,
+            0.028332614205657903,
+            0.019364885849302346
+          ],
+          "effectiveLocalPoints": 365
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.07110616146342617,
+          "augmentation": "frequency",
+          "augmentation_sigma": 0.12998485263716789,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.030751510151813367,
+          "foldNormalizedMse": [
+            0.06543468104093876,
+            0.01933952800004861,
+            0.007480321414452732
+          ],
+          "effectiveLocalPoints": 5
+        }
+      ]
+    },
+    {
+      "horizonCandles": 14,
+      "cvFolds": 3,
+      "validLookbacks": [
+        3,
+        7,
+        14,
+        30,
+        60,
+        90,
+        180,
+        365
+      ],
+      "fixedBaselineLookback": 30,
+      "trainWindows": 1082,
+      "testWindows": 353,
+      "bestTrial": {
+        "lookback": 3,
+        "normalization_scope": "global",
+        "normalization_method": "standard",
+        "local_ratio": 1.0,
+        "augmentation": "none",
+        "augmentation_sigma": 0.0,
+        "alpha": 0.08912509381337459,
+        "cvNormalizedMse": 0.0415240547880386,
+        "foldNormalizedMse": [
+          0.08711733297120856,
+          0.026832923236301116,
+          0.010621908156606113
+        ],
+        "effectiveLocalPoints": null
+      },
+      "nearBestLookbackIqr": {
+        "q25": 3.0,
+        "median": 3.0,
+        "q75": 3.0
+      },
+      "models": {
+        "persistence": {
+          "normalizedMse": 0.014818449477834415,
+          "rmseBps": 618.1853254980924,
+          "maeBps": 441.87947408981876,
+          "endpointDirectionAccuracy": 0.0
+        },
+        "tuned_ridge": {
+          "normalizedMse": 0.016716591556614528,
+          "rmseBps": 656.5853302765312,
+          "maeBps": 460.10967913003424,
+          "endpointDirectionAccuracy": 0.4475920679886686,
+          "gainVsPersistencePercent": -12.809316397234216
+        },
+        "global_ridge": {
+          "normalizedMse": 0.01701180508338365,
+          "rmseBps": 662.3575768644149,
+          "maeBps": 461.29519460236855,
+          "endpointDirectionAccuracy": 0.46175637393767704
+        },
+        "local_full_ridge": {
+          "normalizedMse": 0.017994989168220864,
+          "rmseBps": 681.2289635890464,
+          "maeBps": 480.21478500385126,
+          "endpointDirectionAccuracy": 0.509915014164306
+        }
+      },
+      "baselineCv": {
+        "global_ridge": {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.045667273960634414,
+          "foldNormalizedMse": [
+            0.09954765175278203,
+            0.026391529709063808,
+            0.011062640420057404
+          ],
+          "effectiveLocalPoints": null
+        },
+        "local_full_ridge": {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.05197047272975865,
+          "foldNormalizedMse": [
+            0.1166988453827604,
+            0.026862921106197847,
+            0.012349651700317701
+          ],
+          "effectiveLocalPoints": 30
+        }
+      },
+      "topTrials": [
+        {
+          "lookback": 3,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.0415240547880386,
+          "foldNormalizedMse": [
+            0.08711733297120856,
+            0.026832923236301116,
+            0.010621908156606113
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.08912509381337459,
+          "cvNormalizedMse": 0.04218983426904085,
+          "foldNormalizedMse": [
+            0.0888874664709979,
+            0.02698089902378048,
+            0.010701137312344136
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.04391114440577686,
+          "foldNormalizedMse": [
+            0.0935374672006175,
+            0.027249448528915234,
+            0.010946517487797859
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.045667273960634414,
+          "foldNormalizedMse": [
+            0.09954765175278203,
+            0.026391529709063808,
+            0.011062640420057404
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "frequency",
+          "augmentation_sigma": 0.01631195914422417,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.045768340694477085,
+          "foldNormalizedMse": [
+            0.09983143154754469,
+            0.02638631742041514,
+            0.01108727311547141
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.04961304312052284,
+          "foldNormalizedMse": [
+            0.10981514146484897,
+            0.02714141227099363,
+            0.011882575625725927
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 365,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 5.623413251903491,
+          "cvNormalizedMse": 0.05121835618652473,
+          "foldNormalizedMse": [
+            0.0690365661890561,
+            0.048314704279322176,
+            0.036303798091195924
+          ],
+          "effectiveLocalPoints": 365
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.4207157714464165,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1000.0,
+          "cvNormalizedMse": 0.05327266539818536,
+          "foldNormalizedMse": [
+            0.11379582307408453,
+            0.03375151778490078,
+            0.012270655335570778
+          ],
+          "effectiveLocalPoints": 3
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.0555819805787618,
+          "foldNormalizedMse": [
+            0.12051844127334896,
+            0.03351377947879464,
+            0.012713720984141795
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.08483428982440722,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.0633146344311938,
+          "foldNormalizedMse": [
+            0.13395136261358515,
+            0.04199312848393729,
+            0.013999412196058925
+          ],
+          "effectiveLocalPoints": 6
+        }
+      ]
+    },
+    {
+      "horizonCandles": 30,
+      "cvFolds": 3,
+      "validLookbacks": [
+        3,
+        7,
+        14,
+        30,
+        60,
+        90,
+        180,
+        365
+      ],
+      "fixedBaselineLookback": 30,
+      "trainWindows": 1066,
+      "testWindows": 337,
+      "bestTrial": {
+        "lookback": 365,
+        "normalization_scope": "local",
+        "normalization_method": "standard",
+        "local_ratio": 1.0,
+        "augmentation": "none",
+        "augmentation_sigma": 0.0,
+        "alpha": 5.623413251903491,
+        "cvNormalizedMse": 0.10292143572744629,
+        "foldNormalizedMse": [
+          0.13917220747284706,
+          0.08323836594879254,
+          0.08635373376069928
+        ],
+        "effectiveLocalPoints": 365
+      },
+      "nearBestLookbackIqr": {
+        "q25": 365.0,
+        "median": 365.0,
+        "q75": 365.0
+      },
+      "models": {
+        "persistence": {
+          "normalizedMse": 0.03423994137306705,
+          "rmseBps": 927.8943032807166,
+          "maeBps": 646.1110622444393,
+          "endpointDirectionAccuracy": 0.0
+        },
+        "tuned_ridge": {
+          "normalizedMse": 0.0389363260829801,
+          "rmseBps": 989.4856207718835,
+          "maeBps": 725.8593195278468,
+          "endpointDirectionAccuracy": 0.4807121661721068,
+          "gainVsPersistencePercent": -13.716100324888991
+        },
+        "global_ridge": {
+          "normalizedMse": 0.04137640681793714,
+          "rmseBps": 1020.0192991501225,
+          "maeBps": 702.1697537717198,
+          "endpointDirectionAccuracy": 0.3649851632047478
+        },
+        "local_full_ridge": {
+          "normalizedMse": 0.03814857381545474,
+          "rmseBps": 979.4249328043185,
+          "maeBps": 690.8195047059091,
+          "endpointDirectionAccuracy": 0.39465875370919884
+        }
+      },
+      "baselineCv": {
+        "global_ridge": {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.03162277660168379,
+          "cvNormalizedMse": 0.11893607510232401,
+          "foldNormalizedMse": [
+            0.26995744280044526,
+            0.0596633052763411,
+            0.02718747723018568
+          ],
+          "effectiveLocalPoints": null
+        },
+        "local_full_ridge": {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1.9952623149688788,
+          "cvNormalizedMse": 0.13659654415806274,
+          "foldNormalizedMse": [
+            0.31753560685166754,
+            0.06505793128689355,
+            0.027196094335627138
+          ],
+          "effectiveLocalPoints": 30
+        }
+      },
+      "topTrials": [
+        {
+          "lookback": 365,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 5.623413251903491,
+          "cvNormalizedMse": 0.10292143572744629,
+          "foldNormalizedMse": [
+            0.13917220747284706,
+            0.08323836594879254,
+            0.08635373376069928
+          ],
+          "effectiveLocalPoints": 365
+        },
+        {
+          "lookback": 3,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.10649265270585918,
+          "foldNormalizedMse": [
+            0.23520094919018297,
+            0.05819664930942172,
+            0.0260803596179729
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 7,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.10864478931210642,
+          "foldNormalizedMse": [
+            0.24096705776847557,
+            0.058662900725186436,
+            0.026304409442657214
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 14,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 1e-06,
+          "cvNormalizedMse": 0.11194863014450662,
+          "foldNormalizedMse": [
+            0.24988907491972406,
+            0.0595123418579423,
+            0.026444473655853482
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.03162277660168379,
+          "cvNormalizedMse": 0.11893607510232401,
+          "foldNormalizedMse": [
+            0.26995744280044526,
+            0.0596633052763411,
+            0.02718747723018568
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 60,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.12907458126975077,
+          "foldNormalizedMse": [
+            0.29650042893981376,
+            0.06184729017137199,
+            0.0288760246980666
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 30,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.8256085982466118,
+          "augmentation": "time",
+          "augmentation_sigma": 0.009499512796650124,
+          "alpha": 125.89254117941663,
+          "cvNormalizedMse": 0.13519582517122836,
+          "foldNormalizedMse": [
+            0.31298781776370305,
+            0.06618677356958555,
+            0.026412884180396525
+          ],
+          "effectiveLocalPoints": 25
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "standard",
+          "local_ratio": 1.0,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 0.7079457843841388,
+          "cvNormalizedMse": 0.13865201293772592,
+          "foldNormalizedMse": [
+            0.2890599021910577,
+            0.09492517872923216,
+            0.03197095789288788
+          ],
+          "effectiveLocalPoints": null
+        },
+        {
+          "lookback": 180,
+          "normalization_scope": "local",
+          "normalization_method": "standard",
+          "local_ratio": 0.43939705607607904,
+          "augmentation": "none",
+          "augmentation_sigma": 0.0,
+          "alpha": 15.848931924611142,
+          "cvNormalizedMse": 0.16000924112034068,
+          "foldNormalizedMse": [
+            0.2930935999198194,
+            0.14821337680341234,
+            0.03872074663779029
+          ],
+          "effectiveLocalPoints": 80
+        },
+        {
+          "lookback": 90,
+          "normalization_scope": "global",
+          "normalization_method": "robust",
+          "local_ratio": 1.0,
+          "augmentation": "frequency",
+          "augmentation_sigma": 0.2710133166658904,
+          "alpha": 0.25118864315095824,
+          "cvNormalizedMse": 0.17555737696801701,
+          "foldNormalizedMse": [
+            0.34690648313295575,
+            0.13962732014630813,
+            0.04013832762478724
+          ],
+          "effectiveLocalPoints": null
+        }
+      ]
+    }
+  ],
+  "lookbackPowerLaw": {
+    "a": 1.260134483603654,
+    "b": 1.0991521270620694,
+    "rSquared": 0.48770526090549926
+  },
+  "limitations": [
+    "The target is univariate log close; the paper's cross-series grouping sweep is not applicable.",
+    "Search uses deterministic joint trials rather than Optuna TPE; the searched axes and 21-value alpha loop match the paper.",
+    "No nonlinear baseline is trained; the comparison isolates preprocessing gains against persistence and fixed Ridge baselines."
+  ],
+  "charts": [
+    "charts/1d-data-profile.png",
+    "charts/1d-model-comparison.png",
+    "charts/1d-lookback-horizon.png",
+    "charts/1d-hyperparameters.png",
+    "charts/1d-weights.png",
+    "charts/1d-forecast.png"
+  ]
+}

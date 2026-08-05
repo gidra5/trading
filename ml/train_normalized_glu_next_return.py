@@ -43,7 +43,9 @@ from next_return_sequence import (
 )
 from normalized_glu_next_return import (
     ARCHITECTURE_CONTRACT as GLU_ARCHITECTURE_CONTRACT,
+    INPUT_NORMALIZATION_MODES,
     NormalizedGluNextReturn,
+    TRAINING_POSITION_INPUT_NORMALIZATION,
     optimizer_parameter_groups,
 )
 from linear_next_return_path import (
@@ -62,7 +64,8 @@ from trading_storage import (
 
 RUNNER_CONTRACT = (
     "cross-shard-batched-distinct-second-configurable-horizon-multi-metric-"
-    "reusable-host-buffer-validation-only-optional-summary-loss-glu-stack-v10"
+    "reusable-host-buffer-validation-only-optional-summary-loss-glu-stack-"
+    "reversible-input-normalization-side-features-v13"
 )
 SELECTION_CONTRACT = "validation-composite-path-objective-best-checkpoint-v2"
 
@@ -606,6 +609,10 @@ def validate_plan(plan: dict) -> None:
                     or width < 2
                     for width in widths
                 ) \
+                or architecture.get(
+                    "inputNormalization",
+                    TRAINING_POSITION_INPUT_NORMALIZATION,
+                ) not in INPUT_NORMALIZATION_MODES \
                 or not 0 <= float(architecture.get("dropout", -1)) < 1 \
                 or not 0 <= float(architecture.get("dropoutRate", -1)) <= 1 \
                 or float(architecture.get("initialRadius", 0)) <= float(
@@ -668,6 +675,9 @@ def build_predictor(
         target_mean,
         target_std,
         widths=tuple(int(value) for value in architecture["widths"]),
+        input_normalization=architecture.get(
+            "inputNormalization", TRAINING_POSITION_INPUT_NORMALIZATION
+        ),
         dropout=float(architecture["dropout"]),
         dropout_rate=float(architecture["dropoutRate"]),
         initial_radius=float(architecture["initialRadius"]),
