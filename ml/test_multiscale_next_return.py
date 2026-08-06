@@ -126,6 +126,23 @@ class MultiscaleNextReturnTest(unittest.TestCase):
             hour_target, 3600e-9, rtol=0, atol=3e-13
         )
 
+    def test_resolution_examples_support_a_fifteen_candle_horizon(self) -> None:
+        class AnalyticCloseCache:
+            def load_range(self, start: datetime, count: int) -> np.ndarray:
+                seconds = start.timestamp() + np.arange(count)
+                return np.exp(seconds * 1e-9)
+
+        history, target = daily_resolution_examples(
+            AnalyticCloseCache(),  # type: ignore[arg-type]
+            "2025-01-01",
+            resolution="1m",
+            max_window="1m",
+            horizon_candle_count=15,
+        )
+        self.assertEqual(history.shape, (1440, 1, 120))
+        self.assertEqual(target.shape, (1440, 15))
+        np.testing.assert_allclose(target, 60e-9, rtol=0, atol=3e-15)
+
     def test_resolution_indices_align_source_shards(self) -> None:
         start = int(datetime(
             2025, 1, 1, 0, 0, 17, tzinfo=timezone.utc

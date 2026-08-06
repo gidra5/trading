@@ -3887,7 +3887,7 @@ function BacktestPanel(props: {
             title="Strategy used by the replay bot"
           >
             <option value="peak-valley">Peak / valley</option>
-            <option value="hindsight-oracle-1s">1s hindsight oracle · 1h horizon</option>
+            <option value="hindsight-oracle-1s">Hindsight oracle · 1h horizon</option>
           </select>
           <button
             class={buttonPanelClass}
@@ -4187,7 +4187,11 @@ function BacktestPanel(props: {
               0,
             )}/s`}
           />
-          <SmallMetric label="Drawdown" value={formatPercent(summary()?.maxDrawdownPct)} />
+          <SmallMetric
+            label="Initial DD"
+            value={formatPercent(summary()?.maxInitialBalanceDrawdownPct)}
+          />
+          <SmallMetric label="Peak DD" value={formatPercent(summary()?.maxDrawdownPct)} />
           <Show when={summary()?.sampleCount ?? props.progress?.sampleCount}>
             <SmallMetric
               label="Samples"
@@ -4302,7 +4306,8 @@ type BacktestReplayMetricKey =
   | "returnPct"
   | "realizedPnl"
   | "unrealizedPnl"
-  | "drawdownPct"
+  | "initialBalanceDrawdownPct"
+  | "peakDrawdownPct"
   | "exposurePct"
   | "maxEffectiveLeverage"
   | "feesPaid"
@@ -4386,8 +4391,16 @@ const backtestReplayMetrics: BacktestReplayMetricDefinition[] = [
     format: (value) => `$${formatQuote(value, 2)}`,
   },
   {
-    key: "drawdownPct",
-    label: "Drawdown",
+    key: "initialBalanceDrawdownPct",
+    label: "Initial DD",
+    group: "risk",
+    color: "#f59e0b",
+    value: (frame) => frame.metrics.maxInitialBalanceDrawdownPct,
+    format: formatPercent,
+  },
+  {
+    key: "peakDrawdownPct",
+    label: "Peak DD",
     group: "risk",
     color: "#f05252",
     value: (frame) => frame.metrics.maxDrawdownPct,
@@ -5588,9 +5601,15 @@ function BacktestReplayStatePanel(props: {
           onSelect={props.onMetricSelect}
         />
         <BacktestReplayMetricButton
-          metricKey="drawdownPct"
+          metricKey="initialBalanceDrawdownPct"
           frame={frame()}
-          selected={props.selectedMetricKey === "drawdownPct"}
+          selected={props.selectedMetricKey === "initialBalanceDrawdownPct"}
+          onSelect={props.onMetricSelect}
+        />
+        <BacktestReplayMetricButton
+          metricKey="peakDrawdownPct"
+          frame={frame()}
+          selected={props.selectedMetricKey === "peakDrawdownPct"}
           onSelect={props.onMetricSelect}
         />
         <SmallMetric label="Entry" value={replaySignalLabel(frame()?.entrySignal)} />

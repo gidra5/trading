@@ -222,6 +222,58 @@ def sequence_objective_loss(
     return (per_example * weights.float()).sum() / weights.sum()
 
 
+def weighted_lead_correlation_loss(
+    prediction: Tensor,
+    target: Tensor,
+    weights: Tensor,
+    *,
+    epsilon: float = 1e-8,
+) -> Tensor:
+    """Return one minus the mean Pearson correlation across forecast leads."""
+    if prediction.ndim != 2 or target.shape != prediction.shape \
+            or weights.shape != (prediction.shape[0],):
+        raise ValueError("correlation objective inputs are misaligned")
+    if prediction.shape[0] < 2:
+        raise ValueError("correlation objective requires at least two examples")
+    if not math.isfinite(float(epsilon)) or float(epsilon) <= 0:
+        raise ValueError("correlation epsilon must be positive and finite")
+    values = prediction.float()
+    targets = target.float()
+    sample_weights = weights.float().unsqueeze(1)
+    weight_sum = sample_weights.sum()
+    if float(weight_sum.detach()) <= 0:
+        raise ValueError("correlation weights must have positive sum")
+
+    prediction_centered = values - (
+        sample_weights * values
+    ).sum(dim=0, keepdim=True) / weight_sum
+    target_centered = targets - (
+        sample_weights * targets
+    ).sum(dim=0, keepdim=True) / weight_sum
+
+    # Put every lead near unit target variance before applying epsilon. This
+    # keeps the same numerical behavior for second, minute, hour, and day data.
+    target_variance = (
+        sample_weights * target_centered.square()
+    ).sum(dim=0) / weight_sum
+    scale = target_variance.detach().clamp_min(torch.finfo(torch.float32).tiny).sqrt()
+    prediction_centered = prediction_centered / scale
+    target_centered = target_centered / scale
+    covariance = (
+        sample_weights * prediction_centered * target_centered
+    ).sum(dim=0) / weight_sum
+    prediction_variance = (
+        sample_weights * prediction_centered.square()
+    ).sum(dim=0) / weight_sum
+    normalized_target_variance = (
+        sample_weights * target_centered.square()
+    ).sum(dim=0) / weight_sum
+    denominator = (
+        prediction_variance * normalized_target_variance + float(epsilon)
+    ).sqrt()
+    return 1.0 - (covariance / denominator).mean()
+
+
 class SequenceMetricAccumulator:
     def __init__(
         self,

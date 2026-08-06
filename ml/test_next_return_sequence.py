@@ -20,6 +20,7 @@ from next_return_sequence import (
     sequence_objective_components,
     sequence_objective_loss,
     torch_path_summaries,
+    weighted_lead_correlation_loss,
 )
 from normalized_glu_next_return import NormalizedGluNextReturn
 from train_normalized_glu_next_return import NextReturnDataset
@@ -213,6 +214,38 @@ class NextReturnSequenceTest(unittest.TestCase):
             summary_weight=0,
         )
         torch.testing.assert_close(actual, candle.mean())
+
+    def test_correlation_loss_averages_leads_and_ignores_affine_scale(self) -> None:
+        target = torch.tensor([
+            [-2.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 2.0],
+            [2.0, 0.0],
+        ])
+        prediction = torch.stack((
+            7.0 * target[:, 0] + 3.0,
+            -2.0 * target[:, 1] - 5.0,
+        ), dim=1)
+        loss = weighted_lead_correlation_loss(
+            prediction, target, torch.ones(4)
+        )
+        # Lead one has correlation +1 and lead two -1, so their mean is zero.
+        torch.testing.assert_close(loss, torch.tensor(1.0), atol=1e-6, rtol=0)
+
+    def test_correlation_loss_has_finite_gradient_from_constant_predictions(self) -> None:
+        target = torch.tensor([
+            [-2.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 2.0],
+            [2.0, 0.0],
+        ])
+        prediction = torch.zeros_like(target, requires_grad=True)
+        loss = weighted_lead_correlation_loss(
+            prediction, target, torch.ones(4)
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+        self.assertGreater(float(prediction.grad.abs().sum()), 0)
 
     def test_glu_outputs_the_configured_horizon(self) -> None:
         model = NormalizedGluNextReturn(

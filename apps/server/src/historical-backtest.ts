@@ -93,6 +93,8 @@ export interface HistoricalBacktestOptions {
   learnedOracleModelId?: string;
   /** Uses the same execution leverage projection as live learned-policy use. */
   learnedOracleMaximumLeverage?: number;
+  /** Calibrated predictor quality applied consistently with live oracle execution. */
+  oracleStaticConfidenceScale?: number;
   cache: HistoricalCacheOptions;
   historicalStartTime?: number;
   historicalRangeMs?: number;
@@ -730,6 +732,7 @@ async function runBotHistoricalRangeBacktest(
     oracleFuture,
     learnedOracleDistributionAt,
     learnedOracleMaximumLeverage: options.learnedOracleMaximumLeverage,
+    oracleStaticConfidenceScale: options.oracleStaticConfidenceScale,
     extremaSmaWindowMs: options.extremaSmaWindowMs,
   });
   Object.assign(result.summary, {
@@ -867,6 +870,7 @@ function buildRandomAggregateResult(input: {
         result.summary.perfectMarginCompoundedReturnPct,
       perfectMarginCompoundedCapturePct:
         result.summary.perfectMarginCompoundedCapturePct,
+      maxInitialBalanceDrawdownPct: result.summary.maxInitialBalanceDrawdownPct,
       maxDrawdownPct: result.summary.maxDrawdownPct,
       maxEntryLeverage: result.summary.maxEntryLeverage,
       maxEffectiveLeverage: result.summary.maxEffectiveLeverage,
@@ -995,6 +999,7 @@ function buildRandomAggregateResult(input: {
         backtestSharpeRatioValues.length > 0
           ? average(backtestSharpeRatioValues)
           : undefined,
+      maxInitialBalanceDrawdownPct: metrics.maxInitialBalanceDrawdownPct,
       maxDrawdownPct: metrics.maxDrawdownPct,
       maxEntryLeverage: metrics.maxEntryLeverage,
       maxEffectiveLeverage: metrics.maxEffectiveLeverage,
@@ -1168,6 +1173,9 @@ function averageBotMetrics(results: BacktestResult[]): BotMetrics {
     losingTrades: average(metrics.map((item) => item.losingTrades)),
     winRate: average(metrics.map((item) => item.winRate)),
     peakEquity: average(metrics.map((item) => item.peakEquity)),
+    maxInitialBalanceDrawdownPct: average(
+      metrics.map((item) => item.maxInitialBalanceDrawdownPct),
+    ),
     maxDrawdownPct: average(metrics.map((item) => item.maxDrawdownPct)),
     exposurePct: average(metrics.map((item) => item.exposurePct)),
     maxEntryLeverage: average(metrics.map((item) => item.maxEntryLeverage)),

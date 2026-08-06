@@ -76,6 +76,12 @@ export interface BotBacktestOptions {
   hindsightOracleConfidenceExposurePower?: number;
   /** Minimum fraction of max leverage available to the confidence-conditioned ceiling. */
   hindsightOracleConfidenceLeverageFloor?: number;
+  /** Calibrated predictor quality multiplied into each distribution-derived confidence. */
+  oracleStaticConfidenceScale?: number;
+  /** Total same-side distribution-confidence mass required before expansion. */
+  oracleExpansionConfirmationMass?: number;
+  /** Base expansion-delta cap as a fraction of max leverage, before static-confidence squared. */
+  oracleExpansionDeltaCapFraction?: number;
   onProgress?: (progress: {
     candlesProcessed: number;
     totalCandles: number;
@@ -108,7 +114,7 @@ export const HINDSIGHT_ORACLE_MAX_EFFECTIVE_EXPOSURE = 250;
 export const HINDSIGHT_ORACLE_TEMPERATURE = 0.01;
 export const HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER = 0;
 export const HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR = 0.75;
-const HINDSIGHT_ORACLE_MIN_CONFIDENCE = 0.05;
+export const ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE = 1;
 export const HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR = 10;
 export const LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE = 1;
 
@@ -152,8 +158,21 @@ export async function runBotBacktestFromCandles(
   const oracleTargetMaximumLeverage = backtestStrategy === "learned-oracle-1s"
     ? Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, learnedMaximumLeverage)
     : Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, hindsightMaximumLeverage);
-  if (oracleStrategy && intervalMs !== HINDSIGHT_ORACLE_INTERVAL_MS) {
-    throw new Error("The one-second oracle policy strategies require one-second candles.");
+  if (backtestStrategy === "learned-oracle-1s" && intervalMs !== HINDSIGHT_ORACLE_INTERVAL_MS) {
+    throw new Error("The learned one-second oracle strategy requires one-second candles.");
+  }
+  if (
+    backtestStrategy === "hindsight-oracle-1s"
+    && (
+      intervalMs > HINDSIGHT_ORACLE_HOLDING_PERIOD_MS
+      || HINDSIGHT_ORACLE_HOLDING_PERIOD_MS % intervalMs !== 0
+      || HINDSIGHT_ORACLE_DECISION_DELAY_MS % intervalMs !== 0
+      || HINDSIGHT_ORACLE_VALUE_HORIZON_MS % intervalMs !== 0
+    )
+  ) {
+    throw new Error(
+      "The hindsight oracle candle interval must evenly divide its holding period, decision delay, and value horizon.",
+    );
   }
   const baseBotConfig = createPeakValleyBotConfig(config, intervalMs);
   const botConfig = oracleStrategy
@@ -164,6 +183,11 @@ export async function runBotBacktestFromCandles(
         // prevent 100x targets after account equity changes.
         maxTradeQuote: Number.POSITIVE_INFINITY,
         cooldownMs: HINDSIGHT_ORACLE_HOLDING_PERIOD_MS,
+        targetExposureControl: {
+          expansionConfirmationMass: options.oracleExpansionConfirmationMass ?? 1,
+          expansionDeltaCapFraction: options.oracleExpansionDeltaCapFraction
+            ?? HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+        },
       }
     : baseBotConfig;
   const history = (options.warmup ?? []).map(tradingCandle);
@@ -208,6 +232,9 @@ export async function runBotBacktestFromCandles(
   ) {
     throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
   }
+  const staticConfidenceScale = options.oracleStaticConfidenceScale
+    ?? ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE;
+  validateOracleStaticConfidenceScale(staticConfidenceScale);
   const strategyOptions = {
     config: botConfig.strategy,
     getHistory: api.getHistory.bind(api),
@@ -219,6 +246,7 @@ export async function runBotBacktestFromCandles(
         apiFriction(config),
         confidenceExposurePower,
         confidenceLeverageFloor,
+        staticConfidenceScale,
         options.onOracleDecision,
       )
     : new TracingPeakValleyStrategy(strategyOptions);
@@ -240,6 +268,7 @@ export async function runBotBacktestFromCandles(
   const chartEvery = Math.max(1, Math.ceil(candles.length / (options.maxChartCandles ?? 2_000)));
   const progressEvery = Math.max(1, Math.ceil(candles.length / 100));
   let peakEquity = config.startingQuote;
+  let maxInitialBalanceDrawdownPct = 0;
   let maxDrawdownPct = 0;
   let maxEffectiveLeverage = 0;
   let currentTime = candles[0].openTime;
@@ -376,6 +405,7 @@ export async function runBotBacktestFromCandles(
     netPnl,
     returnPct,
     peakEquity,
+    maxInitialBalanceDrawdownPct,
     maxDrawdownPct,
     tradeCount: summaryOnly ? summaryFillCount : fills.length,
     feesPaid: simulation.feesPaid,
@@ -415,6 +445,7 @@ export async function runBotBacktestFromCandles(
       perfectMarginCompoundedCapturePct: oracle.compoundedNetPnl > 0
         ? netPnl / oracle.compoundedNetPnl * 100
         : undefined,
+      maxInitialBalanceDrawdownPct,
       maxDrawdownPct,
       maxEntryLeverage: botConfig.maxTargetLeverage,
       maxEffectiveLeverage,
@@ -712,6 +743,12 @@ export async function runBotBacktestFromCandles(
 
   function observeRisk(equity: number, effective: number): void {
     peakEquity = Math.max(peakEquity, equity);
+    maxInitialBalanceDrawdownPct = Math.max(
+      maxInitialBalanceDrawdownPct,
+      config.startingQuote > 0
+        ? (config.startingQuote - equity) / config.startingQuote * 100
+        : 0,
+    );
     maxDrawdownPct = Math.max(
       maxDrawdownPct,
       peakEquity > 0 ? (peakEquity - equity) / peakEquity * 100 : 0,
@@ -765,6 +802,7 @@ export async function runBotBacktestFromCandles(
         returnPct: config.startingQuote > 0 ? currentNetPnl / config.startingQuote * 100 : 0,
         realizedPnl,
         unrealizedPnl: currentNetPnl - realizedPnl,
+        maxInitialBalanceDrawdownPct,
         maxDrawdownPct,
         exposurePct: equity > 0 ? grossExposureQuote / equity * 100 : 0,
         maxEffectiveLeverage,
@@ -961,13 +999,27 @@ export function hindsightOracleTargetDecision(
   friction: number,
   temperature = HINDSIGHT_ORACLE_TEMPERATURE,
 ): HindsightOracleTargetDecision {
-  const probabilities = conditionalExposureProbabilities(
-    distribution.probabilities,
-    distribution.grid,
-    currentExposure,
-    friction,
-    1 / temperature,
-  );
+  let probabilities: Float64Array<ArrayBufferLike>;
+  try {
+    probabilities = conditionalExposureProbabilities(
+      distribution.probabilities,
+      distribution.grid,
+      currentExposure,
+      friction,
+      1 / temperature,
+    );
+  } catch (error) {
+    if (error instanceof Error
+      && error.message === "Conditional exposure policy has no valid target action.") {
+      return {
+        targetExposure: currentExposure,
+        confidence: 1,
+        entropy: 0,
+        feasibleActionCount: 0,
+      };
+    }
+    throw error;
+  }
   let modalIndex = 0;
   let entropy = 0;
   for (let index = 0; index < probabilities.length; index += 1) {
@@ -999,12 +1051,25 @@ export function confidenceScaledHindsightOracleExposure(
   return modalExposure * Math.max(0, Math.min(1, confidence)) ** power;
 }
 
+export function scaleOracleConfidence(confidence: number, staticScale: number): number {
+  validateOracleStaticConfidenceScale(staticScale);
+  if (!Number.isFinite(confidence)) throw new Error("Oracle confidence must be finite.");
+  return Math.max(0, Math.min(1, confidence)) * staticScale;
+}
+
+function validateOracleStaticConfidenceScale(value: number): void {
+  if (!(value >= 0 && value <= 1) || !Number.isFinite(value)) {
+    throw new Error("Oracle static confidence scale must be in [0, 1].");
+  }
+}
+
 export function confidenceConditionedHindsightOracleExposure(
   modalExposure: number,
-  confidence: number,
+  distributionConfidence: number,
   maximumLeverage: number,
   power = HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
   leverageFloor = HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+  staticConfidenceScale = ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE,
 ): number {
   if (!(maximumLeverage >= 0) || !Number.isFinite(maximumLeverage)) {
     throw new Error("Hindsight oracle maximum leverage must be finite and non-negative.");
@@ -1012,14 +1077,37 @@ export function confidenceConditionedHindsightOracleExposure(
   if (!(leverageFloor >= 0 && leverageFloor <= 1) || !Number.isFinite(leverageFloor)) {
     throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
   }
-  const boundedConfidence = Math.max(0, Math.min(1, confidence));
+  validateOracleStaticConfidenceScale(staticConfidenceScale);
+  const boundedConfidence = Math.max(0, Math.min(1, distributionConfidence));
   const scaled = confidenceScaledHindsightOracleExposure(
     modalExposure,
     boundedConfidence,
     power,
   );
-  const cap = maximumLeverage * (leverageFloor + (1 - leverageFloor) * boundedConfidence);
+  const cap = maximumLeverage * confidenceConditionedOracleLeverageFraction(
+    boundedConfidence,
+    leverageFloor,
+    staticConfidenceScale,
+  );
   return Math.max(-cap, Math.min(cap, scaled));
+}
+
+export function confidenceConditionedOracleLeverageFraction(
+  distributionConfidence: number,
+  leverageFloor: number,
+  staticConfidenceScale: number,
+): number {
+  if (!Number.isFinite(distributionConfidence)) {
+    throw new Error("Oracle distribution confidence must be finite.");
+  }
+  if (!(leverageFloor >= 0 && leverageFloor <= 1) || !Number.isFinite(leverageFloor)) {
+    throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
+  }
+  validateOracleStaticConfidenceScale(staticConfidenceScale);
+  const boundedConfidence = Math.max(0, Math.min(1, distributionConfidence));
+  const effectiveFloor = leverageFloor * staticConfidenceScale;
+  return staticConfidenceScale
+    * (effectiveFloor + (1 - effectiveFloor) * boundedConfidence);
 }
 
 /**
@@ -1115,6 +1203,7 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
     private readonly friction: number,
     private readonly confidenceExposurePower: number,
     private readonly confidenceLeverageFloor: number,
+    private readonly staticConfidenceScale: number,
     private readonly onOracleDecision?: (decision: OracleBacktestDecision) => void,
   ) {
     super(options);
@@ -1135,31 +1224,38 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       this.friction,
     );
     const scaledModalExposure = decision.targetExposure * executionScale;
+    const effectiveConfidence = scaleOracleConfidence(
+      decision.confidence,
+      this.staticConfidenceScale,
+    );
     const targetExposure = confidenceConditionedHindsightOracleExposure(
       scaledModalExposure,
       decision.confidence,
       context.maxLeverage,
       this.confidenceExposurePower,
       this.confidenceLeverageFloor,
+      this.staticConfidenceScale,
     );
-    const confidenceLeverageFraction = this.confidenceLeverageFloor
-      + (1 - this.confidenceLeverageFloor) * decision.confidence;
+    const confidenceLeverageFraction = confidenceConditionedOracleLeverageFraction(
+      decision.confidence,
+      this.confidenceLeverageFloor,
+      this.staticConfidenceScale,
+    );
     const confidenceLeverageCap = context.maxLeverage * confidenceLeverageFraction;
     const confidenceScale = scaledModalExposure !== 0
       ? targetExposure / scaledModalExposure
-      : decision.confidence ** this.confidenceExposurePower;
+      : effectiveConfidence ** this.confidenceExposurePower;
     const gridStep = Math.abs(distribution.grid[1]! - distribution.grid[0]!);
     const effectiveGridStep = gridStep * executionScale;
     const delta = targetExposure - context.currentExposure;
-    const signalEmitted = decision.confidence >= HINDSIGHT_ORACLE_MIN_CONFIDENCE
-      && Math.abs(delta) >= effectiveGridStep / 2;
+    const signalEmitted = Math.abs(delta) >= effectiveGridStep / 2;
     this.onOracleDecision?.({
       timestamp: context.timestamp,
       currentExposure: context.currentExposure,
       rawModalExposure: distribution.modalExposure,
       conditionedModalExposure: decision.targetExposure,
       targetExposure,
-      confidence: decision.confidence,
+      confidence: effectiveConfidence,
       entropy: decision.entropy,
       signalEmitted,
     });
@@ -1171,9 +1267,13 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       "oracle.targetExposure": targetExposure,
       "oracle.deltaExposure": delta,
       "oracle.confidence": decision.confidence,
+      "oracle.staticConfidenceScale": this.staticConfidenceScale,
+      "oracle.effectiveConfidence": effectiveConfidence,
       "oracle.confidenceExposureScale": confidenceScale,
       "oracle.confidenceExposurePower": this.confidenceExposurePower,
       "oracle.confidenceLeverageFloor": this.confidenceLeverageFloor,
+      "oracle.effectiveConfidenceLeverageFloor":
+        this.confidenceLeverageFloor * this.staticConfidenceScale,
       "oracle.confidenceLeverageCap": confidenceLeverageCap,
       "oracle.entropy": decision.entropy,
       "oracle.feasibleActions": decision.feasibleActionCount,
@@ -1183,7 +1283,9 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
     return {
       targetExposure,
       price: this.tick.price,
-      confidence: decision.confidence,
+      confidence: effectiveConfidence,
+      staticConfidence: this.staticConfidenceScale,
+      distributionConfidence: decision.confidence,
     };
   }
 }

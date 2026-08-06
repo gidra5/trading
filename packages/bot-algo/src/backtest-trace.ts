@@ -151,6 +151,7 @@ export interface BacktestTraceFrame {
     returnPct: number;
     realizedPnl: number;
     unrealizedPnl: number;
+    maxInitialBalanceDrawdownPct: number;
     maxDrawdownPct: number;
     exposurePct: number;
     maxEffectiveLeverage: number;

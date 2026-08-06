@@ -1,0 +1,63 @@
+{
+  "id": "multiscale-candle-resolution-daily-correlation-5path-32epoch-v1",
+  "label": "Full-calendar daily MA depth screen optimizing mean per-lead correlation for the next five daily BTC returns",
+  "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "dailyHistoryDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m",
+  "datasetDirTemplate": "data/training/datasets/multiscale-candle-{resolution}-{maxWindow}-5path-daily-correlation-v1",
+  "runDirTemplate": "data/training/runs/multiscale-candle-{resolution}-{maxWindow}-joint-5path-32epoch-daily-correlation-v1",
+  "evaluateTest": false,
+  "resolutions": ["1d"],
+  "comparisonMaxWindow": "3M",
+  "objective": {
+    "contract": "aligned-five-candle-mean-per-lead-pearson-correlation-v1"
+  },
+  "architecture": {
+    "contract": "telescoping-return-moving-average-two-layer-normalized-glu-v1",
+    "widths": [512, 512],
+    "inputNormalization": "training-position",
+    "dropout": 0.05,
+    "dropoutRate": 0.5,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001
+  },
+  "training": {
+    "epochs": 32,
+    "byResolution": {
+      "1d": {
+        "batchSize": 128,
+        "evaluationBatchSize": 512,
+        "normalizationBatchSize": 512
+      }
+    },
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 3,
+      "threshold": 0.000001,
+      "minimumLearningRate": 0.000001
+    },
+    "earlyStoppingPatience": 8,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16"
+  }
+}

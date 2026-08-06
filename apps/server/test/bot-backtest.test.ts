@@ -12,12 +12,14 @@ import {
 } from "@trading/bot-algo";
 import {
   confidenceConditionedHindsightOracleExposure,
+  confidenceConditionedOracleLeverageFraction,
   confidenceScaledHindsightOracleExposure,
   hindsightOracleTargetDecision,
   hindsightOracleUsableDistribution,
   oracleExecutionExposureScale,
   oracleMaximumEffectiveLeverage,
   runBotBacktestFromCandles,
+  scaleOracleConfidence,
   type OracleBacktestDecision,
 } from "../src/bot-backtest.js";
 import { HistoricalCandleCache } from "../src/historical-candle-cache.js";
@@ -70,12 +72,32 @@ test("hindsight oracle confidence scales deployed exposure without shrinking its
   assert.equal(confidenceConditionedHindsightOracleExposure(100, 0.5, 100, 0, 0.5), 75);
   assert.equal(confidenceConditionedHindsightOracleExposure(50, 0.5, 100, 0, 0.5), 50);
   assert.equal(confidenceConditionedHindsightOracleExposure(-100, 0.25, 100, 0, 0.5), -62.5);
+  assert.equal(confidenceConditionedHindsightOracleExposure(100, 0.5, 100, 0, 0.75, 0.2), 11.5);
+  assert.equal(confidenceConditionedHindsightOracleExposure(100, 1, 100, 0, 0.75, 0.05), 5);
+  assert.equal(confidenceConditionedHindsightOracleExposure(100, 0, 100, 0, 0.75, 0.5), 18.75);
+  assert.equal(confidenceConditionedOracleLeverageFraction(0, 0.75, 0.5), 0.1875);
+  assert.equal(confidenceConditionedOracleLeverageFraction(1, 0.75, 0.5), 0.5);
+  assert.equal(scaleOracleConfidence(0.8, 0.5), 0.4);
+  assert.equal(scaleOracleConfidence(1, 0.05), 0.05);
+  assert.throws(() => scaleOracleConfidence(0.5, 1.01), /must be in \[0, 1\]/);
 });
 
 test("hindsight oracle conditions the target distribution on actual exposure", () => {
   const distribution = oracleDistribution([0.5, 0, 0.5]);
   assert.equal(hindsightOracleTargetDecision(distribution, 1, 0.1, 1).targetExposure, 1);
   assert.equal(hindsightOracleTargetDecision(distribution, -1, 0.1, 1).targetExposure, -1);
+});
+
+test("hindsight oracle holds when transition conditioning has no solvent action", () => {
+  const decision = hindsightOracleTargetDecision(
+    oracleDistribution([1, 0, 0]),
+    100,
+    0.02,
+  );
+
+  assert.equal(decision.targetExposure, 100);
+  assert.equal(decision.confidence, 1);
+  assert.equal(decision.feasibleActionCount, 0);
 });
 
 test("hindsight oracle truncates a latent distribution to the usable exposure interval", () => {
@@ -254,7 +276,12 @@ test("one-second hindsight oracle drives the regular bot execution path", async 
     timedCandle(index * intervalMs, price, intervalMs));
   const result = await runBotBacktestFromCandles(
     candles,
-    { config, strategy: "hindsight-oracle-1s", warmup },
+    {
+      config,
+      strategy: "hindsight-oracle-1s",
+      warmup,
+      oracleExpansionConfirmationMass: 0,
+    },
   );
 
   assert.equal(result.summary.strategy, "hindsight-oracle-1s");
@@ -272,6 +299,7 @@ test("one-second hindsight oracle drives the regular bot execution path", async 
     strategy: "hindsight-oracle-1s",
     warmup,
     hindsightOracleMaximumLeverage: 1,
+    oracleExpansionConfirmationMass: 0,
   });
   assert.equal(capped.summary.maxEntryLeverage, 1);
   assert.equal(capped.summary.perfectMarginLeverage, 1);
@@ -345,6 +373,7 @@ test("capped oracle replay scales filled exposure back to the native policy stat
     config,
     strategy: "learned-oracle-1s",
     learnedOracleMaximumLeverage: 1,
+    oracleExpansionDeltaCapFraction: 1,
     learnedOracleDistributionAt: (timestamp) => timestamp === firstTime
       ? enterLong
       : timestamp === secondTime
@@ -440,6 +469,34 @@ test("one-second hindsight oracle evaluates once per 60-second holding block", a
   );
 });
 
+test("hindsight oracle accepts one-minute candles and evaluates every candle", async () => {
+  const intervalMs = 60_000;
+  const config = createStrategyConfig({
+    startingQuote: 1_000,
+    maxLeverage: 1,
+    legacyValleyPeak: {
+      averagingRangesSec: [60],
+      trendSigmaWindowSec: 60,
+      anticipatoryGridOrderCount: 1,
+      exitGridOrderCount: 1,
+    },
+  });
+  const candles = Array.from({ length: 3 }, (_, index) =>
+    timedCandle(index * intervalMs, 100 + index, intervalMs));
+  const timestamps: number[] = [];
+
+  await runBotBacktestFromCandles(candles, {
+    config,
+    strategy: "hindsight-oracle-1s",
+    hindsightOracleDistributionAt: (timestamp) => {
+      timestamps.push(timestamp);
+      return oracleDistribution([0, 1, 0]);
+    },
+  });
+
+  assert.deepEqual(timestamps, candles.map((candle) => candle.closeTime));
+});
+
 test("one-second hindsight replay stops at an intrabar liquidation boundary", async () => {
   const config = createStrategyConfig({
     startingQuote: 1_000,
@@ -520,6 +577,10 @@ test("summary-only replay preserves trading and risk results", async () => {
 
   assert.equal(summary.summary.finalEquity, full.summary.finalEquity);
   assert.equal(summary.summary.returnPct, full.summary.returnPct);
+  assert.equal(
+    summary.summary.maxInitialBalanceDrawdownPct,
+    full.summary.maxInitialBalanceDrawdownPct,
+  );
   assert.equal(summary.summary.maxDrawdownPct, full.summary.maxDrawdownPct);
   assert.equal(summary.summary.maxEffectiveLeverage, full.summary.maxEffectiveLeverage);
   assert.equal(summary.summary.tradeCount, full.summary.tradeCount);

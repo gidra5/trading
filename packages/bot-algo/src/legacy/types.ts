@@ -552,6 +552,9 @@ export interface BotMetrics {
   losingTrades: number;
   winRate: number;
   peakEquity: number;
+  /** Largest equity loss below the account's starting balance. */
+  maxInitialBalanceDrawdownPct: number;
+  /** Largest equity loss from any running peak. */
   maxDrawdownPct: number;
   exposurePct: number;
   maxEntryLeverage: number;
@@ -811,6 +814,9 @@ export interface BacktestSummary {
   riskAdjustedReturn?: number;
   sharpeRatio?: number;
   backtestSharpeRatio?: number;
+  /** Largest equity loss below the account's starting balance. */
+  maxInitialBalanceDrawdownPct: number;
+  /** Largest equity loss from any running peak. */
   maxDrawdownPct: number;
   maxEntryLeverage?: number;
   maxEffectiveLeverage?: number;
@@ -852,6 +858,9 @@ export interface BacktestSampleSummary {
   perfectMarginCompoundedNetPnl?: number;
   perfectMarginCompoundedReturnPct?: number;
   perfectMarginCompoundedCapturePct?: number;
+  /** Largest equity loss below the sample's starting balance. */
+  maxInitialBalanceDrawdownPct: number;
+  /** Largest equity loss from any running peak. */
   maxDrawdownPct: number;
   maxEntryLeverage?: number;
   maxEffectiveLeverage?: number;

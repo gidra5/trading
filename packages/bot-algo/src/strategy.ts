@@ -44,6 +44,10 @@ export interface TradingStrategyTargetExposureSignal {
   price: number | null;
   /** 0 is uniform grid sizing; 1 concentrates sizing at price. */
   confidence: number | null;
+  /** Predictor-level confidence used for asymmetric exposure transition limits. */
+  staticConfidence: number;
+  /** Confidence derived from the current target-exposure distribution alone. */
+  distributionConfidence: number;
 }
 
 export interface StrategyDiagnostics {

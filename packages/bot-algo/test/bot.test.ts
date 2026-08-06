@@ -219,7 +219,9 @@ test("target exposure expands and reduces positions through the bot contract", a
   nextConfig.maxTradeQuote = 10_000;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
-  strategy.target = { targetExposure: 3, price: 100, confidence: 0.8 };
+  strategy.target = {
+    targetExposure: 3, price: 100, confidence: 0.8, staticConfidence: 1, distributionConfidence: 1,
+  };
   await bot.onTick(tick);
   assert.equal(api.orders[0].order.side, "buy");
   assert.equal(api.orders[0].order.size, 30);
@@ -231,7 +233,9 @@ test("target exposure expands and reduces positions through the bot contract", a
     orderId: api.orders[0].order.id,
     fill: { filledAsset: 30, filledQuote: 3_000, remaining: 0 },
   });
-  strategy.target = { targetExposure: 1, price: 100, confidence: 0.8 };
+  strategy.target = {
+    targetExposure: 1, price: 100, confidence: 0.8, staticConfidence: 1, distributionConfidence: 1,
+  };
   await bot.onTick({ ...tick, timestamp: 2_000 });
 
   assert.equal(strategy.contexts[1]?.currentExposure, 3);
@@ -247,22 +251,85 @@ test("target exposure reversals exit before entering the opposite side", async (
   nextConfig.maxTradeQuote = 10_000;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
-  strategy.target = { targetExposure: 2, price: 100, confidence: 1 };
+  strategy.target = {
+    targetExposure: 2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+  };
   await bot.onTick(tick);
   await bot.onOrder({
     type: "fill",
     orderId: api.orders[0].order.id,
     fill: { filledAsset: 20, filledQuote: 2_000, remaining: 0 },
   });
-  strategy.target = { targetExposure: -2, price: 100, confidence: 1 };
+  strategy.target = {
+    targetExposure: -2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+  };
   await bot.onTick({ ...tick, timestamp: 2_000 });
 
   assert.equal(api.orders[1].order.type, "market");
   assert.equal(api.orders[1].order.side, "sell");
   assert.equal(api.orders[1].order.size, 20);
+  assert.equal(api.orders.length, 2);
+  await bot.onOrder({
+    type: "fill",
+    orderId: api.orders[1].order.id,
+    fill: { filledAsset: 20, filledQuote: 2_000, remaining: 0 },
+  });
+  strategy.target = {
+    targetExposure: -2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+  };
+  await bot.onTick({ ...tick, timestamp: 3_000 });
   assert.equal(api.orders[2].order.type, "limit");
   assert.equal(api.orders[2].order.side, "sell");
   assert.equal(api.orders[2].order.size, 20);
+});
+
+test("target exposure rate-limits expansions quadratically by static confidence", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  strategy.target = {
+    targetExposure: 8, price: 100, confidence: 0.5, staticConfidence: 0.5,
+    distributionConfidence: 1,
+  };
+  await bot.onTick(tick);
+
+  assert.equal((await bot.snapshot()).positions[0].leverage, 1.875);
+  assert.equal(api.orders[0].order.size, 18.75);
+});
+
+test("target exposure confirmations accumulate distribution confidence and interpolate leverage", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  nextConfig.maxTargetLeverage = 100;
+  nextConfig.maxTradeQuote = 100_000;
+  nextConfig.targetExposureControl.expansionConfirmationMass = 1.5;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  strategy.target = {
+    targetExposure: 3, price: 100, confidence: 0.5, staticConfidence: 0.5,
+    distributionConfidence: 0.5,
+  };
+  await bot.onTick(tick);
+  strategy.target = {
+    targetExposure: 5, price: 100, confidence: 0.5, staticConfidence: 0.5,
+    distributionConfidence: 0.5,
+  };
+  await bot.onTick({ ...tick, timestamp: 2_000 });
+  assert.equal(api.orders.length, 0);
+  assert.equal((await bot.snapshot()).targetExposureExpansion?.confirmationMass, 1);
+  strategy.target = {
+    targetExposure: 4, price: 100, confidence: 0.5, staticConfidence: 0.5,
+    distributionConfidence: 0.5,
+  };
+  await bot.onTick({ ...tick, timestamp: 3_000 });
+
+  assert.equal((await bot.snapshot()).positions[0].leverage, 4);
+  assert.equal(api.orders[0].order.size, 40);
 });
 
 test("internal borrowing locks only the amount borrowed from the lender", async () => {
@@ -433,6 +500,10 @@ function config(): TradingBotConfig {
     stopLossRate: null,
     takeProfitRate: null,
     cooldownMs: 0,
+    targetExposureControl: {
+      expansionConfirmationMass: 1,
+      expansionDeltaCapFraction: 0.75,
+    },
     internalBorrow: { enabled: false, lockLenderAmounts: true, borrowerProfitShare: 1 },
   };
 }

@@ -37,6 +37,12 @@ export interface TradingBotConfig<TStrategyConfig = unknown> {
   stopLossRate: number | null;
   takeProfitRate: number | null;
   cooldownMs: number;
+  targetExposureControl: {
+    /** Total same-side distribution-confidence mass required before expansion. */
+    expansionConfirmationMass: number;
+    /** Fraction of max leverage forming the expansion-delta cap before quality scaling. */
+    expansionDeltaCapFraction: number;
+  };
   internalBorrow: {
     enabled: boolean;
     /** Locks exactly the borrowed asset and quote amounts when enabled. */
@@ -90,6 +96,14 @@ export interface BotSnapshot<
   strategy: TStrategySnapshot;
   positions: TradingPosition[];
   lastEntryAt: number;
+  targetExposureExpansion: TargetExposureExpansionConfirmation | null;
+}
+
+export interface TargetExposureExpansionConfirmation {
+  side: PositionSide;
+  confirmationMass: number;
+  minimumLeverage: number;
+  maximumLeverage: number;
 }
 
 export interface BotMetricsSnapshot {
@@ -152,6 +166,7 @@ export class GridTradingBot<
   private positions: TradingPosition[] = [];
   private lastTickAt = 0;
   private lastEntryAt = 0;
+  private targetExposureExpansion: TargetExposureExpansionConfirmation | null = null;
 
   constructor(private readonly options: BotOptions<TStrategyConfig, TStrategySnapshot, TDiagnostics>) {
     this.config = options.config;
@@ -208,6 +223,7 @@ export class GridTradingBot<
   async onOrder(event: TradingOrderEvent): Promise<void> {
     if (event.type === "liquidation") {
       this.positions = [];
+      this.targetExposureExpansion = null;
       return;
     }
     if (event.type === "maintenance") {
@@ -261,11 +277,12 @@ export class GridTradingBot<
 
   async snapshot(): Promise<BotSnapshot<TStrategyConfig, TStrategySnapshot>> {
     return {
-      version: 2,
+      version: 4,
       config: structuredClone(this.config),
       strategy: await this.options.strategy.snapshot(),
       positions: structuredClone(this.positions),
       lastEntryAt: this.lastEntryAt,
+      targetExposureExpansion: structuredClone(this.targetExposureExpansion),
     };
   }
 
@@ -273,12 +290,13 @@ export class GridTradingBot<
     snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>,
     options: { restoreStrategy?: boolean } = {},
   ): Promise<void> {
-    if (snapshot.version !== 2) {
+    if (snapshot.version !== 4) {
       throw new Error(`Unsupported bot snapshot version: ${snapshot.version}`);
     }
     this.config = structuredClone(snapshot.config);
     this.positions = structuredClone(snapshot.positions);
     this.lastEntryAt = snapshot.lastEntryAt ?? 0;
+    this.targetExposureExpansion = structuredClone(snapshot.targetExposureExpansion);
     if (options.restoreStrategy === false) {
       await this.options.strategy.updateConfig(this.config.strategy);
     } else {
@@ -308,6 +326,7 @@ export class GridTradingBot<
 
   async updateConfig(config: TradingBotConfig<TStrategyConfig>): Promise<void> {
     this.config = structuredClone(config);
+    this.targetExposureExpansion = null;
     await this.options.strategy.updateConfig(config.strategy);
   }
 
@@ -492,6 +511,13 @@ export class GridTradingBot<
     tick: TradingTick,
   ): Promise<void> {
     if (!(tick.price > 0) || !Number.isFinite(signal.targetExposure)) return;
+    const accountBeforeControl = await this.options.api.getEquity();
+    const equityBeforeControl = accountBeforeControl.quoteUnleveraged
+      + accountBeforeControl.assetUnleveraged * tick.price;
+    if (!(equityBeforeControl > 0)) return;
+    const currentExposure = this.signedPositionNotional(tick.price) / equityBeforeControl;
+    const controlled = this.controlTargetExposure(signal, currentExposure);
+    if (!controlled) return;
     await this.cancelOpenOrders();
     const account = await this.options.api.getEquity();
     const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
@@ -499,7 +525,7 @@ export class GridTradingBot<
 
     const target = Math.max(
       -this.config.maxTargetLeverage,
-      Math.min(this.config.maxTargetLeverage, signal.targetExposure),
+      Math.min(this.config.maxTargetLeverage, controlled.targetExposure),
     );
     const targetSide: PositionSide | null = target > 0 ? "long" : target < 0 ? "short" : null;
     const oppositeSide: PositionSide | null = targetSide === "long"
@@ -510,11 +536,11 @@ export class GridTradingBot<
 
     if (oppositeSide && this.sidePositionNotional(oppositeSide, tick.price) > 0) {
       // A reversal must release the old side before the new entry consumes capacity.
-      await this.createExit(oppositeSide, 1, null, signal.confidence);
+      await this.createExit(oppositeSide, 1, null, controlled.confidence);
     }
     if (targetSide === null) {
-      await this.createExit("long", 1, signal.price, signal.confidence);
-      await this.createExit("short", 1, signal.price, signal.confidence);
+      await this.createExit("long", 1, controlled.price, controlled.confidence);
+      await this.createExit("short", 1, controlled.price, controlled.confidence);
       return;
     }
 
@@ -529,8 +555,8 @@ export class GridTradingBot<
       await this.createExit(
         targetSide,
         Math.min(1, -difference / currentSideQuote),
-        signal.price,
-        signal.confidence,
+        controlled.price,
+        controlled.confidence,
       );
       return;
     }
@@ -547,10 +573,97 @@ export class GridTradingBot<
       targetSide,
       Math.min(1, difference / capacity.quote),
       requestedLeverage,
-      signal.price,
-      signal.confidence,
+      controlled.price,
+      controlled.confidence,
       tick,
     );
+  }
+
+  private controlTargetExposure(
+    signal: TradingStrategyTargetExposureSignal,
+    currentExposure: number,
+  ): TradingStrategyTargetExposureSignal | null {
+    const desired = Math.max(
+      -this.config.maxTargetLeverage,
+      Math.min(this.config.maxTargetLeverage, signal.targetExposure),
+    );
+    const epsilon = 1e-10;
+    const currentSide: PositionSide | null = currentExposure > epsilon
+      ? "long"
+      : currentExposure < -epsilon
+        ? "short"
+        : null;
+    const desiredSide: PositionSide | null = desired > epsilon
+      ? "long"
+      : desired < -epsilon
+        ? "short"
+        : null;
+
+    // Risk-reducing targets, including complete closure, are never delayed or capped.
+    if (desiredSide === null || (
+      currentSide === desiredSide && Math.abs(desired) <= Math.abs(currentExposure) + epsilon
+    )) {
+      this.targetExposureExpansion = null;
+      return { ...signal, targetExposure: desired };
+    }
+    // A reversal always crosses flat first. A later observation may enter the new side.
+    if (currentSide !== null && desiredSide !== currentSide) {
+      this.targetExposureExpansion = null;
+      return { ...signal, targetExposure: 0, price: null };
+    }
+    if (!Number.isFinite(signal.staticConfidence)) return null;
+    const staticConfidence = Math.max(0, Math.min(1, signal.staticConfidence));
+    if (!Number.isFinite(signal.distributionConfidence)) return null;
+    const distributionConfidence = Math.max(
+      0,
+      Math.min(1, signal.distributionConfidence),
+    );
+    const configuredConfirmationMass = (
+      this.config.targetExposureControl.expansionConfirmationMass
+    );
+    if (!Number.isFinite(configuredConfirmationMass)) return null;
+    const requiredConfirmationMass = Math.max(0, configuredConfirmationMass);
+    const desiredLeverage = Math.abs(desired);
+    if (this.targetExposureExpansion?.side === desiredSide) {
+      this.targetExposureExpansion.confirmationMass += distributionConfidence;
+      this.targetExposureExpansion.minimumLeverage = Math.min(
+        this.targetExposureExpansion.minimumLeverage,
+        desiredLeverage,
+      );
+      this.targetExposureExpansion.maximumLeverage = Math.max(
+        this.targetExposureExpansion.maximumLeverage,
+        desiredLeverage,
+      );
+    } else {
+      this.targetExposureExpansion = {
+        side: desiredSide!,
+        confirmationMass: distributionConfidence,
+        minimumLeverage: desiredLeverage,
+        maximumLeverage: desiredLeverage,
+      };
+    }
+    if (this.targetExposureExpansion.confirmationMass < requiredConfirmationMass) return null;
+
+    const confirmed = this.targetExposureExpansion;
+    this.targetExposureExpansion = null;
+    const selectedLeverage = confirmed.minimumLeverage
+      + staticConfidence * (confirmed.maximumLeverage - confirmed.minimumLeverage);
+    const capFraction = Math.max(
+      0,
+      this.config.targetExposureControl.expansionDeltaCapFraction,
+    );
+    const maximumDelta = this.config.maxTargetLeverage
+      * capFraction
+      * staticConfidence ** 2;
+    const controlledLeverage = Math.min(
+      selectedLeverage,
+      Math.abs(currentExposure) + maximumDelta,
+    );
+    if (!(controlledLeverage > Math.abs(currentExposure) + epsilon)) return null;
+    return {
+      ...signal,
+      targetExposure: desiredSide === "long" ? controlledLeverage : -controlledLeverage,
+    };
   }
 
   private signedPositionNotional(price: number): number {

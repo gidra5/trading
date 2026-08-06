@@ -41,6 +41,7 @@ from next_return_sequence import (
     SequenceNormalization,
     numpy_path_summaries,
     sequence_objective_loss,
+    weighted_lead_correlation_loss,
 )
 from train_normalized_glu_next_return import (
     Reporter,
@@ -60,8 +61,11 @@ from trading_storage import (
 
 
 RUNNER_CONTRACT = "aligned-candle-resolution-joint-multiscale-glu-v1"
-OBJECTIVE_CONTRACT = (
+MSE_OBJECTIVE_CONTRACT = (
     "aligned-five-candle-normalized-mse-plus-cumulative-return-mse-v1"
+)
+CORRELATION_OBJECTIVE_CONTRACT = (
+    "aligned-five-candle-mean-per-lead-pearson-correlation-v1"
 )
 
 
@@ -123,6 +127,11 @@ def validate_plan(plan: dict) -> None:
             or not isinstance(architecture.get("widths"), list) \
             or not architecture["widths"]:
         raise ValueError("resolution architecture is invalid")
+    objective = plan.get("objective", {"contract": MSE_OBJECTIVE_CONTRACT})
+    if objective.get("contract") not in (
+        MSE_OBJECTIVE_CONTRACT, CORRELATION_OBJECTIVE_CONTRACT
+    ):
+        raise ValueError("resolution objective is invalid")
     if any(value != "1d" for value in plan.get("resolutions", ())) \
             and int(plan.get("testExamples", 0)) < 1:
         raise ValueError("sub-daily resolution plan needs testExamples")
@@ -327,7 +336,34 @@ def evaluate(
         ):
             prediction = model(features)
         metrics.add(prediction, targets, weights)
-    return metrics.result()
+    result = metrics.result()
+    correlations = [
+        value["correlation"] for value in result["perLead"]
+        if value["correlation"] is not None
+    ]
+    result["meanPerLeadCorrelation"] = (
+        sum(correlations) / len(correlations) if correlations else None
+    )
+    result["correlationLoss"] = (
+        1.0 - result["meanPerLeadCorrelation"]
+        if result["meanPerLeadCorrelation"] is not None else None
+    )
+    return result
+
+
+def objective_contract(plan: dict) -> str:
+    return str(plan.get("objective", {}).get(
+        "contract", MSE_OBJECTIVE_CONTRACT
+    ))
+
+
+def validation_score(metrics: dict, contract: str) -> float:
+    if contract == CORRELATION_OBJECTIVE_CONTRACT:
+        value = metrics.get("correlationLoss")
+        if value is None or not math.isfinite(float(value)):
+            return math.inf
+        return float(value)
+    return float(metrics["objective"])
 
 
 def main() -> None:
@@ -336,6 +372,7 @@ def main() -> None:
     plan_file = args.plan if args.plan.is_absolute() else repo_root / args.plan
     plan = json.loads(plan_file.read_text(encoding="utf-8"))
     validate_plan(plan)
+    selected_objective_contract = objective_contract(plan)
     if args.max_window not in allowed_max_windows(args.resolution):
         raise ValueError("maximum window is invalid for resolution")
     if args.stop_after_epoch is not None and args.stop_after_epoch < 1:
@@ -561,7 +598,7 @@ def main() -> None:
             sequence_normalization(normalization),
             candle_weight=1, summary_weight=1,
             summary_metric_weights=(0, 0, 0, 0, 1),
-            device=device, track_per_lead=False,
+            device=device, track_per_lead=True,
         )
         for features, targets, weights in iter_device_batches(
             dataset.iter_batches(
@@ -575,13 +612,18 @@ def main() -> None:
                 enabled=device.type == "cuda",
             ):
                 prediction = model(features)
-                loss = sequence_objective_loss(
-                    prediction, targets, weights,
-                    target_std=target_std,
-                    summary_std=summary_std,
-                    summary_metric_weights=summary_weights,
-                    candle_weight=1, summary_weight=1,
-                )
+                if selected_objective_contract == CORRELATION_OBJECTIVE_CONTRACT:
+                    loss = weighted_lead_correlation_loss(
+                        prediction, targets, weights
+                    )
+                else:
+                    loss = sequence_objective_loss(
+                        prediction, targets, weights,
+                        target_std=target_std,
+                        summary_std=summary_std,
+                        summary_metric_weights=summary_weights,
+                        candle_weight=1, summary_weight=1,
+                    )
             loss.backward()
             clip_grad_norm_(
                 model.parameters(), float(training["gradientClip"]),
@@ -594,7 +636,7 @@ def main() -> None:
             batch_size=evaluation_batch_size,
             normalization=normalization, device=device, amp_dtype=amp_dtype,
         )
-        score = float(validation["objective"])
+        score = validation_score(validation, selected_objective_contract)
         improved = score < best_score
         if improved:
             best_score = score; best_epoch = epoch; stale_epochs = 0
@@ -613,7 +655,7 @@ def main() -> None:
             "corpusFingerprint": fingerprint,
             "architectureContract": ARCHITECTURE_CONTRACT,
             "runnerContract": RUNNER_CONTRACT,
-            "objectiveContract": OBJECTIVE_CONTRACT,
+            "objectiveContract": selected_objective_contract,
             "testEvaluated": False,
         }
         save_torch_checkpoint(checkpoint, last_checkpoint)
@@ -623,7 +665,7 @@ def main() -> None:
             "epochs": int(training["epochs"]),
             "seconds": time.monotonic() - started,
             "globalStep": global_step,
-            "train": train_metrics.result(include_per_lead=False),
+            "train": train_metrics.result(include_per_lead=True),
             "validation": validation,
             "bestValidationScore": best_score, "bestEpoch": best_epoch,
             "staleEpochs": stale_epochs, "improved": improved,
@@ -646,7 +688,7 @@ def main() -> None:
         "planSha256": plan_sha, "corpusFingerprint": fingerprint,
         "architectureContract": ARCHITECTURE_CONTRACT,
         "runnerContract": RUNNER_CONTRACT,
-        "objectiveContract": OBJECTIVE_CONTRACT,
+        "objectiveContract": selected_objective_contract,
         "resolution": args.resolution, "maxWindow": args.max_window,
         "componentLabels": dataset.component_labels,
         "parameterCount": parameters,

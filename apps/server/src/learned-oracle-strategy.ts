@@ -11,17 +11,17 @@ import {
   HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
   HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
   HINDSIGHT_ORACLE_TEMPERATURE,
+  ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE,
   confidenceConditionedHindsightOracleExposure,
   hindsightOracleTargetDecision,
   oracleExecutionExposureScale,
+  scaleOracleConfidence,
 } from "./bot-backtest.js";
 import {
   JOINT_PRICE_ORACLE_CONTEXT_LENGTH,
   JointPriceOracleRuntime,
   isJointPriceOracleDecisionTime,
 } from "./joint-price-oracle-runtime.js";
-
-const MINIMUM_CONFIDENCE = 0.05;
 
 export class LearnedOracleStrategy extends PeakValleyStrategy {
   private tick: TradingTick | null = null;
@@ -31,6 +31,7 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
     private readonly runtime: JointPriceOracleRuntime,
     private readonly history: (count: number) => Promise<TradingCandle[]>,
     private readonly friction: number,
+    private readonly staticConfidenceScale = ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE,
   ) {
     super(options);
   }
@@ -59,13 +60,17 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
       this.friction,
       HINDSIGHT_ORACLE_TEMPERATURE,
     );
-    if (decision.confidence < MINIMUM_CONFIDENCE) return null;
+    const effectiveConfidence = scaleOracleConfidence(
+      decision.confidence,
+      this.staticConfidenceScale,
+    );
     const targetExposure = confidenceConditionedHindsightOracleExposure(
       decision.targetExposure * executionScale,
       decision.confidence,
       context.maxLeverage,
       HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
       HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+      this.staticConfidenceScale,
     );
     const gridStep = Math.abs(distribution.grid[1]! - distribution.grid[0]!);
     if (
@@ -75,7 +80,9 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
     return {
       targetExposure,
       price: this.tick.price,
-      confidence: decision.confidence,
+      confidence: effectiveConfidence,
+      staticConfidence: this.staticConfidenceScale,
+      distributionConfidence: decision.confidence,
     };
   }
 }

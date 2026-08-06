@@ -507,3 +507,17 @@ for 0.000000 gain versus the 0.002 gate. Do not train a neural basis/flow
 branch. Screen strictly validated USD-M historical order-book depth next;
 continue to train directly against the original oracle distribution with raw
 KL, never cluster assignments.
+
+
+2. Oracle transition min absolute size - changes as actual amounts move, so we should update it during oracle tracing as well
+4. Oracle transition max absolute size - similar to min size can change as equity grows/shrinks
+5. threshold expected max return (opportunity) from the transition
+6. asymmetric target state logic:
+   1.  exposure reducing/closing actions can pass through always
+   2.  when reversing pass through 0 always, practically requiring a one time confirmation
+   3.  when expanding the exposure rate limit it, possibly in two ways - same side confirmations and capped exposure delta.
+   4.  when using ultiple confirmations keep track of min and max leverages and pick proportionally to static confidence between them
+7.  Drawdown control - first separate initial balance drawdown and recent peak drawdown
+8.  initial balance drawdown acts as a hard stop - basically becomes included in the confidence measure, the larger drawdown the less confident we are. Basically sclae confidence by 1-drawdown
+9.  recent peak drawdown can be softer i think, maybe it should simply prefer scaling down positions instead of creating new or something like that
+10.  

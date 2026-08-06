@@ -332,6 +332,10 @@ export function createPeakValleyBotConfig(
     stopLossRate: null,
     takeProfitRate: null,
     cooldownMs: config.cooldownMs,
+    targetExposureControl: {
+      expansionConfirmationMass: 1,
+      expansionDeltaCapFraction: 0.75,
+    },
     internalBorrow: {
       enabled: config.internalBorrowAccounting === "active",
       lockLenderAmounts: true,

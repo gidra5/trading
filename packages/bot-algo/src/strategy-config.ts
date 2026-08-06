@@ -160,6 +160,7 @@ function emptyMetrics(startingQuote: number): BotMetrics {
     losingTrades: 0,
     winRate: 0,
     peakEquity: startingQuote,
+    maxInitialBalanceDrawdownPct: 0,
     maxDrawdownPct: 0,
     exposurePct: 0,
     maxEntryLeverage: 1,

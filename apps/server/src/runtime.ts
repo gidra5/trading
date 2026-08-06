@@ -197,6 +197,7 @@ export class TradingRuntime {
   private readonly learnedOracleMaximumLeverage: number = (
     LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE
   );
+  private readonly learnedOracleStaticConfidenceScale: number = 1;
 
   constructor(
     private storage: TradingStorage,
@@ -239,6 +240,16 @@ export class TradingRuntime {
         HINDSIGHT_ORACLE_MAX_EXPOSURE,
         maximumLeverage,
       );
+      const staticConfidenceScale = Number(
+        process.env.TRADING_JOINT_PRICE_ORACLE_CONFIDENCE_SCALE ?? 1,
+      );
+      if (!(staticConfidenceScale >= 0 && staticConfidenceScale <= 1)
+        || !Number.isFinite(staticConfidenceScale)) {
+        throw new Error(
+          "TRADING_JOINT_PRICE_ORACLE_CONFIDENCE_SCALE must be in [0, 1].",
+        );
+      }
+      this.learnedOracleStaticConfidenceScale = staticConfidenceScale;
     }
   }
 
@@ -730,6 +741,7 @@ export class TradingRuntime {
           this.learnedOracleRuntime,
           (count) => this.getHistory(count),
           (this.legacyConfig.feeBps + this.legacyConfig.positionRisk.marketSlippageBps) / 10_000,
+          this.learnedOracleStaticConfidenceScale,
         )
       : new PeakValleyStrategy(strategyOptions);
     this.bot = new GridTradingBot({
@@ -913,10 +925,11 @@ export class TradingRuntime {
       if (!this.market.supportsHistoricalCandles || !isHistoricalVenue(this.market.venue)) {
         throw new Error(`${this.market.displaySymbol} does not support candle backtests.`);
       }
-      const backtestInterval = options.strategy === "hindsight-oracle-1s"
-        || options.strategy === "learned-oracle-1s"
+      const backtestInterval = options.strategy === "learned-oracle-1s"
         ? "1s"
-        : this.interval;
+        : options.strategy === "hindsight-oracle-1s"
+          ? this.interval === "1m" ? "1m" : "1s"
+          : this.interval;
       return runHistoricalCandleBacktest({
         id: this.backtest.id,
         preset: options.preset,
@@ -933,6 +946,7 @@ export class TradingRuntime {
         strategy: options.strategy,
         learnedOracleModelId: this.learnedOracleModelId,
         learnedOracleMaximumLeverage: this.learnedOracleMaximumLeverage,
+        oracleStaticConfidenceScale: this.learnedOracleStaticConfidenceScale,
         cache: this.historicalCache,
         historicalStartTime: options.historicalStartTime,
         historicalRangeMs: days(options.historicalDays),
@@ -953,7 +967,7 @@ export class TradingRuntime {
       });
     }
     if (options.strategy === "hindsight-oracle-1s") {
-      throw new Error("The one-second hindsight oracle strategy requires a historical candle preset.");
+      throw new Error("The hindsight oracle strategy requires a historical candle preset.");
     }
     const result = await runBotBacktestFromCandles(
       await this.storage.loadCandles(options.limit),

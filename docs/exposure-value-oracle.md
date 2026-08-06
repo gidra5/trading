@@ -139,6 +139,24 @@ second full-memory pass. The same exact transition-row query is used by the
 non-fused rolling path and the general statistics path, so inspector statistics
 and persisted unconditional targets share one Bellman definition.
 
+## Differentiable training implementation
+
+`ml/differentiable_exposure_value_oracle.py` implements the same single-window
+base-action oracle as a batched PyTorch module without replacing the production
+CPU or CUDA generators. It accepts either positive relative prices or future
+log returns, retains the hard Bellman maximum and hard liquidation boundary,
+and returns action values, logits, and normalized probabilities inside the
+autograd graph.
+
+The forward pass is exact rather than a log-sum-exp relaxation. It is therefore
+piecewise differentiable: gradients follow the selected continuation branch,
+while ties, buy/sell crossings, and liquidation crossings are nonsmooth. The
+separable prefix/suffix continuation scan keeps the normal path linear in the
+number of actions; unusual grids with invalid fee denominators use a dense
+correctness fallback. The Python tests compare fixed and seeded-random paths
+against an independent literal amount-space brute-force implementation and
+check an oracle-policy gradient against a central finite difference.
+
 Oracle input prices and probability output cross the native boundary through a
 reused pair of pinned host staging slots. Slots alternate between calls, while
 the outer dataset worker pipeline can persist/compress one shared output as the

@@ -161,13 +161,16 @@ def daily_resolution_examples(
     *,
     resolution: str,
     max_window: str,
+    horizon_candle_count: int = HORIZON_CANDLE_COUNT,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if horizon_candle_count < 1:
+        raise ValueError("horizon candle count must be positive")
     resolution_seconds = RESOLUTION_SECONDS[resolution]
     candles_per_day = 86_400 // resolution_seconds
     start = datetime.combine(
         date.fromisoformat(day), datetime.min.time(), timezone.utc
     ) - timedelta(seconds=HISTORY_RETURN_COUNT * resolution_seconds)
-    count = HISTORY_RETURN_COUNT + candles_per_day + HORIZON_CANDLE_COUNT - 1
+    count = HISTORY_RETURN_COUNT + candles_per_day + horizon_candle_count - 1
     candle_starts = start + timedelta(seconds=resolution_seconds)
     end_close = close_cache.load_range(
         candle_starts - timedelta(seconds=1),
@@ -205,13 +208,13 @@ def daily_resolution_examples(
     )
     windows = np.lib.stride_tricks.sliding_window_view(
         components,
-        HISTORY_RETURN_COUNT + HORIZON_CANDLE_COUNT,
+        HISTORY_RETURN_COUNT + horizon_candle_count,
         axis=0,
     )
     expected = (
         candles_per_day,
         len(resolution_component_labels(resolution, max_window)),
-        HISTORY_RETURN_COUNT + HORIZON_CANDLE_COUNT,
+        HISTORY_RETURN_COUNT + horizon_candle_count,
     )
     if windows.shape != expected:
         raise RuntimeError(f"resolution window shape {windows.shape} != {expected}")
@@ -228,11 +231,15 @@ class MultiscaleCandleResolutionDataset:
         *,
         resolution: str,
         max_window: str,
+        horizon_candle_count: int = HORIZON_CANDLE_COUNT,
     ) -> None:
         self.shards = shards
         self.resolution = resolution
         self.resolution_seconds = RESOLUTION_SECONDS[resolution]
         self.max_window = max_window
+        if horizon_candle_count < 1:
+            raise ValueError("horizon candle count must be positive")
+        self.horizon_candle_count = int(horizon_candle_count)
         self.component_labels = resolution_component_labels(
             resolution, max_window
         )
@@ -259,6 +266,7 @@ class MultiscaleCandleResolutionDataset:
             day,
             resolution=self.resolution,
             max_window=self.max_window,
+            horizon_candle_count=self.horizon_candle_count,
         )
         self.component_cache[day] = values
         while len(self.component_cache) > self.component_cache_entries:
@@ -283,7 +291,7 @@ class MultiscaleCandleResolutionDataset:
         feature_shape = (
             batch_size, self.component_count, HISTORY_RETURN_COUNT
         )
-        target_shape = (batch_size, HORIZON_CANDLE_COUNT)
+        target_shape = (batch_size, self.horizon_candle_count)
         feature_buffer = np.empty(feature_shape, dtype=np.float32)
         target_buffer = np.empty(target_shape, dtype=np.float32)
         weight_buffer = np.empty(batch_size, dtype=np.float32)

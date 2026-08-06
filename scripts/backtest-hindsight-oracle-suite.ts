@@ -34,14 +34,22 @@ import {
   runBotBacktestFromCandles,
 } from "../apps/server/src/bot-backtest.js";
 import { historicalWarmupSamples } from "../apps/server/src/historical-backtest.js";
+import {
+  fillOracleClosePrices,
+  type OracleReturnNoiseConfig,
+  validateOracleReturnNoise,
+} from "./hindsight-oracle-return-noise.js";
 
 const DAY_MS = 86_400_000;
-const INTERVAL_MS = 1_000;
+const CANDLE_INTERVAL = argument("interval") ?? "1s";
+const INTERVAL_MS = candleIntervalMs(CANDLE_INTERVAL);
 const HISTORY_ROOT = path.resolve(
-  "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  `data/market/immutable/refs/candles/spot-btcusdt/btcusdt/${CANDLE_INTERVAL}`,
 );
 const DEFAULT_OUTPUT = path.resolve(
-  "data/benchmarks/hindsight-oracle-bot-suite-2026-07-31.json",
+  CANDLE_INTERVAL === "1s"
+    ? "data/benchmarks/hindsight-oracle-bot-suite-2026-07-31.json"
+    : `data/benchmarks/hindsight-oracle-bot-suite-${CANDLE_INTERVAL}-2026-07-31.json`,
 );
 const STORED_ORACLE_DATASET_ID =
   "mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle";
@@ -88,6 +96,15 @@ interface SuiteReport {
     maximumExposure: number;
     confidenceExposurePower: number;
     confidenceLeverageFloor: number;
+    confidenceLeverageFloorScaling?: "quadratic-static-confidence";
+    expansionConfirmationMass?: number;
+    expansionConfirmationBasis?: "distribution-confidence-mass";
+    expansionDeltaCapFraction?: number;
+    staticConfidenceScale: number;
+    distributionConfidenceGate?: "disabled";
+    returnCorrelation?: number;
+    returnNoiseSeed?: number;
+    returnCorrelationBasis?: "rolling-value-horizon-log-return";
   };
   generatedAt: string;
   historyRoot: string;
@@ -149,6 +166,34 @@ async function main(): Promise<void> {
     throw new Error("--value-horizon-minutes must cover at least one holding period.");
   }
   const valueHorizonMs = valueHorizonMinutes * 60_000;
+  const returnCorrelation = finiteArgument("oracle-return-correlation", 1);
+  const returnNoiseSeed = integerArgument("oracle-noise-seed", 0);
+  const expansionConfirmationMass = finiteArgument("oracle-expansion-confirmation-mass", 1);
+  if (expansionConfirmationMass < 0) {
+    throw new Error("--oracle-expansion-confirmation-mass must be non-negative.");
+  }
+  const expansionDeltaCapFraction = finiteArgument(
+    "oracle-expansion-delta-cap-fraction",
+    HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+  );
+  if (!(expansionDeltaCapFraction >= 0)) {
+    throw new Error("--oracle-expansion-delta-cap-fraction must be non-negative.");
+  }
+  const returnNoise = returnCorrelation < 1
+    ? {
+        correlation: returnCorrelation,
+        seed: returnNoiseSeed,
+        rollingHorizonSteps: Math.round(valueHorizonMs / INTERVAL_MS),
+      }
+    : undefined;
+  const oracleNoiseSourceHorizonMs = returnNoise
+    ? Math.max(valueHorizonMs, 60 * 60_000)
+    : valueHorizonMs;
+  validateOracleReturnNoise({
+    correlation: returnCorrelation,
+    seed: returnNoiseSeed,
+    rollingHorizonSteps: Math.round(valueHorizonMs / INTERVAL_MS),
+  });
   const latestAvailableDay = availableDays().at(-1);
   if (!latestAvailableDay) throw new Error(`No one-second history found in ${HISTORY_ROOT}.`);
   const latestEndTime = parseDay(latestAvailableDay) + DAY_MS;
@@ -195,9 +240,17 @@ async function main(): Promise<void> {
     : "cpu";
   console.log(
     `BACKEND oracle=${oracleBackend} horizonMinutes=${valueHorizonMinutes}`
+    + ` returnCorrelation=${returnCorrelation} noiseSeed=${returnNoiseSeed}`
     + `${cudaStatus?.device ? ` device=${cudaStatus.device}` : ""}`,
   );
-  const existing = readReport(output, valueHorizonMs);
+  const existing = readReport(
+    output,
+    valueHorizonMs,
+    returnCorrelation,
+    returnNoiseSeed,
+    expansionConfirmationMass,
+    expansionDeltaCapFraction,
+  );
   const report: SuiteReport = existing ?? {
     strategy: "hindsight-oracle-1s",
     summaryOnly: true,
@@ -209,6 +262,15 @@ async function main(): Promise<void> {
       maximumExposure: HINDSIGHT_ORACLE_MAX_EXPOSURE,
       confidenceExposurePower: HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
       confidenceLeverageFloor: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+      confidenceLeverageFloorScaling: "quadratic-static-confidence",
+      expansionConfirmationMass,
+      expansionConfirmationBasis: "distribution-confidence-mass",
+      expansionDeltaCapFraction,
+      staticConfidenceScale: returnCorrelation,
+      distributionConfidenceGate: "disabled",
+      returnCorrelation,
+      returnNoiseSeed,
+      returnCorrelationBasis: "rolling-value-horizon-log-return",
     },
     generatedAt: new Date().toISOString(),
     historyRoot: HISTORY_ROOT,
@@ -229,7 +291,7 @@ async function main(): Promise<void> {
       `START ${window.id} (${index + 1}/${selected.length}) `
       + `${isoDay(window.startTime)}..${isoDay(window.endTime - 1)}`,
     );
-    const loaded = loadWindow(window, warmupMs, valueHorizonMs);
+    const loaded = loadWindow(window, warmupMs, oracleNoiseSourceHorizonMs);
     console.log(
       `LOADED ${window.id} measured=${loaded.candles.length} `
       + `warmup=${loaded.warmup.length} future=${loaded.oracleFuture.length}`,
@@ -245,6 +307,7 @@ async function main(): Promise<void> {
           window.id,
           oracleBackend,
           valueHorizonMs,
+          returnNoise,
         );
     if (precomputed === reusableFitOracle) {
       console.log(`REUSE ${window.id} oracle=fit-full`);
@@ -266,13 +329,18 @@ async function main(): Promise<void> {
       maxChartCandles: 2_000,
       summaryOnly: true,
       hindsightOracleDistributionAt: precomputed?.distributionAt,
-      onProgress: ({ candlesProcessed, totalCandles, elapsedMs }) => {
-        console.log(
-          `REPLAY ${window.id} candles=${candlesProcessed}/${totalCandles} `
-          + `pct=${(candlesProcessed / totalCandles * 100).toFixed(0)} `
-          + `durationMs=${elapsedMs}`,
-        );
-      },
+      oracleStaticConfidenceScale: returnCorrelation,
+      oracleExpansionConfirmationMass: expansionConfirmationMass,
+      oracleExpansionDeltaCapFraction: expansionDeltaCapFraction,
+      onProgress: flag("quiet-replay")
+        ? undefined
+        : ({ candlesProcessed, totalCandles, elapsedMs }) => {
+            console.log(
+              `REPLAY ${window.id} candles=${candlesProcessed}/${totalCandles} `
+              + `pct=${(candlesProcessed / totalCandles * 100).toFixed(0)} `
+              + `durationMs=${elapsedMs}`,
+            );
+          },
     });
     const suiteResult: SuiteResult = {
       id: window.id,
@@ -313,6 +381,7 @@ async function precomputeOracleDistributions(
   windowId: string,
   backend: OracleBackend,
   valueHorizonMs: number,
+  returnNoise?: OracleReturnNoiseConfig,
 ): Promise<PrecomputedOracleDistributions> {
   const holdingPeriodSteps = Math.max(1, Math.round(
     HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / INTERVAL_MS,
@@ -325,14 +394,11 @@ async function precomputeOracleDistributions(
   ));
   const priceCount = candles.length + future.length;
   const prices = new Float64Array(new SharedArrayBuffer(priceCount * Float64Array.BYTES_PER_ELEMENT));
-  for (let index = 0; index < candles.length; index += 1) prices[index] = candles[index]!.close;
-  for (let index = 0; index < future.length; index += 1) {
-    prices[candles.length + index] = future[index]!.close;
-  }
+  fillOracleClosePrices(prices, candles, future, returnNoise);
   const decisionCount = candles.length > 1
     ? Math.floor((candles.length - 2) / holdingPeriodSteps) + 1
     : 0;
-  const storedOracle = storedOracleDefinition(config, valueHorizonSteps);
+  const storedOracle = storedOracleDefinition(config, valueHorizonSteps, !returnNoise);
   const outputColumns = storedOracle.grid.length;
   const probabilities = new Float32Array(new SharedArrayBuffer(
     decisionCount * outputColumns * Float32Array.BYTES_PER_ELEMENT,
@@ -353,7 +419,7 @@ async function precomputeOracleDistributions(
     valueHorizonSteps,
     config,
     quoteBorrowRate,
-  }), storedOracle.grid);
+  }), storedOracle.grid, returnNoise);
   const cachedRows = await loadCachedOracleRows({
     windowId,
     candles,
@@ -525,6 +591,7 @@ function oracleCacheDefinition(
   backend: OracleBackend,
   options: ExposureValueOracleOptions,
   grid: Float64Array,
+  returnNoise?: OracleReturnNoiseConfig,
 ): OracleCacheDefinition {
   const metadata = {
     version: 1,
@@ -544,6 +611,14 @@ function oracleCacheDefinition(
       quoteBorrowRate: options.quoteBorrowRate,
       assetBorrowRate: options.assetBorrowRate,
     },
+    ...(returnNoise ? {
+      returnNoise: {
+        kind: "orthogonalized-rolling-horizon-return-correlation-v4",
+        correlation: returnNoise.correlation,
+        seed: returnNoise.seed,
+        rollingHorizonSteps: returnNoise.rollingHorizonSteps,
+      },
+    } : {}),
     usableGrid: Array.from(grid),
   };
   const contractHash = createHash("sha256")
@@ -551,7 +626,7 @@ function oracleCacheDefinition(
     .digest("hex");
   return {
     backend,
-    namespace: `oracle/1s/hindsight-bot-${contractHash.slice(0, 20)}`,
+    namespace: `oracle/${CANDLE_INTERVAL}/hindsight-bot-${contractHash.slice(0, 20)}`,
     contractHash,
     metadata,
   };
@@ -771,20 +846,44 @@ async function acquireCudaOracleSlot(): Promise<() => void> {
           fs.rmSync(lockFile, { force: true });
         };
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const openCode = (error as NodeJS.ErrnoException).code;
+        // Windows can report an existing lock opened with `wx` as EPERM/EACCES/EBUSY
+        // while another process still owns the descriptor, rather than EEXIST.
+        if (openCode !== "EEXIST" && openCode !== "EPERM"
+          && openCode !== "EACCES" && openCode !== "EBUSY") {
+          throw error;
+        }
         let owner = Number.NaN;
         try {
           owner = Number.parseInt(fs.readFileSync(lockFile, "utf8"), 10);
         } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
+          const code = (readError as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") {
+            throw readError;
+          }
           continue;
         }
-        if (Number.isInteger(owner) && !processExists(owner)) {
+        const stale = Number.isInteger(owner)
+          ? !processExists(owner)
+          : malformedLockIsStale(lockFile);
+        if (stale) {
           fs.rmSync(lockFile, { force: true });
         }
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+function malformedLockIsStale(lockFile: string): boolean {
+  try {
+    return Date.now() - fs.statSync(lockFile).mtimeMs >= 30_000;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EPERM" || code === "EACCES" || code === "EBUSY") {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -807,11 +906,12 @@ interface StoredOracleDefinition {
 function storedOracleDefinition(
   config: StrategyConfig,
   valueHorizonSteps: number,
+  allowStoredRows: boolean,
 ): StoredOracleDefinition {
   const manifest = JSON.parse(fs.readFileSync(STORED_ORACLE_DATASET, "utf8"));
   const execution = manifest.execution;
   const frictionBps = config.feeBps + config.positionRisk.marketSlippageBps;
-  const compatible = !(
+  const compatible = allowStoredRows && !(
     manifest.samplingIntervalMs !== INTERVAL_MS
     || execution?.feeBps !== frictionBps
     || execution?.gridSize !== HINDSIGHT_ORACLE_GRID_SIZE
@@ -1041,7 +1141,14 @@ function aggregate(results: readonly SuiteResult[]): Record<string, unknown> {
   };
 }
 
-function readReport(file: string, valueHorizonMs: number): SuiteReport | undefined {
+function readReport(
+  file: string,
+  valueHorizonMs: number,
+  returnCorrelation: number,
+  returnNoiseSeed: number,
+  expansionConfirmationMass: number,
+  expansionDeltaCapFraction: number,
+): SuiteReport | undefined {
   if (!fs.existsSync(file)) return undefined;
   const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as SuiteReport;
   if (
@@ -1053,6 +1160,15 @@ function readReport(file: string, valueHorizonMs: number): SuiteReport | undefin
     || parsed.oracle?.maximumExposure !== HINDSIGHT_ORACLE_MAX_EXPOSURE
     || parsed.oracle?.confidenceExposurePower !== HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER
     || parsed.oracle?.confidenceLeverageFloor !== HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR
+    || parsed.oracle?.confidenceLeverageFloorScaling !== "quadratic-static-confidence"
+    || parsed.oracle?.expansionConfirmationMass !== expansionConfirmationMass
+    || parsed.oracle?.expansionConfirmationBasis !== "distribution-confidence-mass"
+    || parsed.oracle?.expansionDeltaCapFraction !== expansionDeltaCapFraction
+    || parsed.oracle?.staticConfidenceScale !== returnCorrelation
+    || parsed.oracle?.distributionConfidenceGate !== "disabled"
+    || (parsed.oracle?.returnCorrelation ?? 1) !== returnCorrelation
+    || (parsed.oracle?.returnNoiseSeed ?? 0) !== returnNoiseSeed
+    || parsed.oracle?.returnCorrelationBasis !== "rolling-value-horizon-log-return"
     || !Array.isArray(parsed.results)
   ) {
     throw new Error(`Existing suite report is incompatible: ${file}`);
@@ -1083,6 +1199,20 @@ function integerArgument(name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isSafeInteger(value)) throw new Error(`--${name} is out of range.`);
   return value;
+}
+
+function finiteArgument(name: string, fallback: number): number {
+  const raw = argument(name);
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new Error(`--${name} must be finite.`);
+  return value;
+}
+
+function candleIntervalMs(interval: string): number {
+  if (interval === "1s") return 1_000;
+  if (interval === "1m") return 60_000;
+  throw new Error("--interval must be 1s or 1m.");
 }
 
 function parseDay(value: string): number {
