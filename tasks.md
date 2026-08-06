@@ -202,8 +202,7 @@ ML model based on MLP:
     last accepted model when a transition plateaus.
 5.  Examples are every candle in inspector windows
     1. Pair each prediction-time input with the oracle target at
-       `predictionTime - predictionDelayMs`; the current experiment uses a
-       configurable 60-second delay/hindsight window.
+       `predictionTime`; 
     2. Assign train/validation/test by prediction time. Persist complete
        timestamp-keyed input days and oracle days independently, then represent
        a delay with lightweight row-offset/stride pairings so completed

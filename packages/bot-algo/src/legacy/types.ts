@@ -23,7 +23,11 @@ export type BacktestPreset =
   | "random-windows"
   | "random-length-windows";
 
-export type BacktestStrategy = "peak-valley" | "learned-oracle-1s" | "hindsight-oracle-1s";
+export type BacktestStrategy =
+  | "peak-valley"
+  | "learned-oracle-1s"
+  | "learned-oracle-1m"
+  | "hindsight-oracle-1s";
 
 export type BacktestRunStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
 

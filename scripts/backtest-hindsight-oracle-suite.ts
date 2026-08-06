@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { availableParallelism } from "node:os";
 import path from "node:path";
@@ -31,6 +32,7 @@ import {
   HINDSIGHT_ORACLE_MAX_EXPOSURE,
   HINDSIGHT_ORACLE_TEMPERATURE,
   HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
+  LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE,
   runBotBacktestFromCandles,
 } from "../apps/server/src/bot-backtest.js";
 import { historicalWarmupSamples } from "../apps/server/src/historical-backtest.js";
@@ -41,13 +43,26 @@ import {
 } from "./hindsight-oracle-return-noise.js";
 
 const DAY_MS = 86_400_000;
+const MODEL_PLAN = path.resolve(
+  argument("model-plan")
+    ?? "ml/training-plans/oracle-distribution-path-15m-two-layer-glu-mean-p50-v1.json",
+);
+const ORACLE_SOURCE = argument("oracle-source") ?? "hindsight";
+if (ORACLE_SOURCE !== "hindsight" && ORACLE_SOURCE !== "model") {
+  throw new Error("--oracle-source must be hindsight or model.");
+}
 const CANDLE_INTERVAL = argument("interval") ?? "1s";
 const INTERVAL_MS = candleIntervalMs(CANDLE_INTERVAL);
+if (ORACLE_SOURCE === "model" && CANDLE_INTERVAL !== "1m") {
+  throw new Error("The oracle distribution-path model requires --interval=1m.");
+}
 const HISTORY_ROOT = path.resolve(
   `data/market/immutable/refs/candles/spot-btcusdt/btcusdt/${CANDLE_INTERVAL}`,
 );
 const DEFAULT_OUTPUT = path.resolve(
-  CANDLE_INTERVAL === "1s"
+  ORACLE_SOURCE === "model"
+    ? "data/benchmarks/oracle-distribution-path-1m-suite-diagnostics-2026-08-06.json"
+    : CANDLE_INTERVAL === "1s"
     ? "data/benchmarks/hindsight-oracle-bot-suite-2026-07-31.json"
     : `data/benchmarks/hindsight-oracle-bot-suite-${CANDLE_INTERVAL}-2026-07-31.json`,
 );
@@ -81,12 +96,21 @@ interface SuiteResult {
   loadedCandles: number;
   warmupCandles: number;
   oracleFutureCandles: number;
+  inferenceDurationMs?: number;
+  policyDiagnostics?: {
+    decisions: number;
+    rawNonzero: number;
+    conditionedNonzero: number;
+    targetNonzero: number;
+    signalsEmitted: number;
+    meanConfidence: number;
+  };
   wallDurationMs: number;
   summary: BacktestSummary;
 }
 
 interface SuiteReport {
-  strategy: "hindsight-oracle-1s";
+  strategy: "hindsight-oracle-1s" | "oracle-distribution-path-1m";
   summaryOnly: true;
   oracle: {
     intervalMs: number;
@@ -94,6 +118,7 @@ interface SuiteReport {
     decisionDelayMs: number;
     valueHorizonMs: number;
     maximumExposure: number;
+    executionMaximumLeverage?: number;
     confidenceExposurePower: number;
     confidenceLeverageFloor: number;
     confidenceLeverageFloorScaling?: "quadratic-static-confidence";
@@ -105,10 +130,13 @@ interface SuiteReport {
     returnCorrelation?: number;
     returnNoiseSeed?: number;
     returnCorrelationBasis?: "rolling-value-horizon-log-return";
+    source?: "hindsight" | "model";
+    modelId?: string;
   };
   generatedAt: string;
   historyRoot: string;
   latestAvailableDay: string;
+  modelWorkerStartupMs?: number;
   results: SuiteResult[];
 }
 
@@ -158,15 +186,28 @@ const STATIC_WINDOWS = [
 ] satisfies SuiteWindow[];
 
 async function main(): Promise<void> {
+  const modelPlan = ORACLE_SOURCE === "model"
+    ? JSON.parse(fs.readFileSync(MODEL_PLAN, "utf8")) as { id: string }
+    : undefined;
   const valueHorizonMinutes = integerArgument(
     "value-horizon-minutes",
-    HINDSIGHT_ORACLE_VALUE_HORIZON_MS / 60_000,
+    ORACLE_SOURCE === "model" ? 15 : HINDSIGHT_ORACLE_VALUE_HORIZON_MS / 60_000,
   );
   if (valueHorizonMinutes < HINDSIGHT_ORACLE_HOLDING_PERIOD_MS / 60_000) {
     throw new Error("--value-horizon-minutes must cover at least one holding period.");
   }
   const valueHorizonMs = valueHorizonMinutes * 60_000;
   const returnCorrelation = finiteArgument("oracle-return-correlation", 1);
+  if (ORACLE_SOURCE === "model" && returnCorrelation !== 1) {
+    throw new Error("Return-noise perturbation is only available for hindsight inference.");
+  }
+  const staticConfidenceScale = finiteArgument(
+    "static-confidence",
+    ORACLE_SOURCE === "model" ? 0.75 : returnCorrelation,
+  );
+  if (staticConfidenceScale < 0 || staticConfidenceScale > 1) {
+    throw new Error("--static-confidence must be in [0, 1].");
+  }
   const returnNoiseSeed = integerArgument("oracle-noise-seed", 0);
   const expansionConfirmationMass = finiteArgument("oracle-expansion-confirmation-mass", 1);
   if (expansionConfirmationMass < 0) {
@@ -186,7 +227,9 @@ async function main(): Promise<void> {
         rollingHorizonSteps: Math.round(valueHorizonMs / INTERVAL_MS),
       }
     : undefined;
-  const oracleNoiseSourceHorizonMs = returnNoise
+  const oracleNoiseSourceHorizonMs = ORACLE_SOURCE === "model"
+    ? 0
+    : returnNoise
     ? Math.max(valueHorizonMs, 60 * 60_000)
     : valueHorizonMs;
   validateOracleReturnNoise({
@@ -194,10 +237,14 @@ async function main(): Promise<void> {
     seed: returnNoiseSeed,
     rollingHorizonSteps: Math.round(valueHorizonMs / INTERVAL_MS),
   });
-  const latestAvailableDay = availableDays().at(-1);
+  const latestAvailableDay = ORACLE_SOURCE === "model"
+    ? latestContiguousAvailableDay(93)
+    : availableDays().at(-1);
   if (!latestAvailableDay) throw new Error(`No one-second history found in ${HISTORY_ROOT}.`);
   const latestEndTime = parseDay(latestAvailableDay) + DAY_MS;
-  const latestMeasuredEndTime = latestEndTime - valueHorizonMs;
+  const latestMeasuredEndTime = ORACLE_SOURCE === "model"
+    ? latestEndTime
+    : latestEndTime - valueHorizonMs;
   const windows = [
     ...STATIC_WINDOWS,
     {
@@ -239,8 +286,9 @@ async function main(): Promise<void> {
     ? "cuda"
     : "cpu";
   console.log(
-    `BACKEND oracle=${oracleBackend} horizonMinutes=${valueHorizonMinutes}`
+    `BACKEND source=${ORACLE_SOURCE} oracle=${oracleBackend} horizonMinutes=${valueHorizonMinutes}`
     + ` returnCorrelation=${returnCorrelation} noiseSeed=${returnNoiseSeed}`
+    + ` staticConfidence=${staticConfidenceScale}`
     + `${cudaStatus?.device ? ` device=${cudaStatus.device}` : ""}`,
   );
   const existing = readReport(
@@ -250,9 +298,14 @@ async function main(): Promise<void> {
     returnNoiseSeed,
     expansionConfirmationMass,
     expansionDeltaCapFraction,
+    ORACLE_SOURCE,
+    modelPlan?.id,
+    staticConfidenceScale,
   );
   const report: SuiteReport = existing ?? {
-    strategy: "hindsight-oracle-1s",
+    strategy: ORACLE_SOURCE === "model"
+      ? "oracle-distribution-path-1m"
+      : "hindsight-oracle-1s",
     summaryOnly: true,
     oracle: {
       intervalMs: INTERVAL_MS,
@@ -260,17 +313,22 @@ async function main(): Promise<void> {
       decisionDelayMs: HINDSIGHT_ORACLE_DECISION_DELAY_MS,
       valueHorizonMs,
       maximumExposure: HINDSIGHT_ORACLE_MAX_EXPOSURE,
+      executionMaximumLeverage: ORACLE_SOURCE === "model"
+        ? LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE
+        : HINDSIGHT_ORACLE_MAX_EXPOSURE,
       confidenceExposurePower: HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
       confidenceLeverageFloor: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
       confidenceLeverageFloorScaling: "quadratic-static-confidence",
       expansionConfirmationMass,
       expansionConfirmationBasis: "distribution-confidence-mass",
       expansionDeltaCapFraction,
-      staticConfidenceScale: returnCorrelation,
+      staticConfidenceScale,
       distributionConfidenceGate: "disabled",
       returnCorrelation,
       returnNoiseSeed,
       returnCorrelationBasis: "rolling-value-horizon-log-return",
+      source: ORACLE_SOURCE,
+      ...(modelPlan ? { modelId: modelPlan.id } : {}),
     },
     generatedAt: new Date().toISOString(),
     historyRoot: HISTORY_ROOT,
@@ -281,6 +339,9 @@ async function main(): Promise<void> {
   const completed = new Set(report.results.map((result) => result.id));
   const warmupMs = historicalWarmupSamples(appConfig.strategy, INTERVAL_MS) * INTERVAL_MS;
   let reusableFitOracle: PrecomputedOracleDistributions | undefined;
+  const modelWorker = ORACLE_SOURCE === "model"
+    ? new OracleDistributionPathWorker(MODEL_PLAN)
+    : undefined;
 
   for (const [index, window] of selected.entries()) {
     if (completed.has(window.id)) {
@@ -297,9 +358,13 @@ async function main(): Promise<void> {
       + `warmup=${loaded.warmup.length} future=${loaded.oracleFuture.length}`,
     );
     const startedAt = Date.now();
-    const precomputed = reusableFitOracle?.covers(loaded.candles)
+    const inferenceStartedAt = Date.now();
+    const reusedFitOracle = reusableFitOracle?.covers(loaded.candles) ?? false;
+    const precomputed = reusedFitOracle
       ? reusableFitOracle
-      : await precomputeOracleDistributions(
+      : modelWorker
+        ? await modelWorker.predict(window, loaded.candles)
+        : await precomputeOracleDistributions(
           loaded.candles,
           loaded.oracleFuture,
           appConfig.strategy,
@@ -309,7 +374,7 @@ async function main(): Promise<void> {
           valueHorizonMs,
           returnNoise,
         );
-    if (precomputed === reusableFitOracle) {
+    if (reusedFitOracle) {
       console.log(`REUSE ${window.id} oracle=fit-full`);
     } else if (window.id === "fit-full") {
       reusableFitOracle = precomputed;
@@ -320,18 +385,46 @@ async function main(): Promise<void> {
       global.gc?.();
       continue;
     }
+    const inferenceDurationMs = reusedFitOracle
+      ? 0
+      : Date.now() - inferenceStartedAt;
+    const decisionDiagnostics = {
+      decisions: 0,
+      rawNonzero: 0,
+      conditionedNonzero: 0,
+      targetNonzero: 0,
+      signalsEmitted: 0,
+      confidenceSum: 0,
+    };
     const result = await runBotBacktestFromCandles(loaded.candles, {
       config: appConfig.strategy,
-      strategy: "hindsight-oracle-1s",
+      strategy: ORACLE_SOURCE === "model"
+        ? "learned-oracle-1m"
+        : "hindsight-oracle-1s",
       warmup: loaded.warmup,
       oracleFuture: loaded.oracleFuture,
       maxEquityPoints: 800,
       maxChartCandles: 2_000,
       summaryOnly: true,
-      hindsightOracleDistributionAt: precomputed?.distributionAt,
-      oracleStaticConfidenceScale: returnCorrelation,
+      hindsightOracleDistributionAt: ORACLE_SOURCE === "hindsight"
+        ? precomputed?.distributionAt
+        : undefined,
+      learnedOracleDistributionAt: ORACLE_SOURCE === "model"
+        ? precomputed?.distributionAt
+        : undefined,
+      oracleStaticConfidenceScale: staticConfidenceScale,
       oracleExpansionConfirmationMass: expansionConfirmationMass,
       oracleExpansionDeltaCapFraction: expansionDeltaCapFraction,
+      onOracleDecision: (decision) => {
+        decisionDiagnostics.decisions += 1;
+        decisionDiagnostics.rawNonzero += Number(decision.rawModalExposure !== 0);
+        decisionDiagnostics.conditionedNonzero += Number(
+          decision.conditionedModalExposure !== 0,
+        );
+        decisionDiagnostics.targetNonzero += Number(decision.targetExposure !== 0);
+        decisionDiagnostics.signalsEmitted += Number(decision.signalEmitted);
+        decisionDiagnostics.confidenceSum += decision.confidence;
+      },
       onProgress: flag("quiet-replay")
         ? undefined
         : ({ candlesProcessed, totalCandles, elapsedMs }) => {
@@ -349,6 +442,17 @@ async function main(): Promise<void> {
       loadedCandles: loaded.candles.length,
       warmupCandles: loaded.warmup.length,
       oracleFutureCandles: loaded.oracleFuture.length,
+      inferenceDurationMs,
+      policyDiagnostics: {
+        decisions: decisionDiagnostics.decisions,
+        rawNonzero: decisionDiagnostics.rawNonzero,
+        conditionedNonzero: decisionDiagnostics.conditionedNonzero,
+        targetNonzero: decisionDiagnostics.targetNonzero,
+        signalsEmitted: decisionDiagnostics.signalsEmitted,
+        meanConfidence: decisionDiagnostics.decisions > 0
+          ? decisionDiagnostics.confidenceSum / decisionDiagnostics.decisions
+          : 0,
+      },
       wallDurationMs: Date.now() - startedAt,
       summary: result.summary,
     };
@@ -362,15 +466,210 @@ async function main(): Promise<void> {
 
   if (oracleOnly) {
     console.log(`ORACLE-ONLY-COMPLETE horizonMinutes=${valueHorizonMinutes}`);
+    await modelWorker?.close();
     return;
   }
   console.log(`AGGREGATE ${JSON.stringify(aggregate(report.results))}`);
   console.log(`REPORT ${output}`);
+  if (modelWorker) {
+    report.modelWorkerStartupMs = modelWorker.startupDurationMs;
+    writeReport(output, report);
+    await modelWorker.close();
+  }
 }
 
 interface PrecomputedOracleDistributions {
   distributionAt(timestamp: number): ExposureValueOracleActionDistribution | null;
   covers(candles: readonly Candle[]): boolean;
+}
+
+class OracleDistributionPathWorker {
+  readonly child: ChildProcessWithoutNullStreams;
+  startupDurationMs = 0;
+  private readonly startedAt = Date.now();
+  private pending?: {
+    expectedRows: number;
+    buffer: Buffer;
+    offset: number;
+    resolve: (value: Buffer) => void;
+    reject: (error: Error) => void;
+  };
+
+  constructor(planFile: string) {
+    const python = path.resolve(
+      ".venv-ml",
+      process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+    );
+    this.child = spawn(python, [
+      path.resolve("ml/serve_oracle_distribution_path.py"),
+      "--plan",
+      planFile,
+      "--history-dir",
+      HISTORY_ROOT,
+      "--device",
+      argument("model-device") ?? "auto",
+      "--batch-size",
+      argument("model-batch-size") ?? "4096",
+    ], {
+      cwd: path.resolve("."),
+      env: {
+        ...process.env,
+        PYTHONUTF8: process.env.PYTHONUTF8 ?? "1",
+        PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? "utf-8",
+        PYTHONPATH: [path.resolve("ml"), process.env.PYTHONPATH]
+          .filter(Boolean).join(path.delimiter),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child.stdout.on("data", (chunk: Buffer) => this.accept(chunk));
+    this.child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+    });
+    this.child.once("error", (error) => this.fail(error));
+    this.child.once("exit", (code) => {
+      if (code && this.pending) {
+        this.fail(new Error(`Oracle distribution-path worker exited with code ${code}.`));
+      }
+    });
+  }
+
+  async predict(
+    window: SuiteWindow,
+    candles: readonly Candle[],
+  ): Promise<PrecomputedOracleDistributions> {
+    if (this.pending) throw new Error("Oracle model worker already has an active request.");
+    const expectedRows = Math.round((window.endTime - window.startTime) / INTERVAL_MS);
+    if (candles.length !== expectedRows
+      || candles[0]?.openTime !== window.startTime
+      || candles.at(-1)?.openTime !== window.endTime - INTERVAL_MS) {
+      throw new Error(`Model window ${window.id} is not a complete minute range.`);
+    }
+    const actionCount = 101;
+    const expectedBytes = 16 + expectedRows * actionCount * Float32Array.BYTES_PER_ELEMENT;
+    const startedAt = Date.now();
+    const response = await new Promise<Buffer>((resolve, reject) => {
+      this.pending = {
+        expectedRows,
+        buffer: Buffer.allocUnsafe(expectedBytes),
+        offset: 0,
+        resolve,
+        reject,
+      };
+      this.child.stdin.write(`${JSON.stringify({
+        id: window.id,
+        startTime: window.startTime,
+        endTime: window.endTime,
+      })}\n`);
+    });
+    const rows = response.readUInt32LE(0);
+    const columns = response.readUInt32LE(4);
+    const workerDurationMs = Number(response.readBigUInt64LE(8));
+    if (rows !== expectedRows || columns !== actionCount) {
+      throw new Error(
+        `Model response for ${window.id} has ${rows}x${columns}; expected `
+        + `${expectedRows}x${actionCount}.`,
+      );
+    }
+    if (this.startupDurationMs === 0) {
+      this.startupDurationMs = Math.max(0, Date.now() - startedAt - workerDurationMs);
+    }
+    const probabilities = new Float32Array(
+      response.buffer,
+      response.byteOffset + 16,
+      rows * columns,
+    );
+    const grid = Float64Array.from(
+      { length: columns },
+      (_, index) => -100 + index * 200 / (columns - 1),
+    );
+    const firstCloseTime = candles[0]!.closeTime;
+    const lastCloseTime = candles.at(-1)!.closeTime;
+    console.log(
+      `MODEL ${window.id} rows=${rows} durationMs=${workerDurationMs} `
+      + `rowsPerSecond=${Math.round(rows / Math.max(workerDurationMs / 1_000, 0.001))}`,
+    );
+    return {
+      covers(candidate) {
+        const first = candidate[0]?.closeTime;
+        const last = candidate.at(-1)?.closeTime;
+        return first !== undefined && last !== undefined
+          && first >= firstCloseTime && last <= lastCloseTime
+          && (first - firstCloseTime) % INTERVAL_MS === 0;
+      },
+      distributionAt(timestamp) {
+        const elapsed = timestamp - firstCloseTime;
+        if (elapsed < 0 || elapsed % INTERVAL_MS !== 0 || timestamp > lastCloseTime) {
+          return null;
+        }
+        const row = elapsed / INTERVAL_MS;
+        const values = probabilities.subarray(row * columns, (row + 1) * columns);
+        let total = 0;
+        let mean = 0;
+        let secondMoment = 0;
+        let entropy = 0;
+        let modalIndex = 0;
+        let feasibleActionCount = 0;
+        for (let index = 0; index < columns; index += 1) {
+          const probability = values[index]!;
+          total += probability;
+          if (probability > values[modalIndex]!) modalIndex = index;
+          if (probability > 0) {
+            feasibleActionCount += 1;
+            entropy -= probability * Math.log(probability);
+          }
+          mean += probability * grid[index]!;
+          secondMoment += probability * grid[index]! ** 2;
+        }
+        if (!(total > 0) || !Number.isFinite(total)) {
+          throw new Error(`Model distribution is invalid at ${timestamp}.`);
+        }
+        return {
+          grid,
+          probabilities: values,
+          mean: mean / total,
+          secondMoment: secondMoment / total,
+          modalExposure: grid[modalIndex]!,
+          entropy: entropy / total + Math.log(total),
+          opportunity: 0,
+          feasibleActionCount,
+        };
+      },
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.child.exitCode !== null) return;
+    this.child.stdin.end();
+    await new Promise<void>((resolve, reject) => {
+      this.child.once("exit", (code) => code === 0
+        ? resolve()
+        : reject(new Error(`Oracle distribution-path worker exited with code ${code}.`)));
+    });
+  }
+
+  private accept(chunk: Buffer): void {
+    const pending = this.pending;
+    if (!pending) {
+      this.child.kill();
+      throw new Error("Oracle model worker produced an unsolicited response.");
+    }
+    if (chunk.length > pending.buffer.length - pending.offset) {
+      this.fail(new Error("Oracle model worker response exceeds its declared window."));
+      return;
+    }
+    chunk.copy(pending.buffer, pending.offset);
+    pending.offset += chunk.length;
+    if (pending.offset === pending.buffer.length) {
+      this.pending = undefined;
+      pending.resolve(pending.buffer);
+    }
+  }
+
+  private fail(error: Error): void {
+    const pending = this.pending;
+    this.pending = undefined;
+    pending?.reject(error);
+  }
 }
 
 async function precomputeOracleDistributions(
@@ -1085,6 +1384,23 @@ function availableDays(): string[] {
     .sort();
 }
 
+function latestContiguousAvailableDay(minimumDays: number): string | undefined {
+  const dates = availableDays();
+  const available = new Set(dates);
+  for (let candidate = dates.length - 1; candidate >= 0; candidate -= 1) {
+    const end = parseDay(dates[candidate]!);
+    let complete = true;
+    for (let offset = 1; offset < minimumDays; offset += 1) {
+      if (!available.has(isoDay(end - offset * DAY_MS))) {
+        complete = false;
+        break;
+      }
+    }
+    if (complete) return dates[candidate];
+  }
+  return undefined;
+}
+
 function readReferenceDay(date: string): Candle[] | undefined {
   const file = path.join(HISTORY_ROOT, `${date}.json`);
   return fs.existsSync(file) ? readCandleShardReferenceSync(file) : undefined;
@@ -1137,6 +1453,9 @@ function aggregate(results: readonly SuiteResult[]): Record<string, unknown> {
     worst: worst ? { id: worst.id, returnPct: worst.summary.returnPct } : undefined,
     totalTrades: results.reduce((sum, result) => sum + result.summary.tradeCount, 0),
     totalCandles: results.reduce((sum, result) => sum + result.loadedCandles, 0),
+    inferenceDurationMs: results.reduce(
+      (sum, result) => sum + (result.inferenceDurationMs ?? 0), 0,
+    ),
     wallDurationMs: results.reduce((sum, result) => sum + result.wallDurationMs, 0),
   };
 }
@@ -1148,11 +1467,16 @@ function readReport(
   returnNoiseSeed: number,
   expansionConfirmationMass: number,
   expansionDeltaCapFraction: number,
+  source: "hindsight" | "model",
+  modelId: string | undefined,
+  staticConfidenceScale: number,
 ): SuiteReport | undefined {
   if (!fs.existsSync(file)) return undefined;
   const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as SuiteReport;
   if (
-    parsed.strategy !== "hindsight-oracle-1s"
+    parsed.strategy !== (source === "model"
+      ? "oracle-distribution-path-1m"
+      : "hindsight-oracle-1s")
     || parsed.oracle?.intervalMs !== INTERVAL_MS
     || parsed.oracle?.holdingPeriodMs !== HINDSIGHT_ORACLE_HOLDING_PERIOD_MS
     || parsed.oracle?.decisionDelayMs !== HINDSIGHT_ORACLE_DECISION_DELAY_MS
@@ -1164,11 +1488,13 @@ function readReport(
     || parsed.oracle?.expansionConfirmationMass !== expansionConfirmationMass
     || parsed.oracle?.expansionConfirmationBasis !== "distribution-confidence-mass"
     || parsed.oracle?.expansionDeltaCapFraction !== expansionDeltaCapFraction
-    || parsed.oracle?.staticConfidenceScale !== returnCorrelation
+    || parsed.oracle?.staticConfidenceScale !== staticConfidenceScale
     || parsed.oracle?.distributionConfidenceGate !== "disabled"
     || (parsed.oracle?.returnCorrelation ?? 1) !== returnCorrelation
     || (parsed.oracle?.returnNoiseSeed ?? 0) !== returnNoiseSeed
     || parsed.oracle?.returnCorrelationBasis !== "rolling-value-horizon-log-return"
+    || (parsed.oracle?.source ?? "hindsight") !== source
+    || parsed.oracle?.modelId !== modelId
     || !Array.isArray(parsed.results)
   ) {
     throw new Error(`Existing suite report is incompatible: ${file}`);

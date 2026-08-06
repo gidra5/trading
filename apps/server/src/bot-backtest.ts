@@ -144,7 +144,8 @@ export async function runBotBacktestFromCandles(
   const backtestStrategy = options.strategy ?? "peak-valley";
   const intervalMs = candleIntervalMs(candles);
   const oracleStrategy = backtestStrategy === "hindsight-oracle-1s"
-    || backtestStrategy === "learned-oracle-1s";
+    || backtestStrategy === "learned-oracle-1s"
+    || backtestStrategy === "learned-oracle-1m";
   const learnedMaximumLeverage = options.learnedOracleMaximumLeverage
     ?? LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE;
   const hindsightMaximumLeverage = options.hindsightOracleMaximumLeverage
@@ -156,10 +157,14 @@ export async function runBotBacktestFromCandles(
     throw new Error("Hindsight oracle maximum leverage must be finite and positive.");
   }
   const oracleTargetMaximumLeverage = backtestStrategy === "learned-oracle-1s"
+    || backtestStrategy === "learned-oracle-1m"
     ? Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, learnedMaximumLeverage)
     : Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, hindsightMaximumLeverage);
   if (backtestStrategy === "learned-oracle-1s" && intervalMs !== HINDSIGHT_ORACLE_INTERVAL_MS) {
     throw new Error("The learned one-second oracle strategy requires one-second candles.");
+  }
+  if (backtestStrategy === "learned-oracle-1m" && intervalMs !== 60_000) {
+    throw new Error("The learned one-minute oracle strategy requires one-minute candles.");
   }
   if (
     backtestStrategy === "hindsight-oracle-1s"
@@ -214,9 +219,13 @@ export async function runBotBacktestFromCandles(
       intervalMs,
     )
     : backtestStrategy === "learned-oracle-1s"
+      || backtestStrategy === "learned-oracle-1m"
       ? options.learnedOracleDistributionAt
       : undefined;
-  if (backtestStrategy === "learned-oracle-1s" && !oracleDistributionAt) {
+  if (
+    (backtestStrategy === "learned-oracle-1s" || backtestStrategy === "learned-oracle-1m")
+    && !oracleDistributionAt
+  ) {
     throw new Error("The learned oracle strategy requires causal model distributions.");
   }
   const confidenceExposurePower = options.hindsightOracleConfidenceExposurePower
