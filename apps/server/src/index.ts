@@ -36,6 +36,7 @@ import {
   type BinanceExchangePlaceOrderInput,
 } from "./binance-exchange.js";
 import {
+  MlpTrainingMatrixControlError,
   MlpTrainingMetricsReader,
   MlpTrainingRunNotFoundError,
 } from "./mlp-training-metrics.js";
@@ -132,6 +133,45 @@ server.get("/api/mlp-training/metrics", async (request, reply) => {
     return await mlpTrainingMetrics.read(cursor, query.run);
   } catch (error) {
     if (error instanceof MlpTrainingRunNotFoundError) {
+      return reply.code(400).send({ error: error.message });
+    }
+    throw error;
+  }
+});
+
+server.get("/api/mlp-training/comparison", async (request, reply) => {
+  const query = request.query as { runs?: string };
+  const runKeys = query.runs?.split(",").map((value) => value.trim()).filter(Boolean) ?? [];
+  if (runKeys.length < 1 || runKeys.length > 4
+    || runKeys.some((runKey) => runKey.length > 512)
+    || new Set(runKeys).size !== runKeys.length) {
+    return reply.code(400).send({
+      error: "runs must contain between 1 and 4 distinct training run keys.",
+    });
+  }
+  try {
+    return await mlpTrainingMetrics.compare(runKeys);
+  } catch (error) {
+    if (error instanceof MlpTrainingRunNotFoundError) {
+      return reply.code(400).send({ error: error.message });
+    }
+    throw error;
+  }
+});
+
+server.post("/api/mlp-training/matrices/:matrixId/control", async (request, reply) => {
+  const { matrixId } = request.params as { matrixId?: string };
+  const body = request.body as { action?: string } | undefined;
+  if (!matrixId || matrixId.length > 256
+    || (body?.action !== "pause" && body?.action !== "resume")) {
+    return reply.code(400).send({
+      error: "matrixId and action ('pause' or 'resume') are required.",
+    });
+  }
+  try {
+    return await mlpTrainingMetrics.setMatrixPaused(matrixId, body.action === "pause");
+  } catch (error) {
+    if (error instanceof MlpTrainingMatrixControlError) {
       return reply.code(400).send({ error: error.message });
     }
     throw error;

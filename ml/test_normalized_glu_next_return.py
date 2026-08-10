@@ -10,12 +10,14 @@ from next_return_dataset import (
     EXAMPLE_SPAN_MS,
     HISTORY_RETURN_COUNT,
     SECOND_MS,
+    daily_causal_volatility,
     daily_log_return_examples,
     example_rows,
     select_example_shards,
     validate_split_disjointness,
 )
 from normalized_glu_next_return import (
+    CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
     depth_width_parameter_assignments,
     NormalizedGluNextReturn,
     PER_SEQUENCE_INPUT_NORMALIZATION,
@@ -25,10 +27,18 @@ from normalized_glu_next_return import (
 )
 from train_next_return_memorization import (
     assert_inactive_parameter_values_unchanged,
+    causal_volatility_variant,
+    dropout_variant,
+    l2_variant,
     mask_inactive_parameter_updates,
+    matrix_l2_penalty,
+    optimizer_weight_decay_variant,
+    runner_contract,
     snapshot_inactive_parameter_values,
     validate_plan as validate_memorization_plan,
+    swa_variant,
 )
+from swa import EpochSwaSweep
 
 
 def source_shard(
@@ -70,6 +80,21 @@ class NextReturnDatasetTest(unittest.TestCase):
         np.testing.assert_allclose(history, log_step, rtol=0, atol=1e-8)
         np.testing.assert_allclose(target, log_step, rtol=0, atol=1e-8)
 
+    def test_long_causal_volatility_ends_before_the_target(self) -> None:
+        previous_returns = np.full(DAY_SECONDS, 2e-4, dtype=np.float64)
+        current_returns = np.full(DAY_SECONDS, 3e-4, dtype=np.float64)
+        previous = np.exp(np.cumsum(previous_returns))
+        current = previous[-1] * np.exp(np.cumsum(current_returns))
+        volatility = daily_causal_volatility(
+            previous, current, window=7_200
+        )
+        expected_first = np.sqrt(
+            (7_199 * (2e-4 ** 2) + 3e-4 ** 2) / 7_200
+        )
+        self.assertEqual(volatility.shape, (DAY_SECONDS,))
+        self.assertAlmostEqual(float(volatility[0]), expected_first, places=10)
+        self.assertAlmostEqual(float(volatility[7_199]), 3e-4, places=10)
+
     def test_every_source_second_is_a_distinct_unit_weight_example(self) -> None:
         rows, weights = example_rows(7, 181)
         np.testing.assert_array_equal(rows, np.arange(7, 188))
@@ -98,8 +123,8 @@ class NextReturnDatasetTest(unittest.TestCase):
 
 
 class NormalizedGluNextReturnTest(unittest.TestCase):
-    def test_memorization_plan_accepts_scaled_layer_width(self) -> None:
-        validate_memorization_plan({
+    def test_memorization_plan_accepts_scaled_width_and_dropout(self) -> None:
+        plan = {
             "id": "scaled-width",
             "datasetDir": "data/training/datasets/scaled-width",
             "runDir": "data/training/runs/scaled-width",
@@ -111,8 +136,8 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
             },
             "architecture": {
                 "widths": [1024] * 8,
-                "dropout": 0,
-                "dropoutRate": 0,
+                "dropout": 0.05,
+                "dropoutRate": 0.5,
                 "learnableCentering": False,
             },
             "training": {
@@ -124,7 +149,165 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
                 "mixedPrecision": "float32",
                 "device": "cuda",
             },
-        })
+        }
+        validate_memorization_plan(plan)
+        self.assertIn("dropout-regularization", runner_contract(plan))
+
+        plan["architecture"]["dropoutRate"] = 0
+        with self.assertRaisesRegex(ValueError, "architecture is invalid"):
+            validate_memorization_plan(plan)
+
+    def test_dropout_variant_uses_independent_run_and_dataset_paths(self) -> None:
+        source = {
+            "id": "pure",
+            "label": "Pure",
+            "datasetDir": "data/training/datasets/pure",
+            "runDir": "data/training/runs/pure",
+            "architecture": {"dropout": 0, "dropoutRate": 0},
+        }
+        variant = dropout_variant(
+            source,
+            probability=0.05,
+            application_rate=0.5,
+            suffix="dropout-p05-rate50-v1",
+        )
+        self.assertEqual(source["architecture"]["dropout"], 0)
+        self.assertEqual(variant["architecture"]["dropout"], 0.05)
+        self.assertTrue(variant["runDir"].endswith("dropout-p05-rate50-v1"))
+        self.assertTrue(variant["datasetDir"].endswith("dropout-p05-rate50-v1"))
+
+    def test_causal_volatility_variant_uses_independent_paths(self) -> None:
+        source = {
+            "id": "pure",
+            "label": "Pure",
+            "datasetDir": "data/training/datasets/pure",
+            "runDir": "data/training/runs/pure",
+            "architecture": {"dropout": 0, "dropoutRate": 0},
+        }
+        variant = causal_volatility_variant(
+            source, window=15, suffix="causal-volatility-w15-v1"
+        )
+        self.assertNotIn("inputNormalization", source["architecture"])
+        self.assertEqual(
+            variant["architecture"]["inputNormalization"],
+            CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
+        )
+        self.assertEqual(variant["architecture"]["volatilityWindow"], 15)
+        self.assertTrue(variant["runDir"].endswith("causal-volatility-w15-v1"))
+        long_variant = causal_volatility_variant(
+            source, window=14_400, suffix="causal-volatility-w14400-v1"
+        )
+        self.assertEqual(long_variant["architecture"]["volatilityWindow"], 14_400)
+
+    def test_swa_variant_uses_one_shared_sweep_run(self) -> None:
+        source = {
+            "id": "pure",
+            "label": "Pure",
+            "datasetDir": "data/training/datasets/pure",
+            "runDir": "data/training/runs/pure",
+            "architecture": {"dropout": 0, "dropoutRate": 0},
+            "training": {},
+        }
+        variant = swa_variant(
+            source, suffix="swa-sweep-v1"
+        )
+        self.assertNotIn("swa", source["training"])
+        self.assertEqual(
+            variant["training"]["swa"]["updateInterval"],
+            "epoch-end",
+        )
+        self.assertTrue(
+            variant["runDir"].endswith("swa-sweep-v1")
+        )
+
+    def test_l2_variant_adds_an_explicit_loss_contract(self) -> None:
+        source = {
+            "id": "pure",
+            "label": "Pure",
+            "datasetDir": "data/training/datasets/pure",
+            "runDir": "data/training/runs/pure",
+            "architecture": {"dropout": 0, "dropoutRate": 0},
+            "training": {},
+        }
+        variant = l2_variant(
+            source, rate=1e-4, suffix="l2-rate-1e-4-v1"
+        )
+        self.assertNotIn("l2Regularization", source["training"])
+        self.assertEqual(
+            variant["training"]["l2Regularization"],
+            {
+                "type": "explicit-loss-term",
+                "coefficient": 1e-4,
+                "parameters": "all-trainable-matrices",
+                "reduction": "half-sum-squared",
+            },
+        )
+
+    def test_l2_penalty_includes_weights_but_not_biases(self) -> None:
+        model = torch.nn.Linear(2, 1, bias=True)
+        with torch.no_grad():
+            model.weight.fill_(2)
+            model.bias.fill_(100)
+        torch.testing.assert_close(
+            matrix_l2_penalty(model), torch.tensor(4.0)
+        )
+
+    def test_optimizer_weight_decay_variant_updates_both_groups(self) -> None:
+        source = {
+            "id": "pure",
+            "label": "Pure",
+            "datasetDir": "data/training/datasets/pure",
+            "runDir": "data/training/runs/pure",
+            "architecture": {"dropout": 0, "dropoutRate": 0},
+            "training": {
+                "optimizer": {
+                    "muon": {"weightDecay": 0},
+                    "adamw": {"weightDecay": 0},
+                },
+            },
+        }
+        variant = optimizer_weight_decay_variant(
+            source, rate=1e-4, suffix="optimizer-wd-1e-4-v1"
+        )
+        self.assertEqual(
+            source["training"]["optimizer"]["muon"]["weightDecay"], 0
+        )
+        self.assertEqual(
+            variant["training"]["optimizer"]["muon"]["weightDecay"], 1e-4
+        )
+        self.assertEqual(
+            variant["training"]["optimizer"]["adamw"]["weightDecay"], 1e-4
+        )
+
+    def test_epoch_swa_tracks_start_fraction_candidates(self) -> None:
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.zero_()
+        sweep = EpochSwaSweep(model, maximum_epochs=4)
+        for epoch, value in enumerate((1.0, 2.0, 3.0, 4.0)):
+            with torch.no_grad():
+                model.weight.fill_(value)
+            sweep.update(model, epoch=epoch)
+        states = sweep.candidate_states()
+        torch.testing.assert_close(
+            states["swa-start-50-percent"]["weight"],
+            torch.tensor([[3.0]]),
+        )
+        torch.testing.assert_close(
+            states["swa-start-75-percent"]["weight"],
+            torch.tensor([[3.5]]),
+        )
+        torch.testing.assert_close(
+            states["swa-start-90-percent"]["weight"],
+            torch.tensor([[4.0]]),
+        )
+        restored = EpochSwaSweep(model, maximum_epochs=4)
+        restored.load_state_dict(sweep.state_dict())
+        self.assertEqual(restored.completed_epochs, 4)
+        torch.testing.assert_close(
+            restored.candidate_states()["swa-start-50-percent"]["weight"],
+            torch.tensor([[3.0]]),
+        )
 
     def build_model(self) -> NormalizedGluNextReturn:
         return NormalizedGluNextReturn(
@@ -324,6 +507,67 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
         prediction = model(features)
         expected = (sequence_mean + 2 * sequence_std).expand(-1, 3)
         torch.testing.assert_close(prediction, expected)
+
+    def test_causal_volatility_uses_only_the_requested_history_tail(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.zeros(HISTORY_RETURN_COUNT),
+            torch.ones(HISTORY_RETURN_COUNT),
+            torch.tensor(0.0),
+            torch.tensor(0.001),
+            widths=(16,),
+            input_normalization=CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
+            volatility_window=2,
+            dropout=0,
+        )
+        with torch.no_grad():
+            model.output.bias.fill_(2.0)
+        features = torch.zeros((1, HISTORY_RETURN_COUNT))
+        features[0, 0] = 100.0
+        features[0, -2:] = torch.tensor([-0.0003, 0.0004])
+        expected_volatility = torch.sqrt(torch.tensor(1.35e-7))
+        torch.testing.assert_close(
+            model.causal_volatility(features), expected_volatility.reshape(1)
+        )
+        normalized = model.normalize_features(features)
+        torch.testing.assert_close(
+            normalized[0, -2:], features[0, -2:] / expected_volatility
+        )
+        torch.testing.assert_close(
+            model(features), (2 * expected_volatility).reshape(1)
+        )
+
+    def test_causal_volatility_requires_a_valid_window(self) -> None:
+        with self.assertRaisesRegex(ValueError, "window must be in"):
+            NormalizedGluNextReturn(
+                torch.zeros(HISTORY_RETURN_COUNT),
+                torch.ones(HISTORY_RETURN_COUNT),
+                torch.tensor(0.0),
+                torch.tensor(1.0),
+                widths=(16,),
+                input_normalization=CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
+                dropout=0,
+            )
+
+    def test_long_causal_volatility_uses_external_scale_without_extra_features(
+        self,
+    ) -> None:
+        model = NormalizedGluNextReturn(
+            torch.zeros(HISTORY_RETURN_COUNT),
+            torch.ones(HISTORY_RETURN_COUNT),
+            torch.tensor(0.0),
+            torch.tensor(0.001),
+            widths=(16,),
+            input_normalization=CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
+            volatility_window=14_400,
+            dropout=0,
+        )
+        self.assertEqual(model.layers[0].in_features, HISTORY_RETURN_COUNT)
+        features = torch.full((2, HISTORY_RETURN_COUNT), 2e-4)
+        rms = torch.tensor([3e-4, 4e-4])
+        expected = torch.sqrt(rms.square() + 1e-8)
+        torch.testing.assert_close(model.causal_volatility(features, rms), expected)
+        with self.assertRaisesRegex(ValueError, "require an external"):
+            model(features)
 
     def test_reversible_sequence_stats_are_explicit_side_features(self) -> None:
         model = NormalizedGluNextReturn(

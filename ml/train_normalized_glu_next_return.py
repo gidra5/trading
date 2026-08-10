@@ -25,6 +25,7 @@ from next_return_dataset import (
     SPLIT_CONTRACT,
     ExampleShard,
     count_examples,
+    daily_causal_volatility,
     daily_log_return_examples,
     example_span_ms,
     example_rows,
@@ -158,6 +159,9 @@ class NextReturnDataset:
             str,
             tuple[np.ndarray, np.ndarray],
         ] = OrderedDict()
+        self.volatility_cache: OrderedDict[
+            tuple[str, int], np.ndarray
+        ] = OrderedDict()
 
     def logical_count(self, split: str) -> int:
         row_stride = getattr(self, "row_stride", 1)
@@ -181,6 +185,25 @@ class NextReturnDataset:
         self.component_cache[day] = value
         return value
 
+    def _causal_volatility_component(
+        self, day: str, window: int
+    ) -> np.ndarray:
+        key = (day, int(window))
+        cached = self.volatility_cache.pop(key, None)
+        if cached is not None:
+            self.volatility_cache[key] = cached
+            return cached
+        current = date.fromisoformat(day)
+        value = daily_causal_volatility(
+            self.close_cache.load((current - timedelta(days=1)).isoformat()),
+            self.close_cache.load(day),
+            window=int(window),
+        )
+        self.volatility_cache[key] = value
+        while len(self.volatility_cache) > 5:
+            self.volatility_cache.popitem(last=False)
+        return value
+
     def iter_batches(
         self,
         split: str,
@@ -190,7 +213,8 @@ class NextReturnDataset:
         seed: int,
         shuffle_rows: bool = False,
         reuse_buffers: bool = False,
-    ) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+        causal_volatility_window: int | None = None,
+    ) -> Iterator[tuple[Tensor, ...]]:
         if batch_size < 1:
             raise ValueError("batch size must be positive")
         generator = np.random.default_rng(seed)
@@ -206,9 +230,19 @@ class NextReturnDataset:
             dtype=np.float32,
         )
         weight_buffer = np.empty(batch_size, dtype=np.float32)
+        volatility_buffer = (
+            np.empty(batch_size, dtype=np.float32)
+            if causal_volatility_window is not None else None
+        )
         filled = 0
         for shard in shards:
             history, target = self._component(shard.date)
+            volatility = (
+                self._causal_volatility_component(
+                    shard.date, int(causal_volatility_window)
+                )
+                if causal_volatility_window is not None else None
+            )
             rows, weights = example_rows(shard.row_offset, shard.count)
             row_stride = getattr(self, "row_stride", 1)
             if row_stride > 1:
@@ -232,14 +266,19 @@ class NextReturnDataset:
                 feature_buffer[destination] = history[selection]
                 target_buffer[destination] = target[selection]
                 weight_buffer[destination] = weights[position:position + take]
+                if volatility_buffer is not None and volatility is not None:
+                    volatility_buffer[destination] = volatility[selection]
                 filled += take
                 position += take
                 if filled == batch_size:
-                    yield (
+                    batch = (
                         torch.from_numpy(feature_buffer),
                         torch.from_numpy(target_buffer),
                         torch.from_numpy(weight_buffer),
                     )
+                    if volatility_buffer is not None:
+                        batch = (*batch, torch.from_numpy(volatility_buffer))
+                    yield batch
                     if not reuse_buffers:
                         feature_buffer = np.empty(
                             (batch_size, HISTORY_RETURN_COUNT), dtype=np.float32
@@ -250,13 +289,20 @@ class NextReturnDataset:
                             dtype=np.float32,
                         )
                         weight_buffer = np.empty(batch_size, dtype=np.float32)
+                        if volatility_buffer is not None:
+                            volatility_buffer = np.empty(
+                                batch_size, dtype=np.float32
+                            )
                     filled = 0
         if filled:
-            yield (
+            batch = (
                 torch.from_numpy(feature_buffer[:filled]),
                 torch.from_numpy(target_buffer[:filled]),
                 torch.from_numpy(weight_buffer[:filled]),
             )
+            if volatility_buffer is not None:
+                batch = (*batch, torch.from_numpy(volatility_buffer[:filled]))
+            yield batch
 
 
 @dataclass(frozen=True)
@@ -383,9 +429,9 @@ class MetricAccumulator:
 
 
 def move_batch(
-    batch: tuple[Tensor, Tensor, Tensor],
+    batch: tuple[Tensor, ...],
     device: torch.device,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, ...]:
     return tuple(
         value.to(
             device,
@@ -396,9 +442,9 @@ def move_batch(
 
 
 def iter_device_batches(
-    batches: Iterable[tuple[Tensor, Tensor, Tensor]],
+    batches: Iterable[tuple[Tensor, ...]],
     device: torch.device,
-) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
+) -> Iterator[tuple[Tensor, ...]]:
     """Copy reusable host batches without retaining CUDA staging buffers."""
     if device.type != "cuda":
         for batch in batches:
@@ -426,25 +472,33 @@ def evaluate(
     target_std: float,
     device: torch.device,
     amp_dtype: torch.dtype,
+    causal_volatility_window: int | None = None,
 ) -> dict[str, float | int | None]:
     model.eval()
     metrics = MetricAccumulator(target_std, device)
-    for features, targets, weights in iter_device_batches(
+    for batch in iter_device_batches(
         dataset.iter_batches(
             split,
             batch_size,
             shuffle=False,
             seed=0,
             reuse_buffers=True,
+            causal_volatility_window=causal_volatility_window,
         ),
         device,
     ):
+        features, targets, weights = batch[:3]
+        volatility = batch[3] if len(batch) == 4 else None
         with torch.autocast(
             device_type=device.type,
             dtype=amp_dtype,
             enabled=device.type == "cuda",
         ):
-            prediction = model(features)
+            prediction = (
+                model(features, causal_volatility_rms=volatility)
+                if isinstance(model, NormalizedGluNextReturn)
+                else model(features)
+            )
         metrics.add(prediction, targets, weights)
     return metrics.result()
 
@@ -692,6 +746,7 @@ def build_predictor(
         input_normalization=architecture.get(
             "inputNormalization", TRAINING_POSITION_INPUT_NORMALIZATION
         ),
+        volatility_window=architecture.get("volatilityWindow"),
         dropout=float(architecture["dropout"]),
         dropout_rate=float(architecture["dropoutRate"]),
         initial_radius=float(architecture["initialRadius"]),

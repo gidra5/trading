@@ -6,10 +6,11 @@ import {
   onCleanup,
   onMount,
 } from "solid-js";
-import { Activity, ArrowLeft, BarChart3, Search } from "lucide-solid";
+import { Activity, ArrowLeft, BarChart3, Pause, Play, Plus, Search, X } from "lucide-solid";
 
 const apiBase = import.meta.env.DEV ? "/backend" : "";
 const POLL_MS = 2_000;
+const COMPARISON_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#34d399"] as const;
 
 interface MetricValues {
   loss?: number;
@@ -129,6 +130,26 @@ interface MetricsResponse {
     bestValidationKl?: number;
     bestValidationKlEpoch?: number;
   }>;
+  matrices: Array<{
+    id: string;
+    label: string;
+    totalRuns: number;
+    completedRuns: number;
+    failedRuns: number;
+    queuedRuns: number;
+    progress: number;
+    controllable: boolean;
+    pauseRequested: boolean;
+    paused: boolean;
+    active?: {
+      id: string;
+      label: string;
+      stage: string;
+      epoch?: number;
+      epochs?: number;
+      bestTrainScore?: number;
+    };
+  }>;
   selectedRunKey: string;
   plan: {
     id: string;
@@ -164,6 +185,42 @@ interface MetricsResponse {
   cursor: number;
   reset: boolean;
   events: TrainingEvent[];
+}
+
+interface ComparisonMetricValues {
+  normalizedMse?: number;
+  mse?: number;
+  rmse?: number;
+  mae?: number;
+  zeroBaselineMse?: number;
+  mseSkillVsZero?: number;
+  directionAccuracy?: number;
+  correlation?: number;
+}
+
+interface ComparisonResponse {
+  runs: Array<{
+    key: string;
+    id: string;
+    label: string;
+    running: boolean;
+    stage?: string;
+    epochs?: number;
+    examples?: number;
+    parameterCount?: number;
+    trainableParameterCount?: number;
+    bestEpoch?: number;
+    train?: ComparisonMetricValues;
+    validation?: ComparisonMetricValues;
+    test?: ComparisonMetricValues;
+    validationCheckpointEpoch?: number;
+    fit: Array<{
+      epoch: number;
+      trainNormalizedMse?: number;
+      validationNormalizedMse?: number;
+      bestTrainScore?: number;
+    }>;
+  }>;
 }
 
 interface DatasetPoint {
@@ -240,6 +297,11 @@ export function MlpTrainingPage() {
   const [snapshot, setSnapshot] = createSignal<MetricsResponse>();
   const [runs, setRuns] = createSignal<MetricsResponse["runs"]>([]);
   const [selectedRunKey, setSelectedRunKey] = createSignal<string>();
+  const [comparisonRunKeys, setComparisonRunKeys] = createSignal<string[]>([]);
+  const [comparison, setComparison] = createSignal<ComparisonResponse>();
+  const [comparisonError, setComparisonError] = createSignal<string>();
+  const [matrixControlPending, setMatrixControlPending] = createSignal<string>();
+  const [matrixControlError, setMatrixControlError] = createSignal<string>();
   const [datasetPoints, setDatasetPoints] = createSignal<DatasetPoint[]>([]);
   const [currentDataset, setCurrentDataset] = createSignal<DatasetPoint>();
   const [trainSteps, setTrainSteps] = createSignal<TrainStepPoint[]>([]);
@@ -253,8 +315,10 @@ export function MlpTrainingPage() {
   let cursor = 0;
   let pollTimer: number | undefined;
   let clockTimer: number | undefined;
+  let comparisonTimer: number | undefined;
   let disposed = false;
   let requestGeneration = 0;
+  let comparisonRequestGeneration = 0;
 
   const clearSeries = () => {
     datasetByKey.clear();
@@ -404,6 +468,90 @@ export function MlpTrainingPage() {
     publishSeries();
   };
 
+  const loadComparison = async (keys = comparisonRunKeys()) => {
+    if (keys.length === 0) return;
+    const generation = ++comparisonRequestGeneration;
+    const search = new URLSearchParams({ runs: keys.join(",") });
+    try {
+      const response = await fetch(`${apiBase}/api/mlp-training/comparison?${search}`, {
+        cache: "no-store",
+      });
+      const payload = await response.json() as ComparisonResponse & { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error ?? `Training comparison request failed: ${response.status}`);
+      }
+      if (disposed || generation !== comparisonRequestGeneration) return;
+      setComparison(payload);
+      setComparisonError(undefined);
+    } catch (reason) {
+      if (disposed || generation !== comparisonRequestGeneration) return;
+      setComparisonError(
+        reason instanceof Error ? reason.message : "Training comparison request failed.",
+      );
+    }
+  };
+
+  const updateComparisonRun = (index: number, runKey: string) => {
+    if (!runKey) return;
+    const next = [...comparisonRunKeys()];
+    if (next.some((key, candidateIndex) => candidateIndex !== index && key === runKey)) return;
+    next[index] = runKey;
+    setComparisonRunKeys(next);
+    setComparison(undefined);
+    void loadComparison(next);
+  };
+
+  const addComparisonRun = () => {
+    if (comparisonRunKeys().length >= 4) return;
+    const nextKey = runs().find((run) => !comparisonRunKeys().includes(run.key))?.key;
+    if (!nextKey) return;
+    const next = [...comparisonRunKeys(), nextKey];
+    setComparisonRunKeys(next);
+    setComparison(undefined);
+    void loadComparison(next);
+  };
+
+  const removeComparisonRun = (index: number) => {
+    if (index === 0 || comparisonRunKeys().length <= 1) return;
+    const next = comparisonRunKeys().filter((_, candidateIndex) => candidateIndex !== index);
+    setComparisonRunKeys(next);
+    setComparison(undefined);
+    void loadComparison(next);
+  };
+
+  const setMatrixPaused = async (matrixId: string, paused: boolean) => {
+    setMatrixControlPending(matrixId);
+    setMatrixControlError(undefined);
+    try {
+      const response = await fetch(
+        `${apiBase}/api/mlp-training/matrices/${encodeURIComponent(matrixId)}/control`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: paused ? "pause" : "resume" }),
+        },
+      );
+      const payload = await response.json() as { error?: string };
+      if (!response.ok) {
+        throw new Error(payload.error ?? `Matrix control request failed: ${response.status}`);
+      }
+      setSnapshot((current) => current ? {
+        ...current,
+        matrices: current.matrices.map((matrix) => matrix.id === matrixId ? {
+          ...matrix,
+          pauseRequested: paused,
+          paused: paused ? matrix.paused : false,
+        } : matrix),
+      } : current);
+    } catch (reason) {
+      setMatrixControlError(
+        reason instanceof Error ? reason.message : "Matrix control request failed.",
+      );
+    } finally {
+      setMatrixControlPending(undefined);
+    }
+  };
+
   const load = async () => {
     const generation = ++requestGeneration;
     const requestedRunKey = selectedRunKey();
@@ -424,6 +572,11 @@ export function MlpTrainingPage() {
       cursor = payload.cursor;
       applyEvents(payload.events);
       setRuns(payload.runs);
+      if (comparisonRunKeys().length === 0) {
+        const initialKeys = initialComparisonRunKeys(payload.runs, payload.selectedRunKey);
+        setComparisonRunKeys(initialKeys);
+        void loadComparison(initialKeys);
+      }
       setSelectedRunKey(payload.selectedRunKey);
       setSnapshot(payload);
       setError(undefined);
@@ -452,11 +605,13 @@ export function MlpTrainingPage() {
   onMount(() => {
     void load();
     clockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
+    comparisonTimer = window.setInterval(() => void loadComparison(), 5_000);
   });
   onCleanup(() => {
     disposed = true;
     if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     if (clockTimer !== undefined) window.clearInterval(clockTimer);
+    if (comparisonTimer !== undefined) window.clearInterval(comparisonTimer);
   });
 
   const latestDataset = createMemo(() => currentDataset());
@@ -483,9 +638,9 @@ export function MlpTrainingPage() {
       return current?.days ? current.x / current.days : 0;
     }
     if (stage() === "training") {
-      const current = latestStep();
+      const currentEpoch = latestStep()?.epoch ?? latestEpoch()?.epoch;
       const total = snapshot()?.plan.epochs;
-      return total ? (current?.epoch ?? 0) / total : 0;
+      return total && currentEpoch !== undefined ? (currentEpoch + 1) / total : 0;
     }
     return stage() === "complete" || stage() === "archived" ? 1 : 0;
   });
@@ -493,6 +648,50 @@ export function MlpTrainingPage() {
     const timestamp = Date.parse(snapshot()?.status?.updatedAt ?? "");
     if (!Number.isFinite(timestamp)) return "never";
     return `${Math.max(0, Math.floor((now() - timestamp) / 1_000))}s ago`;
+  });
+  const comparisonTrainFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
+    .map((run, index) => ({
+      label: run.label,
+      color: COMPARISON_COLORS[index % COMPARISON_COLORS.length]!,
+      values: run.fit.flatMap((point) => point.trainNormalizedMse === undefined
+        ? []
+        : [{ x: point.epoch + 1, y: point.trainNormalizedMse }]),
+    }))
+    .filter((series) => series.values.length > 0));
+  const comparisonValidationFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
+    .map((run, index) => ({
+      label: run.label,
+      color: COMPARISON_COLORS[index % COMPARISON_COLORS.length]!,
+      values: run.fit.flatMap((point) => point.validationNormalizedMse === undefined
+        ? []
+        : [{ x: point.epoch + 1, y: point.validationNormalizedMse }]),
+    }))
+    .filter((series) => series.values.length > 0));
+  const comparisonRows = createMemo(() => {
+    const comparedRuns = comparison()?.runs ?? [];
+    return [
+      { label: "Training examples", values: comparedRuns.map((run) => formatCount(run.examples)) },
+      {
+        label: "Parameters",
+        values: comparedRuns.map((run) => formatCount(
+          run.trainableParameterCount ?? run.parameterCount,
+        )),
+      },
+      {
+        label: "Best epoch",
+        values: comparedRuns.map((run) => run.bestEpoch === undefined
+          ? "—"
+          : String(run.bestEpoch + 1)),
+      },
+      { label: "Train normalized MSE", values: comparedRuns.map((run) => formatMetric(run.train?.normalizedMse)) },
+      { label: "Train MSE skill", values: comparedRuns.map((run) => formatPercent(run.train?.mseSkillVsZero)) },
+      { label: "Validation normalized MSE", values: comparedRuns.map((run) => formatMetric(run.validation?.normalizedMse)) },
+      { label: "Validation MSE skill", values: comparedRuns.map((run) => formatPercent(run.validation?.mseSkillVsZero)) },
+      { label: "Validation correlation", values: comparedRuns.map((run) => formatMetric(run.validation?.correlation)) },
+      { label: "Validation direction", values: comparedRuns.map((run) => formatPercent(run.validation?.directionAccuracy)) },
+      { label: "Validation MAE", values: comparedRuns.map((run) => formatMetric(run.validation?.mae)) },
+      { label: "Test normalized MSE", values: comparedRuns.map((run) => formatMetric(run.test?.normalizedMse)) },
+    ];
   });
 
   return (
@@ -548,6 +747,217 @@ export function MlpTrainingPage() {
             </div>
           )}
         </Show>
+
+        <For each={snapshot()?.matrices ?? []}>
+          {(matrix) => (
+            <section class="panel flex flex-col gap-3" data-testid={`training-matrix-${matrix.id}`}>
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div class="muted-label">Experiment matrix</div>
+                  <div class="mt-1 text-lg font-semibold">{matrix.label}</div>
+                </div>
+                <div class="flex items-start gap-3">
+                  <div class="text-right text-sm tabular-nums text-ink-300">
+                    <div>{matrix.completedRuns} / {matrix.totalRuns} runs complete</div>
+                    <div>{Math.round(matrix.progress * 100)}% total progress</div>
+                  </div>
+                  <Show when={matrix.controllable && matrix.completedRuns < matrix.totalRuns}>
+                    <button
+                      class="btn"
+                      type="button"
+                      disabled={matrixControlPending() === matrix.id}
+                      title={matrix.pauseRequested
+                        ? "Resume from the last durable checkpoint"
+                        : "Pause after the current epoch or validation pass"}
+                      onClick={() => void setMatrixPaused(matrix.id, !matrix.pauseRequested)}
+                    >
+                      <Show when={matrix.pauseRequested} fallback={<><Pause size={16} /> Pause</>}>
+                        <Play size={16} /> Resume
+                      </Show>
+                    </button>
+                  </Show>
+                </div>
+              </div>
+              <div class="h-2 overflow-hidden rounded-full bg-ink-800">
+                <div
+                  class="h-full rounded-full bg-accent transition-[width] duration-500"
+                  style={{ width: `${Math.max(0, Math.min(100, matrix.progress * 100))}%` }}
+                />
+              </div>
+              <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-ink-300">
+                <span>{matrix.queuedRuns} queued</span>
+                <Show when={matrix.paused}>
+                  <span class="text-warn">Paused at a durable epoch boundary</span>
+                </Show>
+                <Show when={matrix.pauseRequested && !matrix.paused}>
+                  <span class="text-warn">Pause requested; finishing the current safe boundary</span>
+                </Show>
+                <Show when={matrix.failedRuns > 0}>
+                  <span class="text-loss">{matrix.failedRuns} failed</span>
+                </Show>
+                <Show when={matrix.active}>
+                  {(active) => (
+                    <>
+                      <span class="text-accent">Active: {active().label}</span>
+                      <Show when={active().epoch !== undefined && active().epochs !== undefined}>
+                        <span>
+                          Epoch {(active().epoch ?? 0) + 1} / {active().epochs}
+                        </span>
+                      </Show>
+                      <Show when={active().bestTrainScore !== undefined}>
+                        <span>Best normalized MSE: {formatMetric(active().bestTrainScore)}</span>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+              </div>
+              <Show when={matrixControlError()}>
+                {(message) => (
+                  <div class="rounded border border-loss/50 bg-loss/10 px-3 py-2 text-sm text-loss">
+                    {message()}
+                  </div>
+                )}
+              </Show>
+            </section>
+          )}
+        </For>
+
+        <section class="panel flex flex-col gap-4" data-testid="training-run-comparison">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div class="muted-label">Experiment analysis</div>
+              <div class="mt-1 text-lg font-semibold">Run comparison</div>
+              <p class="mt-1 text-sm text-ink-300">
+                Compare final train and held-out results, then inspect how each model fit over time.
+              </p>
+            </div>
+            <button
+              class="btn"
+              type="button"
+              disabled={comparisonRunKeys().length >= 4
+                || comparisonRunKeys().length >= runs().length}
+              onClick={addComparisonRun}
+            >
+              <Plus size={16} /> Add run
+            </button>
+          </div>
+
+          <div class="grid min-w-0 gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <For each={comparisonRunKeys()}>
+              {(runKey, index) => (
+                <label class="flex min-w-0 flex-col gap-1">
+                  <span class="muted-label">
+                    {index() === 0 ? "Baseline" : `Candidate ${index()}`}
+                  </span>
+                  <div class="flex min-w-0 gap-2">
+                    <select
+                      class="block min-w-0 flex-1 truncate rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                      value={runKey}
+                      onChange={(event) => updateComparisonRun(index(), event.currentTarget.value)}
+                    >
+                      <For each={runs()}>
+                        {(run) => (
+                          <option
+                            value={run.key}
+                            selected={run.key === runKey}
+                            disabled={comparisonRunKeys().some(
+                              (selected, selectedIndex) => selectedIndex !== index()
+                                && selected === run.key,
+                            )}
+                          >
+                            {runSummaryLabel(run)}
+                          </option>
+                        )}
+                      </For>
+                    </select>
+                    <Show when={index() > 0}>
+                      <button
+                        class="btn px-2"
+                        type="button"
+                        title="Remove comparison run"
+                        onClick={() => removeComparisonRun(index())}
+                      >
+                        <X size={16} />
+                      </button>
+                    </Show>
+                  </div>
+                </label>
+              )}
+            </For>
+          </div>
+
+          <Show when={comparisonError()}>
+            {(message) => (
+              <div class="rounded border border-loss/50 bg-loss/10 px-3 py-2 text-sm text-loss">
+                {message()}
+              </div>
+            )}
+          </Show>
+
+          <Show
+            when={comparison()?.runs.length}
+            fallback={<div class="rounded border border-line bg-ink-900/40 px-4 py-6 text-sm text-ink-400">Loading comparison…</div>}
+          >
+            <div class="min-w-0 overflow-x-auto rounded border border-line">
+              <table class="w-full min-w-[48rem] border-collapse text-sm">
+                <thead class="bg-ink-900/80 text-left">
+                  <tr>
+                    <th class="px-3 py-3 text-xs font-medium uppercase tracking-wide text-ink-400">Metric</th>
+                    <For each={comparison()?.runs ?? []}>
+                      {(run, index) => (
+                        <th class="min-w-[12rem] px-3 py-3 font-medium">
+                          <div class="flex items-center gap-2">
+                            <span
+                              class="h-2.5 w-2.5 flex-none rounded-full"
+                              style={{ "background-color": COMPARISON_COLORS[index() % COMPARISON_COLORS.length] }}
+                            />
+                            <span class="line-clamp-2">{run.label}</span>
+                          </div>
+                          <div class="mt-1 text-xs font-normal text-ink-400">
+                            {run.running ? "training" : stageLabel(run.stage ?? "idle")}
+                          </div>
+                        </th>
+                      )}
+                    </For>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={comparisonRows()}>
+                    {(row) => (
+                      <tr class="border-t border-line even:bg-ink-900/25">
+                        <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
+                        <For each={row.values}>
+                          {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
+                        </For>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="grid min-w-0 gap-3 xl:grid-cols-2">
+              <Show when={comparisonTrainFit().length > 0}>
+                <MetricChart
+                  title="Training fit"
+                  subtitle="Normalized MSE by epoch; lower is better"
+                  scale="log"
+                  xLabel="epoch"
+                  series={comparisonTrainFit()}
+                />
+              </Show>
+              <Show when={comparisonValidationFit().length > 0}>
+                <MetricChart
+                  title="Validation fit"
+                  subtitle="Held-out normalized MSE by epoch; lower is better"
+                  scale="log"
+                  xLabel="epoch"
+                  series={comparisonValidationFit()}
+                />
+              </Show>
+            </div>
+          </Show>
+        </section>
 
         <section class="panel flex flex-col gap-3">
           <div class="flex flex-wrap items-center justify-between gap-3">
@@ -1717,6 +2127,28 @@ function formatUnit(value: number | undefined, unit: string, digits = 2): string
 
 function formatPercent(value: number | undefined): string {
   return value === undefined ? "—" : `${(value * 100).toFixed(3)}%`;
+}
+
+function formatCount(value: number | undefined): string {
+  return value === undefined ? "—" : Math.round(value).toLocaleString();
+}
+
+function initialComparisonRunKeys(
+  runs: MetricsResponse["runs"],
+  selectedRunKey: string,
+): string[] {
+  const selected = runs.find((run) => run.key === selectedRunKey) ?? runs[0];
+  if (!selected) return [];
+  const dropoutMarker = "-dropout-";
+  const baselineId = selected.id.includes(dropoutMarker)
+    ? selected.id.slice(0, selected.id.indexOf(dropoutMarker))
+    : selected.id;
+  const baseline = runs.find((run) => run.id === baselineId) ?? selected;
+  const paired = runs.find((run) => run.id.startsWith(`${baselineId}${dropoutMarker}`));
+  const candidate = selected.key !== baseline.key
+    ? selected
+    : paired ?? runs.find((run) => run.key !== baseline.key);
+  return candidate ? [baseline.key, candidate.key] : [baseline.key];
 }
 
 function integer(value: number | undefined): string {

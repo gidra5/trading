@@ -1,0 +1,30 @@
+{
+  "id": "causal-volatility-memorization-windows-v1",
+  "label": "Causal volatility normalization - 4-layer GLU across subset sizes",
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w2-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w5-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w10-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w15-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w30-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w60-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w7200-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-causal-volatility-w14400-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w2-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w5-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w10-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w15-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w30-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w60-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w7200-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-causal-volatility-w14400-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w2-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w5-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w10-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w15-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w30-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w60-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w7200-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-causal-volatility-w14400-v1"
+  ]
+}

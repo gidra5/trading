@@ -2,7 +2,7 @@ Here we discuss and define basic notions and the framework within which we defin
 ### Portfolio
 The natural state space is space of raw quantities. Lets call base currency $q$ for quote and the other currencies as $\mathbf a$ for asset vector. For a single asset case we write simply $a$. 
 
-A tuple $\phi=(q, \mathbf a)$ defines a portfolio. For every portfolio $\phi$ we define equity as:$$
+A tuple $\phi=(q, \mathbf a)$ defines a portfolio. For every portfolio $\phi \in \Phi$ we define equity as:$$
 \begin{aligned}
 Q=q+u \\
 u=\mathbf a \cdot \mathbf{p}
@@ -23,7 +23,7 @@ Exposure is measuring the fraction of equity that is stored in the asset: $$\mat
 There is also total exposure:$$e_a=\sum_i \mathbf e_i=\frac {\mathbf a \cdot p} Q$$The rest of the equity we call unexposed fraction:$$e_q=\frac q Q$$They are constrained to add up to 1:$$e_q+e_a=1$$That means every exposure element is usually within a normal exposure range $\mathbf e_i \in [0,1]$.
 When either exposure or unexposed fraction are outside this range, we say that portfolio is leveraged. Since exposures are constrained, leveraging implies that there is debt somewhere, and that may come with liabilities.
 
-A tuple $\Psi=(e_q,\mathbf e)$ we call portfolio exposure. From exposure definitions we get this relation between it and simple portfolio:$$\Psi=\frac \psi Q$$
+A tuple $\psi=(e_q,\mathbf e)\in\Psi$ we call portfolio exposure. From exposure definitions we get this relation between it and simple portfolio:$$\psi=\frac \phi Q$$
 ### Portfolio evolution
 Portfolio by itself is inert - all of its assets usually don't change their quantities over time. But if there is debt somewhere, or the asset is a derivative of some sort, we usually need to pay maintenance costs $m_t$ periodically or at each time step:$$a_{t+1}=(1-m_t)\cdot a_t$$Usually it is expressed in basis points (bps) which can be thought of as a fraction of a percent:$$1\ bps=0.01\%=0.0001$$
 ### Order execution
@@ -64,4 +64,5 @@ p_{sell}(a)&=\{p:\omega_{ask}(p)=a\}
 ### Price
 At any time $t$ we can have price $p_t$ for the asset in terms of quote. That is the rate of exchange between them.
 
-Given a price history, we can define a return of a single time step as relative increase of price:$$r_t=\frac {p_t-p_{t-1}} {p_{t-1}}$$
+Given a price history, we can define a return of a single time step as relative increase of price:
+$$r_{t+1}=\frac {p_{t+1}-p_t} {p_t}=\frac {\Delta p_t} {p_{t}}=\frac {p_{t+1}} {p_{t}}-1$$

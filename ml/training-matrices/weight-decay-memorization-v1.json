@@ -1,0 +1,30 @@
+{
+  "id": "weight-decay-memorization-v1",
+  "label": "Explicit L2 versus optimizer weight-decay rate screen",
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-l2-rate-1e-6-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-optimizer-wd-rate-1e-6-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-l2-rate-1e-5-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-optimizer-wd-rate-1e-5-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-l2-rate-1e-4-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-optimizer-wd-rate-1e-4-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-l2-rate-1e-3-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-optimizer-wd-rate-1e-3-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-l2-rate-1e-6-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-optimizer-wd-rate-1e-6-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-l2-rate-1e-5-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-optimizer-wd-rate-1e-5-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-l2-rate-1e-4-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-optimizer-wd-rate-1e-4-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-l2-rate-1e-3-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-optimizer-wd-rate-1e-3-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-l2-rate-1e-6-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-optimizer-wd-rate-1e-6-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-l2-rate-1e-5-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-optimizer-wd-rate-1e-5-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-l2-rate-1e-4-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-optimizer-wd-rate-1e-4-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-l2-rate-1e-3-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-optimizer-wd-rate-1e-3-v1"
+  ]
+}

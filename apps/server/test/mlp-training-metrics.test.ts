@@ -248,6 +248,146 @@ test("MLP training metrics discovers plans and defaults to the live run", async 
   }
 });
 
+test("MLP training metrics discovers derived snapshots and matrix progress", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mlp-training-matrix-"));
+  const planFile = path.join(root, "ml", "training-plan.json");
+  const matrixFile = path.join(root, "ml", "training-matrices", "dropout.json");
+  const defaultRunDir = path.join(root, "data", "training", "runs", "default");
+  const derivedRunDir = path.join(root, "data", "training", "runs", "derived");
+  const defaultDatasetDir = path.join(root, "data", "training", "datasets", "default");
+  const derivedDatasetDir = path.join(root, "data", "training", "datasets", "derived");
+  await Promise.all([
+    mkdir(path.dirname(planFile), { recursive: true }),
+    mkdir(path.dirname(matrixFile), { recursive: true }),
+    mkdir(path.join(defaultRunDir, "logs"), { recursive: true }),
+    mkdir(path.join(defaultRunDir, "state"), { recursive: true }),
+    mkdir(path.join(derivedRunDir, "logs"), { recursive: true }),
+    mkdir(path.join(derivedRunDir, "state"), { recursive: true }),
+    mkdir(defaultDatasetDir, { recursive: true }),
+    mkdir(derivedDatasetDir, { recursive: true }),
+  ]);
+  const derivedPlan = {
+    id: "derived-dropout",
+    label: "Derived dropout run",
+    runDir: "data/training/runs/derived",
+    datasetDir: "data/training/datasets/derived",
+    architecture: { dropout: 0.05, dropoutRate: 0.5 },
+    training: { epochs: 512 },
+  };
+  await Promise.all([
+    writeFile(planFile, JSON.stringify({
+      id: "default",
+      label: "Default",
+      runDir: "data/training/runs/default",
+      datasetDir: "data/training/datasets/default",
+      training: { epochs: 512 },
+    })),
+    writeFile(matrixFile, JSON.stringify({
+      id: "dropout-matrix",
+      label: "Dropout matrix",
+      control: {
+        pauseFile: "data/training/matrices/dropout-matrix/control/PAUSE",
+      },
+      runIds: ["derived-dropout", "queued-dropout"],
+    })),
+    writeFile(path.join(derivedRunDir, "state", "plan.json"), JSON.stringify({
+      planSha256: "test",
+      plan: derivedPlan,
+    })),
+    writeFile(path.join(derivedRunDir, "state", "status.json"), JSON.stringify({
+      pid: process.pid,
+      stage: "training",
+      updatedAt: new Date().toISOString(),
+      latest: { epoch: 127, bestTrainScore: 0.25 },
+    })),
+    writeFile(path.join(defaultRunDir, "logs", "training.jsonl"), ""),
+    writeFile(path.join(derivedRunDir, "logs", "training.jsonl"), `${JSON.stringify({
+      event: "minute-return-epoch",
+      epoch: 127,
+      train: { normalizedMse: 0.25, mseSkillVsZero: 0.75 },
+    })}\n`),
+    writeFile(path.join(derivedRunDir, "state", "result.json"), JSON.stringify({
+      examples: 256_000,
+      parameterCount: 5_000_000,
+      bestEpoch: 120,
+      train: { normalizedMse: 0.2, mseSkillVsZero: 0.8 },
+      validation: { normalizedMse: 1.3, rawMae: 0.0002, endpointCorrelation: 0.03 },
+    })),
+    writeFile(path.join(derivedRunDir, "state", "validation-current-best.json"), JSON.stringify({
+      checkpointEpoch: 120,
+      metrics: { normalizedMse: 1.1, correlation: 0.04 },
+    })),
+  ]);
+
+  try {
+    const reader = new MlpTrainingMetricsReader(planFile, root);
+    const response = await reader.read(0);
+    assert.equal(response.selectedRunKey, "run/derived-dropout");
+    assert.equal(response.plan.id, "derived-dropout");
+    assert.equal(response.running, true);
+    assert.equal(response.plan.dropout, 0.05);
+    assert.deepEqual(response.events.map((event) => event.event), ["epoch"]);
+    assert.deepEqual(response.matrices, [{
+      id: "dropout-matrix",
+      label: "Dropout matrix",
+      totalRuns: 2,
+      completedRuns: 0,
+      failedRuns: 0,
+      queuedRuns: 1,
+      progress: 0.125,
+      controllable: true,
+      pauseRequested: false,
+      paused: false,
+      active: {
+        id: "derived-dropout",
+        label: "Derived dropout run",
+        stage: "training",
+        epoch: 127,
+        epochs: 512,
+        bestTrainScore: 0.25,
+      },
+    }]);
+    assert.deepEqual(await reader.setMatrixPaused("dropout-matrix", true), {
+      matrixId: "dropout-matrix",
+      pauseRequested: true,
+    });
+    const pauseRequested = await reader.read(0);
+    assert.equal(pauseRequested.matrices[0]?.pauseRequested, true);
+    assert.equal(pauseRequested.matrices[0]?.paused, false);
+    assert.deepEqual(await reader.setMatrixPaused("dropout-matrix", false), {
+      matrixId: "dropout-matrix",
+      pauseRequested: false,
+    });
+    const comparison = await reader.compare(["run/derived-dropout"]);
+    assert.deepEqual(comparison, {
+      runs: [{
+        key: "run/derived-dropout",
+        id: "derived-dropout",
+        label: "Derived dropout run",
+        running: true,
+        stage: "training",
+        epochs: 512,
+        examples: 256_000,
+        parameterCount: 5_000_000,
+        bestEpoch: 120,
+        train: { normalizedMse: 0.2, mseSkillVsZero: 0.8 },
+        validation: { normalizedMse: 1.1, correlation: 0.04 },
+        validationCheckpointEpoch: 120,
+        fit: [{ epoch: 127, trainNormalizedMse: 0.25 }],
+      }],
+    });
+    await rm(path.join(derivedRunDir, "state", "validation-current-best.json"));
+    const storedValidation = await reader.compare(["run/derived-dropout"]);
+    assert.deepEqual(storedValidation.runs[0]?.validation, {
+      normalizedMse: 1.3,
+      mae: 0.0002,
+      correlation: 0.03,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("MLP training metrics discovers decoder plans with nested datasets", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mlp-training-decoder-"));
   const defaultPlanFile = path.join(root, "ml", "training-plan.json");

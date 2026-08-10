@@ -135,6 +135,41 @@ def daily_log_return_examples(
     )
 
 
+def daily_causal_volatility(
+    previous_close: np.ndarray,
+    current_close: np.ndarray,
+    *,
+    window: int,
+) -> np.ndarray:
+    """Return input-only RMS scales ending at each current-day close.
+
+    Row ``t`` contains the RMS of the ``window`` completed log returns ending
+    at ``current_close[t]``.  The immediately following return, which is the
+    prediction target, is therefore never part of the scale.
+    """
+    if isinstance(window, bool) or not 1 <= int(window) <= DAY_SECONDS:
+        raise ValueError("causal volatility window must be in [1, 86,400]")
+    window = int(window)
+    for name, values in (("previous", previous_close), ("current", current_close)):
+        if values.shape != (DAY_SECONDS,) \
+                or not np.isfinite(values).all() \
+                or bool((values <= 0).any()):
+            raise ValueError(f"{name} daily closes must contain 86,400 positives")
+
+    close = np.concatenate((
+        previous_close[-window:],
+        current_close,
+    )).astype(np.float64, copy=False)
+    squared_returns = np.square(np.diff(np.log(close)), dtype=np.float64)
+    cumulative = np.empty(squared_returns.size + 1, dtype=np.float64)
+    cumulative[0] = 0
+    np.cumsum(squared_returns, out=cumulative[1:])
+    mean_square = (cumulative[window:] - cumulative[:-window]) / window
+    if mean_square.shape != (ROWS_PER_DAY,) or bool((mean_square < 0).any()):
+        raise RuntimeError("daily causal-volatility construction is invalid")
+    return np.sqrt(np.maximum(mean_square, 0)).astype(np.float32)
+
+
 def _source_shards(source_manifest: dict) -> list[ExampleShard]:
     result: list[ExampleShard] = []
     for value in source_manifest.get("shards", ()):

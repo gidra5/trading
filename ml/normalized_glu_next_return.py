@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from next_return_dataset import HISTORY_RETURN_COUNT
+from next_return_dataset import DAY_SECONDS, HISTORY_RETURN_COUNT
 from return_oracle_ce import (
     BRANCH_NORMALIZATION_INITIAL_RADIUS,
     LearnableCenteringNorm,
@@ -19,15 +19,18 @@ PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION = "per-sequence-reversible"
 PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION = (
     "per-sequence-reversible-with-stats"
 )
+CAUSAL_VOLATILITY_INPUT_NORMALIZATION = "causal-volatility"
 INPUT_NORMALIZATION_MODES = frozenset({
     TRAINING_POSITION_INPUT_NORMALIZATION,
     PER_SEQUENCE_INPUT_NORMALIZATION,
     PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
     PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
+    CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
 })
 REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES = frozenset({
     PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
     PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
+    CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
 })
 MINIMUM_SEQUENCE_STD = 1e-8
 ARCHITECTURE_CONTRACT = (
@@ -50,6 +53,7 @@ class NormalizedGluNextReturn(nn.Module):
         *,
         widths: tuple[int, ...] = DEFAULT_WIDTHS,
         input_normalization: str = TRAINING_POSITION_INPUT_NORMALIZATION,
+        volatility_window: int | None = None,
         learnable_centering: bool = True,
         dropout: float = 0.05,
         dropout_rate: float = 0.5,
@@ -78,10 +82,23 @@ class NormalizedGluNextReturn(nn.Module):
             raise ValueError(
                 f"unsupported input normalization: {input_normalization}"
             )
+        if input_normalization == CAUSAL_VOLATILITY_INPUT_NORMALIZATION:
+            if volatility_window is None \
+                    or not isinstance(volatility_window, int) \
+                    or isinstance(volatility_window, bool) \
+                    or not 1 <= volatility_window <= DAY_SECONDS:
+                raise ValueError(
+                    "causal volatility window must be in [1, 86,400]"
+                )
+        elif volatility_window is not None:
+            raise ValueError(
+                "volatility window requires causal-volatility normalization"
+            )
         if not 0 <= dropout < 1 or not 0 <= dropout_rate <= 1:
             raise ValueError("dropout settings are invalid")
         self.widths = tuple(int(width) for width in widths)
         self.input_normalization = input_normalization
+        self.volatility_window = volatility_window
         self.learnable_centering = bool(learnable_centering)
         self.horizon_return_count = int(target_mean.numel())
         self.dropout_rate = float(dropout_rate)
@@ -176,11 +193,41 @@ class NormalizedGluNextReturn(nn.Module):
         )
 
     def _normalize_features_with_sequence_stats(
-        self, features: Tensor
+        self,
+        features: Tensor,
+        causal_volatility_rms: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         if features.ndim != 2 or features.shape[-1] != HISTORY_RETURN_COUNT:
             raise ValueError("normalized GLU expects [example, 120] returns")
         values = features.float()
+        if self.input_normalization == CAUSAL_VOLATILITY_INPUT_NORMALIZATION:
+            if self.volatility_window is None:
+                raise RuntimeError("causal volatility window is missing")
+            if causal_volatility_rms is None:
+                if self.volatility_window > HISTORY_RETURN_COUNT:
+                    raise ValueError(
+                        "causal volatility windows above 120 require an "
+                        "external input-only RMS scale"
+                    )
+                raw_volatility = values[
+                    :, -self.volatility_window:
+                ].square().mean(dim=-1, keepdim=True).sqrt()
+            else:
+                raw_volatility = causal_volatility_rms.float()
+                if raw_volatility.ndim == 1:
+                    raw_volatility = raw_volatility.unsqueeze(-1)
+                if raw_volatility.shape != (values.shape[0], 1) \
+                        or not bool(torch.isfinite(raw_volatility).all()) \
+                        or bool((raw_volatility < 0).any()):
+                    raise ValueError(
+                        "external causal volatility must contain one finite "
+                        "non-negative RMS scale per example"
+                    )
+            volatility_floor = self.target_std.float().mean().detach() * 0.1
+            volatility = (
+                raw_volatility.square() + volatility_floor.square()
+            ).sqrt().clamp_min(MINIMUM_SEQUENCE_STD)
+            return values / volatility, torch.zeros_like(volatility), volatility
         if self.input_normalization in {
             PER_SEQUENCE_INPUT_NORMALIZATION,
             *REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES,
@@ -207,14 +254,36 @@ class NormalizedGluNextReturn(nn.Module):
             None,
         )
 
-    def normalize_features(self, features: Tensor) -> Tensor:
-        return self._normalize_features_with_sequence_stats(features)[0]
+    def normalize_features(
+        self, features: Tensor, causal_volatility_rms: Tensor | None = None
+    ) -> Tensor:
+        return self._normalize_features_with_sequence_stats(
+            features, causal_volatility_rms
+        )[0]
+
+    def causal_volatility(
+        self, features: Tensor, causal_volatility_rms: Tensor | None = None
+    ) -> Tensor:
+        if self.input_normalization != CAUSAL_VOLATILITY_INPUT_NORMALIZATION:
+            raise RuntimeError("model does not use causal volatility normalization")
+        _normalized, _mean, volatility = (
+            self._normalize_features_with_sequence_stats(
+                features, causal_volatility_rms
+            )
+        )
+        if volatility is None:
+            raise RuntimeError("causal volatility scale is missing")
+        return volatility.squeeze(-1)
 
     def _forward_standardized_with_sequence_stats(
-        self, features: Tensor
+        self,
+        features: Tensor,
+        causal_volatility_rms: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         hidden, sequence_mean, sequence_std = (
-            self._normalize_features_with_sequence_stats(features)
+            self._normalize_features_with_sequence_stats(
+                features, causal_volatility_rms
+            )
         )
         intermittent_dropout = (
             self.training
@@ -268,16 +337,24 @@ class NormalizedGluNextReturn(nn.Module):
                     )
         return self.output(hidden), sequence_mean, sequence_std
 
-    def forward_standardized(self, features: Tensor) -> Tensor:
+    def forward_standardized(
+        self, features: Tensor, causal_volatility_rms: Tensor | None = None
+    ) -> Tensor:
         standardized, _sequence_mean, _sequence_std = (
-            self._forward_standardized_with_sequence_stats(features)
+            self._forward_standardized_with_sequence_stats(
+                features, causal_volatility_rms
+            )
         )
         return standardized.squeeze(-1) \
             if self.horizon_return_count == 1 else standardized
 
-    def forward(self, features: Tensor) -> Tensor:
+    def forward(
+        self, features: Tensor, causal_volatility_rms: Tensor | None = None
+    ) -> Tensor:
         standardized, sequence_mean, sequence_std = (
-            self._forward_standardized_with_sequence_stats(features)
+            self._forward_standardized_with_sequence_stats(
+                features, causal_volatility_rms
+            )
         )
         if self.input_normalization \
                 in REVERSIBLE_SEQUENCE_INPUT_NORMALIZATION_MODES:

@@ -66,6 +66,15 @@ interface TrainingRunCatalog {
   runs: TrainingPlan[];
 }
 
+interface TrainingMatrixManifest {
+  id: string;
+  label: string;
+  runIds: string[];
+  control?: {
+    pauseFile: string;
+  };
+}
+
 export interface MlpReverseKlPlan {
   predictionMixtureWeight: number;
 }
@@ -136,8 +145,30 @@ export interface MlpTrainingRunSummary {
   bestValidationKlEpoch?: number;
 }
 
+export interface MlpTrainingMatrixProgress {
+  id: string;
+  label: string;
+  totalRuns: number;
+  completedRuns: number;
+  failedRuns: number;
+  queuedRuns: number;
+  progress: number;
+  controllable: boolean;
+  pauseRequested: boolean;
+  paused: boolean;
+  active?: {
+    id: string;
+    label: string;
+    stage: string;
+    epoch?: number;
+    epochs?: number;
+    bestTrainScore?: number;
+  };
+}
+
 export interface MlpTrainingMetricsResponse {
   runs: MlpTrainingRunSummary[];
+  matrices: MlpTrainingMatrixProgress[];
   selectedRunKey: string;
   plan: {
     id: string;
@@ -173,6 +204,44 @@ export interface MlpTrainingMetricsResponse {
   cursor: number;
   reset: boolean;
   events: MlpTrainingMetricEvent[];
+}
+
+export interface MlpTrainingComparisonMetricValues {
+  normalizedMse?: number;
+  mse?: number;
+  rmse?: number;
+  mae?: number;
+  zeroBaselineMse?: number;
+  mseSkillVsZero?: number;
+  directionAccuracy?: number;
+  correlation?: number;
+}
+
+export interface MlpTrainingComparisonRun {
+  key: string;
+  id: string;
+  label: string;
+  running: boolean;
+  stage?: string;
+  epochs?: number;
+  examples?: number;
+  parameterCount?: number;
+  trainableParameterCount?: number;
+  bestEpoch?: number;
+  train?: MlpTrainingComparisonMetricValues;
+  validation?: MlpTrainingComparisonMetricValues;
+  test?: MlpTrainingComparisonMetricValues;
+  validationCheckpointEpoch?: number;
+  fit: Array<{
+    epoch: number;
+    trainNormalizedMse?: number;
+    validationNormalizedMse?: number;
+    bestTrainScore?: number;
+  }>;
+}
+
+export interface MlpTrainingComparisonResponse {
+  runs: MlpTrainingComparisonRun[];
 }
 
 export class MlpTrainingRunNotFoundError extends Error {
@@ -261,6 +330,7 @@ export class MlpTrainingMetricsReader {
           ? {}
           : { bestValidationKlEpoch: candidate.plan.bestValidationKlEpoch }),
       })),
+      matrices: await this.discoverMatrices(availableRuns),
       selectedRunKey: files.key,
       plan: {
         id: files.plan.id,
@@ -353,6 +423,150 @@ export class MlpTrainingMetricsReader {
     };
   }
 
+  async compare(runKeys: readonly string[]): Promise<MlpTrainingComparisonResponse> {
+    const availableRuns = await this.discoverRuns();
+    const byKey = new Map(availableRuns.map((run) => [run.key, run]));
+    const selected = runKeys.map((runKey) => {
+      const run = byKey.get(runKey);
+      if (!run) throw new MlpTrainingRunNotFoundError(runKey);
+      return run;
+    });
+    return {
+      runs: await Promise.all(selected.map(async (files) => {
+        const [storedResult, rootResult, validation, log] = await Promise.all([
+          readOptionalJson<Record<string, unknown>>(
+            path.join(files.runDir, "state", "result.json"),
+          ),
+          readOptionalJson<Record<string, unknown>>(
+            path.join(files.runDir, "result.json"),
+          ),
+          readOptionalJson<Record<string, unknown>>(
+            path.join(files.runDir, "state", "validation-current-best.json"),
+          ),
+          readMetricLogs(files.logFiles, 0),
+        ]);
+        const result = storedResult ?? rootResult;
+        const resultTrain = metricRecord(result?.train);
+        const resultValidation = metricRecord(
+          result?.bestValidation
+            ?? result?.validation
+            ?? result?.validationMetrics
+            ?? result?.ridgeValidation,
+        );
+        const externalValidation = metricRecord(validation?.metrics);
+        const resultTest = metricRecord(result?.test);
+        const fit = log.events.flatMap((event) => {
+          if (event.event !== "epoch") return [];
+          const epoch = numberField(event.epoch);
+          if (epoch === undefined) return [];
+          const train = metricRecord(event.train);
+          const validationMetrics = metricRecord(event.validation);
+          const bestTrainScore = numberField(event.bestTrainScore);
+          return [{
+            epoch,
+            ...(train?.normalizedMse === undefined
+              ? {}
+              : { trainNormalizedMse: train.normalizedMse }),
+            ...(validationMetrics?.normalizedMse === undefined
+              ? {}
+              : { validationNormalizedMse: validationMetrics.normalizedMse }),
+            ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
+          }];
+        });
+        const examples = numberField(result?.examples);
+        const parameterCount = numberField(result?.parameterCount);
+        const trainableParameterCount = numberField(result?.trainableParameterCount);
+        const bestEpoch = numberField(result?.bestEpoch);
+        const validationCheckpointEpoch = numberField(validation?.checkpointEpoch);
+        return {
+          key: files.key,
+          id: files.plan.id,
+          label: files.plan.label,
+          running: files.running,
+          ...(files.status?.stage ? { stage: files.status.stage } : {}),
+          ...(files.plan.training?.epochs === undefined
+            ? {}
+            : { epochs: files.plan.training.epochs }),
+          ...(examples === undefined ? {} : { examples }),
+          ...(parameterCount === undefined ? {} : { parameterCount }),
+          ...(trainableParameterCount === undefined ? {} : { trainableParameterCount }),
+          ...(bestEpoch === undefined ? {} : { bestEpoch }),
+          ...(resultTrain ? { train: resultTrain } : {}),
+          ...(externalValidation ?? resultValidation
+            ? { validation: externalValidation ?? resultValidation }
+            : {}),
+          ...(resultTest ? { test: resultTest } : {}),
+          ...(validationCheckpointEpoch === undefined
+            ? {}
+            : { validationCheckpointEpoch }),
+          fit,
+        };
+      })),
+    };
+  }
+
+  async setMatrixPaused(
+    matrixId: string,
+    paused: boolean,
+  ): Promise<{ matrixId: string; pauseRequested: boolean }> {
+    const directory = path.join(this.repoRoot, "ml", "training-matrices");
+    let entries: Array<{ name: string; isFile(): boolean }>;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new MlpTrainingMatrixControlError(`Unknown training matrix: ${matrixId}`);
+      }
+      throw error;
+    }
+    let selected: TrainingMatrixManifest | undefined;
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        const candidate = JSON.parse(
+          await fs.readFile(path.join(directory, entry.name), "utf8"),
+        ) as TrainingMatrixManifest;
+        if (candidate.id === matrixId) {
+          selected = candidate;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+    if (!selected) {
+      throw new MlpTrainingMatrixControlError(`Unknown training matrix: ${matrixId}`);
+    }
+    if (!selected.control?.pauseFile) {
+      throw new MlpTrainingMatrixControlError(
+        `Training matrix does not support pause/resume: ${matrixId}`,
+      );
+    }
+    const controlRoot = path.resolve(
+      this.repoRoot,
+      "data",
+      "training",
+      "matrices",
+    );
+    const pauseFile = path.resolve(this.repoRoot, selected.control.pauseFile);
+    const relative = path.relative(controlRoot, pauseFile);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new MlpTrainingMatrixControlError(
+        `Training matrix has an invalid pause control path: ${matrixId}`,
+      );
+    }
+    if (paused) {
+      await fs.mkdir(path.dirname(pauseFile), { recursive: true });
+      await fs.writeFile(pauseFile, `${JSON.stringify({
+        matrixId,
+        requestedAt: new Date().toISOString(),
+      }, null, 2)}\n`, { flag: "w" });
+    } else {
+      await fs.rm(pauseFile, { force: true });
+    }
+    return { matrixId, pauseRequested: paused };
+  }
+
   private async discoverRuns(): Promise<LoadedTrainingPlan[]> {
     const planFiles = new Set<string>([path.resolve(this.planFile)]);
     const planDirectory = path.join(this.repoRoot, "ml", "training-plans");
@@ -373,6 +587,13 @@ export class MlpTrainingMetricsReader {
         return undefined;
       }
     }));
+    const configured = loaded.filter(
+      (candidate): candidate is LoadedTrainingPlan => candidate !== undefined,
+    );
+    const configuredRunDirs = new Set(configured.map((candidate) => candidate.runDir));
+    const snapshots = (await this.discoverRunSnapshots()).filter(
+      (candidate) => !configuredRunDirs.has(candidate.runDir),
+    );
     const catalog = await readOptionalJson<TrainingRunCatalog>(
       path.join(this.repoRoot, "ml", "training-run-catalog.json"),
     );
@@ -380,11 +601,138 @@ export class MlpTrainingMetricsReader {
       (catalog?.runs ?? []).map((plan) => this.loadArchivedRun(plan)),
     );
     return [
-      ...loaded.filter(
-        (candidate): candidate is LoadedTrainingPlan => candidate !== undefined,
-      ),
+      ...configured,
+      ...snapshots,
       ...archived,
     ].sort(compareRuns);
+  }
+
+  private async discoverRunSnapshots(): Promise<LoadedTrainingPlan[]> {
+    const runsRoot = path.join(this.repoRoot, "data", "training", "runs");
+    let entries: Array<{
+      name: string;
+      isDirectory(): boolean;
+      isFile(): boolean;
+    }>;
+    try {
+      entries = await fs.readdir(runsRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const loaded = await Promise.all(entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const snapshotFile = path.join(runsRoot, entry.name, "state", "plan.json");
+        try {
+          const stored = JSON.parse(await fs.readFile(snapshotFile, "utf8")) as {
+            plan?: TrainingPlan;
+          } & Partial<TrainingPlan>;
+          const plan = stored.plan ?? stored as TrainingPlan;
+          return await this.loadStoredPlan(plan, `run/${plan.id}`, snapshotFile);
+        } catch {
+          return undefined;
+        }
+      }));
+    return loaded.filter(
+      (candidate): candidate is LoadedTrainingPlan => candidate !== undefined,
+    );
+  }
+
+  private async discoverMatrices(
+    runs: readonly LoadedTrainingPlan[],
+  ): Promise<MlpTrainingMatrixProgress[]> {
+    const directory = path.join(this.repoRoot, "ml", "training-matrices");
+    let entries: Array<{
+      name: string;
+      isDirectory(): boolean;
+      isFile(): boolean;
+    }>;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+    const byId = new Map(runs.map((run) => [run.plan.id, run]));
+    const matrices: MlpTrainingMatrixProgress[] = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      try {
+        const manifest = JSON.parse(
+          await fs.readFile(path.join(directory, entry.name), "utf8"),
+        ) as TrainingMatrixManifest;
+        if (!manifest.id || !manifest.label || !Array.isArray(manifest.runIds)
+          || manifest.runIds.length === 0) continue;
+        const matrixRuns = manifest.runIds.map((id) => byId.get(id));
+        const completedRuns = matrixRuns.filter(
+          (run) => run?.status?.stage === "complete",
+        ).length;
+        const failedRuns = matrixRuns.filter(
+          (run) => run?.status?.stage === "failed",
+        ).length;
+        const pauseFile = manifest.control?.pauseFile
+          ? path.resolve(this.repoRoot, manifest.control.pauseFile)
+          : undefined;
+        const controlRoot = path.resolve(
+          this.repoRoot,
+          "data",
+          "training",
+          "matrices",
+        );
+        const relativePauseFile = pauseFile
+          ? path.relative(controlRoot, pauseFile)
+          : undefined;
+        const controllable = Boolean(
+          pauseFile
+          && relativePauseFile
+          && !relativePauseFile.startsWith("..")
+          && !path.isAbsolute(relativePauseFile),
+        );
+        const pauseRequested = controllable && pauseFile
+          ? await exists(pauseFile)
+          : false;
+        const active = matrixRuns.find((run) => run?.running);
+        const pausedRun = pauseRequested
+          ? matrixRuns.find((run) => run?.status?.stage === "paused")
+          : undefined;
+        const current = active ?? pausedRun;
+        const activeEpoch = numberField(current?.status?.latest?.epoch);
+        const activeEpochs = current?.plan.training?.epochs;
+        const activeProgress = current && activeEpoch !== undefined && activeEpochs
+          ? Math.min(1, (activeEpoch + 1) / activeEpochs)
+          : 0;
+        const bestTrainScore = numberField(current?.status?.latest?.bestTrainScore);
+        matrices.push({
+          id: manifest.id,
+          label: manifest.label,
+          totalRuns: manifest.runIds.length,
+          completedRuns,
+          failedRuns,
+          queuedRuns: Math.max(
+            0,
+            manifest.runIds.length - completedRuns - failedRuns - (current ? 1 : 0),
+          ),
+          progress: (completedRuns + activeProgress) / manifest.runIds.length,
+          controllable,
+          pauseRequested,
+          paused: pauseRequested && !active,
+          ...(current ? {
+            active: {
+              id: current.plan.id,
+              label: current.plan.label,
+              stage: current.status?.stage ?? "training",
+              ...(activeEpoch === undefined ? {} : { epoch: activeEpoch }),
+              ...(activeEpochs === undefined ? {} : { epochs: activeEpochs }),
+              ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
+            },
+          } : {}),
+        });
+      } catch {
+        continue;
+      }
+    }
+    return matrices;
   }
 
   private async loadArchivedRun(plan: TrainingPlan): Promise<LoadedTrainingPlan> {
@@ -422,16 +770,28 @@ export class MlpTrainingMetricsReader {
 
   private async loadPlan(planFile: string): Promise<LoadedTrainingPlan> {
     const plan = JSON.parse(await fs.readFile(planFile, "utf8")) as TrainingPlan;
+    return await this.loadStoredPlan(
+      plan,
+      path.relative(this.repoRoot, planFile).split(path.sep).join("/"),
+      planFile,
+    );
+  }
+
+  private async loadStoredPlan(
+    plan: TrainingPlan,
+    key: string,
+    sourceFile: string,
+  ): Promise<LoadedTrainingPlan> {
     const configuredDatasetDir = plan.datasetDir ?? plan.dataset?.datasetDir;
     if (!plan.id || !plan.label || !plan.runDir || !configuredDatasetDir) {
-      throw new Error(`Invalid MLP training plan: ${planFile}`);
+      throw new Error(`Invalid MLP training plan: ${sourceFile}`);
     }
     const runDir = path.resolve(this.repoRoot, plan.runDir);
     const datasetDir = path.resolve(this.repoRoot, configuredDatasetDir);
     const statusFile = path.join(runDir, "state", "status.json");
     const [status, planStat] = await Promise.all([
       readOptionalJson<TrainingStatus>(statusFile),
-      fs.stat(planFile),
+      fs.stat(sourceFile),
     ]);
     const updatedAt = validTimestamp(status?.updatedAt)
       ?? validTimestamp(status?.completedAt)
@@ -439,7 +799,7 @@ export class MlpTrainingMetricsReader {
       ?? validTimestamp(status?.pausedAt)
       ?? planStat.mtime.toISOString();
     return {
-      key: path.relative(this.repoRoot, planFile).split(path.sep).join("/"),
+      key,
       plan,
       runDir,
       datasetDir,
@@ -451,6 +811,48 @@ export class MlpTrainingMetricsReader {
       running: processIsAlive(status?.pid) && !isTerminalStage(status?.stage),
     };
   }
+}
+
+export class MlpTrainingMatrixControlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MlpTrainingMatrixControlError";
+  }
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function metricRecord(value: unknown): MlpTrainingComparisonMetricValues | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const metric: MlpTrainingComparisonMetricValues = {};
+  for (const key of [
+    "normalizedMse",
+    "mse",
+    "rmse",
+    "mae",
+    "zeroBaselineMse",
+    "mseSkillVsZero",
+    "directionAccuracy",
+    "correlation",
+  ] as const) {
+    const number = numberField(source[key]);
+    if (number !== undefined) metric[key] = number;
+  }
+  const rawMse = numberField(source.rawMse);
+  const rawRmse = numberField(source.rawRmse);
+  const rawMae = numberField(source.rawMae);
+  const endpointCorrelation = numberField(source.endpointCorrelation)
+    ?? numberField(source.meanHorizonCorrelation);
+  if (metric.mse === undefined && rawMse !== undefined) metric.mse = rawMse;
+  if (metric.rmse === undefined && rawRmse !== undefined) metric.rmse = rawRmse;
+  if (metric.mae === undefined && rawMae !== undefined) metric.mae = rawMae;
+  if (metric.correlation === undefined && endpointCorrelation !== undefined) {
+    metric.correlation = endpointCorrelation;
+  }
+  return Object.keys(metric).length > 0 ? metric : undefined;
 }
 
 async function metricLogFiles(runDir: string): Promise<string[]> {

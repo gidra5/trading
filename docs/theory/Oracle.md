@@ -1,7 +1,4 @@
 For a trading strategy we can define an oracle as an optimal decision policy given future history.
-## Oracle value
-We define oracle value as the total return oracle can get over some time horizon $T$ starting from exposure $e$:$$V_{t,T}(e)=\frac {Q_{t+T}} {Q_t}$$This quantity is at the core of the oracle policy, since it directly tries to maximize it.
-Note that since we optimize *returns* and not simply equity, we can safely scale everything by $Q_t$, effectively setting it to 1. 
 
 For the oracle it is easiest to act over the space of available exposures $e \in E=[E_-, E_+]$, since it is scale independent from actual equity.
 Oracle should be able to handle a wider range of effective exposures $e_{eff} \in E_{eff}=[E_{eff-},E_{eff+}]$, where $A \subset P$, since as price moves, effective exposure also moves. Leaving the set $P$ will result in liquidation.
@@ -10,6 +7,7 @@ The usual setup is to assume $e_t=0$, but it is not required. In this way we can
 
 We may also interpret it as "forcing" exposure at time $t$ and then proceeding optimally.
 
+Note that since we optimize *returns* and not simply equity, we can safely scale everything by $Q_t$, effectively setting it to 1. 
 # Transition rules
 Before we move to the oracle policy, we need to define how oracle can transition between states each time step.
 
@@ -44,24 +42,38 @@ $$
 $$
 In the buy branch $s$ is gross quote spent. In the sell branch $s$ is gross asset value sold.
 ### Maintenance phase
+This is the cost of simply holding the existing position, simply labeled as the mapping $\operatorname{maint}(q,a)$. There are two models that correspond to borrowing and funding mechanisms, which we will name correspondingly.
+
+The transition simply $\operatorname{maint}(q,a)$ to the rebalanced portfolio to get $\phi''$.
+
+We can also iterate it over the holding time $H$, assuming no liquidation:
+$$\begin{aligned}
+\operatorname{maint}_H(\psi_t)=\operatorname{maint}_{H-1}(\operatorname{maint}(q, a))
+\end{aligned}$$
+
+#### Borrowing maintenance
 For convenience define $z^+=\max(0,z)$, $z^-=\max(0,-z)$. Then the portfolio $\psi'$ will update according to debt maintenance rules:
 $$
-\operatorname{maint}(q,a)=
-\left(q^+-(1+r_q)q^-,\ a^+-(1+r_a)a^-\right)
+\operatorname{maint}_H(q,a)=
+\left(q^+-(1+r_q)^Hq^-,\ a^+-(1+r_a)^Ha^-\right)
 $$
 Usually $r_q=r_a=r_{debt}$.
-The transition simply applies it to rebalanced portfolio to get $\phi''$.
-
+#### Funding maintenance
 For simplicity we can also assume funding costs instead of borrowing costs. These scale linearly with asset position sizes independent of the sign, which yields this expression:
 $$
-\operatorname{maint}(q,a)=
-\left(q,\ (1+r_a)a\right)
+\operatorname{maint}_H(q,a)=
+\left(q,\ (1+r_a)^Ha\right)
+$$
+#### Variable rates
+The rates $r_q$, $r_a$ may vary with time, in that case their cumulative holding result is the product:
+$$
+r^H_q=\prod_{h\le H}(1+r^{t-h}_q)=r^{H-1}_q(1+r^{t-H}_q)
 $$
 ### Liquidation phase
 Final phase is the liquidation check after rebalancing, maintenance and the time step.
 
-Portfolio is liquidated simply when $e_{eff}\not\in [E^-_{eff},E^+_{eff}]$ or $Q_{liq}\leq0$. 
-If liquidated, $a_{t+1}=0$ and $q_{t+1}=Q_{liq}$. 
+Portfolio is liquidated simply when $e_{eff}\not\in [E^-_{eff},E^+_{eff}]$ or $Q_{eff}\leq0$. 
+If liquidated, $a_{t+1}=0$ and $q_{t+1}=Q_{eff}$. 
 Otherwise $a_{t+1}=a''$ and $q_{t+1}=q''$.
 
 Then after the price move to $p_{t+1}$ the liquidation transition can be expressed as:
@@ -73,27 +85,38 @@ liq(q,a)=
 (q,a), & \text{otherwise}
 \end{cases}
 $$
+
+For simplification we can assume $Q_{eff}=0$ for any liquidation:
+$$
+liq(q,a)=
+\begin{cases}
+(0,0),
+& Q\leq0\ \lor\ Q_{eff}\leq0\ \lor\ e_{eff}\notin E_{eff}\\
+(q,a), & \text{otherwise}
+\end{cases}
+$$
 ### Finalization phase
 Finally, once oracle is done, it closes the remaining portfolio by applying the same fee-aware rebalance rule with target exposure $0$:
 $$(q_{t+T}^{flat},a_{t+T}^{flat})=\operatorname{reb}_{p_{t+T},f}((q_{t+T},a_{t+T}),0)$$
 
 
-### Value recursion over exposure state
-We can express the transition rules a bit nicer in the equity-exposure space with transform $\Phi_t$:
+### Recursion over exposure state
+We can express the transition rules a bit nicer in the equity-exposure space with transform $\varPsi_t$:
 $$\begin{aligned}
-\Phi_t(q,a)=\left(q+ap_t,\frac{ap_t}{q+ap_t}\right)\\
-\Phi_t^{-1}(Q,e)=\left(Q(1-e),\frac{Qe}{p_t}\right) \\
+\varPsi_t(q,a)=\left(q+ap_t,\frac{ap_t}{q+ap_t}\right)\\
+\varPsi_t^{-1}(Q,e)=\left(Q(1-e),\frac{Qe}{p_t}\right) \\
 \end{aligned}
 $$
-The nice thing about it is that transitions like price movement, liquidation, or changing exposure are much simpler in this state space.
+The nice thing about it is that transitions like price movement, liquidation, or changing exposure are much simpler to express generally in this state space.
 
 Most transition phases are homogeneous in equity: they simply scale $(q,a)$ by some $Q$ which does not change overall exposure. So we only need to track the scalar equity multiplier and the next exposure is practically unchanged.
 
-### Rebalancing phase
+The equity-exposure space introduces an ambiguity when equity is 0 - all exposures become equivalent. In this case we choose 0 exposure as canonical.
+#### Rebalancing phase
 First collapse the rebalance phase. It is by definition does not change exposure, which means we can define $R_t(x\to e)$ as:
 $$
-\operatorname{reb}_{p_t,f}(\Phi_t^{-1}(Q,e),e')
-=\Phi_t(R_t(e\to e')*Q,e')
+\operatorname{reb}_{p_t,f}(\varPsi_t^{-1}(Q,e),e')
+=\varPsi_t(QR_t(e\to e'),e')
 $$
 Substituting the buy/sell rebalance formulas gives:
 $$
@@ -106,91 +129,111 @@ R_t(x\to e)=
 $$
 This is defined only when the relevant denominator and resulting equity are positive; otherwise the branch is infeasible.
 
-### Maintenance phase
-After rebalancing we have a maintenance phase. 
+#### Maintenance phase
+After rebalancing we have a maintenance phase. It follows this general form:
 $$
-\operatorname{maint}(\Phi_t^{-1}(Q,e))=
-\left(Q((1-e)^+-(1+r_q)(1-e)^-),\ \frac{Q}{p_t}(e^+-(1+r_a)e^-)\right)
+\varPsi_t
+\left(\operatorname{maint}_H(\varPsi_t^{-1}(Q,e))\right)=
+\left(Qh(e),\ \frac{k(e)}{h(e)}\right)
 $$
-$$
-h_t(e)=((1-e)^++e^+-(1+r_q)(e^--(1-e)^-))
-$$$$
-\Phi_t
-\left(\operatorname{maint}(\Phi_t^{-1}(Q,e))\right)=
-\left(Qh_t(e),\ \frac{e^+-(1+r_a)e^-}{h_t(e)}\right)
-$$
+Where $h_t$ is the equity change and $k_t$ is the exposure change.
 
-
-$$
-\operatorname{maint}(\Phi_t^{-1}(Q,e))=
-\left(Q((1-e)^+-(1+r_q)(1-e)^-),\ \frac{Q}{p_t}(e^+-(1+r_a)e^-)\right)
-$$
-$$
-h_t(e)=((1-e)^++e^+-(1+r_q)(e^--(1-e)^-))
-$$$$
-\Phi_t
-\left(\operatorname{maint}(\Phi_t^{-1}(Q,e))\right)=
-\left(Qh_t(e),\ \frac{e^+-(1+r_a)e^-}{h_t(e)}\right)
-$$
-Now collapse passive holding after the target exposure has already been reached. With unit post-rebalance equity, target exposure $e$ corresponds to quote amount $1-e$ and base amount $e/p_t$ at $p_t$. During holding these amounts are not rebalanced. Owned amounts stay constant, borrowed amounts grow by maintenance, and exposure is re-marked at every intermediate price. For $j$ passive price moves define maintenance factors:
-$$
-\rho^q_{t,j}=\prod_{i=0}^{j-1}(1+r^q_{t+i}),
-\qquad
-\rho^a_{t,j}=\prod_{i=0}^{j-1}(1+r^a_{t+i})
-$$
-For constant rates these are $(1+r_q)^j$ and $(1+r_a)^j$. The surviving quote amount, surviving base amount, and marked asset value after $j$ moves are:
+The two models have these definitions for equity and exposure changes:
 $$
 \begin{aligned}
-B_{t,j}(e)&=(1-e)^+-\rho^q_{t,j}(1-e)^-\\
-b_{t,j}(e)&=\frac{e^+-\rho^a_{t,j}e^-}{p_t}\\
-A_{t,j}(e)&=p_{t+j}b_{t,j}(e)
-=\frac{p_{t+j}}{p_t}\left(e^+-\rho^a_{t,j}e^-\right)
+k_{H}^{borrow}(e)&=e^+-(1+r_a)^He^-\\
+h_{H}^{borrow}(e)&=(1-e)^++e^+-(1+r_q)^H(e^--(1-e)^-)\\
+k_{H}^{fund}(e)&=(1+r_a)^He\\
+h_{H}^{fund}(e)&=(1-e)+(1+r_a)^He
 \end{aligned}
 $$
-So the hold path is not constant in exposure. Its marked wealth, liquidation close wealth, marked exposure, and liquidation-test exposure after each intermediate move are:
+#### Liquidation and finalization phase
+The liquidation and finalization almost does not change:
+$$
+\varPsi_t
+\left(\operatorname{liq}(\varPsi_t^{-1}(Q,e))\right)=
+\begin{cases}
+(Q_{eff},0),
+& Q\leq0\ \lor\ Q_{eff}\leq0\ \lor\ e_{eff}\notin E_{eff}\\
+(Q,e), & \text{otherwise}
+\end{cases}
+$$
+It is either identity, or an effective transition to 0 exposure.
+
+We could also derive pure equity change:
+$$\eta_{liq}(Q,e)=
+\begin{cases}
+Q_{eff}/Q,
+& Q\leq0\ \lor\ Q_{eff}\leq0\ \lor\ e_{eff}\notin E_{eff}\\
+1, & \text{otherwise}
+\end{cases}$$
+#### Price transition
+For direct quote-asset space we didn't need any explicit price transition, since it is basically an identity. But in equity-exposure state it changes the values:$$
+\begin{aligned}
+\delta_{t+1}(e) &=1+r_{t+1}e\\
+\zeta_{t+1}(e)&=(1+r_{t+1})/\delta_{t+1}(e)
+\end{aligned}
+$$
 $$
 \begin{aligned}
-W_{t,j}(e)&=B_{t,j}(e)+A_{t,j}(e)\\
-Z_{t,j}(e)&=B_{t,j}(e)+L_f(A_{t,j}(e))\\
-d_{t,j}(e)&=\frac{A_{t,j}(e)}{W_{t,j}(e)}\\
-\epsilon_{t,j}(e)&=\frac{L_f(A_{t,j}(e))}{Z_{t,j}(e)}
+\varPsi_{t+1}(\varPsi_t^{-1}(Q,e))
+&=\left(Q\left(1-e+\frac{p_{t+1}}{p_t}e\right),\frac{\frac{e}{p_t}p_{t+1}}{1-e+\frac{e}{p_t}p_{t+1}}\right)\\
+&=\left(Q\left(1-e+(1+r_{t+1})e\right),\frac{(1+r_{t+1})e}{1-e+(1+r_{t+1})e}\right)\\
+&=\left(Q\left(1+r_{t+1}e\right),\frac{(1+r_{t+1})e}{1+r_{t+1}e}\right)\\
+&=\left(Q\delta_{t+1}(e),\frac{(1+r_{t+1})e}{\delta_{t+1}(e)}\right)\\
+&=\left(Q\delta_{t+1}(e),e\zeta_{t+1}(e)\right)
 \end{aligned}
 $$
-Without maintenance this reduces to $d_{t,j}(e)=p_{t+j}e/(p_t(1-e)+p_{t+j}e)$, which changes with price unless $e=0$ or $e=1$.
-
-If for any intermediate move $i\in[1,k]$ we have $W_{t,i}(e)\leq0$, $Z_{t,i}(e)\leq0$, or $\epsilon_{t,i}(e)\notin E_{\operatorname{eff}}$, then the hold is liquidated and has value $-\infty$. Otherwise the $k$-move collapsed hold is:
+#### Log equity
+Under these definitions we can separate equity evolution as this, given current and target exposures $e$ and $e'$:
+$$\begin{aligned}
+Q_t'&=Q_t*R_{t}(e_t\to e_t')*h_{t}(e_t')\\
+Q_{t+1}&=Q_t'*\eta_{liq}(Q_t',e_t'')*\delta_{t+1}(e_t'')
+\end{aligned}
+$$
+Since all changes are multiplicative, we can take logarithm and linearize the transition:
 $$
 \begin{aligned}
-h_{t,k}(e)&=\log W_{t,k}(e)
+\log Q_t'&=\log Q_t+\log R_{t}(e_t\to e_t')+\log h_{t}(e_t')\\
+\log Q_{t+1}&=\log Q_t'+\log \eta_{liq}(Q_t', e_t'')+\log \delta_{t+1}(e_t'')
 \end{aligned}
 $$
-with $h_{t,0}(e)=0$ and $d_{t,0}(e)=e$.
+Assuming $Q_{eff}=0$, we also get:
+$$
+\log \eta_{liq}(Q, e)=
+\begin{cases}
+-\infty,
+& Q\leq0\ \lor\ Q_{eff}\leq0\ \lor\ e_{eff}\notin E_{eff}\\
+0, & \text{otherwise}
+\end{cases}$$
+The $e'$ and $e''$ are exposures after transition and after holding respectively. So the equity transition can be separated from exposure, but not completely, they are still coupled, since they are evolving together. But on the other hand, exposure *is almost* separated from equity:
+$$\begin{aligned}
+e_t'&=e_{t}+\Delta e\\
+e_t''&=k(e_t')/h(e_t')\\
+e_{t+1}&=e_t''*\eta_{liq}(Q_t',e_t'')*\zeta_{t+1}(e_t'')
+\end{aligned}
+$$
+Only liquidation couples them, but otherwise it is completely independent.
+What's also useful, is that any liquidation path maps to $-\infty$.
 
-The collapsed composition is therefore:
-$$
-\operatorname{hold}_{t,k}\left(\operatorname{reb}_{p_t,f}(\Phi_t(Q,x),e)\right)
-=\Phi_{t+k}\left(QR_t(x\to e)e^{h_{t,k}(e)},d_{t,k}(e)\right)
-$$
-or, in log-value form:
-$$
-\log\frac{Q_{t+k}}{Q_t}
-=\log R_t(x\to e)+h_{t,k}(e)
-$$
-
-Then the oracle recurrence is:
+### Log return recursion
+Now we can define *return* $V$ of the particular state under some policy, horizon $T$ at time $t$:
+$$V_{t,H}=\log \frac {Q_{t+H}} {Q_t}$$
+We can parametrize further with a "discount" of the return $\gamma$, initial holding time $H$, and action delay time $D$ and get these equations for the oracle value recursion $V_{t,H,T}$:
 $$
 \begin{aligned}
 V_{t,0}(x)&=\log R_t(x\to0)\\
 V_{t,k}(x)&=\max\limits_{e\in E}
 \left[
-\log R_t(x\to e)+h_{t,1}(e)+V_{t+1,k-1}(d_{t,1}(e))
-\right]\\
-F_{t,H,T}(e)&=h_{t,H'}(e)+V_{t+H',T-H'}(d_{t,H'}(e)),
-\quad H'=\min(H,T,\text{remaining moves})
+\log R_t(x\to e)+h_{t,D'}(e)+\gamma V_{t+D',k-D'}(e)
+\right],
+\quad D'=\min(D,k)\\
+V_{t,H,T}(e)&=h_{t,H'}(e)+V_{t+H',T-H'}(e),
+\quad H'=\min(H,T)
 \end{aligned}
 $$
-Liquidated branches have value $-\infty$. The terminal condition is exactly the finalization phase: rebalance the last surviving state to zero exposure.
 
+# Bellman equation
 # Policy
 We define policy as a distribution over all possible current and target exposures:$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)de}$$Where $R_{t,T}$ is a return from moving to the exposure $e$. The return itself is defined simply as oracle value minus transition cost:$$\begin{aligned}
 R_{t,T}(e_t\to e)=V_{t,T}(e)-C_t(e_t\to e)

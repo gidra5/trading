@@ -216,6 +216,15 @@ ML model based on MLP:
 6.  Validation/testing on last 1M worth of 1s candles.
 
 
+1. volatility norm -
+2. weight decay
+3. tuned dropout
+4. weight ema + mostly training set size related
+5. ema as teacher
+6. output calibration
+7. sam
+8. Ensembles across seeds
+
 Alternatives:
 1.  PatchTST
 3.  iTransformer, ipatch

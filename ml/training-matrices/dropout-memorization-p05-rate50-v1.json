@@ -1,0 +1,14 @@
+{
+  "id": "dropout-memorization-p05-rate50-v1",
+  "label": "Paired memorization diagnostics - 5% dropout at 50% application",
+  "runIds": [
+    "next-second-4-layer-memorization-65k-v1-dropout-p05-rate50-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-dropout-p05-rate50-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-dropout-p05-rate50-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-dropout-p05-rate50-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-dropout-p05-rate50-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-dropout-p05-rate50-v1",
+    "next-second-8-layer-memorization-512k-static-c-quadrants-v1-dropout-p05-rate50-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-dropout-p05-rate50-v1"
+  ]
+}
