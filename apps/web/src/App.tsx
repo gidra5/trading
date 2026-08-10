@@ -5,6 +5,7 @@ import {
   BarChart3,
   Check,
   MinusCircle,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -71,6 +72,7 @@ import type {
   BinanceMarketCatalog,
   BinanceMarketListing,
   MarketGroup,
+  MarketVenue,
   RuntimeSnapshot,
 } from "./types";
 
@@ -588,6 +590,7 @@ export function App() {
       return false;
     }
     applySnapshot(payload as RuntimeSnapshot);
+    await loadMarkets(true);
     return true;
   };
 
@@ -692,14 +695,20 @@ export function App() {
               <Search size={16} />
               KAMA Inspector
             </a>
-            <button class={buttonPrimaryClass} type="button" onClick={() => void controlBot("start")}>
-              <Play size={16} />
-              Start
-            </button>
-            <button class={buttonDangerClass} type="button" onClick={() => void controlBot("stop")}>
-              <Square size={16} />
-              Stop
-            </button>
+            <Show
+              when={isBotRunning()}
+              fallback={
+                <button class={buttonPrimaryClass} type="button" onClick={() => void controlBot("start")}>
+                  <Play size={16} />
+                  Start
+                </button>
+              }
+            >
+              <button class={buttonDangerClass} type="button" onClick={() => void controlBot("stop")}>
+                <Pause size={16} />
+                Pause
+              </button>
+            </Show>
             <button class="btn" type="button" onClick={() => void controlBot("reset")}>
               <RotateCcw size={16} />
               Reset
@@ -958,6 +967,31 @@ function ExchangePaperPanel(props: {
 
   const executionMode = () => execution()?.mode ?? "simulated";
   const canChangeExecution = () => !props.botRunning;
+  const simulatedDisabledReason = () => {
+    if (executionMode() === "simulated") {
+      return "Simulation execution is already selected.";
+    }
+    return props.botRunning ? "Pause the bot before changing execution mode." : undefined;
+  };
+  const binanceDisabledReason = () => {
+    if (executionMode() === "binance") {
+      return "Binance execution is already selected.";
+    }
+    if (props.botRunning) {
+      return "Pause the bot before changing execution mode.";
+    }
+    return execution()?.canUseExchange
+      ? undefined
+      : "Configure a compatible Binance account before enabling Binance execution.";
+  };
+  const executionSwitchHint = () => {
+    if (props.botRunning) {
+      return "Pause the bot before changing execution mode.";
+    }
+    return executionMode() === "simulated" && !execution()?.canUseExchange
+      ? "Configure a compatible Binance account before enabling Binance execution."
+      : undefined;
+  };
   const canTrade = () =>
     Boolean(exchange()?.enabled && exchange()?.configured && exchange()?.compatible);
   const isFutures = () =>
@@ -1083,28 +1117,41 @@ function ExchangePaperPanel(props: {
             </div>
           </div>
           <div class="grid grid-cols-2 gap-2 sm:w-80">
-            <button
-              class={executionMode() === "simulated" ? buttonPrimaryClass : buttonPanelClass}
-              type="button"
-              disabled={!canChangeExecution() || executionMode() === "simulated"}
-              onClick={() => props.onSetExecutionMode("simulated")}
-            >
-              <Check size={16} />
-              Simulated
-            </button>
-            <button
-              class={executionMode() === "binance" ? buttonDangerClass : buttonPanelClass}
-              type="button"
-              disabled={
-                !canChangeExecution() ||
-                executionMode() === "binance" ||
-                !execution()?.canUseExchange
-              }
-              onClick={() => props.onSetExecutionMode("binance")}
-            >
-              <Activity size={16} />
-              Binance
-            </button>
+            <div title={simulatedDisabledReason()}>
+              <button
+                class={`${executionMode() === "simulated" ? buttonPrimaryClass : buttonPanelClass} w-full`}
+                type="button"
+                aria-describedby={executionSwitchHint() ? "execution-switch-hint" : undefined}
+                disabled={!canChangeExecution() || executionMode() === "simulated"}
+                onClick={() => props.onSetExecutionMode("simulated")}
+              >
+                <Check size={16} />
+                Simulated
+              </button>
+            </div>
+            <div title={binanceDisabledReason()}>
+              <button
+                class={`${executionMode() === "binance" ? buttonDangerClass : buttonPanelClass} w-full`}
+                type="button"
+                aria-describedby={executionSwitchHint() ? "execution-switch-hint" : undefined}
+                disabled={
+                  !canChangeExecution() ||
+                  executionMode() === "binance" ||
+                  !execution()?.canUseExchange
+                }
+                onClick={() => props.onSetExecutionMode("binance")}
+              >
+                <Activity size={16} />
+                Binance
+              </button>
+            </div>
+            <Show when={executionSwitchHint()}>
+              {(message) => (
+                <div id="execution-switch-hint" class="col-span-2 text-xs text-warn">
+                  {message()}
+                </div>
+              )}
+            </Show>
           </div>
         </div>
       </div>
@@ -1437,6 +1484,7 @@ function AssetSelector(props: {
         </label>
         <select
           class="w-full rounded-2 border border-line bg-ink-800 px-3 py-2 text-sm text-ink-100 disabled:opacity-60"
+          aria-label="Select market"
           value={props.selectedMarketId ?? ""}
           disabled={props.disabled || !props.catalog}
           onInput={(event) => props.onSelect(event.currentTarget.value)}
@@ -1446,6 +1494,7 @@ function AssetSelector(props: {
               {(market) => (
                 <option
                   value={market.id}
+                  selected={market.id === props.selectedMarketId}
                   disabled={!market.supportsLiveStream}
                   title={market.unavailableReason}
                 >
@@ -1457,15 +1506,18 @@ function AssetSelector(props: {
         </select>
       </div>
 
-      <Show when={props.error ?? firstCatalogWarning(props.catalog)}>
+      <Show when={props.error ?? selectedCatalogWarning(props.catalog, selected()?.venue)}>
         {(message) => <div class="mt-2 text-xs text-warn">{message()}</div>}
       </Show>
     </div>
   );
 }
 
-function firstCatalogWarning(catalog: BinanceMarketCatalog | undefined): string | undefined {
-  return catalog?.warnings[0];
+function selectedCatalogWarning(
+  catalog: BinanceMarketCatalog | undefined,
+  venue: MarketVenue | undefined,
+): string | undefined {
+  return catalog?.sources.find((source) => source.source === venue)?.message;
 }
 
 function marketGroupLabel(group: MarketGroup | "all"): string {

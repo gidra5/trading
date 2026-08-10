@@ -75,9 +75,14 @@ export interface BotBacktestOptions {
   /** Scales modal target exposure by confidence^power. Zero preserves raw modal exposure. */
   hindsightOracleConfidenceExposurePower?: number;
   /** Minimum fraction of max leverage available to the confidence-conditioned ceiling. */
-  hindsightOracleConfidenceLeverageFloor?: number;
+  /** Bot-level leverage floor for confidence-conditioned target exposure. */
+  oracleConfidenceLeverageFloor?: number;
   /** Calibrated predictor quality multiplied into each distribution-derived confidence. */
   oracleStaticConfidenceScale?: number;
+  /** Minimum distribution confidence required for an expansion at full predictor quality. */
+  oracleMinimumDistributionConfidence?: number;
+  /** Expansion confidence threshold approached as static predictor quality falls to zero. */
+  oracleMaximumDistributionConfidenceThreshold?: number;
   /** Total same-side distribution-confidence mass required before expansion. */
   oracleExpansionConfirmationMass?: number;
   /** Base expansion-delta cap as a fraction of max leverage, before static-confidence squared. */
@@ -96,9 +101,14 @@ export interface OracleBacktestDecision {
   rawModalExposure: number;
   /** Modal exposure after transition-cost conditioning, before leverage/confidence limits. */
   conditionedModalExposure: number;
-  /** Requested exposure after leverage/confidence limits. */
+  /** Strategy-requested exposure before bot-level confidence and transition limits. */
   targetExposure: number;
+  /** Confidence of this distribution-derived decision. */
   confidence: number;
+  /** Predictor/model reliability exposed separately by the strategy. */
+  staticConfidence: number;
+  /** Combined confidence retained for diagnostics. */
+  effectiveConfidence: number;
   entropy: number;
   /** The strategy returned a signal; this does not imply that an order filled. */
   signalEmitted: boolean;
@@ -115,6 +125,8 @@ export const HINDSIGHT_ORACLE_TEMPERATURE = 0.01;
 export const HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER = 0;
 export const HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR = 0.75;
 export const ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE = 1;
+export const ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE = 0.05;
+export const ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD = 0.5;
 export const HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR = 10;
 export const LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE = 1;
 
@@ -160,6 +172,30 @@ export async function runBotBacktestFromCandles(
     || backtestStrategy === "learned-oracle-1m"
     ? Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, learnedMaximumLeverage)
     : Math.min(HINDSIGHT_ORACLE_MAX_EXPOSURE, hindsightMaximumLeverage);
+  const minimumDistributionConfidence = options.oracleMinimumDistributionConfidence
+    ?? ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE;
+  const maximumDistributionConfidenceThreshold =
+    options.oracleMaximumDistributionConfidenceThreshold
+    ?? ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD;
+  if (
+    !Number.isFinite(minimumDistributionConfidence)
+    || !Number.isFinite(maximumDistributionConfidenceThreshold)
+    || minimumDistributionConfidence < 0
+    || maximumDistributionConfidenceThreshold > 1
+    || maximumDistributionConfidenceThreshold < minimumDistributionConfidence
+  ) {
+    throw new Error(
+      "Oracle distribution-confidence thresholds must satisfy 0 <= minimum <= maximum <= 1.",
+    );
+  }
+  const confidenceLeverageFloor = options.oracleConfidenceLeverageFloor
+    ?? HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR;
+  if (
+    !(confidenceLeverageFloor >= 0 && confidenceLeverageFloor <= 1)
+    || !Number.isFinite(confidenceLeverageFloor)
+  ) {
+    throw new Error("Oracle confidence leverage floor must be in [0, 1].");
+  }
   if (backtestStrategy === "learned-oracle-1s" && intervalMs !== HINDSIGHT_ORACLE_INTERVAL_MS) {
     throw new Error("The learned one-second oracle strategy requires one-second candles.");
   }
@@ -188,7 +224,10 @@ export async function runBotBacktestFromCandles(
         // prevent 100x targets after account equity changes.
         maxTradeQuote: Number.POSITIVE_INFINITY,
         cooldownMs: HINDSIGHT_ORACLE_HOLDING_PERIOD_MS,
-        targetExposureControl: {
+        exposureControl: {
+          confidenceLeverageFloor,
+          minimumSignalConfidence: minimumDistributionConfidence,
+          maximumSignalConfidenceThreshold: maximumDistributionConfidenceThreshold,
           expansionConfirmationMass: options.oracleExpansionConfirmationMass ?? 1,
           expansionDeltaCapFraction: options.oracleExpansionDeltaCapFraction
             ?? HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
@@ -233,14 +272,6 @@ export async function runBotBacktestFromCandles(
   if (!(confidenceExposurePower >= 0) || !Number.isFinite(confidenceExposurePower)) {
     throw new Error("Hindsight oracle confidence exposure power must be finite and non-negative.");
   }
-  const confidenceLeverageFloor = options.hindsightOracleConfidenceLeverageFloor
-    ?? HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR;
-  if (
-    !(confidenceLeverageFloor >= 0 && confidenceLeverageFloor <= 1)
-    || !Number.isFinite(confidenceLeverageFloor)
-  ) {
-    throw new Error("Hindsight oracle confidence leverage floor must be in [0, 1].");
-  }
   const staticConfidenceScale = options.oracleStaticConfidenceScale
     ?? ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE;
   validateOracleStaticConfidenceScale(staticConfidenceScale);
@@ -254,7 +285,6 @@ export async function runBotBacktestFromCandles(
         oracleDistributionAt,
         apiFriction(config),
         confidenceExposurePower,
-        confidenceLeverageFloor,
         staticConfidenceScale,
         options.onOracleDecision,
       )
@@ -1211,11 +1241,14 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
     ) => ExposureValueOracleActionDistribution | null,
     private readonly friction: number,
     private readonly confidenceExposurePower: number,
-    private readonly confidenceLeverageFloor: number,
     private readonly staticConfidenceScale: number,
     private readonly onOracleDecision?: (decision: OracleBacktestDecision) => void,
   ) {
     super(options);
+  }
+
+  override staticConfidence(): number {
+    return this.staticConfidenceScale;
   }
 
   async targetExposureSignal(
@@ -1237,20 +1270,11 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       decision.confidence,
       this.staticConfidenceScale,
     );
-    const targetExposure = confidenceConditionedHindsightOracleExposure(
+    const targetExposure = confidenceScaledHindsightOracleExposure(
       scaledModalExposure,
       decision.confidence,
-      context.maxLeverage,
       this.confidenceExposurePower,
-      this.confidenceLeverageFloor,
-      this.staticConfidenceScale,
     );
-    const confidenceLeverageFraction = confidenceConditionedOracleLeverageFraction(
-      decision.confidence,
-      this.confidenceLeverageFloor,
-      this.staticConfidenceScale,
-    );
-    const confidenceLeverageCap = context.maxLeverage * confidenceLeverageFraction;
     const confidenceScale = scaledModalExposure !== 0
       ? targetExposure / scaledModalExposure
       : effectiveConfidence ** this.confidenceExposurePower;
@@ -1264,7 +1288,9 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       rawModalExposure: distribution.modalExposure,
       conditionedModalExposure: decision.targetExposure,
       targetExposure,
-      confidence: effectiveConfidence,
+      confidence: decision.confidence,
+      staticConfidence: this.staticConfidenceScale,
+      effectiveConfidence,
       entropy: decision.entropy,
       signalEmitted,
     });
@@ -1280,10 +1306,6 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       "oracle.effectiveConfidence": effectiveConfidence,
       "oracle.confidenceExposureScale": confidenceScale,
       "oracle.confidenceExposurePower": this.confidenceExposurePower,
-      "oracle.confidenceLeverageFloor": this.confidenceLeverageFloor,
-      "oracle.effectiveConfidenceLeverageFloor":
-        this.confidenceLeverageFloor * this.staticConfidenceScale,
-      "oracle.confidenceLeverageCap": confidenceLeverageCap,
       "oracle.entropy": decision.entropy,
       "oracle.feasibleActions": decision.feasibleActionCount,
     };
@@ -1295,9 +1317,7 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
       // the decision tick so a backtest window (and the live policy) cannot
       // retain stale exposure merely because a passive exit never trades.
       price: targetExposure === 0 ? null : this.tick.price,
-      confidence: effectiveConfidence,
-      staticConfidence: this.staticConfidenceScale,
-      distributionConfidence: decision.confidence,
+      confidence: decision.confidence,
     };
   }
 }

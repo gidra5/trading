@@ -31,6 +31,12 @@ export interface BinanceExchangeConfig {
   baseUrlOverride?: string;
 }
 
+export interface BinanceExchangeCatalogCredentials {
+  apiKey?: string;
+  apiSecret?: string;
+  baseUrl: string;
+}
+
 export interface BinanceExchangeBalance {
   asset: string;
   free: number;
@@ -266,6 +272,19 @@ export class BinanceExchangeTrading {
   updateConfig(patch: Partial<BinanceExchangeConfig>): void {
     Object.assign(this.config, patch);
     this.snapshots.clear();
+  }
+
+  catalogCredentialsFor(
+    venue: "usdm-futures" | "coinm-futures",
+  ): BinanceExchangeCatalogCredentials | undefined {
+    const environment = this.resolveEnvironmentForVenue(venue);
+    if (!environment) {
+      return undefined;
+    }
+    return {
+      ...this.credentialsFor(environment),
+      baseUrl: environment.baseUrl,
+    };
   }
 
   drivesOrderExecution(market: BinanceMarketListing): boolean {
@@ -866,16 +885,22 @@ export class BinanceExchangeTrading {
   private resolveEnvironment(
     market: BinanceMarketListing,
   ): ResolvedExchangeEnvironment | undefined {
+    return this.resolveEnvironmentForVenue(market.venue);
+  }
+
+  private resolveEnvironmentForVenue(
+    venue: BinanceMarketListing["venue"],
+  ): ResolvedExchangeEnvironment | undefined {
     const mode =
       this.config.mode === "auto"
-        ? defaultModeForVenue(market.venue, "sandbox")
+        ? defaultModeForVenue(venue, "sandbox")
         : this.config.mode === "live"
-          ? defaultModeForVenue(market.venue, "live")
+          ? defaultModeForVenue(venue, "live")
           : this.config.mode;
     if (!mode) {
       return undefined;
     }
-    if (!modeIsCompatibleWithVenue(mode, market.venue)) {
+    if (!modeIsCompatibleWithVenue(mode, venue)) {
       return undefined;
     }
     return environmentForMode(mode, this.config.baseUrlOverride);

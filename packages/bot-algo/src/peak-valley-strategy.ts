@@ -332,9 +332,12 @@ export function createPeakValleyBotConfig(
     stopLossRate: null,
     takeProfitRate: null,
     cooldownMs: config.cooldownMs,
-    targetExposureControl: {
-      expansionConfirmationMass: 1,
-      expansionDeltaCapFraction: 0.75,
+    exposureControl: {
+      confidenceLeverageFloor: 1,
+      minimumSignalConfidence: 0,
+      maximumSignalConfidenceThreshold: 0,
+      expansionConfirmationMass: 0,
+      expansionDeltaCapFraction: 1,
     },
     internalBorrow: {
       enabled: config.internalBorrowAccounting === "active",
@@ -442,6 +445,10 @@ export class PeakValleyStrategy
     this.rebuildIndicators();
     this.diagnostics = emptyDiagnostics(this.config);
     this.diagnostics = this.buildDiagnostics();
+  }
+
+  staticConfidence(): number {
+    return 1;
   }
 
   async warmup(): Promise<void> {
@@ -873,11 +880,11 @@ function continuousSuffix(candles: TradingCandle[], intervalMs: number): Trading
 }
 
 function entry(side: PositionSide, size: number, price: number | null): TradingStrategyEntrySignal | null {
-  return size > 0 ? { side, size, leverage: 999, price, confidence: null } : null;
+  return size > 0 ? { side, size, leverage: 999, price, confidence: 1 } : null;
 }
 
 function exit(side: PositionSide, size: number, price: number | null): TradingStrategyExitSignal | null {
-  return size > 0 ? { side, size, price, confidence: null } : null;
+  return size > 0 ? { side, size, price, confidence: 1 } : null;
 }
 
 function extremum(shape: "valley" | "peak", timing: PeakValleySignalTiming, previous: number, current: number): boolean {

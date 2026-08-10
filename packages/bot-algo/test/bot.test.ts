@@ -26,7 +26,7 @@ test("positions own their entry and exit orders from creation through fills", as
   const api = new FakeApi();
   const strategy = new FakeStrategy();
   const bot = new GridTradingBot({ api, strategy, config: config() });
-  strategy.entry = { side: "long", size: 0.5, leverage: 1, price: null, confidence: null };
+  strategy.entry = { side: "long", size: 0.5, leverage: 1, price: null, confidence: 1 };
 
   await bot.onTick(tick);
   let snapshot = await bot.snapshot();
@@ -70,14 +70,14 @@ test("exits repay external then internal debt and preserve signed profit", async
   nextConfig.internalBorrow.enabled = true;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
-  strategy.entry = { side: "short", size: 1, leverage: 2, price: null, confidence: null };
+  strategy.entry = { side: "short", size: 1, leverage: 2, price: null, confidence: 1 };
   await bot.onTick(tick);
   await bot.onOrder({
     type: "fill",
     orderId: api.orders[0].order.id,
     fill: { filledAsset: 2, filledQuote: 200, remaining: 0 },
   });
-  strategy.entry = { side: "long", size: 1, leverage: 2, price: null, confidence: null };
+  strategy.entry = { side: "long", size: 1, leverage: 2, price: null, confidence: 1 };
   await bot.onTick({ ...tick, timestamp: 2_000 });
   await bot.onOrder({
     type: "fill",
@@ -114,7 +114,7 @@ test("a rejected unfilled entry removes its position", async () => {
   const api = new FakeApi();
   const strategy = new FakeStrategy();
   const bot = new GridTradingBot({ api, strategy, config: config() });
-  strategy.entry = { side: "short", size: 0.25, leverage: 1, price: null, confidence: null };
+  strategy.entry = { side: "short", size: 0.25, leverage: 1, price: null, confidence: 1 };
   await bot.onTick(tick);
   await bot.onOrder({ type: "rejected", orderId: api.orders[0].order.id });
   assert.equal((await bot.snapshot()).positions.length, 0);
@@ -141,7 +141,7 @@ test("entry sizing uses provider capacity and effective leverage", async () => {
     config: config(),
     onEntryRisk: (report) => reports.push(report),
   });
-  strategy.entry = { side: "short", size: 0.5, leverage: 5, price: null, confidence: null };
+  strategy.entry = { side: "short", size: 0.5, leverage: 5, price: null, confidence: 1 };
 
   await bot.onTick(tick);
 
@@ -184,7 +184,7 @@ test("entry grids stay within provider quote capacity", async () => {
     sizeFraction: 1,
   };
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
-  strategy.entry = { side: "short", size: 1, leverage: 1, price: 100, confidence: null };
+  strategy.entry = { side: "short", size: 1, leverage: 1, price: 100, confidence: 1 };
 
   await bot.onTick(tick);
 
@@ -204,11 +204,56 @@ test("entry sizing absorbs provider dust before applying the trade cap", async (
   nextConfig.minTradeQuote = 10;
   nextConfig.maxTradeQuote = 98;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
-  strategy.entry = { side: "long", size: 0.95, leverage: 1, price: null, confidence: null };
+  strategy.entry = { side: "long", size: 0.95, leverage: 1, price: null, confidence: 1 };
 
   await bot.onTick(tick);
 
   assert.equal(api.orders[0].order.size, 0.98);
+});
+
+test("conventional entries use strategy and signal confidence exposure controls", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeStrategy();
+  strategy.modelConfidence = 0.5;
+  const nextConfig = config();
+  useOracleExposureControls(nextConfig);
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  nextConfig.exposureControl.expansionConfirmationMass = 0;
+  nextConfig.exposureControl.expansionDeltaCapFraction = 1;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  // Static confidence 0.5 raises the signal-confidence threshold to 0.275.
+  strategy.entry = { side: "long", size: 1, leverage: 8, price: null, confidence: 0.27 };
+  await bot.onTick(tick);
+  assert.equal(api.orders.length, 0);
+
+  strategy.entry = { side: "long", size: 1, leverage: 8, price: null, confidence: 0.28 };
+  await bot.onTick({ ...tick, timestamp: 2_000 });
+  assert.equal(api.orders.length, 1);
+  // Confidence permits 2.75x, while the quadratic per-decision delta cap permits 2.5x.
+  assert.equal((await bot.snapshot()).positions[0].leverage, 2.5);
+  assert.equal(api.orders[0].order.size, 25);
+});
+
+test("conventional entry confirmations accumulate signal confidence", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeStrategy();
+  const nextConfig = config();
+  nextConfig.exposureControl.expansionConfirmationMass = 1.5;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  for (let observation = 1; observation <= 2; observation += 1) {
+    strategy.entry = { side: "long", size: 1, leverage: 2, price: null, confidence: 0.5 };
+    await bot.onTick({ ...tick, timestamp: observation * 1_000 });
+  }
+  assert.equal(api.orders.length, 0);
+  assert.equal((await bot.snapshot()).signalConfirmation?.confirmationMass, 1);
+
+  strategy.entry = { side: "long", size: 1, leverage: 2, price: null, confidence: 0.5 };
+  await bot.onTick({ ...tick, timestamp: 3_000 });
+  assert.equal(api.orders.length, 1);
+  assert.equal((await bot.snapshot()).positions[0].leverage, 2);
 });
 
 test("target exposure expands and reduces positions through the bot contract", async () => {
@@ -220,7 +265,7 @@ test("target exposure expands and reduces positions through the bot contract", a
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
   strategy.target = {
-    targetExposure: 3, price: 100, confidence: 0.8, staticConfidence: 1, distributionConfidence: 1,
+    targetExposure: 3, price: 100, confidence: 1,
   };
   await bot.onTick(tick);
   assert.equal(api.orders[0].order.side, "buy");
@@ -234,7 +279,7 @@ test("target exposure expands and reduces positions through the bot contract", a
     fill: { filledAsset: 30, filledQuote: 3_000, remaining: 0 },
   });
   strategy.target = {
-    targetExposure: 1, price: 100, confidence: 0.8, staticConfidence: 1, distributionConfidence: 1,
+    targetExposure: 1, price: 100, confidence: 1,
   };
   await bot.onTick({ ...tick, timestamp: 2_000 });
 
@@ -252,7 +297,7 @@ test("target exposure reversals exit before entering the opposite side", async (
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
   strategy.target = {
-    targetExposure: 2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+    targetExposure: 2, price: 100, confidence: 1,
   };
   await bot.onTick(tick);
   await bot.onOrder({
@@ -261,7 +306,7 @@ test("target exposure reversals exit before entering the opposite side", async (
     fill: { filledAsset: 20, filledQuote: 2_000, remaining: 0 },
   });
   strategy.target = {
-    targetExposure: -2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+    targetExposure: -2, price: 100, confidence: 1,
   };
   await bot.onTick({ ...tick, timestamp: 2_000 });
 
@@ -275,7 +320,7 @@ test("target exposure reversals exit before entering the opposite side", async (
     fill: { filledAsset: 20, filledQuote: 2_000, remaining: 0 },
   });
   strategy.target = {
-    targetExposure: -2, price: 100, confidence: 1, staticConfidence: 1, distributionConfidence: 1,
+    targetExposure: -2, price: 100, confidence: 1,
   };
   await bot.onTick({ ...tick, timestamp: 3_000 });
   assert.equal(api.orders[2].order.type, "limit");
@@ -287,13 +332,14 @@ test("target exposure rate-limits expansions quadratically by static confidence"
   const api = new FakeApi();
   const strategy = new FakeTargetStrategy();
   const nextConfig = config();
+  useOracleExposureControls(nextConfig);
   nextConfig.maxTargetLeverage = 10;
   nextConfig.maxTradeQuote = 10_000;
+  strategy.modelConfidence = 0.5;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
   strategy.target = {
-    targetExposure: 8, price: 100, confidence: 0.5, staticConfidence: 0.5,
-    distributionConfidence: 1,
+    targetExposure: 8, price: 100, confidence: 1,
   };
   await bot.onTick(tick);
 
@@ -301,30 +347,90 @@ test("target exposure rate-limits expansions quadratically by static confidence"
   assert.equal(api.orders[0].order.size, 18.75);
 });
 
+test("target exposure applies the bot's configurable confidence leverage floor", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  nextConfig.exposureControl.confidenceLeverageFloor = 0.75;
+  nextConfig.exposureControl.minimumSignalConfidence = 0;
+  nextConfig.exposureControl.maximumSignalConfidenceThreshold = 0;
+  nextConfig.exposureControl.expansionConfirmationMass = 0;
+  nextConfig.exposureControl.expansionDeltaCapFraction = 1;
+  strategy.modelConfidence = 0.5;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  strategy.target = { targetExposure: 8, price: 100, confidence: 0 };
+  await bot.onTick(tick);
+
+  // 10 * 0.5 * (0.75 * 0.5) = 1.875x.
+  assert.equal((await bot.snapshot()).positions[0].leverage, 1.875);
+  assert.equal(api.orders[0].order.size, 18.75);
+});
+
+test("target exposure gates expansions on quality-scaled distribution confidence", async () => {
+  const api = new FakeApi();
+  const strategy = new FakeTargetStrategy();
+  const nextConfig = config();
+  useOracleExposureControls(nextConfig);
+  nextConfig.maxTargetLeverage = 10;
+  nextConfig.maxTradeQuote = 10_000;
+  nextConfig.exposureControl.expansionConfirmationMass = 0;
+  strategy.modelConfidence = 0.5;
+  const bot = new GridTradingBot({ api, strategy, config: nextConfig });
+
+  // At static confidence 0.5, the threshold is 0.05 + (0.5 - 0.05) * 0.5 = 0.275.
+  strategy.target = {
+    targetExposure: 3, price: 100, confidence: 0.27,
+  };
+  await bot.onTick(tick);
+  assert.equal(api.orders.length, 0);
+
+  strategy.target = {
+    targetExposure: 3, price: 100, confidence: 0.28,
+  };
+  await bot.onTick({ ...tick, timestamp: 2_000 });
+  assert.equal(api.orders.length, 1);
+  assert.equal((await bot.snapshot()).positions[0].leverage, 1.875);
+  await bot.onOrder({
+    type: "fill",
+    orderId: api.orders[0].order.id,
+    fill: { filledAsset: 18.75, filledQuote: 1_875, remaining: 0 },
+  });
+
+  // Risk reductions bypass the confidence gate.
+  strategy.target = {
+    targetExposure: 1, price: 100, confidence: 0,
+  };
+  await bot.onTick({ ...tick, timestamp: 3_000 });
+  assert.equal(api.orders[1].order.side, "sell");
+  assert.equal(api.orders[1].order.size, 8.75);
+});
+
 test("target exposure confirmations accumulate distribution confidence and interpolate leverage", async () => {
   const api = new FakeApi();
   const strategy = new FakeTargetStrategy();
   const nextConfig = config();
+  useOracleExposureControls(nextConfig);
   nextConfig.maxTargetLeverage = 100;
   nextConfig.maxTradeQuote = 100_000;
-  nextConfig.targetExposureControl.expansionConfirmationMass = 1.5;
+  nextConfig.exposureControl.expansionConfirmationMass = 1.5;
+  strategy.modelConfidence = 0.5;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
   strategy.target = {
-    targetExposure: 3, price: 100, confidence: 0.5, staticConfidence: 0.5,
-    distributionConfidence: 0.5,
+    targetExposure: 3, price: 100, confidence: 0.5,
   };
   await bot.onTick(tick);
   strategy.target = {
-    targetExposure: 5, price: 100, confidence: 0.5, staticConfidence: 0.5,
-    distributionConfidence: 0.5,
+    targetExposure: 5, price: 100, confidence: 0.5,
   };
   await bot.onTick({ ...tick, timestamp: 2_000 });
   assert.equal(api.orders.length, 0);
-  assert.equal((await bot.snapshot()).targetExposureExpansion?.confirmationMass, 1);
+  assert.equal((await bot.snapshot()).signalConfirmation?.confirmationMass, 1);
   strategy.target = {
-    targetExposure: 4, price: 100, confidence: 0.5, staticConfidence: 0.5,
-    distributionConfidence: 0.5,
+    targetExposure: 4, price: 100, confidence: 0.5,
   };
   await bot.onTick({ ...tick, timestamp: 3_000 });
 
@@ -339,14 +445,14 @@ test("internal borrowing locks only the amount borrowed from the lender", async 
   nextConfig.internalBorrow.enabled = true;
   const bot = new GridTradingBot({ api, strategy, config: nextConfig });
 
-  strategy.entry = { side: "long", size: 0.5, leverage: 2, price: null, confidence: null };
+  strategy.entry = { side: "long", size: 0.5, leverage: 2, price: null, confidence: 1 };
   await bot.onTick(tick);
   await bot.onOrder({
     type: "fill",
     orderId: api.orders[0].order.id,
     fill: { filledAsset: 10, filledQuote: 1_000, remaining: 0 },
   });
-  strategy.entry = { side: "short", size: 0.5, leverage: 2, price: null, confidence: null };
+  strategy.entry = { side: "short", size: 0.5, leverage: 2, price: null, confidence: 1 };
   await bot.onTick({ ...tick, timestamp: 2_000 });
   await bot.onOrder({
     type: "fill",
@@ -447,9 +553,11 @@ class FakeStrategy implements TradingStrategy<unknown, StrategySnapshot, Strateg
   exit: TradingStrategyExitSignal | null = null;
   restores = 0;
   updates = 0;
+  modelConfidence = 1;
 
   async warmup() {}
   async onTick() {}
+  staticConfidence() { return this.modelConfidence; }
   async entrySignal() {
     const signal = this.entry;
     this.entry = null;
@@ -500,10 +608,23 @@ function config(): TradingBotConfig {
     stopLossRate: null,
     takeProfitRate: null,
     cooldownMs: 0,
-    targetExposureControl: {
-      expansionConfirmationMass: 1,
-      expansionDeltaCapFraction: 0.75,
+    exposureControl: {
+      confidenceLeverageFloor: 1,
+      minimumSignalConfidence: 0,
+      maximumSignalConfidenceThreshold: 0,
+      expansionConfirmationMass: 0,
+      expansionDeltaCapFraction: 1,
     },
     internalBorrow: { enabled: false, lockLenderAmounts: true, borrowerProfitShare: 1 },
+  };
+}
+
+function useOracleExposureControls(config: TradingBotConfig): void {
+  config.exposureControl = {
+    confidenceLeverageFloor: 0.75,
+    minimumSignalConfidence: 0.05,
+    maximumSignalConfidenceThreshold: 0.5,
+    expansionConfirmationMass: 1,
+    expansionDeltaCapFraction: 0.75,
   };
 }

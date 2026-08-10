@@ -9,6 +9,7 @@ import type {
   StrategyDiagnostics,
   StrategySnapshot,
   TradingStrategy,
+  TradingStrategyEntrySignal,
   TradingStrategyTargetExposureSignal,
 } from "./strategy.js";
 
@@ -37,8 +38,14 @@ export interface TradingBotConfig<TStrategyConfig = unknown> {
   stopLossRate: number | null;
   takeProfitRate: number | null;
   cooldownMs: number;
-  targetExposureControl: {
-    /** Total same-side distribution-confidence mass required before expansion. */
+  exposureControl: {
+    /** Minimum leverage fraction before distribution confidence, scaled by model confidence. */
+    confidenceLeverageFloor: number;
+    /** Minimum signal confidence required at full predictor confidence. */
+    minimumSignalConfidence: number;
+    /** Signal-confidence threshold approached as predictor confidence falls to zero. */
+    maximumSignalConfidenceThreshold: number;
+    /** Total same-side signal-confidence mass required before expansion. */
     expansionConfirmationMass: number;
     /** Fraction of max leverage forming the expansion-delta cap before quality scaling. */
     expansionDeltaCapFraction: number;
@@ -96,10 +103,10 @@ export interface BotSnapshot<
   strategy: TStrategySnapshot;
   positions: TradingPosition[];
   lastEntryAt: number;
-  targetExposureExpansion: TargetExposureExpansionConfirmation | null;
+  signalConfirmation: SignalConfirmation | null;
 }
 
-export interface TargetExposureExpansionConfirmation {
+export interface SignalConfirmation {
   side: PositionSide;
   confirmationMass: number;
   minimumLeverage: number;
@@ -120,7 +127,9 @@ export interface BotEntryRiskReport {
   blocker: string | null;
 }
 
-export interface BotDiagnostics<TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics> {
+export interface BotDiagnostics<
+  TDiagnostics extends StrategyDiagnostics = StrategyDiagnostics,
+> {
   strategy: TDiagnostics;
   positions: readonly TradingPosition[];
   /** Derived by flattening position entry/exit grids. */
@@ -166,9 +175,16 @@ export class GridTradingBot<
   private positions: TradingPosition[] = [];
   private lastTickAt = 0;
   private lastEntryAt = 0;
-  private targetExposureExpansion: TargetExposureExpansionConfirmation | null = null;
+  private signalConfirmation: SignalConfirmation | null =
+    null;
 
-  constructor(private readonly options: BotOptions<TStrategyConfig, TStrategySnapshot, TDiagnostics>) {
+  constructor(
+    private readonly options: BotOptions<
+      TStrategyConfig,
+      TStrategySnapshot,
+      TDiagnostics
+    >,
+  ) {
     this.config = options.config;
   }
 
@@ -180,12 +196,13 @@ export class GridTradingBot<
     this.lastTickAt = tick.timestamp;
     await this.options.strategy.onTick(tick);
     await this.applyLifecycle(tick);
+    // todo: should be decomposed and decoupled better
     if (this.options.strategy.targetExposureSignal) {
       const account = await this.options.api.getEquity();
-      const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
-      const currentExposure = equity > 0
-        ? this.signedPositionNotional(tick.price) / equity
-        : 0;
+      const equity =
+        account.quoteUnleveraged + account.assetUnleveraged * tick.price;
+      const currentExposure =
+        equity > 0 ? this.signedPositionNotional(tick.price) / equity : 0;
       const target = await this.options.strategy.targetExposureSignal({
         timestamp: tick.timestamp,
         price: tick.price,
@@ -198,18 +215,23 @@ export class GridTradingBot<
     }
     const exit = await this.options.strategy.exitSignal();
     if (exit) {
+      this.cancelSignalConfirmation(exit.side);
       await this.createExit(exit.side, exit.size, exit.price, exit.confidence);
     }
     const entry = await this.options.strategy.entrySignal();
     if (entry && tick.timestamp - this.lastEntryAt >= this.config.cooldownMs) {
-      await this.createEntry(
-        entry.side,
-        entry.size,
-        entry.leverage,
-        entry.price,
-        entry.confidence,
-        tick,
-      );
+      const controlled = await this.controlEntry(entry, tick);
+      if (controlled) {
+        await this.createEntry(
+          controlled.signal.side,
+          controlled.signal.size,
+          controlled.signal.leverage,
+          controlled.signal.price,
+          controlled.signal.confidence,
+          tick,
+          controlled.maximumQuote,
+        );
+      }
     } else if (entry) {
       this.reportEntryRisk({
         side: entry.side,
@@ -223,14 +245,16 @@ export class GridTradingBot<
   async onOrder(event: TradingOrderEvent): Promise<void> {
     if (event.type === "liquidation") {
       this.positions = [];
-      this.targetExposureExpansion = null;
+      this.signalConfirmation = null;
       return;
     }
     if (event.type === "maintenance") {
       this.applyMaintenance(event.quoteCharge, event.assetCharge);
       return;
     }
-    const found = this.findOrder(event.type === "open" ? event.order.id : event.orderId);
+    const found = this.findOrder(
+      event.type === "open" ? event.order.id : event.orderId,
+    );
     if (!found) {
       return;
     }
@@ -277,12 +301,12 @@ export class GridTradingBot<
 
   async snapshot(): Promise<BotSnapshot<TStrategyConfig, TStrategySnapshot>> {
     return {
-      version: 4,
+      version: 6,
       config: structuredClone(this.config),
       strategy: await this.options.strategy.snapshot(),
       positions: structuredClone(this.positions),
       lastEntryAt: this.lastEntryAt,
-      targetExposureExpansion: structuredClone(this.targetExposureExpansion),
+      signalConfirmation: structuredClone(this.signalConfirmation),
     };
   }
 
@@ -290,13 +314,15 @@ export class GridTradingBot<
     snapshot: BotSnapshot<TStrategyConfig, TStrategySnapshot>,
     options: { restoreStrategy?: boolean } = {},
   ): Promise<void> {
-    if (snapshot.version !== 4) {
+    if (snapshot.version !== 6) {
       throw new Error(`Unsupported bot snapshot version: ${snapshot.version}`);
     }
     this.config = structuredClone(snapshot.config);
     this.positions = structuredClone(snapshot.positions);
     this.lastEntryAt = snapshot.lastEntryAt ?? 0;
-    this.targetExposureExpansion = structuredClone(snapshot.targetExposureExpansion);
+    this.signalConfirmation = structuredClone(
+      snapshot.signalConfirmation,
+    );
     if (options.restoreStrategy === false) {
       await this.options.strategy.updateConfig(this.config.strategy);
     } else {
@@ -319,14 +345,15 @@ export class GridTradingBot<
       positions: this.positions,
       plannedOrders: plannedOrdersOf(this.positions),
       saturated: Boolean(
-        this.lastTickAt && this.lastTickAt - this.lastEntryAt < this.config.cooldownMs
+        this.lastTickAt &&
+        this.lastTickAt - this.lastEntryAt < this.config.cooldownMs,
       ),
     };
   }
 
   async updateConfig(config: TradingBotConfig<TStrategyConfig>): Promise<void> {
     this.config = structuredClone(config);
-    this.targetExposureExpansion = null;
+    this.signalConfirmation = null;
     await this.options.strategy.updateConfig(config.strategy);
   }
 
@@ -423,6 +450,7 @@ export class GridTradingBot<
     signalPrice: number | null,
     confidence: number | null,
     tick: TradingTick,
+    maximumQuote = Number.POSITIVE_INFINITY,
   ): Promise<void> {
     const currentPrice = tick.price;
     if (currentPrice <= 0 || size <= 0) {
@@ -437,7 +465,11 @@ export class GridTradingBot<
     const rules = await this.options.api.getMarketRules();
     const requested = Math.max(
       1,
-      Math.min(requestedLeverage, this.config.maxTargetLeverage, rules.maxLeverage),
+      Math.min(
+        requestedLeverage,
+        this.config.maxTargetLeverage,
+        rules.maxLeverage,
+      ),
     );
     const capacity = await this.options.api.getOrderCapacity({
       side: side === "long" ? "buy" : "sell",
@@ -445,9 +477,14 @@ export class GridTradingBot<
       leverage: requested,
     });
     const leverage = Math.max(1, Math.min(requested, capacity.leverage));
-    const count = signalPrice === null ? 1 : Math.max(1, Math.round(this.config.entryGrid.orderCount));
-    const quantityRules = signalPrice === null ? rules.marketQuantity : rules.limitQuantity;
-    const quantityCap = quantityRules.max === null ? Infinity : quantityRules.max * currentPrice;
+    const count =
+      signalPrice === null
+        ? 1
+        : Math.max(1, Math.round(this.config.entryGrid.orderCount));
+    const quantityRules =
+      signalPrice === null ? rules.marketQuantity : rules.limitQuantity;
+    const quantityCap =
+      quantityRules.max === null ? Infinity : quantityRules.max * currentPrice;
     const notionalCap = rules.maxNotional ?? Infinity;
     const providerCapacity = Math.max(
       0,
@@ -459,7 +496,7 @@ export class GridTradingBot<
     if (remainingCapacity > 0 && remainingCapacity < minimum) {
       desiredQuote = providerCapacity;
     }
-    const quote = Math.min(this.config.maxTradeQuote, desiredQuote);
+    const quote = Math.min(this.config.maxTradeQuote, maximumQuote, desiredQuote);
     this.reportEntryRisk({
       side,
       size: quote,
@@ -483,9 +520,10 @@ export class GridTradingBot<
       exitGrid: null,
       stopLossPrice: null,
       takeProfitPrice: null,
-      expiresAt: this.config.positionLifetimeMs === null
-        ? null
-        : tick.timestamp + this.config.positionLifetimeMs,
+      expiresAt:
+        this.config.positionLifetimeMs === null
+          ? null
+          : tick.timestamp + this.config.positionLifetimeMs,
     };
     this.positions.push(position);
     await this.placeGrid(
@@ -500,7 +538,12 @@ export class GridTradingBot<
     );
     if (entryGrid.orders.length === 0) {
       this.positions.splice(this.positions.indexOf(position), 1);
-      this.reportEntryRisk({ side, size: quote, leverage, blocker: "provider" });
+      this.reportEntryRisk({
+        side,
+        size: quote,
+        leverage,
+        blocker: "provider",
+      });
       return;
     }
     this.lastEntryAt = tick.timestamp;
@@ -512,40 +555,55 @@ export class GridTradingBot<
   ): Promise<void> {
     if (!(tick.price > 0) || !Number.isFinite(signal.targetExposure)) return;
     const accountBeforeControl = await this.options.api.getEquity();
-    const equityBeforeControl = accountBeforeControl.quoteUnleveraged
-      + accountBeforeControl.assetUnleveraged * tick.price;
+    const equityBeforeControl =
+      accountBeforeControl.quoteUnleveraged +
+      accountBeforeControl.assetUnleveraged * tick.price;
     if (!(equityBeforeControl > 0)) return;
-    const currentExposure = this.signedPositionNotional(tick.price) / equityBeforeControl;
-    const controlled = this.controlTargetExposure(signal, currentExposure);
+    const currentExposure =
+      this.signedPositionNotional(tick.price) / equityBeforeControl;
+    const staticConfidence = this.options.strategy.staticConfidence();
+    const controlled = this.controlTargetExposure(
+      signal,
+      currentExposure,
+      staticConfidence,
+    );
     if (!controlled) return;
     await this.cancelOpenOrders();
     const account = await this.options.api.getEquity();
-    const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
+    const equity =
+      account.quoteUnleveraged + account.assetUnleveraged * tick.price;
     if (!(equity > 0)) return;
 
     const target = Math.max(
       -this.config.maxTargetLeverage,
       Math.min(this.config.maxTargetLeverage, controlled.targetExposure),
     );
-    const targetSide: PositionSide | null = target > 0 ? "long" : target < 0 ? "short" : null;
-    const oppositeSide: PositionSide | null = targetSide === "long"
-      ? "short"
-      : targetSide === "short"
-        ? "long"
-        : null;
+    const targetSide: PositionSide | null =
+      target > 0 ? "long" : target < 0 ? "short" : null;
+    const oppositeSide: PositionSide | null =
+      targetSide === "long" ? "short" : targetSide === "short" ? "long" : null;
 
-    if (oppositeSide && this.sidePositionNotional(oppositeSide, tick.price) > 0) {
+    if (
+      oppositeSide &&
+      this.sidePositionNotional(oppositeSide, tick.price) > 0
+    ) {
       // A reversal must release the old side before the new entry consumes capacity.
       await this.createExit(oppositeSide, 1, null, controlled.confidence);
     }
     if (targetSide === null) {
       await this.createExit("long", 1, controlled.price, controlled.confidence);
-      await this.createExit("short", 1, controlled.price, controlled.confidence);
+      await this.createExit(
+        "short",
+        1,
+        controlled.price,
+        controlled.confidence,
+      );
       return;
     }
 
     const refreshed = await this.options.api.getEquity();
-    const refreshedEquity = refreshed.quoteUnleveraged + refreshed.assetUnleveraged * tick.price;
+    const refreshedEquity =
+      refreshed.quoteUnleveraged + refreshed.assetUnleveraged * tick.price;
     if (!(refreshedEquity > 0)) return;
     const currentSideQuote = this.sidePositionNotional(targetSide, tick.price);
     const desiredSideQuote = Math.abs(target) * refreshedEquity;
@@ -582,97 +640,200 @@ export class GridTradingBot<
   private controlTargetExposure(
     signal: TradingStrategyTargetExposureSignal,
     currentExposure: number,
+    strategyStaticConfidence: number,
   ): TradingStrategyTargetExposureSignal | null {
     const desired = Math.max(
       -this.config.maxTargetLeverage,
       Math.min(this.config.maxTargetLeverage, signal.targetExposure),
     );
     const epsilon = 1e-10;
-    const currentSide: PositionSide | null = currentExposure > epsilon
-      ? "long"
-      : currentExposure < -epsilon
-        ? "short"
-        : null;
-    const desiredSide: PositionSide | null = desired > epsilon
-      ? "long"
-      : desired < -epsilon
-        ? "short"
-        : null;
+    const currentSide: PositionSide | null =
+      currentExposure > epsilon
+        ? "long"
+        : currentExposure < -epsilon
+          ? "short"
+          : null;
+    const desiredSide: PositionSide | null =
+      desired > epsilon ? "long" : desired < -epsilon ? "short" : null;
 
     // Risk-reducing targets, including complete closure, are never delayed or capped.
-    if (desiredSide === null || (
-      currentSide === desiredSide && Math.abs(desired) <= Math.abs(currentExposure) + epsilon
-    )) {
-      this.targetExposureExpansion = null;
+    if (
+      desiredSide === null ||
+      (currentSide === desiredSide &&
+        Math.abs(desired) <= Math.abs(currentExposure) + epsilon)
+    ) {
+      this.signalConfirmation = null;
       return { ...signal, targetExposure: desired };
     }
     // A reversal always crosses flat first. A later observation may enter the new side.
     if (currentSide !== null && desiredSide !== currentSide) {
-      this.targetExposureExpansion = null;
+      this.signalConfirmation = null;
       return { ...signal, targetExposure: 0, price: null };
     }
-    if (!Number.isFinite(signal.staticConfidence)) return null;
-    const staticConfidence = Math.max(0, Math.min(1, signal.staticConfidence));
-    if (!Number.isFinite(signal.distributionConfidence)) return null;
-    const distributionConfidence = Math.max(
-      0,
-      Math.min(1, signal.distributionConfidence),
+    const controlledLeverage = this.controlExposureExpansion({
+      side: desiredSide!,
+      desiredLeverage: Math.abs(desired),
+      currentLeverage: Math.abs(currentExposure),
+      confidence: signal.confidence,
+      staticConfidence: strategyStaticConfidence,
+    });
+    if (controlledLeverage === null) return null;
+    return {
+      ...signal,
+      targetExposure:
+        desiredSide === "long" ? controlledLeverage : -controlledLeverage,
+    };
+  }
+
+  private async controlEntry(
+    signal: TradingStrategyEntrySignal,
+    tick: TradingTick,
+  ): Promise<{ signal: TradingStrategyEntrySignal; maximumQuote: number } | null> {
+    if (this.exposureControlsAreNeutral()) {
+      return { signal, maximumQuote: Number.POSITIVE_INFINITY };
+    }
+    if (!(tick.price > 0)) return null;
+    const account = await this.options.api.getEquity();
+    const equity = account.quoteUnleveraged + account.assetUnleveraged * tick.price;
+    if (!(equity > 0)) return null;
+    const currentLeverage = this.sidePositionNotional(signal.side, tick.price) / equity;
+    const desiredLeverage = Math.min(
+      this.config.maxTargetLeverage,
+      currentLeverage + Math.max(0, signal.leverage),
     );
-    const configuredConfirmationMass = (
-      this.config.targetExposureControl.expansionConfirmationMass
+    const controlledLeverage = this.controlExposureExpansion({
+      side: signal.side,
+      desiredLeverage,
+      currentLeverage,
+      confidence: signal.confidence,
+      staticConfidence: this.options.strategy.staticConfidence(),
+    });
+    if (controlledLeverage === null || controlledLeverage <= currentLeverage) return null;
+    return {
+      signal: {
+        ...signal,
+        leverage: Math.min(signal.leverage, Math.max(1, controlledLeverage)),
+      },
+      maximumQuote: (controlledLeverage - currentLeverage) * equity,
+    };
+  }
+
+  private controlExposureExpansion(input: {
+    side: PositionSide;
+    desiredLeverage: number;
+    currentLeverage: number;
+    confidence: number | null;
+    staticConfidence: number;
+  }): number | null {
+    if (this.exposureControlsAreNeutral()) return input.desiredLeverage;
+    const epsilon = 1e-10;
+    if (!Number.isFinite(input.staticConfidence)) return null;
+    const staticConfidence = Math.max(0, Math.min(1, input.staticConfidence));
+    const signalConfidence = input.confidence === null
+      ? 0
+      : Math.max(0, Math.min(1, input.confidence));
+    if (!Number.isFinite(signalConfidence)) return null;
+    const configuredLeverageFloor = this.config.exposureControl.confidenceLeverageFloor;
+    if (!Number.isFinite(configuredLeverageFloor)) return null;
+    const leverageFloor = Math.max(0, Math.min(1, configuredLeverageFloor));
+    const effectiveFloor = leverageFloor * staticConfidence;
+    const leverageFraction = staticConfidence * (
+      effectiveFloor + (1 - effectiveFloor) * signalConfidence
     );
+    const confidenceLimitedLeverage = Math.min(
+      input.desiredLeverage,
+      this.config.maxTargetLeverage * leverageFraction,
+    );
+    if (!(confidenceLimitedLeverage > input.currentLeverage + epsilon)) {
+      this.signalConfirmation = null;
+      return confidenceLimitedLeverage;
+    }
+
+    const configuredMinimumConfidence =
+      this.config.exposureControl.minimumSignalConfidence;
+    const configuredMaximumThreshold =
+      this.config.exposureControl.maximumSignalConfidenceThreshold;
+    if (
+      !Number.isFinite(configuredMinimumConfidence)
+      || !Number.isFinite(configuredMaximumThreshold)
+    ) return null;
+    const minimumConfidence = Math.max(0, Math.min(1, configuredMinimumConfidence));
+    const maximumThreshold = Math.max(
+      minimumConfidence,
+      Math.min(1, configuredMaximumThreshold),
+    );
+    const requiredSignalConfidence = minimumConfidence
+      + (maximumThreshold - minimumConfidence) * (1 - staticConfidence);
+    if (signalConfidence < requiredSignalConfidence) return null;
+
+    const configuredConfirmationMass = this.config.exposureControl.expansionConfirmationMass;
     if (!Number.isFinite(configuredConfirmationMass)) return null;
     const requiredConfirmationMass = Math.max(0, configuredConfirmationMass);
-    const desiredLeverage = Math.abs(desired);
-    if (this.targetExposureExpansion?.side === desiredSide) {
-      this.targetExposureExpansion.confirmationMass += distributionConfidence;
-      this.targetExposureExpansion.minimumLeverage = Math.min(
-        this.targetExposureExpansion.minimumLeverage,
-        desiredLeverage,
+    if (this.signalConfirmation?.side === input.side) {
+      this.signalConfirmation.confirmationMass += signalConfidence;
+      this.signalConfirmation.minimumLeverage = Math.min(
+        this.signalConfirmation.minimumLeverage,
+        confidenceLimitedLeverage,
       );
-      this.targetExposureExpansion.maximumLeverage = Math.max(
-        this.targetExposureExpansion.maximumLeverage,
-        desiredLeverage,
+      this.signalConfirmation.maximumLeverage = Math.max(
+        this.signalConfirmation.maximumLeverage,
+        confidenceLimitedLeverage,
       );
     } else {
-      this.targetExposureExpansion = {
-        side: desiredSide!,
-        confirmationMass: distributionConfidence,
-        minimumLeverage: desiredLeverage,
-        maximumLeverage: desiredLeverage,
+      this.signalConfirmation = {
+        side: input.side,
+        confirmationMass: signalConfidence,
+        minimumLeverage: confidenceLimitedLeverage,
+        maximumLeverage: confidenceLimitedLeverage,
       };
     }
-    if (this.targetExposureExpansion.confirmationMass < requiredConfirmationMass) return null;
+    if (this.signalConfirmation.confirmationMass < requiredConfirmationMass) return null;
 
-    const confirmed = this.targetExposureExpansion;
-    this.targetExposureExpansion = null;
+    const confirmed = this.signalConfirmation;
+    this.signalConfirmation = null;
     const selectedLeverage = confirmed.minimumLeverage
-      + staticConfidence * (confirmed.maximumLeverage - confirmed.minimumLeverage);
-    const capFraction = Math.max(
-      0,
-      this.config.targetExposureControl.expansionDeltaCapFraction,
-    );
+      + staticConfidence * (
+        confirmed.maximumLeverage - confirmed.minimumLeverage
+      );
+    const capFraction = Math.max(0, this.config.exposureControl.expansionDeltaCapFraction);
     const maximumDelta = this.config.maxTargetLeverage
       * capFraction
       * staticConfidence ** 2;
     const controlledLeverage = Math.min(
       selectedLeverage,
-      Math.abs(currentExposure) + maximumDelta,
+      input.currentLeverage + maximumDelta,
     );
-    if (!(controlledLeverage > Math.abs(currentExposure) + epsilon)) return null;
-    return {
-      ...signal,
-      targetExposure: desiredSide === "long" ? controlledLeverage : -controlledLeverage,
-    };
+    return controlledLeverage > input.currentLeverage + epsilon
+      ? controlledLeverage
+      : null;
+  }
+
+  private cancelSignalConfirmation(
+    side: PositionSide,
+  ): void {
+    if (this.signalConfirmation?.side === side) this.signalConfirmation = null;
+  }
+
+  private exposureControlsAreNeutral(): boolean {
+    const control = this.config.exposureControl;
+    return control.confidenceLeverageFloor === 1
+      && control.minimumSignalConfidence === 0
+      && control.maximumSignalConfidenceThreshold === 0
+      && control.expansionConfirmationMass === 0
+      && control.expansionDeltaCapFraction >= 1;
   }
 
   private signedPositionNotional(price: number): number {
-    return this.sidePositionNotional("long", price) - this.sidePositionNotional("short", price);
+    return (
+      this.sidePositionNotional("long", price) -
+      this.sidePositionNotional("short", price)
+    );
   }
 
   private sidePositionNotional(side: PositionSide, price: number): number {
     return this.positions.reduce(
-      (sum, position) => sum + (position.side === side ? position.asset * price : 0),
+      (sum, position) =>
+        sum + (position.side === side ? position.asset * price : 0),
       0,
     );
   }
@@ -683,8 +844,13 @@ export class GridTradingBot<
     price: number | null,
     confidence: number | null,
   ): Promise<void> {
-    const positions = this.positions.filter((position) => position.side === side && position.asset > 0);
-    const total = positions.reduce((sum, position) => sum + this.closableAsset(position), 0);
+    const positions = this.positions.filter(
+      (position) => position.side === side && position.asset > 0,
+    );
+    const total = positions.reduce(
+      (sum, position) => sum + this.closableAsset(position),
+      0,
+    );
     let remaining = total * clamp01(size);
     for (const position of positions) {
       if (remaining <= 0) {
@@ -743,12 +909,14 @@ export class GridTradingBot<
     const weights = gridWeights(count, config, confidence);
     const rules = await this.options.api.getMarketRules();
     const quantityRules = market ? rules.marketQuantity : rules.limitQuantity;
-    const prices = weights.map((_, index) => signalPrice === null
-      ? null
-      : normalizePrice(
-          gridPrice(signalPrice, side, index, config.maxPriceStep),
-          rules.price,
-        ));
+    const prices = weights.map((_, index) =>
+      signalPrice === null
+        ? null
+        : normalizePrice(
+            gridPrice(signalPrice, side, index, config.maxPriceStep),
+            rules.price,
+          ),
+    );
     const sizes = weights.map((weight) => quantity * weight);
     const totalQuote = sizes.reduce(
       (sum, size, index) => sum + size * (prices[index] ?? grid.creationPrice),
@@ -756,14 +924,19 @@ export class GridTradingBot<
     );
     if (quoteLimit !== null && totalQuote > quoteLimit) {
       const scale = quoteLimit / totalQuote;
-      for (let index = 0; index < sizes.length; index += 1) sizes[index] *= scale;
+      for (let index = 0; index < sizes.length; index += 1)
+        sizes[index] *= scale;
     }
     let carry = 0;
     for (let index = sizes.length - 1; index >= 0; index -= 1) {
       sizes[index] += carry;
       carry = 0;
       const notional = sizes[index] * (prices[index] ?? grid.creationPrice);
-      if (index > 0 && rules.minNotional !== null && notional < rules.minNotional) {
+      if (
+        index > 0 &&
+        rules.minNotional !== null &&
+        notional < rules.minNotional
+      ) {
         carry = sizes[index];
         sizes[index] = 0;
       }
@@ -784,9 +957,10 @@ export class GridTradingBot<
         leverage: position.leverage,
         reduceOnly,
       };
-      const result = price === null
-        ? await this.options.api.createMarketOrder(orderInput)
-        : await this.options.api.createLimitOrder({ ...orderInput, price });
+      const result =
+        price === null
+          ? await this.options.api.createMarketOrder(orderInput)
+          : await this.options.api.createLimitOrder({ ...orderInput, price });
       if (result.accepted) {
         grid.orders.push({ order: result.order, filled: 0 });
       }
@@ -802,23 +976,35 @@ export class GridTradingBot<
         continue;
       }
       if (position.exitGrid) {
-        const reset = this.config.exitGrid.reset === "previous-anchor" && (
-          position.side === "long"
-            ? tick.price > position.exitGrid.creationPrice * (1 + this.config.exitGrid.maxPriceStep)
-            : tick.price < position.exitGrid.creationPrice * (1 - this.config.exitGrid.maxPriceStep)
-        );
+        const reset =
+          this.config.exitGrid.reset === "previous-anchor" &&
+          (position.side === "long"
+            ? tick.price >
+              position.exitGrid.creationPrice *
+                (1 + this.config.exitGrid.maxPriceStep)
+            : tick.price <
+              position.exitGrid.creationPrice *
+                (1 - this.config.exitGrid.maxPriceStep));
         if (reset) {
           await this.replaceExitGrid(position, position.asset, tick.price);
         }
         continue;
       }
-      const stop = position.stopLossPrice !== null && (
-        position.side === "long" ? tick.price <= position.stopLossPrice : tick.price >= position.stopLossPrice
-      );
-      const take = position.takeProfitPrice !== null && (
-        position.side === "long" ? tick.price >= position.takeProfitPrice : tick.price <= position.takeProfitPrice
-      );
-      if (stop || take || (position.expiresAt !== null && tick.timestamp >= position.expiresAt)) {
+      const stop =
+        position.stopLossPrice !== null &&
+        (position.side === "long"
+          ? tick.price <= position.stopLossPrice
+          : tick.price >= position.stopLossPrice);
+      const take =
+        position.takeProfitPrice !== null &&
+        (position.side === "long"
+          ? tick.price >= position.takeProfitPrice
+          : tick.price <= position.takeProfitPrice);
+      if (
+        stop ||
+        take ||
+        (position.expiresAt !== null && tick.timestamp >= position.expiresAt)
+      ) {
         await this.replaceExitGrid(position, position.asset, null);
       }
     }
@@ -830,23 +1016,37 @@ export class GridTradingBot<
       return;
     }
     if (this.config.stopLossRate !== null && position.stopLossPrice === null) {
-      position.stopLossPrice = entryPrice
-        * (position.side === "long" ? 1 - this.config.stopLossRate : 1 + this.config.stopLossRate);
+      position.stopLossPrice =
+        entryPrice *
+        (position.side === "long"
+          ? 1 - this.config.stopLossRate
+          : 1 + this.config.stopLossRate);
     }
-    if (this.config.takeProfitRate !== null && position.takeProfitPrice === null) {
-      position.takeProfitPrice = entryPrice
-        * (position.side === "long" ? 1 + this.config.takeProfitRate : 1 - this.config.takeProfitRate);
+    if (
+      this.config.takeProfitRate !== null &&
+      position.takeProfitPrice === null
+    ) {
+      position.takeProfitPrice =
+        entryPrice *
+        (position.side === "long"
+          ? 1 + this.config.takeProfitRate
+          : 1 - this.config.takeProfitRate);
     }
   }
 
-  private updateBorrow(position: TradingPosition, fill: { filledAsset: number; filledQuote: number }): void {
+  private updateBorrow(
+    position: TradingPosition,
+    fill: { filledAsset: number; filledQuote: number },
+  ): void {
     const borrowedRate = Math.max(0, 1 - 1 / position.leverage);
     if (position.side === "long") {
       const borrowed = fill.filledQuote * borrowedRate;
-      position.externalBorrow.quote += borrowed - this.allocateInternal(position, 0, borrowed);
+      position.externalBorrow.quote +=
+        borrowed - this.allocateInternal(position, 0, borrowed);
     } else {
       const borrowed = fill.filledAsset * borrowedRate;
-      position.externalBorrow.asset += borrowed - this.allocateInternal(position, borrowed, 0);
+      position.externalBorrow.asset +=
+        borrowed - this.allocateInternal(position, borrowed, 0);
     }
   }
 
@@ -880,7 +1080,8 @@ export class GridTradingBot<
       if (remaining <= 0) break;
     }
     position.internalBorrow = position.internalBorrow.filter(
-      (borrow) => borrow.asset > Number.EPSILON || borrow.quote > Number.EPSILON,
+      (borrow) =>
+        borrow.asset > Number.EPSILON || borrow.quote > Number.EPSILON,
     );
   }
 
@@ -894,18 +1095,25 @@ export class GridTradingBot<
     }
     let remaining = asset || quote;
     for (const lender of this.positions) {
-      if (lender.id === borrower.id || lender.side === borrower.side || remaining <= 0) {
+      if (
+        lender.id === borrower.id ||
+        lender.side === borrower.side ||
+        remaining <= 0
+      ) {
         continue;
       }
       const lent = this.lentAmounts(lender.id);
-      const available = asset > 0
-        ? Math.max(0, lender.asset - lent.asset)
-        : Math.max(0, lender.quote - lent.quote);
+      const available =
+        asset > 0
+          ? Math.max(0, lender.asset - lent.asset)
+          : Math.max(0, lender.quote - lent.quote);
       const amount = Math.min(remaining, available);
       if (amount <= 0) {
         continue;
       }
-      const existing = borrower.internalBorrow.find((borrow) => borrow.positionId === lender.id);
+      const existing = borrower.internalBorrow.find(
+        (borrow) => borrow.positionId === lender.id,
+      );
       const borrow = existing ?? { positionId: lender.id, asset: 0, quote: 0 };
       borrow.asset += asset > 0 ? amount : 0;
       borrow.quote += quote > 0 ? amount : 0;
@@ -925,27 +1133,34 @@ export class GridTradingBot<
     if (position.side === "long") {
       return Math.max(0, position.asset - lent.asset);
     }
-    const availableQuoteRate = position.quote > 0
-      ? Math.max(0, position.quote - lent.quote) / position.quote
-      : 1;
+    const availableQuoteRate =
+      position.quote > 0
+        ? Math.max(0, position.quote - lent.quote) / position.quote
+        : 1;
     return position.asset * Math.min(1, availableQuoteRate);
   }
 
   private lentAmounts(positionId: string): { asset: number; quote: number } {
-    return this.positions.reduce((total, position) => {
-      for (const borrow of position.internalBorrow) {
-        if (borrow.positionId === positionId) {
-          total.asset += borrow.asset;
-          total.quote += borrow.quote;
+    return this.positions.reduce(
+      (total, position) => {
+        for (const borrow of position.internalBorrow) {
+          if (borrow.positionId === positionId) {
+            total.asset += borrow.asset;
+            total.quote += borrow.quote;
+          }
         }
-      }
-      return total;
-    }, { asset: 0, quote: 0 });
+        return total;
+      },
+      { asset: 0, quote: 0 },
+    );
   }
 
   private findOrder(id: string) {
     for (const position of this.positions) {
-      for (const [grid, entry] of [[position.entryGrid, true], [position.exitGrid, false]] as const) {
+      for (const [grid, entry] of [
+        [position.entryGrid, true],
+        [position.exitGrid, false],
+      ] as const) {
         const item = grid?.orders.find(({ order }) => order.id === id);
         if (grid && item) {
           return { position, grid, entry, item };
@@ -954,7 +1169,11 @@ export class GridTradingBot<
     }
   }
 
-  private removeEmptyGrid(position: TradingPosition, grid: PositionGrid, entry: boolean): void {
+  private removeEmptyGrid(
+    position: TradingPosition,
+    grid: PositionGrid,
+    entry: boolean,
+  ): void {
     if (grid.orders.length > 0) {
       return;
     }
@@ -981,9 +1200,14 @@ export class GridTradingBot<
   }
 
   private async cancelGrid(grid: PositionGrid): Promise<void> {
-    await Promise.all(grid.orders
-      .filter(({ order }) => order.status !== "filled" && order.status !== "rejected")
-      .map(({ order }) => this.options.api.cancelOrder(order.id)));
+    await Promise.all(
+      grid.orders
+        .filter(
+          ({ order }) =>
+            order.status !== "filled" && order.status !== "rejected",
+        )
+        .map(({ order }) => this.options.api.cancelOrder(order.id)),
+    );
     grid.orders.length = 0;
   }
 
@@ -997,24 +1221,36 @@ function filledGridAmount(
   entry: boolean,
   fill: { filledAsset: number; filledQuote: number },
 ): number {
-  return side === "long" === entry ? fill.filledQuote : fill.filledAsset;
+  return (side === "long") === entry ? fill.filledQuote : fill.filledAsset;
 }
 
-function ordersOf(positions: readonly TradingPosition[]): TradingOrderSnapshot[] {
-  return positions.flatMap((position) => [
-    ...(position.entryGrid?.orders ?? []),
-    ...(position.exitGrid?.orders ?? []),
-  ].map(({ order }) => order));
+function ordersOf(
+  positions: readonly TradingPosition[],
+): TradingOrderSnapshot[] {
+  return positions.flatMap((position) =>
+    [
+      ...(position.entryGrid?.orders ?? []),
+      ...(position.exitGrid?.orders ?? []),
+    ].map(({ order }) => order),
+  );
 }
 
-function plannedOrdersOf(positions: readonly TradingPosition[]): TradingOrderSnapshot[] {
+function plannedOrdersOf(
+  positions: readonly TradingPosition[],
+): TradingOrderSnapshot[] {
   return ordersOf(positions).filter(
     (order) => order.status !== "filled" && order.status !== "rejected",
   );
 }
 
-function sumSide(positions: readonly TradingPosition[], side: PositionSide): number {
-  return positions.reduce((sum, position) => sum + (position.side === side ? position.asset : 0), 0);
+function sumSide(
+  positions: readonly TradingPosition[],
+  side: PositionSide,
+): number {
+  return positions.reduce(
+    (sum, position) => sum + (position.side === side ? position.asset : 0),
+    0,
+  );
 }
 
 function distributeMaintenance(
@@ -1034,12 +1270,14 @@ function distributeMaintenance(
   let remaining = charge;
   for (let index = 0; index < positions.length; index += 1) {
     const position = positions[index]!;
-    const weight = externalTotal > 0
-      ? Math.max(0, position.externalBorrow[unit]) / externalTotal
-      : amountTotal > 0
-        ? Math.max(0, position[unit]) / amountTotal
-        : 1 / positions.length;
-    const allocated = index === positions.length - 1 ? remaining : charge * weight;
+    const weight =
+      externalTotal > 0
+        ? Math.max(0, position.externalBorrow[unit]) / externalTotal
+        : amountTotal > 0
+          ? Math.max(0, position[unit]) / amountTotal
+          : 1 / positions.length;
+    const allocated =
+      index === positions.length - 1 ? remaining : charge * weight;
     position[unit] += allocated;
     position.externalBorrow[unit] += allocated;
     remaining -= allocated;
@@ -1051,17 +1289,27 @@ function gridWeights(
   config: GridConfig,
   confidence: number | null,
 ): number[] {
-  const ratio = confidence === null
-    ? config.sizeFraction
-    : 1 - clamp01(confidence) * (1 - config.sizeFraction);
-  const raw = Array.from({ length: count }, (_, index) => config.sizeDistribution === "linear"
-    ? confidence === null ? count - index : 1 + clamp01(confidence) * (count - index - 1)
-    : Math.max(Number.EPSILON, ratio) ** index);
+  const ratio =
+    confidence === null
+      ? config.sizeFraction
+      : 1 - clamp01(confidence) * (1 - config.sizeFraction);
+  const raw = Array.from({ length: count }, (_, index) =>
+    config.sizeDistribution === "linear"
+      ? confidence === null
+        ? count - index
+        : 1 + clamp01(confidence) * (count - index - 1)
+      : Math.max(Number.EPSILON, ratio) ** index,
+  );
   const total = raw.reduce((sum, weight) => sum + weight, 0);
   return raw.map((weight) => weight / total);
 }
 
-function gridPrice(anchor: number, side: "buy" | "sell", index: number, step: number): number {
+function gridPrice(
+  anchor: number,
+  side: "buy" | "sell",
+  index: number,
+  step: number,
+): number {
   const direction = side === "buy" ? -1 : 1;
   return anchor * (1 + direction * Math.max(0, step) * index);
 }

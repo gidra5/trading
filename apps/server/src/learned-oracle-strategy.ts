@@ -9,13 +9,11 @@ import {
 } from "@trading/bot-algo";
 import {
   HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
-  HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
   HINDSIGHT_ORACLE_TEMPERATURE,
   ORACLE_DEFAULT_STATIC_CONFIDENCE_SCALE,
-  confidenceConditionedHindsightOracleExposure,
+  confidenceScaledHindsightOracleExposure,
   hindsightOracleTargetDecision,
   oracleExecutionExposureScale,
-  scaleOracleConfidence,
 } from "./bot-backtest.js";
 import {
   JOINT_PRICE_ORACLE_CONTEXT_LENGTH,
@@ -41,6 +39,10 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
     await super.onTick(tick);
   }
 
+  override staticConfidence(): number {
+    return this.staticConfidenceScale;
+  }
+
   async targetExposureSignal(
     context: TradingStrategyTargetExposureContext,
   ): Promise<TradingStrategyTargetExposureSignal | null> {
@@ -60,17 +62,10 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
       this.friction,
       HINDSIGHT_ORACLE_TEMPERATURE,
     );
-    const effectiveConfidence = scaleOracleConfidence(
-      decision.confidence,
-      this.staticConfidenceScale,
-    );
-    const targetExposure = confidenceConditionedHindsightOracleExposure(
+    const targetExposure = confidenceScaledHindsightOracleExposure(
       decision.targetExposure * executionScale,
       decision.confidence,
-      context.maxLeverage,
       HINDSIGHT_ORACLE_CONFIDENCE_EXPOSURE_POWER,
-      HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
-      this.staticConfidenceScale,
     );
     const gridStep = Math.abs(distribution.grid[1]! - distribution.grid[0]!);
     if (
@@ -80,9 +75,7 @@ export class LearnedOracleStrategy extends PeakValleyStrategy {
     return {
       targetExposure,
       price: this.tick.price,
-      confidence: effectiveConfidence,
-      staticConfidence: this.staticConfidenceScale,
-      distributionConfidence: decision.confidence,
+      confidence: decision.confidence,
     };
   }
 }

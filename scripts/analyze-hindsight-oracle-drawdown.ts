@@ -93,7 +93,7 @@ async function main(): Promise<void> {
     summaryOnly: true,
     hindsightOracleDistributionAt: cache.distributionAt,
     hindsightOracleConfidenceExposurePower: confidenceExposurePower,
-    hindsightOracleConfidenceLeverageFloor: confidenceLeverageFloor,
+    oracleConfidenceLeverageFloor: confidenceLeverageFloor,
   });
   const closeDrawdown = maximumDrawdown(result.equityCurve);
   const largestOneSecondLosses = result.equityCurve

@@ -75,13 +75,14 @@ if (fs.existsSync(appConfig.webDistDir)) {
   });
 }
 
+const exchangeTrading = new BinanceExchangeTrading(appConfig.binanceExchange);
 const marketCatalog = new BinanceMarketCatalog({
   apiKey: appConfig.binanceApiKey,
   apiSecret: appConfig.binanceApiSecret,
+  futuresCredentials: (venue) => exchangeTrading.catalogCredentialsFor(venue),
 });
 const initialMarket = await resolveInitialMarket();
 let activeMarket = initialMarket;
-const exchangeTrading = new BinanceExchangeTrading(appConfig.binanceExchange);
 const runtime = new TradingRuntime(
   createStorage(initialMarket),
   initialMarket,
@@ -100,6 +101,7 @@ const runtime = new TradingRuntime(
   },
 );
 await runtime.init();
+marketCatalog.invalidate();
 const kamaInspector = new KamaInspector(appConfig.dataDir);
 const mlpTrainingMetrics = new MlpTrainingMetricsReader(
   appConfig.mlpTrainingPlanFile,
@@ -344,6 +346,7 @@ server.put("/api/exchange/credentials", async (request, reply) => {
       apiSecret?: string;
     };
     await runtime.setExchangeCredentials(body);
+    marketCatalog.invalidate();
     broadcastState();
     return publicSnapshot();
   } catch (error) {

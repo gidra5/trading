@@ -44,10 +44,6 @@ export interface TradingStrategyTargetExposureSignal {
   price: number | null;
   /** 0 is uniform grid sizing; 1 concentrates sizing at price. */
   confidence: number | null;
-  /** Predictor-level confidence used for asymmetric exposure transition limits. */
-  staticConfidence: number;
-  /** Confidence derived from the current target-exposure distribution alone. */
-  distributionConfidence: number;
 }
 
 export interface StrategyDiagnostics {
@@ -84,6 +80,8 @@ export interface TradingStrategy<
   targetExposureSignal?(
     context: TradingStrategyTargetExposureContext,
   ): Promise<TradingStrategyTargetExposureSignal | null>;
+  /** Model-level reliability, independent of any individual signal. */
+  staticConfidence(): number;
   snapshot(): Promise<TSnapshot>;
   restore(snapshot: TSnapshot): Promise<void>;
   updateConfig(config: TConfig): Promise<void>;

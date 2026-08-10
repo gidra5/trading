@@ -68,6 +68,33 @@ test("Binance user-data fills preserve new bot order ids", () => {
   assert.equal(update?.fills?.[0]?.localOrderId, "bot-123");
 });
 
+test("Binance market catalog credentials follow the UI-configured exchange mode", () => {
+  const exchange = new BinanceExchangeTrading({
+    enabled: true,
+    mode: "usdm-futures-testnet",
+    apiKey: "ui-demo-key",
+    apiSecret: "ui-demo-secret",
+    liveApiKey: "live-key",
+    liveApiSecret: "live-secret",
+    recvWindowMs: 5_000,
+    autoSubmit: true,
+  });
+
+  assert.deepEqual(exchange.catalogCredentialsFor("usdm-futures"), {
+    apiKey: "ui-demo-key",
+    apiSecret: "ui-demo-secret",
+    baseUrl: "https://demo-fapi.binance.com",
+  });
+  assert.equal(exchange.catalogCredentialsFor("coinm-futures"), undefined);
+
+  exchange.updateConfig({ mode: "usdm-futures-live" });
+  assert.deepEqual(exchange.catalogCredentialsFor("usdm-futures"), {
+    apiKey: "live-key",
+    apiSecret: "live-secret",
+    baseUrl: "https://fapi.binance.com",
+  });
+});
+
 test("Binance capacity is capped by remaining provider notional", async () => {
   const exchange = {
     fetchFriction: async () => ({ feeBps: 4, estimatedSlippageBps: 1 }),

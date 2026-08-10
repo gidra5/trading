@@ -1317,7 +1317,7 @@ async function runPreparedWindow(
     learnedOracleDistributionAt: provider,
     learnedOracleMaximumLeverage: policy.maximumLeverage,
     hindsightOracleConfidenceExposurePower: policy.confidenceExposurePower,
-    hindsightOracleConfidenceLeverageFloor: policy.confidenceLeverageFloor,
+    oracleConfidenceLeverageFloor: policy.confidenceLeverageFloor,
     oracleStaticConfidenceScale: policy.staticConfidenceScale,
     oracleExpansionConfirmationMass: policy.expansionConfirmationMass,
     oracleExpansionDeltaCapFraction: policy.expansionDeltaCapFraction,

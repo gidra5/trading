@@ -7,6 +7,7 @@ import {
   type SimulatedTradingSnapshot,
   createPeakValleyBotConfig,
   createPeakValleyStrategyConfig,
+  peakValleyWarmupSamples,
   rescalePeakValleyStrategyConfig,
   createStrategyConfig,
   type BacktestPreset,
@@ -35,16 +36,24 @@ import {
 import type { MarketStreamStatus } from "./binance-stream.js";
 import { runBotBacktestFromCandles } from "./bot-backtest.js";
 import {
+  HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
   HINDSIGHT_ORACLE_MAINTENANCE_BPS_HOUR,
   HINDSIGHT_ORACLE_MAX_EXPOSURE,
   LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE,
+  ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD,
+  ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE,
   oracleMaximumEffectiveLeverage,
 } from "./bot-backtest.js";
 import { JointPriceOracleRuntime } from "./joint-price-oracle-runtime.js";
 import { LearnedOracleStrategy } from "./learned-oracle-strategy.js";
-import type { BinanceMarketListing, StreamVenue } from "./binance-markets.js";
+import {
+  isStreamVenue,
+  type BinanceMarketListing,
+  type StreamVenue,
+} from "./binance-markets.js";
 import {
   BacktestCancelledError,
+  fetchKlines,
   intervalToMs,
   isBacktestCancelledError,
   runHistoricalCandleBacktest,
@@ -93,9 +102,10 @@ type HistoricalPreset = Extract<
 >;
 
 interface StoredRuntimeState {
-  version: 1;
+  version: 2;
   status: "running" | "stopped";
   runStartedAt: number;
+  startingQuote: number;
   bot: BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>;
   simulation?: SimulatedTradingSnapshot;
   binance?: BinanceTradingApiSnapshot;
@@ -255,8 +265,9 @@ export class TradingRuntime {
 
   async init(): Promise<void> {
     await this.storage.ensureReady();
-    this.candles = await this.storage.loadCandles(500);
+    this.candles = await this.storage.loadCandles(this.liveCandleRetention());
     await this.loadSettings();
+    await this.hydrateExchangeWarmupCandles();
     await this.createBot(await this.storage.loadTradingState<StoredRuntimeState>());
   }
 
@@ -279,8 +290,9 @@ export class TradingRuntime {
     this.backtestAbort?.abort();
     this.backtest = createIdleBacktest();
     await this.storage.ensureReady();
-    this.candles = await this.storage.loadCandles(500);
+    this.candles = await this.storage.loadCandles(this.liveCandleRetention());
     await this.loadSettings();
+    await this.hydrateExchangeWarmupCandles();
     await this.createBot(await this.storage.loadTradingState<StoredRuntimeState>());
   }
 
@@ -341,7 +353,7 @@ export class TradingRuntime {
         return false;
       }
       this.candles.push(candle);
-      if (this.candles.length > 500) this.candles.shift();
+      if (this.candles.length > this.liveCandleRetention()) this.candles.shift();
     }
     return true;
   }
@@ -364,7 +376,8 @@ export class TradingRuntime {
         this.exchangeTrading!.reconciliationFromUserDataEvent(this.market, _payload),
       );
       const events = await this.deliverOrderEvents();
-      await this.refreshState(hasFill(events));
+      await this.exchangeTrading!.sync(this.market);
+      await this.refreshState(true);
       this.scheduleSave();
       return events;
     });
@@ -525,12 +538,11 @@ export class TradingRuntime {
     if (!this.exchangeTrading) {
       throw new Error("Binance exchange trading is not configured.");
     }
+    await this.exchangeTrading.sync(this.market);
     if (this.api instanceof BinanceTradingApi) {
       await this.api.sync();
       await this.deliverOrderEvents();
       await this.refreshState(true);
-    } else {
-      await this.exchangeTrading.sync(this.market);
     }
     return this.exchangeTrading.snapshot(this.market);
   }
@@ -676,9 +688,10 @@ export class TradingRuntime {
     }
     await this.refreshState();
     const state: StoredRuntimeState = {
-      version: 1,
+      version: 2,
       status: this.status,
       runStartedAt: this.runStartedAt,
+      startingQuote: this.legacyConfig.startingQuote,
       bot: this.botState,
       simulation: this.api instanceof SimulatedTradingApi ? this.api.snapshot() : undefined,
       binance: this.api instanceof BinanceTradingApi ? this.api.state() : undefined,
@@ -691,6 +704,22 @@ export class TradingRuntime {
   private async createBot(saved?: StoredRuntimeState): Promise<void> {
     this.entryRisk.clear();
     const restored = currentStoredState(saved);
+    if (restored) {
+      this.legacyConfig = createStrategyConfig({
+        ...this.legacyConfig,
+        startingQuote: restored.startingQuote,
+      });
+    } else if (this.executionMode === "binance" && this.exchangeTrading) {
+      const account = await new BinanceExchangeClient(this.exchangeTrading).getEquity(this.market);
+      const accountEquity = account.quoteUnleveraged
+        + account.assetUnleveraged * this.lastPrice();
+      if (accountEquity > 0 && Number.isFinite(accountEquity)) {
+        this.legacyConfig = createStrategyConfig({
+          ...this.legacyConfig,
+          startingQuote: accountEquity,
+        });
+      }
+    }
     this.status = restored?.status ?? this.status;
     this.runStartedAt = restored?.runStartedAt ?? Date.now();
     this.botConfig = restored?.bot.config
@@ -706,6 +735,14 @@ export class TradingRuntime {
         cooldownMs: 60_000,
         maxTradeQuote: Number.POSITIVE_INFINITY,
         maxTargetLeverage: this.learnedOracleMaximumLeverage,
+        exposureControl: {
+          confidenceLeverageFloor: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+          minimumSignalConfidence: ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE,
+          maximumSignalConfidenceThreshold:
+            ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD,
+          expansionConfirmationMass: 1,
+          expansionDeltaCapFraction: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
+        },
       };
     }
     this.api = this.executionMode === "binance" && this.exchangeTrading
@@ -755,12 +792,17 @@ export class TradingRuntime {
       const savedIntervalMs = restored.bot.config.strategy.sampleIntervalMs ?? 60_000;
       await this.bot.restore(
         { ...restored.bot, config: this.botConfig },
-        { restoreStrategy: savedIntervalMs === sampleIntervalMs },
+        {
+          restoreStrategy:
+            savedIntervalMs === sampleIntervalMs
+            && restored.bot.strategy.ready,
+        },
       );
     } else {
       await this.bot.warmup();
     }
     if (this.api instanceof BinanceTradingApi) {
+      await this.exchangeTrading!.sync(this.market);
       await this.api.sync();
       await this.deliverOrderEvents();
     }
@@ -769,7 +811,45 @@ export class TradingRuntime {
   }
 
   private async getHistory(count: number): Promise<TradingCandle[]> {
-    return (await this.storage.loadCandles(Math.max(1, count))).map(toTradingCandle);
+    return this.candles.slice(-Math.max(1, count)).map(toTradingCandle);
+  }
+
+  private liveCandleRetention(): number {
+    return Math.max(500, peakValleyWarmupSamples(this.botConfig.strategy));
+  }
+
+  private async hydrateExchangeWarmupCandles(): Promise<void> {
+    if (
+      this.executionMode !== "binance"
+      || !this.exchangeTrading
+      || !isStreamVenue(this.market.venue)
+    ) {
+      return;
+    }
+    const endpoint = this.exchangeTrading.klineEndpointFor(this.market);
+    if (!endpoint) {
+      return;
+    }
+    const intervalMs = intervalToMs(this.interval);
+    const count = this.liveCandleRetention();
+    const lastOpenTime = Math.floor(Date.now() / intervalMs) * intervalMs - intervalMs;
+    const fetched = await fetchKlines({
+      venue: this.market.venue,
+      symbol: this.market.symbol,
+      interval: this.interval,
+      startTime: lastOpenTime - (count - 1) * intervalMs,
+      endTime: lastOpenTime + intervalMs - 1,
+      limit: count,
+      endpoint,
+    });
+    const merged = new Map(this.candles.map((candle) => [candle.openTime, candle]));
+    for (const candle of fetched) {
+      merged.set(candle.openTime, candle);
+    }
+    this.candles = [...merged.values()]
+      .filter((candle) => candle.closed)
+      .sort((left, right) => left.openTime - right.openTime)
+      .slice(-count);
   }
 
   private async deliverOrderEvents(): Promise<RuntimeBotEvent[]> {
@@ -985,7 +1065,13 @@ export class TradingRuntime {
 }
 
 function currentStoredState(state: StoredRuntimeState | undefined): StoredRuntimeState | undefined {
-  return state?.bot.version === 2 && state.bot.strategy?.version === 5 ? state : undefined;
+  return state?.version === 2
+    && state.bot.version === 6
+    && state.bot.strategy?.version === 5
+    && state.startingQuote > 0
+    && Number.isFinite(state.startingQuote)
+    ? state
+    : undefined;
 }
 
 function normalizeBotConfig(

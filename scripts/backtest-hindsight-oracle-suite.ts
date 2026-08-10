@@ -33,6 +33,8 @@ import {
   HINDSIGHT_ORACLE_TEMPERATURE,
   HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
   LEARNED_ORACLE_DEFAULT_MAXIMUM_LEVERAGE,
+  ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD,
+  ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE,
   runBotBacktestFromCandles,
 } from "../apps/server/src/bot-backtest.js";
 import { historicalWarmupSamples } from "../apps/server/src/historical-backtest.js";
@@ -47,10 +49,11 @@ const MODEL_PLAN = path.resolve(
   argument("model-plan")
     ?? "ml/training-plans/oracle-distribution-path-15m-two-layer-glu-mean-p50-v1.json",
 );
-const ORACLE_SOURCE = argument("oracle-source") ?? "hindsight";
-if (ORACLE_SOURCE !== "hindsight" && ORACLE_SOURCE !== "model") {
+const oracleSourceArgument = argument("oracle-source") ?? "hindsight";
+if (oracleSourceArgument !== "hindsight" && oracleSourceArgument !== "model") {
   throw new Error("--oracle-source must be hindsight or model.");
 }
+const ORACLE_SOURCE: "hindsight" | "model" = oracleSourceArgument;
 const CANDLE_INTERVAL = argument("interval") ?? "1s";
 const INTERVAL_MS = candleIntervalMs(CANDLE_INTERVAL);
 if (ORACLE_SOURCE === "model" && CANDLE_INTERVAL !== "1m") {
@@ -126,7 +129,9 @@ interface SuiteReport {
     expansionConfirmationBasis?: "distribution-confidence-mass";
     expansionDeltaCapFraction?: number;
     staticConfidenceScale: number;
-    distributionConfidenceGate?: "disabled";
+    minimumDistributionConfidence: number;
+    maximumDistributionConfidenceThreshold: number;
+    minimumConfidenceBasis: "distribution-quality-window-scaled";
     returnCorrelation?: number;
     returnNoiseSeed?: number;
     returnCorrelationBasis?: "rolling-value-horizon-log-return";
@@ -207,6 +212,23 @@ async function main(): Promise<void> {
   );
   if (staticConfidenceScale < 0 || staticConfidenceScale > 1) {
     throw new Error("--static-confidence must be in [0, 1].");
+  }
+  const minimumDistributionConfidence = finiteArgument(
+    "oracle-minimum-distribution-confidence",
+    ORACLE_MINIMUM_DISTRIBUTION_CONFIDENCE,
+  );
+  const maximumDistributionConfidenceThreshold = finiteArgument(
+    "oracle-maximum-distribution-confidence-threshold",
+    ORACLE_MAXIMUM_DISTRIBUTION_CONFIDENCE_THRESHOLD,
+  );
+  if (
+    minimumDistributionConfidence < 0
+    || maximumDistributionConfidenceThreshold > 1
+    || maximumDistributionConfidenceThreshold < minimumDistributionConfidence
+  ) {
+    throw new Error(
+      "Oracle distribution-confidence thresholds must satisfy 0 <= minimum <= maximum <= 1.",
+    );
   }
   const returnNoiseSeed = integerArgument("oracle-noise-seed", 0);
   const expansionConfirmationMass = finiteArgument("oracle-expansion-confirmation-mass", 1);
@@ -298,6 +320,8 @@ async function main(): Promise<void> {
     returnNoiseSeed,
     expansionConfirmationMass,
     expansionDeltaCapFraction,
+    minimumDistributionConfidence,
+    maximumDistributionConfidenceThreshold,
     ORACLE_SOURCE,
     modelPlan?.id,
     staticConfidenceScale,
@@ -323,7 +347,9 @@ async function main(): Promise<void> {
       expansionConfirmationBasis: "distribution-confidence-mass",
       expansionDeltaCapFraction,
       staticConfidenceScale,
-      distributionConfidenceGate: "disabled",
+      minimumDistributionConfidence,
+      maximumDistributionConfidenceThreshold,
+      minimumConfidenceBasis: "distribution-quality-window-scaled",
       returnCorrelation,
       returnNoiseSeed,
       returnCorrelationBasis: "rolling-value-horizon-log-return",
@@ -412,7 +438,11 @@ async function main(): Promise<void> {
       learnedOracleDistributionAt: ORACLE_SOURCE === "model"
         ? precomputed?.distributionAt
         : undefined,
+      oracleConfidenceLeverageFloor: HINDSIGHT_ORACLE_CONFIDENCE_LEVERAGE_FLOOR,
       oracleStaticConfidenceScale: staticConfidenceScale,
+      oracleMinimumDistributionConfidence: minimumDistributionConfidence,
+      oracleMaximumDistributionConfidenceThreshold:
+        maximumDistributionConfidenceThreshold,
       oracleExpansionConfirmationMass: expansionConfirmationMass,
       oracleExpansionDeltaCapFraction: expansionDeltaCapFraction,
       onOracleDecision: (decision) => {
@@ -1475,6 +1505,8 @@ function readReport(
   returnNoiseSeed: number,
   expansionConfirmationMass: number,
   expansionDeltaCapFraction: number,
+  minimumDistributionConfidence: number,
+  maximumDistributionConfidenceThreshold: number,
   source: "hindsight" | "model",
   modelId: string | undefined,
   staticConfidenceScale: number,
@@ -1497,7 +1529,10 @@ function readReport(
     || parsed.oracle?.expansionConfirmationBasis !== "distribution-confidence-mass"
     || parsed.oracle?.expansionDeltaCapFraction !== expansionDeltaCapFraction
     || parsed.oracle?.staticConfidenceScale !== staticConfidenceScale
-    || parsed.oracle?.distributionConfidenceGate !== "disabled"
+    || parsed.oracle?.minimumDistributionConfidence !== minimumDistributionConfidence
+    || parsed.oracle?.maximumDistributionConfidenceThreshold
+      !== maximumDistributionConfidenceThreshold
+    || parsed.oracle?.minimumConfidenceBasis !== "distribution-quality-window-scaled"
     || (parsed.oracle?.returnCorrelation ?? 1) !== returnCorrelation
     || (parsed.oracle?.returnNoiseSeed ?? 0) !== returnNoiseSeed
     || parsed.oracle?.returnCorrelationBasis !== "rolling-value-horizon-log-return"

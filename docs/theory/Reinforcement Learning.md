@@ -31,6 +31,8 @@ That means, we seek such a policy $\pi$, that will generate highest *expected sc
 
 For optimal policy we will also have optimal value functions:
 $$ {v_o(s)=\max_{\pi} v(s)} \quad {q_o(s,a)=\max_{\pi} q(s,a)}$$
+Another properly of optimal policy is that is is greedy with respect to its action value function:
+$$\pi_o(a\ |\ s)=\arg \max_a q(s,a)$$
 
 Note that although we define dynamics and policy probabilistically, they can be deterministic, when described by delta distributions.
 
@@ -53,3 +55,7 @@ Another problem is that we might not be able to evaluate next state values, if t
 To get around these problems we can simply approximate the value function and then adjust it according to Bellman equations until we reach fixed point.
 
 This procedure applies to both action value and state value functions.
+
+# Policy improvement
+
+Note that we can continuously improve policy 
