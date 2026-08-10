@@ -13,6 +13,16 @@ const POLL_MS = 2_000;
 
 interface MetricValues {
   loss?: number;
+  normalizedMse?: number;
+  mse?: number;
+  rmse?: number;
+  mae?: number;
+  zeroBaselineMse?: number;
+  mseSkillVsZero?: number;
+  directionAccuracy?: number;
+  correlation?: number;
+  predictionStd?: number;
+  targetStd?: number;
   crossEntropy?: number;
   klDivergence?: number;
   klDivergenceVariance?: number;
@@ -378,6 +388,7 @@ export function MlpTrainingPage() {
           train: metricValues(event.train),
           validation: metricValues(event.validation),
           bestValidation: numberValue(event.bestValidation)
+            ?? numberValue(event.bestValidationScore)
             ?? numberValue(event.bestRawValidationKl),
           staleEpochs: numberValue(event.staleEpochs),
           trainingTargetTemperature: numberValue(
@@ -461,6 +472,9 @@ export function MlpTrainingPage() {
   const hasCurriculumEpochs = createMemo(() => epochs().some(
     (point) => point.trainingTargetTemperature !== undefined
       && point.curriculumTargetKl !== undefined,
+  ));
+  const hasRegressionEpochs = createMemo(() => epochs().some(
+    (point) => point.validation.normalizedMse !== undefined,
   ));
   const stage = createMemo(() => snapshot()?.status?.stage ?? "idle");
   const stageProgress = createMemo(() => {
@@ -659,6 +673,29 @@ export function MlpTrainingPage() {
               </Show>
               <Show when={!hasCurriculumEpochs()}>
                 <>
+              <Show when={hasRegressionEpochs()}>
+                <MetricChart title="Normalized MSE" subtitle="Lower is better; validation determines checkpoint selection" scale="log" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "normalizedMse"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "normalizedMse"),
+                  directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
+                ]} />
+                <MetricChart title="MSE skill versus zero" subtitle="Positive means lower MSE than always predicting zero" unit="ratio" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "mseSkillVsZero"),
+                  epochPlot("Validation", "#22c55e", epochs(), "validation", "mseSkillVsZero"),
+                ]} />
+                <MetricChart title="Direction accuracy" unit="ratio" yDomain={[0, 1]} xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "directionAccuracy"),
+                  epochPlot("Validation", "#f5b84b", epochs(), "validation", "directionAccuracy"),
+                ]} />
+                <MetricChart title="Return correlation" xLabel="epoch" series={[
+                  epochPlot("Train", "#38bdf8", epochs(), "train", "correlation"),
+                  epochPlot("Validation", "#a78bfa", epochs(), "validation", "correlation"),
+                ]} />
+                <MetricChart title="Prediction and target dispersion" scale="log" xLabel="epoch" series={[
+                  epochPlot("Prediction std", "#38bdf8", epochs(), "validation", "predictionStd"),
+                  epochPlot("Target std", "#f5b84b", epochs(), "validation", "targetStd"),
+                ]} />
+              </Show>
               <MetricChart title="Latest batch loss" scale="log" xLabel="global step" series={[
                 metricPlot("Total", "#38bdf8", trainSteps(), "loss"),
               ]} />
@@ -848,6 +885,9 @@ export function MlpTrainingPage() {
           <MetricCard label="Last global step" value={integer(latestStep()?.globalStep)} />
           <MetricCard label="Last batch loss" value={formatMetric(latestStep()?.latest.loss)} />
           <MetricCard label="Last best validation" value={formatMetric(latestEpoch()?.bestValidation)} />
+          <MetricCard label="Validation MSE skill" value={formatPercent(latestEpoch()?.validation.mseSkillVsZero)} />
+          <MetricCard label="Validation direction" value={formatPercent(latestEpoch()?.validation.directionAccuracy)} />
+          <MetricCard label="Validation correlation" value={formatMetric(latestEpoch()?.validation.correlation)} />
           <MetricCard label="Curriculum KL" value={formatMetric(latestEpoch()?.curriculumTargetKl)} />
           <MetricCard label="Target temperature" value={formatMetric(latestEpoch()?.trainingTargetTemperature)} />
           <MetricCard label="Learning rate" value={formatMetric(latestStep()?.learningRate)} />
@@ -1334,7 +1374,19 @@ function metricValues(value: unknown): MetricValues {
   if (!value || typeof value !== "object") return {};
   const record = value as Record<string, unknown>;
   return {
-    loss: numberValue(record.loss) ?? numberValue(record.trainingCrossEntropy),
+    loss: numberValue(record.loss)
+      ?? numberValue(record.normalizedMse)
+      ?? numberValue(record.trainingCrossEntropy),
+    normalizedMse: numberValue(record.normalizedMse),
+    mse: numberValue(record.mse),
+    rmse: numberValue(record.rmse),
+    mae: numberValue(record.mae),
+    zeroBaselineMse: numberValue(record.zeroBaselineMse),
+    mseSkillVsZero: numberValue(record.mseSkillVsZero),
+    directionAccuracy: numberValue(record.directionAccuracy),
+    correlation: numberValue(record.correlation),
+    predictionStd: numberValue(record.predictionStd),
+    targetStd: numberValue(record.targetStd),
     crossEntropy: numberValue(record.crossEntropy)
       ?? numberValue(record.trainingCrossEntropy)
       ?? numberValue(record.rawCrossEntropy),
@@ -1661,6 +1713,10 @@ function shortNumber(value: number): string {
 
 function formatUnit(value: number | undefined, unit: string, digits = 2): string {
   return value === undefined ? "—" : `${value.toFixed(digits)}${unit}`;
+}
+
+function formatPercent(value: number | undefined): string {
+  return value === undefined ? "—" : `${(value * 100).toFixed(3)}%`;
 }
 
 function integer(value: number | undefined): string {

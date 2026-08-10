@@ -496,12 +496,20 @@ class OracleDistributionPathWorker {
   };
 
   constructor(planFile: string) {
+    const workerPlan = JSON.parse(fs.readFileSync(planFile, "utf8")) as {
+      serving?: { type?: string };
+    };
+    const workerScript = workerPlan.serving?.type === "causal-forward-direct"
+      ? "ml/serve_forward_market_oracle.py"
+      : workerPlan.serving?.type === "causal-multiscale-direct"
+        ? "ml/serve_causal_multiscale_oracle.py"
+        : "ml/serve_oracle_distribution_path.py";
     const python = path.resolve(
       ".venv-ml",
       process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
     );
     this.child = spawn(python, [
-      path.resolve("ml/serve_oracle_distribution_path.py"),
+      path.resolve(workerScript),
       "--plan",
       planFile,
       "--history-dir",

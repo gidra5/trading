@@ -318,12 +318,45 @@ export interface VwKamaCandleRangeResponse {
   valueCandidatePath: VwKamaValuePathPoint[];
 }
 
+export interface FoundationForecastBenchmarkMetrics {
+  examples: number;
+  candleMseSkillVsPersistence: number;
+  candleCorrelation: number | null;
+  closeReturnCorrelation: number | null;
+  horizonReturnCorrelation: number | null;
+  horizonDirectionAccuracy: number;
+  oracleForwardKl: number;
+  samplePathCrpsAnchoredLog: number;
+  rawQuantileValidOhlcFraction: number;
+  repairedQuantileValidOhlcFraction: number;
+}
+
+export interface FoundationForecastBenchmarkSummary {
+  generatedAt: string;
+  uniqueOrigins: number;
+  horizonCandles: number;
+  excludedWindows: string[];
+  evidenceRole: string;
+  variants: Array<{
+    id: string;
+    modelId: string;
+    contextLength: number;
+    representation: string;
+    global: FoundationForecastBenchmarkMetrics;
+    windows: Array<{
+      windowId: string;
+      metrics: FoundationForecastBenchmarkMetrics;
+    }>;
+  }>;
+}
+
 export interface VwKamaInspectorCatalog {
   windows: VwKamaInspectorWindow[];
   scales: Array<{ label: string; intervalMs: number }>;
   defaults: VwKamaInspectorRequest;
   presets: VwKamaPreset[];
   predictorPresets: VwKamaPredictorPreset[];
+  foundationForecastBenchmark?: FoundationForecastBenchmarkSummary;
   mlpModels: Array<{
     id: string;
     label: string;

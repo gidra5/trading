@@ -388,18 +388,32 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
         dropout_rate: float = 0.5,
         initial_radius: float = BRANCH_NORMALIZATION_INITIAL_RADIUS,
         minimum_radius: float = 1e-4,
+        output_count: int = OUTPUT_ACTION_COUNT,
     ) -> None:
         super().__init__()
-        _validate_feature_statistics(feature_mean, feature_std)
+        if feature_mean.ndim != 1 \
+                or feature_std.shape != feature_mean.shape \
+                or feature_mean.numel() < 1:
+            raise ValueError(
+                "feature normalization must contain matching non-empty vectors"
+            )
+        if not bool(torch.isfinite(feature_mean).all()) \
+                or not bool(torch.isfinite(feature_std).all()) \
+                or not bool((feature_std > 0).all()):
+            raise ValueError(
+                "feature normalization must be finite with positive scales"
+            )
         if not 0 <= dropout < 1 or not 0 <= dropout_rate <= 1:
             raise ValueError("dropout settings are invalid")
+        if output_count < 1:
+            raise ValueError("decoder output count must be positive")
         self.register_buffer("feature_mean", feature_mean.float().clone())
         self.register_buffer("feature_std", feature_std.float().clone())
         self.dropout_rate = float(dropout_rate)
         self.dropout_gate_probability = dropout_gate_probability(
             self.dropout_rate
         )
-        widths = (INPUT_RETURN_COUNT, *LEARNED_RADIUS_WIDTHS)
+        widths = (feature_mean.numel(), *LEARNED_RADIUS_WIDTHS)
         self.layers = nn.ModuleList([
             nn.Linear(input_width, 2 * output_width)
             for input_width, output_width in zip(
@@ -441,7 +455,7 @@ class LearnedRadiusShrinkingDecoder(nn.Module):
             for width in LEARNED_RADIUS_WIDTHS
         ])
         self.dropout = nn.Dropout(dropout)
-        self.output = nn.Linear(LEARNED_RADIUS_WIDTHS[-1], OUTPUT_ACTION_COUNT)
+        self.output = nn.Linear(LEARNED_RADIUS_WIDTHS[-1], output_count)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

@@ -1217,6 +1217,15 @@ export function KamaInspectorPage() {
 
   const resetViewport = () => setViewport(timeRange());
 
+  const foundationForecastRows = createMemo(() => {
+    const benchmark = catalog()?.foundationForecastBenchmark;
+    if (!benchmark) return [];
+    return benchmark.variants.map((variant) => ({
+      ...variant,
+      selected: variant.windows.find((item) => item.windowId === windowId())?.metrics,
+    }));
+  });
+
   return (
     <main class="min-h-screen bg-ink-950 text-ink-100">
       <div class="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-4 lg:px-6">
@@ -1243,6 +1252,64 @@ export function KamaInspectorPage() {
 
         <Show when={catalogError()}>
           {(message) => <ErrorNotice message={message()} onRetry={() => void loadCatalog()} />}
+        </Show>
+
+        <Show when={catalog()?.foundationForecastBenchmark}>
+          {(benchmark) => (
+            <section class="panel">
+              <div class="mb-3 flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                  <div class="muted-label">Foundation forecast benchmark</div>
+                  <h2 class="text-lg font-semibold">Next 15 one-minute BTC candles</h2>
+                  <div class="mt-1 text-xs text-ink-400">
+                    {formatQuote(benchmark().uniqueOrigins, 0)} untouched origins across 28 inspector windows · fit windows and latest 3M excluded · persistence skill above zero is required.
+                  </div>
+                </div>
+                <div class="text-xs text-ink-400">
+                  Selected window: {catalog()?.windows.find((item) => item.id === windowId())?.label ?? "global only"}
+                </div>
+              </div>
+              <div class="overflow-auto rounded-2 border border-line">
+                <table class="w-full min-w-220 border-collapse">
+                  <thead class="bg-ink-900">
+                    <tr>
+                      <th class="table-head">Model</th>
+                      <th class="table-head">Global candle skill</th>
+                      <th class="table-head">Window candle skill</th>
+                      <th class="table-head">1m return corr.</th>
+                      <th class="table-head">15m return corr.</th>
+                      <th class="table-head">Oracle KL</th>
+                      <th class="table-head">CRPS</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={foundationForecastRows()}>
+                      {(row) => (
+                        <tr>
+                          <td class="td-cell">
+                            <div class="font-medium">{foundationForecastLabel(row.id)}</div>
+                            <div class="mt-0.5 text-xs text-ink-400">{row.contextLength} × 1m · {row.representation}</div>
+                          </td>
+                          <td class="td-cell tabular-nums" classList={{
+                            "text-gain": row.global.candleMseSkillVsPersistence > 0,
+                            "text-loss": row.global.candleMseSkillVsPersistence < 0,
+                          }}>{signedPercent(row.global.candleMseSkillVsPersistence)}</td>
+                          <td class="td-cell tabular-nums" classList={{
+                            "text-gain": (row.selected?.candleMseSkillVsPersistence ?? 0) > 0,
+                            "text-loss": (row.selected?.candleMseSkillVsPersistence ?? 0) < 0,
+                          }}>{row.selected ? signedPercent(row.selected.candleMseSkillVsPersistence) : "—"}</td>
+                          <td class="td-cell tabular-nums">{nullableCorrelation(row.global.closeReturnCorrelation)}</td>
+                          <td class="td-cell tabular-nums">{nullableCorrelation(row.global.horizonReturnCorrelation)}</td>
+                          <td class="td-cell tabular-nums">{formatQuote(row.global.oracleForwardKl, 3)}</td>
+                          <td class="td-cell tabular-nums">{formatQuote(row.global.samplePathCrpsAnchoredLog, 6)}</td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
         </Show>
 
         <Show when={predictorModel() === "legacy" ? latestOptimization() : undefined}>
@@ -5082,6 +5149,18 @@ function formatNoiseRatio(value: number | null): string {
 
 function signedPercent(value: number): string {
   return `${value >= 0 ? "+" : ""}${formatQuote(value * 100, 2)} pp`;
+}
+
+function nullableCorrelation(value: number | null): string {
+  return value === null ? "—" : formatQuote(value, 3);
+}
+
+function foundationForecastLabel(id: string): string {
+  if (id === "fincast-zero-shot") return "FinCast";
+  if (id === "tirex2-zero-shot") return "TiRex-2";
+  if (id === "chronos2-zero-shot") return "Chronos-2";
+  if (id === "chronos2-btc-lora") return "Chronos-2 · BTC LoRA";
+  return id;
 }
 
 function exposure(state: OracleState): number {

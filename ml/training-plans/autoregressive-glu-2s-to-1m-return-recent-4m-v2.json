@@ -1,0 +1,61 @@
+{
+  "id": "autoregressive-glu-2s-to-1m-return-recent-4m-v2",
+  "label": "Scratch full-BPTT 2s GLU rollout to one 1m return on Apr-Jul 2026",
+  "datasetDir": "data/training/datasets/autoregressive-glu-2s-to-1m-return-recent-4m-v2",
+  "runDir": "data/training/runs/autoregressive-glu-2s-to-1m-return-recent-4m-v2",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "split": {
+    "type": "direct-calendar-months-v1",
+    "trainStart": "2026-04-01",
+    "trainEnd": "2026-05-31",
+    "validationStart": "2026-06-01",
+    "validationEnd": "2026-06-30",
+    "testStart": "2026-07-01",
+    "testEnd": "2026-07-23"
+  },
+  "evaluateTest": true,
+  "architecture": {
+    "contract": "autoregressive-shared-two-second-glu-to-single-minute-return-v2",
+    "horizonSeconds": 60,
+    "chunkSeconds": 2,
+    "widths": [512],
+    "dropout": 0.05,
+    "dropoutRate": 0.5,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001
+  },
+  "training": {
+    "epochs": 32,
+    "batchSize": 4096,
+    "evaluationBatchSize": 8192,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "learningRateSchedule": {
+      "type": "reduce-on-validation-plateau",
+      "factor": 0.5,
+      "patience": 3,
+      "threshold": 0.000001,
+      "minimumLearningRate": 0.000001
+    },
+    "earlyStoppingPatience": 8,
+    "gradientClip": 10,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "bfloat16"
+  }
+}

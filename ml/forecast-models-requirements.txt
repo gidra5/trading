@@ -1,0 +1,20 @@
+numpy==2.4.6
+pandas==3.0.5
+scipy==1.17.1
+scikit-learn==1.9.0
+torch==2.13.0; sys_platform != "win32"
+torch==2.13.0+cu130; sys_platform == "win32"
+einops==0.8.1
+huggingface-hub>=0.35.3,<2
+safetensors>=0.8.0,<1
+transformers>=4.41,<6
+accelerate>=1.1,<2
+peft>=0.18.1,<1
+PyYAML>=6,<7
+tqdm>=4.67,<5
+beartype==0.20.2
+einx==0.3.0
+CoLT5-attention==0.11.1
+utilsforecast>=0.2.12,<1
+ninja>=1.13,<2
+zstandard>=0.25,<1

@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "causal-multiscale-oracle-15m-daily-v1",
+  "dataset": {
+    "sourceDatasetDir": "data/training/datasets/mlp-direct-oracle-temporal-v12-delay-3600s-full-minute-oracle",
+    "datasetDir": "data/training/datasets/causal-multiscale-oracle-15m-daily-v1",
+    "minuteHistoryDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m",
+    "featureCount": 771,
+    "sampling": "one sample at each completed minute",
+    "target": "same-time 15-minute 101-action bot-backtest oracle distribution"
+  },
+  "runDir": "data/training/runs/causal-multiscale-oracle-15m-daily-v1",
+  "serving": {
+    "type": "causal-multiscale-direct"
+  },
+  "oracle": {
+    "holdingPeriodCandles": 1,
+    "decisionDelayCandles": 1,
+    "valueHorizonCandles": 15,
+    "friction": 0.00175,
+    "gridSize": 101,
+    "temperature": 0.01,
+    "minExposure": -100,
+    "maxExposure": 100,
+    "maxEffectiveExposure": 250,
+    "quoteBorrowRatePerCandle": 0.000016658479699709332,
+    "assetBorrowRatePerCandle": 0.000016658479699709332
+  },
+  "architecture": {
+    "type": "learned-radius-shrinking",
+    "widths": [512, 496, 480, 464, 448, 432, 416, 400, 384, 368, 352, 336, 320, 304, 288, 272],
+    "dropout": 0.05,
+    "dropoutRate": 0.5,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001
+  },
+  "curriculum": {
+    "type": "kl-gated-equal-validation-entropy-steps-target-probability-temperature",
+    "sourceTemperature": 0.01,
+    "startTemperature": 0.25,
+    "gate": {
+      "metric": "curriculumTargetKl",
+      "threshold": 0.05,
+      "evaluation": "every-epoch"
+    },
+    "finalTemperature": 0.01,
+    "entropySchedulePoints": 100,
+    "solver": {
+      "type": "log-temperature-newton",
+      "minimumEntropyDerivative": 1e-8
+    }
+  },
+  "objective": {
+    "type": "mean-plus-batch-p50-forward-kl",
+    "probabilityFloor": 1e-8,
+    "meanKlWeight": 1,
+    "p50KlWeight": 1,
+    "regularizers": {
+      "softLayerNorm": {
+        "weight": 1,
+        "varianceWeight": 1
+      },
+      "softWeightBound": {
+        "weight": 0.01,
+        "desiredMagnitude": 1,
+        "sharpness": 10,
+        "absoluteEpsilon": 1e-8
+      }
+    }
+  },
+  "training": {
+    "epochs": 1000,
+    "batchSize": 8192,
+    "evaluationBatchSize": 8192,
+    "learningRate": 0.0001,
+    "learningRateSchedule": {
+      "type": "decay-every-prod-kl-stale-block",
+      "startLearningRate": 0.0001,
+      "finalLearningRate": 0.000001,
+      "perEpochDecayFactor": 0.954992586021436,
+      "staleEpochsPerReduction": 16,
+      "decayFactor": 0.4786300923226383,
+      "qualifyingStaleEpochs": 100
+    },
+    "gradientClip": 100,
+    "temperatureStalePatience": 32,
+    "earlyStoppingPatience": 100,
+    "seed": 1337,
+    "device": "cuda"
+  }
+}

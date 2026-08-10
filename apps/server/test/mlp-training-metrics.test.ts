@@ -377,3 +377,57 @@ test("MLP training metrics exposes catalogued archived training.log runs", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("MLP training metrics canonicalizes minute-return events and patience", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mlp-training-minute-return-"));
+  const planFile = path.join(root, "ml", "training-plan.json");
+  const runDir = path.join(root, "data", "training", "runs", "next-second");
+  const datasetDir = path.join(root, "data", "training", "datasets", "next-second");
+  await Promise.all([
+    mkdir(path.dirname(planFile), { recursive: true }),
+    mkdir(path.join(runDir, "logs"), { recursive: true }),
+    mkdir(path.join(runDir, "state"), { recursive: true }),
+    mkdir(datasetDir, { recursive: true }),
+  ]);
+  await writeFile(planFile, JSON.stringify({
+    id: "next-second",
+    label: "Next second",
+    runDir: "data/training/runs/next-second",
+    datasetDir: "data/training/datasets/next-second",
+    training: { epochs: 256, earlyStoppingPatience: 32 },
+  }));
+  await writeFile(path.join(runDir, "state", "status.json"), JSON.stringify({
+    pid: process.pid,
+    stage: "training",
+    updatedAt: new Date().toISOString(),
+  }));
+  await writeFile(path.join(runDir, "logs", "training.jsonl"), [
+    JSON.stringify({ event: "minute-return-dataset-selected", counts: { train: 10 } }),
+    JSON.stringify({
+      event: "minute-return-epoch",
+      epoch: 3,
+      validation: { normalizedMse: 0.98, mseSkillVsZero: 0.02 },
+    }),
+    JSON.stringify({ event: "minute-return-complete", bestEpoch: 3 }),
+    "",
+  ].join("\n"));
+
+  try {
+    const reader = new MlpTrainingMetricsReader(planFile, root);
+    const result = await reader.read(0);
+    assert.equal(result.plan.patience, 32);
+    assert.equal(result.runs[0]?.patience, 32);
+    assert.deepEqual(result.events.map((event) => event.event), [
+      "dataset-complete",
+      "epoch",
+      "training-complete",
+    ]);
+    assert.equal(result.events[1]?.sourceEvent, "minute-return-epoch");
+    assert.deepEqual(result.events[1]?.validation, {
+      normalizedMse: 0.98,
+      mseSkillVsZero: 0.02,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -10,3 +10,7 @@ torch==2.13.0+cu130; sys_platform == "win32"
 triton==3.7.1; sys_platform != "win32"
 triton-windows==3.7.1.post27; sys_platform == "win32"
 zstandard==0.25.0
+einops==0.8.1
+huggingface_hub==0.33.1
+safetensors==0.6.2
+tqdm==4.67.1

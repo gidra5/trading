@@ -51,6 +51,53 @@ produces a 5%-capped, liquidity-size-weighted index for every scale and an
 equal-weight aggregate of the five scale sleeves; see
 [docs/binance-multiscale-basis.md](docs/binance-multiscale-basis.md).
 
+### Kronos candle forecasts
+
+Install the pinned public Kronos mini, small, and base checkpoints, then run the
+probabilistic 15x1m benchmark across the non-fit inspector windows:
+
+```bash
+npm run kronos:setup
+npm run kronos:benchmark -- --models all --temperature 0.8 --sample-count 20
+```
+
+The benchmark retains all Monte Carlo paths, reports candle/correlation/oracle
+distribution metrics, and repairs invalid OHLC quantiles with KQSP. Predictor
+fine-tuning is available through `npm run kronos:finetune`; the documented final
+configuration excludes every policy-calibration inspector episode from both
+training and checkpoint-selection loss. Causal forecast
+artifacts can be calibrated and replayed through the real fee/slippage/borrow-
+aware bot with `npm run kronos:backtest`; its `calibrate` and `validate` phases
+enforce the chronological policy split. After fine-tuning,
+`npm run kronos:final-pipeline` resumes and chains dense inference, policy
+freezing, the guarded one-shot bot validation, and a hash-bound completion
+audit. The audit can also be rerun explicitly with `npm run kronos:audit`. The leakage-free data split, exact
+commands, limitations, and current results are documented in
+[the Kronos report](docs/experiments/kronos-report-2026-08-07.md), with the full
+experiment notebook in
+[docs/experiments/kronos-btcusdt-1m-15-candle-2026-08-06.md](docs/experiments/kronos-btcusdt-1m-15-candle-2026-08-06.md).
+
+### Financial foundation forecast models
+
+FinCast, TiRex-2, and Chronos-2 use a separate pinned Python environment and a
+shared native-quantile adapter:
+
+```bash
+npm run forecast-models:setup
+npm run forecast-models:smoke
+npm run forecast-models:screen
+npm run forecast-models:benchmark
+```
+
+Chronos-2 can be adapted on the strictly pre-test BTC history with
+`forecast-models:finetune:chronos2` and compared with its base checkpoint using
+`forecast-models:validate:chronos2`. Dense causal artifacts use the same real
+bot simulator via `forecast-models:backtest`. The KAMA inspector catalog exposes
+the complete global and per-window benchmark summary. Exact pins, the
+leakage contract, LoRA selection, all-window results, and simulator evidence are
+recorded in
+[docs/experiments/foundation-forecast-models-btcusdt-1m-2026-08-07.md](docs/experiments/foundation-forecast-models-btcusdt-1m-2026-08-07.md).
+
 ## Historical data
 
 The downloader is resumable and stores independently compressed daily shards,

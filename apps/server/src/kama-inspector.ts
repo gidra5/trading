@@ -53,6 +53,8 @@ import {
   type ExposureValueOracle,
   type HandcraftedIndicatorPredictorParameters,
   type DirectIndicatorPredictorParameters,
+  type FoundationForecastBenchmarkMetrics,
+  type FoundationForecastBenchmarkSummary,
 } from "@trading/bot-algo";
 import { readCandleShardReference, TradingStorageLayout } from "@trading/storage";
 import { fetchBinanceSpotDailyShard } from "./binance-history-cache.js";
@@ -1274,8 +1276,94 @@ function inspectorCatalog(dataDir: string, now = Date.now()): VwKamaInspectorCat
       ...HANDCRAFTED_PREDICTOR_PRESETS,
       ...DIRECT_INDICATOR_PREDICTOR_PRESETS,
     ].map((preset) => structuredClone(preset)),
+    foundationForecastBenchmark: loadFoundationForecastBenchmark(dataDir),
     mlpModels: mlpModelSummaries(dataDir),
   };
+}
+
+function loadFoundationForecastBenchmark(
+  dataDir: string,
+): FoundationForecastBenchmarkSummary | undefined {
+  const name = "forecast-models-dense-all-windows-2026-08-07.json";
+  const files = [
+    path.join(dataDir, "benchmarks", name),
+    path.join(REPO_ROOT, "data", "benchmarks", name),
+  ];
+  for (const file of new Set(files)) try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as {
+      contract?: unknown;
+      status?: unknown;
+      generatedAt?: unknown;
+      data?: Record<string, unknown>;
+      results?: Array<Record<string, unknown>>;
+    };
+    if (parsed.contract !== "foundation-forecast-all-inspector-windows-v1"
+      || parsed.status !== "complete"
+      || typeof parsed.generatedAt !== "string"
+      || !parsed.data
+      || !Array.isArray(parsed.results)) {
+      return undefined;
+    }
+    const metricSummary = (source: unknown): FoundationForecastBenchmarkMetrics => {
+      const value = source as {
+        metrics: {
+          examples: number;
+          candle: { mseSkillVsPersistence: number; anchoredLogCorrelation: number | null };
+          closeReturn: {
+            correlation: number | null;
+            horizonCorrelation: number | null;
+            horizonDirectionAccuracy: number;
+          };
+          oracle: { forwardKl: number };
+        };
+        probabilistic: {
+          samplePathCrpsAnchoredLog: number;
+          rawQuantileValidOhlcFraction: number;
+          repairedQuantileValidOhlcFraction: number;
+        };
+      };
+      return {
+        examples: value.metrics.examples,
+        candleMseSkillVsPersistence: value.metrics.candle.mseSkillVsPersistence,
+        candleCorrelation: value.metrics.candle.anchoredLogCorrelation,
+        closeReturnCorrelation: value.metrics.closeReturn.correlation,
+        horizonReturnCorrelation: value.metrics.closeReturn.horizonCorrelation,
+        horizonDirectionAccuracy: value.metrics.closeReturn.horizonDirectionAccuracy,
+        oracleForwardKl: value.metrics.oracle.forwardKl,
+        samplePathCrpsAnchoredLog: value.probabilistic.samplePathCrpsAnchoredLog,
+        rawQuantileValidOhlcFraction: value.probabilistic.rawQuantileValidOhlcFraction,
+        repairedQuantileValidOhlcFraction: value.probabilistic.repairedQuantileValidOhlcFraction,
+      };
+    };
+    return {
+      generatedAt: parsed.generatedAt,
+      uniqueOrigins: Number(parsed.data.uniqueOrigins),
+      horizonCandles: Number(parsed.data.horizonCandles),
+      excludedWindows: Array.isArray(parsed.data.excludedWindows)
+        ? parsed.data.excludedWindows.map(String)
+        : [],
+      evidenceRole: String(parsed.data.evidenceRole ?? ""),
+      variants: parsed.results.map((source) => {
+        const variant = source.variant as Record<string, unknown>;
+        const windows = source.windows as Array<Record<string, unknown>>;
+        return {
+          id: String(variant.id),
+          modelId: String(variant.model_id),
+          contextLength: Number(variant.context_length),
+          representation: String(variant.representation),
+          global: metricSummary(source),
+          windows: windows.map((window) => ({
+            windowId: String(window.windowId),
+            metrics: metricSummary(window),
+          })),
+        };
+      }),
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+    return undefined;
+  }
+  return undefined;
 }
 
 function loadGlobalPresets(dataDir: string): VwKamaPreset[] {

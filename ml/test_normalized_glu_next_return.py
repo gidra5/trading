@@ -16,11 +16,18 @@ from next_return_dataset import (
     validate_split_disjointness,
 )
 from normalized_glu_next_return import (
+    depth_width_parameter_assignments,
     NormalizedGluNextReturn,
     PER_SEQUENCE_INPUT_NORMALIZATION,
     PER_SEQUENCE_REVERSIBLE_INPUT_NORMALIZATION,
     PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION,
     optimizer_parameter_groups,
+)
+from train_next_return_memorization import (
+    assert_inactive_parameter_values_unchanged,
+    mask_inactive_parameter_updates,
+    snapshot_inactive_parameter_values,
+    validate_plan as validate_memorization_plan,
 )
 
 
@@ -91,6 +98,34 @@ class NextReturnDatasetTest(unittest.TestCase):
 
 
 class NormalizedGluNextReturnTest(unittest.TestCase):
+    def test_memorization_plan_accepts_scaled_layer_width(self) -> None:
+        validate_memorization_plan({
+            "id": "scaled-width",
+            "datasetDir": "data/training/datasets/scaled-width",
+            "runDir": "data/training/runs/scaled-width",
+            "historyDir": "data/market/immutable/refs/candles/example",
+            "subset": {
+                "type": "fixed-contiguous",
+                "date": "2026-04-01",
+                "examples": 1_048_576,
+            },
+            "architecture": {
+                "widths": [1024] * 8,
+                "dropout": 0,
+                "dropoutRate": 0,
+                "learnableCentering": False,
+            },
+            "training": {
+                "epochs": 512,
+                "batchSize": 4096,
+                "evaluationBatchSize": 16384,
+                "learningRate": 1e-4,
+                "targetNormalizedMse": 1e-4,
+                "mixedPrecision": "float32",
+                "device": "cuda",
+            },
+        })
+
     def build_model(self) -> NormalizedGluNextReturn:
         return NormalizedGluNextReturn(
             torch.zeros(HISTORY_RETURN_COUNT),
@@ -147,6 +182,87 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
         self.assertEqual(prediction.shape, (7, 5))
         prediction.square().mean().backward()
         self.assertIsNotNone(model.layers[1].weight.grad)
+
+    def test_centering_can_be_fixed_at_the_canonical_projector(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.zeros(HISTORY_RETURN_COUNT),
+            torch.ones(HISTORY_RETURN_COUNT),
+            torch.tensor(0.0),
+            torch.tensor(1.0),
+            widths=(16,),
+            learnable_centering=False,
+            dropout=0,
+        )
+        expected = torch.eye(16) - torch.full((16, 16), 1 / 16)
+        for normalizer in (
+            *model.value_centering_normalizers,
+            *model.gate_centering_normalizers,
+        ):
+            self.assertFalse(normalizer.weight.requires_grad)
+            torch.testing.assert_close(normalizer.weight, expected)
+            self.assertTrue(normalizer.raw_scale.requires_grad)
+        _muon, adamw = optimizer_parameter_groups(model)
+        adamw_ids = {id(parameter) for parameter in adamw}
+        self.assertNotIn(
+            id(model.value_centering_normalizers[0].weight), adamw_ids
+        )
+
+    def test_depth_width_partition_freezes_three_quadrants_exactly(self) -> None:
+        model = NormalizedGluNextReturn(
+            torch.zeros(HISTORY_RETURN_COUNT),
+            torch.ones(HISTORY_RETURN_COUNT),
+            torch.tensor(0.0),
+            torch.tensor(1.0),
+            widths=(4, 4, 4, 4),
+            learnable_centering=False,
+            dropout=0,
+        )
+        assignments = depth_width_parameter_assignments(model)
+        counts = [
+            sum(
+                int((assignment == index).sum())
+                for _parameter, assignment in assignments
+            )
+            for index in range(4)
+        ]
+        self.assertTrue(all(count > 0 for count in counts))
+        self.assertEqual(
+            sum(counts),
+            sum(
+                parameter.numel()
+                for parameter in model.parameters()
+                if parameter.requires_grad
+            ),
+        )
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters()
+             if parameter.requires_grad),
+            lr=1e-2,
+            weight_decay=0,
+        )
+        before = {
+            id(parameter): parameter.detach().clone()
+            for parameter, _assignment in assignments
+        }
+        loss = (model(torch.randn(8, HISTORY_RETURN_COUNT)) - 1).square().mean()
+        loss.backward()
+        frozen = snapshot_inactive_parameter_values(assignments, 2)
+        mask_inactive_parameter_updates(
+            assignments, 2, (optimizer,)
+        )
+        optimizer.step()
+        assert_inactive_parameter_values_unchanged(frozen)
+        active_changed = False
+        for parameter, assignment in assignments:
+            original = before[id(parameter)]
+            inactive = assignment != 2
+            torch.testing.assert_close(parameter[inactive], original[inactive])
+            active = ~inactive
+            if active.any() and not torch.equal(
+                parameter.detach()[active], original[active]
+            ):
+                active_changed = True
+        self.assertTrue(active_changed)
 
     def test_rejects_an_empty_glu_stack(self) -> None:
         with self.assertRaisesRegex(ValueError, "one or more GLU layers"):

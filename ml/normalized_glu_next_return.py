@@ -50,6 +50,7 @@ class NormalizedGluNextReturn(nn.Module):
         *,
         widths: tuple[int, ...] = DEFAULT_WIDTHS,
         input_normalization: str = TRAINING_POSITION_INPUT_NORMALIZATION,
+        learnable_centering: bool = True,
         dropout: float = 0.05,
         dropout_rate: float = 0.5,
         initial_radius: float = BRANCH_NORMALIZATION_INITIAL_RADIUS,
@@ -81,6 +82,7 @@ class NormalizedGluNextReturn(nn.Module):
             raise ValueError("dropout settings are invalid")
         self.widths = tuple(int(width) for width in widths)
         self.input_normalization = input_normalization
+        self.learnable_centering = bool(learnable_centering)
         self.horizon_return_count = int(target_mean.numel())
         self.dropout_rate = float(dropout_rate)
         self.dropout_gate_probability = dropout_gate_probability(dropout_rate)
@@ -124,6 +126,12 @@ class NormalizedGluNextReturn(nn.Module):
             )
             for width in self.widths
         ])
+        if not self.learnable_centering:
+            for normalizer in (
+                *self.value_centering_normalizers,
+                *self.gate_centering_normalizers,
+            ):
+                normalizer.weight.requires_grad_(False)
         self.value_norm_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(width)) for width in self.widths
         ])
@@ -300,6 +308,113 @@ def optimizer_parameter_groups(
     } or any(parameter.ndim != 2 for parameter in muon):
         raise RuntimeError("normalized GLU optimizer routing is incomplete")
     return muon, adamw
+
+
+def depth_width_parameter_assignments(
+    model: NormalizedGluNextReturn,
+) -> tuple[tuple[Tensor, Tensor], ...]:
+    """Assign every trainable scalar to one of four depth-width quadrants."""
+    if len(model.widths) % 2 != 0 \
+            or len(set(model.widths)) != 1 \
+            or model.widths[0] % 2 != 0:
+        raise ValueError(
+            "depth-width partitioning requires an even number of equal, "
+            "even-width layers"
+        )
+    depth_boundary = len(model.widths) // 2
+    width = model.widths[0]
+    width_boundary = width // 2
+    result: list[tuple[Tensor, Tensor]] = []
+    covered: set[int] = set()
+
+    def add(parameter: Tensor, assignment: Tensor) -> None:
+        if not parameter.requires_grad:
+            return
+        if assignment.shape != parameter.shape \
+                or assignment.dtype != torch.uint8 \
+                or int(assignment.min()) < 0 \
+                or int(assignment.max()) > 3 \
+                or id(parameter) in covered:
+            raise RuntimeError("invalid depth-width parameter assignment")
+        covered.add(id(parameter))
+        result.append((parameter, assignment))
+
+    channel_half = (
+        torch.arange(width, device=model.output.weight.device) >= width_boundary
+    ).to(torch.uint8)
+    branch_half = torch.cat((channel_half, channel_half))
+    for index, (
+        layer,
+        value_normalizer,
+        gate_normalizer,
+        value_bias,
+        gate_bias,
+        value_transform,
+        gate_transform,
+    ) in enumerate(zip(
+        model.layers,
+        model.value_centering_normalizers,
+        model.gate_centering_normalizers,
+        model.value_norm_biases,
+        model.gate_norm_biases,
+        model.value_transforms,
+        model.gate_transforms,
+        strict=True,
+    )):
+        depth_offset = 2 if index >= depth_boundary else 0
+        branch_assignment = branch_half + depth_offset
+        channel_assignment = channel_half + depth_offset
+        add(
+            layer.weight,
+            branch_assignment[:, None].expand_as(layer.weight).clone(),
+        )
+        add(layer.bias, branch_assignment.clone())
+        for normalizer, scalar_width_half in (
+            (value_normalizer, 0),
+            (gate_normalizer, 1),
+        ):
+            add(
+                normalizer.weight,
+                channel_assignment[:, None]
+                .expand_as(normalizer.weight).clone(),
+            )
+            add(
+                normalizer.raw_scale,
+                torch.full_like(
+                    normalizer.raw_scale,
+                    depth_offset + scalar_width_half,
+                    dtype=torch.uint8,
+                ),
+            )
+        for bias in (value_bias, gate_bias):
+            add(bias, channel_assignment.clone())
+        for transform in (value_transform, gate_transform):
+            add(
+                transform.weight,
+                channel_assignment[:, None]
+                .expand_as(transform.weight).clone(),
+            )
+
+    output_depth_offset = 2
+    add(
+        model.output.weight,
+        (channel_half + output_depth_offset)[None, :]
+        .expand_as(model.output.weight).clone(),
+    )
+    add(
+        model.output.bias,
+        torch.full_like(
+            model.output.bias, output_depth_offset, dtype=torch.uint8
+        ),
+    )
+    trainable_ids = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    if covered != trainable_ids:
+        raise RuntimeError("depth-width partitioning did not cover the model")
+    return tuple(result)
 
 
 def parameter_count(model: nn.Module) -> int:

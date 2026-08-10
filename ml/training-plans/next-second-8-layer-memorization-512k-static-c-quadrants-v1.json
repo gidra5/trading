@@ -1,0 +1,51 @@
+{
+  "id": "next-second-8-layer-memorization-512k-static-c-quadrants-v1",
+  "label": "Diagnostic - eight-layer 512k static-C GLU - rotating depth-width quadrants",
+  "datasetDir": "data/training/datasets/next-second-8-layer-memorization-512k-static-c-quadrants-v1",
+  "runDir": "data/training/runs/next-second-8-layer-memorization-512k-static-c-quadrants-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-contiguous",
+    "date": "2026-04-01",
+    "examples": 524288
+  },
+  "architecture": {
+    "widths": [512, 512, 512, 512, 512, 512, 512, 512],
+    "dropout": 0.0,
+    "dropoutRate": 0.0,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 4096,
+    "evaluationBatchSize": 16384,
+    "learningRate": 0.0001,
+    "targetNormalizedMse": 0.0001,
+    "parameterPartitioning": {
+      "type": "depth-width-quadrants-v1",
+      "rotation": "epoch-round-robin"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  }
+}

@@ -349,6 +349,41 @@ test("causal learned oracle drives the regular bot without future candles", asyn
   assert.equal(result.summary.perfectMarginLeverage, 1);
 });
 
+test("a learned-oracle flat target market-closes exposure on its decision tick", async () => {
+  const config = createStrategyConfig({
+    startingQuote: 1_000,
+    maxLeverage: 1,
+    cooldownMs: 0,
+    legacyValleyPeak: {
+      averagingRangesSec: [2],
+      trendSigmaWindowSec: 2,
+      anticipatoryGridOrderCount: 1,
+      exitGridOrderCount: 1,
+    },
+  });
+  const candles = Array.from({ length: 62 }, (_, index) =>
+    timedCandle(index * 1_000, index === 1 ? 99 : 100, 1_000));
+  const enterTime = candles[0]!.closeTime;
+  const closeTime = candles[60]!.closeTime;
+  const result = await runBotBacktestFromCandles(candles, {
+    config,
+    strategy: "learned-oracle-1s",
+    learnedOracleMaximumLeverage: 1,
+    oracleExpansionConfirmationMass: 0,
+    oracleExpansionDeltaCapFraction: 1,
+    learnedOracleDistributionAt: (timestamp) => timestamp === enterTime
+      ? oracleDistribution([0, 0, 1])
+      : timestamp === closeTime
+        ? oracleDistribution([0, 1, 0])
+        : null,
+  });
+
+  assert.ok(result.summary.tradeCount >= 2);
+  assert.equal(result.summary.closedPositionCount, 1);
+  assert.equal(result.fills.at(-1)?.filledAt, closeTime);
+  assert.equal(result.fills.at(-1)?.side, "sell");
+});
+
 test("capped oracle replay scales filled exposure back to the native policy state", async () => {
   const config = createStrategyConfig({
     startingQuote: 10_000,

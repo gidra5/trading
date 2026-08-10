@@ -23,6 +23,11 @@ const METRIC_EVENTS = new Set([
   "training-start",
   "time-weighting-ready",
 ]);
+const METRIC_EVENT_ALIASES = new Map([
+  ["minute-return-dataset-selected", "dataset-complete"],
+  ["minute-return-epoch", "epoch"],
+  ["minute-return-complete", "training-complete"],
+]);
 
 interface TrainingPlan {
   id: string;
@@ -45,6 +50,7 @@ interface TrainingPlan {
   training?: {
     epochs?: number;
     patience?: number;
+    earlyStoppingPatience?: number;
     dropout?: number;
     dropoutRate?: number;
     lossWeights?: Record<string, number>;
@@ -240,9 +246,13 @@ export class MlpTrainingMetricsReader {
         ...(candidate.plan.training?.epochs === undefined
           ? {}
           : { epochs: candidate.plan.training.epochs }),
-        ...(candidate.plan.training?.patience === undefined
+        ...((candidate.plan.training?.patience
+          ?? candidate.plan.training?.earlyStoppingPatience) === undefined
           ? {}
-          : { patience: candidate.plan.training.patience }),
+          : {
+              patience: candidate.plan.training?.patience
+                ?? candidate.plan.training?.earlyStoppingPatience,
+            }),
         ...(candidate.plan.archived ? { archived: true } : {}),
         ...(candidate.plan.bestValidationKl === undefined
           ? {}
@@ -258,9 +268,13 @@ export class MlpTrainingMetricsReader {
         ...(files.plan.training?.epochs === undefined
           ? {}
           : { epochs: files.plan.training.epochs }),
-        ...(files.plan.training?.patience === undefined
+        ...((files.plan.training?.patience
+          ?? files.plan.training?.earlyStoppingPatience) === undefined
           ? {}
-          : { patience: files.plan.training.patience }),
+          : {
+              patience: files.plan.training?.patience
+                ?? files.plan.training?.earlyStoppingPatience,
+            }),
         ...(files.plan.samplingIntervalMs === undefined
           ? {}
           : { samplingIntervalMs: files.plan.samplingIntervalMs }),
@@ -548,8 +562,13 @@ async function readMetricLogs(files: readonly string[], requestedCursor: number)
     if (!line.startsWith("{")) continue;
     try {
       const value = JSON.parse(line) as MlpTrainingMetricEvent;
-      if (typeof value.event === "string" && METRIC_EVENTS.has(value.event)) {
-        events.push(value);
+      if (typeof value.event === "string") {
+        const canonicalEvent = METRIC_EVENT_ALIASES.get(value.event) ?? value.event;
+        if (METRIC_EVENTS.has(canonicalEvent)) {
+          events.push(canonicalEvent === value.event
+            ? value
+            : { ...value, event: canonicalEvent, sourceEvent: value.event });
+        }
       }
     } catch {
       // Runner diagnostics and interrupted final lines remain in the log.

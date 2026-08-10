@@ -144,11 +144,15 @@ class NextReturnDataset:
         history_root: Path,
         *,
         horizon_return_count: int = 1,
+        row_stride: int = 1,
     ) -> None:
         self.shards = shards
         self.horizon_return_count = validate_horizon_return_count(
             horizon_return_count
         )
+        if int(row_stride) < 1:
+            raise ValueError("dataset row stride must be positive")
+        self.row_stride = int(row_stride)
         self.close_cache = CloseCache(history_root)
         self.component_cache: OrderedDict[
             str,
@@ -156,7 +160,11 @@ class NextReturnDataset:
         ] = OrderedDict()
 
     def logical_count(self, split: str) -> int:
-        return sum(shard.count for shard in self.shards[split])
+        row_stride = getattr(self, "row_stride", 1)
+        return sum(
+            (shard.count + row_stride - 1) // row_stride
+            for shard in self.shards[split]
+        )
 
     def _component(self, day: str) -> tuple[np.ndarray, np.ndarray]:
         cached = self.component_cache.pop(day, None)
@@ -202,6 +210,10 @@ class NextReturnDataset:
         for shard in shards:
             history, target = self._component(shard.date)
             rows, weights = example_rows(shard.row_offset, shard.count)
+            row_stride = getattr(self, "row_stride", 1)
+            if row_stride > 1:
+                rows = rows[::row_stride]
+                weights = weights[::row_stride]
             if rows[0] < 0 or rows[-1] >= ROWS_PER_DAY:
                 raise IndexError("one-second row falls outside its UTC day")
             if shuffle_rows:
@@ -211,8 +223,10 @@ class NextReturnDataset:
             position = 0
             while position < rows.shape[0]:
                 take = min(batch_size - filled, rows.shape[0] - position)
-                selection = rows[position:position + take] if shuffle_rows else slice(
-                    int(rows[position]), int(rows[position]) + take
+                selection = (
+                    rows[position:position + take]
+                    if shuffle_rows or row_stride > 1
+                    else slice(int(rows[position]), int(rows[position]) + take)
                 )
                 destination = slice(filled, filled + take)
                 feature_buffer[destination] = history[selection]

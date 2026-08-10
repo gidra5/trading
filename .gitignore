@@ -8,6 +8,7 @@ __pycache__
 .hypothesis
 node_modules
 .venv-ml
+.venv-forecast
 .node-22
 .tools
 dist

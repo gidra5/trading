@@ -1291,7 +1291,10 @@ class TracingOraclePolicyStrategy extends TracingPeakValleyStrategy {
     this.targetActive = targetExposureActions(context.currentExposure, targetExposure);
     return {
       targetExposure,
-      price: this.tick.price,
+      // A flat target is a time-sensitive risk reduction.  Market-close it at
+      // the decision tick so a backtest window (and the live policy) cannot
+      // retain stale exposure merely because a passive exit never trades.
+      price: targetExposure === 0 ? null : this.tick.price,
       confidence: effectiveConfidence,
       staticConfidence: this.staticConfidenceScale,
       distributionConfidence: decision.confidence,
