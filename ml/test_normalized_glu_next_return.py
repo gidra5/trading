@@ -10,6 +10,7 @@ from next_return_dataset import (
     EXAMPLE_SPAN_MS,
     HISTORY_RETURN_COUNT,
     SECOND_MS,
+    ExampleShard,
     daily_causal_volatility,
     daily_log_return_examples,
     example_rows,
@@ -38,6 +39,7 @@ from train_next_return_memorization import (
     validate_plan as validate_memorization_plan,
     swa_variant,
 )
+from train_normalized_glu_next_return import NextReturnDataset, uniform_group_cvar
 from swa import EpochSwaSweep
 
 
@@ -59,6 +61,39 @@ def source_shard(
 
 
 class NextReturnDatasetTest(unittest.TestCase):
+    def test_uniform_group_cvar_averages_the_requested_worst_mass(self) -> None:
+        losses = torch.tensor([10.0, 4.0, 1.0, 0.0])
+        self.assertEqual(float(uniform_group_cvar(losses, 0.25)), 10.0)
+        self.assertEqual(float(uniform_group_cvar(losses, 0.50)), 7.0)
+        self.assertEqual(float(uniform_group_cvar(losses, 0.75)), 5.0)
+        self.assertEqual(float(uniform_group_cvar(losses, 1.00)), 3.75)
+
+    def test_exact_zero_targets_are_excluded_from_counts_and_batches(self) -> None:
+        dataset = NextReturnDataset.__new__(NextReturnDataset)
+        dataset.shards = {
+            "train": [ExampleShard("train", 0, 5, "2024-01-01", 0)]
+        }
+        dataset.horizon_return_count = 1
+        dataset.row_stride = 1
+        dataset.exclude_zero_targets = True
+        history = np.arange(5 * HISTORY_RETURN_COUNT, dtype=np.float32).reshape(
+            5, HISTORY_RETURN_COUNT
+        )
+        target = np.array([0, -1, 0, 2, 3], dtype=np.float32)
+        dataset._component = lambda _day: (history, target)
+
+        self.assertEqual(dataset.logical_count("train"), 3)
+        batches = list(dataset.iter_batches(
+            "train", 8, shuffle=False, seed=1
+        ))
+        self.assertEqual(len(batches), 1)
+        features, targets, weights = batches[0]
+        torch.testing.assert_close(targets, torch.tensor([-1.0, 2.0, 3.0]))
+        torch.testing.assert_close(weights, torch.ones(3))
+        torch.testing.assert_close(
+            features[:, 0], torch.tensor([120.0, 360.0, 480.0])
+        )
+
     def test_daily_examples_align_history_and_immediate_target(self) -> None:
         log_step = 1e-6
         previous = np.exp(

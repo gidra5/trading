@@ -101,7 +101,12 @@ test("VW-KAMA runner reproduces current production signal transitions", async ()
     };
   });
   const scoreStart = 900;
-  const config = createPeakValleyStrategyConfig();
+  const config = createPeakValleyStrategyConfig({
+    buyConfirmationOffsets: [],
+    sellConfirmationOffsets: [],
+    buyExitConfirmationOffsets: [],
+    sellExitConfirmationOffsets: [],
+  });
   const warmup = candles.slice(0, scoreStart).slice(-peakValleyWarmupSamples(config));
   const strategy = new PeakValleyStrategy({
     config,

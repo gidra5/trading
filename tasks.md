@@ -217,13 +217,63 @@ ML model based on MLP:
 
 
 1. volatility norm -
-2. weight decay
+2. weight decay ~, maybe need a finer sweep for 8l 1024k
 3. tuned dropout
 4. weight ema + mostly training set size related
-5. ema as teacher
-6. output calibration
-7. sam
+5. ema as teacher, might be useful to extend to full JEPA-like models
+   1. dual student
+   2. Interpolation Consistency Training
+   3. DINO
+   4. JEPA
+   5. BYOL
+   6. FixMatch?
+6. output calibration +, can be ran online
+7. sam +, very effective, many followups
+   1. late training sam
+   2. gradual reduction/increase of sam rate (schedule)
+   3. looksam
+   4. esam
+   5. layerwise perturb scaling
+   6. sam with lookahead
+   7. stable sam
+   8. overparam for sam
+   9. momentum sam
+   10. xsam
+   11. ed-sam
+   12. sampa
 8. Ensembles across seeds
+9.  temporal ensembles
+10. Distributionally Robust Optimization (DRO) ~, good at avoiding overfitting and better generalize, but extremely hurts training fitness.
+    1.  EIIL ~, good overall idea, but not very impactful so far (because of bad defaults)
+    2.  group DRO -, hard to find suitable grouping. But may still be useful because we already have a small partitioning. 
+    3.  CVar DRO -, same
+    4.  DORO
+    5. Common Gradient Descent
+    6. 
+11. prob output +, expectation of the resulting distribution seems to perform much better. But long sampled paths are still very bad
+    1.  We take output of a fixed count of predefined knots, transform it, and then interpolate
+    2.  transformation is based on global distribution of returns 
+        1.  z = (r-μ)/s, mu is approximately 0, s estimated around 2.3
+        2.  u = sigmoid(α·asinh(z)), alpha is estimated around 4
+    3.  each output is one point on finite interval (0, 1) in u space
+    4.  the inverse transform maps each to a point on the real line
+    5.  the value of a density function at that point should be the output of the model
+    6.  for that it is passed through softmax and divide by the knot’s triangular basis area A. Alternatively it can be applied as a bias term on the output of the model (log A), before softmax.
+    7.  we store the knots along the trained model, they are already precomputed based on global distribution of log returns
+    8.  and then use them to reconstruct the distribution by interpolation in u space
+    9.  that automatically creates inductive bias around which returns are more likely
+    10. optimize neg log likelihood loss? Whatever allows for example based training
+12. train a full conditioned path distribution, not simply independent returns
+    1.  split into blocks that output distribution of next return given preceding history
+    2.  that is directly derived from probability of a given path - p(r_1..r_k|h)=p(r_1|h)p(r_2..r_k|r1, h)
+    3.  the model outputs terms p(r_i| r_1..r_i-1, h) for each possible sequence of r_i
+    4.  that grows exponentially in amount of sampled points per return
+    5.  Given input we pass it through a single dense GLU layer, which outputs a distribution for each possible input path
+    6.  With K knots and H steps, it gives K^H distributions per step at H
+    7.  These are then transformed back to returns and sampled sequentially to generate a path
+13. adversarial input training + with log return perturbation only
+14. Robust regression loss to avoid exceptional values dominating ~, helps a bit but slower to train, best seems to be huber thing with 0.5-1 delta
+15. cleanup the examples from 0 return cases +
 
 Alternatives:
 1.  PatchTST
@@ -241,6 +291,8 @@ Alternatives:
 14.  cmos https://proceedings.mlr.press/v267/si25a.html
 15.  sparsetsf https://proceedings.mlr.press/v235/lin24n.html?utm_source=chatgpt.com
 16.  GTR
+17.  DQRN https://arxiv.org/pdf/1807.02787
+18.  EarnHFT https://personal.ntu.edu.sg/boan/papers/AAAI24_EarnHFT.pdf
 
 Insufficient margin trades should not happen
 

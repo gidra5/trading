@@ -438,6 +438,9 @@ server.post("/api/backtest", async (request, reply) => {
       preset,
       strategy: body.strategy === "hindsight-oracle-1s"
         || body.strategy === "learned-oracle-1s"
+        || body.strategy === "learned-oracle-1m"
+        || body.strategy === "macd"
+        || body.strategy === "volume-imbalance"
         ? body.strategy
         : "peak-valley",
       limit: clampInt(Number(body.limit ?? 1_000), 10, 10_000),

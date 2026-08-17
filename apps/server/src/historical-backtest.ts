@@ -27,6 +27,7 @@ import {
   HINDSIGHT_ORACLE_VALUE_HORIZON_MS,
   runBotBacktestFromCandles,
 } from "./bot-backtest.js";
+import { withStoredAggressorVolume } from "./trade-flow-backtest.js";
 import {
   JOINT_PRICE_ORACLE_CONTEXT_LENGTH,
   JointPriceOracleRuntime,
@@ -724,11 +725,27 @@ async function runBotHistoricalRangeBacktest(
     learnedOracleDistributionAt = (timestamp) => byTime.get(timestamp) ?? null;
   }
 
-  emit(`Replaying ${candles.length.toLocaleString()} candles`);
-  const result = await runBotBacktestFromCandles(candles, {
+  const replayWarmup = options.strategy === "volume-imbalance"
+    ? await withStoredAggressorVolume(warmup, {
+        dataDir: options.cache.dataDir,
+        venue: options.venue,
+        symbol: options.symbol,
+        requiredFrom: targetStartTime,
+      })
+    : warmup;
+  const replayCandles = options.strategy === "volume-imbalance"
+    ? await withStoredAggressorVolume(candles, {
+        dataDir: options.cache.dataDir,
+        venue: options.venue,
+        symbol: options.symbol,
+        requiredFrom: targetStartTime,
+      })
+    : candles;
+  emit(`Replaying ${replayCandles.length.toLocaleString()} candles`);
+  const result = await runBotBacktestFromCandles(replayCandles, {
     config,
     strategy: options.strategy,
-    warmup,
+    warmup: replayWarmup,
     oracleFuture,
     learnedOracleDistributionAt,
     learnedOracleMaximumLeverage: options.learnedOracleMaximumLeverage,

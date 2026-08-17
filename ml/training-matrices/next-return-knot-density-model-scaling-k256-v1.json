@@ -1,0 +1,34 @@
+{
+  "id": "next-return-knot-density-model-scaling-k256-v1",
+  "label": "Conditional density model scaling: six clean-count cases at 256 knots",
+  "control": {
+    "pauseFile": "data/training/matrices/next-return-knot-density-model-scaling-k256-v1/control/PAUSE"
+  },
+  "experiment": {
+    "knotCount": 256,
+    "cleanExampleCounts": [65536, 131072, 262144, 524288, 524288, 1048576],
+    "architectures": [
+      "four-layer-width-512",
+      "four-layer-width-512",
+      "four-layer-width-512",
+      "four-layer-width-512",
+      "eight-layer-width-512",
+      "eight-layer-width-1024"
+    ],
+    "cells": 6,
+    "reused": [
+      "next-second-4-layer-knot-density-65k-k256-v1",
+      "next-second-4-layer-knot-density-128k-k256-v1",
+      "next-second-4-layer-knot-density-256k-k256-v1"
+    ]
+  },
+  "runner": "ml/run_next_return_knot_density_model_scaling.py",
+  "runIds": [
+    "next-second-4-layer-knot-density-65k-k256-v1",
+    "next-second-4-layer-knot-density-128k-k256-v1",
+    "next-second-4-layer-knot-density-256k-k256-v1",
+    "next-second-4-layer-knot-density-512k-k256-v1",
+    "next-second-8-layer-knot-density-512k-k256-v1",
+    "next-second-8-layer-width1024-knot-density-1024k-k256-v1"
+  ]
+}

@@ -436,3 +436,7 @@ Quadrant-training artifacts:
 - Plan: `ml/training-plans/next-second-8-layer-memorization-512k-static-c-quadrants-v1.json`
 - Result: `data/training/runs/next-second-8-layer-memorization-512k-static-c-quadrants-v1/state/result.json`
 - Best checkpoint: `data/training/runs/next-second-8-layer-memorization-512k-static-c-quadrants-v1/checkpoints/best.json`
+
+The subsequent standard-SAM radius sweep, literature overview, delayed-escape
+analysis, and empirical radius/dataset scaling laws are documented in
+[`sam-research-and-scaling-2026-08-12.md`](sam-research-and-scaling-2026-08-12.md).

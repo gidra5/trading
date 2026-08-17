@@ -1,0 +1,15 @@
+{
+  "id": "robust-regression-screen-v1",
+  "label": "Robust regression loss screen - four-layer 65k static-C GLU",
+  "control": {
+    "pauseFile": "data/training/matrices/robust-regression-screen-v1/control/PAUSE"
+  },
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-huber-delta-5e-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-huber-delta-1e0-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-huber-delta-2e0-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-student-t-nu-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-student-t-nu-3-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-student-t-nu-10-v1"
+  ]
+}

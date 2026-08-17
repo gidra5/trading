@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "theory/Reinforcement Learning.md",
+                "file": "theory/Oracle.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Reinforcement Learning"
+              "title": "Oracle"
             }
           },
           {
@@ -27,12 +27,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "theory/Basic notions.md",
+                "file": "theory/Reinforcement Learning.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Basic notions"
+              "title": "Reinforcement Learning"
             }
           }
         ]
@@ -201,25 +201,32 @@
   },
   "active": "2e06481950b61c7e",
   "lastOpenFiles": [
-    "theory/Oracle.md",
-    "algorithms.md",
-    "theory/Reinforcement Learning.md",
-    "theory/Basic notions.md",
-    "experiments/cumulative-return-mse-skill-audit-2026-08-05.md",
-    "experiments/next-return-daily-candle-resolution-5path-2026-08-05.md",
-    "experiments/searchcast-exchange-replication-2026-08-05.md",
-    "experiments/next-return-multiscale-candle-resolution-5path-2026-08-05.md",
-    "experiments/next-return-multiscale-moving-average-5s-2026-08-04.md",
-    "experiments/next-return-reversible-sequence-normalization-5s-2026-08-04.md",
-    "experiments/next-return-per-sequence-normalization-5s-2026-08-04.md",
-    "experiments/searchcast-btc-2026-08-04/README.md",
-    "experiments/searchcast-btc-2026-08-04/3month.md",
-    "experiments/searchcast-btc-2026-08-04/1w.md",
-    "experiments/searchcast-btc-2026-08-04/1s.md",
-    "experiments/searchcast-btc-2026-08-04/1month.md",
-    "experiments/searchcast-btc-2026-08-04/1min.md",
-    "experiments/searchcast-btc-2026-08-04/1d.md",
-    "experiments/searchcast-btc-2026-08-04/1h.md",
+    "experiments/imbalance-and-volatility-index-audit-2026-08-17.md",
+    "experiments/multidimensional-return-knot-search-quick.md",
+    "experiments/fourier-return-feature-information-2026-08-17.md",
+    "experiments/multidimensional-return-knot-search-2026-08-17.md",
+    "experiments/one-second-return-32-knot-fits-2026-08-17.md",
+    "experiments/consecutive-log-return-triples-2026-08-17.md",
+    "experiments/consecutive-log-return-pairs-2026-08-17.md",
+    "experiments/global-return-feature-basis-30d-2026-08-17.md",
+    "experiments/global-return-feature-basis-2026-08-17.md",
+    "experiments/live-external-early-screen-2026-08-17-1h.md",
+    "experiments/recommended-model-input-basis-2026-08-17.md",
+    "experiments/live-external-early-screen-2026-08-17.md",
+    "experiments/tardis-monthly-sample-information-2026-08-17.md",
+    "experiments/public-external-feature-information-2026-08-17.md",
+    "experiments/external-feature-basis-audit-2026-08-17.md",
+    "experiments/forward-market-return-information-2026-08-16.md",
+    "experiments/spot-order-book-return-information-2026-08-16.md",
+    "experiments/order-book-return-information-2026-08-16.md",
+    "experiments/information-history-windows-2026-08-16.md",
+    "experiments/extended-market-information-basis-2026-08-16.md",
+    "experiments/volume-multiscale-information-2026-08-16.md",
+    "experiments/indicator-information-basis-2026-08-16.md",
+    "experiments/technical-indicator-predictiveness-2026-08-16.md",
+    "experiments/one-second-conditional-sign-magnitude-dependence-2026-08-16.md",
+    "experiments/one-second-sign-magnitude-dependence-2026-08-16.md",
+    "experiments/one-second-return-reversibility-2026-08-16.md",
     "experiments/searchcast-btc-2026-08-04/results/1w.json",
     "experiments/searchcast-btc-2026-08-04/charts/1w-forecast.png",
     "experiments/searchcast-btc-2026-08-04/charts/1w-weights.png",
@@ -227,7 +234,6 @@
     "experiments/searchcast-btc-2026-08-04/charts/1w-lookback-horizon.png",
     "experiments/searchcast-btc-2026-08-04/charts/1w-model-comparison.png",
     "experiments/searchcast-btc-2026-08-04/charts/1w-data-profile.png",
-    "experiments/next-return-3layer-glu-5s-2026-08-04.md",
     "experiments/searchcast-btc-2026-08-04/results/3month.json",
     "experiments/searchcast-btc-2026-08-04/charts/3month-forecast.png",
     "experiments/searchcast-btc-2026-08-04/charts/3month-weights.png",
@@ -235,17 +241,11 @@
     "experiments/searchcast-btc-2026-08-04/charts/3month-lookback-horizon.png",
     "experiments/searchcast-btc-2026-08-04/results/1month.json",
     "experiments/searchcast-btc-2026-08-04/results/1min.json",
-    "experiments/searchcast-btc-2026-08-04/1M.md",
     "experiments/searchcast-btc-2026-08-04/results/1M.json",
     "experiments/searchcast-btc-2026-08-04/results/1d.json",
     "experiments/searchcast-btc-2026-08-04/results/1h.json",
-    "experiments/searchcast-btc-2026-08-04/1m.md",
     "experiments/searchcast-btc-2026-08-04/results/1m.json",
     "experiments/searchcast-btc-2026-08-04/results/1s.json",
-    "experiments/searchcast-btc-2026-08-04/results/all-scales.json",
-    "experiments/searchcast-btc-2026-08-04/3M.md",
-    "experiments/next-return-2layer-glu-5s-2026-08-04.md",
-    "experiments/next-return-long-2s-glu-2026-08-04.md",
-    "experiments/next-return-candle-only-ablation-2s-3s-5s-2026-08-04.md"
+    "experiments/searchcast-btc-2026-08-04/results/all-scales.json"
   ]
 }

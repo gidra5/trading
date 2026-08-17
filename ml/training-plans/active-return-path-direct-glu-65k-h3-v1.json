@@ -1,0 +1,65 @@
+{
+  "id": "active-return-path-direct-glu-65k-h3-v1",
+  "label": "Matched control - one-layer width-512 direct GLU - 65k clean starts - next 3 active returns - candle plus cumulative MSE",
+  "datasetDir": "data/training/datasets/active-return-path-direct-glu-65k-h3-v1",
+  "runDir": "data/training/runs/active-return-path-direct-glu-65k-h3-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "date": "2026-04-01",
+    "examples": 65536
+  },
+  "architecture": {
+    "contract": "next-return-fused-glu-stack-independent-branch-centering-sqrt-learned-radius-full-a-post-bias-v2",
+    "widths": [512],
+    "dropout": 0,
+    "dropoutRate": 0,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 256,
+    "evaluationBatchSize": 8192,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "selection": "lowest-validation-pooled-candle-mse"
+  },
+  "evaluation": {
+    "type": "fixed-clean-heldout-count",
+    "validationStart": "2026-06-01",
+    "testStart": "2026-07-01",
+    "examplesPerSplit": 65536
+  },
+  "datasetFilter": {
+    "type": "active-return-path",
+    "startRows": "exclude-exact-zero-immediate-target-return",
+    "pathTargets": "next-3-nonzero-log-returns",
+    "inputHistory": "raw-120-one-second-log-returns-including-zeros",
+    "appliesTo": ["normalization", "training", "validation", "test"]
+  },
+  "objective": {
+    "candleWeight": 1,
+    "cumulativeReturnWeight": 1
+  }
+}

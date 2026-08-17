@@ -924,6 +924,107 @@ returned `+0.000%`, `+0.009%`, and `+1.089%` with no liquidations. The 90d row d
 not complete in a reasonable runtime in either mode, so long-window validation is
 blocked on benchmark-runner performance rather than strategy result quality.
 
+## MACD And Aggressor-Volume Baselines (2026-08-10)
+
+The first implementation of these baselines was invalid. It inferred signed
+volume from a candle's close location inside its high/low range and continuously
+rebalanced to `+/-5x` while an indicator state remained active. The tracing
+adapter also exposed a target-exposure method even for event-based strategies,
+which made the bot skip its normal entry/exit path. Reports produced by that
+implementation must not be used.
+
+The first corrected MACD baseline used `12/26/9` line/signal crossovers on
+explicit, UTC-aligned one-hour bars. A crossover emitted one bot entry/exit
+transition; it did not maintain an exact leveraged target every minute. One
+hour was an explicit intraday test choice, not an assertion that MACD has one
+canonical timeframe.
+
+The corrected volume baseline is specifically **aggressor-volume imbalance**,
+not limit-order-book imbalance:
+
+`(buyer-initiated base volume - seller-initiated base volume) / total base volume`
+
+It uses the stored Binance Spot `aggTrades` sidecar, pools five one-minute
+candles, enters at `+/-0.15`, and exits at a zero crossing. OHLC is never used to
+guess the aggressor side. All 28 inspector windows have exact stored flow; the
+latest-three-month interval was skipped because the sidecar ends before that
+window.
+
+At the bot's configured `5x` maximum leverage, `7.5 bps` fee, and `10 bps`
+modeled market slippage per side, neither standalone baseline was viable:
+
+| Strategy | Windows | Profitable | Median return | Geometric mean return | Mean initial DD | Mean peak DD | Trades |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MACD 1h crossover | `29` | `5` | `-25.60%` | `-48.28%` | `41.39%` | `46.48%` | `843` |
+| Aggressor volume, rolling 5m | `28` | `0` | `-99.90%` | `-99.82%` | `97.73%` | `97.74%` | `23,752` |
+
+The result matches the important limitation in the literature: imbalance is a
+very short-horizon predictor and is commonly used as an execution, market-making,
+or directional-filter input. That evidence does not establish a profitable
+full-size standalone position strategy. Likewise, a public Crypto.com MACD/RSI
+example reports positive leveraged APR but still underperforms direct BTC holding;
+it is not evidence that naked MACD is robust across short market regimes.
+
+Reports:
+
+- `data/benchmarks/macd-bot-suite-1m-2026-08-10.json`
+- `data/benchmarks/volume-imbalance-bot-suite-1m-2026-08-10.json`
+
+Relevant definitions and caveats:
+
+- [Oxford Algorithmic Trading notes, section 7.4](https://www.faycaldrissi.com/files/HFT_2024___Oxford___lecture_notes.pdf)
+- [Cont, Kukanov, Stoikov - The Price Impact of Order Book Events](https://arxiv.org/abs/1011.6402)
+- [Crypto.com - Crypto Derivatives Trading with Technical Analysis](https://crypto.com/research/derivatives-trading-with-ta-nov-2024)
+- [Fidelity MACD guide](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/macd)
+
+The Oxford definition uses resting best-bid and best-ask queues. That is a
+different signal from aggressor trade volume. The current UI names the implemented
+variant explicitly; adding the LOB variant requires exact historical best-quote
+queues and a seconds/event-scale execution replay rather than another candle proxy.
+
+### Filtered variants
+
+The standalone indicators were then replaced with two composed strategies:
+
+- **MACD + RSI:** a bullish MACD crossover may enter long only when `RSI(14)`
+  reached `<= 30` in the current or preceding six one-hour bars. A bearish
+  crossover analogously requires `RSI >= 70`. An opposing MACD crossover can
+  always exit; RSI never blocks de-risking. The six-bar causal window avoids
+  requiring the RSI extreme and the lagging crossover on the exact same bar.
+- **Peak/valley + aggressor flow:** the production peak/valley strategy remains
+  the directional source. Its entry is accepted only when the current one-minute
+  Binance aggressor-volume imbalance agrees with the side by at least `15%`.
+  Flow cannot create or maintain exposure, and peak/valley exits always pass.
+  One minute is the finest exact stored flow joined to the candle replay; it is
+  still coarser than the seconds/event horizon in the cited Oxford results.
+
+The same 28 inspector windows were used for the peak/valley comparison; MACD
+also includes latest-three-month history. A flat-account insolvency hole found
+during this run was fixed: negative cash after fully closing exposure now records
+liquidation instead of allowing a return below `-100%`.
+
+| Strategy | Windows | Profitable | Median return | Geometric mean return | Mean initial DD | Mean peak DD | Trades | Liquidated windows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MACD crossover | `29` | `5` | `-25.60%` | `-48.28%` | `41.39%` | `46.48%` | `843` | `0` |
+| MACD + RSI filter | `29` | `2` | `-10.61%` | `-44.13%` | `30.91%` | `32.66%` | `136` | `2` |
+| Peak/valley | `28` | `4` | `-55.50%` | `-100.00%` | `56.24%` | `58.55%` | `7,469` | `1` |
+| Peak/valley + flow filter | `28` | `4` | `-31.47%` | `-100.00%` | `44.31%` | `47.99%` | `4,114` | `1` |
+
+The filters do what they were introduced to do: MACD trades fell `84%`, and the
+flow filter cut peak/valley trades `45%`, fees `23%`, and mean initial drawdown
+by about 12 percentage points. They still do not produce a viable strategy.
+RSI's overbought/oversold reversal filter is especially dangerous in strong
+trends: each of the two liquidated MACD windows made one wrong-side filtered
+entry and was liquidated before the next exit crossover. The flow filter improves
+the base strategy's median return and drawdown but cannot repair its persistent
+fee load or its worst crash window.
+
+Filtered reports:
+
+- `data/benchmarks/macd-rsi-bot-suite-1m-2026-08-10.json`
+- `data/benchmarks/peak-valley-bot-suite-1m-confirmed-corrected-2026-08-10.json`
+- `data/benchmarks/peak-valley-aggressor-filter-bot-suite-1m-2026-08-10.json`
+
 ## Research Backlog
 
 | Direction | Why it may help legacy | Main risk |

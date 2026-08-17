@@ -146,6 +146,7 @@ class NextReturnDataset:
         *,
         horizon_return_count: int = 1,
         row_stride: int = 1,
+        exclude_zero_targets: bool = False,
     ) -> None:
         self.shards = shards
         self.horizon_return_count = validate_horizon_return_count(
@@ -154,6 +155,13 @@ class NextReturnDataset:
         if int(row_stride) < 1:
             raise ValueError("dataset row stride must be positive")
         self.row_stride = int(row_stride)
+        if not isinstance(exclude_zero_targets, bool):
+            raise ValueError("exclude-zero-targets must be boolean")
+        if exclude_zero_targets and self.horizon_return_count != 1:
+            raise ValueError(
+                "exact-zero target filtering currently requires horizon one"
+            )
+        self.exclude_zero_targets = exclude_zero_targets
         self.close_cache = CloseCache(history_root)
         self.component_cache: OrderedDict[
             str,
@@ -165,6 +173,17 @@ class NextReturnDataset:
 
     def logical_count(self, split: str) -> int:
         row_stride = getattr(self, "row_stride", 1)
+        if getattr(self, "exclude_zero_targets", False):
+            count = 0
+            for shard in self.shards[split]:
+                _history, target = self._component(shard.date)
+                rows = shard.row_offset + np.arange(
+                    shard.count, dtype=np.int64
+                )
+                if row_stride > 1:
+                    rows = rows[::row_stride]
+                count += int(np.count_nonzero(target[rows] != 0))
+            return count
         return sum(
             (shard.count + row_stride - 1) // row_stride
             for shard in self.shards[split]
@@ -248,6 +267,12 @@ class NextReturnDataset:
             if row_stride > 1:
                 rows = rows[::row_stride]
                 weights = weights[::row_stride]
+            if getattr(self, "exclude_zero_targets", False):
+                nonzero = target[rows] != 0
+                rows = rows[nonzero]
+                weights = weights[nonzero]
+                if rows.size == 0:
+                    continue
             if rows[0] < 0 or rows[-1] >= ROWS_PER_DAY:
                 raise IndexError("one-second row falls outside its UTC day")
             if shuffle_rows:
@@ -259,7 +284,9 @@ class NextReturnDataset:
                 take = min(batch_size - filled, rows.shape[0] - position)
                 selection = (
                     rows[position:position + take]
-                    if shuffle_rows or row_stride > 1
+                    if shuffle_rows
+                    or row_stride > 1
+                    or getattr(self, "exclude_zero_targets", False)
                     else slice(int(rows[position]), int(rows[position]) + take)
                 )
                 destination = slice(filled, filled + take)
@@ -303,6 +330,157 @@ class NextReturnDataset:
             if volatility_buffer is not None:
                 batch = (*batch, torch.from_numpy(volatility_buffer[:filled]))
             yield batch
+
+    def _daily_group_rows(
+        self, split: str
+    ) -> list[tuple[str, np.ndarray]]:
+        groups: list[tuple[str, np.ndarray]] = []
+        row_stride = getattr(self, "row_stride", 1)
+        for shard in self.shards[split]:
+            _history, target = self._component(shard.date)
+            rows = shard.row_offset + np.arange(shard.count, dtype=np.int64)
+            if row_stride > 1:
+                rows = rows[::row_stride]
+            if getattr(self, "exclude_zero_targets", False):
+                rows = rows[target[rows] != 0]
+            if rows.size:
+                groups.append((shard.date, rows))
+        return groups
+
+    def daily_group_count(self, split: str) -> int:
+        return len(self._daily_group_rows(split))
+
+    def iter_daily_group_batches(
+        self,
+        split: str,
+        batch_size: int,
+        *,
+        shuffle: bool,
+        seed: int,
+        reuse_buffers: bool = False,
+    ) -> Iterator[tuple[Tensor, Tensor, Tensor, Tensor]]:
+        """Globally mix rows while preserving their UTC-day group IDs."""
+        if batch_size < 1:
+            raise ValueError("batch size must be positive")
+        if self.horizon_return_count != 1:
+            raise ValueError("daily grouped batches require horizon one")
+        groups = self._daily_group_rows(split)
+        if not groups:
+            return
+        sizes = np.fromiter(
+            (rows.size for _day, rows in groups), dtype=np.int64
+        )
+        offsets = np.empty(sizes.size + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(sizes, out=offsets[1:])
+        total = int(offsets[-1])
+        order = np.arange(total, dtype=np.int64)
+        if shuffle:
+            np.random.default_rng(seed).shuffle(order)
+        feature_buffer = np.empty(
+            (batch_size, HISTORY_RETURN_COUNT), dtype=np.float32
+        )
+        target_buffer = np.empty(batch_size, dtype=np.float32)
+        weight_buffer = np.ones(batch_size, dtype=np.float32)
+        group_buffer = np.empty(batch_size, dtype=np.int64)
+        for position in range(0, total, batch_size):
+            selected = order[position:position + batch_size]
+            count = selected.size
+            group_ids = np.searchsorted(
+                offsets[1:], selected, side="right"
+            ).astype(np.int64, copy=False)
+            local_positions = selected - offsets[group_ids]
+            for group_id in np.unique(group_ids):
+                destination = np.flatnonzero(group_ids == group_id)
+                day, rows = groups[int(group_id)]
+                history, target = self._component(day)
+                source_rows = rows[local_positions[destination]]
+                feature_buffer[destination] = history[source_rows]
+                target_buffer[destination] = target[source_rows]
+            group_buffer[:count] = group_ids
+            batch = (
+                torch.from_numpy(feature_buffer[:count]),
+                torch.from_numpy(target_buffer[:count]),
+                torch.from_numpy(weight_buffer[:count]),
+                torch.from_numpy(group_buffer[:count]),
+            )
+            yield batch
+            if not reuse_buffers:
+                feature_buffer = np.empty(
+                    (batch_size, HISTORY_RETURN_COUNT), dtype=np.float32
+                )
+                target_buffer = np.empty(batch_size, dtype=np.float32)
+                weight_buffer = np.ones(batch_size, dtype=np.float32)
+                group_buffer = np.empty(batch_size, dtype=np.int64)
+
+    def iter_assigned_group_batches(
+        self,
+        split: str,
+        batch_size: int,
+        environment_ids: np.ndarray,
+        *,
+        shuffle: bool,
+        seed: int,
+        reuse_buffers: bool = False,
+    ) -> Iterator[tuple[Tensor, Tensor, Tensor, Tensor]]:
+        """Globally mix rows while attaching a fixed group to each example."""
+        if batch_size < 1:
+            raise ValueError("batch size must be positive")
+        if self.horizon_return_count != 1:
+            raise ValueError("assigned grouped batches require horizon one")
+        groups = self._daily_group_rows(split)
+        sizes = np.fromiter(
+            (rows.size for _day, rows in groups), dtype=np.int64
+        )
+        offsets = np.empty(sizes.size + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(sizes, out=offsets[1:])
+        total = int(offsets[-1])
+        assignments = np.asarray(environment_ids)
+        if assignments.shape != (total,) \
+                or not np.issubdtype(assignments.dtype, np.integer) \
+                or bool((assignments < 0).any()):
+            raise ValueError(
+                "assigned groups must contain one non-negative integer per example"
+            )
+        order = np.arange(total, dtype=np.int64)
+        if shuffle:
+            np.random.default_rng(seed).shuffle(order)
+        feature_buffer = np.empty(
+            (batch_size, HISTORY_RETURN_COUNT), dtype=np.float32
+        )
+        target_buffer = np.empty(batch_size, dtype=np.float32)
+        weight_buffer = np.ones(batch_size, dtype=np.float32)
+        group_buffer = np.empty(batch_size, dtype=np.int64)
+        for position in range(0, total, batch_size):
+            selected = order[position:position + batch_size]
+            count = selected.size
+            source_groups = np.searchsorted(
+                offsets[1:], selected, side="right"
+            ).astype(np.int64, copy=False)
+            local_positions = selected - offsets[source_groups]
+            for source_group in np.unique(source_groups):
+                destination = np.flatnonzero(source_groups == source_group)
+                day, rows = groups[int(source_group)]
+                history, target = self._component(day)
+                source_rows = rows[local_positions[destination]]
+                feature_buffer[destination] = history[source_rows]
+                target_buffer[destination] = target[source_rows]
+            group_buffer[:count] = assignments[selected]
+            batch = (
+                torch.from_numpy(feature_buffer[:count]),
+                torch.from_numpy(target_buffer[:count]),
+                torch.from_numpy(weight_buffer[:count]),
+                torch.from_numpy(group_buffer[:count]),
+            )
+            yield batch
+            if not reuse_buffers:
+                feature_buffer = np.empty(
+                    (batch_size, HISTORY_RETURN_COUNT), dtype=np.float32
+                )
+                target_buffer = np.empty(batch_size, dtype=np.float32)
+                weight_buffer = np.ones(batch_size, dtype=np.float32)
+                group_buffer = np.empty(batch_size, dtype=np.int64)
 
 
 @dataclass(frozen=True)
@@ -460,6 +638,72 @@ def iter_device_batches(
         for value in device_batch:
             value.record_stream(current_stream)
         yield device_batch
+
+
+def uniform_group_cvar(
+    group_losses: Tensor,
+    tail_fraction: float,
+) -> Tensor:
+    """Mean of the worst alpha mass under a uniform empirical group law."""
+    if group_losses.ndim != 1 or group_losses.numel() < 1:
+        raise ValueError("CVaR requires at least one scalar group loss")
+    if not math.isfinite(tail_fraction) or not 0 < tail_fraction <= 1:
+        raise ValueError("CVaR tail fraction must be in (0, 1]")
+    descending = torch.sort(group_losses, descending=True).values
+    tail_groups = float(tail_fraction) * descending.numel()
+    full_groups = min(int(math.floor(tail_groups)), descending.numel())
+    partial = tail_groups - full_groups
+    numerator = descending[:full_groups].sum()
+    if partial > 1e-12 and full_groups < descending.numel():
+        numerator = numerator + partial * descending[full_groups]
+    return numerator / tail_groups
+
+
+@torch.no_grad()
+def evaluate_daily_group_cvar(
+    model: NormalizedGluNextReturn,
+    dataset: NextReturnDataset,
+    split: str,
+    *,
+    batch_size: int,
+    target_std: float,
+    tail_fraction: float,
+    device: torch.device,
+) -> tuple[dict[str, float | int | None], dict[str, object]]:
+    model.eval()
+    group_count = dataset.daily_group_count(split)
+    if group_count < 1:
+        raise RuntimeError("daily CVaR evaluation found no groups")
+    metrics = MetricAccumulator(target_std, device)
+    squared = torch.zeros(group_count, dtype=torch.float64, device=device)
+    weights_by_group = torch.zeros_like(squared)
+    for features, targets, weights, group_ids in iter_device_batches(
+        dataset.iter_daily_group_batches(
+            split, batch_size, shuffle=False, seed=0, reuse_buffers=True
+        ),
+        device,
+    ):
+        prediction = model(features)
+        metrics.add(prediction, targets, weights)
+        per_example = (
+            (prediction.double() - targets.double()) / float(target_std)
+        ).square() * weights.double()
+        squared.scatter_add_(0, group_ids.long(), per_example)
+        weights_by_group.scatter_add_(0, group_ids.long(), weights.double())
+    if bool((weights_by_group <= 0).any()):
+        raise RuntimeError("daily CVaR evaluation contains an empty group")
+    group_losses = squared / weights_by_group
+    cvar = uniform_group_cvar(group_losses, tail_fraction)
+    return metrics.result(), {
+        "group": "utc-calendar-day",
+        "groupCount": group_count,
+        "tailFraction": float(tail_fraction),
+        "normalizedMse": float(cvar),
+        "meanGroupNormalizedMse": float(group_losses.mean()),
+        "bestGroupNormalizedMse": float(group_losses.min()),
+        "worstGroupNormalizedMse": float(group_losses.max()),
+        "groupNormalizedMse": [float(value) for value in group_losses],
+    }
 
 
 @torch.no_grad()

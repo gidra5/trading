@@ -294,6 +294,9 @@ test("MLP training metrics discovers derived snapshots and matrix progress", asy
       planSha256: "test",
       plan: derivedPlan,
     })),
+    writeFile(path.join(derivedRunDir, "state", "display.json"), JSON.stringify({
+      label: "Legacy candidate-count dropout run",
+    })),
     writeFile(path.join(derivedRunDir, "state", "status.json"), JSON.stringify({
       pid: process.pid,
       stage: "training",
@@ -316,6 +319,109 @@ test("MLP training metrics discovers derived snapshots and matrix progress", asy
     writeFile(path.join(derivedRunDir, "state", "validation-current-best.json"), JSON.stringify({
       checkpointEpoch: 120,
       metrics: { normalizedMse: 1.1, correlation: 0.04 },
+    })),
+    writeFile(path.join(
+      derivedRunDir,
+      "state",
+      "checkpoint-selection-comparison.json",
+    ), JSON.stringify({
+      policies: {
+        "validation-mse": {
+          epoch: 12,
+          selectionScore: 0.91,
+          train: { normalizedMse: 0.8, correlation: 0.2 },
+          validation: { normalizedMse: 0.91, correlation: 0.1 },
+          test: { normalizedMse: 0.95, correlation: 0.08 },
+          distribution: {
+            validation: { negativeLogLikelihood: -10.2 },
+          },
+          autoregressiveEpisodes: {
+            validation: {
+              episodes: 128,
+              sourceEpisodeSeconds: 900,
+              activeCandles: 58_000,
+              activeCandlesPerEpisode: {
+                minimum: 410,
+                mean: 453.125,
+                maximum: 502,
+              },
+              pooledCandles: {
+                mseSkillVsZero: 0.02,
+                correlation: 0.04,
+                directionAccuracy: 0.51,
+              },
+              episodeAverage: {
+                mseSkillVsZero: 0.018,
+                correlation: 0.03,
+                directionAccuracy: 0.505,
+              },
+              episodeReturnCorrelation: 0.03,
+              episodeCumulativePathCorrelation: 0.05,
+              episodeEndpoint: {
+                mseSkillVsZero: 0.01,
+                correlation: 0.06,
+                directionAccuracy: 0.52,
+              },
+            },
+          },
+          sobolExpectedEpisodes: {
+            validation: {
+              episodes: 16,
+              pooledCandles: { correlation: 0.05 },
+              estimator: {
+                trajectories: 4096,
+                randomizedReplicates: 16,
+                trajectoriesPerReplicate: 256,
+                returnTrajectoryVarianceMean: 2e-8,
+                returnMean: {
+                  meanVariance: 3e-12,
+                  p95StandardError: 2e-6,
+                },
+              },
+              pathLikelihood: {
+                exactPathProbabilityMass: 0,
+                episodes: 16,
+                realizedNegativeLogDensityPerCandle: {
+                  mean: -10.5,
+                  median: -10.6,
+                },
+                sampledPathLogDensityPercentile: {
+                  mean: 0.12,
+                  fractionBelow5Percent: 0.25,
+                },
+              },
+            },
+          },
+        },
+      },
+    })),
+    writeFile(path.join(
+      derivedRunDir,
+      "state",
+      "checkpoint-selection-calibrations.json",
+    ), JSON.stringify({
+      policies: {
+        "validation-mse": {
+          transforms: {
+            scaleOnly: { scale: 0.2 },
+            affine: { scale: 0.3, intercept: 0.00001 },
+          },
+          calibrationRaw: { correlation: 0.15 },
+          validation: {
+            scaleOnly: { normalizedMse: 0.99 },
+            affine: { normalizedMse: 0.98 },
+          },
+          test: {
+            scaleOnly: { normalizedMse: 1.01 },
+            affine: { normalizedMse: 1.02 },
+          },
+          densityTemperature: {
+            temperature: 0.8,
+            validation: { negativeLogLikelihood: -10.4 },
+            test: { negativeLogLikelihood: -10.1 },
+          },
+        },
+      },
     })),
   ]);
 
@@ -340,7 +446,7 @@ test("MLP training metrics discovers derived snapshots and matrix progress", asy
       paused: false,
       active: {
         id: "derived-dropout",
-        label: "Derived dropout run",
+        label: "Legacy candidate-count dropout run",
         stage: "training",
         epoch: 127,
         epochs: 512,
@@ -363,17 +469,103 @@ test("MLP training metrics discovers derived snapshots and matrix progress", asy
       runs: [{
         key: "run/derived-dropout",
         id: "derived-dropout",
-        label: "Derived dropout run",
+        label: "Legacy candidate-count dropout run",
         running: true,
         stage: "training",
+        epoch: 127,
         epochs: 512,
         examples: 256_000,
         parameterCount: 5_000_000,
         bestEpoch: 120,
         train: { normalizedMse: 0.2, mseSkillVsZero: 0.8 },
         validation: { normalizedMse: 1.1, correlation: 0.04 },
+        checkpointSelections: {
+          "validation-mse": {
+            epoch: 12,
+            selectionScore: 0.91,
+            train: { normalizedMse: 0.8, correlation: 0.2 },
+            validation: { normalizedMse: 0.91, correlation: 0.1 },
+            test: { normalizedMse: 0.95, correlation: 0.08 },
+            distribution: {
+              validation: { negativeLogLikelihood: -10.2 },
+            },
+            autoregressiveEpisodes: {
+              validation: {
+                episodes: 128,
+                sourceEpisodeSeconds: 900,
+                activeCandles: 58_000,
+                activeCandlesPerEpisode: {
+                  minimum: 410,
+                  mean: 453.125,
+                  maximum: 502,
+                },
+                pooledCandles: {
+                  mseSkillVsZero: 0.02,
+                  directionAccuracy: 0.51,
+                  correlation: 0.04,
+                },
+                episodeAverage: {
+                  mseSkillVsZero: 0.018,
+                  directionAccuracy: 0.505,
+                  correlation: 0.03,
+                },
+                episodeReturnCorrelation: 0.03,
+                episodeCumulativePathCorrelation: 0.05,
+                episodeEndpoint: {
+                  mseSkillVsZero: 0.01,
+                  directionAccuracy: 0.52,
+                  correlation: 0.06,
+                },
+              },
+            },
+            sobolExpectedEpisodes: {
+              validation: {
+                episodes: 16,
+                pooledCandles: { correlation: 0.05 },
+                estimator: {
+                  trajectories: 4096,
+                  randomizedReplicates: 16,
+                  trajectoriesPerReplicate: 256,
+                  returnTrajectoryVarianceMean: 2e-8,
+                  returnMean: {
+                    meanVariance: 3e-12,
+                    p95StandardError: 2e-6,
+                  },
+                },
+                pathLikelihood: {
+                  exactPathProbabilityMass: 0,
+                  episodes: 16,
+                  realizedNegativeLogDensityPerCandle: {
+                    mean: -10.5,
+                    median: -10.6,
+                  },
+                  sampledPathLogDensityPercentile: {
+                    mean: 0.12,
+                    fractionBelow5Percent: 0.25,
+                  },
+                },
+              },
+            },
+            outputCalibration: {
+              scale: 0.2,
+              affineScale: 0.3,
+              affineIntercept: 0.00001,
+              calibrationCorrelation: 0.15,
+              validation: { normalizedMse: 0.99 },
+              test: { normalizedMse: 1.01 },
+              affineValidation: { normalizedMse: 0.98 },
+              affineTest: { normalizedMse: 1.02 },
+              densityTemperature: 0.8,
+              densityValidation: { negativeLogLikelihood: -10.4 },
+              densityTest: { negativeLogLikelihood: -10.1 },
+            },
+          },
+        },
         validationCheckpointEpoch: 120,
-        fit: [{ epoch: 127, trainNormalizedMse: 0.25 }],
+        fit: [
+          { epoch: 120, validationNormalizedMse: 1.1 },
+          { epoch: 127, trainNormalizedMse: 0.25 },
+        ],
       }],
     });
     await rm(path.join(derivedRunDir, "state", "validation-current-best.json"));

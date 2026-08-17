@@ -15,6 +15,10 @@ export interface TradingCandle {
   low: number;
   close: number;
   volume: number;
+  /** Buyer-initiated base volume, when the market-data source supplies aggressor flow. */
+  aggressiveBuyVolume?: number;
+  /** Seller-initiated base volume, when the market-data source supplies aggressor flow. */
+  aggressiveSellVolume?: number;
 }
 
 export interface TradingTick {

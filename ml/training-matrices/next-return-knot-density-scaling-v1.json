@@ -1,0 +1,40 @@
+{
+  "id": "next-return-knot-density-scaling-v1",
+  "label": "Conditional density scaling: 4-layer 65k-256k x 8-1024 knots",
+  "control": {
+    "pauseFile": "data/training/matrices/next-return-knot-density-scaling-v1/control/PAUSE"
+  },
+  "experiment": {
+    "architectures": ["four-layer-width-512"],
+    "cleanExampleCounts": [65536, 131072, 262144],
+    "knotCounts": [8, 16, 32, 64, 128, 256, 512, 1024],
+    "cells": 24,
+    "reused": ["next-second-4-layer-knot-density-65k-v1"]
+  },
+  "runIds": [
+    "next-second-4-layer-knot-density-65k-k8-v1",
+    "next-second-4-layer-knot-density-65k-k16-v1",
+    "next-second-4-layer-knot-density-65k-k32-v1",
+    "next-second-4-layer-knot-density-65k-v1",
+    "next-second-4-layer-knot-density-65k-k128-v1",
+    "next-second-4-layer-knot-density-65k-k256-v1",
+    "next-second-4-layer-knot-density-65k-k512-v1",
+    "next-second-4-layer-knot-density-65k-k1024-v1",
+    "next-second-4-layer-knot-density-128k-k8-v1",
+    "next-second-4-layer-knot-density-128k-k16-v1",
+    "next-second-4-layer-knot-density-128k-k32-v1",
+    "next-second-4-layer-knot-density-128k-k64-v1",
+    "next-second-4-layer-knot-density-128k-k128-v1",
+    "next-second-4-layer-knot-density-128k-k256-v1",
+    "next-second-4-layer-knot-density-128k-k512-v1",
+    "next-second-4-layer-knot-density-128k-k1024-v1",
+    "next-second-4-layer-knot-density-256k-k8-v1",
+    "next-second-4-layer-knot-density-256k-k16-v1",
+    "next-second-4-layer-knot-density-256k-k32-v1",
+    "next-second-4-layer-knot-density-256k-k64-v1",
+    "next-second-4-layer-knot-density-256k-k128-v1",
+    "next-second-4-layer-knot-density-256k-k256-v1",
+    "next-second-4-layer-knot-density-256k-k512-v1",
+    "next-second-4-layer-knot-density-256k-k1024-v1"
+  ]
+}

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from calibrate_next_return_output import calibrate_plan
+
 from normalized_glu_next_return import (
     CAUSAL_VOLATILITY_INPUT_NORMALIZATION,
     NormalizedGluNextReturn,
@@ -18,6 +20,7 @@ from train_normalized_glu_next_return import (
     atomic_json,
     canonical_fingerprint,
     evaluate,
+    evaluate_daily_group_cvar,
     resolve,
 )
 
@@ -33,6 +36,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16_384)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--calibration-days", type=int, default=7)
+    parser.add_argument(
+        "--skip-output-calibration",
+        action="store_true",
+        help=(
+            "Do not fit the standard pre-validation affine output calibration "
+            "after validation evaluation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -96,7 +108,11 @@ def main() -> None:
         decision_stride_seconds=1,
     )
     dataset = NextReturnDataset(
-        shards, history_root, horizon_return_count=1, row_stride=1
+        shards,
+        history_root,
+        horizon_return_count=1,
+        row_stride=1,
+        exclude_zero_targets=training_plan.get("datasetFilter") is not None,
     )
     candidate_states = {
         "raw-best": state,
@@ -122,18 +138,31 @@ def main() -> None:
         else None
     )
     candidate_metrics = {}
+    cvar_dro = training_plan["training"].get("cvarDro")
     for candidate_id, candidate_state in candidate_states.items():
         model.load_state_dict(candidate_state)
-        candidate_metrics[candidate_id] = evaluate(
-            model,
-            dataset,
-            args.split,
-            batch_size=args.batch_size,
-            target_std=float(model.target_std.item()),
-            device=device,
-            amp_dtype=torch.float32,
-            causal_volatility_window=causal_volatility_window,
-        )
+        if cvar_dro is not None:
+            metrics, daily_cvar = evaluate_daily_group_cvar(
+                model, dataset, args.split,
+                batch_size=args.batch_size,
+                target_std=float(model.target_std.item()),
+                tail_fraction=float(cvar_dro["tailFraction"]),
+                device=device,
+            )
+            candidate_metrics[candidate_id] = {
+                **metrics, "dailyCvar": daily_cvar
+            }
+        else:
+            candidate_metrics[candidate_id] = evaluate(
+                model,
+                dataset,
+                args.split,
+                batch_size=args.batch_size,
+                target_std=float(model.target_std.item()),
+                device=device,
+                amp_dtype=torch.float32,
+                causal_volatility_window=causal_volatility_window,
+            )
     selected_candidate = min(
         candidate_metrics,
         key=lambda name: float(candidate_metrics[name]["normalizedMse"]),
@@ -159,12 +188,39 @@ def main() -> None:
         "splitPlanId": split_plan["id"],
         "split": args.split,
         "examples": dataset.logical_count(args.split),
+        "candidateExamples": sum(
+            shard.count for shard in shards[args.split]
+        ),
+        "datasetFilter": training_plan.get("datasetFilter"),
         "selectedCandidate": selected_candidate,
         "candidateMetrics": candidate_metrics,
         "metrics": metrics,
     }
     atomic_json(result, output_file)
     print(json.dumps(result, separators=(",", ":")))
+    if args.split == "validation" and not args.skip_output_calibration:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        calibration = calibrate_plan(
+            repo,
+            training_plan_file,
+            split_plan,
+            split_plan_file,
+            calibration_days=int(args.calibration_days),
+            batch_size=int(args.batch_size),
+            device=device,
+            checkpoint_file=checkpoint_file,
+            selected_candidate=selected_candidate,
+        )
+        print(json.dumps({
+            "event": "output-calibration-complete",
+            "trainingPlanId": training_plan["id"],
+            "selectedCandidate": selected_candidate,
+            "scaleOnly": calibration["transforms"]["scaleOnly"],
+            "validation": calibration["validation"]["scaleOnly"],
+            "test": calibration["test"]["scaleOnly"],
+        }, separators=(",", ":")))
 
 
 if __name__ == "__main__":

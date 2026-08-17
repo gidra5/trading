@@ -1,21 +1,23 @@
 
 https://www.youtube.com/watch?v=NFo9v_yKQXA
-We follow RL problem statement.
-The set of states are portfolios, so $s\in\mathcal S=\Psi$. It may also include history of prices, since it is also evolving due to our actions and part of the environment. Although it is not part of the agent inherently.
-The set of actions are exposure transitions, identified by target exposure, so $a\in\mathcal A(s)=E$ effectively.
-The set of rewards is essentially a set of possible return, so $r\in\mathcal R=\mathbb{R} \cup \{-\infty\}$.
+The dynamics of the environment are described by a (transition) distribution function $p(s',r\ |\ s,a)$ - a probability of transitioning to $s'$ with a reward $r$ given current state $s$ and an action $a$. In our setup it represents how much return and what portfolio we will get, given our current portfolio and a chosen portfolio change.
 
-The dynamics of the environment are described by a distribution function $p(s',r\ |\ s,a)$ - a probability of transitioning to $s'$ with a reward $r$ given current state $s$ and an action $a$. In our setup it represents how much return and what portfolio we will get, given our current portfolio and a chosen portfolio change.
+The distribution acts on the 3 sets - set of states $\mathcal S$, set of rewards $\mathcal R$, and set of actions in any given state $\mathcal A(s)$.
 
 Note that in that setup the sets are not finite, but we can discretize them to get a finite approximation.
 
-The oracle has a policy $\pi(a\ |\ s)$ - a distribution function for probability of an action $a$ given state $s$.
+The oracle has a policy $\pi(a\ |\ s)$ - a distribution function for an action $a$ given state $s$.
 
 We call $g_t$ a *score* of the policy, defined as a weighted sum of all future rewards:
-$$g_t=\sum_{t'>t}w_t*r_t$$
+$$g_t=\sum_{t'\ge t}w_t*r_t$$
 The weight essentially describes how much the *agent* values the reward, while reward's values itself is some objective measure of the reward.
 
-A simple weighting is exponential, scaling each future score by $\gamma$:
+Not all weights are equally nice. A nice weighting is factorizable over all prev time:
+$$w_t=\prod_{t\ge t'}w_{t'}'$$
+That way we can express score recursively as:
+$$g_t=r_t+w_{t+1}' g_{t+1}$$
+
+A simple, nice weighting is exponential, scaling each future score by $\gamma$:
 $$g_t=r_t+\gamma g_{t+1}$$
 That values immediate reward more than the later one.
 
@@ -43,7 +45,6 @@ q(s, a)&=\sum_{s'\in\mathcal S, r\in\mathcal R} p(s',r\ |\ s, a)[r+ w(s')*\sum_{
 &=\mathbb{E}[R_t\ |\ s,a]+\sum_{s'\in\mathcal S, r\in\mathcal R} \sum_{a\in\mathcal A(s')} w(s')*p(s',r\ |\ s, a)\pi(a\ |\ s')q(s',a)
 \end{aligned}$$
 $$v(s)=\sum_{a\in\mathcal A(s)} \sum_{s'\in\mathcal S, r\in\mathcal R} \pi(a\ |\ s)p(s',r\ |\ s, a)[r+w(s')*v(s')]$$
-
 # Policy Evaluation
 
 Given some policy it is useful to be able to compute both value functions.
@@ -55,7 +56,3 @@ Another problem is that we might not be able to evaluate next state values, if t
 To get around these problems we can simply approximate the value function and then adjust it according to Bellman equations until we reach fixed point.
 
 This procedure applies to both action value and state value functions.
-
-# Policy improvement
-
-Note that we can continuously improve policy 

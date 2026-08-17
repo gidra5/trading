@@ -103,6 +103,34 @@ test("checkpoint GC aborts before deletion on an invalid object path", () => {
   }
 });
 
+test("checkpoint GC retains nested selection checkpoint objects", () => {
+  const { layout, cleanup } = fixture();
+  try {
+    const selectionHash = "77".repeat(32);
+    const selectionObject = writeObject(layout, selectionHash, ".bin");
+    const old = new Date(Date.now() - 2 * HOUR_MS);
+    fs.utimesSync(selectionObject, old, old);
+    writeJson(
+      path.join(
+        layout.runs,
+        "density-run",
+        "checkpoints",
+        "selections",
+        "validation-mse.json",
+      ),
+      checkpointReference(selectionHash),
+    );
+
+    assert.deepEqual(
+      pruneTrainingOrphans(layout, { minimumAgeMs: HOUR_MS }),
+      { files: 0, bytes: 0, invalidReferences: 0, skipped: false },
+    );
+    assert.equal(fs.existsSync(selectionObject), true);
+  } finally {
+    cleanup();
+  }
+});
+
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "training-storage-"));
   return {

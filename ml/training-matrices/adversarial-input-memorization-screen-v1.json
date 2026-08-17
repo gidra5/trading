@@ -1,0 +1,39 @@
+{
+  "id": "adversarial-input-memorization-screen-v1",
+  "label": "Adversarial input training - epsilon RMS and clean scaling baselines",
+  "control": {
+    "pauseFile": "data/training/matrices/adversarial-input-memorization-screen-v1/control/PAUSE"
+  },
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-input-eps-1e0-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-adversarial-input-eps-1e0-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-adversarial-input-eps-1e0-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e0-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-adversarial-input-eps-1e0-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-adversarial-input-eps-1e-2-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-adversarial-input-eps-3e-2-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-adversarial-input-eps-1e-1-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-adversarial-input-eps-3e-1-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-adversarial-input-eps-1e0-v1"
+  ]
+}

@@ -175,7 +175,7 @@ def main() -> None:
                             "validation",
                             "--batch-size",
                             "8192",
-                        ), run_root / "state/validation-current-best.json"),
+                        ), run_root / "state/output-calibration-pre-validation-7d.json"),
                     )
                     for command, completion_file in commands:
                         run_resumable(command, completion_file)

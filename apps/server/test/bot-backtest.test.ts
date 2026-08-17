@@ -585,28 +585,32 @@ test("summary-only replay preserves trading and risk results", async () => {
     legacyValleyPeak: {
       averagingRangesSec: [2],
       trendSigmaWindowSec: 2,
-      derivativeClampMode: "deadband",
-      relativeRateEnabled: false,
-      rateThresholdsLow: [0],
-      rateThresholdsHigh: [0],
-      saturationSec: 0,
       anticipatoryGridOrderCount: 1,
       exitGridOrderCount: 1,
     },
   });
-  const warmup = [103, 102, 101]
-    .map((price, index) => timedCandle((index - 3) * 1_000, price, 1_000));
-  const candles = [100, 99, 101, 101, 150]
-    .map((price, index) => timedCandle(index * 1_000, price, 1_000));
-  const full = await runBotBacktestFromCandles(candles, {
+  const candles = Array.from({ length: 62 }, (_, index) =>
+    timedCandle(index * 1_000, index === 1 ? 99 : 100, 1_000));
+  const enterTime = candles[0]!.closeTime;
+  const closeTime = candles[60]!.closeTime;
+  const distributionAt = (timestamp: number) => timestamp === enterTime
+    ? oracleDistribution([0, 0, 1])
+    : timestamp === closeTime
+      ? oracleDistribution([0, 1, 0])
+      : null;
+  const backtestOptions = {
     config,
-    strategy: "hindsight-oracle-1s",
-    warmup,
+    strategy: "learned-oracle-1s" as const,
+    learnedOracleMaximumLeverage: 1,
+    oracleExpansionConfirmationMass: 0,
+    oracleExpansionDeltaCapFraction: 1,
+    learnedOracleDistributionAt: distributionAt,
+  };
+  const full = await runBotBacktestFromCandles(candles, {
+    ...backtestOptions,
   });
   const summary = await runBotBacktestFromCandles(candles, {
-    config,
-    strategy: "hindsight-oracle-1s",
-    warmup,
+    ...backtestOptions,
     summaryOnly: true,
   });
 
@@ -619,6 +623,14 @@ test("summary-only replay preserves trading and risk results", async () => {
   assert.equal(summary.summary.maxDrawdownPct, full.summary.maxDrawdownPct);
   assert.equal(summary.summary.maxEffectiveLeverage, full.summary.maxEffectiveLeverage);
   assert.equal(summary.summary.tradeCount, full.summary.tradeCount);
+  assert.ok(full.summary.closedPositionCount > 0);
+  assert.equal(summary.summary.closedPositionCount, full.summary.closedPositionCount);
+  assert.equal(
+    summary.summary.profitableClosedPositionCount,
+    full.summary.profitableClosedPositionCount,
+  );
+  assert.equal(summary.summary.winRate, full.summary.winRate);
+  assert.equal(summary.finalState.realizedPnl, full.finalState.realizedPnl);
 });
 
 test("new-bot replay exposes centered-SMA extrema and their order errors", async () => {
@@ -660,6 +672,53 @@ test("new-bot replay exposes centered-SMA extrema and their order errors", async
   assert.equal((result.summary.extremaOrderMass?.peakCount ?? 0) > 0, true);
   assert.equal(result.summary.extremaOrderMass?.smaWindowMs, 10 * 60_000);
 });
+
+test("MACD and aggressor-volume strategies execute through the regular bot", async () => {
+  const config = createStrategyConfig({
+    startingQuote: 1_000,
+    maxLeverage: 1,
+    cooldownMs: 0,
+    legacyValleyPeak: {
+      anticipatoryGridOrderCount: 1,
+      exitGridOrderCount: 1,
+    },
+  });
+  const candles = Array.from({ length: 6_000 }, (_, index) => {
+    const previous = technicalStrategyTestPrice(index - 1);
+    const close = technicalStrategyTestPrice(index);
+    return {
+      ...timedCandle(index * 60_000, close),
+      open: previous,
+      high: Math.max(previous, close) + 0.1,
+      low: Math.min(previous, close) - 0.1,
+      volume: 10 + index % 7,
+      aggressiveBuyVolume: close >= previous ? 9 : 1,
+      aggressiveSellVolume: close >= previous ? 1 : 9,
+    };
+  });
+
+  for (const strategy of ["macd", "volume-imbalance"] as const) {
+    const result = await runBotBacktestFromCandles(candles, {
+      config,
+      strategy,
+      summaryOnly: true,
+    });
+    assert.equal(result.summary.strategy, strategy);
+    assert.ok(result.summary.tradeCount > 0, `${strategy} should trade the matched synthetic cycle`);
+    assert.ok(Number.isFinite(result.summary.returnPct));
+    if (strategy === "macd") {
+      assert.ok(result.summary.closedPositionCount > 0, "MACD should close a synthetic-cycle position");
+    }
+  }
+});
+
+function technicalStrategyTestPrice(index: number): number {
+  const hour = Math.max(0, index) / 60;
+  const phase = hour % 72;
+  if (phase < 30) return 120 - phase * 0.5;
+  if (phase < 42) return 105 + (phase - 30) * 1.5;
+  return 123 - (phase - 42) * 0.6;
+}
 
 function candle(close: number, index: number): Candle {
   return timedCandle(index * 60_000, close);

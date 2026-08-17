@@ -1,0 +1,44 @@
+{
+  "id": "next-return-knot-density-autoregressive-episodes-v1",
+  "label": "Density checkpoints - cleaned 15m AR, Sobol expected-path, and realized-path likelihood",
+  "artifactProgress": {
+    "completionFile": "data/training/runs/{runId}/state/autoregressive-episode-evaluation.json",
+    "statusFile": "data/training/runs/{runId}/state/autoregressive-episode-status.json",
+    "completionContract": "six-policy-cleaned-active-return-episode-evaluation-v3"
+  },
+  "experiment": {
+    "checkpointPolicies": 6,
+    "sourceEpisodeSeconds": 900,
+    "maximumEpisodesPerSplit": 128,
+    "sobolExpectedEpisodesPerSplit": 16,
+    "sobolTrajectoriesPerEpisode": 4096,
+    "sobolRandomizedReplicates": 16,
+    "zeroReturns": "removed before rollout"
+  },
+  "runIds": [
+    "next-second-4-layer-knot-density-65k-k8-v1",
+    "next-second-4-layer-knot-density-65k-k16-v1",
+    "next-second-4-layer-knot-density-65k-k32-v1",
+    "next-second-4-layer-knot-density-65k-v1",
+    "next-second-4-layer-knot-density-65k-k128-v1",
+    "next-second-4-layer-knot-density-65k-k256-v1",
+    "next-second-4-layer-knot-density-65k-k512-v1",
+    "next-second-4-layer-knot-density-65k-k1024-v1",
+    "next-second-4-layer-knot-density-128k-k8-v1",
+    "next-second-4-layer-knot-density-128k-k16-v1",
+    "next-second-4-layer-knot-density-128k-k32-v1",
+    "next-second-4-layer-knot-density-128k-k64-v1",
+    "next-second-4-layer-knot-density-128k-k128-v1",
+    "next-second-4-layer-knot-density-128k-k256-v1",
+    "next-second-4-layer-knot-density-128k-k512-v1",
+    "next-second-4-layer-knot-density-128k-k1024-v1",
+    "next-second-4-layer-knot-density-256k-k8-v1",
+    "next-second-4-layer-knot-density-256k-k16-v1",
+    "next-second-4-layer-knot-density-256k-k32-v1",
+    "next-second-4-layer-knot-density-256k-k64-v1",
+    "next-second-4-layer-knot-density-256k-k128-v1",
+    "next-second-4-layer-knot-density-256k-k256-v1",
+    "next-second-4-layer-knot-density-256k-k512-v1",
+    "next-second-4-layer-knot-density-256k-k1024-v1"
+  ]
+}

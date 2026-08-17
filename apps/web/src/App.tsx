@@ -3939,6 +3939,8 @@ function BacktestPanel(props: {
             title="Strategy used by the replay bot"
           >
             <option value="peak-valley">Peak / valley</option>
+            <option value="macd">MACD + RSI confirmation</option>
+            <option value="volume-imbalance">Peak/valley + aggressor-flow filter</option>
             <option value="hindsight-oracle-1s">Hindsight oracle · 1h horizon</option>
           </select>
           <button

@@ -1,0 +1,14 @@
+{
+  "id": "adversarial-log-price-path-screen-v1",
+  "label": "Joint adversarial log-price path - 65k epsilon RMS screen",
+  "control": {
+    "pauseFile": "data/training/matrices/adversarial-log-price-path-screen-v1/control/PAUSE"
+  },
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-log-price-eps-1e-2-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-log-price-eps-3e-2-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-log-price-eps-1e-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-log-price-eps-3e-1-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-adversarial-log-price-eps-1e0-v1"
+  ]
+}

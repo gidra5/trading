@@ -363,14 +363,22 @@ export class SimulatedTradingApi implements TradingApi {
   }
 
   private assessLiquidation(previousPrice: number): boolean {
-    if (this.isLiquidated() || Math.abs(this.asset) <= EPSILON || !(this.price > 0)) return false;
+    if (this.isLiquidated() || !(this.price > 0)) return false;
+    if (Math.abs(this.asset) <= EPSILON) {
+      const closeoutEquity = this.closeoutEquity(this.price);
+      if (!(closeoutEquity > 0) || !Number.isFinite(closeoutEquity)) {
+        this.liquidate(this.price, "insolvent");
+        return true;
+      }
+      this.observeRisk();
+      return false;
+    }
     const boundary = this.liquidationBoundaryPrice();
     const crossed = boundary !== null && previousPrice > 0 && (
       this.asset > 0
         ? previousPrice > boundary && this.price <= boundary
         : previousPrice < boundary && this.price >= boundary
     );
-    const closeoutEquity = this.closeoutEquity(this.price);
     const effectiveLeverage = this.effectiveLeverage(this.price);
     const maximum = this.maximumEffectiveLeverage();
     if (crossed) {
@@ -383,6 +391,7 @@ export class SimulatedTradingApi implements TradingApi {
       );
       return true;
     }
+    const closeoutEquity = this.closeoutEquity(this.price);
     if (!(closeoutEquity > 0) || !Number.isFinite(closeoutEquity)) {
       this.liquidate(this.price, "insolvent");
       return true;

@@ -1,0 +1,66 @@
+{
+  "id": "next-second-4-layer-knot-density-65k-v1",
+  "label": "Distribution - four-layer next-1s GLU - 65k clean examples - fixed 64 KL knots - NLL",
+  "datasetDir": "data/training/datasets/next-second-4-layer-knot-density-65k-v1",
+  "runDir": "data/training/runs/next-second-4-layer-knot-density-65k-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "date": "2026-04-01",
+    "examples": 65536
+  },
+  "evaluation": {
+    "type": "fixed-clean-heldout-count",
+    "validationStart": "2026-06-01",
+    "testStart": "2026-07-01",
+    "examplesPerSplit": 65536
+  },
+  "datasetFilter": {
+    "type": "exclude-exact-zero-target-return",
+    "appliesTo": ["normalization", "training", "validation", "test"],
+    "comparison": "float32-exact-zero-after-log-return-construction"
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-64-knot-fits.json",
+    "fit": "kl",
+    "knotCount": 64,
+    "transform": "frozen-asinh-logistic",
+    "basis": "normalized-piecewise-linear-triangular",
+    "output": "conditional-log-density-height"
+  },
+  "architecture": {
+    "widths": [512, 512, 512, 512],
+    "dropout": 0.0,
+    "dropoutRate": 0.0,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 4096,
+    "evaluationBatchSize": 8192,
+    "learningRate": 0.0001,
+    "selection": "lowest-validation-return-space-negative-log-likelihood",
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  }
+}

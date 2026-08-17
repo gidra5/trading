@@ -1,7 +1,9 @@
 import {
   GridTradingBot,
+  MacdStrategy,
   PeakValleyStrategy,
   SimulatedTradingApi,
+  VolumeImbalanceStrategy,
   DEFAULT_SIMULATED_BORROW_BPS_HOUR,
   DEFAULT_SIMULATED_MAX_EFFECTIVE_LEVERAGE,
   calculateRiskAdjustedMetrics,
@@ -35,6 +37,8 @@ import {
   type PeakValleyStrategyConfig,
   type PeakValleyStrategySnapshot,
   type StrategyOptions,
+  type StrategyDiagnostics,
+  type StrategySnapshot,
   type StrategyConfig,
   type TradeFill,
   type TradingOrder,
@@ -42,6 +46,7 @@ import {
   type TradingOrderSnapshot,
   type TradingTick,
   type TradingPosition,
+  type TradingStrategy,
   type TradingStrategyEntrySignal,
   type TradingStrategyExitSignal,
   type TradingStrategyTargetExposureContext,
@@ -145,6 +150,11 @@ interface PositionAccounting {
   realizedPnl: number;
 }
 
+interface SummaryOrderAccounting {
+  positionId: string;
+  entry: boolean;
+}
+
 export async function runBotBacktestFromCandles(
   candles: readonly Candle[],
   options: BotBacktestOptions,
@@ -154,6 +164,15 @@ export async function runBotBacktestFromCandles(
   const config = options.config;
   const summaryOnly = options.summaryOnly ?? false;
   const backtestStrategy = options.strategy ?? "peak-valley";
+  if (
+    backtestStrategy === "volume-imbalance"
+    && candles.some((candle) => candle.aggressiveBuyVolume === undefined
+      || candle.aggressiveSellVolume === undefined)
+  ) {
+    throw new Error(
+      "Volume-imbalance backtests require buyer- and seller-initiated volume for every candle.",
+    );
+  }
   const intervalMs = candleIntervalMs(candles);
   const oracleStrategy = backtestStrategy === "hindsight-oracle-1s"
     || backtestStrategy === "learned-oracle-1s"
@@ -279,7 +298,7 @@ export async function runBotBacktestFromCandles(
     config: botConfig.strategy,
     getHistory: api.getHistory.bind(api),
   };
-  const strategy = oracleDistributionAt
+  const strategy: TracingBacktestStrategy = oracleDistributionAt
     ? new TracingOraclePolicyStrategy(
         strategyOptions,
         oracleDistributionAt,
@@ -288,9 +307,18 @@ export async function runBotBacktestFromCandles(
         staticConfidenceScale,
         options.onOracleDecision,
       )
-    : new TracingPeakValleyStrategy(strategyOptions);
-  const bot = new GridTradingBot({ api, strategy, config: botConfig });
+    : backtestStrategy === "macd"
+      ? new TracingTechnicalStrategy(new MacdStrategy(strategyOptions))
+      : backtestStrategy === "volume-imbalance"
+        ? new TracingTechnicalStrategy(new VolumeImbalanceStrategy(strategyOptions))
+        : new TracingPeakValleyStrategy(strategyOptions);
+  const bot = new GridTradingBot<PeakValleyStrategyConfig, StrategySnapshot, StrategyDiagnostics>({
+    api,
+    strategy,
+    config: botConfig,
+  });
   const orders = new Map<string, OrderRecord>();
+  const summaryOrders = new Map<string, SummaryOrderAccounting>();
   const positions = new Map<string, PositionAccounting>();
   const fills: TradeFill[] = [];
   const annotations: BacktestChartAnnotation[] = [];
@@ -321,7 +349,7 @@ export async function runBotBacktestFromCandles(
   let lastProcessed = candles[0]!;
   let latestDecision: BacktestSignalTrace | null = null;
   let latestBotSnapshot:
-    BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot> | undefined;
+    BotSnapshot<PeakValleyBotConfig["strategy"], StrategySnapshot> | undefined;
 
   await bot.warmup();
   replay: for (let index = 0; index < candles.length; index += 1) {
@@ -513,9 +541,24 @@ export async function runBotBacktestFromCandles(
   };
 
   async function deliver(): Promise<void> {
-    for (const event of api.drainEvents()) {
+    const events = api.drainEvents();
+    if (
+      summaryOnly
+      && events.some((event) => event.type === "fill" || event.type === "partial-fill")
+    ) {
+      await captureSummaryAccounting();
+    }
+    for (const event of events) {
       if (summaryOnly && (event.type === "fill" || event.type === "partial-fill")) {
         summaryFillCount += 1;
+        const record = summaryOrders.get(event.orderId);
+        if (record) {
+          realizedPnl += accountFill(
+            record,
+            event.fill.filledAsset,
+            event.fill.filledQuote,
+          );
+        }
       } else {
         recordFill(event);
       }
@@ -525,6 +568,28 @@ export async function runBotBacktestFromCandles(
         await capturePositions();
         captureCause = "tick";
       }
+    }
+  }
+
+  async function captureSummaryAccounting(): Promise<void> {
+    const snapshot = await bot.snapshot();
+    const liveOrderIds = new Set<string>();
+    for (const position of snapshot.positions) {
+      positions.set(position.id, positions.get(position.id) ?? {
+        side: position.side,
+        asset: 0,
+        quote: 0,
+        realizedPnl: 0,
+      });
+      for (const [grid, entry] of [[position.entryGrid, true], [position.exitGrid, false]] as const) {
+        for (const item of grid?.orders ?? []) {
+          liveOrderIds.add(item.order.id);
+          summaryOrders.set(item.order.id, { positionId: position.id, entry });
+        }
+      }
+    }
+    for (const orderId of summaryOrders.keys()) {
+      if (!liveOrderIds.has(orderId)) summaryOrders.delete(orderId);
     }
   }
 
@@ -757,7 +822,11 @@ export async function runBotBacktestFromCandles(
     });
   }
 
-  function accountFill(record: OrderRecord, asset: number, quote: number): number {
+  function accountFill(
+    record: Pick<OrderRecord, "positionId" | "entry">,
+    asset: number,
+    quote: number,
+  ): number {
     const position = positions.get(record.positionId);
     if (!position) return 0;
     if (record.entry) {
@@ -799,7 +868,7 @@ export async function runBotBacktestFromCandles(
     time: number,
     price: number,
     account: Awaited<ReturnType<SimulatedTradingApi["getEquity"]>>,
-    snapshot: BotSnapshot<PeakValleyBotConfig["strategy"], PeakValleyStrategySnapshot>,
+    snapshot: BotSnapshot<PeakValleyBotConfig["strategy"], StrategySnapshot>,
     equity: number,
   ): BacktestTraceFrame {
     const longQuantity = snapshot.positions.reduce(
@@ -925,6 +994,12 @@ function tradingCandle(candle: Candle) {
     low: candle.low,
     close: candle.close,
     volume: candle.volume,
+    ...(candle.aggressiveBuyVolume === undefined
+      ? {}
+      : { aggressiveBuyVolume: candle.aggressiveBuyVolume }),
+    ...(candle.aggressiveSellVolume === undefined
+      ? {}
+      : { aggressiveSellVolume: candle.aggressiveSellVolume }),
   };
 }
 
@@ -1012,6 +1087,120 @@ class TracingPeakValleyStrategy extends PeakValleyStrategy {
         ...structuredClone(diagnostics.indicators),
         ...this.targetIndicators,
       },
+    };
+  }
+
+  hasExitDecision(side: PositionSide): boolean {
+    return this.exit?.side === side
+      || this.targetActive.some((action) => action.type === "exit" && action.side === side);
+  }
+
+  currentPrice(): number {
+    return this.tick?.price ?? 0;
+  }
+}
+
+interface TracingBacktestStrategy extends TradingStrategy<
+  PeakValleyStrategyConfig,
+  StrategySnapshot,
+  StrategyDiagnostics
+> {
+  takeDecision(source?: "price" | "kama", includeConfirmations?: boolean): BacktestSignalTrace | null;
+  hasExitDecision(side: PositionSide): boolean;
+  currentPrice(): number;
+}
+
+class TracingTechnicalStrategy implements TracingBacktestStrategy {
+  private tick: TradingTick | null = null;
+  private entry: TradingStrategyEntrySignal | null = null;
+  private exit: TradingStrategyExitSignal | null = null;
+  private targetActive: { type: "entry" | "exit"; side: PositionSide }[] = [];
+  readonly targetExposureSignal?: (
+    context: TradingStrategyTargetExposureContext,
+  ) => Promise<TradingStrategyTargetExposureSignal | null>;
+
+  constructor(
+    private readonly strategy: TradingStrategy<
+      PeakValleyStrategyConfig,
+      StrategySnapshot,
+      StrategyDiagnostics
+    >,
+  ) {
+    if (strategy.targetExposureSignal) {
+      this.targetExposureSignal = async (context) => {
+        const signal = await strategy.targetExposureSignal!(context);
+        if (signal) {
+          this.targetActive = targetExposureActions(
+            context.currentExposure,
+            signal.targetExposure,
+          );
+        }
+        return signal;
+      };
+    }
+  }
+
+  staticConfidence(): number {
+    return this.strategy.staticConfidence();
+  }
+
+  warmup(): Promise<void> {
+    return this.strategy.warmup();
+  }
+
+  async onTick(tick: TradingTick): Promise<void> {
+    this.tick = tick;
+    this.entry = null;
+    this.exit = null;
+    this.targetActive = [];
+    await this.strategy.onTick(tick);
+  }
+
+  async entrySignal(): Promise<TradingStrategyEntrySignal | null> {
+    return this.entry = await this.strategy.entrySignal();
+  }
+
+  async exitSignal(): Promise<TradingStrategyExitSignal | null> {
+    return this.exit = await this.strategy.exitSignal();
+  }
+
+  snapshot(): Promise<StrategySnapshot> {
+    return this.strategy.snapshot();
+  }
+
+  restore(snapshot: StrategySnapshot): Promise<void> {
+    return this.strategy.restore(snapshot);
+  }
+
+  updateConfig(config: PeakValleyStrategyConfig): Promise<void> {
+    return this.strategy.updateConfig(config);
+  }
+
+  getDiagnostics(): StrategyDiagnostics {
+    return this.strategy.getDiagnostics();
+  }
+
+  takeDecision(
+    source: "price" | "kama" = "price",
+    includeConfirmations = false,
+  ): BacktestSignalTrace | null {
+    if (!this.tick) return null;
+    const diagnostics = this.getDiagnostics();
+    const active = [
+      ...(this.entry ? [{ type: "entry" as const, side: this.entry.side }] : []),
+      ...(this.exit ? [{ type: "exit" as const, side: this.exit.side }] : []),
+      ...this.targetActive,
+    ];
+    const confirmationActive = diagnostics.gates.some((gate) => gate.passed);
+    if (active.length === 0 && (!includeConfirmations || !confirmationActive)) return null;
+    return {
+      time: this.tick.timestamp,
+      price: this.tick.price,
+      source,
+      active,
+      gates: structuredClone(diagnostics.gates),
+      blockers: [...diagnostics.blockers],
+      indicators: structuredClone(diagnostics.indicators),
     };
   }
 

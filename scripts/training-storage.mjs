@@ -128,9 +128,19 @@ function checkpointPointerFiles(runsRoot) {
       if (!entry.isDirectory()) continue;
       const child = path.join(directory, entry.name);
       if (entry.name === "checkpoints") {
-        for (const pointer of fs.readdirSync(child, { withFileTypes: true })) {
-          if (pointer.isFile() && pointer.name.endsWith(".json")) {
-            result.push(path.join(child, pointer.name));
+        const checkpointDirectories = [child];
+        while (checkpointDirectories.length > 0) {
+          const checkpointDirectory = checkpointDirectories.pop();
+          for (const pointer of fs.readdirSync(
+            checkpointDirectory,
+            { withFileTypes: true },
+          )) {
+            const candidate = path.join(checkpointDirectory, pointer.name);
+            if (pointer.isDirectory()) {
+              checkpointDirectories.push(candidate);
+            } else if (pointer.isFile() && pointer.name.endsWith(".json")) {
+              result.push(candidate);
+            }
           }
         }
       } else {

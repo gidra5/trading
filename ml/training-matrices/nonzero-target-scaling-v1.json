@@ -1,0 +1,15 @@
+{
+  "id": "nonzero-target-scaling-v1",
+  "label": "Legacy candidate-count zero filtering - retained nonzero counts were lower than the named caps",
+  "control": {
+    "pauseFile": "data/training/matrices/nonzero-target-scaling-v1/control/PAUSE"
+  },
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-targets-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-nonzero-targets-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-nonzero-targets-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-nonzero-targets-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-nonzero-targets-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-nonzero-targets-v1"
+  ]
+}

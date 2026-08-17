@@ -1,0 +1,23 @@
+{
+  "id": "nonzero-mean-teacher-ofat-v1",
+  "label": "Clean 65k Mean Teacher one-factor-at-a-time sweep",
+  "strategy": "one-factor-at-a-time",
+  "predecessor": "nonzero-eiil-irm-annealing-v1",
+  "basePlan": "next-second-4-layer-memorization-65k-static-c-v1.json",
+  "cleanTrainingExamples": 65536,
+  "validationExamples": 65536,
+  "defaults": {
+    "halfLifeEpochs": 4,
+    "consistencyWeight": 1,
+    "rampUpFraction": 0.05,
+    "inputPerturbationRms": 0.01
+  },
+  "axes": {
+    "halfLifeEpochs": [4, 8, 16],
+    "consistencyWeight": [1, 3, 10, 0.5],
+    "rampUpFraction": [0.05, 0.33, 0.66, 1, 0],
+    "inputPerturbationRms": [0.01, 0.1, 1]
+  },
+  "uniqueRuns": 12,
+  "runner": "ml/run_mean_teacher_memorization_sweep.py"
+}

@@ -198,6 +198,107 @@ interface ComparisonMetricValues {
   correlation?: number;
 }
 
+interface ComparisonDistributionValues {
+  negativeLogLikelihood?: number;
+  unitNegativeLogLikelihood?: number;
+  bitsPerExample?: number;
+  globalBaselineNegativeLogLikelihood?: number;
+  nllImprovementVsGlobal?: number;
+  rawNegativeLogLikelihood?: number;
+  nllImprovementVsRaw?: number;
+  expectation?: ComparisonMetricValues;
+  perLeadExpectation?: ComparisonMetricValues[];
+  mode?: ComparisonMetricValues;
+}
+
+interface ComparisonOutputCalibration {
+  scale?: number;
+  affineScale?: number;
+  affineIntercept?: number;
+  calibrationCorrelation?: number;
+  validation?: ComparisonMetricValues;
+  test?: ComparisonMetricValues;
+  affineValidation?: ComparisonMetricValues;
+  affineTest?: ComparisonMetricValues;
+  densityTemperature?: number;
+  densityValidation?: ComparisonDistributionValues;
+  densityTest?: ComparisonDistributionValues;
+}
+
+interface ComparisonAutoregressiveEpisodeValues {
+  episodes?: number;
+  sourceEpisodeSeconds?: number;
+  activeCandles?: number;
+  activeCandlesPerEpisode?: {
+    minimum?: number;
+    mean?: number;
+    maximum?: number;
+  };
+  pooledCandles?: ComparisonMetricValues;
+  episodeAverage?: ComparisonMetricValues;
+  episodeReturnCorrelation?: number;
+  episodeCumulativePathCorrelation?: number;
+  episodeEndpoint?: ComparisonMetricValues;
+  estimator?: {
+    trajectories?: number;
+    randomizedReplicates?: number;
+    trajectoriesPerReplicate?: number;
+    returnTrajectoryVarianceMean?: number;
+    returnMean?: ComparisonEstimatorVarianceValues;
+    cumulativeLogPricePathMean?: ComparisonEstimatorVarianceValues;
+    endpointTrajectoryVarianceMean?: number;
+    endpointMean?: ComparisonEstimatorVarianceValues;
+  };
+  pathLikelihood?: {
+    exactPathProbabilityMass?: number;
+    episodes?: number;
+    realizedNegativeLogDensityPerCandle?: ComparisonLikelihoodSummaryValues;
+    realizedBitsPerCandle?: ComparisonLikelihoodSummaryValues;
+    sampledPathLogDensityPercentile?: ComparisonLikelihoodSummaryValues;
+    twoSidedTypicality?: ComparisonLikelihoodSummaryValues;
+    logDensityZScoreVsSampledPaths?: ComparisonLikelihoodSummaryValues;
+    perCandleDensityRatioVsSampleMedian?: ComparisonLikelihoodSummaryValues;
+  };
+}
+
+interface ComparisonEstimatorVarianceValues {
+  meanVariance?: number;
+  meanStandardError?: number;
+  p95StandardError?: number;
+  maximumStandardError?: number;
+}
+
+interface ComparisonLikelihoodSummaryValues {
+  mean?: number;
+  median?: number;
+  p95?: number;
+  minimum?: number;
+  fractionBelow1Percent?: number;
+  fractionBelow5Percent?: number;
+}
+
+interface ComparisonCheckpointSelection {
+  epoch: number;
+  selectionScore?: number;
+  train?: ComparisonMetricValues;
+  validation?: ComparisonMetricValues;
+  test?: ComparisonMetricValues;
+  distribution?: {
+    train?: ComparisonDistributionValues;
+    validation?: ComparisonDistributionValues;
+    test?: ComparisonDistributionValues;
+  };
+  autoregressiveEpisodes?: {
+    validation?: ComparisonAutoregressiveEpisodeValues;
+    test?: ComparisonAutoregressiveEpisodeValues;
+  };
+  sobolExpectedEpisodes?: {
+    validation?: ComparisonAutoregressiveEpisodeValues;
+    test?: ComparisonAutoregressiveEpisodeValues;
+  };
+  outputCalibration?: ComparisonOutputCalibration;
+}
+
 interface ComparisonResponse {
   runs: Array<{
     key: string;
@@ -205,6 +306,7 @@ interface ComparisonResponse {
     label: string;
     running: boolean;
     stage?: string;
+    epoch?: number;
     epochs?: number;
     examples?: number;
     parameterCount?: number;
@@ -213,11 +315,20 @@ interface ComparisonResponse {
     train?: ComparisonMetricValues;
     validation?: ComparisonMetricValues;
     test?: ComparisonMetricValues;
+    distribution?: {
+      train?: ComparisonDistributionValues;
+      validation?: ComparisonDistributionValues;
+      test?: ComparisonDistributionValues;
+    };
+    checkpointSelections?: Record<string, ComparisonCheckpointSelection>;
+    outputCalibration?: ComparisonOutputCalibration;
     validationCheckpointEpoch?: number;
     fit: Array<{
       epoch: number;
       trainNormalizedMse?: number;
       validationNormalizedMse?: number;
+      trainNegativeLogLikelihood?: number;
+      validationNegativeLogLikelihood?: number;
       bestTrainScore?: number;
     }>;
   }>;
@@ -282,8 +393,10 @@ interface PlotPoint {
 }
 
 interface PlotSeries {
+  id?: string;
   label: string;
   color: string;
+  dash?: string;
   values: PlotPoint[];
 }
 
@@ -293,6 +406,33 @@ interface ChartViewport {
   followLatest: boolean;
 }
 
+type CalibrationVariant = "scale-only" | "affine" | "density-temperature";
+type CheckpointPolicy =
+  | "validation-nll"
+  | "validation-mse"
+  | "validation-correlation"
+  | "train-nll"
+  | "train-mse"
+  | "train-correlation";
+
+const CHECKPOINT_POLICIES: Array<{ value: CheckpointPolicy; label: string }> = [
+  { value: "validation-nll", label: "Best validation NLL" },
+  { value: "validation-mse", label: "Best validation MSE" },
+  { value: "validation-correlation", label: "Best validation correlation" },
+  { value: "train-nll", label: "Best train NLL" },
+  { value: "train-mse", label: "Best train MSE" },
+  { value: "train-correlation", label: "Best train correlation" },
+];
+
+const CALIBRATION_VARIANTS: Array<{
+  value: CalibrationVariant;
+  label: string;
+}> = [
+  { value: "scale-only", label: "Scale-only expectation" },
+  { value: "affine", label: "Affine expectation" },
+  { value: "density-temperature", label: "Density temperature" },
+];
+
 export function MlpTrainingPage() {
   const [snapshot, setSnapshot] = createSignal<MetricsResponse>();
   const [runs, setRuns] = createSignal<MetricsResponse["runs"]>([]);
@@ -300,6 +440,12 @@ export function MlpTrainingPage() {
   const [comparisonRunKeys, setComparisonRunKeys] = createSignal<string[]>([]);
   const [comparison, setComparison] = createSignal<ComparisonResponse>();
   const [comparisonError, setComparisonError] = createSignal<string>();
+  const [checkpointPolicy, setCheckpointPolicy] = createSignal<CheckpointPolicy>(
+    "validation-nll",
+  );
+  const [calibrationVariant, setCalibrationVariant] = createSignal<CalibrationVariant>(
+    "scale-only",
+  );
   const [matrixControlPending, setMatrixControlPending] = createSignal<string>();
   const [matrixControlError, setMatrixControlError] = createSignal<string>();
   const [datasetPoints, setDatasetPoints] = createSignal<DatasetPoint[]>([]);
@@ -642,6 +788,23 @@ export function MlpTrainingPage() {
       const total = snapshot()?.plan.epochs;
       return total && currentEpoch !== undefined ? (currentEpoch + 1) / total : 0;
     }
+    if (stage() === "calibrating-checkpoints"
+      || stage() === "evaluating-path-metrics") {
+      const latest = snapshot()?.status?.latest;
+      const completedPolicies = numericEventField(latest, "completedPolicies") ?? 0;
+      const totalPolicies = numericEventField(latest, "totalPolicies") ?? 0;
+      if (totalPolicies <= 0) return 0;
+      if (stage() === "calibrating-checkpoints") {
+        return Math.min(1, completedPolicies / totalPolicies);
+      }
+      const completedEpisodes = numericEventField(latest, "completedEpisodes") ?? 0;
+      const totalEpisodes = numericEventField(latest, "totalEpisodes") ?? 0;
+      const split = latest?.split === "test" ? 1 : 0;
+      const policyFraction = totalEpisodes > 0
+        ? (split + completedEpisodes / totalEpisodes) / 2
+        : 0;
+      return Math.min(1, (completedPolicies + policyFraction) / totalPolicies);
+    }
     return stage() === "complete" || stage() === "archived" ? 1 : 0;
   });
   const updatedAgo = createMemo(() => {
@@ -649,26 +812,83 @@ export function MlpTrainingPage() {
     if (!Number.isFinite(timestamp)) return "never";
     return `${Math.max(0, Math.floor((now() - timestamp) / 1_000))}s ago`;
   });
-  const comparisonTrainFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
-    .map((run, index) => ({
-      label: run.label,
-      color: COMPARISON_COLORS[index % COMPARISON_COLORS.length]!,
-      values: run.fit.flatMap((point) => point.trainNormalizedMse === undefined
-        ? []
-        : [{ x: point.epoch + 1, y: point.trainNormalizedMse }]),
-    }))
+  const comparisonFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
+    .flatMap((run, index) => {
+      const color = COMPARISON_COLORS[index % COMPARISON_COLORS.length]!;
+      return [
+        {
+          id: `${run.key}:train`,
+          label: `${run.label} · Train`,
+          color,
+          values: run.fit.flatMap((point) => point.trainNormalizedMse === undefined
+            ? []
+            : [{ x: point.epoch + 1, y: point.trainNormalizedMse }]),
+        },
+        {
+          id: `${run.key}:validation`,
+          label: `${run.label} · Validation`,
+          color,
+          dash: "7 5",
+          values: run.fit.flatMap((point) => point.validationNormalizedMse === undefined
+            ? []
+            : [{ x: point.epoch + 1, y: point.validationNormalizedMse }]),
+        },
+      ];
+    })
     .filter((series) => series.values.length > 0));
-  const comparisonValidationFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
-    .map((run, index) => ({
-      label: run.label,
-      color: COMPARISON_COLORS[index % COMPARISON_COLORS.length]!,
-      values: run.fit.flatMap((point) => point.validationNormalizedMse === undefined
-        ? []
-        : [{ x: point.epoch + 1, y: point.validationNormalizedMse }]),
-    }))
+  const comparisonNllFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
+    .flatMap((run, index) => {
+      const color = COMPARISON_COLORS[index % COMPARISON_COLORS.length]!;
+      return [
+        {
+          id: `${run.key}:train-nll`,
+          label: `${run.label} · Train NLL`,
+          color,
+          values: run.fit.flatMap((point) => point.trainNegativeLogLikelihood === undefined
+            ? []
+            : [{ x: point.epoch + 1, y: point.trainNegativeLogLikelihood }]),
+        },
+        {
+          id: `${run.key}:validation-nll`,
+          label: `${run.label} · Validation NLL`,
+          color,
+          dash: "7 5",
+          values: run.fit.flatMap((point) => point.validationNegativeLogLikelihood === undefined
+            ? []
+            : [{ x: point.epoch + 1, y: point.validationNegativeLogLikelihood }]),
+        },
+      ];
+    })
     .filter((series) => series.values.length > 0));
-  const comparisonRows = createMemo(() => {
+  const selectedComparisonCheckpoints = createMemo(() => {
     const comparedRuns = comparison()?.runs ?? [];
+    return comparedRuns.map((run): ComparisonCheckpointSelection | undefined => {
+      const recovered = run.checkpointSelections?.[checkpointPolicy()];
+      if (recovered) {
+        return {
+          ...recovered,
+          outputCalibration: recovered.outputCalibration
+            ?? (checkpointPolicy() === "validation-nll"
+              ? run.outputCalibration
+              : undefined),
+        };
+      }
+      if (checkpointPolicy() !== "validation-nll" || run.bestEpoch === undefined) {
+        return undefined;
+      }
+      return {
+        epoch: run.bestEpoch,
+        train: run.train,
+        validation: run.validation,
+        test: run.test,
+        distribution: run.distribution,
+        outputCalibration: run.outputCalibration,
+      };
+    });
+  });
+  const comparisonUncalibratedRows = createMemo(() => {
+    const comparedRuns = comparison()?.runs ?? [];
+    const selected = selectedComparisonCheckpoints();
     return [
       { label: "Training examples", values: comparedRuns.map((run) => formatCount(run.examples)) },
       {
@@ -678,19 +898,100 @@ export function MlpTrainingPage() {
         )),
       },
       {
-        label: "Best epoch",
-        values: comparedRuns.map((run) => run.bestEpoch === undefined
+        label: "Selected epoch",
+        values: selected.map((selection) => selection?.epoch === undefined
           ? "—"
-          : String(run.bestEpoch + 1)),
+          : String(selection.epoch + 1)),
       },
-      { label: "Train normalized MSE", values: comparedRuns.map((run) => formatMetric(run.train?.normalizedMse)) },
-      { label: "Train MSE skill", values: comparedRuns.map((run) => formatPercent(run.train?.mseSkillVsZero)) },
-      { label: "Validation normalized MSE", values: comparedRuns.map((run) => formatMetric(run.validation?.normalizedMse)) },
-      { label: "Validation MSE skill", values: comparedRuns.map((run) => formatPercent(run.validation?.mseSkillVsZero)) },
-      { label: "Validation correlation", values: comparedRuns.map((run) => formatMetric(run.validation?.correlation)) },
-      { label: "Validation direction", values: comparedRuns.map((run) => formatPercent(run.validation?.directionAccuracy)) },
-      { label: "Validation MAE", values: comparedRuns.map((run) => formatMetric(run.validation?.mae)) },
-      { label: "Test normalized MSE", values: comparedRuns.map((run) => formatMetric(run.test?.normalizedMse)) },
+      { label: "Selection score", values: selected.map((selection) => formatMetric(selection?.selectionScore)) },
+      { label: "Normalized MSE (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.normalizedMse, selection?.validation?.normalizedMse, selection?.test?.normalizedMse])) },
+      { label: "MSE skill (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.mseSkillVsZero, selection?.validation?.mseSkillVsZero, selection?.test?.mseSkillVsZero], formatPercent)) },
+      { label: "Correlation (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.correlation, selection?.validation?.correlation, selection?.test?.correlation])) },
+      { label: "Direction (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.directionAccuracy, selection?.validation?.directionAccuracy, selection?.test?.directionAccuracy], formatPercent)) },
+      { label: "MAE (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.mae, selection?.validation?.mae, selection?.test?.mae])) },
+      { label: "Expectation MSE skill (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.expectation?.mseSkillVsZero, selection?.distribution?.validation?.expectation?.mseSkillVsZero, selection?.distribution?.test?.expectation?.mseSkillVsZero], formatPercent)) },
+      ...[0, 1, 2].flatMap((lead) => [
+        { label: `Step ${lead + 1} MSE skill (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.mseSkillVsZero, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.mseSkillVsZero, selection?.distribution?.test?.perLeadExpectation?.[lead]?.mseSkillVsZero], formatPercent)) },
+        { label: `Step ${lead + 1} correlation (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.correlation, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.correlation, selection?.distribution?.test?.perLeadExpectation?.[lead]?.correlation])) },
+        { label: `Step ${lead + 1} direction (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.directionAccuracy, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.directionAccuracy, selection?.distribution?.test?.perLeadExpectation?.[lead]?.directionAccuracy], formatPercent)) },
+      ]),
+      { label: "AR 15m episodes (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodes, selection?.autoregressiveEpisodes?.test?.episodes], formatCount)) },
+      { label: "AR active candles / episode (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.activeCandlesPerEpisode?.mean, selection?.autoregressiveEpisodes?.test?.activeCandlesPerEpisode?.mean])) },
+      { label: "AR candle MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.pooledCandles?.mseSkillVsZero, selection?.autoregressiveEpisodes?.test?.pooledCandles?.mseSkillVsZero], formatPercent)) },
+      { label: "AR candle correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.pooledCandles?.correlation, selection?.autoregressiveEpisodes?.test?.pooledCandles?.correlation])) },
+      { label: "AR candle direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.pooledCandles?.directionAccuracy, selection?.autoregressiveEpisodes?.test?.pooledCandles?.directionAccuracy], formatPercent)) },
+      { label: "AR mean-episode MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeAverage?.mseSkillVsZero, selection?.autoregressiveEpisodes?.test?.episodeAverage?.mseSkillVsZero], formatPercent)) },
+      { label: "AR mean-episode direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeAverage?.directionAccuracy, selection?.autoregressiveEpisodes?.test?.episodeAverage?.directionAccuracy], formatPercent)) },
+      { label: "AR mean within-episode return correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeReturnCorrelation, selection?.autoregressiveEpisodes?.test?.episodeReturnCorrelation])) },
+      { label: "AR mean cumulative-price-path correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeCumulativePathCorrelation, selection?.autoregressiveEpisodes?.test?.episodeCumulativePathCorrelation])) },
+      { label: "AR endpoint MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeEndpoint?.mseSkillVsZero, selection?.autoregressiveEpisodes?.test?.episodeEndpoint?.mseSkillVsZero], formatPercent)) },
+      { label: "AR endpoint correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeEndpoint?.correlation, selection?.autoregressiveEpisodes?.test?.episodeEndpoint?.correlation])) },
+      { label: "AR endpoint direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodeEndpoint?.directionAccuracy, selection?.autoregressiveEpisodes?.test?.episodeEndpoint?.directionAccuracy], formatPercent)) },
+      { label: "Sobol expected-path episodes (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodes, selection?.sobolExpectedEpisodes?.test?.episodes], formatCount)) },
+      { label: "Sobol trajectories / episode (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.trajectories, selection?.sobolExpectedEpisodes?.test?.estimator?.trajectories], formatCount)) },
+      { label: "Sobol expected candle MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pooledCandles?.mseSkillVsZero, selection?.sobolExpectedEpisodes?.test?.pooledCandles?.mseSkillVsZero], formatPercent)) },
+      { label: "Sobol expected candle correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pooledCandles?.correlation, selection?.sobolExpectedEpisodes?.test?.pooledCandles?.correlation])) },
+      { label: "Sobol expected candle direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pooledCandles?.directionAccuracy, selection?.sobolExpectedEpisodes?.test?.pooledCandles?.directionAccuracy], formatPercent)) },
+      { label: "Sobol mean-episode MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeAverage?.mseSkillVsZero, selection?.sobolExpectedEpisodes?.test?.episodeAverage?.mseSkillVsZero], formatPercent)) },
+      { label: "Sobol mean-episode direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeAverage?.directionAccuracy, selection?.sobolExpectedEpisodes?.test?.episodeAverage?.directionAccuracy], formatPercent)) },
+      { label: "Sobol within-episode return correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeReturnCorrelation, selection?.sobolExpectedEpisodes?.test?.episodeReturnCorrelation])) },
+      { label: "Sobol cumulative-price-path correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeCumulativePathCorrelation, selection?.sobolExpectedEpisodes?.test?.episodeCumulativePathCorrelation])) },
+      { label: "Sobol endpoint MSE skill (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeEndpoint?.mseSkillVsZero, selection?.sobolExpectedEpisodes?.test?.episodeEndpoint?.mseSkillVsZero], formatPercent)) },
+      { label: "Sobol endpoint correlation (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeEndpoint?.correlation, selection?.sobolExpectedEpisodes?.test?.episodeEndpoint?.correlation])) },
+      { label: "Sobol endpoint direction (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.episodeEndpoint?.directionAccuracy, selection?.sobolExpectedEpisodes?.test?.episodeEndpoint?.directionAccuracy], formatPercent)) },
+      { label: "Sobol return trajectory variance (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.returnTrajectoryVarianceMean, selection?.sobolExpectedEpisodes?.test?.estimator?.returnTrajectoryVarianceMean])) },
+      { label: "Sobol expected-return estimator variance (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.returnMean?.meanVariance, selection?.sobolExpectedEpisodes?.test?.estimator?.returnMean?.meanVariance])) },
+      { label: "Sobol expected-return p95 SE (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.returnMean?.p95StandardError, selection?.sobolExpectedEpisodes?.test?.estimator?.returnMean?.p95StandardError])) },
+      { label: "Sobol cumulative-path estimator variance (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.cumulativeLogPricePathMean?.meanVariance, selection?.sobolExpectedEpisodes?.test?.estimator?.cumulativeLogPricePathMean?.meanVariance])) },
+      { label: "Sobol cumulative-path p95 SE (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.cumulativeLogPricePathMean?.p95StandardError, selection?.sobolExpectedEpisodes?.test?.estimator?.cumulativeLogPricePathMean?.p95StandardError])) },
+      { label: "Sobol endpoint estimator variance (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.endpointMean?.meanVariance, selection?.sobolExpectedEpisodes?.test?.estimator?.endpointMean?.meanVariance])) },
+      { label: "Sobol endpoint mean SE (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.estimator?.endpointMean?.meanStandardError, selection?.sobolExpectedEpisodes?.test?.estimator?.endpointMean?.meanStandardError])) },
+      { label: "Realized path NLL / candle (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.realizedNegativeLogDensityPerCandle?.mean, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.realizedNegativeLogDensityPerCandle?.mean])) },
+      { label: "Realized path bits / candle (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.realizedBitsPerCandle?.mean, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.realizedBitsPerCandle?.mean])) },
+      { label: "Realized path density percentile mean (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.sampledPathLogDensityPercentile?.mean, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.sampledPathLogDensityPercentile?.mean], formatPercent)) },
+      { label: "Realized path density percentile median (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.sampledPathLogDensityPercentile?.median, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.sampledPathLogDensityPercentile?.median], formatPercent)) },
+      { label: "Realized paths below 5th density percentile (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.sampledPathLogDensityPercentile?.fractionBelow5Percent, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.sampledPathLogDensityPercentile?.fractionBelow5Percent], formatPercent)) },
+      { label: "Realized paths below 1st density percentile (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.sampledPathLogDensityPercentile?.fractionBelow1Percent, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.sampledPathLogDensityPercentile?.fractionBelow1Percent], formatPercent)) },
+      { label: "Realized path two-sided typicality (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.twoSidedTypicality?.mean, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.twoSidedTypicality?.mean], formatPercent)) },
+      { label: "Realized path log-density z-score (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.logDensityZScoreVsSampledPaths?.mean, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.logDensityZScoreVsSampledPaths?.mean])) },
+      { label: "Realized / sampled-median density ratio per candle (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.sobolExpectedEpisodes?.validation?.pathLikelihood?.perCandleDensityRatioVsSampleMedian?.median, selection?.sobolExpectedEpisodes?.test?.pathLikelihood?.perCandleDensityRatioVsSampleMedian?.median])) },
+    ];
+  });
+  const selectedCheckpointLabel = createMemo(() => CHECKPOINT_POLICIES.find(
+    (policy) => policy.value === checkpointPolicy(),
+  )?.label ?? "Selected checkpoint");
+  const selectedCalibrationLabel = createMemo(() => CALIBRATION_VARIANTS.find(
+    (variant) => variant.value === calibrationVariant(),
+  )?.label ?? "Calibration");
+  const comparisonCalibrationRows = createMemo(() => {
+    const calibrations = selectedComparisonCheckpoints().map(
+      (selection) => selection?.outputCalibration,
+    );
+    if (calibrationVariant() === "affine") {
+      return [
+        { label: "Affine scale", values: calibrations.map((value) => formatMetric(value?.affineScale)) },
+        { label: "Affine intercept", values: calibrations.map((value) => formatMetric(value?.affineIntercept)) },
+        { label: "Calibration correlation", values: calibrations.map((value) => formatMetric(value?.calibrationCorrelation)) },
+        { label: "Normalized MSE (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.affineValidation?.normalizedMse, value?.affineTest?.normalizedMse])) },
+        { label: "MSE skill (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.affineValidation?.mseSkillVsZero, value?.affineTest?.mseSkillVsZero], formatPercent)) },
+        { label: "Correlation (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.affineValidation?.correlation, value?.affineTest?.correlation])) },
+        { label: "Direction (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.affineValidation?.directionAccuracy, value?.affineTest?.directionAccuracy], formatPercent)) },
+      ];
+    }
+    if (calibrationVariant() === "density-temperature") {
+      return [
+        { label: "Temperature", values: calibrations.map((value) => formatMetric(value?.densityTemperature)) },
+        { label: "Expectation MSE skill (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.densityValidation?.expectation?.mseSkillVsZero, value?.densityTest?.expectation?.mseSkillVsZero], formatPercent)) },
+        { label: "Expectation correlation (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.densityValidation?.expectation?.correlation, value?.densityTest?.expectation?.correlation])) },
+      ];
+    }
+    return [
+      { label: "Scale", values: calibrations.map((value) => formatMetric(value?.scale)) },
+      { label: "Calibration correlation", values: calibrations.map((value) => formatMetric(value?.calibrationCorrelation)) },
+      { label: "Normalized MSE (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.validation?.normalizedMse, value?.test?.normalizedMse])) },
+      { label: "MSE skill (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.validation?.mseSkillVsZero, value?.test?.mseSkillVsZero], formatPercent)) },
+      { label: "Correlation (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.validation?.correlation, value?.test?.correlation])) },
+      { label: "Direction (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.validation?.directionAccuracy, value?.test?.directionAccuracy], formatPercent)) },
     ];
   });
 
@@ -898,6 +1199,46 @@ export function MlpTrainingPage() {
             when={comparison()?.runs.length}
             fallback={<div class="rounded border border-line bg-ink-900/40 px-4 py-6 text-sm text-ink-400">Loading comparison…</div>}
           >
+            <div class="flex flex-wrap items-end justify-between gap-3 rounded border border-line bg-ink-900/35 px-3 py-3">
+              <div>
+                <div class="text-sm font-medium text-ink-100">Result selection</div>
+                <div class="mt-0.5 text-xs text-ink-400">
+                  Compare the exact checkpoint selected by each train or validation criterion.
+                </div>
+              </div>
+              <div class="flex flex-wrap items-end gap-3">
+                <label class="flex min-w-[15rem] flex-col gap-1">
+                  <span class="muted-label">Checkpoint criterion</span>
+                  <select
+                    data-testid="comparison-checkpoint-policy"
+                    class="rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                    value={checkpointPolicy()}
+                    onChange={(event) => setCheckpointPolicy(
+                      event.currentTarget.value as CheckpointPolicy,
+                    )}
+                  >
+                    <For each={CHECKPOINT_POLICIES}>
+                      {(policy) => <option value={policy.value}>{policy.label}</option>}
+                    </For>
+                  </select>
+                </label>
+                <label class="flex min-w-[15rem] flex-col gap-1">
+                  <span class="muted-label">Calibration variant</span>
+                  <select
+                    data-testid="comparison-calibration-variant"
+                    class="rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                    value={calibrationVariant()}
+                    onChange={(event) => setCalibrationVariant(
+                      event.currentTarget.value as CalibrationVariant,
+                    )}
+                  >
+                    <For each={CALIBRATION_VARIANTS}>
+                      {(variant) => <option value={variant.value}>{variant.label}</option>}
+                    </For>
+                  </select>
+                </label>
+              </div>
+            </div>
             <div class="min-w-0 overflow-x-auto rounded border border-line">
               <table class="w-full min-w-[48rem] border-collapse text-sm">
                 <thead class="bg-ink-900/80 text-left">
@@ -914,7 +1255,7 @@ export function MlpTrainingPage() {
                             <span class="line-clamp-2">{run.label}</span>
                           </div>
                           <div class="mt-1 text-xs font-normal text-ink-400">
-                            {run.running ? "training" : stageLabel(run.stage ?? "idle")}
+                            {comparisonRunProgressLabel(run)}
                           </div>
                         </th>
                       )}
@@ -922,9 +1263,35 @@ export function MlpTrainingPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  <For each={comparisonRows()}>
+                  <tr class="border-t border-line bg-ink-900/70">
+                    <th
+                      colspan={(comparison()?.runs.length ?? 0) + 1}
+                      class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-ink-300"
+                    >
+                      Uncalibrated results / {selectedCheckpointLabel()}
+                    </th>
+                  </tr>
+                  <For each={comparisonUncalibratedRows()}>
                     {(row) => (
                       <tr class="border-t border-line even:bg-ink-900/25">
+                        <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
+                        <For each={row.values}>
+                          {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
+                        </For>
+                      </tr>
+                    )}
+                  </For>
+                  <tr class="border-t-2 border-accent/50 bg-accent/8">
+                    <th
+                      colspan={(comparison()?.runs.length ?? 0) + 1}
+                      class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-accent"
+                    >
+                      Calibrated results / {selectedCalibrationLabel()}
+                    </th>
+                  </tr>
+                  <For each={comparisonCalibrationRows()}>
+                    {(row) => (
+                      <tr class="border-t border-line bg-accent/[0.035] even:bg-accent/[0.065]">
                         <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
                         <For each={row.values}>
                           {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
@@ -936,23 +1303,24 @@ export function MlpTrainingPage() {
               </table>
             </div>
 
-            <div class="grid min-w-0 gap-3 xl:grid-cols-2">
-              <Show when={comparisonTrainFit().length > 0}>
+            <div class="min-w-0">
+              <Show when={comparisonFit().length > 0}>
                 <MetricChart
                   title="Training fit"
-                  subtitle="Normalized MSE by epoch; lower is better"
+                  subtitle="Training (solid) and validation (dashed) normalized MSE by epoch; click any legend item to toggle it"
                   scale="log"
                   xLabel="epoch"
-                  series={comparisonTrainFit()}
+                  series={comparisonFit()}
                 />
               </Show>
-              <Show when={comparisonValidationFit().length > 0}>
+            </div>
+            <div class="min-w-0">
+              <Show when={comparisonNllFit().length > 0}>
                 <MetricChart
-                  title="Validation fit"
-                  subtitle="Held-out normalized MSE by epoch; lower is better"
-                  scale="log"
+                  title="Distribution fit"
+                  subtitle="Training (solid) and validation (dashed) return-space negative log likelihood; lower is better"
                   xLabel="epoch"
-                  series={comparisonValidationFit()}
+                  series={comparisonNllFit()}
                 />
               </Show>
             </div>
@@ -983,6 +1351,7 @@ export function MlpTrainingPage() {
               latestStep(),
               latestEpoch(),
               snapshot()?.plan.epochs,
+              snapshot()?.status?.latest,
             )}</span>
             <Show when={snapshot()?.plan.patience !== undefined}>
               <span>Early-stop patience: {snapshot()?.plan.patience} epochs</span>
@@ -1418,14 +1787,29 @@ function MetricChart(props: {
   const [viewport, setViewport] = createSignal<ChartViewport>();
   const [plotPixelWidth, setPlotPixelWidth] = createSignal(innerWidth);
   const [dragging, setDragging] = createSignal(false);
+  const [hiddenSeriesIds, setHiddenSeriesIds] = createSignal<ReadonlySet<string>>(
+    new Set<string>(),
+  );
   let svg!: SVGSVGElement;
   let resizeObserver: ResizeObserver | undefined;
   let drag: { pointerId: number; clientX: number } | undefined;
-  const usable = createMemo(() => props.series.map((series) => ({
+  const available = createMemo(() => props.series.map((series, index) => ({
     ...series,
+    seriesId: series.id ?? `${series.label}:${index}`,
     values: series.values.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y)
       && (scale() !== "log" || point.y > 0)),
   })).filter((series) => series.values.length > 0));
+  const usable = createMemo(() => available().filter(
+    (series) => !hiddenSeriesIds().has(series.seriesId),
+  ));
+  const toggleSeries = (seriesId: string) => {
+    setHiddenSeriesIds((current) => {
+      const next = new Set(current);
+      if (next.has(seriesId)) next.delete(seriesId);
+      else next.add(seriesId);
+      return next;
+    });
+  };
   const fullXDomain = createMemo(() => {
     let xMin = Number.POSITIVE_INFINITY;
     let xMax = Number.NEGATIVE_INFINITY;
@@ -1678,11 +2062,33 @@ function MetricChart(props: {
       <div class="flex flex-wrap items-start justify-between gap-2">
         <div><h3 class="font-semibold">{props.title}</h3><Show when={props.subtitle}><p class="text-xs text-ink-300">{props.subtitle}</p></Show></div>
         <div class="flex flex-col items-end gap-1.5">
-          <div class="flex flex-wrap justify-end gap-x-3 gap-y-1 text-xs">
-            <For each={rendered()}>{(series) => <span class="inline-flex items-center gap-1 text-ink-300">
-              <span class="h-2 w-2 rounded-full" style={{ background: series.color }} />
-              {series.label} <span class="tabular-nums text-ink-100">{formatMetric(series.values.at(-1)?.y)}{props.unit ? ` ${props.unit}` : ""}</span>
-            </span>}</For>
+          <div class="flex flex-wrap justify-end gap-1 text-xs">
+            <For each={available()}>{(series) => {
+              const hidden = () => hiddenSeriesIds().has(series.seriesId);
+              return <button
+                type="button"
+                class={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-left transition ${hidden()
+                  ? "border-line/60 text-ink-500 opacity-55"
+                  : "border-line bg-ink-900/50 text-ink-300"}`}
+                aria-label={`${hidden() ? "Show" : "Hide"} ${series.label}`}
+                aria-pressed={!hidden()}
+                title={`${hidden() ? "Show" : "Hide"} curve`}
+                onClick={() => toggleSeries(series.seriesId)}
+              >
+                <svg width="14" height="8" aria-hidden="true">
+                  <line
+                    x1="1" x2="13" y1="4" y2="4"
+                    stroke={series.color}
+                    stroke-width="2"
+                    stroke-dasharray={series.dash}
+                  />
+                </svg>
+                <span>{series.label}</span>
+                <span class="tabular-nums text-ink-100">
+                  {formatMetric(series.values.at(-1)?.y)}{props.unit ? ` ${props.unit}` : ""}
+                </span>
+              </button>;
+            }}</For>
           </div>
           <div class="flex items-center gap-1 text-[11px] text-ink-400">
             <span class={`mr-1 ${isFollowingLatest() ? "text-gain" : ""}`}>
@@ -1723,7 +2129,26 @@ function MetricChart(props: {
           <For each={rendered()}>{(series) => {
             const points = () => series.values
               .map((point) => `${xPosition(point.x)},${yPosition(point.y)}`).join(" ");
-            return <polyline points={points()} fill="none" stroke={series.color} stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" />;
+            return <>
+              <polyline
+                points={points()}
+                fill="none"
+                stroke={series.color}
+                stroke-width="2"
+                stroke-dasharray={series.dash}
+                stroke-linejoin="round"
+                stroke-linecap="round"
+                vector-effect="non-scaling-stroke"
+              />
+              <Show when={series.values.length === 1}>
+                <circle
+                  cx={xPosition(series.values[0]!.x)}
+                  cy={yPosition(series.values[0]!.y)}
+                  r="3.5"
+                  fill={series.color}
+                />
+              </Show>
+            </>;
           }}</For>
           <Show when={bounds()}>{(value) => <>
             <text class="training-chart-axis" x={margin.left} y={height - 13} text-anchor="start">{shortNumber(value().xMin)}</text>
@@ -2026,6 +2451,13 @@ function lossWeightLabel(value: number | undefined): string | undefined {
   return value === undefined ? undefined : `Loss weight ${value}`;
 }
 
+function formatMetricTuple(
+  values: readonly (number | undefined)[],
+  formatter: (value: number | undefined) => string = formatMetric,
+): string {
+  return values.map(formatter).join(" / ");
+}
+
 function reverseKlLabel(
   lossWeight: number | undefined,
   predictionMixtureWeight: number | undefined,
@@ -2178,8 +2610,19 @@ function stageLabel(stage: string): string {
     "cuda-build": "Building CUDA kernels", dataset: "Preparing dataset",
     "dataset-refinement": "Refining teacher fits", "dataset-features": "Refreshing features",
     training: "Training network weights", verification: "Verifying model artifact",
+    "calibrating-checkpoints": "Calibrating checkpoints",
+    "evaluating-path-metrics": "Evaluating path metrics",
     complete: "Complete", archived: "Archived", paused: "Paused", failed: "Failed", starting: "Starting",
   } as Record<string, string>)[stage] ?? stage;
+}
+
+function comparisonRunProgressLabel(
+  run: ComparisonResponse["runs"][number],
+): string {
+  const stageKey = run.stage ?? (run.running ? "training" : "idle");
+  const stage = stageLabel(stageKey);
+  if (stageKey !== "training" || run.epoch === undefined) return stage;
+  return `${stage} · epoch ${run.epoch + 1} / ${run.epochs ?? "—"}`;
 }
 
 function runSummaryLabel(run: MetricsResponse["runs"][number]): string {
@@ -2196,9 +2639,32 @@ function progressLabel(
   step: TrainStepPoint | undefined,
   epoch: EpochPoint | undefined,
   totalEpochs: number | undefined,
+  latest?: TrainingEvent,
 ): string {
   if (stage.startsWith("dataset") && dataset) return `Day ${dataset.x} / ${dataset.days ?? "—"} · ${dataset.date} ${dataset.split}`;
   if (stage === "training" && step) return `Epoch ${step.epoch + 1} / ${totalEpochs ?? "—"} · global step ${step.globalStep.toLocaleString()}`;
   if (stage === "training" && epoch) return `Epoch ${epoch.epoch + 1} / ${totalEpochs ?? "—"} · global step ${epoch.globalStep.toLocaleString()}`;
+  if (stage === "calibrating-checkpoints") {
+    return `Checkpoint ${
+      (numericEventField(latest, "completedPolicies") ?? 0) + 1
+    } / ${numericEventField(latest, "totalPolicies") ?? "—"} · ${
+      typeof latest?.policy === "string" ? latest.policy : "calibration"
+    }`;
+  }
+  if (stage === "evaluating-path-metrics") {
+    return `Sobol ${
+      typeof latest?.split === "string" ? latest.split : "split"
+    } · episode ${numericEventField(latest, "completedEpisodes") ?? 0} / ${
+      numericEventField(latest, "totalEpisodes") ?? "—"
+    } · ${integer(numericEventField(latest, "trajectories"))} trajectories`;
+  }
   return stageLabel(stage);
+}
+
+function numericEventField(
+  event: TrainingEvent | undefined,
+  key: string,
+): number | undefined {
+  const value = event?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }

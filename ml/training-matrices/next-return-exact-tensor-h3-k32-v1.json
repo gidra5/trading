@@ -1,0 +1,19 @@
+{
+  "id": "next-return-exact-tensor-h3-k32-v1",
+  "label": "Exact joint tensor: three active returns, 32 knots, three single-layer width-512 GLU blocks",
+  "control": {
+    "pauseFile": "data/training/matrices/next-return-exact-tensor-h3-k32-v1/control/PAUSE"
+  },
+  "experiment": {
+    "cleanStartCount": 65536,
+    "returnCount": 3,
+    "knotCount": 32,
+    "jointCells": 32768,
+    "conditionalTensorEntries": [32, 1024, 32768],
+    "queueAfter": "next-second-8-layer-width1024-knot-density-1024k-k256-v1 checkpoint comparison and calibration"
+  },
+  "runner": "ml/run_exact_tensor_return_path.py",
+  "runIds": [
+    "next-second-exact-tensor-density-65k-h3-k32-v1"
+  ]
+}

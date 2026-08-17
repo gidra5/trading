@@ -748,7 +748,17 @@ def save_torch_checkpoint(
         _maybe_prune_checkpoint_orphans(store_root)
         return reference
     finally:
-        temporary.unlink(missing_ok=True)
+        # Windows indexers and virus scanners can briefly retain a handle to a
+        # newly written PyTorch zip archive after the immutable object and its
+        # pointer have already been committed. Cleanup must not turn that
+        # successful checkpoint save into a failed training run.
+        for attempt in range(20):
+            try:
+                temporary.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                if attempt < 19:
+                    time.sleep(min(0.05 * (attempt + 1), 0.5))
 
 
 def load_torch_checkpoint(
@@ -912,7 +922,7 @@ def _prune_checkpoint_orphans(store_root: Path) -> None:
     invalid = False
     runs_root = training_root / "runs"
     if runs_root.exists():
-        for file in runs_root.rglob("checkpoints/*.json"):
+        for file in runs_root.rglob("checkpoints/**/*.json"):
             try:
                 value = json.loads(file.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):

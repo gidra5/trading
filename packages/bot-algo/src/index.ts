@@ -7,6 +7,7 @@ export {
 export * from "./bot.js";
 export * from "./simulated-trading-api.js";
 export * from "./peak-valley-strategy.js";
+export * from "./technical-strategies.js";
 export type * from "./strategy.js";
 export type * from "./trading-api.js";
 export * from "./indicators.js";

@@ -66,12 +66,21 @@ interface TrainingRunCatalog {
   runs: TrainingPlan[];
 }
 
+interface TrainingRunDisplayMetadata {
+  label?: string;
+}
+
 interface TrainingMatrixManifest {
   id: string;
   label: string;
   runIds: string[];
   control?: {
     pauseFile: string;
+  };
+  artifactProgress?: {
+    completionFile: string;
+    statusFile: string;
+    completionContract?: string;
   };
 }
 
@@ -217,12 +226,114 @@ export interface MlpTrainingComparisonMetricValues {
   correlation?: number;
 }
 
+export interface MlpTrainingComparisonDistributionValues {
+  negativeLogLikelihood?: number;
+  unitNegativeLogLikelihood?: number;
+  bitsPerExample?: number;
+  globalBaselineNegativeLogLikelihood?: number;
+  nllImprovementVsGlobal?: number;
+  rawNegativeLogLikelihood?: number;
+  nllImprovementVsRaw?: number;
+  expectation?: MlpTrainingComparisonMetricValues;
+  perLeadExpectation?: MlpTrainingComparisonMetricValues[];
+  mode?: MlpTrainingComparisonMetricValues;
+}
+
+export interface MlpTrainingOutputCalibrationValues {
+  scale?: number;
+  affineScale?: number;
+  affineIntercept?: number;
+  calibrationCorrelation?: number;
+  validation?: MlpTrainingComparisonMetricValues;
+  test?: MlpTrainingComparisonMetricValues;
+  affineValidation?: MlpTrainingComparisonMetricValues;
+  affineTest?: MlpTrainingComparisonMetricValues;
+  densityTemperature?: number;
+  densityValidation?: MlpTrainingComparisonDistributionValues;
+  densityTest?: MlpTrainingComparisonDistributionValues;
+}
+
+export interface MlpTrainingAutoregressiveEpisodeValues {
+  episodes?: number;
+  sourceEpisodeSeconds?: number;
+  activeCandles?: number;
+  activeCandlesPerEpisode?: {
+    minimum?: number;
+    mean?: number;
+    maximum?: number;
+  };
+  pooledCandles?: MlpTrainingComparisonMetricValues;
+  episodeAverage?: MlpTrainingComparisonMetricValues;
+  episodeReturnCorrelation?: number;
+  episodeCumulativePathCorrelation?: number;
+  episodeEndpoint?: MlpTrainingComparisonMetricValues;
+  estimator?: {
+    trajectories?: number;
+    randomizedReplicates?: number;
+    trajectoriesPerReplicate?: number;
+    returnTrajectoryVarianceMean?: number;
+    returnMean?: MlpTrainingEstimatorVarianceValues;
+    cumulativeLogPricePathMean?: MlpTrainingEstimatorVarianceValues;
+    endpointTrajectoryVarianceMean?: number;
+    endpointMean?: MlpTrainingEstimatorVarianceValues;
+  };
+  pathLikelihood?: {
+    exactPathProbabilityMass?: number;
+    episodes?: number;
+    realizedNegativeLogDensityPerCandle?: MlpTrainingLikelihoodSummaryValues;
+    realizedBitsPerCandle?: MlpTrainingLikelihoodSummaryValues;
+    sampledPathLogDensityPercentile?: MlpTrainingLikelihoodSummaryValues;
+    twoSidedTypicality?: MlpTrainingLikelihoodSummaryValues;
+    logDensityZScoreVsSampledPaths?: MlpTrainingLikelihoodSummaryValues;
+    perCandleDensityRatioVsSampleMedian?: MlpTrainingLikelihoodSummaryValues;
+  };
+}
+
+export interface MlpTrainingEstimatorVarianceValues {
+  meanVariance?: number;
+  meanStandardError?: number;
+  p95StandardError?: number;
+  maximumStandardError?: number;
+}
+
+export interface MlpTrainingLikelihoodSummaryValues {
+  mean?: number;
+  median?: number;
+  p95?: number;
+  minimum?: number;
+  fractionBelow1Percent?: number;
+  fractionBelow5Percent?: number;
+}
+
+export interface MlpTrainingCheckpointSelectionValues {
+  epoch: number;
+  selectionScore?: number;
+  train?: MlpTrainingComparisonMetricValues;
+  validation?: MlpTrainingComparisonMetricValues;
+  test?: MlpTrainingComparisonMetricValues;
+  distribution?: {
+    train?: MlpTrainingComparisonDistributionValues;
+    validation?: MlpTrainingComparisonDistributionValues;
+    test?: MlpTrainingComparisonDistributionValues;
+  };
+  autoregressiveEpisodes?: {
+    validation?: MlpTrainingAutoregressiveEpisodeValues;
+    test?: MlpTrainingAutoregressiveEpisodeValues;
+  };
+  sobolExpectedEpisodes?: {
+    validation?: MlpTrainingAutoregressiveEpisodeValues;
+    test?: MlpTrainingAutoregressiveEpisodeValues;
+  };
+  outputCalibration?: MlpTrainingOutputCalibrationValues;
+}
+
 export interface MlpTrainingComparisonRun {
   key: string;
   id: string;
   label: string;
   running: boolean;
   stage?: string;
+  epoch?: number;
   epochs?: number;
   examples?: number;
   parameterCount?: number;
@@ -231,11 +342,20 @@ export interface MlpTrainingComparisonRun {
   train?: MlpTrainingComparisonMetricValues;
   validation?: MlpTrainingComparisonMetricValues;
   test?: MlpTrainingComparisonMetricValues;
+  distribution?: {
+    train?: MlpTrainingComparisonDistributionValues;
+    validation?: MlpTrainingComparisonDistributionValues;
+    test?: MlpTrainingComparisonDistributionValues;
+  };
+  checkpointSelections?: Record<string, MlpTrainingCheckpointSelectionValues>;
+  outputCalibration?: MlpTrainingOutputCalibrationValues;
   validationCheckpointEpoch?: number;
   fit: Array<{
     epoch: number;
     trainNormalizedMse?: number;
     validationNormalizedMse?: number;
+    trainNegativeLogLikelihood?: number;
+    validationNegativeLogLikelihood?: number;
     bestTrainScore?: number;
   }>;
 }
@@ -433,7 +553,8 @@ export class MlpTrainingMetricsReader {
     });
     return {
       runs: await Promise.all(selected.map(async (files) => {
-        const [storedResult, rootResult, validation, log] = await Promise.all([
+        const [storedResult, rootResult, validation, outputCalibration,
+          checkpointSelection, checkpointCalibrations, log] = await Promise.all([
           readOptionalJson<Record<string, unknown>>(
             path.join(files.runDir, "state", "result.json"),
           ),
@@ -442,6 +563,27 @@ export class MlpTrainingMetricsReader {
           ),
           readOptionalJson<Record<string, unknown>>(
             path.join(files.runDir, "state", "validation-current-best.json"),
+          ),
+          readOptionalJson<Record<string, unknown>>(
+            path.join(
+              files.runDir,
+              "state",
+              "output-calibration-pre-validation-7d.json",
+            ),
+          ),
+          readOptionalJson<Record<string, unknown>>(
+            path.join(
+              files.runDir,
+              "state",
+              "checkpoint-selection-comparison.json",
+            ),
+          ),
+          readOptionalJson<Record<string, unknown>>(
+            path.join(
+              files.runDir,
+              "state",
+              "checkpoint-selection-calibrations.json",
+            ),
           ),
           readMetricLogs(files.logFiles, 0),
         ]);
@@ -454,13 +596,122 @@ export class MlpTrainingMetricsReader {
             ?? result?.ridgeValidation,
         );
         const externalValidation = metricRecord(validation?.metrics);
+        const selectedValidation = externalValidation ?? resultValidation;
+        const parsedOutputCalibration = outputCalibrationRecord(outputCalibration);
         const resultTest = metricRecord(result?.test);
-        const fit = log.events.flatMap((event) => {
+        const resultDistribution = recordField(result?.distribution);
+        const trainDistribution = distributionRecord(resultDistribution?.train);
+        const validationDistribution = distributionRecord(
+          resultDistribution?.validation,
+        );
+        const testDistribution = distributionRecord(resultDistribution?.test);
+        const checkpointSelections: Record<
+          string, MlpTrainingCheckpointSelectionValues
+        > = {};
+        const checkpointPolicies = recordField(checkpointSelection?.policies);
+        const checkpointCalibrationPolicies = recordField(
+          checkpointCalibrations?.policies,
+        );
+        for (const [policy, value] of Object.entries(checkpointPolicies ?? {})) {
+          const source = recordField(value);
+          const epoch = numberField(source?.epoch);
+          if (!source || epoch === undefined) continue;
+          const policyDistribution = recordField(source.distribution);
+          const trainPolicyDistribution = distributionRecord(policyDistribution?.train);
+          const validationPolicyDistribution = distributionRecord(
+            policyDistribution?.validation,
+          );
+          const testPolicyDistribution = distributionRecord(policyDistribution?.test);
+          const policyOutputCalibration = outputCalibrationRecord(
+            checkpointCalibrationPolicies?.[policy],
+          );
+          const autoregressiveEpisodes = recordField(
+            source.autoregressiveEpisodes,
+          );
+          const validationEpisodes = autoregressiveEpisodeRecord(
+            autoregressiveEpisodes?.validation,
+          );
+          const testEpisodes = autoregressiveEpisodeRecord(
+            autoregressiveEpisodes?.test,
+          );
+          const sobolExpectedEpisodes = recordField(
+            source.sobolExpectedEpisodes,
+          );
+          const validationSobolEpisodes = autoregressiveEpisodeRecord(
+            sobolExpectedEpisodes?.validation,
+          );
+          const testSobolEpisodes = autoregressiveEpisodeRecord(
+            sobolExpectedEpisodes?.test,
+          );
+          checkpointSelections[policy] = {
+            epoch,
+            ...(numberField(source.selectionScore) === undefined
+              ? {}
+              : { selectionScore: numberField(source.selectionScore) }),
+            ...(metricRecord(source.train) ? { train: metricRecord(source.train) } : {}),
+            ...(metricRecord(source.validation)
+              ? { validation: metricRecord(source.validation) }
+              : {}),
+            ...(metricRecord(source.test) ? { test: metricRecord(source.test) } : {}),
+            ...(trainPolicyDistribution
+              || validationPolicyDistribution
+              || testPolicyDistribution
+              ? {
+                  distribution: {
+                    ...(trainPolicyDistribution
+                      ? { train: trainPolicyDistribution }
+                      : {}),
+                    ...(validationPolicyDistribution
+                      ? { validation: validationPolicyDistribution }
+                      : {}),
+                    ...(testPolicyDistribution
+                      ? { test: testPolicyDistribution }
+                      : {}),
+                  },
+                }
+              : {}),
+            ...(validationEpisodes || testEpisodes
+              ? {
+                  autoregressiveEpisodes: {
+                    ...(validationEpisodes
+                      ? { validation: validationEpisodes }
+                      : {}),
+                    ...(testEpisodes ? { test: testEpisodes } : {}),
+                  },
+                }
+              : {}),
+            ...(validationSobolEpisodes || testSobolEpisodes
+              ? {
+                  sobolExpectedEpisodes: {
+                    ...(validationSobolEpisodes
+                      ? { validation: validationSobolEpisodes }
+                      : {}),
+                    ...(testSobolEpisodes
+                      ? { test: testSobolEpisodes }
+                      : {}),
+                  },
+                }
+              : {}),
+            ...(policyOutputCalibration
+              ? { outputCalibration: policyOutputCalibration }
+              : {}),
+          };
+        }
+        const examples = numberField(result?.examples);
+        const parameterCount = numberField(result?.parameterCount);
+        const trainableParameterCount = numberField(result?.trainableParameterCount);
+        const bestEpoch = numberField(result?.bestEpoch);
+        const currentEpoch = numberField(files.status?.latest?.epoch)
+          ?? numberField(files.status?.epoch);
+        const validationCheckpointEpoch = numberField(validation?.checkpointEpoch);
+        const fit: MlpTrainingComparisonRun["fit"] = log.events.flatMap((event) => {
           if (event.event !== "epoch") return [];
           const epoch = numberField(event.epoch);
           if (epoch === undefined) return [];
           const train = metricRecord(event.train);
           const validationMetrics = metricRecord(event.validation);
+          const trainDensity = distributionRecord(event.trainDistribution);
+          const validationDensity = distributionRecord(event.validationDistribution);
           const bestTrainScore = numberField(event.bestTrainScore);
           return [{
             epoch,
@@ -470,20 +721,41 @@ export class MlpTrainingMetricsReader {
             ...(validationMetrics?.normalizedMse === undefined
               ? {}
               : { validationNormalizedMse: validationMetrics.normalizedMse }),
+            ...(trainDensity?.negativeLogLikelihood === undefined
+              ? {}
+              : { trainNegativeLogLikelihood: trainDensity.negativeLogLikelihood }),
+            ...(validationDensity?.negativeLogLikelihood === undefined
+              ? {}
+              : {
+                  validationNegativeLogLikelihood:
+                    validationDensity.negativeLogLikelihood,
+                }),
             ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
           }];
         });
-        const examples = numberField(result?.examples);
-        const parameterCount = numberField(result?.parameterCount);
-        const trainableParameterCount = numberField(result?.trainableParameterCount);
-        const bestEpoch = numberField(result?.bestEpoch);
-        const validationCheckpointEpoch = numberField(validation?.checkpointEpoch);
+        if (selectedValidation?.normalizedMse !== undefined
+          && !fit.some((point) => point.validationNormalizedMse !== undefined)) {
+          const checkpointEpoch = validationCheckpointEpoch ?? bestEpoch;
+          if (checkpointEpoch !== undefined) {
+            const existing = fit.find((point) => point.epoch === checkpointEpoch);
+            if (existing) {
+              existing.validationNormalizedMse = selectedValidation.normalizedMse;
+            } else {
+              fit.push({
+                epoch: checkpointEpoch,
+                validationNormalizedMse: selectedValidation.normalizedMse,
+              });
+              fit.sort((left, right) => left.epoch - right.epoch);
+            }
+          }
+        }
         return {
           key: files.key,
           id: files.plan.id,
           label: files.plan.label,
           running: files.running,
           ...(files.status?.stage ? { stage: files.status.stage } : {}),
+          ...(currentEpoch === undefined ? {} : { epoch: currentEpoch }),
           ...(files.plan.training?.epochs === undefined
             ? {}
             : { epochs: files.plan.training.epochs }),
@@ -492,10 +764,27 @@ export class MlpTrainingMetricsReader {
           ...(trainableParameterCount === undefined ? {} : { trainableParameterCount }),
           ...(bestEpoch === undefined ? {} : { bestEpoch }),
           ...(resultTrain ? { train: resultTrain } : {}),
-          ...(externalValidation ?? resultValidation
-            ? { validation: externalValidation ?? resultValidation }
+          ...(selectedValidation
+            ? { validation: selectedValidation }
             : {}),
           ...(resultTest ? { test: resultTest } : {}),
+          ...(Object.keys(checkpointSelections).length > 0
+            ? { checkpointSelections }
+            : {}),
+          ...(trainDistribution || validationDistribution || testDistribution
+            ? {
+                distribution: {
+                  ...(trainDistribution ? { train: trainDistribution } : {}),
+                  ...(validationDistribution
+                    ? { validation: validationDistribution }
+                    : {}),
+                  ...(testDistribution ? { test: testDistribution } : {}),
+                },
+              }
+            : {}),
+          ...(parsedOutputCalibration
+            ? { outputCalibration: parsedOutputCalibration }
+            : {}),
           ...(validationCheckpointEpoch === undefined
             ? {}
             : { validationCheckpointEpoch }),
@@ -623,12 +912,22 @@ export class MlpTrainingMetricsReader {
     const loaded = await Promise.all(entries
       .filter((entry) => entry.isDirectory())
       .map(async (entry) => {
-        const snapshotFile = path.join(runsRoot, entry.name, "state", "plan.json");
+        const stateDir = path.join(runsRoot, entry.name, "state");
+        const snapshotFile = path.join(stateDir, "plan.json");
         try {
-          const stored = JSON.parse(await fs.readFile(snapshotFile, "utf8")) as {
-            plan?: TrainingPlan;
-          } & Partial<TrainingPlan>;
-          const plan = stored.plan ?? stored as TrainingPlan;
+          const [stored, display] = await Promise.all([
+            fs.readFile(snapshotFile, "utf8").then((value) => JSON.parse(value) as {
+              plan?: TrainingPlan;
+            } & Partial<TrainingPlan>),
+            readOptionalJson<TrainingRunDisplayMetadata>(
+              path.join(stateDir, "display.json"),
+            ),
+          ]);
+          const storedPlan = stored.plan ?? stored as TrainingPlan;
+          const displayLabel = display?.label?.trim();
+          const plan = displayLabel
+            ? { ...storedPlan, label: displayLabel }
+            : storedPlan;
           return await this.loadStoredPlan(plan, `run/${plan.id}`, snapshotFile);
         } catch {
           return undefined;
@@ -665,12 +964,37 @@ export class MlpTrainingMetricsReader {
         if (!manifest.id || !manifest.label || !Array.isArray(manifest.runIds)
           || manifest.runIds.length === 0) continue;
         const matrixRuns = manifest.runIds.map((id) => byId.get(id));
-        const completedRuns = matrixRuns.filter(
-          (run) => run?.status?.stage === "complete",
-        ).length;
-        const failedRuns = matrixRuns.filter(
-          (run) => run?.status?.stage === "failed",
-        ).length;
+        const artifactStates = manifest.artifactProgress
+          ? await Promise.all(manifest.runIds.map(async (id) => {
+              const completionFile = path.resolve(
+                this.repoRoot,
+                manifest.artifactProgress!.completionFile.replaceAll("{runId}", id),
+              );
+              const statusFile = path.resolve(
+                this.repoRoot,
+                manifest.artifactProgress!.statusFile.replaceAll("{runId}", id),
+              );
+              const requiredContract = (
+                manifest.artifactProgress!.completionContract
+              );
+              const completion = requiredContract
+                ? await readOptionalJson<{ contract?: string }>(completionFile)
+                : undefined;
+              return {
+                id,
+                complete: requiredContract
+                  ? completion?.contract === requiredContract
+                  : await exists(completionFile),
+                status: await readOptionalJson<TrainingStatus>(statusFile),
+              };
+            }))
+          : undefined;
+        const completedRuns = artifactStates
+          ? artifactStates.filter((value) => value.complete).length
+          : matrixRuns.filter((run) => run?.status?.stage === "complete").length;
+        const failedRuns = artifactStates
+          ? artifactStates.filter((value) => value.status?.stage === "failed").length
+          : matrixRuns.filter((run) => run?.status?.stage === "failed").length;
         const pauseFile = manifest.control?.pauseFile
           ? path.resolve(this.repoRoot, manifest.control.pauseFile)
           : undefined;
@@ -692,17 +1016,34 @@ export class MlpTrainingMetricsReader {
         const pauseRequested = controllable && pauseFile
           ? await exists(pauseFile)
           : false;
-        const active = matrixRuns.find((run) => run?.running);
-        const pausedRun = pauseRequested
+        const activeArtifact = artifactStates?.find((value) =>
+          !value.complete
+          && processIsAlive(value.status?.pid)
+          && !isTerminalStage(value.status?.stage));
+        const active = artifactStates
+          ? undefined
+          : matrixRuns.find((run) => run?.running);
+        const pausedRun = !artifactStates && pauseRequested
           ? matrixRuns.find((run) => run?.status?.stage === "paused")
           : undefined;
         const current = active ?? pausedRun;
-        const activeEpoch = numberField(current?.status?.latest?.epoch);
-        const activeEpochs = current?.plan.training?.epochs;
-        const activeProgress = current && activeEpoch !== undefined && activeEpochs
+        const activeEpoch = activeArtifact
+          ? numberField(activeArtifact.status?.epoch)
+          : numberField(current?.status?.latest?.epoch);
+        const artifactMaximumEpoch = numberField(
+          activeArtifact?.status?.maximumEpoch,
+        );
+        const activeEpochs = activeArtifact
+          ? (artifactMaximumEpoch === undefined ? undefined : artifactMaximumEpoch + 1)
+          : current?.plan.training?.epochs;
+        const hasCurrent = Boolean(activeArtifact ?? current);
+        const activeProgress = hasCurrent && activeEpoch !== undefined && activeEpochs
           ? Math.min(1, (activeEpoch + 1) / activeEpochs)
           : 0;
         const bestTrainScore = numberField(current?.status?.latest?.bestTrainScore);
+        const activeRun = activeArtifact
+          ? byId.get(activeArtifact.id)
+          : current;
         matrices.push({
           id: manifest.id,
           label: manifest.label,
@@ -711,17 +1052,19 @@ export class MlpTrainingMetricsReader {
           failedRuns,
           queuedRuns: Math.max(
             0,
-            manifest.runIds.length - completedRuns - failedRuns - (current ? 1 : 0),
+            manifest.runIds.length - completedRuns - failedRuns - (hasCurrent ? 1 : 0),
           ),
           progress: (completedRuns + activeProgress) / manifest.runIds.length,
           controllable,
           pauseRequested,
-          paused: pauseRequested && !active,
-          ...(current ? {
+          paused: pauseRequested && !active && !activeArtifact,
+          ...(hasCurrent ? {
             active: {
-              id: current.plan.id,
-              label: current.plan.label,
-              stage: current.status?.stage ?? "training",
+              id: activeArtifact?.id ?? activeRun!.plan.id,
+              label: activeRun?.plan.label ?? activeArtifact!.id,
+              stage: activeArtifact?.status?.stage
+                ?? activeRun?.status?.stage
+                ?? "training",
               ...(activeEpoch === undefined ? {} : { epoch: activeEpoch }),
               ...(activeEpochs === undefined ? {} : { epochs: activeEpochs }),
               ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
@@ -820,6 +1163,12 @@ export class MlpTrainingMatrixControlError extends Error {
   }
 }
 
+function recordField(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -853,6 +1202,204 @@ function metricRecord(value: unknown): MlpTrainingComparisonMetricValues | undef
     metric.correlation = endpointCorrelation;
   }
   return Object.keys(metric).length > 0 ? metric : undefined;
+}
+
+function distributionRecord(
+  value: unknown,
+): MlpTrainingComparisonDistributionValues | undefined {
+  const source = recordField(value);
+  if (!source) return undefined;
+  const result: MlpTrainingComparisonDistributionValues = {};
+  for (const key of [
+    "negativeLogLikelihood",
+    "unitNegativeLogLikelihood",
+    "bitsPerExample",
+    "globalBaselineNegativeLogLikelihood",
+    "nllImprovementVsGlobal",
+    "rawNegativeLogLikelihood",
+    "nllImprovementVsRaw",
+  ] as const) {
+    const number = numberField(source[key]);
+    if (number !== undefined) result[key] = number;
+  }
+  const expectation = metricRecord(source.expectation);
+  const perLeadExpectation = Array.isArray(source.perLeadExpectation)
+    ? source.perLeadExpectation.flatMap((value) => {
+        const metric = metricRecord(value);
+        return metric ? [metric] : [];
+      })
+    : undefined;
+  const mode = metricRecord(source.mode);
+  if (expectation) result.expectation = expectation;
+  if (perLeadExpectation?.length) {
+    result.perLeadExpectation = perLeadExpectation;
+  }
+  if (mode) result.mode = mode;
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function autoregressiveEpisodeRecord(
+  value: unknown,
+): MlpTrainingAutoregressiveEpisodeValues | undefined {
+  const source = recordField(value);
+  if (!source) return undefined;
+  const result: MlpTrainingAutoregressiveEpisodeValues = {};
+  for (const key of [
+    "episodes",
+    "sourceEpisodeSeconds",
+    "activeCandles",
+    "episodeReturnCorrelation",
+    "episodeCumulativePathCorrelation",
+  ] as const) {
+    const number = numberField(source[key]);
+    if (number !== undefined) result[key] = number;
+  }
+  const activeSource = recordField(source.activeCandlesPerEpisode);
+  if (activeSource) {
+    const minimum = numberField(activeSource.minimum);
+    const mean = numberField(activeSource.mean);
+    const maximum = numberField(activeSource.maximum);
+    if (minimum !== undefined || mean !== undefined || maximum !== undefined) {
+      result.activeCandlesPerEpisode = {
+        ...(minimum === undefined ? {} : { minimum }),
+        ...(mean === undefined ? {} : { mean }),
+        ...(maximum === undefined ? {} : { maximum }),
+      };
+    }
+  }
+  const pooledCandles = metricRecord(source.pooledCandles);
+  const episodeAverage = metricRecord(source.episodeAverage);
+  const episodeEndpoint = metricRecord(source.episodeEndpoint);
+  if (pooledCandles) result.pooledCandles = pooledCandles;
+  if (episodeAverage) result.episodeAverage = episodeAverage;
+  if (episodeEndpoint) result.episodeEndpoint = episodeEndpoint;
+  const estimatorSource = recordField(source.estimator);
+  if (estimatorSource) {
+    const estimator: NonNullable<
+      MlpTrainingAutoregressiveEpisodeValues["estimator"]
+    > = {};
+    for (const key of [
+      "trajectories",
+      "randomizedReplicates",
+      "trajectoriesPerReplicate",
+      "returnTrajectoryVarianceMean",
+      "endpointTrajectoryVarianceMean",
+    ] as const) {
+      const number = numberField(estimatorSource[key]);
+      if (number !== undefined) estimator[key] = number;
+    }
+    for (const key of [
+      "returnMean",
+      "cumulativeLogPricePathMean",
+      "endpointMean",
+    ] as const) {
+      const summary = estimatorVarianceRecord(estimatorSource[key]);
+      if (summary) estimator[key] = summary;
+    }
+    if (Object.keys(estimator).length > 0) result.estimator = estimator;
+  }
+  const likelihoodSource = recordField(source.pathLikelihood);
+  if (likelihoodSource) {
+    const likelihood: NonNullable<
+      MlpTrainingAutoregressiveEpisodeValues["pathLikelihood"]
+    > = {};
+    const exactMass = numberField(likelihoodSource.exactPathProbabilityMass);
+    const episodes = numberField(likelihoodSource.episodes);
+    if (exactMass !== undefined) likelihood.exactPathProbabilityMass = exactMass;
+    if (episodes !== undefined) likelihood.episodes = episodes;
+    for (const key of [
+      "realizedNegativeLogDensityPerCandle",
+      "realizedBitsPerCandle",
+      "sampledPathLogDensityPercentile",
+      "twoSidedTypicality",
+      "logDensityZScoreVsSampledPaths",
+      "perCandleDensityRatioVsSampleMedian",
+    ] as const) {
+      const summary = likelihoodSummaryRecord(likelihoodSource[key]);
+      if (summary) likelihood[key] = summary;
+    }
+    if (Object.keys(likelihood).length > 0) {
+      result.pathLikelihood = likelihood;
+    }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function estimatorVarianceRecord(
+  value: unknown,
+): MlpTrainingEstimatorVarianceValues | undefined {
+  const source = recordField(value);
+  if (!source) return undefined;
+  const result: MlpTrainingEstimatorVarianceValues = {};
+  for (const key of [
+    "meanVariance",
+    "meanStandardError",
+    "p95StandardError",
+    "maximumStandardError",
+  ] as const) {
+    const number = numberField(source[key]);
+    if (number !== undefined) result[key] = number;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function likelihoodSummaryRecord(
+  value: unknown,
+): MlpTrainingLikelihoodSummaryValues | undefined {
+  const source = recordField(value);
+  if (!source) return undefined;
+  const result: MlpTrainingLikelihoodSummaryValues = {};
+  for (const key of [
+    "mean",
+    "median",
+    "p95",
+    "minimum",
+    "fractionBelow1Percent",
+    "fractionBelow5Percent",
+  ] as const) {
+    const number = numberField(source[key]);
+    if (number !== undefined) result[key] = number;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function outputCalibrationRecord(
+  value: unknown,
+): MlpTrainingOutputCalibrationValues | undefined {
+  const source = recordField(value);
+  if (!source) return undefined;
+  const transforms = recordField(source.transforms);
+  const scaleOnly = recordField(transforms?.scaleOnly);
+  const affine = recordField(transforms?.affine);
+  const calibrationRaw = metricRecord(source.calibrationRaw);
+  const validation = recordField(source.validation);
+  const test = recordField(source.test);
+  const densityTemperature = recordField(source.densityTemperature);
+  const result: MlpTrainingOutputCalibrationValues = {};
+  const scale = numberField(scaleOnly?.scale);
+  const affineScale = numberField(affine?.scale);
+  const affineIntercept = numberField(affine?.intercept);
+  const temperature = numberField(densityTemperature?.temperature);
+  if (scale !== undefined) result.scale = scale;
+  if (affineScale !== undefined) result.affineScale = affineScale;
+  if (affineIntercept !== undefined) result.affineIntercept = affineIntercept;
+  if (calibrationRaw?.correlation !== undefined) {
+    result.calibrationCorrelation = calibrationRaw.correlation;
+  }
+  const scaleValidation = metricRecord(validation?.scaleOnly);
+  const scaleTest = metricRecord(test?.scaleOnly);
+  const affineValidation = metricRecord(validation?.affine);
+  const affineTest = metricRecord(test?.affine);
+  const densityValidation = distributionRecord(densityTemperature?.validation);
+  const densityTest = distributionRecord(densityTemperature?.test);
+  if (scaleValidation) result.validation = scaleValidation;
+  if (scaleTest) result.test = scaleTest;
+  if (affineValidation) result.affineValidation = affineValidation;
+  if (affineTest) result.affineTest = affineTest;
+  if (temperature !== undefined) result.densityTemperature = temperature;
+  if (densityValidation) result.densityValidation = densityValidation;
+  if (densityTest) result.densityTest = densityTest;
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 async function metricLogFiles(runDir: string): Promise<string[]> {

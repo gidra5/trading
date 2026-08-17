@@ -224,8 +224,10 @@ test("defaults use the validation-selected multi-scale oracle candidate", () => 
   );
   assert.equal(config.derivativeSource, "kama");
   assert.equal(config.derivativeClampMode, "deadband");
-  assert.deepEqual(config.buyConfirmationOffsets, []);
-  assert.deepEqual(config.sellConfirmationOffsets, []);
+  assert.deepEqual(config.buyConfirmationOffsets, [1, 2]);
+  assert.deepEqual(config.sellConfirmationOffsets, [1, 2]);
+  assert.deepEqual(config.buyExitConfirmationOffsets, [1, 2]);
+  assert.deepEqual(config.sellExitConfirmationOffsets, [1, 2]);
   assert.equal(config.buyEntrySignalTiming, "end");
   assert.equal(config.buyExitSignalTiming, "start");
   assert.equal(config.kamaSignalFriction, 0.00175);

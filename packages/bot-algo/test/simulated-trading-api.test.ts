@@ -161,6 +161,32 @@ test("simulated trading stops an insolvent account instead of allowing recovery"
   assert.equal((await api.getEquity()).assetUnleveraged, 0);
 });
 
+test("simulated trading liquidates negative cash even after exposure is fully closed", async () => {
+  const api = simulated({
+    snapshot: {
+      version: 1,
+      quote: -1,
+      asset: 0,
+      price: 100,
+      updatedAt: 0,
+      orders: [],
+      feesPaid: 0,
+      maintenancePaid: 0,
+      liquidationCount: 0,
+      liquidatedAt: null,
+      liquidationPrice: null,
+      liquidationReason: null,
+      maxEffectiveLeverage: 0,
+    },
+  });
+
+  await api.onTick(tick(1_000, 100));
+
+  assert.equal(api.status().liquidationReason, "insolvent");
+  assert.equal(api.status().liquidationCount, 1);
+  assert.equal(api.status().equity, 0);
+});
+
 test("simulated trading accrues quote and asset borrow maintenance", async () => {
   const long = simulated({ quoteBorrowBpsHour: 10 });
   await long.onTick(tick(1, 100));

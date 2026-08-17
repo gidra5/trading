@@ -86,7 +86,9 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const archive = path.join(temporaryDir, `.${date}.zip`);
+    // Multiple symbols are commonly backfilled in parallel. Include the full
+    // market identity so concurrent workers cannot overwrite each other's ZIP.
+    const archive = path.join(temporaryDir, `.${symbol}.${interval}.${date}.zip`);
     try {
       const url = [
         "https://data.binance.vision/data/spot/daily/klines",

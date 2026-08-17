@@ -128,10 +128,10 @@ export const defaultPeakValleyStrategyConfig: PeakValleyStrategyConfig = {
   rateThresholdsHigh: [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
   buyDataIndex: 1,
   sellDataIndex: 1,
-  buyConfirmationOffsets: [],
-  sellConfirmationOffsets: [],
-  buyExitConfirmationOffsets: [],
-  sellExitConfirmationOffsets: [],
+  buyConfirmationOffsets: [1, 2],
+  sellConfirmationOffsets: [1, 2],
+  buyExitConfirmationOffsets: [1, 2],
+  sellExitConfirmationOffsets: [1, 2],
   buyEntrySignalTiming: "end",
   sellEntrySignalTiming: "end",
   buyExitSignalTiming: "start",
@@ -880,11 +880,11 @@ function continuousSuffix(candles: TradingCandle[], intervalMs: number): Trading
 }
 
 function entry(side: PositionSide, size: number, price: number | null): TradingStrategyEntrySignal | null {
-  return size > 0 ? { side, size, leverage: 999, price, confidence: 1 } : null;
+  return size > 0 ? { side, size, leverage: 999, price, confidence: null } : null;
 }
 
 function exit(side: PositionSide, size: number, price: number | null): TradingStrategyExitSignal | null {
-  return size > 0 ? { side, size, price, confidence: 1 } : null;
+  return size > 0 ? { side, size, price, confidence: null } : null;
 }
 
 function extremum(shape: "valley" | "peak", timing: PeakValleySignalTiming, previous: number, current: number): boolean {

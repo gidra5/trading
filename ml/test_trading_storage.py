@@ -300,6 +300,7 @@ class TradingStorageTests(unittest.TestCase):
                 / "disposable-smoke"
                 / "nested-run"
                 / "checkpoints"
+                / "selections"
                 / "best.json"
             )
             nested_pointer.parent.mkdir(parents=True, exist_ok=True)

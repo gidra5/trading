@@ -1,0 +1,48 @@
+{
+  "id": "nonzero-eiil-irm-annealing-v1",
+  "label": "Clean ERM baselines, then 65k EIIL + IRMv1 annealing and penalty grid",
+  "control": {
+    "pauseFile": "data/training/matrices/nonzero-eiil-irm-annealing-v1/control/PAUSE"
+  },
+  "experiment": {
+    "examples": 65536,
+    "epochs": 512,
+    "optimizerSteps": 8192,
+    "annealingFractions": [0, 0.25, 0.5, 0.75],
+    "annealingSteps": [0, 2048, 4096, 6144],
+    "penaltyWeights": [1, 10, 30, 100, 300, 1000],
+    "matrixCells": 24,
+    "uniqueSweepRuns": 21,
+    "penaltyOneReuse": "weight 1 is unchanged across the annealing boundary",
+    "schedule": "constant weight 1 before boundary, selected penalty afterward"
+  },
+  "runIds": [
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-4-layer-memorization-128k-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-4-layer-memorization-256k-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-4-layer-memorization-512k-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-8-layer-memorization-512k-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-8-layer-memorization-1024k-width1024-static-c-v1-nonzero-clean-count-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-1-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-10-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-30-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-100-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-300-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0-penalty-1000-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p25-penalty-10-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p25-penalty-30-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p25-penalty-100-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p25-penalty-300-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p25-penalty-1000-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p5-penalty-10-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p5-penalty-30-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p5-penalty-100-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p5-penalty-300-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p5-penalty-1000-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p75-penalty-10-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p75-penalty-30-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p75-penalty-100-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p75-penalty-300-validation-curve-v1",
+    "next-second-4-layer-memorization-65k-static-c-v1-nonzero-eiil-irmv1-anneal-0p75-penalty-1000-validation-curve-v1"
+  ]
+}

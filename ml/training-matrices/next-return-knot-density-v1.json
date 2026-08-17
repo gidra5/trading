@@ -1,0 +1,10 @@
+{
+  "id": "next-return-knot-density-v1",
+  "label": "Conditional next-1s return distribution with fixed 64 knots",
+  "control": {
+    "pauseFile": "data/training/matrices/next-return-knot-density-v1/control/PAUSE"
+  },
+  "runIds": [
+    "next-second-4-layer-knot-density-65k-v1"
+  ]
+}

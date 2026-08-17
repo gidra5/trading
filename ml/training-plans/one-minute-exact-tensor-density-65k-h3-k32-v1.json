@@ -1,0 +1,71 @@
+{
+  "id": "one-minute-exact-tensor-density-65k-h3-k32-v1",
+  "label": "Exact joint 1m tensor density - three single-layer width-512 GLU blocks - 65k clean starts - 3 active returns x 32 knots",
+  "datasetDir": "data/training/datasets/one-minute-exact-tensor-density-65k-h3-k32-v1",
+  "runDir": "data/training/runs/one-minute-exact-tensor-density-65k-h3-k32-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1m",
+  "candleResolution": "1m",
+  "subset": {
+    "type": "fixed-clean-count",
+    "date": "2026-04-01",
+    "examples": 65536
+  },
+  "architecture": {
+    "contract": "three-return-exact-32-knot-joint-tensor-three-single-layer-normalized-glu-blocks-v1",
+    "blocks": 3,
+    "hiddenWidth": 512,
+    "conditionalTensorEntries": [32, 1024, 32768],
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 256,
+    "evaluationBatchSize": 256,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "selection": "lowest-validation-mean-conditional-negative-log-likelihood"
+  },
+  "evaluation": {
+    "type": "fixed-clean-heldout-count",
+    "validationStart": "2026-06-01",
+    "testStart": "2026-07-01",
+    "examplesPerSplit": 28672
+  },
+  "datasetFilter": {
+    "type": "active-return-path",
+    "startRows": "exclude-exact-zero-immediate-target-return",
+    "pathTargets": "next-3-nonzero-one-minute-log-returns",
+    "inputHistory": "raw-120-one-minute-log-returns-including-zeros",
+    "appliesTo": ["normalization", "training", "validation", "test"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-minute-return-knots-k32-v1.json",
+    "fit": "32",
+    "knotCount": 32,
+    "returnCount": 3,
+    "jointTensorShape": [32, 32, 32],
+    "normalization": "area-aware-softmax-on-final-axis-per-prefix",
+    "factorization": "exact-full-prefix-chain-rule-tensors"
+  }
+}

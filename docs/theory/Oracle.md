@@ -234,6 +234,45 @@ V_{t,H,T}(e)&=h_{t,H'}(e)+V_{t+H',T-H'}(e),
 $$
 
 # Bellman equation
+We follow RL problem statement.
+
+The set of actions are exposure transitions, identified by target exposure, so $a\in\mathcal A(s)=E$ effectively.
+The set of rewards is essentially a set of possible return, so $r\in\mathcal R=\mathbb{R} \cup \{-\infty\}$.
+
+Next we define what is the state set of states of our problem. The market can be generally described as aggregate result of many actors trading within a platform that manages execution. Each actor is defined by its portfolio and set of orders it offers, which define limit order book (LOB) microstructure. Agent is just another actor in this system, and actors are mostly indistinguishable from other agents.
+
+That kind of suggests that whatever policy we choose, it will probably need to have capacity for describing each of the actors, or at least their aggregate behavior, which may be somewhat simpler. If we could estimate market participants count and capacity per actor, then we might manage to predict required model capacity.
+
+In the simplest case we might define state as the LOB that evolves independently, since our market impact is negligible in case of small equity. And the agents state itself - portfolio describing allocation of equity across assets. For simplicity assume only one asset.
+
+As mentioned before it may also include a set of pending limit orders, but for simplicity we omit them as well for now.
+
+Some actors that participate in the market may act based on the historic states, so that means we might want to include all of the prior LOB history as well.
+
+To formalize - set of states is, in most general case, a cartesian product of market states, limit order states and portfolio states $\mathcal S=\mathcal S_{market}\times \mathcal S_{portfolio} \times \mathcal S_{orders}$. And in the particular case considered here it is simplified to $\mathcal S=(market: \mathcal S_{market},\ quote: \mathbb{R},\ asset: \mathbb{R})$
+
+The agent's set of actions is the set of target portfolio and orders states $\mathcal A(s)=\mathcal S_{portfolio}\times \mathcal S_{orders}$, and it is independent of the current state as a whole. That also implies that it is a composite action, consisting of portfolio action and order action. But it still may refer to it for convenience, since it is nice for noop expression. We might want to also express actions as portfolio state deltas, which may feel more natural, but harder to properly manage as action space. So instead we opt for expressing the end result we want and then deriving the necessary changes.
+
+The agent's reward is mainly defined by the return we get by keeping the selected state. That is defined by market movement and order execution, if any. The reward is then the delta between prev equity and the new, calculated as mark-to-market value of all assets+canceling of pending orders. We could generically say its $\mathcal R=\mathbb R$, but more concretely its derived from market return.
+
+Now to the transition distribution. Its effective behavior is mostly described by what we already discussed in prev section. To fit the RL formulation we can a bit adjust it.
+
+First, market changes and portfolio changes are independent, and further more market changes are independent of our actions. Returns and portfolio changes are deterministic in terms of the changes to the state and action. The order state changes are not deterministic in market change/action, essentially because it is not guaranteed to execute fully even if price actually touched it. That suggests the following composition:
+$$
+p(s', r | s, a)=p_{m}(s_m'|s_m)p_{o}(s_o'|s_o, a_o, s_m')\delta_{s_p'}\delta_r
+$$
+$$s_p'=F(s_p, a_p)$$
+$$r=R(\Delta s_m, \Delta s_p)$$
+The delta terms correspond to the two deterministic components, while others correspond to market and order dynamics.
+
+Next lets consider score. It is a simple weighted sum of returns we got. Since returns are deterministic, the score is also deterministic. The weight can describe two useful characteristics - validity of current estimates and value of immediate returns vs delayed ones. Thus we get the following for the score:
+$$g_t=r_t+\gamma w_{t+1} g_{t+1}$$
+For a perfect trader both $\gamma$ and $w_{t+1}$ are 1, but once we get into approximation/training realm, these might become more useful.
+
+Next is action value function. From definition, it describes expected score given state and action. Since returns are deterministic that reduces to exact score:
+$$
+q(s, a)=\mathbb{E}[G_t\ |\ s, a]=\sum_{s'\in\mathcal S, r\in\mathcal R} p(s',r\ |\ s, a)[r+w*v(s')]
+$$
 # Policy
 We define policy as a distribution over all possible current and target exposures:$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)de}$$Where $R_{t,T}$ is a return from moving to the exposure $e$. The return itself is defined simply as oracle value minus transition cost:$$\begin{aligned}
 R_{t,T}(e_t\to e)=V_{t,T}(e)-C_t(e_t\to e)

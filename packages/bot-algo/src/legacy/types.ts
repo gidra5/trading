@@ -25,6 +25,8 @@ export type BacktestPreset =
 
 export type BacktestStrategy =
   | "peak-valley"
+  | "macd"
+  | "volume-imbalance"
   | "learned-oracle-1s"
   | "learned-oracle-1m"
   | "hindsight-oracle-1s";
@@ -83,6 +85,10 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  /** Buyer-initiated base volume, when available from trade-flow data. */
+  aggressiveBuyVolume?: number;
+  /** Seller-initiated base volume, when available from trade-flow data. */
+  aggressiveSellVolume?: number;
   closed: boolean;
 }
 
