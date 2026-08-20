@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -17,7 +19,13 @@ from compressed_path_return_density import (
 )
 from recurrent_market_path_density import (
     ARCHITECTURE_CONTRACT as RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+    RESIDUAL_ARCHITECTURE_CONTRACT as RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
     RecurrentMarketPathDensity,
+    ResidualRecurrentMarketPathDensity,
+)
+from low_rank_path_matrix_density import (
+    ARCHITECTURE_CONTRACT as LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+    DynamicLowRankPathMatrixDensity,
 )
 from return_knot_density import KnotDensityContract
 from return_knot_density import inverse_unit_to_returns, triangular_basis_areas
@@ -25,6 +33,7 @@ from trading_storage import load_torch_checkpoint
 from train_feature_compressed_path_density import (
     ImmediateFeatureActivePathDataset,
     PathMetrics,
+    LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT,
     RECURRENT_MARKET_RUNNER_CONTRACT,
     RUNNER_CONTRACT,
     evaluate,
@@ -78,6 +87,18 @@ def parse_args() -> argparse.Namespace:
 
 def resolve(repo: Path, value: Path) -> Path:
     return value.resolve() if value.is_absolute() else (repo / value).resolve()
+
+
+def model_state_fingerprint(state: dict[str, torch.Tensor]) -> str:
+    """Identify selection checkpoints that carry identical model weights."""
+    digest = hashlib.sha256()
+    for name, value in state.items():
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
 
 
 class CalibrationPathDataset:
@@ -175,39 +196,73 @@ class CalibrationPathDataset:
 def load_model(
     plan: dict, densities: tuple[KnotDensityContract, ...], checkpoint: dict,
     device: torch.device,
-) -> CompressedPathReturnDensity | RecurrentMarketPathDensity:
+) -> CompressedPathReturnDensity | RecurrentMarketPathDensity \
+        | DynamicLowRankPathMatrixDensity:
     if checkpoint.get("planSha256") != canonical_hash(plan):
         raise ValueError("checkpoint belongs to a different training plan")
-    recurrent_market = (
-        plan["architecture"].get("contract")
-        == RECURRENT_MARKET_ARCHITECTURE_CONTRACT
+    architecture_contract = plan["architecture"].get("contract")
+    recurrent_market = architecture_contract in {
+        RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+        RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+    }
+    residual_recurrent_market = (
+        architecture_contract
+        == RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT
+    )
+    low_rank_path_matrix = (
+        architecture_contract == LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT
     )
     expected_runner = (
-        RECURRENT_MARKET_RUNNER_CONTRACT if recurrent_market else RUNNER_CONTRACT
+        LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT
+        if low_rank_path_matrix else (
+            RECURRENT_MARKET_RUNNER_CONTRACT if recurrent_market else RUNNER_CONTRACT
+        )
     )
     if checkpoint.get("runnerContract") != expected_runner:
         raise ValueError("checkpoint runner contract changed")
     state = checkpoint["model"]
     architecture = plan["architecture"]
-    model = (
-        RecurrentMarketPathDensity(
+    if low_rank_path_matrix:
+        model = DynamicLowRankPathMatrixDensity(
             state["feature_mean"], state["feature_std"], densities[0],
             market_width=int(architecture["marketWidth"]),
-            state_widths=tuple(int(value) for value in architecture["stateWidths"]),
+            path_embedding_width=int(architecture["pathEmbeddingWidth"]),
+            path_count=int(architecture["pathCount"]),
+            return_count=int(architecture["returnCount"]),
+            matrix_rank=int(architecture["matrixRank"]),
+            hidden_width_cap=int(architecture["hiddenWidthCap"]),
             initial_radius=float(architecture["initialRadius"]),
             minimum_radius=float(architecture["minimumRadius"]),
             learnable_centering=bool(architecture["learnableCentering"]),
         )
-        if recurrent_market else
-        CompressedPathReturnDensity(
-            state["feature_mean"], state["feature_std"], densities,
-            market_width=int(architecture["marketWidth"]),
-            state_widths=tuple(int(value) for value in architecture["stateWidths"]),
-            initial_radius=float(architecture["initialRadius"]),
-            minimum_radius=float(architecture["minimumRadius"]),
-            learnable_centering=bool(architecture["learnableCentering"]),
+    else:
+        model = (
+            (
+            ResidualRecurrentMarketPathDensity
+            if residual_recurrent_market else RecurrentMarketPathDensity
+            )(
+                state["feature_mean"], state["feature_std"], densities[0],
+                market_width=int(architecture["marketWidth"]),
+                state_widths=tuple(
+                    int(value) for value in architecture["stateWidths"]
+                ),
+                transition_rank=int(architecture.get("transitionRank", 1)),
+                initial_radius=float(architecture["initialRadius"]),
+                minimum_radius=float(architecture["minimumRadius"]),
+                learnable_centering=bool(architecture["learnableCentering"]),
+            )
+            if recurrent_market else
+            CompressedPathReturnDensity(
+                state["feature_mean"], state["feature_std"], densities,
+                market_width=int(architecture["marketWidth"]),
+                state_widths=tuple(
+                    int(value) for value in architecture["stateWidths"]
+                ),
+                initial_radius=float(architecture["initialRadius"]),
+                minimum_radius=float(architecture["minimumRadius"]),
+                learnable_centering=bool(architecture["learnableCentering"]),
+            )
         )
-    )
     model.load_state_dict(state)
     model.eval()
     return model.to(device)
@@ -254,10 +309,21 @@ def temperature_scaled_output(
         for log_mass in output.log_masses
     )
     expectations = torch.stack([
-        log_mass.exp() @ model.means(step)
+        (
+            log_mass.exp() @ model.means(step)
+            if output.component_means is None else
+            (log_mass.exp() * output.component_means[step]).sum(dim=1)
+        )
         for step, log_mass in enumerate(scaled)
     ], dim=1)
-    return CompressedPathOutput(scaled, expectations)
+    return CompressedPathOutput(
+        scaled,
+        expectations,
+        knots_unit=output.knots_unit,
+        areas_unit=output.areas_unit,
+        component_means=output.component_means,
+        arithmetic_component_means=output.arithmetic_component_means,
+    )
 
 
 def component_arithmetic_return_means(
@@ -302,7 +368,14 @@ def collect_point_arrays(
     ):
         output = model(features)
         arithmetic = torch.stack([
-            log_mass.exp() @ arithmetic_component_means[step]
+            (
+                log_mass.exp() @ arithmetic_component_means[step]
+                if output.arithmetic_component_means is None else
+                (
+                    log_mass.exp()
+                    * output.arithmetic_component_means[step]
+                ).sum(dim=1)
+            )
             for step, log_mass in enumerate(output.log_masses)
         ], dim=1)
         log_predictions.append(output.expectations.cpu().numpy())
@@ -1142,9 +1215,11 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA evaluation was requested but is unavailable")
     architecture = plan["architecture"]
-    recurrent_market = (
-        architecture.get("contract") == RECURRENT_MARKET_ARCHITECTURE_CONTRACT
-    )
+    recurrent_market = architecture.get("contract") in {
+        RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+        RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+        LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+    }
     feature_history = int(architecture.get("inputFeatureLags", 1))
     dataset_root = resolve(repo, Path(plan["datasetDir"]))
     evaluation_dataset = ImmediateFeatureActivePathDataset(
@@ -1215,12 +1290,44 @@ def main() -> None:
             "policies": {},
         }
     requested = tuple(args.checkpoint_policies)
+    evaluated_models: dict[str, str] = {}
     for index, policy in enumerate(requested):
         checkpoint_file = run_root / f"checkpoints/selections/{policy}.json"
         checkpoint = load_torch_checkpoint(
             checkpoint_file, map_location="cpu", weights_only=False
         )
         epoch = int(checkpoint["epoch"])
+        fingerprint = model_state_fingerprint(checkpoint["model"])
+        reused_policy = evaluated_models.get(fingerprint)
+        if reused_policy is not None:
+            reused_comparison = copy.deepcopy(
+                comparison["policies"][reused_policy]
+            )
+            reused_comparison.update({
+                "epoch": epoch,
+                "selectionScore": float(checkpoint["score"]),
+                "checkpoint": str(checkpoint_file.relative_to(repo)),
+                "evaluationReusedFrom": reused_policy,
+            })
+            comparison["policies"][policy] = reused_comparison
+            atomic_json(comparison, comparison_file)
+            reused_calibration = copy.deepcopy(
+                calibrations["policies"][reused_policy]
+            )
+            reused_calibration.update({
+                "checkpointEpoch": epoch,
+                "checkpointPolicy": policy,
+                "evaluationReusedFrom": reused_policy,
+            })
+            calibrations["policies"][policy] = reused_calibration
+            atomic_json(calibrations, calibration_file)
+            reporter.status(
+                "reused-identical-checkpoint-evaluation",
+                planId=plan["id"], policy=policy, epoch=epoch,
+                reusedFrom=reused_policy, completedPolicies=index + 1,
+                totalPolicies=len(requested),
+            )
+            continue
         reporter.status(
             "evaluating-checkpoints", planId=plan["id"], policy=policy,
             epoch=epoch, completedPolicies=index, totalPolicies=len(requested),
@@ -1276,6 +1383,7 @@ def main() -> None:
         atomic_json(
             calibrations, calibration_file
         )
+        evaluated_models[fingerprint] = policy
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()

@@ -15,6 +15,9 @@ from return_knot_density import (
 ARCHITECTURE_CONTRACT = (
     "recurrent-market-compressed-history-fixed-output-path-density-v1"
 )
+RESIDUAL_ARCHITECTURE_CONTRACT = (
+    "recurrent-market-compressed-history-residual-output-path-density-v1"
+)
 
 
 def _hidden_width(input_width: int, output_width: int) -> int:
@@ -50,10 +53,12 @@ class RecurrentMarketPathDensity(nn.Module):
 
     The input encoder consumes three consecutive feature rows.  A market state
     of constant width is advanced once per forecast step.  At step ``s`` it
-    emits a dynamic transition factor with width ``Q_s``.  Its outer product
-    with a learned output factor, plus a learned output bias, defines a
-    row-normalized ``Q_s x O`` transition.  Multiplying the compressed history
-    distribution by that transition yields the step's fixed-``O`` marginal.
+    emits a dynamic transition factor with width ``Q_s``.  A learned source
+    expansion maps each coordinate into the configured transition rank, and a
+    learned rank-by-output factor plus output bias defines a row-normalized
+    ``Q_s x O`` transition.  Rank one retains the original outer-product
+    construction.  Multiplying the compressed history distribution by that
+    transition yields the step's fixed-``O`` marginal.
     The next history state is obtained only from ``concat(q_s, g_s)``; it does
     not feed back into the market-state recurrence.
     """
@@ -68,6 +73,7 @@ class RecurrentMarketPathDensity(nn.Module):
         *,
         market_width: int,
         state_widths: tuple[int, ...],
+        transition_rank: int = 1,
         initial_radius: float,
         minimum_radius: float,
         learnable_centering: bool,
@@ -82,6 +88,9 @@ class RecurrentMarketPathDensity(nn.Module):
         self.return_count = len(state_widths)
         self.market_width = int(market_width)
         self.state_widths = tuple(int(width) for width in state_widths)
+        self.transition_rank = int(transition_rank)
+        if self.transition_rank <= 0:
+            raise ValueError("transition rank must be positive")
         self.output_width = len(density.knots_unit)
         self.density_transform = density.transform
         self.register_buffer("feature_mean", feature_mean.float().clone())
@@ -126,9 +135,26 @@ class RecurrentMarketPathDensity(nn.Module):
         ])
 
         prior = torch.from_numpy(density.prior_component_masses).float()
-        self.destination_factors = nn.ParameterList([
-            nn.Parameter(torch.log(prior.clone())) for _ in self.state_widths
-        ])
+        log_prior = torch.log(prior.clone())
+        if self.transition_rank == 1:
+            self.source_factors = None
+            self.destination_factors = nn.ParameterList([
+                nn.Parameter(log_prior.clone()) for _ in self.state_widths
+            ])
+        else:
+            self.source_factors = nn.ParameterList()
+            self.destination_factors = nn.ParameterList()
+            for width in self.state_widths:
+                source = torch.ones(width, self.transition_rank)
+                source_noise = torch.randn_like(source) * 0.01
+                source_noise.sub_(source_noise.mean(dim=1, keepdim=True))
+                source.add_(source_noise)
+                self.source_factors.append(nn.Parameter(source))
+                self.destination_factors.append(nn.Parameter(
+                    log_prior[None, :].expand(
+                        self.transition_rank, -1
+                    ).clone() / self.transition_rank
+                ))
         self.destination_biases = nn.ParameterList([
             nn.Parameter(torch.zeros_like(prior)) for _ in self.state_widths
         ])
@@ -172,12 +198,9 @@ class RecurrentMarketPathDensity(nn.Module):
         )):
             market = market_block(market)
             factor = factor_block(market)
-            transition = torch.softmax(
-                factor[:, :, None] * destination.float()[None, None, :]
-                + bias.float()[None, None, :],
-                dim=2,
+            marginal = self.contract_transition(
+                step, q, factor, destination, bias
             )
-            marginal = torch.bmm(q[:, None, :], transition).squeeze(1)
             marginal = marginal / marginal.sum(dim=1, keepdim=True).clamp_min(1e-12)
             log_masses.append(torch.log(marginal.clamp_min(1e-30)))
             expectations.append(marginal @ self.density_means)
@@ -190,6 +213,53 @@ class RecurrentMarketPathDensity(nn.Module):
             log_masses=tuple(log_masses),
             expectations=torch.stack(expectations, dim=1),
         )
+
+    def conditional_transition(
+        self,
+        step: int,
+        factor: Tensor,
+        destination: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        logits = self.transition_logits(
+            step, factor, destination, bias
+        )
+        return torch.softmax(
+            logits,
+            dim=2,
+        )
+
+    def transition_logits(
+        self,
+        step: int,
+        factor: Tensor,
+        destination: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        if self.transition_rank == 1:
+            return (
+                factor[:, :, None] * destination.float()[None, None, :]
+                + bias.float()[None, None, :]
+            )
+        if self.source_factors is None:
+            raise RuntimeError("ranked transition is missing source factors")
+        source = self.source_factors[step].float()
+        expanded = factor[:, :, None] * source[None, :, :]
+        return torch.matmul(expanded, destination.float()) \
+            + bias.float()[None, None, :]
+
+    def contract_transition(
+        self,
+        step: int,
+        q: Tensor,
+        factor: Tensor,
+        destination: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        transition = self.conditional_transition(
+            step, factor, destination, bias
+        )
+        return torch.bmm(q[:, None, :], transition).squeeze(1)
 
     def knots(self, step: int) -> Tensor:
         if step < 0 or step >= self.return_count:
@@ -205,3 +275,95 @@ class RecurrentMarketPathDensity(nn.Module):
         if step < 0 or step >= self.return_count:
             raise IndexError(step)
         return self.density_means
+
+
+class ResidualRecurrentMarketPathDensity(RecurrentMarketPathDensity):
+    """Mix a learned full baseline transition with the rank-one conditional.
+
+    Every compressed state owns a learned baseline row ``F'`` and a learned
+    mixture logit ``b'``.  Both branches are normalized before their convex
+    mixture, so every resulting transition row remains a probability
+    distribution without a second softmax::
+
+        F = softmax(F')
+        P = softmax(A B + b)
+        lambda = sigmoid(b')
+        T = (1 - lambda) F + lambda P
+
+    The baseline starts near the global return prior with small row-specific
+    noise.  This preserves the prior initialization while breaking row
+    symmetry so the compressed-state coordinates can specialize immediately.
+    """
+
+    architecture_contract = RESIDUAL_ARCHITECTURE_CONTRACT
+
+    def __init__(
+        self,
+        feature_mean: Tensor,
+        feature_std: Tensor,
+        density: KnotDensityContract,
+        *,
+        market_width: int,
+        state_widths: tuple[int, ...],
+        transition_rank: int = 1,
+        initial_radius: float,
+        minimum_radius: float,
+        learnable_centering: bool,
+    ) -> None:
+        super().__init__(
+            feature_mean,
+            feature_std,
+            density,
+            market_width=market_width,
+            state_widths=state_widths,
+            transition_rank=transition_rank,
+            initial_radius=initial_radius,
+            minimum_radius=minimum_radius,
+            learnable_centering=learnable_centering,
+        )
+        prior = torch.from_numpy(density.prior_component_masses).float()
+        log_prior = torch.log(prior.clamp_min(torch.finfo(prior.dtype).tiny))
+        self.baseline_logits = nn.ParameterList()
+        self.mixture_logits = nn.ParameterList()
+        for width in self.state_widths:
+            baseline = log_prior[None, :].expand(width, -1).clone()
+            baseline.add_(torch.randn_like(baseline) * 0.01)
+            self.baseline_logits.append(nn.Parameter(baseline))
+            self.mixture_logits.append(nn.Parameter(torch.zeros(width)))
+
+    def conditional_transition(
+        self,
+        step: int,
+        factor: Tensor,
+        destination: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        learned = super().conditional_transition(step, factor, destination, bias)
+        baseline = torch.softmax(self.baseline_logits[step].float(), dim=1)
+        mixture = torch.sigmoid(self.mixture_logits[step].float())[None, :, None]
+        return (1.0 - mixture) * baseline[None, :, :] + mixture * learned
+
+    def contract_transition(
+        self,
+        step: int,
+        q: Tensor,
+        factor: Tensor,
+        destination: Tensor,
+        bias: Tensor,
+    ) -> Tensor:
+        """Contract the exact mixture without materializing batched ``T``.
+
+        Algebraically this is ``q @ ((1-lambda)F + lambda P)``.  Applying the
+        row gate to ``q`` first avoids allocating the extra ``[B, Q, O]``
+        mixture tensor and its backward intermediates.
+        """
+        learned = super().conditional_transition(
+            step, factor, destination, bias
+        )
+        baseline = torch.softmax(self.baseline_logits[step].float(), dim=1)
+        mixture = torch.sigmoid(self.mixture_logits[step].float())[None, :]
+        baseline_marginal = (q * (1.0 - mixture)) @ baseline
+        learned_marginal = torch.bmm(
+            (q * mixture)[:, None, :], learned
+        ).squeeze(1)
+        return baseline_marginal + learned_marginal

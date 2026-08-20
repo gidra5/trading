@@ -1,8 +1,8 @@
 # Live external-feature early screen — 2026-08-17
 
-Generated at 2026-08-20T07:44:17.930Z after **44.357 hours of observed target coverage**. The latest collector session is 52647 wall-clock seconds old; the archive spans 70.005 wall-clock hours including gaps.
+Generated at 2026-08-20T13:03:18.470Z after **49.672 hours of observed target coverage**. The latest collector session is 71787 wall-clock seconds old; the archive spans 75.322 wall-clock hours including gaps.
 
-Latest target observation: 2026-08-20T07:44:21.000Z; staleness: 0.0s.
+Latest target observation: 2026-08-20T13:03:23.000Z; staleness: 0.0s.
 
 **Current interpretation:** Early 1s-1m screen. Retain only as preliminary evidence; this window contains too few independent slow-horizon outcomes.
 
@@ -26,37 +26,37 @@ Latest target observation: 2026-08-20T07:44:21.000Z; staleness: 0.0s.
 
 ## Storage
 
-- Stored across all trials: 505.19 MiB; active session: 97.60 MiB; projected active rate: 160.18 MiB/day.
+- Stored across all trials: 549.56 MiB; active session: 141.97 MiB; projected active rate: 170.87 MiB/day.
 - Treat a projection from the first 15 minutes as an upper-biased startup estimate: one immediate options surface, GDELT pull, and mempool snapshot have not yet been amortized over their normal cadences.
-- Unresolved slow candidate feeds in the active session: 6.48 MiB; projected 10.64 MiB/day.
+- Unresolved slow candidate feeds in the active session: 8.90 MiB; projected 10.72 MiB/day.
 - Evidence duration is observed target coverage, with gaps capped at five carried seconds; wall-clock age is never treated as data. Storage rate alone uses latest-session wall time because bytes accrue with elapsed time. Normal collection now stores causal 1s book summaries instead of full high-frequency books; --raw-books is diagnostic-only.
 
 ## Feed inventory
 
 | source | files | stored | active-session stored | projected/day |
 |---|---:|---:|---:|---:|
-| cross-exchange-book-1s | 3 | 94.21 MiB | 39.68 MiB | 65.11 MiB |
+| cross-exchange-book-1s | 3 | 108.62 MiB | 54.08 MiB | 65.09 MiB |
 | kraken-btcusd-book | 2 | 87.98 MiB | 0.00 MiB | 0.00 MiB |
+| binance-spot-aggtrade | 5 | 86.94 MiB | 45.76 MiB | 55.07 MiB |
 | coinbase-btcusd-level2 | 2 | 76.26 MiB | 0.00 MiB | 0.00 MiB |
-| binance-spot-aggtrade | 5 | 70.23 MiB | 29.05 MiB | 47.67 MiB |
 | binance-spot-depth-diff | 2 | 58.32 MiB | 0.00 MiB | 0.00 MiB |
 | deribit-btc-perpetual-book | 2 | 28.65 MiB | 0.00 MiB | 0.00 MiB |
-| binance-usdm-mark-price | 3 | 24.41 MiB | 10.26 MiB | 16.84 MiB |
+| binance-usdm-mark-price | 3 | 28.12 MiB | 13.98 MiB | 16.83 MiB |
 | binance-usdm-book-ticker | 2 | 19.56 MiB | 0.00 MiB | 0.00 MiB |
-| deribit-btc-perpetual-trades | 3 | 13.12 MiB | 6.66 MiB | 10.93 MiB |
-| mempool-live | 5 | 8.10 MiB | 2.66 MiB | 4.37 MiB |
-| binance-usdm-liquidations | 3 | 7.75 MiB | 3.24 MiB | 5.32 MiB |
-| deribit-btc-option-surface-raw | 187 | 6.26 MiB | 2.24 MiB | 3.68 MiB |
-| deribit-btc-option-trades | 3 | 4.79 MiB | 2.23 MiB | 3.66 MiB |
-| deribit-btc-option-summary | 5 | 4.17 MiB | 1.36 MiB | 2.23 MiB |
+| deribit-btc-perpetual-trades | 3 | 17.00 MiB | 10.54 MiB | 12.68 MiB |
+| binance-usdm-liquidations | 3 | 9.36 MiB | 4.85 MiB | 5.84 MiB |
+| mempool-live | 5 | 9.06 MiB | 3.62 MiB | 4.36 MiB |
+| deribit-btc-option-surface-raw | 208 | 7.13 MiB | 3.11 MiB | 3.74 MiB |
+| deribit-btc-option-trades | 3 | 6.41 MiB | 3.85 MiB | 4.64 MiB |
+| deribit-btc-option-summary | 5 | 4.69 MiB | 1.87 MiB | 2.26 MiB |
 | binance-spot-depth-snapshot | 2 | 0.66 MiB | 0.00 MiB | 0.00 MiB |
-| binance-usdm-premium-index | 5 | 0.51 MiB | 0.17 MiB | 0.27 MiB |
-| gdelt-crypto-news | 5 | 0.17 MiB | 0.05 MiB | 0.08 MiB |
-| binance-usdm-book-ticker-session | 4 | 0.01 MiB | 0.00 MiB | 0.00 MiB |
-| kraken-btcusd-book-session | 5 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
+| binance-usdm-premium-index | 5 | 0.57 MiB | 0.23 MiB | 0.27 MiB |
+| gdelt-crypto-news | 5 | 0.19 MiB | 0.08 MiB | 0.09 MiB |
+| binance-usdm-book-ticker-session | 5 | 0.01 MiB | 0.00 MiB | 0.00 MiB |
+| kraken-btcusd-book-session | 5 | 0.01 MiB | 0.00 MiB | 0.00 MiB |
 | deribit-btc-perpetual-book-session | 5 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
-| binance-spot-depth-diff-session | 5 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
 | coinbase-btcusd-level2-session | 5 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
+| binance-spot-depth-diff-session | 5 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
 | collector-session | 4 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
 | binance-usdm-mark-price-session | 4 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
 | binance-spot-aggtrade-session | 4 | 0.00 MiB | 0.00 MiB | 0.00 MiB |
@@ -66,39 +66,39 @@ Latest target observation: 2026-08-20T07:44:21.000Z; staleness: 0.0s.
 
 | family | feature | observations | changes | distinct | health |
 |---|---|---:|---:|---:|---|
-| futures-premium | premium_bps | 2669 | 2667 | 2668 | varying |
-| futures-premium | funding_rate_bps | 2669 | 1335 | 1218 | varying |
-| futures-premium | mark_index_abs_gap_bps | 2669 | 2667 | 2668 | varying |
-| options | atm_iv_1d | 2669 | 2351 | 1188 | varying |
-| options | atm_iv_7d | 2669 | 2170 | 810 | varying |
-| options | atm_iv_30d | 2669 | 1516 | 405 | varying |
-| options | atm_iv_term_7d_minus_1d | 2669 | 2483 | 1153 | varying |
-| options | atm_iv_term_30d_minus_7d | 2669 | 2316 | 748 | varying |
-| options | put_call_25d_skew_1d | 2669 | 2501 | 785 | varying |
-| options | put_call_25d_skew_7d | 2669 | 2387 | 548 | varying |
-| options | put_call_25d_skew_30d | 2669 | 2127 | 305 | varying |
-| options | total_call_put_oi_imbalance | 2669 | 2082 | 2073 | varying |
-| options | one_day_call_put_oi_imbalance | 2669 | 805 | 804 | varying |
-| options | log_distance_to_major_strike | 2669 | 2667 | 2646 | varying |
-| options | hours_to_next_expiry | 2669 | 2668 | 2669 | varying |
-| mempool | transaction_count | 2669 | 2668 | 2482 | varying |
-| mempool | virtual_size | 2669 | 2668 | 2669 | varying |
-| mempool | total_fee_btc | 2669 | 2668 | 2668 | varying |
-| mempool | mean_fee_sat_vbyte | 2669 | 2668 | 2669 | varying |
-| mempool | fastest_fee | 2669 | 389 | 6 | varying |
-| mempool | half_hour_fee | 2669 | 179 | 5 | varying |
-| mempool | hour_fee | 2669 | 40 | 4 | varying |
-| mempool | economy_fee | 2669 | 24 | 2 | near-constant |
-| mempool | minimum_fee | 2669 | 0 | 1 | near-constant |
-| mempool | projected_first_block_vsize | 2669 | 2663 | 427 | varying |
-| mempool | projected_first_block_fee_range_high | 2669 | 656 | 486 | varying |
-| news-gdelt | crypto_terms_per_million | 183 | 178 | 179 | varying |
-| news-gdelt | story_count | 183 | 154 | 18 | varying |
-| news-gdelt | source_count | 183 | 151 | 12 | varying |
-| news-gdelt | mean_tone | 183 | 178 | 177 | varying |
-| news-gdelt | mean_positive | 183 | 178 | 177 | varying |
-| news-gdelt | mean_negative | 183 | 178 | 176 | varying |
-| news-gdelt | mean_polarity | 183 | 178 | 177 | varying |
+| futures-premium | premium_bps | 2988 | 2986 | 2987 | varying |
+| futures-premium | funding_rate_bps | 2988 | 1335 | 1218 | varying |
+| futures-premium | mark_index_abs_gap_bps | 2988 | 2986 | 2987 | varying |
+| options | atm_iv_1d | 2988 | 2657 | 1434 | varying |
+| options | atm_iv_7d | 2988 | 2450 | 982 | varying |
+| options | atm_iv_30d | 2988 | 1751 | 472 | varying |
+| options | atm_iv_term_7d_minus_1d | 2988 | 2792 | 1381 | varying |
+| options | atm_iv_term_30d_minus_7d | 2988 | 2615 | 904 | varying |
+| options | put_call_25d_skew_1d | 2988 | 2814 | 955 | varying |
+| options | put_call_25d_skew_7d | 2988 | 2692 | 679 | varying |
+| options | put_call_25d_skew_30d | 2988 | 2402 | 379 | varying |
+| options | total_call_put_oi_imbalance | 2988 | 2399 | 2389 | varying |
+| options | one_day_call_put_oi_imbalance | 2988 | 1039 | 1035 | varying |
+| options | log_distance_to_major_strike | 2988 | 2986 | 2965 | varying |
+| options | hours_to_next_expiry | 2988 | 2987 | 2988 | varying |
+| mempool | transaction_count | 2988 | 2987 | 2760 | varying |
+| mempool | virtual_size | 2988 | 2987 | 2988 | varying |
+| mempool | total_fee_btc | 2988 | 2987 | 2987 | varying |
+| mempool | mean_fee_sat_vbyte | 2988 | 2987 | 2988 | varying |
+| mempool | fastest_fee | 2988 | 439 | 6 | varying |
+| mempool | half_hour_fee | 2988 | 210 | 5 | varying |
+| mempool | hour_fee | 2988 | 50 | 4 | varying |
+| mempool | economy_fee | 2988 | 32 | 2 | near-constant |
+| mempool | minimum_fee | 2988 | 0 | 1 | near-constant |
+| mempool | projected_first_block_vsize | 2988 | 2981 | 431 | varying |
+| mempool | projected_first_block_fee_range_high | 2988 | 747 | 552 | varying |
+| news-gdelt | crypto_terms_per_million | 204 | 199 | 200 | varying |
+| news-gdelt | story_count | 204 | 172 | 20 | varying |
+| news-gdelt | source_count | 204 | 167 | 13 | varying |
+| news-gdelt | mean_tone | 204 | 198 | 197 | varying |
+| news-gdelt | mean_positive | 204 | 198 | 197 | varying |
+| news-gdelt | mean_negative | 204 | 198 | 196 | varying |
+| news-gdelt | mean_polarity | 204 | 198 | 197 | varying |
 
 ## Predictive smoke/early screen
 
@@ -107,36 +107,36 @@ This is a single chronological split. During the smoke stage, a few appended obs
 
 | family | feature | target | eval rows | effective outcomes | bits/target | positive blocks | decision | evidence |
 |---|---|---:|---:|---:|---:|---:|---|---|
-| news-gdelt | mean_tone | 30m | 45 | 22 | 0.214526 | 4/5 | promising | early |
-| options | put_call_25d_skew_7d | 30m | 665 | 22 | 0.184676 | 5/6 | promising | early |
-| news-gdelt | mean_negative | 30m | 45 | 22 | 0.156320 | 2/5 | inconclusive | early |
-| mempool | half_hour_fee | 15m | 786 | 52 | 0.067119 | 5/6 | promising | early |
-| news-gdelt | mean_tone | 1m | 69 | 69 | 0.066352 | 4/6 | inconclusive | early |
-| news-gdelt | crypto_terms_per_million | 30m | 45 | 22 | 0.066307 | 4/5 | promising | early |
-| mempool | total_fee_btc | 15m | 786 | 52 | 0.063171 | 4/6 | inconclusive | early |
-| news-gdelt | source_count | 5s | 71 | 71 | 0.062633 | 4/6 | inconclusive | early |
-| futures-premium | funding_rate_bps | 1m | 1031 | 1031 | 0.050166 | 4/6 | inconclusive | early |
-| mempool | mean_fee_sat_vbyte | 15m | 786 | 52 | 0.049178 | 4/6 | inconclusive | early |
-| options | put_call_25d_skew_7d | 15s | 1055 | 1055 | 0.048655 | 5/6 | promising | early |
-| news-gdelt | mean_polarity | 1s | 74 | 74 | 0.047701 | 4/6 | inconclusive | early |
-| futures-premium | funding_rate_bps | 15s | 1055 | 1055 | 0.046195 | 5/6 | promising | early |
-| options | put_call_25d_skew_30d | 15s | 1055 | 1055 | 0.045420 | 6/6 | promising | early |
-| options | put_call_25d_skew_7d | 15m | 786 | 52 | 0.041839 | 4/6 | inconclusive | early |
-| options | atm_iv_term_7d_minus_1d | 1m | 1030 | 1030 | 0.039496 | 6/6 | promising | early |
-| mempool | total_fee_btc | 30m | 665 | 22 | 0.035597 | 3/6 | inconclusive | early |
-| mempool | virtual_size | 15m | 786 | 52 | 0.035228 | 5/6 | promising | early |
-| options | put_call_25d_skew_1d | 15s | 1055 | 1055 | 0.033382 | 5/6 | promising | early |
-| news-gdelt | mean_negative | 1s | 74 | 74 | 0.033279 | 4/6 | inconclusive | early |
-| options | atm_iv_1d | 5s | 1063 | 1063 | 0.031841 | 4/6 | inconclusive | early |
-| news-gdelt | mean_positive | 1s | 74 | 74 | 0.031234 | 5/6 | promising | early |
-| options | put_call_25d_skew_1d | 1m | 1030 | 1030 | 0.028939 | 4/6 | inconclusive | early |
-| news-gdelt | mean_tone | 1s | 74 | 74 | 0.028001 | 4/6 | inconclusive | early |
-| options | put_call_25d_skew_1d | 5s | 1063 | 1063 | 0.026402 | 5/6 | promising | early |
-| options | put_call_25d_skew_30d | 1m | 1030 | 1030 | 0.023291 | 5/6 | promising | early |
-| news-gdelt | story_count | 5s | 71 | 71 | 0.020092 | 2/6 | inconclusive | early |
-| options | put_call_25d_skew_1d | 15m | 786 | 52 | 0.019747 | 4/6 | inconclusive | early |
-| options | atm_iv_1d | 15s | 1055 | 1055 | 0.018660 | 4/6 | inconclusive | early |
-| options | atm_iv_1d | 15m | 786 | 52 | 0.018155 | 3/6 | inconclusive | early |
+| options | atm_iv_30d | 30m | 792 | 26 | 0.114613 | 5/6 | promising | early |
+| news-gdelt | mean_tone | 15m | 62 | 61 | 0.078755 | 4/6 | inconclusive | early |
+| options | put_call_25d_skew_7d | 15s | 1182 | 1182 | 0.043902 | 6/6 | promising | early |
+| options | put_call_25d_skew_7d | 15m | 914 | 60 | 0.043444 | 4/6 | inconclusive | early |
+| futures-premium | funding_rate_bps | 15s | 1183 | 1183 | 0.040187 | 6/6 | promising | early |
+| futures-premium | funding_rate_bps | 30m | 792 | 26 | 0.033925 | 4/6 | inconclusive | early |
+| options | put_call_25d_skew_30d | 15s | 1182 | 1182 | 0.024686 | 6/6 | promising | early |
+| options | hours_to_next_expiry | 15m | 914 | 60 | 0.019143 | 3/6 | inconclusive | early |
+| news-gdelt | mean_negative | 15m | 62 | 61 | 0.018890 | 2/6 | inconclusive | early |
+| mempool | half_hour_fee | 15m | 914 | 60 | 0.018715 | 4/6 | inconclusive | early |
+| options | atm_iv_term_7d_minus_1d | 15s | 1182 | 1182 | 0.018212 | 6/6 | promising | early |
+| news-gdelt | mean_polarity | 5s | 80 | 80 | 0.016613 | 4/6 | inconclusive | early |
+| options | put_call_25d_skew_7d | 1m | 1158 | 1157 | 0.016046 | 6/6 | promising | early |
+| options | atm_iv_term_30d_minus_7d | 15m | 914 | 60 | 0.015125 | 4/6 | inconclusive | early |
+| options | put_call_25d_skew_30d | 1m | 1158 | 1157 | 0.013820 | 6/6 | promising | early |
+| futures-premium | funding_rate_bps | 1m | 1158 | 1157 | 0.011165 | 5/6 | promising | early |
+| mempool | projected_first_block_fee_range_high | 5s | 1191 | 1191 | 0.007612 | 4/6 | inconclusive | early |
+| options | atm_iv_1d | 5m | 1059 | 211 | 0.007211 | 4/6 | inconclusive | early |
+| news-gdelt | mean_polarity | 5m | 72 | 72 | 0.005887 | 4/6 | inconclusive | early |
+| options | atm_iv_term_7d_minus_1d | 1m | 1158 | 1157 | 0.004809 | 4/6 | inconclusive | early |
+| options | atm_iv_7d | 15m | 914 | 60 | 0.003858 | 3/6 | inconclusive | early |
+| options | put_call_25d_skew_7d | 5m | 1059 | 211 | 0.003719 | 2/6 | inconclusive | early |
+| options | atm_iv_1d | 15s | 1182 | 1182 | 0.002584 | 4/6 | inconclusive | early |
+| options | put_call_25d_skew_30d | 5m | 1059 | 211 | 0.001988 | 2/6 | inconclusive | early |
+| options | put_call_25d_skew_1d | 5m | 1059 | 211 | 0.001988 | 3/6 | inconclusive | early |
+| options | put_call_25d_skew_7d | 1s | 1192 | 1192 | 0.001793 | 3/6 | inconclusive | early |
+| mempool | minimum_fee | 1s | 1192 | 1192 | 0.000000 | 0/6 | weak-in-this-window | early |
+| mempool | minimum_fee | 5s | 1191 | 1191 | 0.000000 | 0/6 | weak-in-this-window | early |
+| mempool | minimum_fee | 15s | 1183 | 1183 | 0.000000 | 0/6 | weak-in-this-window | early |
+| mempool | minimum_fee | 1m | 1159 | 1158 | 0.000000 | 0/6 | weak-in-this-window | early |
 
 ## Retention decision
 

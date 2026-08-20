@@ -292,12 +292,10 @@ $$
 R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})=\Delta \log Q_t=\Delta V_{t}=\log R_t(x\to e)+h(e,\Delta s_{m,t})$$
 Where $x \to e$ is part of $\Delta s_{p,t}$, and $h$ is basically $h_{t,T,H}$ derived from market changes.
 
-We can split market state into price $p_t$, trend $t_t$, volatility $v_t$ and latent market state $s_{l,t}$. And actions can be identified by target exposure, as we discussed earlier. These two changes make sums into integrals:
+We can split market state into price $p_t$, slow "real" price $\bar p_t$, trend $t_t$, volatility $v_t$, and  latent market state $s_{l,t}$. Actions can be identified by target exposure, as we discussed earlier. These two changes make sums into integrals:
 $$\begin{aligned}
 q(s_t, a_t)
-&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E}\int_{\log p\in \mathbb R}dp\ da\ p_{m}(s_{l,t+1}, p|s_{l,t}, p_t)[R(p-p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{l,t+1}, p_{t+1})q(s_{t+1},a)]
-\\
-&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E}\int_{\log p\in \mathbb R}dp\ da\ p_{m}(p|s_{l,t}, p_t)p_{m}(s_{l,t+1}|s_{l,t}, p, p_t)[R(p-p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{l,t+1}, p_{t+1})q(s_{t+1},a)]
+&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E} \int_{\log v\in \mathbb R} \int_{t\in \mathbb R} \int_{\log\bar p\in E}\int_{\log p\in \mathbb R}d\bar p\ dv\ dt\ dp\ da\ p_{m}(s_{l,t+1}, p, \bar p, t, v|s_{t}, p_t)[R(\log p-\log p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{t+1})q(s_{t+1},a)]
 \end{aligned}$$
 # Perfect Policy
 We define policy as a distribution over all possible current and target exposures:$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)de}$$Where $R_{t,T}$ is a return from moving to the exposure $e$. The return itself is defined simply as oracle value minus transition cost:$$\begin{aligned}

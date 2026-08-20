@@ -24,6 +24,58 @@ ARCHITECTURE_CONTRACT = (
 class CompressedPathOutput:
     log_masses: tuple[Tensor, ...]
     expectations: Tensor
+    knots_unit: tuple[Tensor, ...] | None = None
+    areas_unit: tuple[Tensor, ...] | None = None
+    component_means: tuple[Tensor, ...] | None = None
+    arithmetic_component_means: tuple[Tensor, ...] | None = None
+
+
+def batched_triangular_basis_areas(knots: Tensor) -> Tensor:
+    """Return triangular-basis areas for one ordered knot grid per example."""
+    if knots.ndim != 2 or knots.shape[1] < 3:
+        raise ValueError("dynamic density knots must have shape [batch, knots]")
+    gaps = knots[:, 1:] - knots[:, :-1]
+    if not bool(torch.isfinite(knots).all()) or bool((gaps <= 0).any()):
+        raise ValueError("dynamic density knots must be finite and increasing")
+    areas = torch.empty_like(knots)
+    areas[:, 0] = gaps[:, 0] / 2
+    areas[:, -1] = gaps[:, -1] / 2
+    areas[:, 1:-1] = (gaps[:, :-1] + gaps[:, 1:]) / 2
+    return areas
+
+
+def batched_interpolated_log_density_unit(
+    log_masses: Tensor,
+    unit_targets: Tensor,
+    knots: Tensor,
+    areas: Tensor,
+) -> Tensor:
+    """Evaluate a piecewise-linear density on a per-example knot grid."""
+    if log_masses.ndim != 2 or unit_targets.ndim != 1 \
+            or knots.shape != log_masses.shape \
+            or areas.shape != knots.shape \
+            or unit_targets.shape[0] != log_masses.shape[0]:
+        raise ValueError("invalid dynamic knot-density evaluation shapes")
+    targets = unit_targets.float().clamp(0, 1)
+    # Searchsorted's discrete interval choice need not be differentiable; the
+    # selected endpoints and interpolation fraction remain differentiable.
+    interval = (targets[:, None] >= knots[:, 1:-1]).sum(dim=1)
+    left = knots.gather(1, interval[:, None]).squeeze(1)
+    right = knots.gather(1, (interval + 1)[:, None]).squeeze(1)
+    fraction = ((targets - left) / (right - left)).clamp(0, 1)
+    epsilon = torch.finfo(fraction.dtype).eps
+    stable_fraction = fraction.clamp(epsilon, 1 - epsilon)
+    log_heights = log_masses.float() - torch.log(areas.float())
+    left_log_height = log_heights.gather(
+        1, interval[:, None]
+    ).squeeze(1)
+    right_log_height = log_heights.gather(
+        1, (interval + 1)[:, None]
+    ).squeeze(1)
+    return torch.logaddexp(
+        left_log_height + torch.log1p(-stable_fraction),
+        right_log_height + torch.log(stable_fraction),
+    )
 
 
 def _identity_output(block: TensorPathGluBlock) -> None:
@@ -246,8 +298,16 @@ def path_log_density_terms(
     )
     terms = []
     for step, log_masses in enumerate(output.log_masses):
-        unit_log_density = interpolated_log_density_unit(
-            log_masses, unit[:, step], model.knots(step), model.areas(step)
-        )
+        if output.knots_unit is None or output.areas_unit is None:
+            unit_log_density = interpolated_log_density_unit(
+                log_masses, unit[:, step], model.knots(step), model.areas(step)
+            )
+        else:
+            unit_log_density = batched_interpolated_log_density_unit(
+                log_masses,
+                unit[:, step],
+                output.knots_unit[step],
+                output.areas_unit[step],
+            )
         terms.append(unit_log_density + log_jacobian[:, step])
     return torch.stack(terms, dim=1)

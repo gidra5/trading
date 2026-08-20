@@ -1,0 +1,77 @@
+{
+  "id": "recurrent-market-path-density-h15-w384-q256-gap64-featurelag3-train256k-residual-d16-ema4-cal64k-v1",
+  "label": "Recurrent market path density - 15 active 1s returns - lag-0/1/2 59-feature state - W384 - Q256 increasing-gap +64 - O256 - residual learned baseline D16 transition - 256k clean - no SAM - weight EMA 4 epochs - online per-step affine 64k validation",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/recurrent-market-path-density-h15-w384-q256-gap64-featurelag3-train256k-residual-d16-ema4-cal64k-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "recurrent-market-compressed-history-residual-output-path-density-v1",
+    "inputFeatureLags": 3,
+    "marketWidth": 384,
+    "returnCount": 15,
+    "stateWidths": [256, 320, 320, 384, 384, 384, 448, 448, 448, 448, 512, 512, 512, 512, 512],
+    "outputKnots": 256,
+    "transitionRank": 16,
+    "marketState": "m0=GLU(concat(feature[t-2:t]),384); m_s=GLU(m_s-1,384)",
+    "learnedConditional": "A_s=GLU(m_s,Q_s)[:, :, None] times learned-source-factor_s[Q_s,16]; P_s=row-softmax(A_s times learned-output-factor_s[16,O] + learned-output-bias_s[O])",
+    "baselineConditional": "F_s=row-softmax(learned-full-baseline-logits_s)",
+    "mixture": "lambda_s=sigmoid(learned-row-mixture-logits_s); T_s=(1-lambda_s)*F_s+lambda_s*P_s",
+    "marginal": "p_s = q_s times T_s, contracted without materializing the mixed transition",
+    "historyState": "q_1=softmax(GLU(m0,Q1)); q_s+1=softmax(GLU(concat(q_s,dynamic-factor_s),Q_s+1))",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 512,
+    "evaluationBatchSize": 512,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": null,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "datasetDir": "data/training/datasets/next-return-production-basis-history3-calibration-tail-64k-v1",
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 256,
+    "targetFilter": "each start and every path target are exact-nonzero active returns",
+    "trainingLoss": "mean marginal return-density NLL across 15 steps"
+  }
+}

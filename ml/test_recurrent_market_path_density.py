@@ -6,7 +6,10 @@ import unittest
 import torch
 
 from compressed_path_return_density import path_log_density_terms
-from recurrent_market_path_density import RecurrentMarketPathDensity
+from recurrent_market_path_density import (
+    RecurrentMarketPathDensity,
+    ResidualRecurrentMarketPathDensity,
+)
 from return_knot_density import KnotDensityContract
 
 
@@ -19,6 +22,30 @@ class RecurrentMarketPathDensityTest(unittest.TestCase):
         return RecurrentMarketPathDensity(
             torch.zeros(15), torch.ones(15), density,
             market_width=16, state_widths=(8, 12, 12),
+            initial_radius=0.0031622776601683794,
+            minimum_radius=1e-4, learnable_centering=False,
+        )
+
+    def make_residual_model(self) -> ResidualRecurrentMarketPathDensity:
+        density = KnotDensityContract.load(
+            Path("data/benchmarks/one-second-return-knot-scaling-v1.json"),
+            fit="32",
+        )
+        return ResidualRecurrentMarketPathDensity(
+            torch.zeros(15), torch.ones(15), density,
+            market_width=16, state_widths=(8, 12, 12),
+            initial_radius=0.0031622776601683794,
+            minimum_radius=1e-4, learnable_centering=False,
+        )
+
+    def make_ranked_residual_model(self) -> ResidualRecurrentMarketPathDensity:
+        density = KnotDensityContract.load(
+            Path("data/benchmarks/one-second-return-knot-scaling-v1.json"),
+            fit="32",
+        )
+        return ResidualRecurrentMarketPathDensity(
+            torch.zeros(15), torch.ones(15), density,
+            market_width=16, state_widths=(8, 12, 12), transition_rank=4,
             initial_radius=0.0031622776601683794,
             minimum_radius=1e-4, learnable_centering=False,
         )
@@ -52,6 +79,60 @@ class RecurrentMarketPathDensityTest(unittest.TestCase):
                 self.assertGreater(float(block.output.weight.grad.norm()), 0.0)
         for parameter in (*model.destination_factors, *model.destination_biases):
             self.assertIsNotNone(parameter.grad)
+            self.assertGreater(float(parameter.grad.norm()), 0.0)
+
+    def test_residual_transition_is_normalized_and_fully_trainable(self) -> None:
+        torch.manual_seed(23)
+        model = self.make_residual_model()
+        output = model(torch.randn(9, 15))
+        for value in output.log_masses:
+            torch.testing.assert_close(value.exp().sum(dim=1), torch.ones(9))
+        targets = torch.randn(9, 3) * 1e-4
+        loss = -path_log_density_terms(output, targets, model).mean()
+        loss.backward()
+        for parameter in (*model.baseline_logits, *model.mixture_logits):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+            self.assertGreater(float(parameter.grad.norm()), 0.0)
+
+    def test_residual_contraction_matches_explicit_transition(self) -> None:
+        torch.manual_seed(29)
+        model = self.make_residual_model()
+        batch = 5
+        step = 1
+        width = model.state_widths[step]
+        q = torch.softmax(torch.randn(batch, width), dim=1)
+        factor = torch.randn(batch, width)
+        destination = model.destination_factors[step]
+        bias = model.destination_biases[step]
+        explicit = torch.bmm(
+            q[:, None, :],
+            model.conditional_transition(step, factor, destination, bias),
+        ).squeeze(1)
+        contracted = model.contract_transition(
+            step, q, factor, destination, bias
+        )
+        torch.testing.assert_close(contracted, explicit, rtol=1e-5, atol=1e-7)
+
+    def test_ranked_residual_transition_is_trainable(self) -> None:
+        torch.manual_seed(31)
+        model = self.make_ranked_residual_model()
+        output = model(torch.randn(7, 15))
+        for value in output.log_masses:
+            torch.testing.assert_close(value.exp().sum(dim=1), torch.ones(7))
+        loss = -path_log_density_terms(
+            output, torch.randn(7, 3) * 1e-4, model
+        ).mean()
+        loss.backward()
+        self.assertIsNotNone(model.source_factors)
+        for parameter in (
+            *model.source_factors,
+            *model.destination_factors,
+            *model.baseline_logits,
+            *model.mixture_logits,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
             self.assertGreater(float(parameter.grad.norm()), 0.0)
 
 

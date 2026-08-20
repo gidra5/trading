@@ -22,7 +22,13 @@ from compressed_path_return_density import (
 )
 from recurrent_market_path_density import (
     ARCHITECTURE_CONTRACT as RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+    RESIDUAL_ARCHITECTURE_CONTRACT as RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
     RecurrentMarketPathDensity,
+    ResidualRecurrentMarketPathDensity,
+)
+from low_rank_path_matrix_density import (
+    ARCHITECTURE_CONTRACT as LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+    DynamicLowRankPathMatrixDensity,
 )
 from normalized_glu_next_return import optimizer_parameter_groups
 from return_knot_density import KnotDensityContract
@@ -48,6 +54,9 @@ from train_normalized_glu_next_return import (
 RUNNER_CONTRACT = "feature-immediate-compressed-active-return-path-density-v3"
 RECURRENT_MARKET_RUNNER_CONTRACT = (
     "feature-lag3-recurrent-market-compressed-path-density-v1"
+)
+LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT = (
+    "feature-lag3-dynamic-low-rank-path-matrix-density-v1"
 )
 
 
@@ -579,14 +588,27 @@ def main() -> None:
         if architecture_contract not in {
             ARCHITECTURE_CONTRACT,
             RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+            RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+            LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
         }:
             raise ValueError("compressed path architecture contract changed")
-        recurrent_market = (
-            architecture_contract == RECURRENT_MARKET_ARCHITECTURE_CONTRACT
+        recurrent_market = architecture_contract in {
+            RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+            RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
+        }
+        residual_recurrent_market = (
+            architecture_contract
+            == RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT
+        )
+        low_rank_path_matrix = (
+            architecture_contract == LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT
         )
         runner_contract = (
-            RECURRENT_MARKET_RUNNER_CONTRACT if recurrent_market
-            else RUNNER_CONTRACT
+            LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT
+            if low_rank_path_matrix else (
+                RECURRENT_MARKET_RUNNER_CONTRACT if recurrent_market
+                else RUNNER_CONTRACT
+            )
         )
         if training.get("adversarialInput") is not None:
             raise ValueError("this run explicitly forbids adversarial inputs")
@@ -643,23 +665,47 @@ def main() -> None:
         })
         reporter.status("computing-training-statistics", planId=plan["id"])
         stats = training_statistics(dataset, int(training["evaluationBatchSize"]))
-        widths = tuple(int(value) for value in architecture["stateWidths"])
         density_file = (repo / plan["density"]["source"]).resolve()
-        if recurrent_market:
+        if low_rank_path_matrix:
             density = KnotDensityContract.load(
                 density_file, fit=str(int(architecture["outputKnots"]))
             )
-            model = RecurrentMarketPathDensity(
+            model = DynamicLowRankPathMatrixDensity(
+                torch.from_numpy(stats["featureMean"]),
+                torch.from_numpy(stats["featureStd"]),
+                density,
+                market_width=int(architecture["marketWidth"]),
+                path_embedding_width=int(architecture["pathEmbeddingWidth"]),
+                path_count=int(architecture["pathCount"]),
+                return_count=int(architecture["returnCount"]),
+                matrix_rank=int(architecture["matrixRank"]),
+                hidden_width_cap=int(architecture["hiddenWidthCap"]),
+                initial_radius=float(architecture["initialRadius"]),
+                minimum_radius=float(architecture["minimumRadius"]),
+                learnable_centering=bool(architecture["learnableCentering"]),
+            ).to(device)
+        elif recurrent_market:
+            widths = tuple(int(value) for value in architecture["stateWidths"])
+            density = KnotDensityContract.load(
+                density_file, fit=str(int(architecture["outputKnots"]))
+            )
+            model_type = (
+                ResidualRecurrentMarketPathDensity
+                if residual_recurrent_market else RecurrentMarketPathDensity
+            )
+            model = model_type(
                 torch.from_numpy(stats["featureMean"]),
                 torch.from_numpy(stats["featureStd"]),
                 density,
                 market_width=int(architecture["marketWidth"]),
                 state_widths=widths,
+                transition_rank=int(architecture.get("transitionRank", 1)),
                 initial_radius=float(architecture["initialRadius"]),
                 minimum_radius=float(architecture["minimumRadius"]),
                 learnable_centering=bool(architecture["learnableCentering"]),
             ).to(device)
         else:
+            widths = tuple(int(value) for value in architecture["stateWidths"])
             densities = tuple(
                 KnotDensityContract.load(density_file, fit=str(width))
                 for width in widths

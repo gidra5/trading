@@ -1,0 +1,10 @@
+{
+  "id": "dynamic-low-rank-path-matrix-density-h15-v1",
+  "label": "Dynamic low-rank path matrix density · H15 · W256/Q16/D64/O32/L8 · 256k clean",
+  "runIds": [
+    "dynamic-low-rank-path-matrix-density-h15-w256-q16-d64-o32-l8-cap256-featurelag3-train256k-nosam-ema4-cal64k-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/dynamic-low-rank-path-matrix-density-h15-v1/PAUSE"
+  }
+}

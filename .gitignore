@@ -16,3 +16,4 @@ apps/*/dist
 packages/*/dist
 packages/bot-algo/native/cuda/build
 .env
+.obsidian
