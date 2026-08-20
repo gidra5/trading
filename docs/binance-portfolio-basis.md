@@ -28,7 +28,8 @@ The default run:
 - treats pivots within 5% of the maximum unexplained variance as
   near-equivalent and chooses the largest mean absolute candle return within
   that set; and
-- writes JSON and Markdown reports under `data/portfolio-basis/`.
+- writes JSON and Markdown reports under `docs/portfolio/`, while reusable
+  market-data caches remain under `data/portfolio-basis/`.
 
 Useful options:
 

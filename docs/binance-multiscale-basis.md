@@ -43,7 +43,7 @@ a pure maximum-residual QR basis at the same size, and reports:
 - assets selected at every scale and at a majority of scales; and
 - per-scale coverage of the simple 3-of-5 membership consensus.
 
-Reports are written under `data/portfolio-basis/scale-comparison/`.
+Reports are written under `docs/portfolio/scale-comparison/`.
 
 ## Point-in-time index backtest
 

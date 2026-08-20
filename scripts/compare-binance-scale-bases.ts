@@ -143,9 +143,11 @@ main().catch((error: unknown) => {
 });
 
 async function main(): Promise<void> {
-  const dataDir = path.resolve(optionValue(args, "--data-dir") ?? "data");
+  const reportDir = path.resolve(
+    optionValue(args, "--report-dir") ?? "docs/portfolio",
+  );
   const scales = await Promise.all(
-    SCALE_DEFINITIONS.map((definition) => loadScale(definition, dataDir)),
+    SCALE_DEFINITIONS.map((definition) => loadScale(definition, reportDir)),
   );
   validateScales(scales);
 
@@ -218,7 +220,7 @@ async function main(): Promise<void> {
     return {
       id: scale.id,
       label: scale.label,
-      file: scale.file,
+      file: path.relative(process.cwd(), scale.file),
       window: {
         start: scale.report.parameters.returnStartTime,
         end: scale.report.parameters.returnEndTime,
@@ -446,7 +448,7 @@ async function main(): Promise<void> {
       entries: recurrenceEntries,
     },
   };
-  const output = await writeReport(report, dataDir);
+  const output = await writeReport(report, reportDir);
 
   console.log(
     `Independent 360-return bases: ${comparisons
@@ -481,9 +483,9 @@ async function main(): Promise<void> {
 
 async function loadScale(
   definition: (typeof SCALE_DEFINITIONS)[number],
-  dataDir: string,
+  reportDir: string,
 ): Promise<LoadedScale> {
-  const runDir = path.join(dataDir, "portfolio-basis", "runs");
+  const runDir = path.join(reportDir, "runs");
   const expression = new RegExp(
     `^\\d{4}-\\d{2}-\\d{2}-all-usdt-${escapeRegExp(
       definition.id,
@@ -845,13 +847,9 @@ async function writeReport(
       }>;
     };
   },
-  dataDir: string,
+  reportDir: string,
 ): Promise<{ json: string; markdown: string; weights: string }> {
-  const root = path.join(
-    dataDir,
-    "portfolio-basis",
-    "scale-comparison",
-  );
+  const root = path.join(reportDir, "scale-comparison");
   const stem =
     `${report.endDate}-5scale-360c-q4-` +
     `${residualBandTag(
@@ -1199,5 +1197,5 @@ Compare the latest independent q4 Binance bases for exactly 360 returns at
 1d, 4h, 1h, 15m, and 1m. The report compares return-prioritized selection with
 pure orthogonality at each scale and then measures cross-scale recurrence.
 
-  --data-dir data    Source-report and output root`);
+  --report-dir docs/portfolio    Source-report and output root`);
 }

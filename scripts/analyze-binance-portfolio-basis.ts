@@ -78,6 +78,7 @@ interface CliOptions {
   concurrency: number;
   endDay: number;
   dataDir: string;
+  reportDir: string;
   refresh: boolean;
 }
 
@@ -310,7 +311,7 @@ async function main(): Promise<void> {
     returnStartTime,
     returnEndTime,
   });
-  const output = await writeReport(report, options.dataDir);
+  const output = await writeReport(report, options.reportDir);
 
   console.log("");
   console.log(renderConsoleSummary(report));
@@ -423,6 +424,7 @@ function parseOptions(values: string[]): CliOptions {
     concurrency,
     endDay,
     dataDir: path.resolve(value("--data-dir") ?? "data"),
+    reportDir: path.resolve(value("--report-dir") ?? "docs/portfolio"),
     refresh: values.includes("--refresh"),
   };
 }
@@ -1186,9 +1188,8 @@ function buildReport(input: {
 
 async function writeReport(
   report: PortfolioBasisReport,
-  dataDir: string,
+  reportDir: string,
 ): Promise<{ json: string; markdown: string }> {
-  const root = path.join(dataDir, "portfolio-basis");
   const runStem = [
     report.parameters.returnEndTime.slice(0, 10),
     report.parameters.products,
@@ -1200,7 +1201,7 @@ async function writeReport(
     report.parameters.correlationMethod,
     `k${report.basis.entries.length}`,
   ].join("-");
-  const runDir = path.join(root, "runs");
+  const runDir = path.join(reportDir, "runs");
   const json = path.join(runDir, `${runStem}.json`);
   const markdown = path.join(runDir, `${runStem}.md`);
   const jsonContent = `${JSON.stringify(report, null, 2)}\n`;
@@ -1208,8 +1209,8 @@ async function writeReport(
   await Promise.all([
     writeTextAtomic(json, jsonContent),
     writeTextAtomic(markdown, markdownContent),
-    writeTextAtomic(path.join(root, "latest.json"), jsonContent),
-    writeTextAtomic(path.join(root, "latest.md"), markdownContent),
+    writeTextAtomic(path.join(reportDir, "latest.json"), jsonContent),
+    writeTextAtomic(path.join(reportDir, "latest.md"), markdownContent),
   ]);
   return { json, markdown };
 }
@@ -1635,7 +1636,8 @@ Build a near-orthogonal basis of actual Binance asset return vectors.
   --include-stables             Keep stablecoin base assets
   --concurrency 6               Parallel Binance requests
   --refresh                     Ignore candle caches for the requested window
-  --data-dir data               Cache and report root
+  --data-dir data               Market-data cache root
+  --report-dir docs/portfolio   Generated report directory
 
-Reports are written under data/portfolio-basis/.`);
+Reports are written under docs/portfolio/.`);
 }
