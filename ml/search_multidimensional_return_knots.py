@@ -1,4 +1,4 @@
-"""Search beta-companded adaptive point clouds for consecutive BTC returns."""
+"""Search density-tempered adaptive point clouds for consecutive BTC returns."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from typing import Any, Literal, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
 from sklearn.cluster import MiniBatchKMeans
 
 from multidimensional_return_knots import (
@@ -48,11 +50,14 @@ class SearchOptions:
     validation_stride: int
     rebuild_cache: bool
     quick: bool
+    minimum_component_draws: int = 16
+    fast_point_cloud: bool = False
+    compute_conditional_diagnostics: bool = True
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Search beta-companded multidimensional point-cloud return densities.",
+        description="Search density-tempered multidimensional point-cloud return densities.",
     )
     parser.add_argument("--pair-analysis", type=Path, default=DEFAULT_PAIR_ANALYSIS)
     parser.add_argument("--triple-analysis", type=Path, default=DEFAULT_TRIPLE_ANALYSIS)
@@ -108,7 +113,7 @@ def main() -> None:
             options,
         )
     artifact: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "generatedAt": utc_now(),
         "source": {
             "pairAnalysis": relative(repo, pair_path),
@@ -116,14 +121,14 @@ def main() -> None:
             "oneDimensionalReference": relative(repo, reference_path),
         },
         "methodology": {
-            "pipeline": "zero mask -> fitted covariance whitening -> asinh -> fitted beta-powered matrix transform -> sigmoid -> adaptive triangular-kernel point cloud",
+            "pipeline": "zero mask -> fitted covariance whitening -> asinh -> fitted matrix transform -> sigmoid -> density-tempered adaptive triangular-kernel point cloud",
             "zeroMasks": "Exact mask probabilities remain separate; this search fits only all-active continuous components.",
             "split": "The first four UTC years fit the representation; the final UTC year reports temporal drift. Acceptance measures in-sample representation error, matching the 1D reference experiment.",
             "densityCriterion": "Training histogram Jensen-Shannon divergence in bits per active coordinate must not exceed the direct JS-optimized 1D 32-knot reference.",
             "operationCriterion": "Every autoregressive conditional-mean RMSE and conditional-median MAE must not exceed the corresponding error produced by quantizing the target coordinate through the JS-optimized 1D 32-knot representation.",
             "conditionalQueries": "2D scores r2|r1. 3D scores both r2|r1 and r3|r1,r2. Empirical quantile cells use 24 bins for one conditioning coordinate and 12 per axis for two conditioning coordinates.",
             "cloud": "Mini-batch k-means centers, local product-triangular bandwidths, empirical component weights, and one low-weight full-support triangular background whose density vanishes at the strip boundary.",
-            "beta": "The beta=1 invertible transform supplies a pilot density. Escort weights proportional to pilot_density^(beta-1) refit the transform toward a Jacobian proportional to density^beta.",
+            "beta": "Beta changes only center allocation in mapped unit space. Smoothed pilot-density weights proportional to p(u)^(beta-1) flatten the observations seen by k-means; final bandwidths and mixture weights are always refit to the untempered distribution. Beta is reselected from the incumbent and its neighboring candidates at each knot count.",
             "betaCandidates": {"2": beta_candidates(2), "3": beta_candidates(3)},
             "transformFamilies": ["shared scalar", "positive scaling vector", "factorized rotation-shear-positive-scale matrix"],
             "modelIntegration": f"Conditional operations target {options.conditional_draws:,} deterministic scrambled-Sobol quadrature draws, allocated equally within every component and then weighted by exact mixture mass.",
@@ -164,32 +169,34 @@ def search_dimension(
     screening: dict[str, Any] = {}
     transformed: dict[str, tuple[np.ndarray, np.ndarray, AsinhMatrixTransform]] = {}
     screen_count = 128 if options.quick else (384 if dimension == 2 else 512)
+    incumbent_transform: dict[str, Any] | None = None
     for family in ("scalar", "vector", "factorized"):
-        print(f"  fitting {family} beta=1 pilot...", flush=True)
-        pilot = fit_tail_transform(
-            whitened_train, whitened_validation, family, 1.0, options, None,
+        print(f"  fitting nested {family} transform on the true distribution...", flush=True)
+        transform_fit = fit_tail_transform(
+            whitened_train,
+            whitened_validation,
+            family,
+            options,
+            incumbent_transform,
         )
+        incumbent_transform = transform_fit
+        transform = AsinhMatrixTransform(
+            np.asarray(transform_fit["matrix"], dtype=np.float64),
+        )
+        unit_train = transform.forward(whitened_train)
+        unit_validation = transform.forward(whitened_validation)
         for beta in beta_candidates(dimension):
-            fit = pilot if beta == 1.0 else fit_tail_transform(
-                whitened_train,
-                whitened_validation,
-                family,
-                beta,
-                options,
-                pilot,
-            )
             key = transform_key(family, beta)
             print(
-                f"  screening {family} beta={beta:g} with {screen_count:,} points...",
+                f"  screening {family} allocation beta={beta:g} "
+                f"with {screen_count:,} points...",
                 flush=True,
             )
-            transform = AsinhMatrixTransform(np.asarray(fit["matrix"], dtype=np.float64))
-            unit_train = transform.forward(whitened_train)
-            unit_validation = transform.forward(whitened_validation)
             cloud = fit_cloud(
                 unit_train,
                 unit_validation,
                 screen_count,
+                beta,
                 transform,
                 covariance,
                 train,
@@ -198,7 +205,7 @@ def search_dimension(
                 reference,
                 options,
             )
-            transforms[key] = fit
+            transforms[key] = {**transform_fit, "beta": beta}
             screening[key] = cloud
             transformed[key] = (unit_train, unit_validation, transform)
     selected_key = min(screening, key=lambda key: screening[key]["acceptanceScore"])
@@ -211,6 +218,7 @@ def search_dimension(
     search = search_cloud_counts(
         candidate_cloud_counts(dimension, options.quick),
         transformed[selected_key],
+        float(selected["beta"]),
         covariance,
         train,
         validation,
@@ -243,42 +251,35 @@ def fit_tail_transform(
     train: np.ndarray,
     validation: np.ndarray,
     family: TransformFamily,
-    beta: float,
     options: SearchOptions,
-    pilot: dict[str, Any] | None,
+    initial: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if not 0 < beta <= 1:
-        raise ValueError("beta must lie in (0, 1]")
-    if beta < 1 and pilot is None:
-        raise ValueError("a beta=1 pilot is required for escort fitting")
     dimension = train.shape[1]
     selected = evenly_spaced_rows(train, options.transform_sample)
     device = torch.device(options.device)
     values = torch.as_tensor(np.arcsinh(selected), dtype=torch.float64, device=device)
     angle_count = dimension * (dimension - 1) // 2
-    if pilot is None:
+    if initial is None:
         initial_scale = math.pi / math.sqrt(3.0) / max(
             float(np.mean(np.std(np.arcsinh(selected), axis=0))), 1e-6,
         )
         initial_logs = np.full(1 if family == "scalar" else dimension, math.log(initial_scale))
         initial_rotation = np.zeros(angle_count)
         initial_shear = np.zeros(angle_count)
-        escort_weights = np.ones(selected.shape[0], dtype=np.float64)
     else:
-        initial_logs = np.asarray(pilot["parameters"]["logScales"], dtype=np.float64)
+        source_logs = np.asarray(initial["parameters"]["logScales"], dtype=np.float64)
+        if family == "scalar":
+            initial_logs = np.asarray([float(np.mean(source_logs))])
+        elif source_logs.size == 1:
+            initial_logs = np.repeat(source_logs, dimension)
+        else:
+            initial_logs = source_logs.copy()
         initial_rotation = np.asarray(
-            pilot["parameters"].get("rotation", np.zeros(angle_count)), dtype=np.float64,
+            initial["parameters"].get("rotation", np.zeros(angle_count)), dtype=np.float64,
         )
         initial_shear = np.asarray(
-            pilot["parameters"].get("shear", np.zeros(angle_count)), dtype=np.float64,
+            initial["parameters"].get("shear", np.zeros(angle_count)), dtype=np.float64,
         )
-        pilot_transform = AsinhMatrixTransform(np.asarray(pilot["matrix"], dtype=np.float64))
-        log_weights = (beta - 1.0) * pilot_transform.log_abs_jacobian(selected)
-        log_weights = np.minimum(log_weights, np.quantile(log_weights, 0.999))
-        log_weights -= np.max(log_weights)
-        escort_weights = np.exp(log_weights)
-        escort_weights /= np.mean(escort_weights)
-    weight_tensor = torch.as_tensor(escort_weights, dtype=torch.float64, device=device)
     log_scales = torch.nn.Parameter(torch.as_tensor(initial_logs, dtype=torch.float64, device=device))
     parameters: list[torch.nn.Parameter] = [log_scales]
     rotation = None
@@ -299,7 +300,7 @@ def fit_tail_transform(
         matrix = torch_transform_matrix(dimension, family, log_scales, rotation, shear)
         latent = values @ matrix.T
         energy = torch.sum(F.softplus(latent) + F.softplus(-latent), dim=1)
-        loss = -torch.logdet(matrix) + torch.sum(weight_tensor * energy) / torch.sum(weight_tensor)
+        loss = -torch.logdet(matrix) + torch.mean(energy)
         if family == "factorized":
             assert rotation is not None and shear is not None
             loss = loss + 2e-5 * (rotation.square().sum() + shear.square().sum())
@@ -322,19 +323,13 @@ def fit_tail_transform(
         assert rotation is not None and shear is not None
         result_parameters["rotation"] = rotation.detach().cpu().numpy().tolist()
         result_parameters["shear"] = shear.detach().cpu().numpy().tolist()
-    effective_sample_size = float(
-        np.sum(escort_weights) ** 2 / np.sum(escort_weights * escort_weights)
-    )
     return {
         "family": family,
-        "beta": beta,
         "matrix": matrix.tolist(),
         "parameters": result_parameters,
-        "escortEffectiveSampleSize": effective_sample_size,
-        "escortEffectiveSampleFraction": effective_sample_size / escort_weights.size,
         "uniformNllTrainPerObservation": transform_uniform_nll(train, matrix),
         "uniformNllValidationPerObservation": transform_uniform_nll(validation, matrix),
-        "escortObjective": best,
+        "uniformObjective": best,
     }
 
 
@@ -376,10 +371,80 @@ def transform_uniform_nll(whitened: np.ndarray, matrix: np.ndarray) -> float:
     )
 
 
+def fast_weighted_lloyd(
+    values: np.ndarray,
+    sample_weights: np.ndarray,
+    count: int,
+    initial_centers: np.ndarray | None,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit many low-dimensional centers with tree-based weighted Lloyd updates.
+
+    The production joint search often has roughly two observations per center.
+    Exact all-pairs mini-batch k-means is needlessly expensive in that regime;
+    a cKDTree makes assignment nearly linearithmic in the center count. Full
+    verification deliberately retains the original MiniBatchKMeans path.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    sample_weights = np.asarray(sample_weights, dtype=np.float64)
+    if values.ndim != 2 or sample_weights.shape != (values.shape[0],):
+        raise ValueError("fast Lloyd inputs have inconsistent shapes")
+    if not 1 <= count <= values.shape[0]:
+        raise ValueError("fast Lloyd center count is outside the sample")
+    if initial_centers is None:
+        probabilities = np.maximum(sample_weights, 0.0)
+        probabilities /= np.sum(probabilities)
+        rng = np.random.default_rng(seed)
+        selected = rng.choice(values.shape[0], size=count, replace=False, p=probabilities)
+        centers = values[selected].copy()
+        iterations = 10
+        damping = 1.0
+    else:
+        centers = np.asarray(initial_centers, dtype=np.float64).copy()
+        if centers.shape != (count, values.shape[1]):
+            raise ValueError("fast Lloyd initial centers have the wrong shape")
+        # A shallow, heavily damped warm update is cheap in isolation but
+        # forces the outer fixed-point loop to repeat every covariance and
+        # transform proposal while centers inch toward their centroids. Six
+        # half-steps settle a transported/pruned cloud in the same refit while
+        # retaining damping for assignment-boundary stability.
+        iterations = 6
+        damping = 0.5
+    centers = np.clip(centers, 1e-8, 1.0 - 1e-8)
+    previous_labels: np.ndarray | None = None
+    for _ in range(iterations):
+        distances, labels = cKDTree(centers).query(values, k=1, workers=-1)
+        if previous_labels is not None and np.array_equal(labels, previous_labels):
+            break
+        mass = np.bincount(labels, weights=sample_weights, minlength=count)
+        updated = centers.copy()
+        occupied = mass > np.finfo(np.float64).tiny
+        for axis in range(values.shape[1]):
+            totals = np.bincount(
+                labels,
+                weights=sample_weights * values[:, axis],
+                minlength=count,
+            )
+            centroids = totals[occupied] / mass[occupied]
+            updated[occupied, axis] += damping * (
+                centroids - updated[occupied, axis]
+            )
+        empty = np.flatnonzero(~occupied)
+        if empty.size:
+            removal_score = sample_weights * np.square(distances)
+            replacements = np.argpartition(removal_score, -empty.size)[-empty.size:]
+            updated[empty] = values[replacements]
+        previous_labels = labels
+        centers = np.clip(updated, 1e-8, 1.0 - 1e-8)
+    labels = cKDTree(centers).query(values, k=1, workers=-1)[1]
+    return centers, labels.astype(np.int64, copy=False)
+
+
 def fit_cloud(
     unit_train: np.ndarray,
     unit_validation: np.ndarray,
     count: int,
+    beta: float,
     transform: AsinhMatrixTransform,
     covariance: CovarianceTransform,
     raw_train: np.ndarray,
@@ -387,21 +452,56 @@ def fit_cloud(
     reference_operations: list[dict[str, float | int]],
     reference: dict[str, Any],
     options: SearchOptions,
+    *,
+    initial_adaptive_centers: np.ndarray | None = None,
+    disabled_conditional_mean_targets: frozenset[int] = frozenset(),
+    conditional_metrics_active: bool = True,
+    enable_conditional_weight_calibration: bool = True,
+    compute_conditional_diagnostics: bool = True,
+    cloud_seed_offset: int = 0,
 ) -> dict[str, Any]:
     dimension = unit_train.shape[1]
+    if not dimension / (dimension + 2.0) <= beta <= 1.0:
+        raise ValueError("allocation beta lies outside its dimension-motivated bounds")
     adaptive_count = max(2, count - 1)
     selected = evenly_spaced_rows(unit_train, options.cloud_sample)
-    kmeans = MiniBatchKMeans(
-        n_clusters=adaptive_count,
-        init="k-means++",
-        n_init=1,
-        max_iter=40 if options.quick else 90,
-        batch_size=min(16_384, selected.shape[0]),
-        reassignment_ratio=0.002,
-        random_state=1701 + dimension + count,
-    )
-    labels = kmeans.fit_predict(selected)
-    adaptive_centers = np.clip(kmeans.cluster_centers_.astype(np.float64), 1e-8, 1 - 1e-8)
+    allocation_weights, allocation = density_tempering_weights(selected, beta)
+    if initial_adaptive_centers is not None:
+        initial_adaptive_centers = np.asarray(initial_adaptive_centers, dtype=np.float64)
+        if initial_adaptive_centers.shape != (adaptive_count, dimension):
+            raise ValueError(
+                "initial adaptive centers must match the requested cloud size and dimension",
+            )
+        initial_adaptive_centers = np.clip(initial_adaptive_centers, 1e-8, 1 - 1e-8)
+    cloud_seed = 1701 + dimension + count + cloud_seed_offset
+    if options.fast_point_cloud:
+        adaptive_centers, labels = fast_weighted_lloyd(
+            selected,
+            allocation_weights,
+            adaptive_count,
+            initial_adaptive_centers,
+            cloud_seed,
+        )
+    else:
+        kmeans_init: str | np.ndarray = (
+            "k-means++" if initial_adaptive_centers is None else initial_adaptive_centers
+        )
+        kmeans = MiniBatchKMeans(
+            n_clusters=adaptive_count,
+            init=kmeans_init,
+            n_init=1,
+            max_iter=40 if options.quick else 90,
+            batch_size=min(16_384, selected.shape[0]),
+            reassignment_ratio=0.002,
+            random_state=cloud_seed,
+        )
+        kmeans.fit(selected, sample_weight=allocation_weights)
+        labels = kmeans.predict(selected)
+        adaptive_centers = np.clip(
+            kmeans.cluster_centers_.astype(np.float64),
+            1e-8,
+            1 - 1e-8,
+        )
     cluster_counts = np.bincount(labels, minlength=adaptive_count).astype(np.float64)
     residual = selected - adaptive_centers[labels]
     squared = np.zeros((adaptive_count, dimension), dtype=np.float64)
@@ -435,74 +535,106 @@ def fit_cloud(
         raise AssertionError("cloud bandwidth search failed")
     _, bandwidth_scale, widths = best
     density_weights = weights.copy()
-    calibrated_weights, calibration = calibrate_conditional_weights(
-        centers,
-        widths,
-        weights,
-        covariance,
-        transform,
-        raw_train,
-        reference_operations,
-        options,
-    )
-    blend_candidates: list[tuple[float, float, np.ndarray]] = []
-    for blend in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
-        candidate_weights = (1.0 - blend) * density_weights + blend * calibrated_weights
-        candidate_model = point_cloud_bin_probabilities(
-            edges, centers, widths, candidate_weights,
+    if enable_conditional_weight_calibration:
+        calibrated_weights, calibration = calibrate_conditional_weights(
+            centers,
+            widths,
+            weights,
+            covariance,
+            transform,
+            raw_train,
+            reference_operations,
+            options,
+            disabled_conditional_mean_targets,
         )
-        candidate_js_per_dimension = probability_metrics(
-            train_target, candidate_model,
-        )["jensenShannonBits"] / dimension
-        blend_candidates.append((candidate_js_per_dimension, blend, candidate_weights))
-    js_threshold = float(reference["densityThresholds"]["jensenShannonBits"])
-    density_eligible = [item for item in blend_candidates if item[0] <= js_threshold]
-    if density_eligible:
-        _, selected_blend, weights = max(density_eligible, key=lambda item: item[1])
+        blend_candidates: list[tuple[float, float, np.ndarray]] = []
+        for blend in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
+            candidate_weights = (1.0 - blend) * density_weights + blend * calibrated_weights
+            candidate_model = point_cloud_bin_probabilities(
+                edges, centers, widths, candidate_weights,
+            )
+            candidate_js_per_dimension = probability_metrics(
+                train_target, candidate_model,
+            )["jensenShannonBits"] / dimension
+            blend_candidates.append((candidate_js_per_dimension, blend, candidate_weights))
+        js_threshold = float(reference["densityThresholds"]["jensenShannonBits"])
+        density_eligible = [item for item in blend_candidates if item[0] <= js_threshold]
+        if density_eligible:
+            _, selected_blend, weights = max(density_eligible, key=lambda item: item[1])
+        else:
+            _, selected_blend, weights = min(blend_candidates, key=lambda item: item[0])
+        calibration["selectedDensitySafeBlend"] = selected_blend
+        calibration["calibratedWeightTotalVariation"] = float(
+            0.5 * np.sum(np.abs(calibrated_weights - density_weights))
+        )
+        calibration["selectedWeightTotalVariation"] = float(
+            0.5 * np.sum(np.abs(weights - density_weights))
+        )
     else:
-        _, selected_blend, weights = min(blend_candidates, key=lambda item: item[0])
-    calibration["selectedDensitySafeBlend"] = selected_blend
-    calibration["calibratedWeightTotalVariation"] = float(
-        0.5 * np.sum(np.abs(calibrated_weights - density_weights))
-    )
-    calibration["selectedWeightTotalVariation"] = float(
-        0.5 * np.sum(np.abs(weights - density_weights))
-    )
+        weights = density_weights
+        calibration = {
+            "enabled": False,
+            "reason": "Conditional operations are diagnostics under the JS-only objective.",
+            "selectedDensitySafeBlend": 0.0,
+            "calibratedWeightTotalVariation": 0.0,
+            "selectedWeightTotalVariation": 0.0,
+        }
     model = point_cloud_bin_probabilities(edges, centers, widths, weights)
     density = with_per_dimension(probability_metrics(train_target, model), dimension)
     validation_target = np.histogramdd(unit_validation, bins=edges)[0]
     validation_density = with_per_dimension(
         probability_metrics(validation_target, model), dimension,
     )
-    evaluation_per_component = quadrature_samples_per_component(
-        count,
-        options.conditional_draws,
-        maximum=2_048,
+    if compute_conditional_diagnostics:
+        evaluation_per_component = quadrature_samples_per_component(
+            count,
+            options.conditional_draws,
+            maximum=2_048,
+            minimum=options.minimum_component_draws,
+        )
+        unit_model, model_components = sample_each_point_cloud_component(
+            centers,
+            widths,
+            seed=9109 + 101 * dimension + count,
+            samples_per_component=evaluation_per_component,
+        )
+        unit_model = np.clip(
+            unit_model,
+            np.finfo(np.float64).eps,
+            1.0 - np.finfo(np.float64).eps,
+        )
+        raw_model = covariance.inverse(transform.inverse(unit_model))
+        model_sample_weights = weights[model_components] / evaluation_per_component
+        operations = conditional_operation_metrics(
+            raw_train,
+            raw_model,
+            CONDITIONAL_BINS,
+            model_sample_weights,
+        )
+        validation_operations = conditional_operation_metrics(
+            raw_validation,
+            raw_model,
+            CONDITIONAL_BINS,
+            model_sample_weights,
+        )
+        operation_draws = int(unit_model.shape[0])
+    else:
+        evaluation_per_component = 0
+        operation_draws = 0
+        operations = []
+        validation_operations = []
+    acceptance = acceptance_metrics(
+        density,
+        operations,
+        reference,
+        reference_operations,
+        disabled_conditional_mean_targets,
+        conditional_metrics_active=conditional_metrics_active,
     )
-    unit_model, model_components = sample_each_point_cloud_component(
-        centers,
-        widths,
-        seed=9109 + 101 * dimension + count,
-        samples_per_component=evaluation_per_component,
-    )
-    unit_model = np.clip(unit_model, np.finfo(np.float64).eps, 1.0 - np.finfo(np.float64).eps)
-    raw_model = covariance.inverse(transform.inverse(unit_model))
-    model_sample_weights = weights[model_components] / evaluation_per_component
-    operations = conditional_operation_metrics(
-        raw_train,
-        raw_model,
-        CONDITIONAL_BINS,
-        model_sample_weights,
-    )
-    validation_operations = conditional_operation_metrics(
-        raw_validation,
-        raw_model,
-        CONDITIONAL_BINS,
-        model_sample_weights,
-    )
-    acceptance = acceptance_metrics(density, operations, reference, reference_operations)
     return {
         "knotCount": int(count),
+        "beta": beta,
+        "allocation": allocation,
         "centersUnit": centers.tolist(),
         "bandwidthsUnit": widths.tolist(),
         "componentWeights": weights.tolist(),
@@ -510,13 +642,71 @@ def fit_cloud(
         "bandwidthScale": bandwidth_scale,
         "conditionalWeightCalibration": calibration,
         "operationQuadratureSamplesPerComponent": evaluation_per_component,
-        "operationQuadratureDraws": int(unit_model.shape[0]),
+        "operationQuadratureDraws": operation_draws,
+        "conditionalDiagnosticsComputed": compute_conditional_diagnostics,
         "validationHistogramBinsPerAxis": histogram_bins,
         "density": density,
         "validationDensity": validation_density,
         "conditionalOperations": operations,
         "validationConditionalOperations": validation_operations,
+        "disabledConditionalMeanTargets": sorted(disabled_conditional_mean_targets),
         **acceptance,
+    }
+
+
+def density_tempering_weights(
+    unit_values: np.ndarray,
+    beta: float,
+) -> tuple[np.ndarray, dict[str, float | int]]:
+    """Estimate p(u) and return escort weights proportional to p(u)^(beta-1)."""
+    unit_values = np.asarray(unit_values, dtype=np.float64)
+    if unit_values.ndim != 2 or unit_values.shape[1] not in (2, 3):
+        raise ValueError("density tempering supports only 2D and 3D matrices")
+    dimension = unit_values.shape[1]
+    lower = dimension / (dimension + 2.0)
+    if not lower <= beta <= 1.0:
+        raise ValueError("allocation beta lies outside its dimension-motivated bounds")
+    if beta == 1.0:
+        weights = np.ones(unit_values.shape[0], dtype=np.float64)
+        return weights, {
+            "histogramBinsPerAxis": 0,
+            "gaussianSmoothingSigmaBins": 0.0,
+            "effectiveSampleSize": float(weights.size),
+            "effectiveSampleFraction": 1.0,
+            "minimumWeight": 1.0,
+            "maximumWeight": 1.0,
+        }
+    bins = 128 if dimension == 2 else 48
+    histogram = np.histogramdd(
+        unit_values,
+        bins=[bins] * dimension,
+        range=[(0.0, 1.0)] * dimension,
+    )[0]
+    smoothing_sigma = 1.25
+    density = gaussian_filter(histogram, sigma=smoothing_sigma, mode="reflect")
+    positive = density[density > 0]
+    floor = max(float(np.quantile(positive, 0.01)) * 0.1, np.finfo(np.float64).tiny)
+    density = np.maximum(density, floor)
+    indices = np.clip(
+        np.floor(unit_values * bins).astype(np.int64),
+        0,
+        bins - 1,
+    )
+    log_density = np.log(density[tuple(indices[:, axis] for axis in range(dimension))])
+    log_weights = (beta - 1.0) * log_density
+    # A tiny number of boundary cells should not dominate a center-allocation fit.
+    log_weights = np.minimum(log_weights, np.quantile(log_weights, 0.999))
+    log_weights -= np.max(log_weights)
+    weights = np.exp(log_weights)
+    weights /= np.mean(weights)
+    effective_sample_size = float(np.sum(weights) ** 2 / np.sum(weights * weights))
+    return weights, {
+        "histogramBinsPerAxis": bins,
+        "gaussianSmoothingSigmaBins": smoothing_sigma,
+        "effectiveSampleSize": effective_sample_size,
+        "effectiveSampleFraction": effective_sample_size / weights.size,
+        "minimumWeight": float(np.min(weights)),
+        "maximumWeight": float(np.max(weights)),
     }
 
 
@@ -529,12 +719,13 @@ def calibrate_conditional_weights(
     raw_train: np.ndarray,
     reference_operations: list[dict[str, float | int]],
     options: SearchOptions,
+    disabled_conditional_mean_targets: frozenset[int] = frozenset(),
 ) -> tuple[np.ndarray, dict[str, float | int]]:
     """Calibrate mixture weights to the conditional operations used for acceptance."""
     dimension = raw_train.shape[1]
     target_draws = 262_144 if options.quick else 1_048_576
     maximum_per_component = 256 if options.quick else 512
-    available = max(16, target_draws // centers.shape[0])
+    available = max(options.minimum_component_draws, target_draws // centers.shape[0])
     samples_per_component = min(
         maximum_per_component,
         1 << int(math.floor(math.log2(available))),
@@ -597,6 +788,7 @@ def calibrate_conditional_weights(
         ])
         probability_tolerance = np.maximum(empirical_near_median / 2.0, 2e-3)
         calibration_rows.append({
+            "targetAxis": float(target_axis),
             "mass": component_mass,
             "first": component_first,
             "below": component_below,
@@ -636,7 +828,8 @@ def calibrate_conditional_weights(
             mean_error = (model_mean - row["mean"]) / row["meanTolerance"]
             median_error = (model_below - 0.5) / row["medianProbabilityTolerance"]
             supported = (mass > 1e-10).to(dtype)
-            loss = loss + torch.sum(probability * supported * mean_error.square())
+            if int(row["targetAxis"]) not in disabled_conditional_mean_targets:
+                loss = loss + torch.sum(probability * supported * mean_error.square())
             loss = loss + torch.sum(probability * supported * median_error.square())
             loss = loss + 1_000.0 * torch.sum(probability * (1.0 - supported))
         relative = torch.log(torch.clamp(weights, min=1e-300)) \
@@ -664,8 +857,11 @@ def quadrature_samples_per_component(
     component_count: int,
     target_draws: int,
     maximum: int,
+    minimum: int = 16,
 ) -> int:
-    available = max(16, target_draws // component_count)
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("component quadrature limits are inconsistent")
+    available = max(minimum, target_draws // component_count)
     return min(maximum, 1 << int(math.floor(math.log2(available))))
 
 
@@ -693,6 +889,7 @@ def conditional_cell_indices(
 def search_cloud_counts(
     candidates: list[int],
     transformed: tuple[np.ndarray, np.ndarray, AsinhMatrixTransform],
+    beta: float,
     covariance: CovarianceTransform,
     raw_train: np.ndarray,
     raw_validation: np.ndarray,
@@ -703,32 +900,57 @@ def search_cloud_counts(
 ) -> dict[str, Any]:
     unit_train, unit_validation, transform = transformed
     fits: list[dict[str, Any]] = []
+    current_beta = beta
+    dimension = unit_train.shape[1]
     for count in candidates:
         if count == screened["knotCount"]:
             fit = screened
         else:
-            print(f"  point-cloud count search {count:,} knots...", flush=True)
-            fit = fit_cloud(
-                unit_train,
-                unit_validation,
-                count,
-                transform,
-                covariance,
-                raw_train,
-                raw_validation,
-                reference_operations,
-                reference,
-                options,
-            )
+            trials: list[dict[str, Any]] = []
+            for candidate_beta in neighboring_beta_candidates(dimension, current_beta):
+                print(
+                    f"  point-cloud count search {count:,} knots, "
+                    f"allocation beta={candidate_beta:g}...",
+                    flush=True,
+                )
+                trials.append(fit_cloud(
+                    unit_train,
+                    unit_validation,
+                    count,
+                    candidate_beta,
+                    transform,
+                    covariance,
+                    raw_train,
+                    raw_validation,
+                    reference_operations,
+                    reference,
+                    options,
+                ))
+            fit = min(trials, key=lambda candidate: candidate["acceptanceScore"])
+            fit["allocationBetaTrials"] = [
+                {
+                    "beta": candidate["beta"],
+                    "acceptanceScore": candidate["acceptanceScore"],
+                    "passes": candidate["passes"],
+                }
+                for candidate in trials
+            ]
+        current_beta = float(fit["beta"])
         fits.append(fit)
         if enough_confirmation(fits):
             break
     passing = [fit for fit in fits if fit["passes"]]
     smallest = min(passing, key=lambda fit: fit["knotCount"], default=None)
     best = min(fits, key=lambda fit: fit["acceptanceScore"])
+    confirmed = next((
+        fits[index - 1]["knotCount"]
+        for index in range(1, len(fits))
+        if fits[index - 1]["passes"] and fits[index]["passes"]
+    ), None)
     return {
         "candidates": fits,
         "smallestPassingKnotCount": None if smallest is None else smallest["knotCount"],
+        "confirmedPassingKnotCount": confirmed,
         "bestTestedKnotCount": best["knotCount"],
         "bestAcceptanceScore": best["acceptanceScore"],
     }
@@ -751,38 +973,62 @@ def fit_final_models(
         reference_operations = reference_conditional_operations(full, reference)
         selected = dimensions[str(dimension)]["selectedTransform"]
         family = selected["family"]
-        beta = float(selected["beta"])
-        print(
-            f"Final {dimension}D: fitting {family} beta={beta:g} on five years...",
-            flush=True,
-        )
-        pilot = fit_tail_transform(whitened, whitened, family, 1.0, options, None)
-        transform_fit = pilot if beta == 1.0 else fit_tail_transform(
-            whitened, whitened, family, beta, options, pilot,
-        )
-        transform = AsinhMatrixTransform(np.asarray(transform_fit["matrix"], dtype=np.float64))
-        unit = transform.forward(whitened)
         search = dimensions[str(dimension)]["search"]
         selected_count = search["smallestPassingKnotCount"] or search["bestTestedKnotCount"]
+        source_fit = next(
+            candidate for candidate in search["candidates"]
+            if candidate["knotCount"] == selected_count
+        )
+        beta = float(source_fit["beta"])
+        print(
+            f"Final {dimension}D: fitting {family} transform on five years; "
+            f"starting allocation beta={beta:g}...",
+            flush=True,
+        )
+        transform_fit: dict[str, Any] | None = None
+        for nested_family in ("scalar", "vector", "factorized"):
+            transform_fit = fit_tail_transform(
+                whitened,
+                whitened,
+                nested_family,
+                options,
+                transform_fit,
+            )
+            if nested_family == family:
+                break
+        if transform_fit is None:
+            raise AssertionError("nested transform fit did not produce a result")
+        transform = AsinhMatrixTransform(np.asarray(transform_fit["matrix"], dtype=np.float64))
+        unit = transform.forward(whitened)
         remaining = [
             count for count in candidate_cloud_counts(dimension, options.quick)
             if count >= selected_count
         ]
         fit = None
+        current_beta = beta
         for count in remaining:
-            print(f"Final {dimension}D point cloud at {count:,} knots...", flush=True)
-            candidate = fit_cloud(
-                unit,
-                unit,
-                count,
-                transform,
-                covariance,
-                full,
-                full,
-                reference_operations,
-                reference,
-                options,
-            )
+            trials: list[dict[str, Any]] = []
+            for candidate_beta in neighboring_beta_candidates(dimension, current_beta):
+                print(
+                    f"Final {dimension}D point cloud at {count:,} knots, "
+                    f"allocation beta={candidate_beta:g}...",
+                    flush=True,
+                )
+                trials.append(fit_cloud(
+                    unit,
+                    unit,
+                    count,
+                    candidate_beta,
+                    transform,
+                    covariance,
+                    full,
+                    full,
+                    reference_operations,
+                    reference,
+                    options,
+                ))
+            candidate = min(trials, key=lambda trial: trial["acceptanceScore"])
+            current_beta = float(candidate["beta"])
             if fit is None or candidate["acceptanceScore"] < fit["acceptanceScore"]:
                 fit = candidate
             if candidate["passes"]:
@@ -795,7 +1041,7 @@ def fit_final_models(
             "validationThinning": thinning,
             "referenceConditionalOperations": reference_operations,
             "transformFamily": family,
-            "beta": beta,
+            "beta": float(fit["beta"]),
             "covariance": covariance_payload(covariance),
             "postAsinhTransform": transform_fit,
             "fit": fit,
@@ -808,31 +1054,69 @@ def acceptance_metrics(
     operations: list[dict[str, float | int]],
     reference: dict[str, Any],
     reference_operations: list[dict[str, float | int]],
+    disabled_conditional_mean_targets: frozenset[int] = frozenset(),
+    *,
+    conditional_metrics_active: bool = True,
 ) -> dict[str, Any]:
     density_ratio = density["jensenShannonBitsPerDimension"] \
         / reference["densityThresholds"]["jensenShannonBits"]
     query_ratios: list[dict[str, float | int | bool]] = []
     ratios = [density_ratio]
-    for operation, baseline in zip(operations, reference_operations, strict=True):
+    ranking_ratios = [density_ratio]
+    operation_pairs = (
+        zip(operations, reference_operations, strict=True)
+        if conditional_metrics_active or operations
+        else ()
+    )
+    for operation, baseline in operation_pairs:
+        target_axis = int(operation["targetAxis"])
         mean_ratio = float(operation["conditionalMeanRmseBps"]) \
             / max(float(baseline["conditionalMeanRmseBps"]), 1e-15)
         median_ratio = float(operation["conditionalMedianMaeBps"]) \
             / max(float(baseline["conditionalMedianMaeBps"]), 1e-15)
         coverage = float(operation["coveredConditioningMass"])
         coverage_ratio = 1.0 if coverage >= 1.0 - 1e-12 else 1_000_000.0
-        ratios.extend((mean_ratio, median_ratio, coverage_ratio))
+        mean_enabled = (
+            conditional_metrics_active
+            and target_axis not in disabled_conditional_mean_targets
+        )
+        median_enabled = conditional_metrics_active
+        coverage_enabled = conditional_metrics_active
+        if mean_enabled:
+            ratios.append(mean_ratio)
+            ranking_ratios.append(mean_ratio)
+        if median_enabled:
+            ratios.append(median_ratio)
+            ranking_ratios.append(median_ratio)
+        if coverage_enabled:
+            ratios.append(coverage_ratio)
+            if coverage_ratio > 1.0:
+                ranking_ratios.append(coverage_ratio)
         query_ratios.append({
-            "targetAxis": int(operation["targetAxis"]),
+            "targetAxis": target_axis,
             "conditionalMeanRatioTo1d32": mean_ratio,
+            "conditionalMeanEnabled": mean_enabled,
             "conditionalMedianRatioTo1d32": median_ratio,
+            "conditionalMedianEnabled": median_enabled,
             "coveredConditioningMass": coverage,
-            "passes": mean_ratio <= 1.0 and median_ratio <= 1.0 and coverage_ratio <= 1.0,
+            "coverageEnabled": coverage_enabled,
+            "passes": (
+                (not mean_enabled or mean_ratio <= 1.0)
+                and (not median_enabled or median_ratio <= 1.0)
+                and (not coverage_enabled or coverage_ratio <= 1.0)
+            ),
         })
     score = max(ratios)
+    ranking_score = float(
+        np.mean(np.power(np.asarray(ranking_ratios, dtype=np.float64), 8.0)) ** (1.0 / 8.0)
+    )
     return {
         "densityJsRatioTo1d32": density_ratio,
         "conditionalRatios": query_ratios,
         "acceptanceScore": score,
+        "jointObjective": ranking_score,
+        "disabledConditionalMeanTargets": sorted(disabled_conditional_mean_targets),
+        "conditionalMetricsActive": conditional_metrics_active,
         "passes": bool(score <= 1.0),
     }
 
@@ -893,6 +1177,14 @@ def beta_candidates(dimension: int) -> list[float]:
     raise ValueError("only 2D and 3D searches are supported")
 
 
+def neighboring_beta_candidates(dimension: int, incumbent: float) -> list[float]:
+    candidates = beta_candidates(dimension)
+    index = min(range(len(candidates)), key=lambda item: abs(candidates[item] - incumbent))
+    lower = max(0, index - 1)
+    upper = min(len(candidates), index + 2)
+    return candidates[lower:upper]
+
+
 def candidate_cloud_counts(dimension: int, quick: bool) -> list[int]:
     if quick:
         return [64, 128, 256, 512]
@@ -941,7 +1233,7 @@ def compact_search_parameters(artifact: dict[str, Any]) -> None:
 def render_report(artifact: dict[str, Any]) -> str:
     reference = artifact["reference1d"]
     lines = [
-        "# Beta-companded multidimensional one-second return point clouds",
+        "# Density-tempered multidimensional one-second return point clouds",
         "",
         f"Generated {artifact['generatedAt']}.",
         "",
@@ -954,9 +1246,10 @@ def render_report(artifact: dict[str, Any]) -> str:
         "The point cloud must also beat the 1D 32-knot quantizer on every measured conditional "
         "mean and conditional median operation. Exact zero masks remain separate mixture components.",
         "",
-        "The beta transform targets a Jacobian proportional to the pilot density raised to beta. "
-        "Beta=1 favors density uniformization; smaller beta retains more adaptive center allocation "
-        "in dense regions.",
+        "Beta affects only knot allocation after the invertible mapping. K-means observations are "
+        "weighted by the smoothed mapped density raised to beta minus one. Smaller beta spends "
+        "relatively fewer centers in the concentrated middle while leaving the mapping and tails "
+        "geometrically unchanged. Final bandwidths and weights target the true distribution.",
         "",
         "## Exact zero-mask split",
         "",
@@ -990,9 +1283,9 @@ def render_report(artifact: dict[str, Any]) -> str:
             lines.append(operation_row(operation))
         lines.extend([
             "",
-            f"### Transform and beta screening at {result['screeningKnotCount']:,} points",
+            f"### Transform and allocation-beta screening at {result['screeningKnotCount']:,} points",
             "",
-            "| family | beta | escort ESS | JS/d | conditional mean RMSEs | conditional median MAEs | max ratio |",
+            "| family | beta | allocation ESS | JS/d | conditional mean RMSEs | conditional median MAEs | max ratio |",
             "|---|---:|---:|---:|---|---|---:|",
         ])
         ordered = sorted(
@@ -1004,7 +1297,7 @@ def render_report(artifact: dict[str, Any]) -> str:
             fit = result["screening"][key]
             lines.append(
                 f"| {transform['family']} | {transform['beta']:.3g} | "
-                f"{transform['escortEffectiveSampleFraction']:.3%} | "
+                f"{fit['allocation']['effectiveSampleFraction']:.3%} | "
                 f"{fit['density']['jensenShannonBitsPerDimension']:.8g} | "
                 f"{operation_values(fit['conditionalOperations'], 'conditionalMeanRmseBps')} | "
                 f"{operation_values(fit['conditionalOperations'], 'conditionalMedianMaeBps')} | "
@@ -1017,21 +1310,29 @@ def render_report(artifact: dict[str, Any]) -> str:
             "",
             "### Knot-count search",
             "",
-            "| points | fit JS/d | final-year JS/d | conditional mean RMSEs | conditional median MAEs | max ratio | passes |",
-            "|---:|---:|---:|---|---|---:|---:|",
+            "| points | beta | fit JS/d | final-year JS/d | conditional mean RMSEs | conditional median MAEs | max ratio | passes |",
+            "|---:|---:|---:|---:|---|---|---:|---:|",
         ])
         for fit in result["search"]["candidates"]:
             lines.append(
-                f"| {fit['knotCount']:,} | {fit['density']['jensenShannonBitsPerDimension']:.8g} | "
+                f"| {fit['knotCount']:,} | {fit['beta']:.3g} | "
+                f"{fit['density']['jensenShannonBitsPerDimension']:.8g} | "
                 f"{fit['validationDensity']['jensenShannonBitsPerDimension']:.8g} | "
                 f"{operation_values(fit['conditionalOperations'], 'conditionalMeanRmseBps')} | "
                 f"{operation_values(fit['conditionalOperations'], 'conditionalMedianMaeBps')} | "
                 f"{fit['acceptanceScore']:.6g} | {'yes' if fit['passes'] else 'no'} |"
             )
         minimum = result["search"]["smallestPassingKnotCount"]
+        candidates = result["search"]["candidates"]
+        confirmed = next((
+            candidates[index - 1]["knotCount"]
+            for index in range(1, len(candidates))
+            if candidates[index - 1]["passes"] and candidates[index]["passes"]
+        ), None)
         lines.extend([
             "",
             f"Smallest tested passing point cloud: **{minimum if minimum is not None else 'none'}**. "
+            f"First passing count confirmed by the next tested size: **{confirmed if confirmed is not None else 'none'}**. "
             f"Best tested count: **{result['search']['bestTestedKnotCount']}** with maximum "
             f"normalized error {result['search']['bestAcceptanceScore']:.6g}.",
             "",
@@ -1052,7 +1353,46 @@ def render_report(artifact: dict[str, Any]) -> str:
             f"Post-asinh matrix: `{json.dumps(final['postAsinhTransform']['matrix'], separators=(',', ':'))}`",
             "",
         ])
+    two = artifact["dimensions"]["2"]
+    three = artifact["dimensions"]["3"]
+    final_two = artifact["finalModels"]["2"]["fit"]
+    final_three = artifact["finalModels"]["3"]["fit"]
+    selected_two_count = two["search"]["smallestPassingKnotCount"] \
+        or two["search"]["bestTestedKnotCount"]
+    selected_three_count = three["search"]["smallestPassingKnotCount"] \
+        or three["search"]["bestTestedKnotCount"]
+    selected_two_fit = next(
+        fit for fit in two["search"]["candidates"]
+        if fit["knotCount"] == selected_two_count
+    )
+    selected_three_fit = next(
+        fit for fit in three["search"]["candidates"]
+        if fit["knotCount"] == selected_three_count
+    )
+    two_minimum = two["search"]["smallestPassingKnotCount"]
+    two_summary = (
+        f"the smallest tested 2D pass is {two_minimum:,} points"
+        if two_minimum is not None
+        else "no tested 2D count passes"
+    )
     lines.extend([
+        "## Conclusions",
+        "",
+        f"- In the four-year representation fit, {two_summary}. The first pass confirmed by "
+        f"the next tested size is {two['search']['confirmedPassingKnotCount'] or 'none'}.",
+        f"- No tested 3D count passes; the best is {three['search']['bestTestedKnotCount']:,} "
+        f"points at {three['search']['bestAcceptanceScore']:.6g}x the strictest 1D32 threshold.",
+        f"- The complete-five-year 2D refit {'passes' if final_two['passes'] else 'does not pass'} "
+        f"at {final_two['knotCount']:,} points with {strictest_metric(final_two)}.",
+        f"- The complete-five-year 3D refit {'passes' if final_three['passes'] else 'does not pass'} "
+        f"at {final_three['knotCount']:,} points with {strictest_metric(final_three)}.",
+        f"- Screening / selected-count / complete-five-year allocation betas are "
+        f"{two['selectedTransform']['beta']:.3g} / {selected_two_fit['beta']:.3g} / "
+        f"{artifact['finalModels']['2']['beta']:.3g} in 2D and "
+        f"{three['selectedTransform']['beta']:.3g} / {selected_three_fit['beta']:.3g} / "
+        f"{artifact['finalModels']['3']['beta']:.3g} in 3D. Beta does not participate in the "
+        "forward or inverse mapping; it only changes finite point placement.",
+        "",
         "## Interpretation",
         "",
         "- Fit JS measures representation error. Final-year JS and conditional-operation errors "
@@ -1061,6 +1401,10 @@ def render_report(artifact: dict[str, Any]) -> str:
         "nearest-center reconstructions.",
         "- Counts are the smallest tested passing configurations in the recorded search bracket, "
         "not proofs over every omitted integer.",
+        "- Point-cloud fits are not nested across counts. A higher count can score worse because "
+        "k-means initialization, local bandwidths, and operation-aware weight calibration are refit.",
+        "- When no complete-five-year candidate passes, the final section retains the tested "
+        "candidate with the lowest maximum normalized error rather than relabeling it as passing.",
         "",
         "## Reproduction",
         "",
@@ -1087,6 +1431,18 @@ def operation_row(operation: dict[str, float | int]) -> str:
 
 def operation_values(operations: list[dict[str, Any]], field: str) -> str:
     return " / ".join(f"{float(operation[field]):.7g}" for operation in operations)
+
+
+def strictest_metric(fit: dict[str, Any]) -> str:
+    candidates = [(float(fit["densityJsRatioTo1d32"]), "density JS")]
+    for query in fit["conditionalRatios"]:
+        target = int(query["targetAxis"]) + 1
+        candidates.extend((
+            (float(query["conditionalMeanRatioTo1d32"]), f"r{target} conditional-mean RMSE"),
+            (float(query["conditionalMedianRatioTo1d32"]), f"r{target} conditional-median MAE"),
+        ))
+    ratio, name = max(candidates)
+    return f"{name} ({ratio:.6g}x)"
 
 
 def format_operations(operations: list[dict[str, Any]]) -> str:

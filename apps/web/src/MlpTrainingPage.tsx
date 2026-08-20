@@ -196,6 +196,8 @@ interface ComparisonMetricValues {
   mseSkillVsZero?: number;
   directionAccuracy?: number;
   correlation?: number;
+  predictionStd?: number;
+  targetStd?: number;
 }
 
 interface ComparisonDistributionValues {
@@ -223,6 +225,35 @@ interface ComparisonOutputCalibration {
   densityTemperature?: number;
   densityValidation?: ComparisonDistributionValues;
   densityTest?: ComparisonDistributionValues;
+  pointVariants?: Record<string, ComparisonPointCalibrationVariant>;
+  pointWindowVariants?: Record<
+    string,
+    Record<string, ComparisonPointCalibrationVariant>
+  >;
+}
+
+interface ComparisonPointCalibrationVariant {
+  label?: string;
+  mode?: string;
+  domain?: string;
+  degree?: number;
+  ridge?: number;
+  inputScale?: number;
+  outputScale?: number;
+  trailingActiveReturns?: number;
+  calibrationWindow?: number;
+  perStep?: boolean;
+  jointMatrix?: boolean;
+  matrixRows?: number;
+  matrixColumns?: number;
+  coefficientCount?: number;
+  coefficients?: number[];
+  calibration?: ComparisonMetricValues;
+  validation?: ComparisonMetricValues;
+  test?: ComparisonMetricValues;
+  calibrationPerLead?: ComparisonMetricValues[];
+  validationPerLead?: ComparisonMetricValues[];
+  testPerLead?: ComparisonMetricValues[];
 }
 
 interface ComparisonAutoregressiveEpisodeValues {
@@ -325,10 +356,15 @@ interface ComparisonResponse {
     validationCheckpointEpoch?: number;
     fit: Array<{
       epoch: number;
+      x?: number;
+      live?: boolean;
+      train?: ComparisonMetricValues;
+      validation?: ComparisonMetricValues;
       trainNormalizedMse?: number;
       validationNormalizedMse?: number;
       trainNegativeLogLikelihood?: number;
       validationNegativeLogLikelihood?: number;
+      onlineTrainNegativeLogLikelihood?: number;
       bestTrainScore?: number;
     }>;
   }>;
@@ -406,7 +442,29 @@ interface ChartViewport {
   followLatest: boolean;
 }
 
-type CalibrationVariant = "scale-only" | "affine" | "density-temperature";
+type CalibrationVariant =
+  | "scale-only"
+  | "affine"
+  | "density-temperature"
+  | "affine-arithmetic"
+  | "cubic-log"
+  | "cubic-arithmetic"
+  | "online-affine-log"
+  | "online-affine-arithmetic"
+  | "online-cubic-log"
+  | "online-cubic-arithmetic"
+  | "affine-log-per-step"
+  | "affine-arithmetic-per-step"
+  | "cubic-log-per-step"
+  | "cubic-arithmetic-per-step"
+  | "online-affine-log-per-step"
+  | "online-affine-arithmetic-per-step"
+  | "online-cubic-log-per-step"
+  | "online-cubic-arithmetic-per-step"
+  | "matrix-affine-log"
+  | "matrix-affine-arithmetic"
+  | "online-matrix-affine-log"
+  | "online-matrix-affine-arithmetic";
 type CheckpointPolicy =
   | "validation-nll"
   | "validation-mse"
@@ -429,9 +487,29 @@ const CALIBRATION_VARIANTS: Array<{
   label: string;
 }> = [
   { value: "scale-only", label: "Scale-only expectation" },
-  { value: "affine", label: "Affine expectation" },
+  { value: "affine", label: "Affine expectation · log" },
+  { value: "affine-arithmetic", label: "Affine expectation · arithmetic" },
+  { value: "cubic-log", label: "Full cubic expectation · log" },
+  { value: "cubic-arithmetic", label: "Full cubic expectation · arithmetic" },
+  { value: "affine-log-per-step", label: "Per-step affine · log" },
+  { value: "affine-arithmetic-per-step", label: "Per-step affine · arithmetic" },
+  { value: "cubic-log-per-step", label: "Per-step full cubic · log" },
+  { value: "cubic-arithmetic-per-step", label: "Per-step full cubic · arithmetic" },
+  { value: "online-affine-log", label: "Online affine · log" },
+  { value: "online-affine-arithmetic", label: "Online affine · arithmetic" },
+  { value: "online-cubic-log", label: "Online full cubic · log" },
+  { value: "online-cubic-arithmetic", label: "Online full cubic · arithmetic" },
+  { value: "online-affine-log-per-step", label: "Online per-step affine · log" },
+  { value: "online-affine-arithmetic-per-step", label: "Online per-step affine · arithmetic" },
+  { value: "online-cubic-log-per-step", label: "Online per-step full cubic · log" },
+  { value: "online-cubic-arithmetic-per-step", label: "Online per-step full cubic · arithmetic" },
+  { value: "matrix-affine-log", label: "Matrix affine · log" },
+  { value: "matrix-affine-arithmetic", label: "Matrix affine · arithmetic" },
+  { value: "online-matrix-affine-log", label: "Online matrix affine · log" },
+  { value: "online-matrix-affine-arithmetic", label: "Online matrix affine · arithmetic" },
   { value: "density-temperature", label: "Density temperature" },
 ];
+const CALIBRATION_WINDOWS = [64_000, 32_000, 16_000, 12_000, 8_000, 4_000, 2_000, 1_000, 512, 256, 64, 16];
 
 export function MlpTrainingPage() {
   const [snapshot, setSnapshot] = createSignal<MetricsResponse>();
@@ -446,6 +524,7 @@ export function MlpTrainingPage() {
   const [calibrationVariant, setCalibrationVariant] = createSignal<CalibrationVariant>(
     "scale-only",
   );
+  const [calibrationWindow, setCalibrationWindow] = createSignal(16_000);
   const [matrixControlPending, setMatrixControlPending] = createSignal<string>();
   const [matrixControlError, setMatrixControlError] = createSignal<string>();
   const [datasetPoints, setDatasetPoints] = createSignal<DatasetPoint[]>([]);
@@ -822,7 +901,7 @@ export function MlpTrainingPage() {
           color,
           values: run.fit.flatMap((point) => point.trainNormalizedMse === undefined
             ? []
-            : [{ x: point.epoch + 1, y: point.trainNormalizedMse }]),
+            : [{ x: point.x ?? point.epoch + 1, y: point.trainNormalizedMse }]),
         },
         {
           id: `${run.key}:validation`,
@@ -831,7 +910,7 @@ export function MlpTrainingPage() {
           dash: "7 5",
           values: run.fit.flatMap((point) => point.validationNormalizedMse === undefined
             ? []
-            : [{ x: point.epoch + 1, y: point.validationNormalizedMse }]),
+            : [{ x: point.x ?? point.epoch + 1, y: point.validationNormalizedMse }]),
         },
       ];
     })
@@ -844,9 +923,13 @@ export function MlpTrainingPage() {
           id: `${run.key}:train-nll`,
           label: `${run.label} · Train NLL`,
           color,
-          values: run.fit.flatMap((point) => point.trainNegativeLogLikelihood === undefined
-            ? []
-            : [{ x: point.epoch + 1, y: point.trainNegativeLogLikelihood }]),
+          values: run.fit.flatMap((point) => {
+            const value = point.onlineTrainNegativeLogLikelihood
+              ?? point.trainNegativeLogLikelihood;
+            return value === undefined
+              ? []
+              : [{ x: point.x ?? point.epoch + 1, y: value }];
+          }),
         },
         {
           id: `${run.key}:validation-nll`,
@@ -855,11 +938,92 @@ export function MlpTrainingPage() {
           dash: "7 5",
           values: run.fit.flatMap((point) => point.validationNegativeLogLikelihood === undefined
             ? []
-            : [{ x: point.epoch + 1, y: point.validationNegativeLogLikelihood }]),
+            : [{ x: point.x ?? point.epoch + 1, y: point.validationNegativeLogLikelihood }]),
         },
       ];
     })
     .filter((series) => series.values.length > 0));
+  const comparisonMetricFit = (
+    field: keyof ComparisonMetricValues,
+  ): PlotSeries[] => (comparison()?.runs ?? []).flatMap((run, index) => {
+    const color = COMPARISON_COLORS[index % COMPARISON_COLORS.length]!;
+    return [
+      {
+        id: `${run.key}:train:${field}`,
+        label: `${run.label} · Train`,
+        color,
+        values: run.fit.flatMap((point) => {
+          const value = point.train?.[field];
+          return value === undefined
+            ? []
+            : [{ x: point.x ?? point.epoch + 1, y: value }];
+        }),
+      },
+      {
+        id: `${run.key}:validation:${field}`,
+        label: `${run.label} · Validation`,
+        color,
+        dash: "7 5",
+        values: run.fit.flatMap((point) => {
+          const value = point.validation?.[field];
+          return value === undefined
+            ? []
+            : [{ x: point.x ?? point.epoch + 1, y: value }];
+        }),
+      },
+    ];
+  }).filter((series) => series.values.length > 0);
+  const comparisonSkillFit = createMemo(() => comparisonMetricFit("mseSkillVsZero"));
+  const comparisonDirectionFit = createMemo(() => comparisonMetricFit("directionAccuracy"));
+  const comparisonCorrelationFit = createMemo(() => comparisonMetricFit("correlation"));
+  const comparisonDispersionFit = createMemo<PlotSeries[]>(() => (
+    comparison()?.runs ?? []
+  ).flatMap((run, index) => {
+    const color = COMPARISON_COLORS[index % COMPARISON_COLORS.length]!;
+    return [
+      {
+        id: `${run.key}:train:predictionStd`,
+        label: `${run.label} · Train prediction std`,
+        color,
+        values: run.fit.flatMap((point) => point.train?.predictionStd === undefined
+          ? []
+          : [{ x: point.x ?? point.epoch + 1, y: point.train.predictionStd }]),
+      },
+      {
+        id: `${run.key}:train:targetStd`,
+        label: `${run.label} · Train target std`,
+        color,
+        dash: "3 3",
+        values: run.fit.flatMap((point) => point.train?.targetStd === undefined
+          ? []
+          : [{ x: point.x ?? point.epoch + 1, y: point.train.targetStd }]),
+      },
+      {
+        id: `${run.key}:validation:predictionStd`,
+        label: `${run.label} · Validation prediction std`,
+        color,
+        dash: "7 5",
+        values: run.fit.flatMap((point) => point.validation?.predictionStd === undefined
+          ? []
+          : [{
+              x: point.x ?? point.epoch + 1,
+              y: point.validation.predictionStd,
+            }]),
+      },
+      {
+        id: `${run.key}:validation:targetStd`,
+        label: `${run.label} · Validation target std`,
+        color,
+        dash: "10 4 2 4",
+        values: run.fit.flatMap((point) => point.validation?.targetStd === undefined
+          ? []
+          : [{ x: point.x ?? point.epoch + 1, y: point.validation.targetStd }]),
+      },
+    ];
+  }).filter((series) => series.values.length > 0));
+  const comparisonHasLiveRun = createMemo(() => (
+    comparison()?.runs.some((run) => run.running) ?? false
+  ));
   const selectedComparisonCheckpoints = createMemo(() => {
     const comparedRuns = comparison()?.runs ?? [];
     return comparedRuns.map((run): ComparisonCheckpointSelection | undefined => {
@@ -983,6 +1147,31 @@ export function MlpTrainingPage() {
         { label: "Temperature", values: calibrations.map((value) => formatMetric(value?.densityTemperature)) },
         { label: "Expectation MSE skill (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.densityValidation?.expectation?.mseSkillVsZero, value?.densityTest?.expectation?.mseSkillVsZero], formatPercent)) },
         { label: "Expectation correlation (validation / test)", values: calibrations.map((value) => formatMetricTuple([value?.densityValidation?.expectation?.correlation, value?.densityTest?.expectation?.correlation])) },
+      ];
+    }
+    if (calibrationVariant() !== "scale-only") {
+      const variants = calibrations.map(
+        (value) => value?.pointWindowVariants?.[String(calibrationWindow())]?.[calibrationVariant()]
+          ?? (calibrationWindow() === 16_000
+            ? value?.pointVariants?.[calibrationVariant()]
+            : undefined),
+      );
+      return [
+        { label: "Domain", values: variants.map((value) => value?.domain ?? "—") },
+        { label: "Polynomial degree", values: variants.map((value) => value?.degree === undefined ? "—" : String(value.degree)) },
+        { label: "Calibration window", values: variants.map((value) => value?.calibrationWindow === undefined ? "—" : formatCount(value.calibrationWindow)) },
+        { label: "Trailing active returns", values: variants.map((value) => value?.trailingActiveReturns === undefined ? "—" : formatCount(value.trailingActiveReturns)) },
+        { label: "Coefficients", values: variants.map((value) => value?.jointMatrix
+          ? `${value.matrixRows ?? 15}×${value.matrixColumns ?? 15} matrix + bias (${formatCount(value.coefficientCount ?? 240)} parameters)`
+          : value?.coefficients?.map((coefficient) => formatMetric(coefficient)).join(" / ") ?? (value?.perStep ? "15 independent fits" : "rolling")) },
+        { label: "Calibration MSE skill", values: variants.map((value) => formatPercent(value?.calibration?.mseSkillVsZero)) },
+        { label: "Normalized MSE (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validation?.normalizedMse, value?.test?.normalizedMse])) },
+        { label: "MSE skill (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validation?.mseSkillVsZero, value?.test?.mseSkillVsZero], formatPercent)) },
+        { label: "Correlation (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validation?.correlation, value?.test?.correlation])) },
+        { label: "Direction (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validation?.directionAccuracy, value?.test?.directionAccuracy], formatPercent)) },
+        { label: "Step 1 MSE skill (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validationPerLead?.[0]?.mseSkillVsZero, value?.testPerLead?.[0]?.mseSkillVsZero], formatPercent)) },
+        { label: "Step 1 correlation (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validationPerLead?.[0]?.correlation, value?.testPerLead?.[0]?.correlation])) },
+        { label: "Step 1 direction (validation / test)", values: variants.map((value) => formatMetricTuple([value?.validationPerLead?.[0]?.directionAccuracy, value?.testPerLead?.[0]?.directionAccuracy], formatPercent)) },
       ];
     }
     return [
@@ -1237,6 +1426,21 @@ export function MlpTrainingPage() {
                     </For>
                   </select>
                 </label>
+                <Show when={!["scale-only", "affine", "density-temperature"].includes(calibrationVariant())}>
+                  <label class="flex min-w-[11rem] flex-col gap-1">
+                    <span class="muted-label">Calibration window</span>
+                    <select
+                      data-testid="comparison-calibration-window"
+                      class="rounded border border-line bg-ink-900 px-3 py-2 text-sm text-ink-100 outline-none focus:border-accent"
+                      value={String(calibrationWindow())}
+                      onChange={(event) => setCalibrationWindow(Number(event.currentTarget.value))}
+                    >
+                      <For each={CALIBRATION_WINDOWS}>
+                        {(window) => <option value={String(window)}>{formatCount(window)} active returns</option>}
+                      </For>
+                    </select>
+                  </label>
+                </Show>
               </div>
             </div>
             <div class="min-w-0 overflow-x-auto rounded border border-line">
@@ -1263,24 +1467,6 @@ export function MlpTrainingPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr class="border-t border-line bg-ink-900/70">
-                    <th
-                      colspan={(comparison()?.runs.length ?? 0) + 1}
-                      class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-ink-300"
-                    >
-                      Uncalibrated results / {selectedCheckpointLabel()}
-                    </th>
-                  </tr>
-                  <For each={comparisonUncalibratedRows()}>
-                    {(row) => (
-                      <tr class="border-t border-line even:bg-ink-900/25">
-                        <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
-                        <For each={row.values}>
-                          {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
-                        </For>
-                      </tr>
-                    )}
-                  </For>
                   <tr class="border-t-2 border-accent/50 bg-accent/8">
                     <th
                       colspan={(comparison()?.runs.length ?? 0) + 1}
@@ -1292,6 +1478,24 @@ export function MlpTrainingPage() {
                   <For each={comparisonCalibrationRows()}>
                     {(row) => (
                       <tr class="border-t border-line bg-accent/[0.035] even:bg-accent/[0.065]">
+                        <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
+                        <For each={row.values}>
+                          {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
+                        </For>
+                      </tr>
+                    )}
+                  </For>
+                  <tr class="border-t border-line bg-ink-900/70">
+                    <th
+                      colspan={(comparison()?.runs.length ?? 0) + 1}
+                      class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-ink-300"
+                    >
+                      Uncalibrated results / {selectedCheckpointLabel()}
+                    </th>
+                  </tr>
+                  <For each={comparisonUncalibratedRows()}>
+                    {(row) => (
+                      <tr class="border-t border-line even:bg-ink-900/25">
                         <th class="whitespace-nowrap px-3 py-2 text-left font-normal text-ink-300">{row.label}</th>
                         <For each={row.values}>
                           {(value) => <td class="px-3 py-2 tabular-nums text-ink-100">{value}</td>}
@@ -1371,7 +1575,9 @@ export function MlpTrainingPage() {
         <section class="flex flex-col gap-3">
           <SectionHeading
             title="Network optimization"
-            subtitle={stage() === "archived"
+            subtitle={comparisonHasLiveRun()
+              ? `${comparison()?.runs.length ?? 0} selected run paths · updating live`
+              : stage() === "archived"
               ? `${trainSteps().length} historical updates · ${epochs().length} completed epochs`
               : stage() === "training"
               ? epochs().length > 0
@@ -1381,8 +1587,18 @@ export function MlpTrainingPage() {
                 ? `${trainSteps().length} updates from the most recent training attempt; live updates resume after refinement`
                 : "Plots will populate when refinement hands off to weight training"}
           />
-          <Show when={trainSteps().length > 0 || epochs().length > 0} fallback={<WaitingForTraining stage={stage()} />}>
+          <Show when={trainSteps().length > 0 || epochs().length > 0
+            || comparisonFit().length > 0 || comparisonNllFit().length > 0}
+          fallback={<WaitingForTraining stage={stage()} />}>
             <div class="grid min-w-0 gap-3 xl:grid-cols-2">
+              <Show when={comparisonNllFit().length > 0}>
+                <MetricChart
+                  title="Negative log likelihood"
+                  subtitle="Each selected run; solid training paths update within the current epoch, dashed paths are validation"
+                  xLabel="epoch"
+                  series={comparisonNllFit()}
+                />
+              </Show>
               <Show when={hasCurriculumEpochs()}>
                 <MetricChart title="Gate: curriculum target KL" subtitle="Temperature takes one downward step only when validation KL is at or below 0.05" scale="log" xLabel="epoch" series={[
                   epochPlot("Train", "#38bdf8", epochs(), "train", "curriculumTargetKl"),
@@ -1452,25 +1668,25 @@ export function MlpTrainingPage() {
               </Show>
               <Show when={!hasCurriculumEpochs()}>
                 <>
-              <Show when={hasRegressionEpochs()}>
-                <MetricChart title="Normalized MSE" subtitle="Lower is better; validation determines checkpoint selection" scale="log" xLabel="epoch" series={[
+              <Show when={comparisonFit().length > 0 || hasRegressionEpochs()}>
+                <MetricChart title="Normalized MSE" subtitle="Every selected run; training is solid and validation is dashed" scale="log" xLabel="epoch" series={comparisonFit().length > 0 ? comparisonFit() : [
                   epochPlot("Train", "#38bdf8", epochs(), "train", "normalizedMse"),
                   epochPlot("Validation", "#f5b84b", epochs(), "validation", "normalizedMse"),
                   directEpochPlot("Best validation", "#22c55e", epochs(), "bestValidation"),
                 ]} />
-                <MetricChart title="MSE skill versus zero" subtitle="Positive means lower MSE than always predicting zero" unit="ratio" xLabel="epoch" series={[
+                <MetricChart title="MSE skill versus zero" subtitle="Positive means lower MSE than always predicting zero" unit="ratio" xLabel="epoch" series={comparisonSkillFit().length > 0 ? comparisonSkillFit() : [
                   epochPlot("Train", "#38bdf8", epochs(), "train", "mseSkillVsZero"),
                   epochPlot("Validation", "#22c55e", epochs(), "validation", "mseSkillVsZero"),
                 ]} />
-                <MetricChart title="Direction accuracy" unit="ratio" yDomain={[0, 1]} xLabel="epoch" series={[
+                <MetricChart title="Direction accuracy" unit="ratio" yDomain={[0, 1]} xLabel="epoch" series={comparisonDirectionFit().length > 0 ? comparisonDirectionFit() : [
                   epochPlot("Train", "#38bdf8", epochs(), "train", "directionAccuracy"),
                   epochPlot("Validation", "#f5b84b", epochs(), "validation", "directionAccuracy"),
                 ]} />
-                <MetricChart title="Return correlation" xLabel="epoch" series={[
+                <MetricChart title="Return correlation" xLabel="epoch" series={comparisonCorrelationFit().length > 0 ? comparisonCorrelationFit() : [
                   epochPlot("Train", "#38bdf8", epochs(), "train", "correlation"),
                   epochPlot("Validation", "#a78bfa", epochs(), "validation", "correlation"),
                 ]} />
-                <MetricChart title="Prediction and target dispersion" scale="log" xLabel="epoch" series={[
+                <MetricChart title="Prediction and target dispersion" scale="log" xLabel="epoch" series={comparisonDispersionFit().length > 0 ? comparisonDispersionFit() : [
                   epochPlot("Prediction std", "#38bdf8", epochs(), "validation", "predictionStd"),
                   epochPlot("Target std", "#f5b84b", epochs(), "validation", "targetStd"),
                 ]} />
@@ -2644,6 +2860,21 @@ function progressLabel(
   if (stage.startsWith("dataset") && dataset) return `Day ${dataset.x} / ${dataset.days ?? "—"} · ${dataset.date} ${dataset.split}`;
   if (stage === "training" && step) return `Epoch ${step.epoch + 1} / ${totalEpochs ?? "—"} · global step ${step.globalStep.toLocaleString()}`;
   if (stage === "training" && epoch) return `Epoch ${epoch.epoch + 1} / ${totalEpochs ?? "—"} · global step ${epoch.globalStep.toLocaleString()}`;
+  if (stage === "training") {
+    const liveEpoch = numericEventField(latest, "epoch");
+    const liveBatch = numericEventField(latest, "batch");
+    const liveBatches = numericEventField(latest, "batches");
+    const liveStep = numericEventField(latest, "globalStep");
+    if (liveEpoch !== undefined) {
+      const batch = liveBatch === undefined
+        ? ""
+        : ` · batch ${liveBatch.toLocaleString()} / ${liveBatches?.toLocaleString() ?? "—"}`;
+      const globalStep = liveStep === undefined
+        ? ""
+        : ` · global step ${liveStep.toLocaleString()}`;
+      return `Epoch ${liveEpoch + 1} / ${totalEpochs ?? "—"}${batch}${globalStep}`;
+    }
+  }
   if (stage === "calibrating-checkpoints") {
     return `Checkpoint ${
       (numericEventField(latest, "completedPolicies") ?? 0) + 1

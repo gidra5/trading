@@ -2,7 +2,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readCandleShardReferenceSync, type SequentialCandle } from "@trading/storage";
-import type { CoinMetricsRow, CommunityCryptoDailyRow, DvolRow, MempoolMiningRow, VixRow } from "./lib/external-public-data.ts";
+import type {
+  BinanceFundingRateRow,
+  CoinMetricsRow,
+  CommunityCryptoDailyRow,
+  DvolRow,
+  MacroRow,
+  MempoolMiningRow,
+  VixRow,
+} from "./lib/external-public-data.ts";
 
 const MINUTE_MS = 60_000;
 const DAY_MS = 86_400_000;
@@ -11,6 +19,10 @@ const PRIMARY_END = "2025-11-13";
 const TRANSFER_START = "2026-04-21";
 const TRANSFER_END = "2026-06-23";
 const TRAIN_DAYS = 180;
+const LONG_PRIMARY_START = "2021-08-01";
+const LONG_PRIMARY_END = "2025-12-31";
+const LONG_TRAIN_END = "2025-01-01";
+const LONG_FIRST_TEST_END = "2025-07-01";
 const TARGET_BINS = 8;
 const FEATURE_BINS = 4;
 const SMOOTHING = 0.5;
@@ -40,11 +52,16 @@ interface Segment {
   validVolumePrefix: Map<string, Uint32Array>;
 }
 
+interface SplitPlan {
+  trainDays: number;
+  firstTestDays: number;
+}
+
 interface CandidateDefinition {
   id: string;
   label: string;
   family: string;
-  source: "cross-market" | "deribit-dvol" | "cboe-vix" | "coinmetrics" | "community-daily" | "mempool-proxy";
+  source: "cross-market" | "deribit-dvol" | "cboe-vix" | "global-macro" | "binance-funding" | "coinmetrics" | "community-daily" | "mempool-proxy";
   lookback: string;
   value: (segment: Segment, index: number, time: number) => number;
 }
@@ -54,6 +71,7 @@ interface ObservationSet {
   sign: Uint8Array;
   magnitude: Uint8Array;
   base: Uint8Array;
+  baseContexts: number;
   split: Uint8Array;
   times: Float64Array;
   rawTarget: Float64Array;
@@ -98,6 +116,7 @@ interface GroupResult {
   observations: Record<string, number>;
   ranked: CandidateScore[];
   selected: SelectedStep[];
+  baseline: "return-volatility" | "production-basis";
 }
 
 export async function run(args = process.argv.slice(2)) {
@@ -110,11 +129,15 @@ export async function run(args = process.argv.slice(2)) {
   const report = resolve(value("--report") ?? DEFAULT_REPORT);
   const dvol = readArtifact<DvolRow>(path.join(externalDirectory, "deribit-btc-dvol-1h.json"));
   const vix = readArtifact<VixRow>(path.join(externalDirectory, "fred-cboe-vix-1d.json"));
+  const macro = readArtifact<MacroRow>(path.join(externalDirectory, "global-macro-state.json"));
+  const funding = readArtifact<BinanceFundingRateRow>(path.join(externalDirectory, "binance-btcusdt-funding-rates.json"));
   const coinMetrics = readArtifact<CoinMetricsRow>(path.join(externalDirectory, "coinmetrics-btc-network-flows-1d.json"));
   const mempool = readArtifact<MempoolMiningRow>(path.join(externalDirectory, "mempool-btc-mining-proxies-3y.json"));
   const community = readArtifact<CommunityCryptoDailyRow>(path.join(externalDirectory, "community-crypto-market-daily.json"));
   dvol.rows.sort((left, right) => left.availableAt - right.availableAt);
   vix.rows.sort((left, right) => left.availableAt - right.availableAt);
+  macro.rows.sort((left, right) => left.availableAt - right.availableAt);
+  funding.rows.sort((left, right) => left.availableAt - right.availableAt);
   coinMetrics.rows.sort((left, right) => left.availableAt - right.availableAt);
   mempool.rows.sort((left, right) => left.availableAt - right.availableAt);
   community.rows.sort((left, right) => left.availableAt - right.availableAt);
@@ -123,22 +146,50 @@ export async function run(args = process.argv.slice(2)) {
   const primary = loadSegment(PRIMARY_START, PRIMARY_END, 31);
   console.error("Loading aligned transfer candle segment...");
   const transfer = loadSegment(TRANSFER_START, TRANSFER_END, 31);
-  const candidates = buildCandidates(dvol.rows, vix.rows, coinMetrics.rows, community.rows, mempool.rows);
+  const candidates = buildCandidates(dvol.rows, vix.rows, macro.rows, funding.rows, coinMetrics.rows, community.rows, mempool.rows);
   const groups: GroupResult[] = [];
   const horizons = [1, 5, 15, 30, 60];
   const sourceGroups: Array<{ id: string; source: CandidateDefinition["source"]; horizons: number[] }> = [
     { id: "cross-market", source: "cross-market", horizons },
     { id: "deribit-dvol", source: "deribit-dvol", horizons: [5, 15, 30, 60] },
     { id: "cboe-vix", source: "cboe-vix", horizons },
+    { id: "global-macro", source: "global-macro", horizons },
+    { id: "binance-funding", source: "binance-funding", horizons },
     { id: "coinmetrics", source: "coinmetrics", horizons: [15, 30, 60] },
     { id: "community-daily", source: "community-daily", horizons: [15, 30, 60] },
     { id: "mempool-proxy", source: "mempool-proxy", horizons: [15, 30, 60] },
   ];
   for (const group of sourceGroups) for (const horizon of group.horizons) {
     const definitions = candidates.filter((candidate) => candidate.source === group.source);
-    const cadence = group.source === "cross-market" ? Math.min(5, horizon) : 60;
+    const cadence = group.source === "cross-market"
+      ? Math.min(5, horizon)
+      : group.source === "global-macro"
+        ? 1_440
+        : group.source === "binance-funding"
+          ? 480
+          : 60;
     console.error(`Scoring ${group.id} at ${horizon}m (${definitions.length} candidates)...`);
     groups.push(analyzeGroup(`${group.id}-${horizon}m`, horizon, cadence, definitions, primary, transfer));
+  }
+  const macroDefinitions = candidates.filter((candidate) => candidate.source === "global-macro");
+  for (const horizon of horizons) {
+    console.error(`Scoring macro additions after the production basis at ${horizon}m (${macroDefinitions.length} candidates)...`);
+    groups.push(analyzeGroup(
+      `global-macro-production-${horizon}m`, horizon, 1_440, macroDefinitions, primary, transfer,
+      { trainDays: TRAIN_DAYS, firstTestDays: 30 }, "production-basis",
+    ));
+  }
+  console.error("Loading the long BTC-only validation segment for macro and funding...");
+  const longPrimary = loadSegment(LONG_PRIMARY_START, LONG_PRIMARY_END, 31, ["BTCUSDT"]);
+  const longSplit: SplitPlan = {
+    trainDays: dayDifference(LONG_PRIMARY_START, LONG_TRAIN_END),
+    firstTestDays: dayDifference(LONG_TRAIN_END, LONG_FIRST_TEST_END),
+  };
+  for (const source of ["global-macro", "binance-funding"] as const) for (const horizon of horizons) {
+    const definitions = candidates.filter((candidate) => candidate.source === source);
+    const cadence = source === "global-macro" ? 1_440 : 480;
+    console.error(`Scoring long-history ${source} at ${horizon}m (${definitions.length} candidates)...`);
+    groups.push(analyzeGroup(`${source}-long-${horizon}m`, horizon, cadence, definitions, longPrimary, transfer, longSplit));
   }
   console.error("Scoring the joint hourly external basis...");
   groups.push(analyzeGroup("joint-external-60m", 60, 60, candidates, primary, transfer));
@@ -152,27 +203,45 @@ export async function run(args = process.argv.slice(2)) {
       crossMarket: ALT_SYMBOLS.map((symbol) => `Binance spot ${symbol} completed 1m candles`),
       dvol: { source: dvol.source, retrievedAt: dvol.retrievedAt, rows: dvol.rows.length, first: dvol.rows[0]?.time, last: dvol.rows.at(-1)?.time },
       vix: { source: vix.source, retrievedAt: vix.retrievedAt, rows: vix.rows.length, first: vix.rows[0]?.time, last: vix.rows.at(-1)?.time },
+      macro: {
+        source: macro.source,
+        retrievedAt: macro.retrievedAt,
+        rows: macro.rows.length,
+        series: summarizeMacroSeries(macro.rows),
+      },
+      funding: { source: funding.source, retrievedAt: funding.retrievedAt, rows: funding.rows.length, first: funding.rows[0]?.time, last: funding.rows.at(-1)?.time },
       coinMetrics: { source: coinMetrics.source, retrievedAt: coinMetrics.retrievedAt, rows: coinMetrics.rows.length, first: coinMetrics.rows[0]?.time, last: coinMetrics.rows.at(-1)?.time },
       community: { source: community.source, retrievedAt: community.retrievedAt, rows: community.rows.length, first: community.rows[0]?.time, last: community.rows.at(-1)?.time },
       mempool: { source: mempool.source, retrievedAt: mempool.retrievedAt, rows: mempool.rows.length, first: mempool.rows[0]?.time, last: mempool.rows.at(-1)?.time },
     },
     split: {
       primary: { start: PRIMARY_START, end: PRIMARY_END, trainDays: TRAIN_DAYS, testDays: dayCount(PRIMARY_START, PRIMARY_END) - TRAIN_DAYS },
+      longPrimary: {
+        start: LONG_PRIMARY_START,
+        end: LONG_PRIMARY_END,
+        trainEndExclusive: LONG_TRAIN_END,
+        firstTestEndExclusive: LONG_FIRST_TEST_END,
+      },
       transfer: { start: TRANSFER_START, end: TRANSFER_END, days: dayCount(TRANSFER_START, TRANSFER_END) },
     },
     method: {
       target: "Eight training-quantile cells of the forward BTC log return",
       baseline: "Quartiles of the same-horizon trailing BTC return crossed with trailing realized volatility",
+      productionBaseline: "Training-median states of the selected multiscale BTC volatility basis plus the selected ETH-volatility coordinate through 15m; 30m and 1h use BTC 30m/240m volatility",
       candidate: "Training-only quartiles; missing observations are omitted on a matched basis",
       score: "Held-out candidate-minus-baseline log likelihood in bits per target, plus sign and magnitude components",
       stability: "Positive full-distribution gain in both chronological primary halves and the separated transfer block",
       greedySelection: "At each step choose the candidate with the largest positive worst-block gain conditional on the already selected quartile coordinates",
-      slowSourceCadence: "Hourly evaluation to avoid treating repeated daily or half-daily values as independent minute observations",
+      slowSourceCadence: "Daily evaluation for macro state, one evaluation per normal 8h settlement for funding, and hourly evaluation for other slow sources",
     },
     groups,
     limitations: [
       "DVOL is an hourly volatility-index history, not a historical full option surface; ATM, 25-delta skew, term structure, strike OI, and IV/skew changes remain live-forward measurements.",
       "VIX is a daily US-equity option-implied volatility index. The backtest delays each close until the next UTC day and therefore tests it as a slow macro regime feature, not a live intraday VIX feed.",
+      "Macro values are current revised observations, not point-in-time vintages. Conservative fixed publication lags prevent obvious same-period leakage, but any selected macro result remains provisional until repeated on vintage release data.",
+      "The global macro discovery screen tests 309 correlated transformations. The three-block rule reduces but does not eliminate multiple-testing bias; the failed 2021-2026 screen overrides recent-window discoveries for production selection.",
+      "Monthly CPI/labor/production and quarterly GDP have too few independent releases in a 180-day fit to establish short-horizon value. Daily sampling limits duplication, and per-series update counts are recorded, but these slow levels should be treated as regime metadata rather than proven candle predictors.",
+      "Binance funding features use only the last settled BTCUSDT USD-M funding rates, delayed by one minute. Historical pre-settlement predicted funding and authenticated margin borrow rates are not present in the public endpoint.",
       "mempool.space history contains mined-block aggregates rather than the earlier unconfirmed transaction backlog; it is labeled as a mempool proxy and not as historical live mempool state.",
       "Coin Metrics Community exchange-flow history is downloaded retrospectively and can be revised. The screen assumes next-day availability and stores each row's latest revision time separately; results are provisional and not a true point-in-time test.",
       "The community whale/miner/liquidation/derivatives archive is CC-BY but upstream-derived and retrospectively revised. Its next-day screen is exploratory, not point-in-time production evidence.",
@@ -196,8 +265,10 @@ function analyzeGroup(
   candidates: CandidateDefinition[],
   primary: Segment,
   transfer: Segment,
+  splitPlan: SplitPlan = { trainDays: TRAIN_DAYS, firstTestDays: 30 },
+  baseline: GroupResult["baseline"] = "return-volatility",
 ): GroupResult {
-  const observations = buildObservationSet(primary, transfer, horizonMinutes, cadenceMinutes, candidates);
+  const observations = buildObservationSet(primary, transfer, horizonMinutes, cadenceMinutes, candidates, splitPlan, baseline);
   const ranked = candidates.map((candidate, index) => scoreCandidate(candidate, index, observations, []))
     .sort(compareCandidateScores);
   const selected: SelectedStep[] = [];
@@ -222,6 +293,7 @@ function analyzeGroup(
     observations: countSplits(observations.split),
     ranked,
     selected,
+    baseline,
   };
 }
 
@@ -231,8 +303,10 @@ function buildObservationSet(
   horizon: number,
   cadence: number,
   candidates: CandidateDefinition[],
+  splitPlan: SplitPlan,
+  baseline: GroupResult["baseline"],
 ): ObservationSet {
-  const raw = collectRawObservations(primary, transfer, horizon, cadence, candidates);
+  const raw = collectRawObservations(primary, transfer, horizon, cadence, candidates, splitPlan, baseline);
   const trainingIndices = raw.split.flatMap((split, index) => split === 0 ? [index] : []);
   const targetEdges = quantileEdges(trainingIndices.map((index) => raw.target[index]!), TARGET_BINS);
   const magnitudeEdges = quantileEdges(trainingIndices.map((index) => Math.abs(raw.target[index]!)), 4);
@@ -242,12 +316,26 @@ function buildObservationSet(
   const sign = new Uint8Array(raw.target.length);
   const magnitude = new Uint8Array(raw.target.length);
   const base = new Uint8Array(raw.target.length);
+  let baseContexts = 16;
   for (let index = 0; index < raw.target.length; index += 1) {
     target[index] = bin(raw.target[index]!, targetEdges);
     sign[index] = raw.target[index]! >= 0 ? 1 : 0;
     magnitude[index] = bin(Math.abs(raw.target[index]!), magnitudeEdges);
-    base[index] = bin(raw.previous[index]!, previousEdges) * FEATURE_BINS
+    if (baseline === "return-volatility") base[index] = bin(raw.previous[index]!, previousEdges) * FEATURE_BINS
       + bin(raw.volatility[index]!, volatilityEdges);
+  }
+  if (baseline === "production-basis") {
+    const productionEdges = raw.production.map((values) => quantileEdges(
+      trainingIndices.map((index) => values[index]!), 2,
+    ));
+    baseContexts = 2 ** raw.production.length;
+    for (let index = 0; index < raw.target.length; index += 1) {
+      let state = 0;
+      for (let feature = 0; feature < raw.production.length; feature += 1) {
+        state = state * 2 + bin(raw.production[feature]![index]!, productionEdges[feature]!);
+      }
+      base[index] = state;
+    }
   }
   const candidateEdges = raw.features.map((values) => quantileEdges(
     trainingIndices.map((index) => values[index]!).filter(Number.isFinite),
@@ -267,6 +355,7 @@ function buildObservationSet(
     sign,
     magnitude,
     base,
+    baseContexts,
     split: Uint8Array.from(raw.split),
     times: Float64Array.from(raw.times),
     rawTarget: Float64Array.from(raw.target),
@@ -284,6 +373,8 @@ function collectRawObservations(
   horizon: number,
   cadence: number,
   candidates: CandidateDefinition[],
+  splitPlan: SplitPlan,
+  baseline: GroupResult["baseline"],
 ) {
   const times: number[] = [];
   const target: number[] = [];
@@ -291,6 +382,9 @@ function collectRawObservations(
   const volatility: number[] = [];
   const split: number[] = [];
   const features = candidates.map(() => [] as number[]);
+  const production = baseline === "production-basis"
+    ? productionBasisDefinitions(horizon).map(() => [] as number[])
+    : [];
   const append = (segment: Segment, transferSegment: boolean) => {
     const startIndex = Math.round((segment.targetStart - segment.firstTime) / MINUTE_MS);
     const endIndex = Math.round((segment.targetEnd - segment.firstTime) / MINUTE_MS);
@@ -305,12 +399,20 @@ function collectRawObservations(
       if (![forward, trailing, trailingVolatility].every(Number.isFinite)) continue;
       const time = segment.firstTime + index * MINUTE_MS;
       const dayIndex = Math.floor((time - segment.targetStart) / DAY_MS);
-      const splitId = transferSegment ? 3 : dayIndex < TRAIN_DAYS ? 0 : dayIndex < TRAIN_DAYS + 30 ? 1 : 2;
+      const splitId = transferSegment ? 3 : dayIndex < splitPlan.trainDays
+        ? 0
+        : dayIndex < splitPlan.trainDays + splitPlan.firstTestDays ? 1 : 2;
       times.push(time);
       target.push(forward);
       previous.push(trailing);
       volatility.push(trailingVolatility);
       split.push(splitId);
+      if (production.length > 0) {
+        const productionValues = productionBasisValues(segment, index, horizon);
+        for (let feature = 0; feature < production.length; feature += 1) {
+          production[feature]!.push(productionValues[feature]!);
+        }
+      }
       for (let candidate = 0; candidate < candidates.length; candidate += 1) {
         features[candidate]!.push(candidates[candidate]!.value(segment, index, time));
       }
@@ -318,7 +420,7 @@ function collectRawObservations(
   };
   append(primary, false);
   append(transfer, true);
-  return { times, target, previous, volatility, split, features };
+  return { times, target, previous, volatility, split, features, production };
 }
 
 function scoreCandidate(
@@ -346,6 +448,30 @@ function scoreCandidate(
   };
 }
 
+function productionBasisDefinitions(horizon: number) {
+  if (horizon <= 5) return ["BTC volatility 15m", "BTC volatility 60m", horizon === 1 ? "ETH volatility 30m" : "ETH volatility 60m"];
+  if (horizon === 15) return ["BTC volatility 15m", "BTC volatility 60m", "BTC volatility 240m", "ETH volatility 60m"];
+  return ["BTC volatility 30m", "BTC volatility 240m"];
+}
+
+function productionBasisValues(segment: Segment, index: number, horizon: number) {
+  if (horizon <= 5) return [
+    windowVolatility(segment, "BTCUSDT", index, 15),
+    windowVolatility(segment, "BTCUSDT", index, 60),
+    windowVolatility(segment, "ETHUSDT", index, horizon === 1 ? 30 : 60),
+  ];
+  if (horizon === 15) return [
+    windowVolatility(segment, "BTCUSDT", index, 15),
+    windowVolatility(segment, "BTCUSDT", index, 60),
+    windowVolatility(segment, "BTCUSDT", index, 240),
+    windowVolatility(segment, "ETHUSDT", index, 60),
+  ];
+  return [
+    windowVolatility(segment, "BTCUSDT", index, 30),
+    windowVolatility(segment, "BTCUSDT", index, 240),
+  ];
+}
+
 function scoreAllTargets(
   observations: ObservationSet,
   trainSplits: number[],
@@ -371,7 +497,7 @@ function scoreAllTargets(
 }
 
 export function conditionalGain(
-  observations: Pick<ObservationSet, "base" | "featureBins">,
+  observations: Pick<ObservationSet, "base" | "baseContexts" | "featureBins">,
   training: number[],
   evaluation: number[],
   selected: number[],
@@ -379,7 +505,7 @@ export function conditionalGain(
   targets: Uint8Array,
   targetClasses: number,
 ): number {
-  const baseContexts = 16 * FEATURE_BINS ** selected.length;
+  const baseContexts = observations.baseContexts * FEATURE_BINS ** selected.length;
   const fullContexts = baseContexts * FEATURE_BINS;
   const baseCounts = new Float64Array(baseContexts * targetClasses);
   const baseTotals = new Float64Array(baseContexts);
@@ -423,6 +549,8 @@ function contextAt(
 function buildCandidates(
   dvol: DvolRow[],
   vix: VixRow[],
+  macro: MacroRow[],
+  funding: BinanceFundingRateRow[],
   coinMetrics: CoinMetricsRow[],
   community: CommunityCryptoDailyRow[],
   mempool: MempoolMiningRow[],
@@ -431,10 +559,97 @@ function buildCandidates(
     ...crossMarketCandidates(),
     ...dvolCandidates(dvol),
     ...vixCandidates(vix),
+    ...macroCandidates(macro),
+    ...fundingCandidates(funding),
     ...coinMetricsCandidates(coinMetrics),
     ...communityDailyCandidates(community),
     ...mempoolCandidates(mempool),
   ];
+}
+
+function macroCandidates(rows: MacroRow[]): CandidateDefinition[] {
+  const candidates: CandidateDefinition[] = [];
+  const ids = [...new Set(rows.map((row) => row.id))].sort();
+  const positiveGrowthSeries = new Set([
+    "CPIAUCSL", "CP0000EZ19M086NEST", "PAYEMS", "INDPRO", "GDPC1", "CLVMNACSCAB1GQEA19", "JPNRGDPEXP", "DTWEXBGS",
+    "OECD_INDUSTRIAL_PRODUCTION_EA20", "OECD_INDUSTRIAL_PRODUCTION_GBR", "OECD_INDUSTRIAL_PRODUCTION_JPN", "OECD_INDUSTRIAL_PRODUCTION_IND",
+  ]);
+  for (const id of ids) {
+    const series = rows.filter((row) => row.id === id)
+      .sort((left, right) => left.availableAt - right.availableAt);
+    const definition = series[0]!;
+    const slug = id.toLowerCase();
+    const lags = definition.frequency === "daily" ? [1, 5, 21]
+      : definition.frequency === "event" ? [1, 2, 4]
+      : definition.frequency === "monthly" ? [1, 3, 12]
+        : [1, 4];
+    const unit = definition.frequency === "daily" ? "trading observation(s)"
+      : definition.frequency === "event" ? "policy decision(s)"
+      : definition.frequency === "monthly" ? "monthly observation(s)"
+        : "quarterly observation(s)";
+    candidates.push(candidate(
+      `macro-${slug}-level`, definition.label, `${definition.economy} macro level`, "global-macro", "latest conservatively available release",
+      (_segment, _index, time) => latest(series, time)?.value ?? Number.NaN,
+    ));
+    candidates.push(candidate(
+      `macro-${slug}-age`, `${definition.label} release age`, "Macro release age", "global-macro", "latest conservatively available release",
+      (_segment, _index, time) => {
+        const row = latest(series, time);
+        return row ? (time - row.availableAt) / DAY_MS : Number.NaN;
+      },
+    ));
+    for (const lag of lags) {
+      candidates.push(candidate(
+        `macro-${slug}-change-${lag}`, `${definition.label} change`, `${definition.economy} macro change`, "global-macro", `${lag} ${unit}`,
+        (_segment, _index, time) => observationChange(series, time, lag, (row) => row.value),
+      ));
+      candidates.push(candidate(
+        `macro-${slug}-absolute-change-${lag}`, `${definition.label} absolute change`, `${definition.economy} macro shock`, "global-macro", `${lag} ${unit}`,
+        (_segment, _index, time) => Math.abs(observationChange(series, time, lag, (row) => row.value)),
+      ));
+      if (positiveGrowthSeries.has(id)) candidates.push(candidate(
+        `macro-${slug}-log-change-${lag}`, `${definition.label} log growth`, `${definition.economy} macro growth`, "global-macro", `${lag} ${unit}`,
+        (_segment, _index, time) => observationLogChange(series, time, lag, (row) => row.value),
+      ));
+    }
+  }
+  return candidates;
+}
+
+function fundingCandidates(rows: BinanceFundingRateRow[]): CandidateDefinition[] {
+  const candidates: CandidateDefinition[] = [
+    candidate(
+      "funding-level", "BTCUSDT settled funding rate", "Funding state", "binance-funding", "latest settlement",
+      (_segment, _index, time) => latest(rows, time)?.fundingRate ?? Number.NaN,
+    ),
+    candidate(
+      "funding-absolute-level", "Absolute BTCUSDT settled funding rate", "Funding pressure", "binance-funding", "latest settlement",
+      (_segment, _index, time) => Math.abs(latest(rows, time)?.fundingRate ?? Number.NaN),
+    ),
+    candidate(
+      "funding-age", "Funding settlement age", "Funding timing", "binance-funding", "latest settlement",
+      (_segment, _index, time) => {
+        const row = latest(rows, time);
+        return row ? (time - row.availableAt) / 3_600_000 : Number.NaN;
+      },
+    ),
+  ];
+  for (const settlements of [1, 3, 9, 21, 90]) {
+    const lookback = `${settlements} settlement(s), normally ${(settlements * 8 / 24).toFixed(1)}d`;
+    candidates.push(candidate(
+      `funding-change-${settlements}`, "Funding-rate change", "Funding change", "binance-funding", lookback,
+      (_segment, _index, time) => observationChange(rows, time, settlements, (row) => row.fundingRate),
+    ));
+    candidates.push(candidate(
+      `funding-mean-${settlements}`, "Mean settled funding rate", "Funding state", "binance-funding", lookback,
+      (_segment, _index, time) => eventMean(rows, time, settlements, (row) => row.fundingRate),
+    ));
+    candidates.push(candidate(
+      `funding-absolute-mean-${settlements}`, "Mean absolute settled funding rate", "Funding pressure", "binance-funding", lookback,
+      (_segment, _index, time) => eventMean(rows, time, settlements, (row) => Math.abs(row.fundingRate)),
+    ));
+  }
+  return candidates;
 }
 
 function vixCandidates(rows: VixRow[]): CandidateDefinition[] {
@@ -684,7 +899,7 @@ function candidate(
   return { id, label, family, source, lookback, value };
 }
 
-function loadSegment(start: string, end: string, warmupDays: number): Segment {
+function loadSegment(start: string, end: string, warmupDays: number, symbols: readonly string[] = SYMBOLS): Segment {
   const targetStart = parseDay(start);
   const targetEnd = parseDay(end) + DAY_MS;
   const firstTime = targetStart - warmupDays * DAY_MS;
@@ -695,7 +910,7 @@ function loadSegment(start: string, end: string, warmupDays: number): Segment {
   const validReturnPrefix = new Map<string, Uint32Array>();
   const volumePrefix = new Map<string, Float64Array>();
   const validVolumePrefix = new Map<string, Uint32Array>();
-  for (const symbol of SYMBOLS) {
+  for (const symbol of symbols) {
     const closes = new Float64Array(minuteCount).fill(Number.NaN);
     const volumes = new Float64Array(minuteCount).fill(Number.NaN);
     for (let day = firstTime; day < finalTime; day += DAY_MS) {
@@ -788,6 +1003,26 @@ function eventChange<T extends { availableAt: number }>(
   return current && previous ? value(current) - value(previous) : Number.NaN;
 }
 
+function observationChange<T extends { availableAt: number }>(
+  rows: T[], time: number, lag: number, value: (row: T) => number,
+) {
+  const index = latestIndex(rows, time);
+  if (index < lag) return Number.NaN;
+  const current = value(rows[index]!);
+  const previous = value(rows[index - lag]!);
+  return Number.isFinite(current) && Number.isFinite(previous) ? current - previous : Number.NaN;
+}
+
+function observationLogChange<T extends { availableAt: number }>(
+  rows: T[], time: number, lag: number, value: (row: T) => number,
+) {
+  const index = latestIndex(rows, time);
+  if (index < lag) return Number.NaN;
+  const current = value(rows[index]!);
+  const previous = value(rows[index - lag]!);
+  return current > 0 && previous > 0 ? Math.log(current / previous) : Number.NaN;
+}
+
 function eventSum<T extends { availableAt: number }>(
   rows: T[], time: number, count: number, value: (row: T) => number,
 ) {
@@ -800,6 +1035,13 @@ function eventSum<T extends { availableAt: number }>(
     total += item;
   }
   return total;
+}
+
+function eventMean<T extends { availableAt: number }>(
+  rows: T[], time: number, count: number, value: (row: T) => number,
+) {
+  const total = eventSum(rows, time, count, value);
+  return Number.isFinite(total) ? total / count : Number.NaN;
 }
 
 function eventLogChange<T extends { availableAt: number }>(
@@ -832,12 +1074,16 @@ function bin(value: number, edges: number[]) {
 
 function compareCandidateScores(left: CandidateScore, right: CandidateScore) {
   return Number(right.stable) - Number(left.stable)
-    || worstBlock(right) - worstBlock(left)
-    || right.primary.bits - left.primary.bits;
+    || finiteScore(worstBlock(right)) - finiteScore(worstBlock(left))
+    || finiteScore(right.primary.bits) - finiteScore(left.primary.bits);
 }
 
 function worstBlock(score: CandidateScore) {
   return Math.min(score.firstHalf.bits, score.secondHalf.bits, score.transfer.bits);
+}
+
+function finiteScore(value: number) {
+  return Number.isFinite(value) ? value : Number.NEGATIVE_INFINITY;
 }
 
 function countSplits(splits: Uint8Array) {
@@ -851,7 +1097,40 @@ function countSplits(splits: Uint8Array) {
   return result;
 }
 
-function renderReport(artifact: Awaited<ReturnType<typeof run>>) {
+function summarizeMacroSeries(rows: MacroRow[]) {
+  const trainingStart = parseDay(PRIMARY_START);
+  const trainingEnd = trainingStart + TRAIN_DAYS * DAY_MS;
+  const primaryEnd = parseDay(PRIMARY_END) + DAY_MS;
+  const transferStart = parseDay(TRANSFER_START);
+  const transferEnd = parseDay(TRANSFER_END) + DAY_MS;
+  return [...new Set(rows.map((row) => row.id))].sort().map((id) => {
+    const series = rows.filter((row) => row.id === id)
+      .sort((left, right) => left.availableAt - right.availableAt);
+    const count = (start: number, end: number) => series.filter((row) => row.availableAt >= start && row.availableAt < end).length;
+    const valueChanges = (start: number, end: number) => {
+      const inWindow = series.filter((row) => row.availableAt >= start && row.availableAt < end);
+      return inWindow.reduce((total, row, index) => total + (index > 0 && row.value !== inWindow[index - 1]!.value ? 1 : 0), 0);
+    };
+    return {
+      id,
+      label: series[0]!.label,
+      economy: series[0]!.economy,
+      provider: series[0]!.provider,
+      sourceUrl: series[0]!.sourceUrl,
+      frequency: series[0]!.frequency,
+      availabilityLagDays: series[0]!.availabilityLagDays,
+      rows: series.length,
+      first: series[0]!.time,
+      last: series.at(-1)!.time,
+      trainingReleases: count(trainingStart, trainingEnd),
+      trainingValueChanges: valueChanges(trainingStart, trainingEnd),
+      primaryTestReleases: count(trainingEnd, primaryEnd),
+      transferReleases: count(transferStart, transferEnd),
+    };
+  });
+}
+
+export function renderReport(artifact: Awaited<ReturnType<typeof run>>) {
   const lines = [
     "# Public external feature information audit",
     "",
@@ -861,10 +1140,63 @@ function renderReport(artifact: Awaited<ReturnType<typeof run>>) {
     "",
   ];
   const selected = artifact.groups.flatMap((group) => group.selected.map((item) => ({ group, item })));
+  const recentMacroSelected = selected.filter(({ group }) => /^global-macro-\d/.test(group.id));
+  const longMacroFundingSelected = selected.filter(({ group }) => /^(global-macro|binance-funding)-long-/.test(group.id));
   lines.push(
-    `The public backfill produced ${artifact.sources.dvol.rows.toLocaleString()} hourly DVOL rows, ${artifact.sources.vix.rows.toLocaleString()} daily VIX rows, ${artifact.sources.coinMetrics.rows.toLocaleString()} Coin Metrics rows, ${artifact.sources.community.rows.toLocaleString()} community whale/miner/derivatives rows, and ${artifact.sources.mempool.rows.toLocaleString()} mined-block proxy rows. The matched cross-market corpus contains BTC plus ${ALT_SYMBOLS.join(", ")} minute bars.`,
+    `The public backfill produced ${artifact.sources.dvol.rows.toLocaleString()} hourly DVOL rows, ${artifact.sources.vix.rows.toLocaleString()} daily VIX rows, ${artifact.sources.macro.rows.toLocaleString()} macro observations across ${artifact.sources.macro.series.length} series, ${artifact.sources.funding.rows.toLocaleString()} BTCUSDT funding settlements, ${artifact.sources.coinMetrics.rows.toLocaleString()} Coin Metrics rows, ${artifact.sources.community.rows.toLocaleString()} community whale/miner/derivatives rows, and ${artifact.sources.mempool.rows.toLocaleString()} mined-block proxy rows. The matched cross-market corpus contains BTC plus ${ALT_SYMBOLS.join(", ")} minute bars.`,
     "",
     `${selected.length} conditional coordinates passed the three-block stability rule across all source/horizon screens. A selected coordinate is a distribution feature, not automatically a profitable direction signal.`,
+    "",
+    `${recentMacroSelected.length} macro coordinates pass in the recent 180-day-fit screen, but ${longMacroFundingSelected.length} macro/funding coordinates pass when trained on 2021-2024 and tested on both halves of 2025 plus the 2026 transfer block. Therefore the recent US, UK, euro-area, and China results are regime-dependent research candidates, not required production inputs.`,
+    "",
+    "No settled-funding transformation passes either window. Slow CPI, labor, production, and GDP levels have too few independent releases for a reliable 1m-1h decision even when the carried-forward state creates many target rows.",
+    "",
+    "## Best recent non-US candidate by economy",
+    "",
+    "This is a discovery view, not a production-selection table. `stable` here means positive in three recent chronological blocks; none of these economies has a candidate that also passes the separate long-history screen.",
+    "",
+    "| economy | horizon | best candidate | stable | lookback | first half | second half | transfer |",
+    "|---|---:|---|:---:|---|---:|---:|---:|",
+  );
+  const macroGroups = artifact.groups.filter((group) => /^global-macro-\d+m$/.test(group.id));
+  for (const economy of ["Euro area", "United Kingdom", "China", "Japan", "India", "Russia"]) {
+    const prefixes = artifact.sources.macro.series
+      .filter((series) => series.economy === economy)
+      .map((series) => `macro-${series.id.toLowerCase()}-`);
+    const matches = macroGroups.flatMap((group) => group.ranked
+      .filter((candidate) => prefixes.some((prefix) => candidate.id.startsWith(prefix)))
+      .map((candidate) => ({ group, candidate })));
+    const stable = matches.filter(({ candidate }) => candidate.stable)
+      .sort((left, right) => compareCandidateScores(left.candidate, right.candidate));
+    const fallback = matches.sort((left, right) => compareCandidateScores(left.candidate, right.candidate));
+    const best = stable[0] ?? fallback[0];
+    if (!best) continue;
+    lines.push(`| ${economy} | ${best.group.horizonMinutes}m | ${best.candidate.label} | ${best.candidate.stable ? "yes" : "no"} | ${best.candidate.lookback} | ${fixed(best.candidate.firstHalf.bits)} | ${fixed(best.candidate.secondHalf.bits)} | ${fixed(best.candidate.transfer.bits)} |`);
+  }
+  lines.push(
+    "",
+    "## Do the recent macro winners survive the established basis?",
+    "",
+    "No. The table compares the same coordinate on the same 180-day/2026 windows. The second score appends it after training-median states of the established multiscale BTC volatility basis and the selected ETH-volatility coordinate through 15m.",
+    "",
+    "| horizon | coordinate | simple primary / transfer | after basis primary / transfer | after-basis halves | survives |",
+    "|---:|---|---:|---:|---:|:---:|",
+  );
+  const comparisons = [
+    [5, "macro-dgs2-absolute-change-21"],
+    [15, "macro-oecd_industrial_production_gbr-change-3"],
+    [30, "macro-t10y2y-change-1"],
+    [30, "macro-ecb_yc_2y-absolute-change-1"],
+    [60, "macro-ecb_yc_2y-change-1"],
+    [60, "macro-oecd_cpi_yoy_chn-absolute-change-1"],
+  ] as const;
+  for (const [horizon, id] of comparisons) {
+    const simple = artifact.groups.find((group) => group.id === `global-macro-${horizon}m`)?.ranked.find((candidate) => candidate.id === id);
+    const conditioned = artifact.groups.find((group) => group.id === `global-macro-production-${horizon}m`)?.ranked.find((candidate) => candidate.id === id);
+    if (!simple || !conditioned) continue;
+    lines.push(`| ${horizon}m | ${conditioned.label}, ${conditioned.lookback} | ${fixed(simple.primary.bits)} / ${fixed(simple.transfer.bits)} | ${fixed(conditioned.primary.bits)} / ${fixed(conditioned.transfer.bits)} | ${fixed(conditioned.firstHalf.bits)}, ${fixed(conditioned.secondHalf.bits)} | ${conditioned.stable ? "yes" : "no"} |`);
+  }
+  lines.push(
     "",
     "## Selected conditional basis",
     "",
@@ -879,6 +1211,18 @@ function renderReport(artifact: Awaited<ReturnType<typeof run>>) {
     const best = group.ranked.find((item) => item.stable) ?? group.ranked[0];
     lines.push(`| ${group.id} | ${group.candidateCount} | ${best?.label ?? "none"} | ${best?.stable ? "yes" : "no"} | ${best?.lookback ?? "—"} | ${fixed(best?.firstHalf.bits)} | ${fixed(best?.secondHalf.bits)} | ${fixed(best?.transfer.bits)} |`);
   }
+  lines.push(
+    "",
+    "## Macro coverage and effective updates",
+    "",
+    "The release count is more relevant than the number of target candles that inherit a value. `value changes` is even stricter for policy rates and other series that often repeat unchanged.",
+    "",
+    "| series | economy | provider | frequency | assumed lag | rows | train releases | train value changes | primary test | transfer |",
+    "|---|---|---|---|---:|---:|---:|---:|---:|---:|",
+  );
+  for (const series of artifact.sources.macro.series) lines.push(
+    `| ${series.id}: ${series.label} | ${series.economy} | ${series.provider} | ${series.frequency} | ${series.availabilityLagDays}d | ${series.rows} | ${series.trainingReleases} | ${series.trainingValueChanges} | ${series.primaryTestReleases} | ${series.transferReleases} |`,
+  );
   lines.push(
     "",
     "## Interpretation constraints",
@@ -916,6 +1260,10 @@ function parseDay(value: string) {
 
 function dayCount(start: string, end: string) {
   return Math.round((parseDay(end) - parseDay(start)) / DAY_MS) + 1;
+}
+
+function dayDifference(start: string, endExclusive: string) {
+  return Math.round((parseDay(endExclusive) - parseDay(start)) / DAY_MS);
 }
 
 function resolve(value: string) {

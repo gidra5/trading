@@ -8,6 +8,7 @@ import AdmZip from "adm-zip";
 import WebSocket from "ws";
 import { deriveDeribitOptionSummary, type DeribitBookSummary } from "./lib/external-public-data.ts";
 import { summarizeGdeltGkg, summarizeGdeltNgrams } from "./lib/external-live-data.ts";
+import { LiveBookCompactor } from "./lib/live-book-compactor.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_OUTPUT = "data/market/mutable/external-live";
@@ -20,7 +21,16 @@ interface WebSocketSpec {
   subscribe?: unknown;
   onOpen?: () => Promise<void>;
   minRecordIntervalMs?: number;
+  staleAfterMs?: number;
 }
+
+const COMPACTED_BOOK_SOURCES = new Set([
+  "binance-spot-depth-diff",
+  "binance-usdm-book-ticker",
+  "coinbase-btcusd-level2",
+  "kraken-btcusd-book",
+  "deribit-btc-perpetual-book",
+]);
 
 class RotatingJsonlSink {
   private streams = new Map<string, {
@@ -31,6 +41,7 @@ class RotatingJsonlSink {
     completed: Promise<void>;
   }>();
   private pendingWrites = new Set<Promise<void>>();
+  private writtenBytesBySource = new Map<string, number>();
   private readonly flushTimer: NodeJS.Timeout;
 
   constructor(private readonly root: string) {
@@ -68,6 +79,10 @@ class RotatingJsonlSink {
     this.streams.clear();
   }
 
+  bytesWritten() {
+    return Object.fromEntries(this.writtenBytesBySource);
+  }
+
   private flush(source: string) {
     const current = this.streams.get(source);
     return current ? this.flushState(current, source) : Promise.resolve();
@@ -86,6 +101,7 @@ class RotatingJsonlSink {
     const write = current.completed.then(async () => {
       const compressed = await gzipBuffer(contents, { level: 6 });
       await fsp.appendFile(current.file, compressed);
+      this.writtenBytesBySource.set(source, (this.writtenBytesBySource.get(source) ?? 0) + compressed.length);
     }).catch((error: unknown) => {
       console.error(`${source} compressed sink error: ${error instanceof Error ? error.message : error}`);
     });
@@ -110,6 +126,8 @@ export async function run(args = process.argv.slice(2)) {
   --output-dir data/market/mutable/external-live
   --duration-seconds N       Stop after N seconds; omit to run indefinitely
   --rest-only                Skip WebSocket streams
+  --raw-books               Also retain full high-frequency order-book messages
+  --status-file FILE         Atomically write collector health every 5 seconds
 
 Optional environment variables:
   TRADING_ECONOMICS_API_KEY  Point-in-time macro calendar actual/forecast feed
@@ -119,12 +137,18 @@ Optional environment variables:
   const output = path.resolve(repoRoot, value("--output-dir") ?? DEFAULT_OUTPUT);
   const durationSeconds = Number(value("--duration-seconds") ?? 0);
   const restOnly = args.includes("--rest-only");
+  const rawBooks = args.includes("--raw-books");
+  const statusFile = value("--status-file") ? path.resolve(repoRoot, value("--status-file")!) : undefined;
   await fsp.mkdir(output, { recursive: true });
   const sink = new RotatingJsonlSink(output);
+  const bookCompactor = new LiveBookCompactor();
   let stopping = false;
   const sockets = new Set<WebSocket>();
   const timers = new Set<NodeJS.Timeout>();
   let optionSnapshotCount = 0;
+  let binanceSnapshotRunning = false;
+  const startedAt = Date.now();
+  const sourceHealth = new Map<string, { messages: number; lastMessageAt: number; opens: number; closes: number }>();
 
   const stop = async () => {
     if (stopping) return;
@@ -136,10 +160,22 @@ Optional environment variables:
   process.once("SIGTERM", () => void stop());
   if (durationSeconds > 0) setTimeout(() => void stop(), durationSeconds * 1_000).unref();
 
+  const compactTimer = setInterval(() => {
+    sink.write("cross-exchange-book-1s", bookCompactor.summarize(), Date.now());
+  }, 1_000);
+  compactTimer.unref();
+  timers.add(compactTimer);
+  if (statusFile) {
+    const statusTimer = setInterval(() => void writeStatus(), 5_000);
+    statusTimer.unref();
+    timers.add(statusTimer);
+    await writeStatus();
+  }
+
   sink.write("collector-session", {
     event: "start",
     pid: process.pid,
-    startedAt: new Date().toISOString(),
+    startedAt: new Date(startedAt).toISOString(),
     sources: ["binance", "coinbase", "kraken", "deribit", "mempool.space", "GDELT"],
   });
 
@@ -194,14 +230,13 @@ Optional environment variables:
       {
         id: "binance-spot-depth-diff",
         url: "wss://stream.binance.com:9443/ws/btcusdt@depth@100ms",
-        onOpen: async () => sink.write("binance-spot-depth-snapshot", await requestJson(
-          new URL("https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000"),
-        )),
+        onOpen: refreshBinanceSpotSnapshot,
+        staleAfterMs: 15_000,
       },
-      { id: "binance-spot-aggtrade", url: "wss://stream.binance.com:9443/ws/btcusdt@aggTrade" },
-      { id: "binance-usdm-liquidations", url: "wss://fstream.binance.com/ws/!forceOrder@arr" },
-      { id: "binance-usdm-mark-price", url: "wss://fstream.binance.com/ws/btcusdt@markPrice@1s" },
-      { id: "binance-usdm-book-ticker", url: "wss://fstream.binance.com/ws/btcusdt@bookTicker", minRecordIntervalMs: 100 },
+      { id: "binance-spot-aggtrade", url: "wss://stream.binance.com:9443/ws/btcusdt@aggTrade", staleAfterMs: 30_000 },
+      { id: "binance-usdm-liquidations", url: "wss://fstream.binance.com/market/ws/!forceOrder@arr" },
+      { id: "binance-usdm-mark-price", url: "wss://fstream.binance.com/market/ws/btcusdt@markPrice@1s", staleAfterMs: 10_000 },
+      { id: "binance-usdm-book-ticker", url: "wss://fstream.binance.com/public/ws/btcusdt@bookTicker", minRecordIntervalMs: 100, staleAfterMs: 15_000 },
       {
         id: "coinbase-btcusd-level2",
         url: "wss://ws-feed.exchange.coinbase.com",
@@ -225,7 +260,46 @@ Optional environment variables:
   await Promise.allSettled(websocketTasks);
   sink.write("collector-session", { event: "stop", stoppedAt: new Date().toISOString() });
   await sink.close();
+  if (statusFile) await writeStatus();
   console.log("External live collection stopped cleanly.");
+
+  async function refreshBinanceSpotSnapshot() {
+    if (binanceSnapshotRunning) return;
+    binanceSnapshotRunning = true;
+    try {
+      const observedAt = Date.now();
+      const snapshot = await requestJson(new URL("https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=5000"));
+      bookCompactor.consume("binance-spot-depth-snapshot", snapshot, observedAt);
+      if (rawBooks) sink.write("binance-spot-depth-snapshot", snapshot, observedAt);
+    } finally {
+      binanceSnapshotRunning = false;
+    }
+  }
+
+  async function writeStatus() {
+    if (!statusFile) return;
+    const now = Date.now();
+    const status = {
+      version: 1,
+      pid: process.pid,
+      startedAt: new Date(startedAt).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      stopping,
+      output,
+      rawBooks,
+      compressedBytesBySource: sink.bytesWritten(),
+      compressedBytesTotal: Object.values(sink.bytesWritten()).reduce((sum, bytes) => sum + bytes, 0),
+      sources: Object.fromEntries([...sourceHealth.entries()].map(([source, health]) => [source, {
+        ...health,
+        lastMessageAt: health.lastMessageAt > 0 ? new Date(health.lastMessageAt).toISOString() : null,
+        ageSeconds: health.lastMessageAt > 0 ? (now - health.lastMessageAt) / 1_000 : null,
+      }])),
+    };
+    await fsp.mkdir(path.dirname(statusFile), { recursive: true });
+    const temporary = `${statusFile}.${process.pid}.tmp`;
+    await fsp.writeFile(temporary, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+    await fsp.rename(temporary, statusFile);
+  }
 
   function schedule(label: string, interval: number, task: () => Promise<void>) {
     let running = false;
@@ -268,24 +342,53 @@ Optional environment variables:
       sockets.add(socket);
       let opened = false;
       let lastRecordedAt = 0;
+      let lastMessageAt = Date.now();
+      const health = sourceHealth.get(spec.id) ?? { messages: 0, lastMessageAt: 0, opens: 0, closes: 0 };
+      sourceHealth.set(spec.id, health);
       const ping = setInterval(() => {
         if (socket.readyState === WebSocket.OPEN) socket.ping();
       }, 30_000);
       ping.unref();
+      const staleCheck = spec.staleAfterMs ? setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN && Date.now() - lastMessageAt > spec.staleAfterMs!) {
+          console.error(`${spec.id}: no messages for ${Date.now() - lastMessageAt}ms; reconnecting`);
+          socket.close(4_000, "stale stream");
+        }
+      }, Math.min(5_000, spec.staleAfterMs)) : undefined;
+      staleCheck?.unref();
       socket.on("open", () => {
         opened = true;
+        health.opens += 1;
         sink.write(`${spec.id}-session`, { event: "open", url: spec.url });
         if (spec.subscribe) socket.send(JSON.stringify(spec.subscribe));
         void spec.onOpen?.().catch((error) => console.error(`${spec.id} snapshot: ${error.message}`));
       });
       socket.on("message", (data) => {
         const receivedAt = Date.now();
-        if (spec.minRecordIntervalMs && receivedAt - lastRecordedAt < spec.minRecordIntervalMs) return;
-        lastRecordedAt = receivedAt;
+        lastMessageAt = receivedAt;
+        health.messages += 1;
+        health.lastMessageAt = receivedAt;
         const text = data.toString();
         let payload: unknown = text;
         try { payload = JSON.parse(text); } catch { /* retain raw text */ }
-        sink.write(spec.id, { receivedAt, monotonicNs: process.hrtime.bigint().toString(), message: payload }, receivedAt);
+        bookCompactor.consume(spec.id, payload, receivedAt);
+        if (spec.id === "binance-spot-depth-diff" && bookCompactor.needsBinanceSnapshot()) {
+          void refreshBinanceSpotSnapshot().catch((error) => console.error(`${spec.id} resnapshot: ${error.message}`));
+        }
+        if (spec.id === "kraken-btcusd-book" && bookCompactor.needsKrakenSnapshot()) {
+          console.error(`${spec.id}: reconstructed book crossed; reconnecting for a fresh snapshot`);
+          socket.close(4_001, "invalid reconstructed book");
+          return;
+        }
+        if (spec.minRecordIntervalMs && receivedAt - lastRecordedAt < spec.minRecordIntervalMs) return;
+        lastRecordedAt = receivedAt;
+        const deribitChannel = String((payload as any)?.params?.channel ?? "");
+        const routedSource = spec.id === "deribit-btc-perpetual-book" && deribitChannel.startsWith("trades.")
+          ? deribitChannel.includes("option") ? "deribit-btc-option-trades" : "deribit-btc-perpetual-trades"
+          : spec.id;
+        if (rawBooks || !COMPACTED_BOOK_SOURCES.has(spec.id) || routedSource !== spec.id) {
+          sink.write(routedSource, { receivedAt, monotonicNs: process.hrtime.bigint().toString(), message: payload }, receivedAt);
+        }
       });
       socket.on("error", (error) => {
         if (!opened) reject(error);
@@ -293,7 +396,9 @@ Optional environment variables:
       });
       socket.on("close", (code, reason) => {
         clearInterval(ping);
+        if (staleCheck) clearInterval(staleCheck);
         sockets.delete(socket);
+        health.closes += 1;
         sink.write(`${spec.id}-session`, { event: "close", code, reason: reason.toString() });
         resolve();
       });

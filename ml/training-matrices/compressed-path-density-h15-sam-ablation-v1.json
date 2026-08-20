@@ -1,0 +1,11 @@
+{
+  "id": "compressed-path-density-h15-sam-ablation-v1",
+  "label": "Compressed 15-step path density · SAM ablation · 512k clean · EMA 4 epochs",
+  "runIds": [
+    "compressed-path-density-h15-q128-256-512cap-feature59-train512k-sam5e2-ema4-v1",
+    "compressed-path-density-h15-q128-256-512cap-feature59-train512k-ema4-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/compressed-path-density-h15-sam-ablation-v1/PAUSE"
+  }
+}

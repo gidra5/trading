@@ -347,6 +347,36 @@ def sample_each_point_cloud_component(
     return result, np.repeat(np.arange(count, dtype=np.int64), samples_per_component)
 
 
+def select_nonredundant_point_cloud_centers(
+    centers: np.ndarray,
+    weights: np.ndarray,
+    retained_count: int,
+) -> np.ndarray:
+    """Return indices that preserve mass and isolated coverage while pruning centers."""
+    centers = _matrix(centers)
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.shape != (centers.shape[0],):
+        raise ValueError("point-cloud center weights are inconsistent")
+    if not 1 <= retained_count <= centers.shape[0]:
+        raise ValueError("retained center count is outside the available range")
+    if retained_count == centers.shape[0]:
+        return np.arange(centers.shape[0], dtype=np.int64)
+    tree = cKDTree(centers)
+    distances = tree.query(centers, k=2, workers=-1)[0][:, 1]
+    positive = distances[distances > 0]
+    distance_floor = (
+        float(np.quantile(positive, 0.05)) * 0.1
+        if positive.size else np.finfo(np.float64).eps
+    )
+    isolation = np.maximum(distances, distance_floor)
+    normalized_weights = np.maximum(weights, np.finfo(np.float64).tiny)
+    # Low-mass centers close to another center have the lowest first-order
+    # removal cost. Isolated tail centers survive despite their low mass.
+    removal_cost = normalized_weights * isolation * isolation
+    retained = np.argpartition(removal_cost, -retained_count)[-retained_count:]
+    return np.sort(retained.astype(np.int64))
+
+
 def conditional_operation_metrics(
     reference_values: np.ndarray,
     approximation_values: np.ndarray,

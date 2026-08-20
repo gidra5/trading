@@ -401,6 +401,24 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
         prediction.square().mean().backward()
         self.assertIsNotNone(model.layers[1].weight.grad)
 
+    def test_training_position_normalization_accepts_augmented_features(self) -> None:
+        feature_count = 178
+        model = NormalizedGluNextReturn(
+            torch.zeros(feature_count),
+            torch.ones(feature_count),
+            torch.tensor(0.0),
+            torch.tensor(1.0),
+            widths=(16, 16, 16, 16),
+            learnable_centering=False,
+            dropout=0,
+        )
+        self.assertEqual(model.feature_count, feature_count)
+        self.assertEqual(model.layers[0].in_features, feature_count)
+        prediction = model(torch.randn(7, feature_count))
+        self.assertEqual(prediction.shape, (7,))
+        with self.assertRaisesRegex(ValueError, "feature_count"):
+            model(torch.randn(7, HISTORY_RETURN_COUNT))
+
     def test_centering_can_be_fixed_at_the_canonical_projector(self) -> None:
         model = NormalizedGluNextReturn(
             torch.zeros(HISTORY_RETURN_COUNT),

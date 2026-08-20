@@ -1,0 +1,56 @@
+{
+  "id": "next-return-production-basis-density-4l-65k-k256-v1",
+  "label": "Production-basis distribution - four-layer width-512 next-1s GLU - 65k clean examples - 256 fixed global knots - NLL",
+  "datasetDir": "data/training/datasets/next-return-production-basis-4l-65k-v1",
+  "runDir": "data/training/runs/next-return-production-basis-density-4l-65k-k256-v1",
+  "datasetFilter": {
+    "type": "exclude-exact-zero-target-return",
+    "appliesTo": ["normalization", "training", "validation", "test"],
+    "comparison": "float32-exact-zero-after-log-return-construction"
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": "256",
+    "knotCount": 256,
+    "returnCount": 1,
+    "transform": "frozen-asinh-logistic",
+    "basis": "normalized-piecewise-linear-triangular",
+    "output": "conditional-log-density-height",
+    "pointForecast": "expectation"
+  },
+  "architecture": {
+    "widths": [512, 512, 512, 512],
+    "dropout": 0.0,
+    "dropoutRate": 0.0,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 4096,
+    "evaluationBatchSize": 8192,
+    "learningRate": 0.0001,
+    "selection": "lowest-validation-return-space-negative-log-likelihood",
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  }
+}

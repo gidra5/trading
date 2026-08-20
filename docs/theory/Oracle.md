@@ -222,13 +222,13 @@ $$V_{t,H}=\log \frac {Q_{t+H}} {Q_t}$$
 We can parametrize further with a "discount" of the return $\gamma$, initial holding time $H$, and action delay time $D$ and get these equations for the oracle value recursion $V_{t,H,T}$:
 $$
 \begin{aligned}
-V_{t,0}(x)&=\log R_t(x\to0)\\
-V_{t,k}(x)&=\max\limits_{e\in E}
-\left[
-\log R_t(x\to e)+h_{t,D'}(e)+\gamma V_{t+D',k-D'}(e)
-\right],
+V_{t,0}(x\to e)&=\log R_t(x\to0)\\
+V_{t,k}(x\to e)&=
+\log R_t(x\to e)+h_{t,D'}(e)+\gamma V_{t+D',k-D'}(e),
 \quad D'=\min(D,k)\\
-V_{t,H,T}(e)&=h_{t,H'}(e)+V_{t+H',T-H'}(e),
+V_{t,H,T}(e)&=h_{t,H'}(e)+\max\limits_{e'\in E}
+\left[V_{t+H',T-H'}(e\to e')
+\right],
 \quad H'=\min(H,T)
 \end{aligned}
 $$
@@ -259,21 +259,47 @@ Now to the transition distribution. Its effective behavior is mostly described b
 
 First, market changes and portfolio changes are independent, and further more market changes are independent of our actions. Returns and portfolio changes are deterministic in terms of the changes to the state and action. The order state changes are not deterministic in market change/action, essentially because it is not guaranteed to execute fully even if price actually touched it. That suggests the following composition:
 $$
-p(s', r | s, a)=p_{m}(s_m'|s_m)p_{o}(s_o'|s_o, a_o, s_m')\delta_{s_p'}\delta_r
+p(s_{t+1}, r_{t} | s_t, a_t)=p_{m}(s_{m,t+1}|s_{m,t})p_{o}(s_{o,t+1}|s_{o,t}, a_{o,t}, s_{m,t+1})\delta_{s_{p,t+1}}\delta_{r,t}
 $$
-$$s_p'=F(s_p, a_p)$$
-$$r=R(\Delta s_m, \Delta s_p)$$
+$$s_{p,t+1}=F(s_{p,t}, a_{p,t})$$
+$$r_{t}=R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})$$
 The delta terms correspond to the two deterministic components, while others correspond to market and order dynamics.
+
+Note that F in a sense is also a part of policy - we are free to choose any such function, since portfolio is inert. We define what actions are available for managing the portfolio in particular and how do they change it.
+For simplicity lets assume that $a_{p,t}$ is equal to $\Delta s_{p,t}$, which means $s_{p,t+1}=s_{p,t} + a_{p,t}$ in a sense.
 
 Next lets consider score. It is a simple weighted sum of returns we got. Since returns are deterministic, the score is also deterministic. The weight can describe two useful characteristics - validity of current estimates and value of immediate returns vs delayed ones. Thus we get the following for the score:
 $$g_t=r_t+\gamma w_{t+1} g_{t+1}$$
 For a perfect trader both $\gamma$ and $w_{t+1}$ are 1, but once we get into approximation/training realm, these might become more useful.
 
+For now lets assume both 1 for simplicity.
+
 Next is action value function. From definition, it describes expected score given state and action. Since returns are deterministic that reduces to exact score:
+$$\begin{aligned}
+q(s_t, a_t)&=\sum_{s'\in\mathcal S, r\in\mathcal R} p(s',r\ |\ s, a)[r+ w(s')*\sum_{a\in\mathcal A(s)} \pi(a\ |\ s')q(s',a)]
+\\
+&=\sum_{s_{m,t+1}\in\mathcal S_m, s_{o,t+1}\in\mathcal S_o} \sum_{a_{o,t+1}\in\mathcal A(s_{o,t+1}),a_{p,t+1}\in\mathcal A(s_{o,t+1})}p_{m}(s_{m,t+1}|s_{m,t})p_{o}(s_{o,t+1}|s_{o,t}, a_{o,t}, s_{m,t+1})[R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})+\pi(a_{t+1}\ |\ s_{m,t+1}, s_{o,t+1})q(s_{t+1},a_{t+1})]
+\end{aligned}$$
+
+Assume we ignore limit orders, then our q function simplifies:
+$$\begin{aligned}
+q(s_t, a_t)
+&=\sum_{s_{m,t+1}\in\mathcal S_m} \sum_{a_{t+1}\in\mathcal A}p_{m}(s_{m,t+1}|s_{m,t})[R(\Delta s_{m,t}, \Delta s_{p,t})+\pi(a_{t+1}\ |\ s_{m,t+1})q(s_{t+1},a_{t+1})]
+\end{aligned}$$
+
+Then whats left to define is the $R$ function that defines the resulting return from advancing in time given the change in market, orders and taken action. And that is mostly what we already defined beforehand implicitly through transition rules. Thus we can defined it simply as:
 $$
-q(s, a)=\mathbb{E}[G_t\ |\ s, a]=\sum_{s'\in\mathcal S, r\in\mathcal R} p(s',r\ |\ s, a)[r+w*v(s')]
-$$
-# Policy
+R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})=\Delta \log Q_t=\Delta V_{t}=\log R_t(x\to e)+h(e,\Delta s_{m,t})$$
+Where $x \to e$ is part of $\Delta s_{p,t}$, and $h$ is basically $h_{t,T,H}$ derived from market changes.
+
+We can split market state into price $p_t$, trend $t_t$, volatility $v_t$ and latent market state $s_{l,t}$. And actions can be identified by target exposure, as we discussed earlier. These two changes make sums into integrals:
+$$\begin{aligned}
+q(s_t, a_t)
+&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E}\int_{\log p\in \mathbb R}dp\ da\ p_{m}(s_{l,t+1}, p|s_{l,t}, p_t)[R(p-p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{l,t+1}, p_{t+1})q(s_{t+1},a)]
+\\
+&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E}\int_{\log p\in \mathbb R}dp\ da\ p_{m}(p|s_{l,t}, p_t)p_{m}(s_{l,t+1}|s_{l,t}, p, p_t)[R(p-p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{l,t+1}, p_{t+1})q(s_{t+1},a)]
+\end{aligned}$$
+# Perfect Policy
 We define policy as a distribution over all possible current and target exposures:$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)de}$$Where $R_{t,T}$ is a return from moving to the exposure $e$. The return itself is defined simply as oracle value minus transition cost:$$\begin{aligned}
 R_{t,T}(e_t\to e)=V_{t,T}(e)-C_t(e_t\to e)
 \end{aligned}$$

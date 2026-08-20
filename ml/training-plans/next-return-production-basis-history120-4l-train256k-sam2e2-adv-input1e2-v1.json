@@ -1,0 +1,60 @@
+{
+  "id": "next-return-production-basis-history120-4l-train256k-sam2e2-adv-input1e2-v1",
+  "label": "Production-basis temporal features - 120s x 59 channels - four-layer width-512 next-1s GLU - 256k clean train - SAM rho 0.02 + input-only adversarial epsilon RMS 0.01",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train256k-v1",
+  "runDir": "data/training/runs/next-return-production-basis-history120-4l-train256k-sam2e2-adv-input1e2-v1",
+  "architecture": {
+    "widths": [512, 512, 512, 512],
+    "dropout": 0.0,
+    "dropoutRate": 0.0,
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 4096,
+    "evaluationBatchSize": 4096,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": {
+      "type": "sharpness-aware-minimization",
+      "rho": 0.02,
+      "adaptive": false,
+      "gradientNorm": "global-l2",
+      "perturbationUnit": "optimizer-update",
+      "baseObjective": "clean-plus-adversarial-input"
+    },
+    "adversarialInput": {
+      "type": "projected-gradient-ascent",
+      "space": "training-feature-normalized-input",
+      "norm": "rms-l2",
+      "epsilonRms": 0.01,
+      "steps": 1,
+      "stepSizeRms": 0.01,
+      "randomStart": false,
+      "adversarialWeight": 0.5,
+      "target": "unchanged-next-return",
+      "regenerateAtSamPerturbedWeights": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  }
+}

@@ -4,7 +4,7 @@ Generated 2026-08-17T12:21:06.874Z. This is the canonical inventory for external
 
 ## Outcome
 
-The requested list is fully enumerated. Public backfills, matched crypto minute histories, and ten synchronized monthly quote/liquidation samples have been measured. Selected: 3; provisional: 3; rejected: 2; collecting live: 6; proxy-only: 1; credential-required: 1. There is no generic awaiting-data bucket.
+The requested list is fully enumerated. Public backfills, matched crypto minute histories, ten synchronized monthly quote/liquidation samples, and the first causal live fast-feature block have been measured. Selected: 3; provisional: 4; rejected: 2; collecting live: 6; proxy-only: 1; credential-required: 2. There is no generic awaiting-data bucket. Cross-exchange books, Binance BTC liquidations, Deribit perpetual trade flow, and Deribit option-trade flow are now explicitly **measured-early**, not "to be checked"; collection continues only to confirm or overturn the one-regime result.
 
 The matched 15m neural test remains negative: adding all 231 existing forward inputs changed validation objective from 2.6894290 to 2.6957000 (0.233% worse). This is why the basis must be selected conditionally instead of concatenating every candidate.
 
@@ -29,8 +29,22 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 | family | provisional lookback | reason |
 |---|---|---|
 | Spot order additions, cancellations, and executions | latest synchronized update, 1s, 5s | 0.0058477776 primary and 0.020244919 transfer bits/target for the snapshot OFI proxy; one of four chronological blocks is negative. |
-| Cross-exchange spot and perpetual books | Coinbase trailing return 5s, Coinbase realized volatility 5m | Sparse monthly samples show stable cross-venue information through 1m: Coinbase 5s trailing return adds 0.017814736 primary / 0.018444009 transfer bits at the 1s target; Coinbase 5m realized volatility adds 0.013721870 / 0.0060156912 at 1m. No cross-venue feature was stable at 5m or longer. |
-| Liquidations and liquidation bursts | 15m count for 1s/5s targets, 1h count for 15s/1m targets | Zero-aware sparse-sample bins show stable liquidation-count information through 1m: a 15m count adds 0.0070383517 primary / 0.0075641338 transfer bits for 1s, and a 1h count adds 0.0071318950 / 0.0061818179 for 1m. No liquidation feature was stable at 5m or longer. |
+| Cross-exchange spot and perpetual books | Coinbase trailing return 5s, Coinbase realized volatility 5m; live 1s depth churn and 5s–60s book state | Sparse monthly samples show stable cross-venue information through 1m. The first causal live block also found 12 strict early effects, led by Binance displayed-depth churn at +0.023151, +0.025787, and +0.033485 bits/target for 5s, 15s, and 1m. This is measured-early evidence, not production promotion. |
+| Liquidations and liquidation bursts | 15m count for 1s/5s targets, 1h count for 15s/1m targets | Sparse monthly samples show stable liquidation-count information through 1m. In the first causal live block, none of 48 BTC-liquidation feature/horizon pairs met the strict early-effect rule; the best count result was +0.022600 bits/target at 15s but had a -0.009786 lower block bound and only 4/6 positive blocks. This is an inconclusive measured result, not an untested family or a rejection. |
+| Global macro-market state | previous available release; 1/5/21 daily, 1/3/12 monthly, 1/4 quarterly, and policy-event changes | The expanded 36-series screen covers the US, euro area, UK, China, Japan, India, and Russia. Some US/UK/euro/China coordinates pass the recent discovery split, but every candidate fails the 2021-2026 long-window test. Keep only as a gated rolling-regime experiment. |
+
+## Measured live early — no longer awaiting a first test
+
+The following checkpoint is frozen at **29.701 observed target hours**. Compact cross-exchange books cover **20.155 hours / 72,268 rows**; the event feeds contain **1,235 BTCUSDT liquidations**, **91,227 Deribit perpetual trades**, and **13,306 Deribit option trades**. The first 60% of the interval trains the categorical density and the last 40% evaluates it in six chronological blocks. It is only one contiguous market regime, the search is exploratory and not multiple-testing adjusted, and each feature is tested against a small return/volatility baseline rather than the complete production basis.
+
+| family | tested pairs | checkpoint result | disposition now |
+|---|---:|---|---|
+| Cross-exchange books and displayed-depth flow | 160 clean pairs | 12 strict early effects and 22 consistently weak rows; strongest robust pattern is Binance depth churn, with smaller L1-imbalance and cross-venue-dispersion effects | measured-early, provisional positive; keep for joint ablation |
+| Deribit perpetual trade flow | 48 | 18 strict early effects; 15s trade count to the 1m target adds +0.051094 bits/target with a +0.004624 lower block bound and 6/6 positive blocks | measured-early, provisional positive; strongest live family |
+| Binance BTC liquidation flow | 48 | no strict early effect; four consistently weak rows; best count row is positive but unstable | measured-early, inconclusive; do not add to the current basis |
+| Deribit option-trade flow | 48 | no strict early effect; 15 consistently weak rows; best count row is +0.016507 bits/target at 1s with a -0.005075 lower bound | measured-early, inconclusive; do not add to the current basis |
+
+These statuses concern the fast trade/book streams only. Full option-surface IV/skew/term-structure/OI features, GDELT, and true mempool state remain separate low-cadence families whose first useful chronological test still needs more observations. Full checkpoint details are in `docs/experiments/live-fast-feature-early-screen-2026-08-19.md`; automated 3-day and 7-day reruns are confirmation tests, not the first measurement.
 
 ## Unresolved evidence, classified
 
@@ -38,7 +52,7 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 |---|---:|---|
 | collecting-live | 6 | Causal collection is active, but there is not yet a separated continuous-history test block. |
 | proxy-only | 1 | Public historical proxies were tested; the exact requested point-in-time series remains unavailable. |
-| credential-required | 1 | The exact historical series requires a vendor key or licensed data. |
+| credential-required | 2 | The exact historical series requires an exchange/vendor key or licensed data. |
 
 ## Complete feature inventory
 
@@ -46,9 +60,10 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 |---|---|---|---|---|
 | Spot order additions, cancellations, and executions | live-local | provisional | raw event, 1s, 2s, 5s, 15s, 30s, 1m | 0.0058477776 primary and 0.020244919 transfer bits/target for the snapshot OFI proxy; one of four chronological blocks is negative. |
 | Spot queue imbalance and microprice | live-local | selected | latest fresh snapshot, 1s, 2s, 5s, 15s, 1m | 0.014954081 primary and 0.022972245 transfer bits/target for L1 quantity imbalance, positive in 4/4 sub-blocks. |
-| Cross-exchange spot and perpetual books | historical-and-live | provisional | raw event, 1s, 2s, 5s, 15s, 30s, 1m | Sparse monthly samples show stable cross-venue information through 1m: Coinbase 5s trailing return adds 0.017814736 primary / 0.018444009 transfer bits at the 1s target; Coinbase 5m realized volatility adds 0.013721870 / 0.0060156912 at 1m. No cross-venue feature was stable at 5m or longer. |
-| Liquidations and liquidation bursts | historical-and-live | provisional | 1s, 5s, 15s, 1m, 5m, 15m, 30m, 1h | Zero-aware sparse-sample bins show stable liquidation-count information through 1m: a 15m count adds 0.0070383517 primary / 0.0075641338 transfer bits for 1s, and a 1h count adds 0.0071318950 / 0.0061818179 for 1m. No liquidation feature was stable at 5m or longer. |
-| Futures premium, basis, funding, and spot/perpetual disagreement | historical-local | rejected | 1m, 2m, 5m, 15m, 30m, 1h, 4h | Basis level added -0.018264236 primary bits/target; no positioning feature was stable. Futures log trade count, not premium, was strongest at 0.031064383. |
+| Cross-exchange spot and perpetual books | historical-and-live | provisional; measured-early | raw event, 1s, 2s, 5s, 15s, 30s, 1m | Sparse monthly evidence is positive through 1m. The 20.155h live-book checkpoint found 12 strict early effects, led by Binance depth churn at 5s–1m. Historical Kraken rows are excluded because only 69.8% were structurally valid before the 2026-08-19 reconstruction fix. |
+| Liquidations and liquidation bursts | historical-and-live | provisional; measured-early | 1s, 5s, 15s, 1m, 5m, 15m, 30m, 1h | Sparse monthly samples are positive through 1m, but the 29.701h causal live checkpoint found no strict winner among 48 pairs. Retain the prior provisional status pending confirmation rather than treating this family as untested or rejected. |
+| Deribit perpetual and option trade flow | live-local | measured-early | 1s, 5s, 15s, 1m | Perpetual activity produced 18/48 strict early effects; option-trade flow produced 0/48. These are one-regime results from 91,227 perpetual and 13,306 option trades, respectively. Full option-surface features are a separate family. |
+| Futures premium, basis, funding, and spot/perpetual disagreement | historical-local | rejected | last settlement; 1, 3, 9, 21, 90 settlements; 1m, 2m, 5m, 15m, 30m, 1h, 4h | 5,919 official BTCUSDT funding settlements plus local basis/metrics were tested. No funding transformation was stable in either the recent or 2021-2026 screen; the best long-window scores were negative at every 1m-1h target. Futures log trade count, not premium, remained the useful derivative-market activity feature. |
 | Spot aggressor flow and trade sequence | historical-local | selected | raw event, 1s, 2s, 5s, 15s, 30s, 1m | Last aggressor side adds 0.12525481 primary and 0.10207176 transfer bits/target at 1s; 0.087281126 at age 2s and -0.0046537989 at age 3s. |
 | Cross-market returns, volatility, and lead/lag | historical-local | selected | 1s, 2s, 5s, 15s, 30s, 1m, 2m, 5m, 15m, 30m, 1h, 4h | ETH realized volatility adds 0.069524 primary / 0.036094 transfer bits at a 30m lookback for the 1m target; a 60m lookback adds 0.026971 / 0.017613 at 5m and 0.010539 / 0.005732 at 15m. The gain is magnitude information; no feature was stable at 30m or 1h. |
 | ATM implied volatility and DVOL | free-backfill | collecting-live | 1m, 2m, 5m, 15m, 30m, 1h, 4h | All 17 DVOL level/change/implied-realized candidates failed stability from 5m through 1h; historical ATM surface features remain unavailable and are accumulating live. |
@@ -57,6 +72,8 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 | Option OI, major strikes, and expiration pressure | live-local | collecting-live | current surface, 5m change, 15m change, 1h change, 4h change, 1d change | Not yet measured: the first point-in-time OI surface exists, but a chronological test block does not. |
 | News events, GDELT intensity, and sentiment shocks | live-local | collecting-live | 5m decay, 15m decay, 30m decay, 1h decay, 4h decay | Not yet measured: the DOC proxy was excluded because HTTP 429 throttling stopped it before the primary/transfer span completed. Point-in-time GDELT collection remains active. |
 | Scheduled macro events and standardized surprises | paid-pit | credential-required | pre-event 4h, pre-event 1h, post 1m, post 5m, post 15m, post 30m, post 1h | Not measured. |
+| Global macro-market state and slow economic levels | free-backfill | provisional | latest value/age; 1d, 5d, 21d daily changes; 1/2/4 policy events; 1m, 3m, 12m monthly changes; 1q, 4q GDP changes | 21,715 observations across 36 US, euro-area, UK, China, Japan, India, and Russia series were tested as 309 transformations. Recent euro 2y, UK production, and China CPI shocks were positive discovery candidates, but every macro candidate failed the 2021-2026 long-window stability test. |
+| Binance spot-margin borrow rates | signed-api | credential-required | latest daily BTC and USDT rates; 1d, 7d, 30d changes/means; long-minus-short cost spread | The official history endpoint requires a signed USER_DATA request. No configured Binance key is available, so no borrow-rate result is claimed. |
 | Exchange, whale, miner, ETF, and treasury flows | historical-local | proxy-only | 1h, 4h, 1d, 3d, 7d, 30d | No exchange, whale, miner, funding, OI, liquidation, premium, or stablecoin-flow coordinate was stable at 15m, 30m, or 1h. The test is retrospective and ETF/treasury point-in-time histories remain unavailable. |
 | Live Bitcoin mempool pressure | live-local | collecting-live | 1m, 2m, 5m, 15m, 30m, 1h, 4h | All 36 mined-block fee/size/reward proxy candidates failed stability at 15m–1h. True unconfirmed-mempool snapshots are accumulating live for a later test. |
 | Slow futures percentage-depth snapshots | historical-local | rejected | latest 30s snapshot, 1m, 5m, 15m | Best full-distribution result was -0.0015874785 primary bits/target and was unstable. |
@@ -91,7 +108,7 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 - Target horizons: 1s, 5s, 15s, 1m, 5m.
 - Timing: Use receive time for every venue and require a maximum age per venue.
 - Leakage risk: Exchange clocks are not directly comparable; event-time joins create false lead/lag unless receive-time latency is retained.
-- Decision: **provisional**. Sparse monthly samples show stable cross-venue information through 1m: Coinbase 5s trailing return adds 0.017814736 primary / 0.018444009 transfer bits at the 1s target; Coinbase 5m realized volatility adds 0.013721870 / 0.0060156912 at 1m. No cross-venue feature was stable at 5m or longer.
+- Decision: **provisional; measured-early**. Sparse monthly samples show stable cross-venue information through 1m. The first causal live checkpoint used 20.155h of compact books and found 12 strict early effects, led by Binance depth churn at 5s–1m. Historical Kraken-derived scores are excluded because only 69.8% of its compact rows were structurally valid before the 2026-08-19 fix.
 
 ### Liquidations and liquidation bursts
 
@@ -101,17 +118,17 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 - Target horizons: 1s, 5s, 15s, 1m, 5m, 15m, 30m, 1h.
 - Timing: Timestamp by exchange event and local receive time; fit transforms on training history only.
 - Leakage risk: Binance's stream reports only the latest liquidation per symbol in each 1s window, so it is censored burst data.
-- Decision: **provisional**. Zero-aware sparse-sample bins show stable liquidation-count information through 1m: a 15m count adds 0.0070383517 primary / 0.0075641338 transfer bits for 1s, and a 1h count adds 0.0071318950 / 0.0061818179 for 1m. No liquidation feature was stable at 5m or longer.
+- Decision: **provisional; measured-early but inconclusive live**. Zero-aware sparse monthly bins show stable liquidation-count information through 1m. The 29.701h causal live checkpoint contained 1,235 BTCUSDT events and produced no strict early winner among 48 pairs. This does not reverse the sparse historical result, but it prevents treating the live family as either untested or confirmed.
 
 ### Futures premium, basis, funding, and spot/perpetual disagreement
 
-- Source: [Existing Binance spot and USD-M 1m histories plus 5m positioning metrics](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api)
-- History: 2025-03-18..2025-11-13 plus 2026-04-21..2026-06-23
-- Candidate features: basis level, basis change, basis EMA deviation, relative spot/futures return, funding level/change, premium z-score, spot/futures activity ratio.
+- Source: [Official Binance USD-M funding-rate history plus existing spot/USD-M 1m histories and 5m positioning metrics](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Get-Funding-Rate-History)
+- History: 5,919 BTCUSDT settlements from 2021-03-24 through 2026-08-17; local price/basis blocks cover 2025-03-18..2025-11-13 plus 2026-04-21..2026-06-23
+- Candidate features: last settled rate, absolute rate, settlement age, changes and signed/absolute means over 1/3/9/21/90 settlements, basis level/change/EMA deviation, relative spot/futures return, premium z-score, spot/futures activity ratio.
 - Target horizons: 1s, 1m, 5m, 15m, 30m, 1h.
 - Timing: A futures minute becomes usable only after close; 5m metrics retain a full 5m lag.
 - Leakage risk: Repeated 5m values reduce effective sample size.
-- Decision: **rejected**. Basis level added -0.018264236 primary bits/target; no positioning feature was stable. Futures log trade count, not premium, was strongest at 0.031064383.
+- Decision: **rejected**. No settled-funding transformation was stable in either the recent or long-history screen. In the long screen the best full-distribution increments were -0.030384, -0.050337, -0.059803, -0.060808, and -0.023782 bits/target at 1m, 5m, 15m, 30m, and 1h. This does not test the pre-settlement predicted next rate. Futures log trade count, not premium, was strongest at 0.031064383 in the derivatives activity layer.
 
 ### Spot aggressor flow and trade sequence
 
@@ -193,6 +210,26 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 - Leakage risk: Today's revised previous value and final consensus must never replace what was displayed before a historical release.
 - Decision: **credential-required**. Not measured.
 
+### Global macro-market state and slow economic levels
+
+- Sources: [FRED](https://fred.stlouisfed.org/), the [ECB Data Portal](https://data.ecb.europa.eu/), the [OECD SDMX API](https://www.oecd.org/en/data/insights/data-explainers/2024/09/api.html), [Bank of England Bank Rate](https://www.bankofengland.co.uk/boeapps/database/Bank-Rate.asp), and [Bank of Russia key-rate/inflation histories](https://www.cbr.ru/eng/hd_base/KeyRate/).
+- Coverage: 21,715 observations across 36 series for the US, euro area, UK, China, Japan, India, and Russia. China includes USD/CNY, CPI, and real-GDP growth; Russia includes official key-rate decisions and inflation. The long validation fits 2021-08-01..2024-12-31, tests both halves of 2025, and transfers to 2026-04-21..2026-06-23.
+- Availability boundary: China's NBS National Data interface exposes richer official domestic statistics, but its undocumented query endpoint is not reproducibly accessible from this environment; no blocked or malformed response is retained. Current OECD China aggregates are used instead. Current Russian GDP/industrial backfills were not available from the tested intergovernmental feeds, so the Russia branch is limited to official CBR rate and inflation data rather than silently substituting stale observations.
+- Candidate features: last level, explicit release age, raw/absolute changes, and positive-series log growth over 1/5/21 daily observations, 1/2/4 policy decisions, 1/3/12 monthly observations, and 1/4 quarterly observations.
+- Target horizons: 1m, 5m, 15m, 30m, 1h.
+- Timing: Daily observations are delayed one day, monthly observations 40-50 days from period start, and quarterly GDP 150 days from quarter start. These conservative fixed lags prevent obvious period leakage but do not recreate historical revision vintages.
+- Effective sample: the recent fit has about 130 changing Treasury/dollar observations but only 6 monthly and 2 quarterly releases. The long fit has roughly 1,249 daily target origins, about 41 monthly releases, and only about 14 quarterly releases.
+- Recent discovery result: euro-area 2y-yield shocks are stable marginally at 30m and selected at 1h; UK three-month industrial-production change is selected at 15m; China one-month absolute CPI change is a stable marginal 1h candidate but adds nothing after the stronger selected coordinate. Japan, India, and Russia have no three-block recent winner.
+- Decision: **provisional rolling-regime experiment only**. No macro candidate survives when trained on 2021-2024 and required to work in both 2025 halves and the 2026 transfer block. The 309 correlated transformations also create substantial multiple-testing risk. Do not add GDP/CPI/policy levels to the required 1m-1h tensor.
+
+### Binance spot-margin borrow rates
+
+- Source: [Binance margin interest-rate history](https://developers.binance.com/docs/margin_trading/borrow-and-repay/Query-Margin-Interest-Rate-History).
+- Required series: USDT daily interest rate (cost of a margin long), BTC daily interest rate (cost of a margin short), their change/rolling means, and a side-aligned borrow-cost spread.
+- Timing: Query values strictly available before the prediction timestamp; retain VIP level because the returned rate is account-tier dependent.
+- Access: the endpoint is signed USER_DATA and permits at most one month per request. The current environment has no configured Binance API key/secret, so it cannot be backfilled or scored yet.
+- Decision: **credential-required, not measured**. Borrow cost may matter more to position economics than to the physical next-return distribution; once accessible, score both density information and net post-financing strategy value.
+
 ### Exchange, whale, miner, ETF, and treasury flows
 
 - Source: [Coin Metrics network data; CryptoQuant/Glassnode labeled flows; issuer ETF holdings; SEC filings](https://docs.coinmetrics.io/api/v4/)
@@ -228,13 +265,13 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 - `npm run fetch:research-forward-market -- --ranges 2026-07-18..2026-08-16` rebuilds the research-only spot-flow and Binance derivatives layer without touching the sealed oracle corpus. Official SHA-256 checksums are verified and source ZIPs are discarded after reduction.
 - `npm run fetch:gdelt-history` builds the reduced 15-minute retrospective crypto-news count/tone proxy in sub-72-hour API chunks. Missing intervals remain null, HTTP 429 responses back off, and completed chunks are checkpointed before the immutable artifact is written.
 - `npm run analysis:global-feature-basis:export-30d` reconstructs the 147-coordinate common-coverage dataset. `npm run analysis:global-feature-basis -- --input-dir data/runtime-cache/global-feature-basis-30d --output data/benchmarks/global-return-feature-basis-30d.json --report docs/experiments/global-return-feature-basis-30d-2026-08-17.md` reruns the joint search.
-- `npm run fetch:external-public` refreshes the free DVOL, Coin Metrics, community daily, mempool-proxy, and current Deribit surface data.
+- `npm run fetch:external-public` refreshes the free DVOL, VIX, global macro state, official BTCUSDT funding settlements, Coin Metrics, community daily, mempool-proxy, and current Deribit surface data. Use `--source global-macro` or `--source binance-funding` to update only those families.
 - `npm run analysis:external-public` rebuilds the held-out information screen in `docs/experiments/public-external-feature-information-2026-08-17.md` and its machine-readable JSON artifact.
 - `npm run fetch:tardis-samples` streams and reduces the ten free first-of-month cross-venue quote and liquidation samples without retaining raw tick CSV; `npm run analysis:tardis-samples` rebuilds their 1s–1h screen.
-- `npm run collect:external-live` records synchronized exchange, liquidation, premium, Deribit surface, GDELT, and mempool observations under `data/market/mutable/external-live`.
-- `npm run analysis:external-live-early` rebuilds the horizon-aware live readiness, storage, feature-variation, and early held-out likelihood screen. The active watcher records immutable 1h and 24h checkpoints as collection reaches them.
+- `npm run collect:external-live:start` starts synchronized exchange, liquidation, premium, Deribit surface, GDELT, and mempool collection under a restart supervisor. Use `collect:external-live:status` and `collect:external-live:stop` for operations; the unsuffixed command remains the foreground/debug form.
+- `npm run analysis:external-live-early` rebuilds the horizon-aware live readiness, storage, feature-variation, and early held-out likelihood screen. Coverage and watcher checkpoints are based on observed target seconds, not process wall-clock age.
 - The concrete model tensor, horizon routing, causal lookbacks, and selected/provisional/excluded split are summarized in `docs/experiments/recommended-model-input-basis-2026-08-17.md`.
-- Live JSONL is stored as concatenated complete gzip members. Each source flushes at least once per second, so files remain readable while the collector runs and a crash loses at most the current in-memory chunk.
+- Live JSONL is stored as concatenated complete gzip members. Each source flushes at least once per second, so files remain readable while the collector runs and a crash loses at most the current in-memory chunk. Normal collection compacts high-frequency books to causal 1-second rows; full book messages require the explicit diagnostic `--raw-books` flag.
 - Set `TRADING_ECONOMICS_API_KEY` for point-in-time macro consensus and `BLOCKWORKS_API_KEY` for ETF flows. Every public source operates without credentials.
 
 ## Acquisition blockers recorded
@@ -242,15 +279,16 @@ This backfill does not manufacture unavailable history. Continuous cross-exchang
 - Binance no longer publishes its historical liquidationSnapshot archive. Ten free first-of-month Tardis samples now provide sparse event evidence; continuous history still requires a vendor or new live collection.
 - Ten free first-of-month Tardis quote samples now cover synchronized Binance, Coinbase, Kraken, and Deribit top-of-book state. Continuous L2/L3 books and complete historical Deribit option surfaces remain vendor datasets.
 - Binance's public BTCUSDT option EOHSummary archive ends on 2023-10-23, so it cannot provide a recent 30-day surface substitute; current BVOL index data remains available but does not contain strike/delta/OI structure.
-- Macro consensus forecasts need a point-in-time calendar vendor. Official BLS/FRED data supplies actuals and revisions but not historical pre-release consensus.
+- Macro consensus forecasts need a point-in-time calendar vendor. Official FRED/ECB/OECD/BoE/CBR data supplies actuals and current revisions but not historical pre-release consensus.
 - CryptoQuant documents that exchange-wallet clustering revisions make its historical exchange-flow endpoint non-point-in-time.
-- The current environment has no Databento, Trading Economics, Blockworks, Glassnode, CryptoQuant, or FRED credentials.
-- Live point-in-time collection is now running. Order events, option surfaces, GDELT, and true mempool state still need enough forward history before a continuous-history impact test is possible.
+- The current environment has no Databento, Trading Economics, Blockworks, Glassnode, CryptoQuant, or Binance signed USER_DATA credentials. Global official macro levels and Binance settled funding are public and have been backfilled without credentials.
+- Binance margin borrow-rate history requires a signed API key and only accepts a one-month range per request. It remains credential-required; no substitute series is stored as if it were the Binance rate.
+- Live point-in-time collection is running under a restart supervisor as of 2026-08-18. The first interrupted archive contains 9.598 observed hours, not the previously reported 24 hours. Repair details are in `docs/experiments/live-external-collection-repair-2026-08-18.md`. Fast books/order events, BTC liquidation flow, and Deribit perpetual/option trade flow have since received their first causal screen at the 29.701h target / 20.155h book checkpoint. Full option surfaces, GDELT, and true mempool state still need enough forward history for their first useful low-cadence test.
 
 ## Live evidence timing and retention
 
 - One hour is a feed-health and very-large-effect smoke test for 1s–15s targets, not a feature rejection window.
-- One day is the first early screen for 1s–1m targets. It is still one market regime, so a negative score alone does not justify deletion.
+- One day is the first early screen for 1s–1m targets. That screen is now complete for fast books and trade/event flows. It is still one market regime, so a negative score alone does not justify deletion.
 - GDELT has about 96 observations/day; use at least seven separated days for its first screen. A 1h target has only 24 non-overlapping outcomes/day and needs roughly 30–90 days.
 - The unresolved options, premium, GDELT, and mempool feeds are low-volume. The raw exchange books dominate storage; compact those to causal 1s derived state after reconstruction tests instead of cutting the slow candidates early.
 

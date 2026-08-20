@@ -227,17 +227,17 @@ ML model based on MLP:
    4. JEPA
    5. BYOL
    6. FixMatch?
-6. output calibration +, can be ran online
+6. output calibration +, can be ran online. 64k online per-step affine seems to be the best
 7. sam +, very effective, many followups
    1. late training sam
    2. gradual reduction/increase of sam rate (schedule)
-   3. looksam
+   3. looksam - improve perf by doing sam not every step
    4. esam
    5. layerwise perturb scaling
    6. sam with lookahead
    7. stable sam
    8. overparam for sam
-   9. momentum sam
+   9. momentum sam - reduce double pass of sam to one pass for adamW based optimization
    10. xsam
    11. ed-sam
    12. sampa
@@ -263,6 +263,7 @@ ML model based on MLP:
     8.  and then use them to reconstruct the distribution by interpolation in u space
     9.  that automatically creates inductive bias around which returns are more likely
     10. optimize neg log likelihood loss? Whatever allows for example based training
+    11. Instead of full complex pipeline, we can simply replace with learned linear price coefficients, because that is basically what we get out of that procedure
 12. train a full conditioned path distribution, not simply independent returns
     1.  split into blocks that output distribution of next return given preceding history
     2.  that is directly derived from probability of a given path - p(r_1..r_k|h)=p(r_1|h)p(r_2..r_k|r1, h)
@@ -274,25 +275,29 @@ ML model based on MLP:
 13. adversarial input training + with log return perturbation only
 14. Robust regression loss to avoid exceptional values dominating ~, helps a bit but slower to train, best seems to be huber thing with 0.5-1 delta
 15. cleanup the examples from 0 return cases +
+16. prioritize correlation. train using standardized predictions and targets mse loss.
+
+check how much information is in the feature sets of other assets. 
+higher order model - since we need many mappings (preceding -> next distribution) for all possible combinations of preceding paths, we can output actual 1-layer models, that we then use to sample paths from.
 
 Alternatives:
 1.  PatchTST
-3.  iTransformer, ipatch
-4.  encoder(-decoder)s
-5.  LSTM
-6.  DLinear https://arxiv.org/html/2606.27282v1?utm_source=chatgpt.com https://arxiv.org/abs/2305.10721?utm_source=chatgpt.com https://arxiv.org/html/2403.14587v2 https://arxiv.org/pdf/2205.13504
-7.  TiDE https://arxiv.org/abs/2304.08424
-8.  DUET
-9.  TLOB https://arxiv.org/html/2502.15757v3
-10.  TQNet https://arxiv.org/abs/2505.12917?utm_source=chatgpt.com
-11.  MoE https://proceedings.mlr.press/v238/ni24a.html
-12.  FITS https://arxiv.org/abs/2307.03756?utm_source=chatgpt.com
-13.  TSMixer (https://arxiv.org/pdf/2303.06053, https://arxiv.org/abs/2405.14616?utm_source=chatgpt.com)
-14.  cmos https://proceedings.mlr.press/v267/si25a.html
-15.  sparsetsf https://proceedings.mlr.press/v235/lin24n.html?utm_source=chatgpt.com
-16.  GTR
-17.  DQRN https://arxiv.org/pdf/1807.02787
-18.  EarnHFT https://personal.ntu.edu.sg/boan/papers/AAAI24_EarnHFT.pdf
+2.  iTransformer, ipatch
+3.  encoder(-decoder)s
+4.  LSTM
+5.  DLinear https://arxiv.org/html/2606.27282v1?utm_source=chatgpt.com https://arxiv.org/abs/2305.10721?utm_source=chatgpt.com https://arxiv.org/html/2403.14587v2 https://arxiv.org/pdf/2205.13504
+6.  TiDE https://arxiv.org/abs/2304.08424
+7.  DUET
+8.  TLOB https://arxiv.org/html/2502.15757v3
+9.   TQNet https://arxiv.org/abs/2505.12917?utm_source=chatgpt.com
+10.  MoE https://proceedings.mlr.press/v238/ni24a.html
+11.  FITS https://arxiv.org/abs/2307.03756?utm_source=chatgpt.com
+12.  TSMixer (https://arxiv.org/pdf/2303.06053, https://arxiv.org/abs/2405.14616?utm_source=chatgpt.com)
+13.  cmos https://proceedings.mlr.press/v267/si25a.html
+14.  sparsetsf https://proceedings.mlr.press/v235/lin24n.html?utm_source=chatgpt.com
+15.  GTR
+16.  DQRN https://arxiv.org/pdf/1807.02787
+17.  EarnHFT https://personal.ntu.edu.sg/boan/papers/AAAI24_EarnHFT.pdf
 
 Insufficient margin trades should not happen
 

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { Resolver } from "node:dns/promises";
 import fs from "node:fs/promises";
+import { request as httpsRequest } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -8,9 +10,15 @@ import {
   normalizeCommunityCryptoDaily,
   normalizeCoinMetricsRows,
   normalizeDvolRows,
+  normalizeBinanceFundingRows,
+  normalizeMacroCsv,
+  normalizeMacroHtmlTable,
   normalizeFredVixCsv,
+  type BinanceFundingRateRow,
   type DeribitBookSummary,
   type CommunityCryptoMetricPayload,
+  type MacroRow,
+  type MacroSeriesDefinition,
 } from "./lib/external-public-data.ts";
 
 const DAY_MS = 86_400_000;
@@ -20,6 +28,87 @@ const COIN_METRICS = [
   "FlowOutExNtv", "FlowOutExUSD", "HashRate", "IssTotNtv", "IssTotUSD", "SplyExNtv",
   "SplyExUSD", "TxCnt", "TxTfrCnt", "volume_reported_spot_usd_1d",
 ] as const;
+const fred = (
+  id: string,
+  label: string,
+  economy: string,
+  frequency: MacroSeriesDefinition["frequency"],
+  availabilityLagDays: number,
+): MacroSeriesDefinition => ({
+  id, label, economy, frequency, availabilityLagDays,
+  provider: "Federal Reserve Bank of St. Louis FRED",
+  sourceUrl: `https://fred.stlouisfed.org/series/${id}`,
+});
+const FRED_MACRO_SERIES: MacroSeriesDefinition[] = [
+  fred("DFF", "US effective federal funds rate", "United States", "daily", 1),
+  fred("ECBDFR", "ECB deposit facility rate", "Euro area", "daily", 1),
+  fred("DGS2", "US 2-year Treasury yield", "United States", "daily", 1),
+  fred("DGS10", "US 10-year Treasury yield", "United States", "daily", 1),
+  fred("T10Y2Y", "US 10-year minus 2-year yield spread", "United States", "daily", 1),
+  fred("DTWEXBGS", "Trade-weighted US dollar index", "United States", "daily", 1),
+  fred("BAMLH0A0HYM2", "US high-yield credit spread", "United States", "daily", 1),
+  fred("CPIAUCSL", "US consumer price index", "United States", "monthly", 45),
+  fred("CP0000EZ19M086NEST", "Euro-area consumer price index", "Euro area", "monthly", 45),
+  fred("UNRATE", "US unemployment rate", "United States", "monthly", 40),
+  fred("PAYEMS", "US nonfarm payroll employment", "United States", "monthly", 40),
+  fred("INDPRO", "US industrial production index", "United States", "monthly", 50),
+  fred("GDPC1", "US real GDP", "United States", "quarterly", 150),
+  fred("CLVMNACSCAB1GQEA19", "Euro-area real GDP", "Euro area", "quarterly", 150),
+  fred("JPNRGDPEXP", "Japan real GDP", "Japan", "quarterly", 150),
+  fred("DEXCHUS", "Chinese yuan per US dollar", "China", "daily", 1),
+  fred("IRSTCI01JPM156N", "Japan short-term interest rate", "Japan", "monthly", 45),
+  fred("IRSTCI01INM156N", "India short-term interest rate", "India", "monthly", 45),
+];
+
+const ecb = (id: string, label: string): MacroSeriesDefinition => ({
+  id, label, economy: "Euro area", frequency: "daily", availabilityLagDays: 1,
+  provider: "European Central Bank Data Portal",
+  sourceUrl: id === "ECB_ESTR"
+    ? "https://data.ecb.europa.eu/data/datasets/EST"
+    : "https://data.ecb.europa.eu/data/datasets/YC",
+});
+const ECB_MACRO_SERIES = [
+  { definition: ecb("ECB_ESTR", "Euro short-term rate (€STR)"), key: "EST/B.EU000A2X2A25.WT" },
+  { definition: ecb("ECB_YC_2Y", "Euro-area AAA 2-year yield"), key: "YC/B.U2.EUR.4F.G_N_C.SV_C_YM.SR_2Y" },
+  { definition: ecb("ECB_YC_10Y", "Euro-area AAA 10-year yield"), key: "YC/B.U2.EUR.4F.G_N_C.SV_C_YM.SR_10Y" },
+] as const;
+
+const oecd = (
+  id: string,
+  label: string,
+  economy: string,
+  frequency: MacroSeriesDefinition["frequency"],
+  availabilityLagDays: number,
+  sourceUrl: string,
+): MacroSeriesDefinition => ({
+  id, label, economy, frequency, availabilityLagDays,
+  provider: "OECD Data Explorer SDMX API",
+  sourceUrl,
+});
+const OECD_CPI_FLOW = "OECD.SDD.TPS,DSD_G20_PRICES@DF_G20_PRICES,1.0";
+const OECD_GDP_FLOW = "OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_G20,1.1";
+const OECD_INDUSTRIAL_FLOW = "OECD.SDD.STES,DSD_KEI@DF_KEI,4.0";
+const OECD_CPI_SERIES = [
+  ["CHN", "China"], ["GBR", "United Kingdom"], ["JPN", "Japan"], ["IND", "India"],
+].map(([area, economy]) => ({
+  definition: oecd(`OECD_CPI_YOY_${area}`, `${economy} CPI year-over-year`, economy!, "monthly", 45,
+    `https://data-explorer.oecd.org/vis?fs[0]=Topic%2C1%7CEconomy%23ECON%23%7CPrices%23ECON_PRICES%23`),
+  key: `${area}.M...PA...`,
+}));
+const OECD_GDP_SERIES = [
+  ["CHN", "China"], ["GBR", "United Kingdom"], ["IND", "India"],
+].map(([area, economy]) => ({
+  definition: oecd(`OECD_REAL_GDP_QOQ_${area}`, `${economy} real GDP quarter-over-quarter`, economy!, "quarterly", 150,
+    "https://data-explorer.oecd.org/"),
+  key: `Q.Y.${area}.S1.S1.B1GQ._Z._Z._Z.PC.L.G1.T0102`,
+}));
+const OECD_INDUSTRIAL_SERIES = [
+  ["EA20", "Euro area"], ["GBR", "United Kingdom"], ["JPN", "Japan"], ["IND", "India"],
+].map(([area, economy]) => ({
+  definition: oecd(`OECD_INDUSTRIAL_PRODUCTION_${area}`, `${economy} industrial production index`, economy!, "monthly", 50,
+    "https://data-explorer.oecd.org/"),
+  key: `${area}.M.PRVM.IX.BTE..`,
+}));
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 interface Artifact<T> {
@@ -35,7 +124,7 @@ export async function run(args = process.argv.slice(2)): Promise<void> {
   if (args.includes("--help")) {
     console.log(`Usage: npm run fetch:external-public -- [options]
 
-  --source all|deribit-dvol|cboe-vix|deribit-surface|coinmetrics|mempool|community-crypto
+  --source all|deribit-dvol|cboe-vix|global-macro|binance-funding|deribit-surface|coinmetrics|mempool|community-crypto
   --start YYYY-MM-DD
   --end YYYY-MM-DD
   --output-dir data/market/mutable/external
@@ -53,11 +142,13 @@ export async function run(args = process.argv.slice(2)): Promise<void> {
   const quiet = args.includes("--quiet");
   await fs.mkdir(outputDir, { recursive: true });
   const selected = source === "all"
-    ? ["deribit-dvol", "cboe-vix", "deribit-surface", "coinmetrics", "mempool", "community-crypto"]
+    ? ["deribit-dvol", "cboe-vix", "global-macro", "binance-funding", "deribit-surface", "coinmetrics", "mempool", "community-crypto"]
     : [source];
   for (const item of selected) {
     if (item === "deribit-dvol") await fetchDvol(outputDir, start, end, quiet);
     else if (item === "cboe-vix") await fetchVix(outputDir, start, end);
+    else if (item === "global-macro") await fetchGlobalMacro(outputDir, start, end, quiet);
+    else if (item === "binance-funding") await fetchBinanceFunding(outputDir, start, end, quiet);
     else if (item === "deribit-surface") await fetchDeribitSurface(outputDir, quiet);
     else if (item === "coinmetrics") await fetchCoinMetrics(outputDir, start, end, quiet);
     else if (item === "mempool") await fetchMempool(outputDir, quiet);
@@ -66,9 +157,183 @@ export async function run(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
+async function fetchGlobalMacro(outputDir: string, start: string, end: string, quiet: boolean) {
+  const rows: MacroRow[] = [];
+  const failures: Array<{ id: string; provider: string; error: string }> = [];
+  const attempt = async (
+    definition: MacroSeriesDefinition,
+    load: () => Promise<MacroRow[]>,
+  ): Promise<MacroRow[]> => {
+    try {
+      return await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push({ id: definition.id, provider: definition.provider, error: message });
+      console.warn(`Skipped unavailable macro ${definition.id}: ${message}`);
+      return [];
+    }
+  };
+  const extendedStart = new Date(parseDay(start) - 400 * DAY_MS).toISOString().slice(0, 10);
+  for (const definition of FRED_MACRO_SERIES) {
+    const url = new URL("https://fred.stlouisfed.org/graph/fredgraph.csv");
+    url.searchParams.set("id", definition.id);
+    url.searchParams.set("cosd", extendedStart);
+    url.searchParams.set("coed", end);
+    const normalized = await attempt(definition, async () => normalizeMacroCsv(await requestText(url), definition)
+      .filter((row) => row.time >= parseDay(start) - 400 * DAY_MS && row.time < parseDay(end) + DAY_MS));
+    rows.push(...normalized);
+    if (!quiet) console.log(`FRED macro ${definition.id}: ${normalized.length.toLocaleString()} rows`);
+  }
+
+  for (const { definition, key } of ECB_MACRO_SERIES) {
+    const url = new URL(`https://data-api.ecb.europa.eu/service/data/${key}`);
+    url.searchParams.set("startPeriod", extendedStart);
+    url.searchParams.set("endPeriod", end);
+    url.searchParams.set("format", "csvdata");
+    const normalized = await attempt(definition, async () => normalizeMacroCsv(await requestText(url), definition, {
+      period: "TIME_PERIOD", value: "OBS_VALUE",
+    }));
+    rows.push(...normalized);
+    if (!quiet) console.log(`ECB macro ${definition.id}: ${normalized.length.toLocaleString()} rows`);
+  }
+  const euroTwoYear = rows.filter((row) => row.id === "ECB_YC_2Y");
+  const euroTenYear = new Map(rows.filter((row) => row.id === "ECB_YC_10Y").map((row) => [row.time, row]));
+  const euroSpreadDefinition: MacroSeriesDefinition = {
+    ...ecb("ECB_YC_10Y2Y", "Euro-area AAA 10-year minus 2-year yield spread"),
+    sourceUrl: "https://data.ecb.europa.eu/data/datasets/YC",
+  };
+  rows.push(...euroTwoYear.flatMap((twoYear) => {
+    const tenYear = euroTenYear.get(twoYear.time);
+    return tenYear ? [{ ...euroSpreadDefinition, time: twoYear.time, availableAt: Math.max(twoYear.availableAt, tenYear.availableAt), value: tenYear.value - twoYear.value }] : [];
+  }));
+
+  for (const { definition, key } of OECD_CPI_SERIES) {
+    const url = oecdUrl(OECD_CPI_FLOW, key, extendedStart);
+    const normalized = await attempt(definition, async () => normalizeMacroCsv(await requestText(url, 5, oecdHeaders()), definition, {
+      period: "TIME_PERIOD", value: "OBS_VALUE",
+      filter: { MEASURE: "CPI", UNIT_MEASURE: "PA", TRANSFORMATION: "GY" },
+    }));
+    rows.push(...normalized);
+    if (!quiet) console.log(`OECD macro ${definition.id}: ${normalized.length.toLocaleString()} rows`);
+  }
+  for (const { definition, key } of OECD_GDP_SERIES) {
+    const normalized = await attempt(definition, async () => normalizeMacroCsv(
+      await requestText(oecdUrl(OECD_GDP_FLOW, key, extendedStart), 5, oecdHeaders()),
+      definition,
+      { period: "TIME_PERIOD", value: "OBS_VALUE" },
+    ));
+    rows.push(...normalized);
+    if (!quiet) console.log(`OECD macro ${definition.id}: ${normalized.length.toLocaleString()} rows`);
+  }
+  for (const { definition, key } of OECD_INDUSTRIAL_SERIES) {
+    const normalized = await attempt(definition, async () => normalizeMacroCsv(
+      await requestText(oecdUrl(OECD_INDUSTRIAL_FLOW, key, extendedStart), 5, oecdHeaders()),
+      definition,
+      { period: "TIME_PERIOD", value: "OBS_VALUE" },
+    ));
+    rows.push(...normalized);
+    if (!quiet) console.log(`OECD macro ${definition.id}: ${normalized.length.toLocaleString()} rows`);
+  }
+
+  const cbrStart = formatCbrDate(parseDay(start) - 400 * DAY_MS);
+  const cbrEnd = formatCbrDate(parseDay(end));
+  const cbrKeyRate: MacroSeriesDefinition = {
+    id: "CBR_KEY_RATE", label: "Bank of Russia key rate", economy: "Russia", frequency: "event", availabilityLagDays: 1,
+    provider: "Bank of Russia", sourceUrl: "https://www.cbr.ru/eng/hd_base/KeyRate/",
+  };
+  const cbrInflation: MacroSeriesDefinition = {
+    id: "CBR_CPI_YOY", label: "Russia inflation year-over-year", economy: "Russia", frequency: "monthly", availabilityLagDays: 45,
+    provider: "Bank of Russia", sourceUrl: "https://www.cbr.ru/statistics/ddkp/infl/",
+  };
+  const cbrKeyUrl = new URL(cbrKeyRate.sourceUrl);
+  cbrKeyUrl.searchParams.set("UniDbQuery.Posted", "True");
+  cbrKeyUrl.searchParams.set("UniDbQuery.From", cbrStart);
+  cbrKeyUrl.searchParams.set("UniDbQuery.To", cbrEnd);
+  const cbrInflationUrl = new URL(cbrInflation.sourceUrl);
+  cbrInflationUrl.searchParams.set("UniDbQuery.Posted", "True");
+  cbrInflationUrl.searchParams.set("UniDbQuery.From", cbrStart);
+  cbrInflationUrl.searchParams.set("UniDbQuery.To", cbrEnd);
+  const cbrKeyDailyRows = await attempt(cbrKeyRate, async () => normalizeMacroHtmlTable(await requestCbrText(cbrKeyUrl), cbrKeyRate, { period: 0, value: 1 }));
+  const cbrKeyRows = cbrKeyDailyRows.filter((row, index) => index === 0 || row.value !== cbrKeyDailyRows[index - 1]!.value);
+  const cbrInflationRows = await attempt(cbrInflation, async () => normalizeMacroHtmlTable(await requestCbrText(cbrInflationUrl), cbrInflation, { period: 0, value: 2 }));
+  rows.push(...cbrKeyRows, ...cbrInflationRows);
+  if (!quiet) console.log(`Bank of Russia macro: ${cbrKeyRows.length.toLocaleString()} key-rate and ${cbrInflationRows.length.toLocaleString()} inflation rows`);
+
+  const boeDefinition: MacroSeriesDefinition = {
+    id: "BOE_BANK_RATE", label: "Bank of England Bank Rate", economy: "United Kingdom", frequency: "event", availabilityLagDays: 1,
+    provider: "Bank of England", sourceUrl: "https://www.bankofengland.co.uk/boeapps/database/Bank-Rate.asp",
+  };
+  const boeRows = await attempt(boeDefinition, async () => normalizeMacroHtmlTable(await requestText(new URL(boeDefinition.sourceUrl)), boeDefinition, { period: 0, value: 1 }));
+  rows.push(...boeRows);
+  if (!quiet) console.log(`Bank of England macro ${boeDefinition.id}: ${boeRows.length.toLocaleString()} rows`);
+
+  const earliestTime = parseDay(start) - 400 * DAY_MS;
+  const latestTime = parseDay(end) + DAY_MS;
+  rows.splice(0, rows.length, ...rows.filter((row) => (
+    row.time >= earliestTime && row.time < latestTime
+    && row.availableAt >= earliestTime && row.availableAt < latestTime + 200 * DAY_MS
+  )));
+  rows.sort((left, right) => left.availableAt - right.availableAt || left.id.localeCompare(right.id));
+  const series = [...new Set(rows.map((row) => row.id))];
+  await writeArtifact(path.join(outputDir, "global-macro-state.json"), {
+    version: 1,
+    source: "Official and intergovernmental macro series from FRED, ECB, OECD, Bank of England, and Bank of Russia",
+    retrievedAt: new Date().toISOString(),
+    request: {
+      start,
+      end,
+      series: [...FRED_MACRO_SERIES, ...ECB_MACRO_SERIES.map((item) => item.definition), ...OECD_CPI_SERIES.map((item) => item.definition), ...OECD_GDP_SERIES.map((item) => item.definition), ...OECD_INDUSTRIAL_SERIES.map((item) => item.definition), cbrKeyRate, cbrInflation, boeDefinition, euroSpreadDefinition],
+      failedSeries: failures,
+      causalAvailability: "fixed conservative provider/frequency release lags; current revised values, not vintage snapshots",
+    },
+    rows,
+  });
+  console.log(`Stored ${rows.length.toLocaleString()} global macro rows across ${series.length} valid series; ${failures.length} unavailable series.`);
+}
+
+async function fetchBinanceFunding(outputDir: string, start: string, end: string, quiet: boolean) {
+  const startTime = parseDay(start);
+  const endTime = parseDay(end) + DAY_MS - 1;
+  const rows: BinanceFundingRateRow[] = [];
+  let cursor = startTime;
+  while (cursor <= endTime) {
+    const url = new URL("https://fapi.binance.com/fapi/v1/fundingRate");
+    url.searchParams.set("symbol", "BTCUSDT");
+    url.searchParams.set("startTime", String(cursor));
+    url.searchParams.set("endTime", String(endTime));
+    url.searchParams.set("limit", "1000");
+    const page = normalizeBinanceFundingRows(await requestJson<unknown[]>(url));
+    if (page.length === 0) break;
+    rows.push(...page);
+    const next = page.at(-1)!.time + 1;
+    if (next <= cursor || page.length < 1_000) break;
+    cursor = next;
+    if (!quiet) console.log(`Binance funding through ${new Date(page.at(-1)!.time).toISOString()}: ${rows.length.toLocaleString()} rows`);
+  }
+  const unique = [...new Map(rows.map((row) => [row.time, row])).values()]
+    .filter((row) => row.time >= startTime && row.time <= endTime)
+    .sort((left, right) => left.time - right.time);
+  await writeArtifact(path.join(outputDir, "binance-btcusdt-funding-rates.json"), {
+    version: 1,
+    source: "Binance USD-M Futures public funding-rate history",
+    retrievedAt: new Date().toISOString(),
+    request: {
+      symbol: "BTCUSDT",
+      endpoint: "GET /fapi/v1/fundingRate",
+      start,
+      end,
+      causalAvailability: "funding settlement timestamp + 1 minute",
+    },
+    rows: unique,
+  });
+  console.log(`Stored ${unique.length.toLocaleString()} BTCUSDT funding settlements.`);
+}
+
 async function fetchVix(outputDir: string, start: string, end: string) {
   const url = new URL("https://fred.stlouisfed.org/graph/fredgraph.csv");
   url.searchParams.set("id", "VIXCLS");
+  url.searchParams.set("cosd", start);
+  url.searchParams.set("coed", end);
   const rows = normalizeFredVixCsv(await requestText(url))
     .filter((row) => row.time >= parseDay(start) && row.time < parseDay(end) + DAY_MS);
   await writeArtifact(path.join(outputDir, "fred-cboe-vix-1d.json"), {
@@ -224,7 +489,7 @@ async function requestJson<T = unknown>(url: URL, attempts = 5): Promise<T> {
   return JSON.parse(await requestText(url, attempts)) as T;
 }
 
-async function requestText(url: URL, attempts = 5): Promise<string> {
+async function requestText(url: URL, attempts = 5, headers: Record<string, string> = {}): Promise<string> {
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const controller = new AbortController();
@@ -232,7 +497,7 @@ async function requestText(url: URL, attempts = 5): Promise<string> {
     try {
       const response = await fetch(url, {
         signal: controller.signal,
-        headers: { "user-agent": "trading-external-feature-audit/1.0" },
+        headers: { "user-agent": "trading-external-feature-audit/1.0", ...headers },
       });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
       return await response.text();
@@ -244,6 +509,53 @@ async function requestText(url: URL, attempts = 5): Promise<string> {
     }
   }
   throw lastError;
+}
+
+function oecdUrl(flow: string, key: string, start: string) {
+  const url = new URL(`https://sdmx.oecd.org/public/rest/v1/data/${flow}/${key}`);
+  url.searchParams.set("startPeriod", start.slice(0, 7));
+  return url;
+}
+
+function oecdHeaders() {
+  return { accept: "text/csv", "accept-language": "en" };
+}
+
+function formatCbrDate(time: number) {
+  const date = new Date(time);
+  return [String(date.getUTCDate()).padStart(2, "0"), String(date.getUTCMonth() + 1).padStart(2, "0"), date.getUTCFullYear()].join(".");
+}
+
+async function requestCbrText(url: URL): Promise<string> {
+  try {
+    return await requestText(url, 2);
+  } catch (originalError) {
+    const resolver = new Resolver();
+    resolver.setServers(["8.8.8.8"]);
+    const addresses = await resolver.resolve4(url.hostname);
+    const address = addresses[0];
+    if (!address) throw originalError;
+    return await new Promise<string>((resolve, reject) => {
+      const request = httpsRequest(url, {
+        headers: { "user-agent": "trading-external-feature-audit/1.0" },
+        lookup: (_hostname, options, callback) => {
+          if (typeof options === "object" && options.all) callback(null, [{ address, family: 4 }]);
+          else callback(null, address, 4);
+        },
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8");
+          if ((response.statusCode ?? 500) >= 400) reject(new Error(`${response.statusCode}: ${body}`));
+          else resolve(body);
+        });
+      });
+      request.setTimeout(60_000, () => request.destroy(new Error("Bank of Russia request timed out")));
+      request.on("error", reject);
+      request.end();
+    });
+  }
 }
 
 async function writeArtifact<T>(file: string, artifact: Omit<Artifact<T>, "sha256">): Promise<void> {

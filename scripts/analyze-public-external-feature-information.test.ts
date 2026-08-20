@@ -14,6 +14,6 @@ test("conditional gain is positive for a genuinely informative candidate", () =>
     targets[index] = feature[index]! < 2 ? 0 : 1;
     (index < count / 2 ? training : evaluation).push(index);
   }
-  const gain = conditionalGain({ base, featureBins: [feature] }, training, evaluation, [], 0, targets, 2);
+  const gain = conditionalGain({ base, baseContexts: 1, featureBins: [feature] }, training, evaluation, [], 0, targets, 2);
   assert.ok(gain > 0.9);
 });

@@ -224,6 +224,8 @@ export interface MlpTrainingComparisonMetricValues {
   mseSkillVsZero?: number;
   directionAccuracy?: number;
   correlation?: number;
+  predictionStd?: number;
+  targetStd?: number;
 }
 
 export interface MlpTrainingComparisonDistributionValues {
@@ -251,6 +253,81 @@ export interface MlpTrainingOutputCalibrationValues {
   densityTemperature?: number;
   densityValidation?: MlpTrainingComparisonDistributionValues;
   densityTest?: MlpTrainingComparisonDistributionValues;
+  pointVariants?: Record<string, MlpTrainingPointCalibrationVariantValues>;
+  pointWindowVariants?: Record<
+    string,
+    Record<string, MlpTrainingPointCalibrationVariantValues>
+  >;
+}
+
+export interface MlpTrainingPointCalibrationVariantValues {
+  label?: string;
+  mode?: string;
+  domain?: string;
+  degree?: number;
+  ridge?: number;
+  inputScale?: number;
+  outputScale?: number;
+  trailingActiveReturns?: number;
+  calibrationWindow?: number;
+  perStep?: boolean;
+  jointMatrix?: boolean;
+  matrixRows?: number;
+  matrixColumns?: number;
+  coefficientCount?: number;
+  coefficients?: number[];
+  calibration?: MlpTrainingComparisonMetricValues;
+  validation?: MlpTrainingComparisonMetricValues;
+  test?: MlpTrainingComparisonMetricValues;
+  calibrationPerLead?: MlpTrainingComparisonMetricValues[];
+  validationPerLead?: MlpTrainingComparisonMetricValues[];
+  testPerLead?: MlpTrainingComparisonMetricValues[];
+}
+
+function pointCalibrationVariantRecord(
+  value: unknown,
+): MlpTrainingPointCalibrationVariantValues | undefined {
+  const variant = recordField(value);
+  if (!variant) return undefined;
+  const parsed: MlpTrainingPointCalibrationVariantValues = {};
+  for (const field of ["label", "mode", "domain"] as const) {
+    if (typeof variant[field] === "string") parsed[field] = variant[field];
+  }
+  if (typeof variant.perStep === "boolean") parsed.perStep = variant.perStep;
+  if (typeof variant.jointMatrix === "boolean") parsed.jointMatrix = variant.jointMatrix;
+  for (const field of [
+    "degree", "ridge", "inputScale", "outputScale", "trailingActiveReturns",
+    "calibrationWindow", "matrixRows", "matrixColumns", "coefficientCount",
+  ] as const) {
+    const number = numberField(variant[field]);
+    if (number !== undefined) parsed[field] = number;
+  }
+  if (Array.isArray(variant.coefficients)) {
+    const coefficients = variant.coefficients.flatMap((coefficient) => {
+      const number = numberField(coefficient);
+      return number === undefined ? [] : [number];
+    });
+    if (coefficients.length === variant.coefficients.length) {
+      parsed.coefficients = coefficients;
+    }
+  }
+  const calibrationMetric = metricRecord(variant.calibration);
+  const validationMetric = metricRecord(variant.validation);
+  const testMetric = metricRecord(variant.test);
+  if (calibrationMetric) parsed.calibration = calibrationMetric;
+  if (validationMetric) parsed.validation = validationMetric;
+  if (testMetric) parsed.test = testMetric;
+  for (const field of [
+    "calibrationPerLead", "validationPerLead", "testPerLead",
+  ] as const) {
+    if (!Array.isArray(variant[field])) continue;
+    const metrics = variant[field].flatMap((metric) => {
+      const parsedMetric = metricRecord(metric);
+      return parsedMetric ? [parsedMetric] : [];
+    });
+    if (metrics.length > 0) parsed[field] = metrics;
+  }
+  return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
 export interface MlpTrainingAutoregressiveEpisodeValues {
@@ -352,10 +429,15 @@ export interface MlpTrainingComparisonRun {
   validationCheckpointEpoch?: number;
   fit: Array<{
     epoch: number;
+    x?: number;
+    live?: boolean;
+    train?: MlpTrainingComparisonMetricValues;
+    validation?: MlpTrainingComparisonMetricValues;
     trainNormalizedMse?: number;
     validationNormalizedMse?: number;
     trainNegativeLogLikelihood?: number;
     validationNegativeLogLikelihood?: number;
+    onlineTrainNegativeLogLikelihood?: number;
     bestTrainScore?: number;
   }>;
 }
@@ -715,6 +797,8 @@ export class MlpTrainingMetricsReader {
           const bestTrainScore = numberField(event.bestTrainScore);
           return [{
             epoch,
+            ...(train ? { train } : {}),
+            ...(validationMetrics ? { validation: validationMetrics } : {}),
             ...(train?.normalizedMse === undefined
               ? {}
               : { trainNormalizedMse: train.normalizedMse }),
@@ -733,6 +817,26 @@ export class MlpTrainingMetricsReader {
             ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
           }];
         });
+        const statusLatest = recordField(files.status?.latest);
+        const liveEpoch = numberField(statusLatest?.epoch);
+        const liveBatch = numberField(statusLatest?.batch);
+        const liveBatches = numberField(statusLatest?.batches);
+        const liveNll = numberField(statusLatest?.onlineNegativeLogLikelihood);
+        const liveTrain = metricRecord(statusLatest?.onlineTrain);
+        if (files.running && liveEpoch !== undefined && liveNll !== undefined) {
+          fit.push({
+            epoch: liveEpoch,
+            x: liveBatch !== undefined && liveBatches !== undefined && liveBatches > 0
+              ? liveEpoch + Math.min(1, Math.max(0, liveBatch / liveBatches))
+              : liveEpoch,
+            live: true,
+            ...(liveTrain ? { train: liveTrain } : {}),
+            ...(liveTrain?.normalizedMse === undefined
+              ? {}
+              : { trainNormalizedMse: liveTrain.normalizedMse }),
+            onlineTrainNegativeLogLikelihood: liveNll,
+          });
+        }
         if (selectedValidation?.normalizedMse !== undefined
           && !fit.some((point) => point.validationNormalizedMse !== undefined)) {
           const checkpointEpoch = validationCheckpointEpoch ?? bestEpoch;
@@ -749,6 +853,11 @@ export class MlpTrainingMetricsReader {
             }
           }
         }
+        fit.sort((left, right) => (
+          left.x ?? left.epoch + 1
+        ) - (
+          right.x ?? right.epoch + 1
+        ));
         return {
           key: files.key,
           id: files.plan.id,
@@ -1186,6 +1295,8 @@ function metricRecord(value: unknown): MlpTrainingComparisonMetricValues | undef
     "mseSkillVsZero",
     "directionAccuracy",
     "correlation",
+    "predictionStd",
+    "targetStd",
   ] as const) {
     const number = numberField(source[key]);
     if (number !== undefined) metric[key] = number;
@@ -1375,6 +1486,8 @@ function outputCalibrationRecord(
   const validation = recordField(source.validation);
   const test = recordField(source.test);
   const densityTemperature = recordField(source.densityTemperature);
+  const pointVariantsSource = recordField(source.pointVariants);
+  const pointWindowVariantsSource = recordField(source.pointWindowVariants);
   const result: MlpTrainingOutputCalibrationValues = {};
   const scale = numberField(scaleOnly?.scale);
   const affineScale = numberField(affine?.scale);
@@ -1399,6 +1512,31 @@ function outputCalibrationRecord(
   if (temperature !== undefined) result.densityTemperature = temperature;
   if (densityValidation) result.densityValidation = densityValidation;
   if (densityTest) result.densityTest = densityTest;
+  const pointVariants: Record<string, MlpTrainingPointCalibrationVariantValues> = {};
+  for (const [key, value] of Object.entries(pointVariantsSource ?? {})) {
+    const parsed = pointCalibrationVariantRecord(value);
+    if (parsed) pointVariants[key] = parsed;
+  }
+  if (Object.keys(pointVariants).length > 0) result.pointVariants = pointVariants;
+  const pointWindowVariants: Record<
+    string,
+    Record<string, MlpTrainingPointCalibrationVariantValues>
+  > = {};
+  for (const [window, variantsValue] of Object.entries(
+    pointWindowVariantsSource ?? {},
+  )) {
+    const variantsSource = recordField(variantsValue);
+    if (!variantsSource) continue;
+    const variants: Record<string, MlpTrainingPointCalibrationVariantValues> = {};
+    for (const [key, value] of Object.entries(variantsSource)) {
+      const parsed = pointCalibrationVariantRecord(value);
+      if (parsed) variants[key] = parsed;
+    }
+    if (Object.keys(variants).length > 0) pointWindowVariants[window] = variants;
+  }
+  if (Object.keys(pointWindowVariants).length > 0) {
+    result.pointWindowVariants = pointWindowVariants;
+  }
   return Object.keys(result).length > 0 ? result : undefined;
 }
 

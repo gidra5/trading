@@ -1,6 +1,6 @@
 # Tardis monthly-sample external information audit
 
-Generated 2026-08-17T10:14:25.738Z. Free Tardis samples cover 10 independent UTC days.
+Generated 2026-08-19T19:21:53.094Z. Free Tardis samples cover 10 independent UTC days.
 
 ## Outcome
 
@@ -8,14 +8,14 @@ These results replace an unqualified `awaiting-data` label with sparse monthly-s
 
 | target | candidates | stable | best feature | lookback | primary bits | transfer bits | sign bits | magnitude bits |
 |---:|---:|---:|---|---:|---:|---:|---:|---:|
-| 1s | 118 | 103 | binance-spot-btcusdt L1 quantity imbalance | latest | 0.046000 | 0.044636 | 0.044670 | 0.017566 |
-| 5s | 118 | 93 | binance-spot-btcusdt L1 quantity imbalance | latest | 0.071323 | 0.075743 | 0.056154 | 0.014432 |
-| 15s | 118 | 74 | coinbase-spot-btcusd realized volatility | 300s | 0.060975 | 0.041179 | 0.012799 | 0.069473 |
-| 1m | 118 | 16 | coinbase-spot-btcusd realized volatility | 300s | 0.013722 | 0.006016 | -0.000592 | 0.017479 |
-| 5m | 118 | 0 | binance-spot-btcusdt trailing return | 300s | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
-| 15m | 118 | 0 | BTC liquidation count | 1s | -0.001622 | -0.001267 | -0.000038 | -0.001085 |
-| 30m | 118 | 0 | kraken-spot-xbtusd realized volatility | 2s | -0.000091 | 0.001194 | -0.000181 | 0.000090 |
-| 1h | 118 | 0 | deribit-btc-perpetual trailing return | 1s | -0.002399 | -0.003050 | -0.000098 | -0.001495 |
+| 1s | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 5s | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 15s | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 1m | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 5m | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 15m | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 30m | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
+| 1h | 118 | 0 | binance-spot-btcusdt L1 quantity imbalance | latest | — | — | — | — |
 
 ## Causal and validation constraints
 

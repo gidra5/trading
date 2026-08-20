@@ -13,6 +13,32 @@ export interface VixRow {
   close: number;
 }
 
+export type MacroFrequency = "daily" | "event" | "monthly" | "quarterly";
+
+export interface MacroSeriesDefinition {
+  id: string;
+  label: string;
+  economy: string;
+  frequency: MacroFrequency;
+  availabilityLagDays: number;
+  provider: string;
+  sourceUrl: string;
+}
+
+export interface MacroRow extends MacroSeriesDefinition {
+  time: number;
+  availableAt: number;
+  value: number;
+}
+
+export interface BinanceFundingRateRow {
+  time: number;
+  availableAt: number;
+  symbol: string;
+  fundingRate: number;
+  markPrice: number | null;
+}
+
 export interface CoinMetricsRow {
   time: number;
   availableAt: number;
@@ -113,6 +139,85 @@ export function normalizeFredVixCsv(csv: string): VixRow[] {
     // The daily close is known after the US session. The following UTC
     // boundary is a conservative, DST-independent point-in-time timestamp.
     rows.push({ time, availableAt: time + 86_400_000, close });
+  }
+  return deduplicate(rows, (row) => row.time);
+}
+
+export function normalizeMacroCsv(
+  csv: string,
+  definition: MacroSeriesDefinition,
+  columns: { period?: string; value?: string; filter?: Record<string, string> } = {},
+): MacroRow[] {
+  const records = parseCsvRecords(csv);
+  if (records.length === 0) return [];
+  const header = records[0]!;
+  const periodIndex = header.indexOf(columns.period ?? "observation_date");
+  const valueIndex = header.indexOf(columns.value ?? definition.id);
+  if (periodIndex < 0 || valueIndex < 0) return [];
+  const filters = Object.entries(columns.filter ?? {}).map(([name, expected]) => [header.indexOf(name), expected] as const);
+  const rows: MacroRow[] = [];
+  for (const record of records.slice(1)) {
+    if (filters.some(([index, expected]) => index < 0 || record[index] !== expected)) continue;
+    const rawValue = record[valueIndex];
+    if (!rawValue || rawValue.trim() === "." || rawValue.trim() === "..") continue;
+    const time = parseMacroPeriod(record[periodIndex] ?? "");
+    const value = Number(rawValue.trim().replace(",", "."));
+    if (!Number.isFinite(time) || !Number.isFinite(value)) continue;
+    rows.push({
+      ...definition,
+      time,
+      availableAt: time + definition.availabilityLagDays * 86_400_000,
+      value,
+    });
+  }
+  return deduplicate(rows, (row) => row.time);
+}
+
+export function normalizeMacroHtmlTable(
+  html: string,
+  definition: MacroSeriesDefinition,
+  columns: { period: number; value: number },
+): MacroRow[] {
+  const rows: MacroRow[] = [];
+  for (const match of html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
+    const cells = [...match[1]!.matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)]
+      .map((cell) => decodeHtml(cell[1]!.replace(/<[^>]+>/g, "")).trim());
+    const rawPeriod = cells[columns.period];
+    const rawValue = cells[columns.value];
+    if (!rawPeriod || !rawValue) continue;
+    const time = parseMacroPeriod(rawPeriod);
+    const value = Number(rawValue.replace(/\s/g, "").replace(",", "."));
+    if (!Number.isFinite(time) || !Number.isFinite(value)) continue;
+    rows.push({
+      ...definition,
+      time,
+      availableAt: time + definition.availabilityLagDays * 86_400_000,
+      value,
+    });
+  }
+  return deduplicate(rows, (row) => row.time);
+}
+
+export function normalizeBinanceFundingRows(payload: unknown[]): BinanceFundingRateRow[] {
+  const rows: BinanceFundingRateRow[] = [];
+  for (const raw of payload) {
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    const time = Number(record.fundingTime);
+    const fundingRate = Number(record.fundingRate);
+    const rawMarkPrice = record.markPrice;
+    const markPrice = rawMarkPrice === "" || rawMarkPrice == null ? null : Number(rawMarkPrice);
+    const symbol = String(record.symbol ?? "");
+    if (!symbol || !Number.isFinite(time) || !Number.isFinite(fundingRate)) continue;
+    rows.push({
+      time,
+      // Funding is usable only after settlement; one minute also prevents the
+      // settlement instant from sharing a target candle with the feature.
+      availableAt: time + 60_000,
+      symbol,
+      fundingRate,
+      markPrice: markPrice !== null && Number.isFinite(markPrice) ? markPrice : null,
+    });
   }
   return deduplicate(rows, (row) => row.time);
 }
@@ -383,6 +488,66 @@ function sum(values: number[]): number {
 
 function difference(left: number | null | undefined, right: number | null | undefined): number | null {
   return left == null || right == null ? null : left - right;
+}
+
+function parseCsvRecords(csv: string): string[][] {
+  const records: string[][] = [];
+  let record: string[] = [];
+  let field = "";
+  let quoted = false;
+  const input = csv.replace(/^\uFEFF/, "");
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (character === '"') {
+      if (quoted && input[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else quoted = !quoted;
+    } else if (character === "," && !quoted) {
+      record.push(field);
+      field = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && input[index + 1] === "\n") index += 1;
+      record.push(field);
+      if (record.some((value) => value.length > 0)) records.push(record);
+      record = [];
+      field = "";
+    } else field += character;
+  }
+  if (field.length > 0 || record.length > 0) {
+    record.push(field);
+    if (record.some((value) => value.length > 0)) records.push(record);
+  }
+  return records;
+}
+
+function parseMacroPeriod(raw: string): number {
+  const value = raw.trim();
+  let match = /^(\d{4})-Q([1-4])$/.exec(value);
+  if (match) return Date.UTC(Number(match[1]), (Number(match[2]) - 1) * 3, 1);
+  match = /^(\d{4})-(\d{2})$/.exec(value);
+  if (match) return Date.UTC(Number(match[1]), Number(match[2]) - 1, 1);
+  match = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(value);
+  if (match) return Date.UTC(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
+  match = /^(\d{2})\.(\d{4})$/.exec(value);
+  if (match) return Date.UTC(Number(match[2]), Number(match[1]) - 1, 1);
+  match = /^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2}|\d{4})$/.exec(value);
+  if (match) {
+    const month = MONTHS.get(match[2]!.toUpperCase());
+    const rawYear = Number(match[3]);
+    const year = rawYear < 100 ? 2_000 + rawYear : rawYear;
+    if (month !== undefined) return Date.UTC(year, month, Number(match[1]));
+  }
+  const parsed = Date.parse(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function decodeHtml(value: string): string {
+  return value
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
 }
 
 function deduplicate<T>(rows: T[], key: (row: T) => number): T[] {

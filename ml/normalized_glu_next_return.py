@@ -61,12 +61,14 @@ class NormalizedGluNextReturn(nn.Module):
         minimum_radius: float = 1e-4,
     ) -> None:
         super().__init__()
-        if feature_mean.shape != (HISTORY_RETURN_COUNT,) \
+        if feature_mean.ndim != 1 or feature_mean.numel() < 1 \
                 or feature_std.shape != feature_mean.shape \
                 or not bool(torch.isfinite(feature_mean).all()) \
                 or not bool(torch.isfinite(feature_std).all()) \
                 or bool((feature_std <= 0).any()):
-            raise ValueError("feature normalization must contain 120 finite values")
+            raise ValueError(
+                "feature normalization must contain one or more finite scales"
+            )
         if target_mean.ndim > 1 or target_std.shape != target_mean.shape \
                 or target_mean.numel() < 1 \
                 or not bool(torch.isfinite(target_mean).all()) \
@@ -100,6 +102,7 @@ class NormalizedGluNextReturn(nn.Module):
         self.input_normalization = input_normalization
         self.volatility_window = volatility_window
         self.learnable_centering = bool(learnable_centering)
+        self.feature_count = int(feature_mean.numel())
         self.horizon_return_count = int(target_mean.numel())
         self.dropout_rate = float(dropout_rate)
         self.dropout_gate_probability = dropout_gate_probability(dropout_rate)
@@ -113,7 +116,7 @@ class NormalizedGluNextReturn(nn.Module):
             "target_std", target_std.float().reshape(target_shape).clone()
         )
 
-        input_width = HISTORY_RETURN_COUNT + (
+        input_width = self.feature_count + (
             2 if input_normalization
             == PER_SEQUENCE_REVERSIBLE_WITH_STATS_INPUT_NORMALIZATION
             else 0
@@ -197,14 +200,16 @@ class NormalizedGluNextReturn(nn.Module):
         features: Tensor,
         causal_volatility_rms: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
-        if features.ndim != 2 or features.shape[-1] != HISTORY_RETURN_COUNT:
-            raise ValueError("normalized GLU expects [example, 120] returns")
+        if features.ndim != 2 or features.shape[-1] != self.feature_count:
+            raise ValueError(
+                "normalized GLU expects [example, feature_count] inputs"
+            )
         values = features.float()
         if self.input_normalization == CAUSAL_VOLATILITY_INPUT_NORMALIZATION:
             if self.volatility_window is None:
                 raise RuntimeError("causal volatility window is missing")
             if causal_volatility_rms is None:
-                if self.volatility_window > HISTORY_RETURN_COUNT:
+                if self.volatility_window > self.feature_count:
                     raise ValueError(
                         "causal volatility windows above 120 require an "
                         "external input-only RMS scale"

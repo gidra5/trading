@@ -7,6 +7,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const DEFAULT_INPUT = "data/market/mutable/external-live";
 const DEFAULT_OUTPUT = "data/benchmarks/live-external-early-screen.json";
 const DEFAULT_REPORT = "docs/experiments/live-external-early-screen-2026-08-17.md";
+const DEFAULT_COLLECTOR_STATUS = "data/runtime-cache/external-live-collector/collector-status.json";
 const HORIZONS = [1, 5, 15, 60, 300, 900, 1_800, 3_600];
 const CANDIDATE_SOURCES = [
   "binance-usdm-premium-index",
@@ -37,6 +38,7 @@ interface PriceGrid {
   endSecond: number;
   logPrice: Float64Array;
   absoluteReturnPrefix: Float64Array;
+  invalidPrefix: Uint32Array;
 }
 
 interface ScoreRow {
@@ -89,6 +91,23 @@ export function effectiveOutcomeCount(durationSeconds: number, horizonSeconds: n
   return Math.max(0, Math.min(observations, Math.floor(durationSeconds / Math.max(1, horizonSeconds))));
 }
 
+export function observedCoverage(records: Array<{ recordedAt: number }>, maximumCarrySeconds = 5) {
+  const seconds = [...new Set(records
+    .map((row) => Math.floor(row.recordedAt / 1_000))
+    .filter(Number.isFinite))].sort((left, right) => left - right);
+  if (seconds.length === 0) return { seconds: 0, firstObservedAt: null, lastObservedAt: null, wallSpanSeconds: 0 };
+  let coveredSeconds = 1;
+  for (let index = 1; index < seconds.length; index += 1) {
+    coveredSeconds += Math.min(maximumCarrySeconds, seconds[index]! - seconds[index - 1]!);
+  }
+  return {
+    seconds: coveredSeconds,
+    firstObservedAt: seconds[0]! * 1_000,
+    lastObservedAt: seconds.at(-1)! * 1_000,
+    wallSpanSeconds: seconds.at(-1)! - seconds[0]! + 1,
+  };
+}
+
 export function classifyEarlyScore(
   durationHours: number,
   bitsPerTarget: number,
@@ -138,10 +157,17 @@ function analyze(input: string) {
     ? Date.parse(String(startEvents.at(-1)!.payload.startedAt))
     : oldestMtime(input);
   const generatedAt = Date.now();
-  const durationSeconds = Math.max(0, (generatedAt - collectorStartedAt) / 1_000);
-  const durationHours = durationSeconds / 3_600;
-  const inventory = inventorySources(input, durationHours, collectorStartedAt);
   const targetRecords = loadRecords(input, "binance-spot-aggtrade");
+  const coverage = observedCoverage(targetRecords);
+  const durationSeconds = coverage.seconds;
+  const durationHours = durationSeconds / 3_600;
+  const wallDurationSeconds = Math.max(0, (generatedAt - collectorStartedAt) / 1_000);
+  const liveStatus = readJson(path.resolve(repoRoot, DEFAULT_COLLECTOR_STATUS));
+  const liveSessionBytes = liveStatus && path.resolve(String(liveStatus.output ?? "")) === input
+    ? liveStatus.compressedBytesBySource as Record<string, number> | undefined
+    : undefined;
+  const sessionWallDurationHours = wallDurationSeconds / 3_600;
+  const inventory = inventorySources(input, sessionWallDurationHours, collectorStartedAt, liveSessionBytes);
   const priceGrid = buildPriceGrid(targetRecords);
   const featureSeries = CANDIDATE_SOURCES
     .map((source) => extractFeatureSeries(source, loadRecords(input, source)))
@@ -159,10 +185,15 @@ function analyze(input: string) {
   const totalBytes = inventory.reduce((sum, row) => sum + row.bytes, 0);
   const sessionBytes = inventory.reduce((sum, row) => sum + row.sessionBytes, 0);
   return {
-    version: 1,
+    version: 2,
     generatedAt: new Date(generatedAt).toISOString(),
     input: path.relative(repoRoot, input).replaceAll("\\", "/"),
     collectorStartedAt: new Date(collectorStartedAt).toISOString(),
+    firstObservedAt: coverage.firstObservedAt === null ? null : new Date(coverage.firstObservedAt).toISOString(),
+    lastObservedAt: coverage.lastObservedAt === null ? null : new Date(coverage.lastObservedAt).toISOString(),
+    stalenessSeconds: coverage.lastObservedAt === null ? null : Math.max(0, (generatedAt - coverage.lastObservedAt) / 1_000),
+    wallDurationSeconds,
+    wallSpanSeconds: coverage.wallSpanSeconds,
     durationSeconds,
     durationHours,
     checkpoint: durationHours < 1 ? "pre-1h" : durationHours < 24 ? "1h-smoke" : durationHours < 24 * 7 ? "1d-early" : "multi-day",
@@ -178,15 +209,16 @@ function analyze(input: string) {
       sessionBytes,
       candidateBytes,
       candidateSessionBytes,
-      projectedTotalBytesPerDay: durationHours > 0 ? sessionBytes * 24 / durationHours : null,
-      projectedCandidateBytesPerDay: durationHours > 0 ? candidateSessionBytes * 24 / durationHours : null,
-      note: "Daily projections use only files created by the active gzip collector session; the stored total also includes a short earlier plain-JSONL trial. Candidate bytes are unresolved options, premium, GDELT, and mempool feeds. High-volume exchange books are excluded because sparse Tardis evidence has already shown short-horizon value.",
+      projectedTotalBytesPerDay: sessionWallDurationHours > 0 ? sessionBytes * 24 / sessionWallDurationHours : null,
+      projectedCandidateBytesPerDay: sessionWallDurationHours > 0 ? candidateSessionBytes * 24 / sessionWallDurationHours : null,
+      note: "Evidence duration is observed target coverage, with gaps capped at five carried seconds; wall-clock age is never treated as data. Storage rate alone uses latest-session wall time because bytes accrue with elapsed time. Normal collection now stores causal 1s book summaries instead of full high-frequency books; --raw-books is diagnostic-only.",
     },
     readiness: buildReadinessTable(),
     inventory,
     featureHealth,
     scores,
     bestScores: scores
+      .filter((row) => row.effectiveEvaluationOutcomes >= 16)
       .slice()
       .sort((left, right) => right.bitsPerTarget - left.bitsPerTarget)
       .slice(0, 30),
@@ -206,7 +238,12 @@ function writeArtifact(artifact: ReturnType<typeof analyze>, output: string, rep
   fs.writeFileSync(report, renderReport(artifact), "utf8");
 }
 
-function inventorySources(input: string, durationHours: number, collectorStartedAt: number) {
+function inventorySources(
+  input: string,
+  durationHours: number,
+  collectorStartedAt: number,
+  liveSessionBytes?: Record<string, number>,
+) {
   return fs.readdirSync(input, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => {
@@ -214,7 +251,8 @@ function inventorySources(input: string, durationHours: number, collectorStarted
       const files = listFiles(root);
       const bytes = files.reduce((sum, file) => sum + fs.statSync(file).size, 0);
       const sessionFiles = files.filter((file) => fs.statSync(file).birthtimeMs >= collectorStartedAt - 5_000);
-      const sessionBytes = sessionFiles.reduce((sum, file) => sum + fs.statSync(file).size, 0);
+      const sessionBytes = liveSessionBytes?.[entry.name]
+        ?? sessionFiles.reduce((sum, file) => sum + fs.statSync(file).size, 0);
       return {
         source: entry.name,
         files: files.length,
@@ -225,6 +263,10 @@ function inventorySources(input: string, durationHours: number, collectorStarted
       };
     })
     .sort((left, right) => right.bytes - left.bytes);
+}
+
+function readJson(file: string): any {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; }
 }
 
 function loadRecords(input: string, source: string): LiveRecord[] {
@@ -281,15 +323,22 @@ function buildPriceGrid(records: LiveRecord[]): PriceGrid | undefined {
   const endSecond = seconds.at(-1)!;
   const logPrice = new Float64Array(endSecond - startSecond + 1);
   const absoluteReturnPrefix = new Float64Array(logPrice.length + 1);
+  const invalidPrefix = new Uint32Array(logPrice.length + 1);
   let previous = prices.get(startSecond)!;
+  let previousObservedSecond = startSecond;
   for (let second = startSecond; second <= endSecond; second += 1) {
-    previous = prices.get(second) ?? previous;
+    const observed = prices.get(second);
+    if (observed !== undefined) {
+      previous = observed;
+      previousObservedSecond = second;
+    }
     const index = second - startSecond;
     logPrice[index] = previous;
     const change = index === 0 ? 0 : Math.abs(previous - logPrice[index - 1]!);
     absoluteReturnPrefix[index + 1] = absoluteReturnPrefix[index]! + change;
+    invalidPrefix[index + 1] = invalidPrefix[index]! + (second - previousObservedSecond > 5 ? 1 : 0);
   }
-  return { startSecond, endSecond, logPrice, absoluteReturnPrefix };
+  return { startSecond, endSecond, logPrice, absoluteReturnPrefix, invalidPrefix };
 }
 
 function extractFeatureSeries(source: typeof CANDIDATE_SOURCES[number], records: LiveRecord[]): FeatureSeries {
@@ -428,6 +477,7 @@ function scoreSeries(series: FeatureSeries, price: PriceGrid, durationHours: num
         const end = index + horizonSeconds;
         const previous = index - horizonSeconds;
         if (previous < 0 || end >= price.logPrice.length) return [];
+        if (price.invalidPrefix[end + 1]! !== price.invalidPrefix[previous]!) return [];
         const value = row.values[feature];
         if (!Number.isFinite(value)) return [];
         const volatilityStart = Math.max(0, index - Math.max(60, horizonSeconds));
@@ -464,6 +514,7 @@ function scoreSeries(series: FeatureSeries, price: PriceGrid, durationHours: num
       const bitsPerTarget = mean(logRatios);
       const classified = classifyEarlyScore(durationHours, bitsPerTarget, blockBits);
       const evaluationDuration = Math.max(0, evaluation.at(-1)!.second - evaluation[0]!.second);
+      const effectiveEvaluationOutcomes = effectiveOutcomeCount(evaluationDuration, horizonSeconds, evaluationCount);
       rows.push({
         family: series.family,
         source: series.source,
@@ -472,12 +523,12 @@ function scoreSeries(series: FeatureSeries, price: PriceGrid, durationHours: num
         observations: samples.length,
         trainingObservations: trainingCount,
         evaluationObservations: evaluationCount,
-        effectiveEvaluationOutcomes: effectiveOutcomeCount(evaluationDuration, horizonSeconds, evaluationCount),
+        effectiveEvaluationOutcomes,
         bitsPerTarget,
         blockBits,
         positiveBlocks: blockBits.filter((value) => value > 0).length,
         evidence: classified.evidence,
-        decision: classified.decision,
+        decision: effectiveEvaluationOutcomes < 16 ? "inconclusive" : classified.decision,
       });
     }
   }
@@ -538,7 +589,9 @@ function renderReport(artifact: ReturnType<typeof analyze>) {
   const lines = [
     "# Live external-feature early screen — 2026-08-17",
     "",
-    `Generated at ${artifact.generatedAt} after **${artifact.durationHours.toFixed(3)} hours** of collection.`,
+    `Generated at ${artifact.generatedAt} after **${artifact.durationHours.toFixed(3)} hours of observed target coverage**. The latest collector session is ${artifact.wallDurationSeconds.toFixed(0)} wall-clock seconds old; the archive spans ${(artifact.wallSpanSeconds / 3_600).toFixed(3)} wall-clock hours including gaps.`,
+    "",
+    `Latest target observation: ${artifact.lastObservedAt ?? "none"}; staleness: ${artifact.stalenessSeconds === null ? "n/a" : `${artifact.stalenessSeconds.toFixed(1)}s`}.`,
     "",
     `**Current interpretation:** ${artifact.interpretation}`,
     "",
@@ -556,6 +609,7 @@ function renderReport(artifact: ReturnType<typeof analyze>) {
     "## Storage",
     "",
     `- Stored across all trials: ${mib(artifact.storage.totalBytes)}; active session: ${mib(artifact.storage.sessionBytes)}; projected active rate: ${mib(artifact.storage.projectedTotalBytesPerDay)}/day.`,
+    "- Treat a projection from the first 15 minutes as an upper-biased startup estimate: one immediate options surface, GDELT pull, and mempool snapshot have not yet been amortized over their normal cadences.",
     `- Unresolved slow candidate feeds in the active session: ${mib(artifact.storage.candidateSessionBytes)}; projected ${mib(artifact.storage.projectedCandidateBytesPerDay)}/day.`,
     `- ${artifact.storage.note}`,
     "",
@@ -579,6 +633,7 @@ function renderReport(artifact: ReturnType<typeof analyze>) {
   } else {
     lines.push(
       "Scores are out-of-sample gain over trailing-return and trailing-volatility bins. Positive bits/target is better. The first 60% of this live window fits all quantile edges and categorical probabilities; the last 40% is evaluated in six chronological blocks.",
+      "This is a single chronological split. During the smoke stage, a few appended observations can move the split boundary and materially reorder sparse categorical scores; do not treat the ranking as a selected model basis until it survives separated-day evaluation.",
       "",
       "| family | feature | target | eval rows | effective outcomes | bits/target | positive blocks | decision | evidence |",
       "|---|---|---:|---:|---:|---:|---:|---|---|",

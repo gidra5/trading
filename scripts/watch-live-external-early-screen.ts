@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { run } from "./analyze-live-external-early-screen.ts";
+import { run as runFast } from "./analyze-live-fast-features.ts";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactFile = path.join(repoRoot, "data/benchmarks/live-external-early-screen.json");
@@ -11,6 +12,7 @@ interface State {
   pid: number;
   startedAt: string;
   collectorStartedAt: string;
+  observedCoverageHours: number;
   checkpointsHours: number[];
   completedHours: number[];
   status: "running" | "complete" | "failed";
@@ -22,18 +24,20 @@ export async function watch(args = process.argv.slice(2)) {
     const index = args.indexOf(name);
     return index < 0 ? undefined : args[index + 1];
   };
-  const checkpoints = (value("--checkpoints") ?? "1,24")
+  const checkpoints = (value("--checkpoints") ?? "1,24,72,168")
     .split(",")
     .map(Number)
     .filter((item) => Number.isFinite(item) && item > 0)
     .sort((left, right) => left - right);
   if (checkpoints.length === 0) throw new Error("At least one positive checkpoint hour is required.");
+  const pollSeconds = Math.max(10, Number(value("--poll-seconds") ?? 900));
   if (!fs.existsSync(artifactFile)) run();
   const artifact = JSON.parse(fs.readFileSync(artifactFile, "utf8")) as { collectorStartedAt: string };
   const state: State = {
     pid: process.pid,
     startedAt: new Date().toISOString(),
     collectorStartedAt: artifact.collectorStartedAt,
+    observedCoverageHours: 0,
     checkpointsHours: checkpoints,
     completedHours: [],
     status: "running",
@@ -41,9 +45,22 @@ export async function watch(args = process.argv.slice(2)) {
   writeState(state);
   try {
     for (const checkpoint of checkpoints) {
-      const dueAt = Date.parse(state.collectorStartedAt) + checkpoint * 3_600_000;
-      while (Date.now() < dueAt) await delay(Math.min(60_000, dueAt - Date.now()));
+      let current = run() as { durationHours: number; collectorStartedAt: string };
+      state.collectorStartedAt = current.collectorStartedAt;
+      state.observedCoverageHours = current.durationHours;
+      writeState(state);
+      while (current.durationHours < checkpoint) {
+        await delay(pollSeconds * 1_000);
+        current = run() as { durationHours: number; collectorStartedAt: string };
+        state.collectorStartedAt = current.collectorStartedAt;
+        state.observedCoverageHours = current.durationHours;
+        writeState(state);
+      }
       run(["--checkpoint", `${checkpoint}h`]);
+      if (checkpoint >= 24) runFast([
+        "--output", `data/benchmarks/live-fast-feature-early-screen-${checkpoint}h.json`,
+        "--report", `docs/experiments/live-fast-feature-early-screen-2026-08-19-${checkpoint}h.md`,
+      ]);
       state.completedHours.push(checkpoint);
       writeState(state);
     }
