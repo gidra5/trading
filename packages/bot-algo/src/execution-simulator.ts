@@ -65,6 +65,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   feeBps: 7.5,
   maxPositionQuote: Number.POSITIVE_INFINITY,
   limitOffsetBps: 2,
+  priceTickSize: 0,
   maxOpenOrders: 1024,
   cooldownMs: 300_000,
   staleOrderMs: 30 * 24 * 60 * 60 * 1000,
@@ -195,6 +196,7 @@ interface LegacyLongBorrowAllocation {
 
 const roundAsset = (value: number) => Number(value.toFixed(8));
 const roundQuote = (value: number) => Number(value.toFixed(6));
+type RoundPriceStepMode = "floor" | "ceil" | "round";
 const NO_EVENTS: BotEvent[] = [];
 const MIN_BASE_QUANTITY = 0.00000001;
 const LEGACY_EXIT_GRID_REASON = "legacy exit grid";
@@ -238,6 +240,7 @@ export function createStrategyConfig(
     maxPositionQuote:
       overrides.maxPositionQuote ?? defaultStrategyConfig.maxPositionQuote,
     limitOffsetBps: overrides.limitOffsetBps ?? defaultStrategyConfig.limitOffsetBps,
+    priceTickSize: overrides.priceTickSize ?? defaultStrategyConfig.priceTickSize,
     maxOpenOrders: overrides.maxOpenOrders ?? defaultStrategyConfig.maxOpenOrders,
     cooldownMs: overrides.cooldownMs ?? defaultStrategyConfig.cooldownMs,
     staleOrderMs: overrides.staleOrderMs ?? defaultStrategyConfig.staleOrderMs,
@@ -268,6 +271,7 @@ export function createStrategyConfig(
   );
   config.maxPositionQuote = Math.max(config.minOrderQuote, config.maxPositionQuote);
   config.limitOffsetBps = Math.max(0, config.limitOffsetBps);
+  config.priceTickSize = cleanPositive(config.priceTickSize);
   config.maxOpenOrders = Math.max(1, Math.round(config.maxOpenOrders));
   config.cooldownMs = Math.max(0, config.cooldownMs);
   config.staleOrderMs = Math.max(1_000, config.staleOrderMs);
@@ -381,7 +385,6 @@ export class SimulatedExecutionEngine {
         type: "status_changed",
         at,
         message: `Bot ${status}`,
-        state: this.snapshot(),
       },
     ];
   }
@@ -403,15 +406,26 @@ export class SimulatedExecutionEngine {
         type: "state_reset",
         at,
         message: "Paper bot state reset",
-        state: this.snapshot(),
       },
     ];
   }
 
   setConfig(config: StrategyConfig, at = Date.now()): void {
+    const previousExitGridPositionMode =
+      this.state.config.legacyValleyPeak.exitGridPositionMode;
     this.state.config = createStrategyConfig(config);
     this.state.updatedAt = at;
     this.priceMemoryLimit = priceMemoryLimit(this.state.config);
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode !==
+      previousExitGridPositionMode
+    ) {
+      this.state.memory.legacyValleyPeak = {
+        ...this.ensureLegacyValleyPeakMemory(),
+        exitGrids: {},
+      };
+      this.legacyPositionLotCache = undefined;
+    }
   }
 
   cancelOpenOrder(orderId: string, reason: string, at = Date.now()): BotEvent[] {
@@ -439,7 +453,6 @@ export class SimulatedExecutionEngine {
         at,
         message: `${order.side.toUpperCase()} order cancelled: ${reason}`,
         order: structuredClone(order),
-        state: this.snapshot(),
       },
     ];
   }
@@ -685,7 +698,6 @@ export class SimulatedExecutionEngine {
           message: `Manual ${input.side.toUpperCase()} fill recorded`,
           order: structuredClone(order),
           fill: structuredClone(fill),
-          state: this.snapshot(),
         },
       ];
     } catch (error) {
@@ -1110,7 +1122,6 @@ export class SimulatedExecutionEngine {
       message: `${input.side.toUpperCase()} exchange fill reconciled at ${price}`,
       order: structuredClone(order),
       fill: structuredClone(fill),
-      state: this.snapshot(),
     };
   }
 
@@ -1799,7 +1810,7 @@ export class SimulatedExecutionEngine {
       targetEntryLeverage,
     );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
-    const price = roundQuote(limitPrice);
+    const price = this.normalizeOrderPrice(limitPrice, "buy", "limit");
 
     if (quoteSize < config.minOrderQuote || price <= 0) {
       return undefined;
@@ -1844,8 +1855,10 @@ export class SimulatedExecutionEngine {
 
     const isStopLoss = reason === "stop loss";
     const priceOffset = config.limitOffsetBps / 10_000;
-    const price = roundQuote(
+    const price = this.normalizeOrderPrice(
       marketPrice * (isStopLoss ? 1 - priceOffset : 1 + priceOffset),
+      "sell",
+      "limit",
     );
 
     this.state.baseFree = roundAsset(this.state.baseFree - quantity);
@@ -1892,7 +1905,7 @@ export class SimulatedExecutionEngine {
       targetEntryLeverage,
     );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
-    const price = roundQuote(limitPrice);
+    const price = this.normalizeOrderPrice(limitPrice, "sell", "limit");
 
     if (
       !config.legacyValleyPeak.shortSideEnabled ||
@@ -2076,7 +2089,7 @@ export class SimulatedExecutionEngine {
   ): TradingOrder | undefined {
     const config = this.state.config;
     const roundedQuantity = roundAsset(quantity);
-    const roundedPrice = roundQuote(price);
+    const roundedPrice = this.normalizeOrderPrice(price, "buy", type);
     const quoteSize = roundedQuantity * roundedPrice;
 
     if (roundedQuantity <= 0 || roundedPrice <= 0 || quoteSize < config.minOrderQuote) {
@@ -2135,7 +2148,7 @@ export class SimulatedExecutionEngine {
     trigger?: "above" | "below",
   ): TradingOrder | undefined {
     const roundedQuantity = roundAsset(quantity);
-    const roundedPrice = roundQuote(price);
+    const roundedPrice = this.normalizeOrderPrice(price, "sell", type);
     const quoteSize = roundedQuantity * roundedPrice;
 
     if (
@@ -2209,6 +2222,28 @@ export class SimulatedExecutionEngine {
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
     return order;
+  }
+
+  private normalizeOrderPrice(
+    price: number,
+    side: "buy" | "sell",
+    type: OrderType,
+  ): number {
+    const roundedPrice = roundQuote(price);
+    const tickSize = this.state.config.priceTickSize;
+    if (!Number.isFinite(tickSize) || tickSize <= 0 || type === "market") {
+      return roundedPrice;
+    }
+
+    const mode =
+      type === "stop-market"
+        ? side === "buy"
+          ? "ceil"
+          : "floor"
+        : side === "buy"
+          ? "floor"
+          : "ceil";
+    return roundPriceToStep(roundedPrice, tickSize, mode);
   }
 
   private applyLotLifecycleControls(
@@ -3593,7 +3628,13 @@ export class SimulatedExecutionEngine {
       return [];
     }
 
-    const orders: TradingOrder[] = [];
+    const orderSpecs: Array<{
+      price: number;
+      quantity: number;
+      type: OrderType;
+      trigger?: "below";
+    }> = [];
+    const specByPriceKey = new Map<string, typeof orderSpecs[number]>();
     let remainingQuantity = availableQuantity;
 
     for (let index = 0; index < orderCount; index += 1) {
@@ -3603,6 +3644,10 @@ export class SimulatedExecutionEngine {
         lowerPrice,
         upperPrice,
       );
+      const isLimitOrder = price > currentPrice;
+      const type: OrderType = isLimitOrder ? "limit" : "stop-market";
+      const normalizedPrice = this.normalizeOrderPrice(price, "sell", type);
+      const priceKey = `${type}:${normalizedPrice}`;
       const desiredQuantity = this.legacyExitGridOrderQuantity(
         index,
         orderCount,
@@ -3616,39 +3661,55 @@ export class SimulatedExecutionEngine {
       const remainingAfterFill = roundAsset(remainingQuantity - quantity);
       if (
         remainingAfterFill > MIN_BASE_QUANTITY &&
-        remainingAfterFill * price < config.minOrderQuote
+        remainingAfterFill * normalizedPrice < config.minOrderQuote
       ) {
         quantity = remainingQuantity;
       }
-      if (quantity * price < config.minOrderQuote) {
-        if (remainingQuantity * price >= config.minOrderQuote) {
+      if (quantity * normalizedPrice < config.minOrderQuote) {
+        if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
           quantity = remainingQuantity;
-        } else if (index === orderCount - 1 && orders.length === 0) {
+        } else if (index === orderCount - 1 && orderSpecs.length === 0) {
           break;
         } else {
           continue;
         }
       }
 
-      const isLimitOrder = price > currentPrice;
-      const order = this.createSellCloseOrderAtPrice(
-        price,
-        quantity,
-        createdAt,
-        `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; peak ${upperPrice}`,
-        lot.id,
-        isLimitOrder ? "limit" : "stop-market",
-        isLimitOrder ? undefined : "below",
-      );
-      if (!order) {
-        break;
+      const existingSpec = specByPriceKey.get(priceKey);
+      if (existingSpec) {
+        existingSpec.quantity = roundAsset(existingSpec.quantity + quantity);
+      } else {
+        const spec = {
+          price: normalizedPrice,
+          quantity,
+          type,
+          trigger: isLimitOrder ? undefined : "below" as const,
+        };
+        orderSpecs.push(spec);
+        specByPriceKey.set(priceKey, spec);
       }
 
-      orders.push(order);
       remainingQuantity = roundAsset(remainingQuantity - quantity);
       if (remainingQuantity <= MIN_BASE_QUANTITY) {
         break;
       }
+    }
+
+    const orders: TradingOrder[] = [];
+    for (const spec of orderSpecs) {
+      const order = this.createSellCloseOrderAtPrice(
+        spec.price,
+        spec.quantity,
+        createdAt,
+        `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; peak ${upperPrice}`,
+        lot.id,
+        spec.type,
+        spec.trigger,
+      );
+      if (!order) {
+        break;
+      }
+      orders.push(order);
     }
 
     grid.gridPeakPrice = upperPrice;
@@ -3682,7 +3743,13 @@ export class SimulatedExecutionEngine {
       return [];
     }
 
-    const orders: TradingOrder[] = [];
+    const orderSpecs: Array<{
+      price: number;
+      quantity: number;
+      type: OrderType;
+      trigger?: "above";
+    }> = [];
+    const specByPriceKey = new Map<string, typeof orderSpecs[number]>();
     let remainingQuantity = availableQuantity;
 
     for (let index = 0; index < orderCount; index += 1) {
@@ -3692,6 +3759,10 @@ export class SimulatedExecutionEngine {
         lowerPrice,
         upperPrice,
       );
+      const isLimitOrder = price < currentPrice;
+      const type: OrderType = isLimitOrder ? "limit" : "stop-market";
+      const normalizedPrice = this.normalizeOrderPrice(price, "buy", type);
+      const priceKey = `${type}:${normalizedPrice}`;
       const desiredQuantity = this.legacyExitGridOrderQuantity(
         index,
         orderCount,
@@ -3705,39 +3776,55 @@ export class SimulatedExecutionEngine {
       const remainingAfterFill = roundAsset(remainingQuantity - quantity);
       if (
         remainingAfterFill > MIN_BASE_QUANTITY &&
-        remainingAfterFill * price < config.minOrderQuote
+        remainingAfterFill * normalizedPrice < config.minOrderQuote
       ) {
         quantity = remainingQuantity;
       }
-      if (quantity * price < config.minOrderQuote) {
-        if (remainingQuantity * price >= config.minOrderQuote) {
+      if (quantity * normalizedPrice < config.minOrderQuote) {
+        if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
           quantity = remainingQuantity;
-        } else if (index === orderCount - 1 && orders.length === 0) {
+        } else if (index === orderCount - 1 && orderSpecs.length === 0) {
           break;
         } else {
           continue;
         }
       }
 
-      const isLimitOrder = price < currentPrice;
-      const order = this.createBuyCloseOrderAtPrice(
-        price,
-        quantity,
-        createdAt,
-        `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; trough ${lowerPrice}`,
-        lot.id,
-        isLimitOrder ? "limit" : "stop-market",
-        isLimitOrder ? undefined : "above",
-      );
-      if (!order) {
-        break;
+      const existingSpec = specByPriceKey.get(priceKey);
+      if (existingSpec) {
+        existingSpec.quantity = roundAsset(existingSpec.quantity + quantity);
+      } else {
+        const spec = {
+          price: normalizedPrice,
+          quantity,
+          type,
+          trigger: isLimitOrder ? undefined : "above" as const,
+        };
+        orderSpecs.push(spec);
+        specByPriceKey.set(priceKey, spec);
       }
 
-      orders.push(order);
       remainingQuantity = roundAsset(remainingQuantity - quantity);
       if (remainingQuantity <= MIN_BASE_QUANTITY) {
         break;
       }
+    }
+
+    const orders: TradingOrder[] = [];
+    for (const spec of orderSpecs) {
+      const order = this.createBuyCloseOrderAtPrice(
+        spec.price,
+        spec.quantity,
+        createdAt,
+        `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; trough ${lowerPrice}`,
+        lot.id,
+        spec.type,
+        spec.trigger,
+      );
+      if (!order) {
+        break;
+      }
+      orders.push(order);
     }
 
     grid.gridTroughPrice = lowerPrice;
@@ -5086,6 +5173,7 @@ function mergeStrategyOverrides(
     feeBps: overrides.feeBps ?? base.feeBps,
     maxPositionQuote: overrides.maxPositionQuote ?? base.maxPositionQuote,
     limitOffsetBps: overrides.limitOffsetBps ?? base.limitOffsetBps,
+    priceTickSize: overrides.priceTickSize ?? base.priceTickSize,
     maxOpenOrders: overrides.maxOpenOrders ?? base.maxOpenOrders,
     cooldownMs: overrides.cooldownMs ?? base.cooldownMs,
     staleOrderMs: overrides.staleOrderMs ?? base.staleOrderMs,
@@ -5339,6 +5427,36 @@ function cleanFiniteNumber(value: number | undefined): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function roundPriceToStep(
+  value: number,
+  step: number,
+  mode: RoundPriceStepMode = "round",
+): number {
+  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) {
+    return roundQuote(value);
+  }
+
+  const precision = decimalPrecision(step);
+  const scaled = value / step;
+  const rounded =
+    mode === "floor"
+      ? Math.floor(scaled + 1e-10)
+      : mode === "ceil"
+        ? Math.ceil(scaled - 1e-10)
+        : Math.round(scaled);
+  return Number((rounded * step).toFixed(precision));
+}
+
+function decimalPrecision(value: number): number {
+  const text = value.toString();
+  if (text.includes("e-")) {
+    const [, exponent] = text.split("e-");
+    return Number(exponent) || 0;
+  }
+  const [, fraction = ""] = text.split(".");
+  return fraction.length;
 }
 
 function isLeverageLimitError(error: unknown): boolean {

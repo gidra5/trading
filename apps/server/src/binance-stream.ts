@@ -15,6 +15,7 @@ export interface MarketStreamHandlers {
   onCandle: (candle: Candle) => void | Promise<void>;
   onOrderBook: (snapshot: OrderBookSnapshot) => void | Promise<void>;
   onStatus: (status: MarketStreamStatus) => void;
+  onError?: (error: unknown, context: string) => void;
 }
 
 export interface BinanceMarketStreamOptions {
@@ -90,7 +91,7 @@ export class BinanceMarketStream {
     });
 
     socket.on("message", (raw) => {
-      this.handleMessage(raw.toString());
+      this.handleMessage(spec.label, raw.toString());
     });
 
     socket.on("close", () => {
@@ -107,8 +108,15 @@ export class BinanceMarketStream {
     });
   }
 
-  private handleMessage(raw: string): void {
-    const payload = JSON.parse(raw) as { stream?: string; data?: unknown };
+  private handleMessage(label: string, raw: string): void {
+    let payload: { stream?: string; data?: unknown };
+    try {
+      payload = JSON.parse(raw) as { stream?: string; data?: unknown };
+    } catch (error) {
+      this.reportHandlerError(error, `${label} message parse`);
+      return;
+    }
+
     const stream = (payload.stream ?? "").toLowerCase();
     const data = payload.data as Record<string, unknown> | undefined;
 
@@ -123,7 +131,7 @@ export class BinanceMarketStream {
     ) {
       const tick = parseTrade(data);
       if (tick) {
-        void this.handlers.onTick(tick);
+        this.dispatchHandler(() => this.handlers.onTick(tick), `${label} trade tick`);
       }
       return;
     }
@@ -131,7 +139,7 @@ export class BinanceMarketStream {
     if (stream.includes("@kline")) {
       const candle = parseKline(data);
       if (candle) {
-        void this.handlers.onCandle(candle);
+        this.dispatchHandler(() => this.handlers.onCandle(candle), `${label} kline`);
       }
       return;
     }
@@ -139,9 +147,29 @@ export class BinanceMarketStream {
     if (stream.includes("@depth")) {
       const snapshot = parseDepth(this.symbol, data);
       if (snapshot) {
-        void this.handlers.onOrderBook(snapshot);
+        this.dispatchHandler(() => this.handlers.onOrderBook(snapshot), `${label} depth`);
       }
     }
+  }
+
+  private dispatchHandler(
+    run: () => void | Promise<void>,
+    context: string,
+  ): void {
+    try {
+      void Promise.resolve(run()).catch((error) => {
+        this.reportHandlerError(error, context);
+      });
+    } catch (error) {
+      this.reportHandlerError(error, context);
+    }
+  }
+
+  private reportHandlerError(error: unknown, context: string): void {
+    this.handlers.onError?.(error, context);
+    this.emitStatus(
+      `Binance ${this.venue} ${this.environment} ${context} handler failed: ${errorMessage(error)}`,
+    );
   }
 
   private scheduleReconnect(spec: StreamSocketSpec): void {
@@ -355,4 +383,8 @@ function parseDepth(
 
 function combinedStreamUrl(baseUrl: string, streams: string[]): string {
   return `${baseUrl}/stream?streams=${streams.join("/")}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

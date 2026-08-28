@@ -461,6 +461,13 @@ function createStream(market: BinanceMarketListing, generation: number): Binance
         await runtime.handleOrderBook(snapshot);
         scheduleBroadcast();
       },
+      onError: (error, context) => {
+        server.log.error(
+          { err: error, context },
+          "Binance market stream handler failed",
+        );
+        scheduleBroadcast();
+      },
     },
   });
 }
@@ -493,6 +500,13 @@ function createUserDataStream(
         } else {
           scheduleBroadcast();
         }
+      },
+      onError: (error, context) => {
+        server.log.error(
+          { err: error, context },
+          "Binance user-data stream handler failed",
+        );
+        scheduleBroadcast();
       },
     },
   });

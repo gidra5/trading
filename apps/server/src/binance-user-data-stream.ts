@@ -11,6 +11,7 @@ const EVENT_SYNC_DELAY_MS = 150;
 export interface BinancePaperUserDataStreamHandlers {
   onStatus: (status: BinancePaperUserDataStreamStatus) => void;
   onUserData: (payload: unknown) => void | Promise<void>;
+  onError?: (error: unknown, context: string) => void;
 }
 
 export interface BinancePaperUserDataStreamOptions {
@@ -128,7 +129,9 @@ export class BinancePaperUserDataStream {
     }
     this.eventTimer = setTimeout(() => {
       this.eventTimer = undefined;
-      void this.flushPayloads();
+      void this.flushPayloads().catch((error) => {
+        this.reportHandlerError(error, "queued user-data events");
+      });
     }, EVENT_SYNC_DELAY_MS);
   }
 
@@ -139,7 +142,11 @@ export class BinancePaperUserDataStream {
       if (this.stopped) {
         return;
       }
-      await this.options.handlers.onUserData(payload);
+      try {
+        await this.options.handlers.onUserData(payload);
+      } catch (error) {
+        this.reportHandlerError(error, "user-data event");
+      }
     }
   }
 
@@ -213,6 +220,11 @@ export class BinancePaperUserDataStream {
       lastEventAt: Date.now(),
       reconnectAttempt: this.reconnectAttempt,
     });
+  }
+
+  private reportHandlerError(error: unknown, context: string): void {
+    this.options.handlers.onError?.(error, context);
+    this.emitStatus(false, `Binance user-data ${context} handler failed: ${errorMessage(error)}`);
   }
 }
 

@@ -56,7 +56,7 @@ export class TradingStorage {
     );
   }
 
-  async saveBotState(state: PaperBotState): Promise<void> {
+  async saveBotState(state: Readonly<PaperBotState>): Promise<void> {
     await writeJsonAtomic(this.botStatePath, state);
   }
 
@@ -66,7 +66,7 @@ export class TradingStorage {
     );
   }
 
-  async saveLiveBotState(state: PaperBotState): Promise<void> {
+  async saveLiveBotState(state: Readonly<PaperBotState>): Promise<void> {
     await writeJsonAtomic(this.liveBotStatePath, state);
   }
 

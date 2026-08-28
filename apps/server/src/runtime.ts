@@ -164,6 +164,7 @@ export class TradingRuntime {
     executionMode: "simulated",
     updatedAt: 0,
   };
+  private exchangePositionModeWarningMessage?: string;
 
   constructor(
     private storage: TradingStorage,
@@ -217,6 +218,7 @@ export class TradingRuntime {
     this.recentEvents = [];
     this.lastSavedOrderBookAt = 0;
     this.exchangeAccountWarningMessage = undefined;
+    this.exchangePositionModeWarningMessage = undefined;
     this.liveEquityCurve = [];
     this.lastLiveEquitySampleAt = 0;
     this.backtestAbort?.abort();
@@ -333,12 +335,11 @@ export class TradingRuntime {
     const bot = this.bot.view();
     const exchangeSnapshot = this.publicExchangeSnapshot();
     const exchangeDriven = this.isExchangeDrivenExecution();
-    const publicBot = compactPublicBotState(
-      exchangeDriven
-        ? exchangeDrivenPublicBotState(bot, exchangeSnapshot, this.market)
-        : bot,
-    );
-    const positionState = exchangeDriven ? this.bot.snapshot() : publicBot;
+    const compactBot = compactPublicBotState(bot);
+    const publicBot = exchangeDriven
+      ? exchangeDrivenPublicBotState(compactBot, bot, exchangeSnapshot, this.market)
+      : compactBot;
+    const positionState = exchangeDriven ? bot : publicBot;
     return {
       market: {
         id: this.market.id,
@@ -358,7 +359,7 @@ export class TradingRuntime {
         orderBook: this.orderBook,
       },
       bot: publicBot,
-      positions: analyzePositions(positionState),
+      positions: analyzePositions(positionState as PaperBotState),
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
       equityCurve: this.liveEquityCurve,
@@ -385,7 +386,7 @@ export class TradingRuntime {
       const statusEvents = this.bot.setStatus("running");
       events.push(...statusEvents);
       if (wasStopped) {
-        this.recordLiveEquity(Date.now(), this.bot.snapshot(), true);
+        this.recordLiveEquity(Date.now(), this.bot.view(), true);
       }
       this.recordEvents(statusEvents);
       await this.flushState();
@@ -580,7 +581,7 @@ export class TradingRuntime {
     const takeProfitPrice = normalizeOptionalPositiveNumber(input.takeProfitPrice, "Take profit");
 
     if (input.targetPositionId) {
-      const positions = analyzePositions(this.bot.snapshot());
+      const positions = analyzePositions(this.bot.view() as PaperBotState);
       const target =
         input.side === "sell"
           ? positions.longs.find((lot) => lot.id === input.targetPositionId)
@@ -741,6 +742,7 @@ export class TradingRuntime {
     this.executionMode = nextMode;
     await this.saveExecutionMode();
     this.exchangeAccountWarningMessage = undefined;
+    this.exchangePositionModeWarningMessage = undefined;
     this.liveEquityCurve = [];
     this.lastLiveEquitySampleAt = 0;
 
@@ -783,7 +785,7 @@ export class TradingRuntime {
     exchangeSnapshot: BinancePaperSnapshot | undefined,
     at: number,
   ): BotEvent[] {
-    const previous = this.bot.snapshot();
+    const previous = this.bot.view();
     const exchangeStartingQuote =
       exchangeQuoteBalance(exchangeSnapshot, this.market) ?? this.config.startingQuote;
     this.config = this.createMarketConfig(undefined, exchangeStartingQuote);
@@ -804,7 +806,6 @@ export class TradingRuntime {
       type: "state_reset",
       at,
       message: "Binance execution enabled; local simulated positions cleared",
-      state: this.bot.snapshot(),
     }];
   }
 
@@ -819,7 +820,6 @@ export class TradingRuntime {
       type: "state_reset",
       at,
       message: "Simulated execution enabled",
-      state: this.bot.snapshot(),
     }];
   }
 
@@ -884,7 +884,7 @@ export class TradingRuntime {
       this.saveTimer = undefined;
     }
 
-    const snapshot = this.bot.snapshot();
+    const snapshot = this.bot.view();
     const saveState = this.isExchangeDrivenExecution()
       ? () => this.storage.saveLiveBotState(snapshot)
       : () => this.storage.saveBotState(snapshot);
@@ -931,7 +931,7 @@ export class TradingRuntime {
 
   private recordLiveEquity(
     time: number,
-    state: PaperBotState = this.bot.snapshot(),
+    state: Readonly<PaperBotState> = this.bot.view(),
     force = false,
     exchangeSnapshot?: BinancePaperSnapshot,
   ): void {
@@ -1017,13 +1017,13 @@ export class TradingRuntime {
     options: { includeUnprofitable?: boolean },
     at: number,
   ): BotEvent[] {
-    const state = this.bot.snapshot();
+    const state = this.bot.view();
     const price = state.lastPrice;
     if (!Number.isFinite(price) || price <= 0) {
       return [];
     }
 
-    const ledger = analyzePositions(state, { currentPrice: price });
+    const ledger = analyzePositions(state as PaperBotState, { currentPrice: price });
     const reason = options.includeUnprofitable
       ? "forced local position close"
       : "local profitable position close";
@@ -1077,7 +1077,7 @@ export class TradingRuntime {
     reason: string,
     at: number,
   ): BotEvent[] {
-    const state = this.bot.snapshot();
+    const state = this.bot.view();
     const residualBase = roundAssetBalance(state.baseFree + state.baseReserved);
     if (Math.abs(residualBase) <= BALANCE_EPSILON) {
       return [];
@@ -1364,6 +1364,7 @@ export class TradingRuntime {
 
   private async applyExchangeSnapshot(snapshot: BinancePaperSnapshot): Promise<BotEvent[]> {
     this.applyExchangeMaxLeverage(snapshot);
+    this.applyExchangePositionModeRules(snapshot);
     this.applyExchangeTradingRules(snapshot);
     const reconciliation = exchangeReconciliationFromSnapshot(snapshot);
     const events: BotEvent[] = [];
@@ -1382,7 +1383,7 @@ export class TradingRuntime {
     } else {
       events.push(...this.applyExchangeAccountGuard(snapshot));
     }
-    this.recordLiveEquity(Date.now(), this.bot.snapshot(), false, snapshot);
+    this.recordLiveEquity(Date.now(), this.bot.view(), false, snapshot);
     this.recordEvents(events);
     await this.flushState();
     return events;
@@ -1397,7 +1398,7 @@ export class TradingRuntime {
     const driftMessage = exchangeAccountDriftMessage(
       snapshot,
       this.market,
-      this.bot.snapshot(),
+      this.bot.view() as PaperBotState,
       {
         suppressTransientFuturesDrift: this.isExchangeSettlementGraceActive(),
       },
@@ -1430,7 +1431,6 @@ export class TradingRuntime {
       return events.map((event) => ({
         ...event,
         message,
-        state: this.bot.snapshot(),
       }));
     }
 
@@ -1439,7 +1439,6 @@ export class TradingRuntime {
         type: "status_changed",
         at,
         message,
-        state: this.bot.snapshot(),
       },
     ];
   }
@@ -1484,6 +1483,18 @@ export class TradingRuntime {
 
   private applyExchangeTradingRules(snapshot: BinancePaperSnapshot): void {
     let next = this.config;
+    const priceTickSize = snapshot.symbolFilters?.tickSize;
+    if (
+      priceTickSize !== undefined &&
+      Number.isFinite(priceTickSize) &&
+      priceTickSize > 0 &&
+      priceTickSize !== next.priceTickSize
+    ) {
+      next = createStrategyConfig({
+        ...next,
+        priceTickSize,
+      });
+    }
     const minOrderQuote = snapshot.symbolFilters?.minNotional;
     if (minOrderQuote && minOrderQuote > 0) {
       next = createStrategyConfig({
@@ -1523,6 +1534,34 @@ export class TradingRuntime {
     }
     this.config = next;
     this.bot.setConfig(next);
+  }
+
+  private applyExchangePositionModeRules(snapshot: BinancePaperSnapshot): void {
+    if (
+      !this.isExchangeDrivenExecution() ||
+      !isAutomatedExchangeExecutionVenue(this.market.venue) ||
+      snapshot.positionMode !== "one-way" ||
+      this.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
+      return;
+    }
+
+    const next = createStrategyConfig({
+      ...this.config,
+      legacyValleyPeak: {
+        ...this.config.legacyValleyPeak,
+        exitGridPositionMode: "aggregate",
+      },
+    });
+    this.config = next;
+    this.bot.setConfig(next);
+
+    const message =
+      "Binance futures account is in one-way position mode; using aggregate exit grids for exchange-driven execution.";
+    if (this.exchangePositionModeWarningMessage !== message) {
+      this.exchangePositionModeWarningMessage = message;
+      this.exchangeAccountGuard.onWarning?.(message);
+    }
   }
 
   private async executeBacktest(
@@ -1798,13 +1837,17 @@ export class TradingRuntime {
 }
 
 function exchangeDrivenPublicBotState(
-  state: Readonly<PaperBotState>,
+  publicState: PaperBotState,
+  sourceState: Readonly<PaperBotState>,
   snapshot: BinancePaperSnapshot,
   market: BinanceMarketListing,
 ): PaperBotState {
-  const next = structuredClone(state) as PaperBotState;
-  const equity = exchangeRuntimeEquity(snapshot, market, state.lastPrice);
-  const exposureQuote = exchangeRuntimeExposureQuote(snapshot, market, state.lastPrice);
+  const next: PaperBotState = {
+    ...publicState,
+    metrics: { ...publicState.metrics },
+  };
+  const equity = exchangeRuntimeEquity(snapshot, market, sourceState.lastPrice);
+  const exposureQuote = exchangeRuntimeExposureQuote(snapshot, market, sourceState.lastPrice);
   const startingQuote = next.config.startingQuote;
   const netPnl =
     equity !== undefined && Number.isFinite(startingQuote)
@@ -1817,27 +1860,29 @@ function exchangeDrivenPublicBotState(
   next.baseReserved = 0;
   next.avgEntryPrice = 0;
   next.avgShortEntryPrice = 0;
-  next.realizedPnl = state.realizedPnl;
-  next.feesPaid = state.feesPaid;
-  next.winningTrades = state.winningTrades;
-  next.losingTrades = state.losingTrades;
+  next.realizedPnl = sourceState.realizedPnl;
+  next.feesPaid = sourceState.feesPaid;
+  next.winningTrades = sourceState.winningTrades;
+  next.losingTrades = sourceState.losingTrades;
   next.metrics = {
     ...next.metrics,
     equity: equity ?? next.metrics.equity,
-    realizedPnl: state.realizedPnl,
+    realizedPnl: sourceState.realizedPnl,
     unrealizedPnl: 0,
     netPnl,
     returnPct:
       equity !== undefined && startingQuote > 0
         ? (netPnl / startingQuote) * 100
         : 0,
-    feesPaid: state.feesPaid,
-    tradeCount: state.fills.length,
-    winningTrades: state.winningTrades,
-    losingTrades: state.losingTrades,
+    feesPaid: sourceState.feesPaid,
+    tradeCount: sourceState.fills.length,
+    winningTrades: sourceState.winningTrades,
+    losingTrades: sourceState.losingTrades,
     winRate:
-      state.winningTrades + state.losingTrades > 0
-        ? (state.winningTrades / (state.winningTrades + state.losingTrades)) * 100
+      sourceState.winningTrades + sourceState.losingTrades > 0
+        ? (sourceState.winningTrades /
+          (sourceState.winningTrades + sourceState.losingTrades)) *
+          100
         : 0,
     peakEquity: equity ?? 0,
     maxDrawdownPct: 0,
