@@ -14,6 +14,7 @@ import type {
   OrderType,
   PaperBotState,
   PositionLifecycle,
+  PositionLot,
   PositionLotSide,
   PriceTick,
   StrategyConfig,
@@ -34,6 +35,7 @@ import {
 } from "./legacy-valley-peak.js";
 import { PeakValleyBotCore, createBotCoreState, evaluateBot } from "./bot.js";
 import { canFillOrderAtTick, orderExecutionPrice } from "./execution.js";
+import { closeQuantityWithoutMinimumNotionalRemainder } from "./close-sizing.js";
 import {
   analyzePositions,
   createPositionRiskConfig,
@@ -100,6 +102,7 @@ interface ImmediateFillRollback {
   sequence: number;
   ordersLength: number;
   fillsLength: number;
+  positionLifecyclesLength: number;
   liquidatedPositionCount: number;
   metrics: BotMetrics;
 }
@@ -921,6 +924,7 @@ export class SimulatedExecutionEngine {
 
       this.state.orders.push(order);
       this.state.fills.push(fill);
+      ensureManagedPositionLifecycles(this.state, at);
       this.refreshAverageEntryPrices();
       this.refreshClosedPositionLifecycles(at);
       this.state.lastPrice = roundQuote(price);
@@ -1382,6 +1386,7 @@ export class SimulatedExecutionEngine {
       manual: false,
     };
     this.state.fills.push(fill);
+    ensureManagedPositionLifecycles(this.state, input.filledAt);
     this.recordLegacyExitGridFill(order, fill);
     this.refreshAverageEntryPrices();
     this.refreshClosedPositionLifecycles(input.filledAt);
@@ -2227,7 +2232,15 @@ export class SimulatedExecutionEngine {
     if (!config.legacyValleyPeak.longSideEnabled) {
       return undefined;
     }
-    const quantity = roundAsset(desiredQuantity);
+    const quantity = roundAsset(
+      closeQuantityWithoutMinimumNotionalRemainder({
+        requestedQuantity: desiredQuantity,
+        availableQuantity: Math.max(0, this.state.baseFree),
+        executionPrice: marketPrice,
+        minNotional: config.minOrderQuote,
+        quantityEpsilon: MIN_BASE_QUANTITY,
+      }),
+    );
     const quoteSize = quantity * marketPrice;
 
     if (
@@ -2473,9 +2486,18 @@ export class SimulatedExecutionEngine {
     const price = roundQuote(
       marketPrice * (1 - this.state.config.limitOffsetBps / 10_000),
     );
+    const quantity = roundAsset(
+      closeQuantityWithoutMinimumNotionalRemainder({
+        requestedQuantity: desiredQuantity,
+        availableQuantity: this.availableShortCloseQuantity(),
+        executionPrice: price,
+        minNotional: this.state.config.minOrderQuote,
+        quantityEpsilon: MIN_BASE_QUANTITY,
+      }),
+    );
     return this.createTriggeredBuyOrder(
       price,
-      desiredQuantity,
+      quantity,
       createdAt,
       reason,
     );
@@ -4222,32 +4244,7 @@ export class SimulatedExecutionEngine {
     lot: LegacyExitGridLot,
     price: number,
   ): LegacyExitGridMemory {
-    const grids = (memory.exitGrids ??= {});
-    let grid = grids[lot.id];
-    if (!grid) {
-      const entryPrice = cleanPositive(lot.averagePrice) || price;
-      grid = {
-        lotId: lot.id,
-        side: lot.side,
-        entryPrice,
-        entryQuantity: lot.originalQuantity,
-        peakPrice: Math.max(entryPrice, price),
-        gridPeakPrice: 0,
-        troughPrice: Math.min(entryPrice, price),
-        gridTroughPrice: 0,
-        resetPrice: 0,
-        gridCreatedAt: 0,
-        gridOrderIds: [],
-      };
-      grids[lot.id] = grid;
-    } else {
-      grid.side = lot.side;
-      grid.troughPrice ??= Math.min(grid.entryPrice, price);
-      grid.gridTroughPrice ??= 0;
-      grid.resetPrice ??= 0;
-      grid.gridCreatedAt ??= 0;
-    }
-    return grid;
+    return ensureExitGridMemory(memory, lot, price);
   }
 
   private legacyExitGridResetPeakPrice(
@@ -4364,17 +4361,18 @@ export class SimulatedExecutionEngine {
         orderCount,
         remainingQuantity,
       );
-      let quantity = roundAsset(Math.min(remainingQuantity, desiredQuantity));
+      let quantity = roundAsset(
+        closeQuantityWithoutMinimumNotionalRemainder({
+          requestedQuantity: desiredQuantity,
+          availableQuantity: remainingQuantity,
+          executionPrice: normalizedPrice,
+          minNotional: config.minOrderQuote,
+          quantityEpsilon: MIN_BASE_QUANTITY,
+        }),
+      );
 
       if (quantity <= MIN_BASE_QUANTITY) {
         break;
-      }
-      const remainingAfterFill = roundAsset(remainingQuantity - quantity);
-      if (
-        remainingAfterFill > MIN_BASE_QUANTITY &&
-        remainingAfterFill * normalizedPrice < config.minOrderQuote
-      ) {
-        quantity = remainingQuantity;
       }
       if (quantity * normalizedPrice < config.minOrderQuote) {
         if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
@@ -4490,17 +4488,18 @@ export class SimulatedExecutionEngine {
         orderCount,
         remainingQuantity,
       );
-      let quantity = roundAsset(Math.min(remainingQuantity, desiredQuantity));
+      let quantity = roundAsset(
+        closeQuantityWithoutMinimumNotionalRemainder({
+          requestedQuantity: desiredQuantity,
+          availableQuantity: remainingQuantity,
+          executionPrice: normalizedPrice,
+          minNotional: config.minOrderQuote,
+          quantityEpsilon: MIN_BASE_QUANTITY,
+        }),
+      );
 
       if (quantity <= MIN_BASE_QUANTITY) {
         break;
-      }
-      const remainingAfterFill = roundAsset(remainingQuantity - quantity);
-      if (
-        remainingAfterFill > MIN_BASE_QUANTITY &&
-        remainingAfterFill * normalizedPrice < config.minOrderQuote
-      ) {
-        quantity = remainingQuantity;
       }
       if (quantity * normalizedPrice < config.minOrderQuote) {
         if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
@@ -5071,6 +5070,7 @@ export class SimulatedExecutionEngine {
       liquidatedPositionCount: order.liquidatedPositionCount,
     };
     this.state.fills.push(fill);
+    ensureManagedPositionLifecycles(this.state, filledAt);
     this.recordLegacyExitGridFill(order, fill);
     this.refreshAverageEntryPrices();
     if (fill.liquidation) {
@@ -5579,6 +5579,21 @@ export class SimulatedExecutionEngine {
     return this.legacyPositionLotCache?.activeShortQuantity ?? 0;
   }
 
+  private availableShortCloseQuantity(): number {
+    let quantity = this.activeShortQuantity();
+    for (const index of this.openOrderIndexes) {
+      const order = this.state.orders[index];
+      if (
+        order?.status === "open" &&
+        order.side === "buy" &&
+        order.positionEffect === "close"
+      ) {
+        quantity -= Math.max(0, order.quantity - order.filledQuantity);
+      }
+    }
+    return roundAsset(Math.max(0, quantity));
+  }
+
   private activeLongExposureQuote(marketPrice: number): number {
     if (
       this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
@@ -5883,6 +5898,7 @@ export class SimulatedExecutionEngine {
       sequence: this.state.sequence,
       ordersLength: this.state.orders.length,
       fillsLength: this.state.fills.length,
+      positionLifecyclesLength: this.state.positionLifecycles.length,
       liquidatedPositionCount: this.liquidatedPositionCountValue,
       metrics: { ...this.state.metrics },
     };
@@ -5907,6 +5923,7 @@ export class SimulatedExecutionEngine {
     this.state.sequence = rollback.sequence;
     this.state.orders.length = rollback.ordersLength;
     this.state.fills.length = rollback.fillsLength;
+    this.state.positionLifecycles.length = rollback.positionLifecyclesLength;
     this.liquidatedPositionCountValue = rollback.liquidatedPositionCount;
     this.state.metrics = rollback.metrics;
     this.legacyPositionLotCache = undefined;
@@ -6039,6 +6056,103 @@ export class SimulatedExecutionEngine {
   }
 }
 
+function ensureExitGridMemory(
+  memory: LegacyValleyPeakMemory,
+  lot: LegacyExitGridLot,
+  price: number,
+): LegacyExitGridMemory {
+  const grids = (memory.exitGrids ??= {});
+  let grid = grids[lot.id];
+  if (!grid) {
+    const entryPrice = cleanPositive(lot.averagePrice) || price;
+    grid = {
+      lotId: lot.id,
+      side: lot.side,
+      entryPrice,
+      entryQuantity: lot.originalQuantity,
+      peakPrice: Math.max(entryPrice, price),
+      gridPeakPrice: 0,
+      troughPrice: Math.min(entryPrice, price),
+      gridTroughPrice: 0,
+      resetPrice: 0,
+      gridCreatedAt: 0,
+      gridOrderIds: [],
+    };
+    grids[lot.id] = grid;
+  } else {
+    grid.side = lot.side;
+    grid.troughPrice ??= Math.min(grid.entryPrice, price);
+    grid.gridTroughPrice ??= 0;
+    grid.resetPrice ??= 0;
+    grid.gridCreatedAt ??= 0;
+  }
+  return grid;
+}
+
+function ensureManagedPositionLifecycles(
+  state: PaperBotState,
+  at: number,
+): void {
+  const managedIds = new Set(
+    state.positionLifecycles.map((position) => position.id),
+  );
+  const ledger = analyzePositions(state, { currentPrice: state.lastPrice });
+  const activeLots: PositionLot[] = [...ledger.longs, ...ledger.shorts].filter(
+    (lot) => lot.status !== "pending" && lot.status !== "closed",
+  );
+
+  for (const lot of activeLots) {
+    if (
+      state.config.legacyValleyPeak.exitGridEnabled &&
+      state.memory.legacyValleyPeak
+    ) {
+      ensureExitGridMemory(
+        state.memory.legacyValleyPeak,
+        lot,
+        cleanPositive(state.lastPrice) || lot.averagePrice,
+      );
+    }
+    if (managedIds.has(lot.id)) {
+      continue;
+    }
+
+    const sourceOrder = state.orders.find(
+      (order) => order.id === lot.sourceOrderId,
+    );
+    const entryOrderIds = state.orders
+      .filter(
+        (order) =>
+          order.id === lot.sourceOrderId || order.positionId === lot.id,
+      )
+      .map((order) => order.id);
+    const entryPrice =
+      cleanPositive(lot.averagePrice) ||
+      cleanPositive(lot.pendingLimitPrice) ||
+      cleanPositive(state.lastPrice);
+    const allocatedQuote = roundQuote(
+      entryPrice * Math.max(lot.originalQuantity, lot.filledQuantity),
+    );
+
+    state.positionLifecycles.push({
+      id: lot.id,
+      side: lot.side,
+      phase: "closing",
+      source: sourceOrder?.manual ? "manual" : "strategy",
+      createdAt: lot.openedAt,
+      updatedAt: Math.max(lot.openedAt, at),
+      settledAt: Math.max(lot.openedAt, at),
+      entryStartPrice: roundQuote(entryPrice),
+      anticipatedEntryPrice: roundQuote(entryPrice),
+      confidence: 1,
+      requestedQuote: allocatedQuote,
+      allocatedQuote,
+      entryOrderIds:
+        entryOrderIds.length > 0 ? entryOrderIds : [lot.sourceOrderId],
+    });
+    managedIds.add(lot.id);
+  }
+}
+
 function normalizeLoadedState(
   state: PaperBotState,
   overrides: PartialStrategyConfig,
@@ -6067,6 +6181,7 @@ function normalizeLoadedState(
   normalized.exitGridOrderCountTotal ??= 0;
   normalized.avgEntryPrice = inferAverageLongEntryPrice(normalized);
   normalized.avgShortEntryPrice = inferAverageShortEntryPrice(normalized);
+  ensureManagedPositionLifecycles(normalized, normalized.updatedAt);
   normalized.winningTrades ??= 0;
   normalized.losingTrades ??= 0;
   normalized.sequence ??= normalized.orders.length + normalized.fills.length;

@@ -175,6 +175,7 @@ export interface BinancePaperPlaceOrderInput {
   reduceOnly?: boolean;
   positionSide?: "BOTH" | "LONG" | "SHORT";
   clientOrderId?: string;
+  allowMinNotionalQuantityIncrease?: boolean;
 }
 
 export interface BinancePaperCancelOrderInput {
@@ -553,6 +554,7 @@ export class BinancePaperTrading {
       reduceOnly,
       positionSide,
       clientOrderId: clientOrderIdForBotOrder(order.id),
+      allowMinNotionalQuantityIncrease: order.positionEffect !== "close",
     });
   }
 
@@ -1065,7 +1067,12 @@ export class BinancePaperTrading {
     const minNotional = filters.minNotional ?? 0;
     let adjustedQuantity = quantity;
 
-    if (minNotional > 0 && effectivePrice && effectivePrice * adjustedQuantity < minNotional) {
+    if (
+      minNotional > 0 &&
+      effectivePrice &&
+      effectivePrice * adjustedQuantity < minNotional &&
+      positionInput.allowMinNotionalQuantityIncrease !== false
+    ) {
       adjustedQuantity = normalizeQuantity(
         minNotional / effectivePrice,
         positionInput.type,

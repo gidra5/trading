@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   SimulatedExecutionEngine,
   analyzePositions,
+  closeQuantityWithoutMinimumNotionalRemainder,
   createInitialBotState,
   createStrategyConfig,
   legacyValleyPeakObservedPriceRangeWarmupRatio,
@@ -648,6 +649,13 @@ export class TradingRuntime {
       if (quantity > target.remainingQuantity + 0.00000001) {
         throw new Error("Close quantity is larger than the target position.");
       }
+      normalizedInput.quantity = closeQuantityWithoutMinimumNotionalRemainder({
+        requestedQuantity: quantity,
+        availableQuantity: target.remainingQuantity,
+        executionPrice:
+          normalizedInput.price ?? this.bot.view().lastPrice,
+        minNotional: this.config.minOrderQuote,
+      });
     }
 
     if (entryGrid) {

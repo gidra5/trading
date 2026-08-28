@@ -62,4 +62,8 @@ export {
   type BalanceProjection,
 } from "./leveraged-balance.js";
 export { calculateRiskAdjustedMetrics } from "./risk-metrics.js";
+export {
+  closeQuantityWithoutMinimumNotionalRemainder,
+  type MinimumNotionalCloseSizingInput,
+} from "./close-sizing.js";
 export type * from "./types.js";

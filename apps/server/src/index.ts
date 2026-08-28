@@ -61,6 +61,9 @@ if (fs.existsSync(appConfig.webDistDir)) {
     root: appConfig.webDistDir,
     prefix: "/",
   });
+  for (const clientPath of ["/backtest", "/correlations"]) {
+    server.get(clientPath, async (_request, reply) => reply.sendFile("index.html"));
+  }
 }
 
 const marketCatalog = new BinanceMarketCatalog({
