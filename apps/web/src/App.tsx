@@ -1,4 +1,13 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  onMount,
+  type JSX,
+} from "solid-js";
 import { createStore, reconcile, unwrap } from "solid-js/store";
 import {
   Activity,
@@ -24,10 +33,13 @@ import type {
   Candle,
   LegacyEntryRiskDebug,
   LegacyMarketStateDebug,
+  LegacyValleyPeakAnticipationDebug,
   LegacyValleyPeakCheckDebug,
   LongPositionLot,
   ManualTradeInput,
+  PositionLifecycle,
   PositionLedger,
+  PositionLot,
   ShortPositionLot,
   EquityPoint,
   StrategyConfig,
@@ -816,9 +828,12 @@ export function App() {
 
         <PositionLedgerPanel
           ledger={snapshot()?.positions}
+          orders={bot()?.orders ?? []}
+          positionLifecycles={bot()?.positionLifecycles ?? []}
           baseAsset={bot()?.baseAsset ?? "Base"}
           quoteAsset={bot()?.quoteAsset ?? "USDT"}
           currentPrice={market()?.lastPrice ?? bot()?.lastPrice ?? 0}
+          anticipation={bot()?.memory.legacyValleyPeakDebug?.anticipation}
           exchangeDriven={snapshot()?.execution.exchangeDriven}
           error={manualTradeError()}
           onRecordTrade={recordManualTrade}
@@ -2996,9 +3011,12 @@ function FillsPanel(props: { fills: TradeFill[] }) {
 
 function PositionLedgerPanel(props: {
   ledger?: PositionLedger;
+  orders: TradingOrder[];
+  positionLifecycles: PositionLifecycle[];
   baseAsset: string;
   quoteAsset: string;
   currentPrice: number;
+  anticipation?: LegacyValleyPeakAnticipationDebug;
   exchangeDriven?: boolean;
   error?: string;
   onRecordTrade: (input: ManualTradeInput) => Promise<boolean>;
@@ -3008,8 +3026,13 @@ function PositionLedgerPanel(props: {
   const shorts = () => (props.ledger?.shorts ?? []).filter((lot) => lot.status !== "closed");
   const [draft, setDraft] = createSignal<ManualTradeDraft>();
   const [submitting, setSubmitting] = createSignal(false);
-  const [lotViewMode, setLotViewMode] = createSignal<LotViewMode>("tables");
   const currentPrice = () => props.currentPrice || summary()?.currentPrice || 0;
+  const anticipatedPriceForSide = (side: ManualTradeInput["side"]) => {
+    const positionSide = side === "buy" ? "long" : "short";
+    return props.anticipation?.side === positionSide
+      ? props.anticipation.extremaPrice
+      : 0;
+  };
   const openDraft = (draft: ManualTradeDraft) => {
     setDraft({
       ...draft,
@@ -3019,6 +3042,7 @@ function PositionLedgerPanel(props: {
       lifetimeMinutes: draft.lifetimeMinutes ?? 0,
       stopLossPrice: draft.stopLossPrice ?? 0,
       takeProfitPrice: draft.takeProfitPrice ?? 0,
+      confidence: draft.confidence ?? 0.5,
     });
   };
   const submitDraft = async () => {
@@ -3027,7 +3051,11 @@ function PositionLedgerPanel(props: {
       return;
     }
 
-    const price = manualTradePrice(value, currentPrice());
+    const createsEntryGrid =
+      !value.targetPositionId && value.priceMode === "limit";
+    const price = createsEntryGrid
+      ? currentPrice()
+      : manualTradePrice(value, currentPrice());
     const quantity = manualTradeQuantity(value, currentPrice());
     if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(quantity) || quantity <= 0) {
       return;
@@ -3036,7 +3064,7 @@ function PositionLedgerPanel(props: {
     setSubmitting(true);
     const ok = await props.onRecordTrade({
       side: value.side,
-      orderType: props.exchangeDriven
+      orderType: props.exchangeDriven && !createsEntryGrid
         ? value.priceMode === "limit"
           ? "limit"
           : "market"
@@ -3053,6 +3081,13 @@ function PositionLedgerPanel(props: {
         !value.targetPositionId && value.stopLossPrice > 0 ? value.stopLossPrice : undefined,
       takeProfitPrice:
         !value.targetPositionId && value.takeProfitPrice > 0 ? value.takeProfitPrice : undefined,
+      entryGrid:
+        createsEntryGrid
+          ? {
+              anticipatedPrice: value.price,
+              confidence: value.confidence,
+            }
+          : undefined,
     });
     setSubmitting(false);
     if (ok) {
@@ -3071,23 +3106,6 @@ function PositionLedgerPanel(props: {
           <div class="mr-1 text-sm text-ink-300">
             Fee + slip {formatPercent((summary()?.feeAndSlippageRate ?? 0) * 100)}
           </div>
-          <div class="grid grid-cols-2 gap-1 rounded-2 border border-line bg-ink-900 p-1">
-            <For each={lotViewModes}>
-              {(mode) => (
-                <button
-                  class="rounded-2 px-2.5 py-1.5 text-sm font-semibold transition"
-                  classList={{
-                    "bg-accent text-ink-950": lotViewMode() === mode.value,
-                    "text-ink-300 hover:text-ink-100": lotViewMode() !== mode.value,
-                  }}
-                  onClick={() => setLotViewMode(mode.value)}
-                  type="button"
-                >
-                  {mode.label}
-                </button>
-              )}
-            </For>
-          </div>
           <button
             class="btn"
             onClick={() =>
@@ -3096,12 +3114,13 @@ function PositionLedgerPanel(props: {
                 side: "buy",
                 quantity: 0,
                 quoteAmount: 0,
-                price: currentPrice(),
+                price: anticipatedPriceForSide("buy") || currentPrice(),
                 priceMode: "current",
                 positionEffect: "open",
                 lifetimeMinutes: 0,
                 stopLossPrice: 0,
                 takeProfitPrice: 0,
+                confidence: 0.5,
               })
             }
             type="button"
@@ -3117,12 +3136,13 @@ function PositionLedgerPanel(props: {
                 side: "sell",
                 quantity: 0,
                 quoteAmount: 0,
-                price: currentPrice(),
+                price: anticipatedPriceForSide("sell") || currentPrice(),
                 priceMode: "current",
                 positionEffect: "open",
                 lifetimeMinutes: 0,
                 stopLossPrice: 0,
                 takeProfitPrice: 0,
+                confidence: 0.5,
               })
             }
             type="button"
@@ -3167,70 +3187,32 @@ function PositionLedgerPanel(props: {
         )}
       </Show>
 
-      <Show
-        when={lotViewMode() === "tree"}
-        fallback={
-          <div class="grid min-w-0 grid-cols-1 gap-4 2xl:grid-cols-2">
-            <PositionLongTable
-              lots={longs()}
-              baseAsset={props.baseAsset}
-              quoteAsset={props.quoteAsset}
-              onClose={(lot) =>
-                openDraft({
-                  title: "Close Long",
-                  side: "sell",
-                  quantity: lot.remainingQuantity,
-                  quoteAmount: lot.remainingQuantity * currentPrice(),
-                  price: currentPrice(),
-                  priceMode: "current",
-                  targetPositionId: lot.id,
-                  positionEffect: "close",
-                  lifetimeMinutes: 0,
-                  stopLossPrice: 0,
-                  takeProfitPrice: 0,
-                })
-              }
-            />
-            <PositionShortTable
-              lots={shorts()}
-              baseAsset={props.baseAsset}
-              quoteAsset={props.quoteAsset}
-              onClose={(lot) =>
-                openDraft({
-                  title: "Close Short",
-                  side: "buy",
-                  quantity: lot.remainingQuantity,
-                  quoteAmount: lot.remainingQuantity * currentPrice(),
-                  price: currentPrice(),
-                  priceMode: "current",
-                  targetPositionId: lot.id,
-                  positionEffect: "close",
-                  lifetimeMinutes: 0,
-                  stopLossPrice: 0,
-                  takeProfitPrice: 0,
-                })
-              }
-            />
-          </div>
+      <PositionList
+        lots={[...longs(), ...shorts()]}
+        orders={props.orders}
+        positionLifecycles={props.positionLifecycles}
+        baseAsset={props.baseAsset}
+        quoteAsset={props.quoteAsset}
+        onClose={(lot) =>
+          openDraft({
+            title: lot.side === "long" ? "Close Long" : "Close Short",
+            side: lot.side === "long" ? "sell" : "buy",
+            quantity: lot.remainingQuantity,
+            quoteAmount: lot.remainingQuantity * currentPrice(),
+            price: currentPrice(),
+            priceMode: "current",
+            targetPositionId: lot.id,
+            positionEffect: "close",
+            lifetimeMinutes: 0,
+            stopLossPrice: 0,
+            takeProfitPrice: 0,
+            confidence: 0.5,
+          })
         }
-      >
-        <LotTreeView
-          longs={longs()}
-          shorts={shorts()}
-          baseAsset={props.baseAsset}
-          quoteAsset={props.quoteAsset}
-        />
-      </Show>
+      />
     </section>
   );
 }
-
-type LotViewMode = "tables" | "tree";
-
-const lotViewModes: Array<{ value: LotViewMode; label: string }> = [
-  { value: "tables", label: "Tables" },
-  { value: "tree", label: "Tree" },
-];
 
 type ManualTradePriceMode = "current" | "limit";
 
@@ -3246,10 +3228,11 @@ type ManualTradeDraft = {
   lifetimeMinutes: number;
   stopLossPrice: number;
   takeProfitPrice: number;
+  confidence: number;
 };
 
 function manualTradePrice(draft: ManualTradeDraft, currentPrice: number): number {
-  return draft.priceMode === "current" ? currentPrice : draft.price;
+  return draft.priceMode === "limit" ? draft.price : currentPrice;
 }
 
 function manualTradeQuantity(draft: ManualTradeDraft, currentPrice: number): number {
@@ -3257,12 +3240,11 @@ function manualTradeQuantity(draft: ManualTradeDraft, currentPrice: number): num
     return draft.quantity;
   }
 
-  const price = manualTradePrice(draft, currentPrice);
-  if (price <= 0) {
+  if (currentPrice <= 0) {
     return 0;
   }
 
-  return draft.quoteAmount / price;
+  return draft.quoteAmount / currentPrice;
 }
 
 function ManualTradeForm(props: {
@@ -3285,19 +3267,31 @@ function ManualTradeForm(props: {
   const isClose = () => Boolean(props.draft.targetPositionId);
   const effectivePrice = () => manualTradePrice(props.draft, props.currentPrice);
   const estimatedQuantity = () => manualTradeQuantity(props.draft, props.currentPrice);
-  const estimatedQuote = () => estimatedQuantity() * effectivePrice();
+  const estimatedQuote = () =>
+    isClose()
+      ? estimatedQuantity() * effectivePrice()
+      : props.draft.quoteAmount;
   const actionVerb = () => (props.draft.side === "buy" ? "Buy" : "Sell");
+  const validEntryLimit = () =>
+    isClose() ||
+    props.draft.priceMode !== "limit" ||
+    (props.draft.price > 0 &&
+      props.draft.confidence >= 0 &&
+      props.draft.confidence <= 1 &&
+      (props.draft.side === "buy"
+        ? props.draft.price < props.currentPrice
+        : props.draft.price > props.currentPrice));
   const canSubmit = () =>
     !props.submitting &&
     Number.isFinite(effectivePrice()) &&
     effectivePrice() > 0 &&
     Number.isFinite(estimatedQuantity()) &&
-    estimatedQuantity() > 0;
+    estimatedQuantity() > 0 &&
+    validEntryLimit();
   const setPriceMode = (priceMode: ManualTradePriceMode) => {
     props.onChange({
       ...props.draft,
       priceMode,
-      price: priceMode === "limit" && props.draft.price > 0 ? props.draft.price : props.currentPrice,
     });
   };
 
@@ -3312,7 +3306,11 @@ function ManualTradeForm(props: {
       <div class="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <div class="muted-label">
-            {props.exchangeDriven ? "Managed Order" : "Manual Fill"}
+            {props.exchangeDriven
+              ? isClose()
+                ? "Managed Close"
+                : "Managed Position"
+              : "Manual Fill"}
           </div>
           <div class="flex items-center gap-2">
             <h3 class="text-base font-semibold">{props.draft.title}</h3>
@@ -3397,6 +3395,18 @@ function ManualTradeForm(props: {
           />
         </Show>
       </div>
+      <Show when={!isClose() && props.draft.priceMode === "limit"}>
+        <div class="mt-3 max-w-sm">
+          <NumberField
+            label="Confidence"
+            value={props.draft.confidence}
+            min={0}
+            max={1}
+            step={0.05}
+            onInput={(value) => update("confidence", value)}
+          />
+        </div>
+      </Show>
       <Show when={!isClose()}>
         <div class="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
           <NumberField
@@ -3428,11 +3438,618 @@ function ManualTradeForm(props: {
           {formatAsset(estimatedQuantity())} {props.baseAsset}
         </div>
         <div class="mt-1 text-sm text-ink-300 tabular-nums">
-          at {formatQuote(effectivePrice(), 4)} {props.quoteAsset} for {formatQuote(estimatedQuote(), 2)}{" "}
-          {props.quoteAsset}
+          <Show
+            when={!isClose() && props.draft.priceMode === "limit"}
+            fallback={
+              <>
+                at {formatQuote(effectivePrice(), 4)} {props.quoteAsset} for{" "}
+                {formatQuote(estimatedQuote(), 2)} {props.quoteAsset}
+              </>
+            }
+          >
+            {formatQuote(props.currentPrice, 4)} to{" "}
+            {formatQuote(props.draft.price, 4)} {props.quoteAsset} ·{" "}
+            confidence {formatQuote(props.draft.confidence, 2)} ·{" "}
+            {formatQuote(estimatedQuote(), 2)} {props.quoteAsset}
+          </Show>
         </div>
       </div>
     </form>
+  );
+}
+
+function PositionList(props: {
+  lots: PositionLot[];
+  orders: TradingOrder[];
+  positionLifecycles: PositionLifecycle[];
+  baseAsset: string;
+  quoteAsset: string;
+  onClose: (lot: PositionLot) => void;
+}) {
+  const lots = () =>
+    props.lots.slice().sort((left, right) => right.openedAt - left.openedAt);
+
+  return (
+    <div class="min-w-0 overflow-hidden rounded-2 bg-ink-800 p-3">
+      <div class="mb-3 flex flex-wrap items-end justify-between gap-2">
+        <div>
+          <div class="muted-label">Open lots</div>
+          <h3 class="text-base font-semibold">Long/short positions</h3>
+        </div>
+        <div class="text-sm text-ink-300 tabular-nums">
+          {lots().length} {lots().length === 1 ? "position" : "positions"}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 gap-2">
+        <For
+          each={lots()}
+          fallback={<div class="rounded-2 border border-line bg-ink-900 p-3 text-sm text-ink-300">No open positions</div>}
+        >
+          {(lot) => (
+            <PositionListItem
+              lot={lot}
+              orders={props.orders}
+              lifecycle={
+                lot.lifecycle ??
+                props.positionLifecycles.find((position) => position.id === lot.id)
+              }
+              baseAsset={props.baseAsset}
+              quoteAsset={props.quoteAsset}
+              onClose={() => props.onClose(lot)}
+            />
+          )}
+        </For>
+      </div>
+    </div>
+  );
+}
+
+function PositionListItem(props: {
+  lot: PositionLot;
+  orders: TradingOrder[];
+  lifecycle?: PositionLifecycle;
+  baseAsset: string;
+  quoteAsset: string;
+  onClose: () => void;
+}) {
+  const lifecycleId = () => props.lifecycle?.id ?? props.lot.id;
+  const entryOrderIds = () => new Set(props.lifecycle?.entryOrderIds ?? []);
+  const orders = () =>
+    props.orders
+      .filter(
+        (order) =>
+          order.id === props.lot.sourceOrderId ||
+          entryOrderIds().has(order.id) ||
+          order.positionId === props.lot.id ||
+          order.positionId === lifecycleId() ||
+          order.targetPositionId === props.lot.id ||
+          order.targetPositionId === lifecycleId(),
+      )
+      .sort(
+        (left, right) =>
+          left.price - right.price ||
+          left.createdAt - right.createdAt ||
+          left.id.localeCompare(right.id),
+      );
+  const isEntryOrder = (order: TradingOrder) =>
+    order.id === props.lot.sourceOrderId ||
+    entryOrderIds().has(order.id) ||
+    order.positionId === props.lot.id ||
+    order.positionId === lifecycleId();
+  const stage = () => (props.lifecycle?.phase === "closing" ? "exit" : "entry");
+  const stageOrders = () =>
+    orders().filter((order) =>
+      stage() === "entry" ? isEntryOrder(order) : !isEntryOrder(order),
+    );
+  const executedStageOrders = () =>
+    stageOrders().filter((order) => positionOrderState(order) === "executed").length;
+  const breakEvenPrice = () => lotBreakEvenPrice(props.lot);
+  const possible = () =>
+    props.lot.side === "long"
+      ? props.lot.canReachLowerBaseline
+      : props.lot.canReachUpperBaseline;
+  const canClose = () =>
+    props.lot.status !== "pending" &&
+    props.lot.remainingQuantity > 0 &&
+    (!props.lifecycle || props.lifecycle.phase === "closing");
+
+  return (
+    <details class="group rounded-2 border border-line bg-ink-900">
+      <summary class="cursor-pointer list-none p-3">
+        <div class="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.4fr)_minmax(8rem,.75fr)_minmax(8rem,.65fr)_minmax(7rem,.55fr)_auto] lg:items-center">
+          <div class="flex min-w-0 items-center gap-2">
+            <ChevronRight class="shrink-0 transition-transform group-open:rotate-90" size={16} />
+            <span
+              class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+              classList={{
+                "bg-gain/12 text-gain": props.lot.side === "long",
+                "bg-loss/12 text-loss": props.lot.side === "short",
+              }}
+            >
+              {props.lot.side}
+            </span>
+            <StatusBadge status={props.lot.status} />
+            <span class="truncate text-sm font-semibold text-ink-100">
+              {props.lot.sourceOrderId}
+            </span>
+          </div>
+
+          <PositionSummaryValue
+            label="Lifecycle"
+            value={props.lifecycle?.phase ?? "unmanaged"}
+          />
+          <PositionSummaryValue
+            label="Break-even"
+            value={`$${formatQuote(breakEvenPrice(), 4)}`}
+          />
+          <PositionSummaryValue
+            label={`${stage()} grid`}
+            value={`${executedStageOrders()}/${stageOrders().length} executed`}
+          />
+          <div class="flex items-center justify-between gap-3 lg:justify-end">
+            <div>
+              <div class="muted-label mb-1">Possible</div>
+              <PossibleBadge possible={possible()} />
+            </div>
+            <button
+              class="btn px-2 py-1 text-xs"
+              disabled={!canClose()}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                props.onClose();
+              }}
+              type="button"
+            >
+              <MinusCircle size={14} />
+              Close
+            </button>
+          </div>
+        </div>
+      </summary>
+
+      <div class="border-t border-line p-3">
+        <div class="grid grid-cols-2 overflow-hidden rounded-2 border border-line sm:grid-cols-3 xl:grid-cols-6">
+          <PositionDetailCell label={props.lot.side === "long" ? "Left / bought" : "Left / sold"}>
+            <QuantityValueRatioCell
+              quantity={props.lot.remainingQuantity}
+              totalQuantity={props.lot.filledQuantity || props.lot.originalQuantity}
+              quote={
+                props.lot.side === "long"
+                  ? props.lot.remainingCostQuote
+                  : props.lot.remainingProceedsQuote
+              }
+              totalQuote={
+                props.lot.side === "long" ? props.lot.costQuote : props.lot.proceedsQuote
+              }
+              quoteAsset={props.quoteAsset}
+            />
+          </PositionDetailCell>
+          <PositionDetailCell label="Leverage">
+            <LeverageCell leverage={props.lot.leverage} />
+          </PositionDetailCell>
+          <PositionDetailCell label="Borrowed">
+            <BorrowedCell
+              lot={props.lot}
+              baseAsset={props.baseAsset}
+              quoteAsset={props.quoteAsset}
+            />
+          </PositionDetailCell>
+          <PositionDetailCell label="Pending">
+            <PendingCell
+              quantity={props.lot.pendingQuantity}
+              quote={props.lot.pendingQuote}
+              price={props.lot.pendingLimitPrice}
+              quoteAsset={props.quoteAsset}
+            />
+          </PositionDetailCell>
+          <PositionDetailCell label="Closed">
+            <ActionAmount
+              quantity={props.lot.closedQuantity}
+              quote={props.lot.closedQuote}
+            />
+          </PositionDetailCell>
+          <PositionDetailCell label="Average price">
+            <span>${formatQuote(props.lot.averagePrice, 4)}</span>
+          </PositionDetailCell>
+          <PositionDetailCell label="Break-even">
+            <span>${formatQuote(breakEvenPrice(), 4)}</span>
+          </PositionDetailCell>
+          <PositionDetailCell label="Max loss">
+            <span>${formatQuote(lotMaxLossPrice(props.lot), 4)}</span>
+          </PositionDetailCell>
+          <PositionDetailCell label={props.lot.side === "long" ? "Sell now" : "Buy now"}>
+            <ActionAmount
+              quantity={
+                props.lot.side === "long"
+                  ? props.lot.recommendedSellQuantity
+                  : props.lot.recommendedBuyQuantity
+              }
+              quote={
+                props.lot.side === "long"
+                  ? props.lot.recommendedSellQuote
+                  : props.lot.recommendedBuyQuote
+              }
+            />
+          </PositionDetailCell>
+          <PositionDetailCell label="Opened">
+            <span class="whitespace-nowrap text-ink-300">
+              {formatDateTime(props.lot.openedAt)}
+            </span>
+          </PositionDetailCell>
+          <PositionDetailCell label="Position ID">
+            <span class="break-all font-mono text-xs text-ink-300">{props.lot.id}</span>
+          </PositionDetailCell>
+          <PositionDetailCell label="Rules">
+            <LotRulesCell lot={props.lot} />
+          </PositionDetailCell>
+        </div>
+
+        <div class="mt-3 flex flex-wrap items-end justify-between gap-2">
+          <div>
+            <div class="muted-label">Position grid</div>
+            <h4 class="text-sm font-semibold">Orders by price</h4>
+          </div>
+          <div class="text-xs text-ink-300 tabular-nums">
+            {orders().length} {orders().length === 1 ? "order" : "orders"}
+          </div>
+        </div>
+        <div class="mt-2 max-w-full overflow-x-auto">
+          <table class="w-full min-w-160">
+            <thead>
+              <tr>
+                <th class="table-head pb-2">Role</th>
+                <th class="table-head pb-2">Price</th>
+                <th class="table-head pb-2">Size</th>
+                <th class="table-head pb-2">Status</th>
+                <th class="table-head pb-2">Order</th>
+              </tr>
+            </thead>
+            <tbody>
+              <For
+                each={orders()}
+                fallback={<EmptyRow columns={5} label="No position grid orders available" />}
+              >
+                {(order) => (
+                  <tr>
+                    <td class="td-cell">
+                      <span
+                        class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+                        classList={{
+                          "bg-accent/12 text-accent": isEntryOrder(order),
+                          "bg-warn/12 text-warn": !isEntryOrder(order),
+                        }}
+                      >
+                        {isEntryOrder(order) ? "entry" : "exit"}
+                      </span>
+                    </td>
+                    <td class="td-cell tabular-nums">${formatQuote(order.price, 4)}</td>
+                    <td class="td-cell tabular-nums">
+                      {formatAsset(order.filledQuantity)} / {formatAsset(order.quantity)}{" "}
+                      <span class="text-ink-300">{props.baseAsset}</span>
+                    </td>
+                    <td class="td-cell">
+                      <PositionOrderStateBadge order={order} />
+                    </td>
+                    <td class="td-cell font-mono text-xs text-ink-300">{order.id}</td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function PositionSummaryValue(props: { label: string; value: string }) {
+  return (
+    <div class="min-w-0 pl-6 lg:pl-0">
+      <div class="muted-label">{props.label}</div>
+      <div class="mt-1 truncate text-sm font-semibold capitalize text-ink-100 tabular-nums">
+        {props.value}
+      </div>
+    </div>
+  );
+}
+
+function PositionDetailCell(props: { label: string; children: JSX.Element }) {
+  return (
+    <div class="min-w-0 border-b border-r border-line p-3">
+      <div class="muted-label mb-1">{props.label}</div>
+      <div class="min-w-0 text-sm text-ink-100 tabular-nums">{props.children}</div>
+    </div>
+  );
+}
+
+function PositionExecutionState(props: {
+  positionLifecycles: PositionLifecycle[];
+  orders: TradingOrder[];
+  baseAsset: string;
+  quoteAsset: string;
+}) {
+  const activePositions = () =>
+    props.positionLifecycles
+      .filter((position) => position.phase !== "closed")
+      .sort((left, right) => right.createdAt - left.createdAt);
+
+  return (
+    <Show when={activePositions().length > 0}>
+      <div class="mb-4 border-y border-line py-3">
+        <div class="mb-2 flex flex-wrap items-end justify-between gap-2">
+          <div>
+            <div class="muted-label">Managed Positions</div>
+            <h3 class="text-base font-semibold">Position Execution State</h3>
+          </div>
+          <div class="text-sm text-ink-300 tabular-nums">
+            {activePositions().length} active
+          </div>
+        </div>
+        <For each={activePositions()}>
+          {(position) => (
+            <PositionExecutionItem
+              position={position}
+              orders={props.orders}
+              baseAsset={props.baseAsset}
+              quoteAsset={props.quoteAsset}
+            />
+          )}
+        </For>
+      </div>
+    </Show>
+  );
+}
+
+function PositionExecutionItem(props: {
+  position: PositionLifecycle;
+  orders: TradingOrder[];
+  baseAsset: string;
+  quoteAsset: string;
+}) {
+  const entryOrderIds = () => new Set(props.position.entryOrderIds);
+  const orders = () =>
+    props.orders
+      .filter(
+        (order) =>
+          entryOrderIds().has(order.id) ||
+          order.positionId === props.position.id ||
+          order.targetPositionId === props.position.id,
+      )
+      .sort(
+        (left, right) =>
+          left.createdAt - right.createdAt || left.id.localeCompare(right.id),
+      );
+  const entryOrders = () =>
+    orders().filter(
+      (order) =>
+        entryOrderIds().has(order.id) ||
+        order.positionId === props.position.id,
+    );
+  const executedOrderCount = () =>
+    orders().filter((order) => positionOrderState(order) === "executed").length;
+  const executedEntryOrderCount = () =>
+    entryOrders().filter((order) => positionOrderState(order) === "executed")
+      .length;
+  const waitingOrderCount = () =>
+    orders().filter((order) => order.status === "open").length;
+  const cancelledOrderCount = () =>
+    orders().filter((order) => order.status === "cancelled").length;
+  const entryFilledQuantity = () =>
+    entryOrders().reduce(
+      (total, order) => total + Math.max(0, order.filledQuantity),
+      0,
+    );
+  const entryWaitingQuantity = () =>
+    entryOrders().reduce(
+      (total, order) =>
+        total +
+        (order.status === "open"
+          ? Math.max(0, order.quantity - order.filledQuantity)
+          : 0),
+      0,
+    );
+  const entryFilledQuote = () =>
+    entryOrders().reduce(
+      (total, order) => total + order.price * Math.max(0, order.filledQuantity),
+      0,
+    );
+  const entryTotalQuantity = () =>
+    entryOrders().reduce((total, order) => total + order.quantity, 0);
+  const entryProgressPct = () => {
+    const total = entryTotalQuantity();
+    return total > 0 ? Math.min(100, (entryFilledQuantity() / total) * 100) : 0;
+  };
+  const missingEntryOrderCount = () =>
+    Math.max(
+      0,
+      props.position.entryOrderIds.length -
+        entryOrders().filter((order) => entryOrderIds().has(order.id)).length,
+    );
+
+  return (
+    <details class="border-t border-line py-2" open>
+      <summary class="cursor-pointer list-none py-1">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-center gap-2">
+            <span
+              class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+              classList={{
+                "bg-gain/12 text-gain": props.position.side === "long",
+                "bg-loss/12 text-loss": props.position.side === "short",
+              }}
+            >
+              {props.position.side}
+            </span>
+            <StatusBadge status={props.position.phase} />
+            <span class="max-w-full truncate text-sm font-semibold text-ink-100">
+              {props.position.id}
+            </span>
+          </div>
+          <div class="text-sm text-ink-300 tabular-nums">
+            {executedOrderCount()} executed · {waitingOrderCount()} waiting ·{" "}
+            {cancelledOrderCount()} cancelled
+          </div>
+        </div>
+      </summary>
+
+      <div class="mt-2 grid grid-cols-2 border-y border-line sm:grid-cols-3 xl:grid-cols-6">
+        <PositionStateMetric label="Phase" value={props.position.phase} />
+        <PositionStateMetric
+          label="Entry Filled"
+          value={`${formatAsset(entryFilledQuantity())} ${props.baseAsset}`}
+        />
+        <PositionStateMetric
+          label="Entry Waiting"
+          value={`${formatAsset(entryWaitingQuantity())} ${props.baseAsset}`}
+        />
+        <PositionStateMetric
+          label="Filled Value"
+          value={`${formatQuote(entryFilledQuote(), 2)} ${props.quoteAsset}`}
+        />
+        <PositionStateMetric
+          label="Entry Orders"
+          value={`${executedEntryOrderCount()}/${entryOrders().length} executed`}
+        />
+        <PositionStateMetric
+          label="Entry Progress"
+          value={formatPercent(entryProgressPct())}
+        />
+      </div>
+      <div class="h-1.5 bg-ink-700">
+        <div
+          class="h-full bg-accent transition-all"
+          style={{ width: `${entryProgressPct()}%` }}
+        />
+      </div>
+
+      <div class="mt-2 max-w-full overflow-x-auto">
+        <table class="min-w-full w-max">
+          <thead>
+            <tr>
+              <th class="table-head pb-2">Role</th>
+              <th class="table-head pb-2">State</th>
+              <th class="table-head pb-2">Order</th>
+              <th class="table-head pb-2">Side</th>
+              <th class="table-head pb-2">Type</th>
+              <th class="table-head pb-2">Price</th>
+              <th class="table-head pb-2">Filled / Total</th>
+              <th class="table-head pb-2">Waiting</th>
+              <th class="table-head pb-2">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For
+              each={orders()}
+              fallback={<EmptyRow columns={9} label="No position orders available" />}
+            >
+              {(order) => {
+                const isEntry = () =>
+                  entryOrderIds().has(order.id) ||
+                  order.positionId === props.position.id;
+                const remainingQuantity = () =>
+                  order.status === "open"
+                    ? Math.max(0, order.quantity - order.filledQuantity)
+                    : 0;
+                return (
+                  <tr>
+                    <td class="td-cell">
+                      <span
+                        class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+                        classList={{
+                          "bg-accent/12 text-accent": isEntry(),
+                          "bg-warn/12 text-warn": !isEntry(),
+                        }}
+                      >
+                        {isEntry() ? "entry" : "exit"}
+                      </span>
+                    </td>
+                    <td class="td-cell">
+                      <PositionOrderStateBadge order={order} />
+                    </td>
+                    <td class="td-cell font-mono text-xs text-ink-300">
+                      {order.id}
+                    </td>
+                    <td class="td-cell">
+                      <Side side={order.side} />
+                    </td>
+                    <td class="td-cell uppercase text-ink-300">{order.type}</td>
+                    <td class="td-cell tabular-nums">
+                      ${formatQuote(order.price, 4)}
+                    </td>
+                    <td class="td-cell tabular-nums">
+                      {formatAsset(order.filledQuantity)} /{" "}
+                      {formatAsset(order.quantity)}
+                    </td>
+                    <td class="td-cell tabular-nums">
+                      {remainingQuantity() > 0
+                        ? formatAsset(remainingQuantity())
+                        : "-"}
+                    </td>
+                    <td class="td-cell whitespace-nowrap text-ink-300">
+                      {formatDateTime(order.updatedAt)}
+                    </td>
+                  </tr>
+                );
+              }}
+            </For>
+          </tbody>
+        </table>
+      </div>
+      <Show when={missingEntryOrderCount() > 0}>
+        <div class="mt-2 text-xs text-warn tabular-nums">
+          {missingEntryOrderCount()} entry orders unavailable
+        </div>
+      </Show>
+    </details>
+  );
+}
+
+function PositionStateMetric(props: { label: string; value: string }) {
+  return (
+    <div class="min-w-0 border-r border-line px-3 py-2 last:border-r-0">
+      <div class="muted-label">{props.label}</div>
+      <div class="mt-1 truncate text-sm font-semibold text-ink-100 tabular-nums">
+        {props.value}
+      </div>
+    </div>
+  );
+}
+
+type PositionOrderState =
+  | "waiting"
+  | "partial-waiting"
+  | "executed"
+  | "partial-cancelled"
+  | "cancelled";
+
+function positionOrderState(order: TradingOrder): PositionOrderState {
+  const remainingQuantity = Math.max(0, order.quantity - order.filledQuantity);
+  if (order.status === "filled" || remainingQuantity <= 0.00000001) {
+    return "executed";
+  }
+  if (order.status === "open") {
+    return order.filledQuantity > 0 ? "partial-waiting" : "waiting";
+  }
+  return order.filledQuantity > 0 ? "partial-cancelled" : "cancelled";
+}
+
+function PositionOrderStateBadge(props: { order: TradingOrder }) {
+  const state = () => positionOrderState(props.order);
+  return (
+    <span
+      class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
+      classList={{
+        "bg-warn/12 text-warn":
+          state() === "waiting" || state() === "partial-waiting",
+        "bg-gain/12 text-gain": state() === "executed",
+        "bg-ink-700 text-ink-200": state() === "partial-cancelled",
+        "bg-loss/12 text-loss": state() === "cancelled",
+      }}
+    >
+      {state().replace("-", " ")}
+    </span>
   );
 }
 
@@ -3472,7 +4089,7 @@ function LotTreeView(props: {
                     >
                       {lot.side}
                     </span>
-                    <StatusBadge status={lot.status} />
+                    <StatusBadge status={lot.lifecycle?.phase ?? lot.status} />
                     <span class="truncate text-sm font-semibold text-ink-100">{lot.id}</span>
                   </div>
                   <div class="text-sm tabular-nums text-ink-300">
@@ -3489,6 +4106,17 @@ function LotTreeView(props: {
                     lot.originalQuantity,
                   )} ${props.baseAsset}`}
                 />
+                <Show when={lot.lifecycle}>
+                  {(lifecycle) => (
+                    <LotTreeBranch
+                      label="Entry grid"
+                      value={`$${formatQuote(lifecycle().entryStartPrice, 4)} -> $${formatQuote(
+                        lifecycle().anticipatedEntryPrice,
+                        4,
+                      )} · ${formatQuote(lifecycle().confidence * 100, 0)}%`}
+                    />
+                  )}
+                </Show>
                 <LotTreeBranch
                   label="Exposure"
                   value={`$${formatQuote(lot.exposureQuote, 2)} ${props.quoteAsset}`}
@@ -3511,7 +4139,7 @@ function LotTreeView(props: {
                 />
                 <Show when={lot.pendingQuantity > 0}>
                   <LotTreeBranch
-                    label="Pending close"
+                    label={lot.lifecycle ? "Pending entry" : "Pending close"}
                     value={`${formatAsset(lot.pendingQuantity)} @ $${formatQuote(
                       lot.pendingLimitPrice,
                       4,
@@ -3527,7 +4155,15 @@ function LotTreeView(props: {
                     )}`}
                   />
                 </Show>
-                <Show when={lot.lifetimeMs || lot.stopLossPrice || lot.takeProfitPrice || lot.borrowLocked}>
+                <Show
+                  when={
+                    lot.lifecycle ||
+                    lot.lifetimeMs ||
+                    lot.stopLossPrice ||
+                    lot.takeProfitPrice ||
+                    lot.borrowLocked
+                  }
+                >
                   <div class="mt-2">
                     <LotRulesCell lot={lot} />
                   </div>
@@ -3632,7 +4268,7 @@ function PositionLongTable(props: {
               {(lot) => (
                 <tr>
                   <td class="td-cell">
-                    <StatusBadge status={lot.status} />
+                    <StatusBadge status={lot.lifecycle?.phase ?? lot.status} />
                   </td>
                   <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
                   <td class="td-cell">
@@ -3680,7 +4316,11 @@ function PositionLongTable(props: {
                   <td class="td-cell">
                     <button
                       class="btn px-2 py-1 text-xs"
-                      disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
+                      disabled={
+                        lot.status === "pending" ||
+                        lot.remainingQuantity <= 0 ||
+                        Boolean(lot.lifecycle && lot.lifecycle.phase !== "closing")
+                      }
                       onClick={() => props.onClose(lot)}
                       type="button"
                     >
@@ -3735,7 +4375,7 @@ function PositionShortTable(props: {
               {(lot) => (
                 <tr>
                   <td class="td-cell">
-                    <StatusBadge status={lot.status} />
+                    <StatusBadge status={lot.lifecycle?.phase ?? lot.status} />
                   </td>
                   <td class="td-cell text-ink-300">{lot.sourceOrderId}</td>
                   <td class="td-cell">
@@ -3783,7 +4423,11 @@ function PositionShortTable(props: {
                   <td class="td-cell">
                     <button
                       class="btn px-2 py-1 text-xs"
-                      disabled={lot.status === "pending" || lot.remainingQuantity <= 0}
+                      disabled={
+                        lot.status === "pending" ||
+                        lot.remainingQuantity <= 0 ||
+                        Boolean(lot.lifecycle && lot.lifecycle.phase !== "closing")
+                      }
                       onClick={() => props.onClose(lot)}
                       type="button"
                     >
@@ -3804,6 +4448,7 @@ function PositionShortTable(props: {
 function LotRulesCell(props: { lot: LongPositionLot | ShortPositionLot }) {
   if (
     !props.lot.borrowLocked &&
+    !props.lot.lifecycle &&
     !props.lot.lifetimeMs &&
     !props.lot.stopLossPrice &&
     !props.lot.takeProfitPrice
@@ -3813,6 +4458,14 @@ function LotRulesCell(props: { lot: LongPositionLot | ShortPositionLot }) {
 
   return (
     <div class="flex max-w-52 flex-wrap gap-1">
+      <Show when={props.lot.lifecycle}>
+        {(lifecycle) => (
+          <span class="rounded-2 bg-ink-700 px-2 py-1 text-xs text-ink-100 tabular-nums">
+            Grid ${formatQuote(lifecycle().anticipatedEntryPrice, 4)} ·{" "}
+            {formatQuote(lifecycle().confidence * 100, 0)}%
+          </span>
+        )}
+      </Show>
       <Show when={props.lot.borrowLocked}>
         <span class="rounded-2 bg-warn/12 px-2 py-1 text-xs font-semibold uppercase text-warn">
           no borrow
@@ -3947,10 +4600,13 @@ function StatusBadge(props: { status: string }) {
     <span
       class="rounded-2 px-2 py-1 text-xs font-semibold uppercase"
       classList={{
-        "bg-accent/12 text-accent": props.status === "open",
-        "bg-warn/12 text-warn": props.status === "pending",
+        "bg-accent/12 text-accent":
+          props.status === "open" || props.status === "closing",
+        "bg-warn/12 text-warn":
+          props.status === "pending" || props.status === "settling",
         "bg-gain/12 text-gain": props.status === "closed",
-        "bg-ink-700 text-ink-200": props.status === "partially-closed",
+        "bg-ink-700 text-ink-200":
+          props.status === "partially-closed" || props.status === "created",
       }}
     >
       {props.status.replace("-", " ")}

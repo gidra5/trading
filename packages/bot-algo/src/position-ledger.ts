@@ -169,12 +169,29 @@ export function analyzePositions(
   }
 
   const borrowProfiles = buildBorrowProfiles(longs, shorts, context, state);
-  const finalizedLongs = longs.map((lot) =>
-    finalizeLongLot(lot, context, borrowProfiles.longs.get(lot.id) ?? emptyBorrowProfile()),
+  const lifecycleById = new Map(
+    (state.positionLifecycles ?? []).map((lifecycle) => [lifecycle.id, lifecycle]),
   );
-  const finalizedShorts = shorts.map((lot) =>
-    finalizeShortLot(lot, context, borrowProfiles.shorts.get(lot.id) ?? emptyBorrowProfile()),
-  );
+  const finalizedLongs = longs.map((lot) => ({
+    ...finalizeLongLot(
+      lot,
+      context,
+      borrowProfiles.longs.get(lot.id) ?? emptyBorrowProfile(),
+    ),
+    ...(lifecycleById.has(lot.id)
+      ? { lifecycle: structuredClone(lifecycleById.get(lot.id)) }
+      : {}),
+  }));
+  const finalizedShorts = shorts.map((lot) => ({
+    ...finalizeShortLot(
+      lot,
+      context,
+      borrowProfiles.shorts.get(lot.id) ?? emptyBorrowProfile(),
+    ),
+    ...(lifecycleById.has(lot.id)
+      ? { lifecycle: structuredClone(lifecycleById.get(lot.id)) }
+      : {}),
+  }));
   const activeLongs = finalizedLongs.filter((lot) => lot.status !== "pending");
   const activeShorts = finalizedShorts.filter((lot) => lot.status !== "pending");
   const longQuantity = roundAsset(sum(activeLongs, "remainingQuantity"));
@@ -339,8 +356,24 @@ function applyBuyFill(
       unitCost,
       context,
     );
+    const lotId = sourceOrder?.positionId || fill.positionId || `long_${fill.id}`;
+    const existing = longs.find((lot) => lot.id === lotId);
+    if (existing) {
+      existing.originalQuantity = roundAsset(existing.originalQuantity + quantityLeft);
+      existing.filledQuantity = roundAsset(existing.filledQuantity + quantityLeft);
+      existing.remainingQuantity = roundAsset(existing.remainingQuantity + quantityLeft);
+      existing.costQuote = roundQuote(existing.costQuote + costLeft);
+      existing.remainingCostQuote = roundQuote(existing.remainingCostQuote + costLeft);
+      existing.averagePrice = roundQuote(existing.costQuote / existing.filledQuantity);
+      existing.borrowAllocations.push(...borrowAllocations);
+      existing.borrowDepthRemaining = Math.max(
+        existing.borrowDepthRemaining,
+        inheritedLongBorrowDepth(borrowAllocations, context.longBorrowDepth),
+      );
+      return;
+    }
     longs.push({
-      id: `long_${fill.id}`,
+      id: lotId,
       side: "long",
       sourceOrderId: fill.orderId,
       openedAt: sourceOrder?.createdAt ?? fill.filledAt,
@@ -407,8 +440,28 @@ function applySellFill(
       unitProceeds,
       context,
     );
+    const lotId = sourceOrder?.positionId || fill.positionId || `short_${fill.id}`;
+    const existing = shorts.find((lot) => lot.id === lotId);
+    if (existing) {
+      existing.originalQuantity = roundAsset(existing.originalQuantity + quantityLeft);
+      existing.filledQuantity = roundAsset(existing.filledQuantity + quantityLeft);
+      existing.remainingQuantity = roundAsset(existing.remainingQuantity + quantityLeft);
+      existing.proceedsQuote = roundQuote(existing.proceedsQuote + proceedsLeft);
+      existing.remainingProceedsQuote = roundQuote(
+        existing.remainingProceedsQuote + proceedsLeft,
+      );
+      existing.averagePrice = roundQuote(
+        existing.proceedsQuote / existing.filledQuantity,
+      );
+      existing.borrowAllocations.push(...borrowAllocations);
+      existing.borrowDepthRemaining = Math.max(
+        existing.borrowDepthRemaining,
+        inheritedShortBorrowDepth(borrowAllocations, context.shortBorrowDepth),
+      );
+      return;
+    }
     shorts.push({
-      id: `short_${fill.id}`,
+      id: lotId,
       side: "short",
       sourceOrderId: fill.orderId,
       openedAt: sourceOrder?.createdAt ?? fill.filledAt,
@@ -789,8 +842,31 @@ function appendPendingOrderLot(
       order.estimatedQuoteCost > 0
         ? (order.estimatedQuoteCost * pendingQuantity) / order.quantity
         : pendingQuantity * order.price * (1 + feeRate);
+    const lotId = order.positionId || `pending_long_${order.id}`;
+    const existing = longs.find((lot) => lot.id === lotId);
+    if (existing) {
+      const previousPendingQuantity = existing.pendingQuantity;
+      const nextPendingQuantity = roundAsset(previousPendingQuantity + pendingQuantity);
+      existing.originalQuantity = roundAsset(existing.originalQuantity + pendingQuantity);
+      existing.pendingQuantity = nextPendingQuantity;
+      existing.pendingQuote = roundQuote(existing.pendingQuote + pendingQuote);
+      existing.pendingLimitPrice = roundQuote(
+        (existing.pendingLimitPrice * previousPendingQuantity +
+          order.price * pendingQuantity) /
+          nextPendingQuantity,
+      );
+      if (existing.filledQuantity <= EPSILON) {
+        existing.remainingQuantity = nextPendingQuantity;
+        existing.remainingCostQuote = existing.pendingQuote;
+        existing.costQuote = existing.pendingQuote;
+        existing.averagePrice = roundQuote(
+          existing.pendingQuote / nextPendingQuantity,
+        );
+      }
+      return;
+    }
     longs.push({
-      id: `pending_long_${order.id}`,
+      id: lotId,
       side: "long",
       sourceOrderId: order.id,
       openedAt: order.createdAt,
@@ -814,8 +890,31 @@ function appendPendingOrderLot(
   }
 
   const pendingQuote = pendingQuantity * order.price * (1 - feeRate);
+  const lotId = order.positionId || `pending_short_${order.id}`;
+  const existing = shorts.find((lot) => lot.id === lotId);
+  if (existing) {
+    const previousPendingQuantity = existing.pendingQuantity;
+    const nextPendingQuantity = roundAsset(previousPendingQuantity + pendingQuantity);
+    existing.originalQuantity = roundAsset(existing.originalQuantity + pendingQuantity);
+    existing.pendingQuantity = nextPendingQuantity;
+    existing.pendingQuote = roundQuote(existing.pendingQuote + pendingQuote);
+    existing.pendingLimitPrice = roundQuote(
+      (existing.pendingLimitPrice * previousPendingQuantity +
+        order.price * pendingQuantity) /
+        nextPendingQuantity,
+    );
+    if (existing.filledQuantity <= EPSILON) {
+      existing.remainingQuantity = nextPendingQuantity;
+      existing.remainingProceedsQuote = existing.pendingQuote;
+      existing.proceedsQuote = existing.pendingQuote;
+      existing.averagePrice = roundQuote(
+        existing.pendingQuote / nextPendingQuantity,
+      );
+    }
+    return;
+  }
   shorts.push({
-    id: `pending_short_${order.id}`,
+    id: lotId,
     side: "short",
     sourceOrderId: order.id,
     openedAt: order.createdAt,

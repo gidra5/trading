@@ -612,6 +612,15 @@ export class TradingRuntime {
     const lifetimeMs = normalizeOptionalPositiveNumber(input.lifetimeMs, "Lot lifetime");
     const stopLossPrice = normalizeOptionalPositiveNumber(input.stopLossPrice, "Stop loss");
     const takeProfitPrice = normalizeOptionalPositiveNumber(input.takeProfitPrice, "Take profit");
+    const entryGrid = input.entryGrid
+      ? {
+          anticipatedPrice: normalizeRequiredPositiveNumber(
+            input.entryGrid.anticipatedPrice,
+            "Anticipated entry price",
+          ),
+          confidence: normalizeConfidence(input.entryGrid.confidence),
+        }
+      : undefined;
     const normalizedInput: ManualTradeInput = {
       ...input,
       quantity,
@@ -619,7 +628,12 @@ export class TradingRuntime {
       lifetimeMs,
       stopLossPrice,
       takeProfitPrice,
+      entryGrid,
     };
+
+    if (entryGrid && input.targetPositionId) {
+      throw new Error("A close order cannot create an entry grid.");
+    }
 
     if (input.targetPositionId) {
       const positions = analyzePositions(this.bot.view() as PaperBotState);
@@ -634,6 +648,19 @@ export class TradingRuntime {
       if (quantity > target.remainingQuantity + 0.00000001) {
         throw new Error("Close quantity is larger than the target position.");
       }
+    }
+
+    if (entryGrid) {
+      const events = this.bot.createPositionEntryGrid(normalizedInput);
+      this.recordEvents(events);
+      if (this.isExchangeDrivenExecution()) {
+        await this.submitCreatedOrdersToPaperExchange(events, {
+          force: true,
+          throwOnFailure: true,
+        });
+      }
+      await this.flushState();
+      return events;
     }
 
     if (this.isExchangeDrivenExecution()) {
@@ -1058,6 +1085,40 @@ export class TradingRuntime {
     if (!this.paperTrading) {
       return;
     }
+
+    const stateBeforeSettlement = this.bot.view();
+    const settlingPositions = stateBeforeSettlement.positionLifecycles.filter(
+      (position) => position.phase === "settling",
+    );
+    for (const position of settlingPositions) {
+      try {
+        for (const orderId of position.entryOrderIds) {
+          const order = stateBeforeSettlement.orders.find(
+            (candidate) => candidate.id === orderId,
+          );
+          if (!order || order.status === "filled") {
+            continue;
+          }
+          const snapshot = await this.paperTrading.cancelBotOrder(
+            this.market,
+            order,
+          );
+          await this.applyExchangeSnapshot(snapshot);
+        }
+      } catch (error) {
+        if (options.throwOnFailure) {
+          throw error;
+        }
+        return;
+      }
+
+      events.push(
+        ...this.bot.completePositionEntrySettlements(
+          new Set([position.id]),
+        ),
+      );
+    }
+
     for (const event of events) {
       if (event.type !== "order_created" || !event.order) {
         continue;
@@ -2544,6 +2605,22 @@ function normalizeOptionalPositiveNumber(
   return number > 0 ? number : undefined;
 }
 
+function normalizeRequiredPositiveNumber(value: number, label: string): number {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) {
+    throw new Error(`${label} must be positive.`);
+  }
+  return number;
+}
+
+function normalizeConfidence(value: number): number {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0 || number > 1) {
+    throw new Error("Entry grid confidence must be between 0 and 1.");
+  }
+  return number;
+}
+
 function normalizeExchangeSide(side: string): "buy" | "sell" {
   return side.toUpperCase() === "SELL" ? "sell" : "buy";
 }
@@ -2760,9 +2837,21 @@ function isHistoricalBacktestPreset(
 }
 
 function compactPublicBotState(state: Readonly<PaperBotState>): PaperBotState {
+  const activePositionEntryOrderIds = new Set(
+    state.positionLifecycles
+      .filter((position) => position.phase !== "closed")
+      .flatMap((position) => position.entryOrderIds),
+  );
   return {
     ...state,
-    orders: compactPublicOrders(state.orders).map((order) => ({ ...order })),
+    positionLifecycles: state.positionLifecycles.map((position) => ({
+      ...position,
+      entryOrderIds: [...position.entryOrderIds],
+    })),
+    orders: compactPublicOrders(
+      state.orders,
+      activePositionEntryOrderIds,
+    ).map((order) => ({ ...order })),
     fills: state.fills.slice(-PUBLIC_FILL_LIMIT).map((fill) => ({ ...fill })),
     memory: compactPublicMemory(state.memory, state.config),
     metrics: { ...state.metrics },
@@ -2781,6 +2870,8 @@ function compactPublicEvent(event: BotEvent): BotEvent {
     message: event.message,
     order: event.order ? { ...event.order } : undefined,
     fill: event.fill ? { ...event.fill } : undefined,
+    positionId: event.positionId,
+    positionPhase: event.positionPhase,
   };
 }
 
@@ -2810,11 +2901,16 @@ function compactPublicMemory(
 }
 
 
-function compactPublicOrders(orders: readonly TradingOrder[]): readonly TradingOrder[] {
+function compactPublicOrders(
+  orders: readonly TradingOrder[],
+  retainedOrderIds: ReadonlySet<string> = new Set(),
+): readonly TradingOrder[] {
   const recentStart = Math.max(0, orders.length - PUBLIC_ORDER_LIMIT);
   const openBeforeRecent = orders
     .slice(0, recentStart)
-    .filter((order) => order.status === "open");
+    .filter(
+      (order) => order.status === "open" || retainedOrderIds.has(order.id),
+    );
 
   return [...openBeforeRecent, ...orders.slice(recentStart)];
 }

@@ -440,6 +440,7 @@ export interface TradingOrder {
   reason: string;
   realizedPnl: number;
   feeQuote: number;
+  positionId?: string;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
   lifetimeMs?: number;
@@ -461,6 +462,7 @@ export interface TradeFill {
   realizedPnl: number;
   filledAt: number;
   reason: string;
+  positionId?: string;
   targetPositionId?: string;
   positionEffect?: PositionEffect;
   lifetimeMs?: number;
@@ -482,6 +484,31 @@ export interface ManualTradeInput {
   lifetimeMs?: number;
   stopLossPrice?: number;
   takeProfitPrice?: number;
+  entryGrid?: PositionEntryGridInput;
+}
+
+export interface PositionEntryGridInput {
+  anticipatedPrice: number;
+  confidence: number;
+}
+
+export type PositionLifecyclePhase = "created" | "settling" | "closing" | "closed";
+
+export interface PositionLifecycle {
+  id: string;
+  side: PositionLotSide;
+  phase: PositionLifecyclePhase;
+  source: "manual" | "strategy";
+  createdAt: number;
+  updatedAt: number;
+  settledAt?: number;
+  closedAt?: number;
+  entryStartPrice: number;
+  anticipatedEntryPrice: number;
+  confidence: number;
+  requestedQuote: number;
+  allocatedQuote: number;
+  entryOrderIds: string[];
 }
 
 export interface ExchangeOrderUpdate {
@@ -587,6 +614,7 @@ export interface PaperBotState extends BotCoreState {
   exitGridOrderCountTotal: number;
   winningTrades: number;
   losingTrades: number;
+  positionLifecycles: PositionLifecycle[];
   orders: TradingOrder[];
   fills: TradeFill[];
   metrics: BotMetrics;
@@ -624,6 +652,7 @@ export interface PositionLotBase {
   stopLossPrice?: number;
   takeProfitPrice?: number;
   borrowLocked: boolean;
+  lifecycle?: PositionLifecycle;
 }
 
 export interface LongPositionLot extends PositionLotBase {
@@ -701,12 +730,15 @@ export interface BotEvent {
     | "order_created"
     | "order_filled"
     | "order_cancelled"
+    | "position_phase_changed"
     | "status_changed"
     | "state_reset";
   at: number;
   message: string;
   order?: TradingOrder;
   fill?: TradeFill;
+  positionId?: string;
+  positionPhase?: PositionLifecyclePhase;
   state?: PaperBotState;
 }
 

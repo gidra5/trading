@@ -13,6 +13,7 @@ import type {
   ManualTradeInput,
   OrderType,
   PaperBotState,
+  PositionLifecycle,
   PositionLotSide,
   PriceTick,
   StrategyConfig,
@@ -31,15 +32,8 @@ import {
   warmupLegacyValleyPeakPriceRanges,
   type LegacyValleyPeakAnticipation,
 } from "./legacy-valley-peak.js";
-import {
-  PeakValleyBotCore,
-  createBotCoreState,
-  evaluateBot,
-} from "./bot.js";
-import {
-  canFillOrderAtTick,
-  orderExecutionPrice,
-} from "./execution.js";
+import { PeakValleyBotCore, createBotCoreState, evaluateBot } from "./bot.js";
+import { canFillOrderAtTick, orderExecutionPrice } from "./execution.js";
 import {
   analyzePositions,
   createPositionRiskConfig,
@@ -75,11 +69,7 @@ export const defaultStrategyConfig: StrategyConfig = {
 };
 
 export type PartialStrategyConfig = Partial<
-  Omit<
-    StrategyConfig,
-    | "legacyValleyPeak"
-    | "positionRisk"
-  >
+  Omit<StrategyConfig, "legacyValleyPeak" | "positionRisk">
 > & {
   legacyValleyPeak?: Partial<StrategyConfig["legacyValleyPeak"]>;
   positionRisk?: Partial<StrategyConfig["positionRisk"]>;
@@ -206,8 +196,10 @@ const MIN_ENTRY_LEVERAGE = 1;
 export function createStrategyConfig(
   overrides: PartialStrategyConfig = {},
 ): StrategyConfig {
-  const startingQuote = overrides.startingQuote ?? defaultStrategyConfig.startingQuote;
-  const maxLeverage = overrides.maxLeverage ?? defaultStrategyConfig.maxLeverage;
+  const startingQuote =
+    overrides.startingQuote ?? defaultStrategyConfig.startingQuote;
+  const maxLeverage =
+    overrides.maxLeverage ?? defaultStrategyConfig.maxLeverage;
   const config: StrategyConfig = {
     symbol: overrides.symbol ?? defaultStrategyConfig.symbol,
     baseAsset: overrides.baseAsset ?? defaultStrategyConfig.baseAsset,
@@ -239,12 +231,16 @@ export function createStrategyConfig(
     feeBps: overrides.feeBps ?? defaultStrategyConfig.feeBps,
     maxPositionQuote:
       overrides.maxPositionQuote ?? defaultStrategyConfig.maxPositionQuote,
-    limitOffsetBps: overrides.limitOffsetBps ?? defaultStrategyConfig.limitOffsetBps,
-    priceTickSize: overrides.priceTickSize ?? defaultStrategyConfig.priceTickSize,
-    maxOpenOrders: overrides.maxOpenOrders ?? defaultStrategyConfig.maxOpenOrders,
+    limitOffsetBps:
+      overrides.limitOffsetBps ?? defaultStrategyConfig.limitOffsetBps,
+    priceTickSize:
+      overrides.priceTickSize ?? defaultStrategyConfig.priceTickSize,
+    maxOpenOrders:
+      overrides.maxOpenOrders ?? defaultStrategyConfig.maxOpenOrders,
     cooldownMs: overrides.cooldownMs ?? defaultStrategyConfig.cooldownMs,
     staleOrderMs: overrides.staleOrderMs ?? defaultStrategyConfig.staleOrderMs,
-    minOrderQuote: overrides.minOrderQuote ?? defaultStrategyConfig.minOrderQuote,
+    minOrderQuote:
+      overrides.minOrderQuote ?? defaultStrategyConfig.minOrderQuote,
     legacyValleyPeak: createLegacyValleyPeakConfig({
       ...defaultStrategyConfig.legacyValleyPeak,
       ...(overrides.legacyValleyPeak ?? {}),
@@ -269,7 +265,10 @@ export function createStrategyConfig(
     0,
     1,
   );
-  config.maxPositionQuote = Math.max(config.minOrderQuote, config.maxPositionQuote);
+  config.maxPositionQuote = Math.max(
+    config.minOrderQuote,
+    config.maxPositionQuote,
+  );
   config.limitOffsetBps = Math.max(0, config.limitOffsetBps);
   config.priceTickSize = cleanPositive(config.priceTickSize);
   config.maxOpenOrders = Math.max(1, Math.round(config.maxOpenOrders));
@@ -306,6 +305,7 @@ export function createInitialBotState(
     exitGridOrderCountTotal: 0,
     winningTrades: 0,
     losingTrades: 0,
+    positionLifecycles: [],
     orders: [],
     fills: [],
     metrics: emptyMetrics(config.startingQuote),
@@ -327,14 +327,19 @@ export class SimulatedExecutionEngine {
     price: 0,
   };
 
-  constructor(initialState?: PaperBotState, overrides: PartialStrategyConfig = {}) {
+  constructor(
+    initialState?: PaperBotState,
+    overrides: PartialStrategyConfig = {},
+  ) {
     this.state = initialState
       ? normalizeLoadedState(initialState, overrides)
       : createInitialBotState(overrides);
     this.priceMemoryLimit = priceMemoryLimit(this.state.config);
     this.core = new PeakValleyBotCore(this.state);
     this.reusableTick.symbol = this.state.symbol;
-    this.liquidatedPositionCountValue = countLiquidatedPositions(this.state.fills);
+    this.liquidatedPositionCountValue = countLiquidatedPositions(
+      this.state.fills,
+    );
     this.rebuildOpenOrderIndex();
   }
 
@@ -406,6 +411,47 @@ export class SimulatedExecutionEngine {
     this.state.updatedAt = Math.max(this.state.updatedAt, at);
   }
 
+  completePositionEntrySettlements(
+    positionIds?: ReadonlySet<string>,
+    at = Date.now(),
+  ): BotEvent[] {
+    this.updateLegacyPositionLotCache();
+    const events: BotEvent[] = [];
+
+    for (const position of this.state.positionLifecycles) {
+      if (
+        position.phase !== "settling" ||
+        (positionIds && !positionIds.has(position.id))
+      ) {
+        continue;
+      }
+
+      const lot =
+        position.side === "long"
+          ? this.legacyPositionLotCache?.longs.get(position.id)
+          : this.legacyPositionLotCache?.shorts.get(position.id);
+      position.phase =
+        lot && lot.remainingQuantity > MIN_BASE_QUANTITY ? "closing" : "closed";
+      position.updatedAt = at;
+      position.settledAt = at;
+      if (position.phase === "closed") {
+        position.closedAt = at;
+      }
+      events.push({
+        type: "position_phase_changed",
+        at,
+        message: `${position.side.toUpperCase()} position ${position.id} ${position.phase}`,
+        positionId: position.id,
+        positionPhase: position.phase,
+      });
+    }
+
+    if (events.length > 0) {
+      this.state.updatedAt = Math.max(this.state.updatedAt, at);
+    }
+    return events;
+  }
+
   reset(overrides: PartialStrategyConfig = {}, at = Date.now()): BotEvent[] {
     this.state = createInitialBotState(
       mergeStrategyOverrides(this.state.config, overrides),
@@ -445,7 +491,11 @@ export class SimulatedExecutionEngine {
     }
   }
 
-  cancelOpenOrder(orderId: string, reason: string, at = Date.now()): BotEvent[] {
+  cancelOpenOrder(
+    orderId: string,
+    reason: string,
+    at = Date.now(),
+  ): BotEvent[] {
     const index = this.findOrderIndex(orderId);
     if (index === undefined) {
       return [];
@@ -580,7 +630,10 @@ export class SimulatedExecutionEngine {
     return events;
   }
 
-  createManagedPositionOrder(input: ManualTradeInput, at = Date.now()): BotEvent[] {
+  createManagedPositionOrder(
+    input: ManualTradeInput,
+    at = Date.now(),
+  ): BotEvent[] {
     const price =
       cleanPositive(input.price) ||
       this.state.lastPrice ||
@@ -590,7 +643,9 @@ export class SimulatedExecutionEngine {
     const type: Extract<OrderType, "limit" | "market"> =
       input.orderType === "limit" ? "limit" : "market";
     const positionEffect =
-      input.targetPositionId || input.positionEffect === "close" ? "close" : "open";
+      input.targetPositionId || input.positionEffect === "close"
+        ? "close"
+        : "open";
     const lifecycleFields =
       positionEffect === "close" ? {} : normalizedLotLifecycleFields(input);
     const reason = input.reason?.trim() || "manual managed exchange order";
@@ -606,7 +661,9 @@ export class SimulatedExecutionEngine {
     }
 
     const normalizedPrice =
-      type === "limit" ? this.normalizeOrderPrice(price, input.side, type) : roundQuote(price);
+      type === "limit"
+        ? this.normalizeOrderPrice(price, input.side, type)
+        : roundQuote(price);
     const quoteSize = roundQuote(normalizedPrice * quantity);
     if (quoteSize < this.state.config.minOrderQuote) {
       throw new Error(
@@ -618,8 +675,12 @@ export class SimulatedExecutionEngine {
     const estimatedQuoteCost =
       input.side === "buy" ? roundQuote(quoteSize * (1 + feeRate)) : 0;
     if (input.side === "buy") {
-      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+      this.state.quoteFree = roundQuote(
+        this.state.quoteFree - estimatedQuoteCost,
+      );
+      this.state.quoteReserved = roundQuote(
+        this.state.quoteReserved + estimatedQuoteCost,
+      );
     } else if (positionEffect === "close") {
       this.state.baseFree = roundAsset(this.state.baseFree - quantity);
       this.state.baseReserved = roundAsset(this.state.baseReserved + quantity);
@@ -655,8 +716,81 @@ export class SimulatedExecutionEngine {
     ];
   }
 
+  createPositionEntryGrid(
+    input: ManualTradeInput,
+    at = Date.now(),
+  ): BotEvent[] {
+    const entryGrid = input.entryGrid;
+    const startPrice =
+      cleanPositive(input.price) || cleanPositive(this.state.lastPrice);
+    const anticipatedPrice = cleanPositive(entryGrid?.anticipatedPrice);
+    const confidence = entryGrid?.confidence ?? 0;
+    const quantity = roundAsset(input.quantity);
+
+    if (!entryGrid) {
+      throw new Error("Entry grid configuration is required.");
+    }
+    if (startPrice <= 0 || anticipatedPrice <= 0) {
+      throw new Error("Entry grid prices must be positive.");
+    }
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      throw new Error("Entry grid confidence must be between 0 and 1.");
+    }
+    if (quantity <= 0) {
+      throw new Error("Entry grid quantity must be positive.");
+    }
+
+    const side: PositionLotSide = input.side === "buy" ? "long" : "short";
+    if (
+      (side === "long" && anticipatedPrice >= startPrice) ||
+      (side === "short" && anticipatedPrice <= startPrice)
+    ) {
+      throw new Error(
+        side === "long"
+          ? "A long entry grid must anticipate a price below the current price."
+          : "A short entry grid must anticipate a price above the current price.",
+      );
+    }
+
+    const requestedQuote = roundQuote(quantity * startPrice);
+    const orders = this.createPositionEntryGridOrders({
+      side,
+      createdAt: at,
+      startPrice,
+      anticipatedPrice,
+      requestedQuote,
+      confidence,
+      source: "manual",
+      reason: input.reason?.trim() || "manual position entry grid",
+      lifecycle: normalizedLotLifecycleFields(input),
+      targetEntryLeverage:
+        side === "long"
+          ? this.targetLongEntryLeverage(startPrice)
+          : this.targetShortEntryLeverage(startPrice),
+    });
+    if (orders.length === 0) {
+      throw new Error(
+        "Entry grid could not reserve enough capacity for one order.",
+      );
+    }
+
+    this.state.updatedAt = at;
+    recalculateMetrics(this.state);
+    return orders.map((order) => ({
+      type: "order_created" as const,
+      at,
+      message: `Manual ${order.side.toUpperCase()} entry grid order created at ${order.price}`,
+      order: structuredClone(order),
+      positionId: order.positionId,
+      positionPhase: "created" as const,
+    }));
+  }
+
   recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
-    const price = cleanPositive(input.price) || this.state.lastPrice || this.state.avgEntryPrice;
+    const price =
+      cleanPositive(input.price) ||
+      this.state.lastPrice ||
+      this.state.avgEntryPrice;
     const quantity = roundAsset(input.quantity);
     const positionEffect = input.targetPositionId
       ? "close"
@@ -703,10 +837,13 @@ export class SimulatedExecutionEngine {
             newLongBase > 0 ? roundQuote((oldCost + spent) / newLongBase) : 0;
         } else if (oldBase >= 0) {
           const oldCost = this.state.avgEntryPrice * oldBase;
-          this.state.avgEntryPrice = newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
+          this.state.avgEntryPrice =
+            newBase > 0 ? roundQuote((oldCost + spent) / newBase) : 0;
         } else if (newBase > 0) {
           const leftoverRatio = Math.min(1, newBase / quantity);
-          this.state.avgEntryPrice = roundQuote((spent * leftoverRatio) / newBase);
+          this.state.avgEntryPrice = roundQuote(
+            (spent * leftoverRatio) / newBase,
+          );
         } else {
           this.state.avgEntryPrice = 0;
         }
@@ -717,10 +854,16 @@ export class SimulatedExecutionEngine {
         this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
         this.state.baseFree = roundAsset(this.state.baseFree - quantity);
 
-        if (!opensPosition && closedLongQuantity > 0 && this.state.avgEntryPrice > 0) {
-          const feeForClosedQuantity = feeQuote * (closedLongQuantity / quantity);
+        if (
+          !opensPosition &&
+          closedLongQuantity > 0 &&
+          this.state.avgEntryPrice > 0
+        ) {
+          const feeForClosedQuantity =
+            feeQuote * (closedLongQuantity / quantity);
           realizedPnl = roundQuote(
-            (price - this.state.avgEntryPrice) * closedLongQuantity - feeForClosedQuantity,
+            (price - this.state.avgEntryPrice) * closedLongQuantity -
+              feeForClosedQuantity,
           );
         }
 
@@ -746,7 +889,8 @@ export class SimulatedExecutionEngine {
         price: roundQuote(price),
         quantity,
         filledQuantity: quantity,
-        estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
+        estimatedQuoteCost:
+          input.side === "buy" ? roundQuote(quoteQuantity + feeQuote) : 0,
         createdAt: at,
         updatedAt: at,
         filledAt: at,
@@ -778,6 +922,7 @@ export class SimulatedExecutionEngine {
       this.state.orders.push(order);
       this.state.fills.push(fill);
       this.refreshAverageEntryPrices();
+      this.refreshClosedPositionLifecycles(at);
       this.state.lastPrice = roundQuote(price);
       this.state.updatedAt = at;
       recalculateMetrics(this.state);
@@ -809,8 +954,7 @@ export class SimulatedExecutionEngine {
     try {
       const fills = [...(input.fills ?? [])].sort(
         (left, right) =>
-          left.filledAt - right.filledAt ||
-          left.id.localeCompare(right.id),
+          left.filledAt - right.filledAt || left.id.localeCompare(right.id),
       );
       for (const fill of fills) {
         const event = this.applyExchangeFill(fill);
@@ -833,6 +977,7 @@ export class SimulatedExecutionEngine {
       }
 
       this.refreshAverageEntryPrices();
+      this.refreshClosedPositionLifecycles(at);
       this.state.updatedAt = Math.max(at, ...events.map((event) => event.at));
       recalculateMetrics(this.state);
       this.rebuildOpenOrderIndex();
@@ -860,7 +1005,13 @@ export class SimulatedExecutionEngine {
   }
 
   onTick(tick: PriceTick, options: TickProcessingOptions = {}): BotEvent[] {
-    return this.onPriceTick(tick.symbol, tick.eventTime, tick.price, tick.quantity, options);
+    return this.onPriceTick(
+      tick.symbol,
+      tick.eventTime,
+      tick.price,
+      tick.quantity,
+      options,
+    );
   }
 
   onPriceTick(
@@ -877,10 +1028,7 @@ export class SimulatedExecutionEngine {
     return this.processAcceptedPriceTick(eventTime, price, quantity, options);
   }
 
-  onReplayPriceTick(
-    eventTime: number,
-    price: number,
-  ): BotEvent[] {
+  onReplayPriceTick(eventTime: number, price: number): BotEvent[] {
     if (price <= 0) {
       return [];
     }
@@ -920,7 +1068,9 @@ export class SimulatedExecutionEngine {
 
   warmupFromCandles(candles: readonly Candle[]): number {
     const previousMemory = this.ensureLegacyValleyPeakMemory();
-    const nextMemory = createLegacyValleyPeakMemory(this.state.config.legacyValleyPeak);
+    const nextMemory = createLegacyValleyPeakMemory(
+      this.state.config.legacyValleyPeak,
+    );
     nextMemory.exitGrids = previousMemory.exitGrids;
     this.state.memory.legacyValleyPeak = nextMemory;
 
@@ -940,7 +1090,9 @@ export class SimulatedExecutionEngine {
   ): Promise<number> {
     const batchSize = Math.max(1, Math.floor(options.batchSize ?? 2_000));
     const previousMemory = structuredClone(this.ensureLegacyValleyPeakMemory());
-    const nextMemory = createLegacyValleyPeakMemory(this.state.config.legacyValleyPeak);
+    const nextMemory = createLegacyValleyPeakMemory(
+      this.state.config.legacyValleyPeak,
+    );
     nextMemory.exitGrids = previousMemory.exitGrids;
     this.state.memory.legacyValleyPeak = nextMemory;
 
@@ -985,7 +1137,11 @@ export class SimulatedExecutionEngine {
     return processed;
   }
 
-  private warmupPrice(eventTime: number, price: number, sourceCandle?: Candle): number {
+  private warmupPrice(
+    eventTime: number,
+    price: number,
+    sourceCandle?: Candle,
+  ): number {
     if (!Number.isFinite(price) || price <= 0) {
       return 0;
     }
@@ -1021,7 +1177,10 @@ export class SimulatedExecutionEngine {
       return [];
     }
 
-    const updatedAt = cleanPositive(update.updatedAt) || cleanPositive(update.createdAt) || fallbackAt;
+    const updatedAt =
+      cleanPositive(update.updatedAt) ||
+      cleanPositive(update.createdAt) ||
+      fallbackAt;
     const exchangeCreatedAt = cleanPositive(update.createdAt);
     if (
       (exchangeCreatedAt > 0 && exchangeCreatedAt < order.createdAt) ||
@@ -1049,7 +1208,9 @@ export class SimulatedExecutionEngine {
         side: update.side,
         price: cleanPositive(averagePrice) || order.price,
         quantity: missingFilledQuantity,
-        quoteQuantity: roundQuote((cleanPositive(averagePrice) || order.price) * missingFilledQuantity),
+        quoteQuantity: roundQuote(
+          (cleanPositive(averagePrice) || order.price) * missingFilledQuantity,
+        ),
         feeQuote: update.feeQuote ?? 0,
         realizedPnl: undefined,
         filledAt: updatedAt,
@@ -1093,20 +1254,32 @@ export class SimulatedExecutionEngine {
     if (input.filledAt < this.state.createdAt) {
       return undefined;
     }
-    if (input.localOrderId && this.findOrderIndex(input.localOrderId) === undefined) {
+    if (
+      input.localOrderId &&
+      this.findOrderIndex(input.localOrderId) === undefined
+    ) {
       return undefined;
     }
 
     const index = this.findOrCreateExchangeOrder(input);
     const order = this.state.orders[index];
-    if (!order || order.status === "cancelled") {
+    if (
+      !order ||
+      (order.status === "cancelled" &&
+        !this.isSettlingPositionEntryOrder(order))
+    ) {
       return undefined;
     }
-    if (order.status === "filled" && order.filledQuantity >= order.quantity - MIN_BASE_QUANTITY) {
+    if (
+      order.status === "filled" &&
+      order.filledQuantity >= order.quantity - MIN_BASE_QUANTITY
+    ) {
       return undefined;
     }
 
-    const remainingQuantity = roundAsset(Math.max(0, order.quantity - order.filledQuantity));
+    const remainingQuantity = roundAsset(
+      Math.max(0, order.quantity - order.filledQuantity),
+    );
     const quantity = roundAsset(input.quantity);
     const price = roundQuote(input.price);
     if (quantity <= MIN_BASE_QUANTITY || price <= 0) {
@@ -1117,7 +1290,10 @@ export class SimulatedExecutionEngine {
       if (order.side === "buy") {
         order.estimatedQuoteCost = Math.max(
           order.estimatedQuoteCost,
-          roundQuote((cleanPositive(input.quoteQuantity) || price * quantity) + input.feeQuote),
+          roundQuote(
+            (cleanPositive(input.quoteQuantity) || price * quantity) +
+              input.feeQuote,
+          ),
         );
       }
     }
@@ -1126,7 +1302,8 @@ export class SimulatedExecutionEngine {
       cleanPositive(input.quoteQuantity) || price * quantity,
     );
     const feeQuote = roundQuote(Math.max(0, input.feeQuote));
-    const positionEffect = input.positionEffect ?? order.positionEffect ?? "auto";
+    const positionEffect =
+      input.positionEffect ?? order.positionEffect ?? "auto";
     const orderView: TradingOrder = {
       ...order,
       price,
@@ -1198,6 +1375,7 @@ export class SimulatedExecutionEngine {
       realizedPnl,
       filledAt: input.filledAt,
       reason: input.reason?.trim() || order.reason || "exchange fill",
+      positionId: order.positionId,
       targetPositionId: order.targetPositionId,
       positionEffect,
       ...normalizedLotLifecycleFields(order),
@@ -1206,6 +1384,7 @@ export class SimulatedExecutionEngine {
     this.state.fills.push(fill);
     this.recordLegacyExitGridFill(order, fill);
     this.refreshAverageEntryPrices();
+    this.refreshClosedPositionLifecycles(input.filledAt);
     this.state.lastPrice = price;
 
     return {
@@ -1225,16 +1404,21 @@ export class SimulatedExecutionEngine {
 
     const quantity = roundAsset(input.quantity);
     const price = roundQuote(input.price);
-    const quoteQuantity = roundQuote(cleanPositive(input.quoteQuantity) || price * quantity);
+    const quoteQuantity = roundQuote(
+      cleanPositive(input.quoteQuantity) || price * quantity,
+    );
     const order: TradingOrder = {
-      id: input.localOrderId || `ex_ord_${this.nextSequence().toString().padStart(6, "0")}`,
+      id:
+        input.localOrderId ||
+        `ex_ord_${this.nextSequence().toString().padStart(6, "0")}`,
       side: input.side,
       type: "limit",
       status: "open",
       price,
       quantity,
       filledQuantity: 0,
-      estimatedQuoteCost: input.side === "buy" ? roundQuote(quoteQuantity + input.feeQuote) : 0,
+      estimatedQuoteCost:
+        input.side === "buy" ? roundQuote(quoteQuantity + input.feeQuote) : 0,
       createdAt: input.filledAt,
       updatedAt: input.filledAt,
       reason: input.reason?.trim() || "exchange fill",
@@ -1285,15 +1469,25 @@ export class SimulatedExecutionEngine {
       );
       const nextRemainingReserve =
         nextQuantity > MIN_BASE_QUANTITY
-          ? roundQuote(nextEstimatedQuoteCost * (nextRemainingQuantity / nextQuantity))
+          ? roundQuote(
+              nextEstimatedQuoteCost * (nextRemainingQuantity / nextQuantity),
+            )
           : 0;
-      const reserveDelta = roundQuote(nextRemainingReserve - currentRemainingReserve);
-      this.state.quoteReserved = roundQuote(this.state.quoteReserved + reserveDelta);
+      const reserveDelta = roundQuote(
+        nextRemainingReserve - currentRemainingReserve,
+      );
+      this.state.quoteReserved = roundQuote(
+        this.state.quoteReserved + reserveDelta,
+      );
       this.state.quoteFree = roundQuote(this.state.quoteFree - reserveDelta);
       order.estimatedQuoteCost = nextEstimatedQuoteCost;
     } else if (order.positionEffect !== "open") {
-      const reserveDelta = roundAsset(nextRemainingQuantity - currentRemainingQuantity);
-      this.state.baseReserved = roundAsset(this.state.baseReserved + reserveDelta);
+      const reserveDelta = roundAsset(
+        nextRemainingQuantity - currentRemainingQuantity,
+      );
+      this.state.baseReserved = roundAsset(
+        this.state.baseReserved + reserveDelta,
+      );
       this.state.baseFree = roundAsset(this.state.baseFree - reserveDelta);
     }
 
@@ -1308,7 +1502,10 @@ export class SimulatedExecutionEngine {
   ): void {
     const reservedPortion =
       order.status === "open"
-        ? Math.min(this.state.quoteReserved, remainingOrderReserveQuote(order, quantity))
+        ? Math.min(
+            this.state.quoteReserved,
+            remainingOrderReserveQuote(order, quantity),
+          )
         : 0;
     if (reservedPortion > 0) {
       this.state.quoteReserved = roundQuote(
@@ -1322,7 +1519,10 @@ export class SimulatedExecutionEngine {
     }
   }
 
-  private consumeBaseReserveForExchangeFill(order: TradingOrder, quantity: number): void {
+  private consumeBaseReserveForExchangeFill(
+    order: TradingOrder,
+    quantity: number,
+  ): void {
     if (order.status === "open" && order.positionEffect !== "open") {
       const reservedQuantity = Math.min(this.state.baseReserved, quantity);
       this.state.baseReserved = roundAsset(
@@ -1370,7 +1570,9 @@ export class SimulatedExecutionEngine {
     }
 
     if (events) {
-      events.push(...this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents));
+      events.push(
+        ...this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents),
+      );
     } else {
       this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents);
     }
@@ -1400,7 +1602,13 @@ export class SimulatedExecutionEngine {
       : false;
     if (!liquidated) {
       if (events) {
-        events.push(...this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents));
+        events.push(
+          ...this.enforceEffectiveLeverageLimit(
+            eventTime,
+            price,
+            collectEvents,
+          ),
+        );
       } else {
         this.enforceEffectiveLeverageLimit(eventTime, price, collectEvents);
       }
@@ -1437,7 +1645,11 @@ export class SimulatedExecutionEngine {
     const config = this.state.config;
 
     if (config.legacyValleyPeak.exitGridEnabled) {
-      return this.evaluateLegacyValleyPeakExitGridStrategy(tick, collectEvents, options);
+      return this.evaluateLegacyValleyPeakExitGridStrategy(
+        tick,
+        collectEvents,
+        options,
+      );
     }
 
     if (this.openOrderIndexes.size >= config.maxOpenOrders) {
@@ -1604,6 +1816,28 @@ export class SimulatedExecutionEngine {
 
     const signal = legacyValleyPeakDecisionSignal(decision);
     const anticipation = decision.anticipation;
+    const settlementSide: PositionLotSide | undefined =
+      decision.entrySignal.signal === "buy"
+        ? "long"
+        : decision.entrySignal.signal === "sell"
+          ? "short"
+          : undefined;
+    const settlement = settlementSide
+      ? this.beginPositionEntryGridSettlements(
+          settlementSide,
+          tick.eventTime,
+          events !== undefined,
+        )
+      : { events: NO_EVENTS, positionIds: new Set<string>() };
+    events?.push(...settlement.events);
+    if (settlement.positionIds.size > 0 && !options.deferMarketOrderFills) {
+      events?.push(
+        ...this.completePositionEntrySettlements(
+          settlement.positionIds,
+          tick.eventTime,
+        ),
+      );
+    }
     if (signal === "hold" && !anticipation) {
       this.state.memory.lastSignal = signal;
       return events ?? NO_EVENTS;
@@ -1614,27 +1848,27 @@ export class SimulatedExecutionEngine {
     }
 
     const orders: TradingOrder[] = [];
-    let acted = false;
+    let acted = settlement.positionIds.size > 0;
 
     if (decision.exitSignal.signal === "buy") {
-      if (legacyConfig.shortSideEnabled && activeShortQuantity > MIN_BASE_QUANTITY) {
+      if (
+        legacyConfig.shortSideEnabled &&
+        activeShortQuantity > MIN_BASE_QUANTITY
+      ) {
         const activeShorts = this.activeLegacyShortLots(tick.price);
-        if (events) {
-          events.push(
-            ...this.cancelLegacyAnticipatoryEntryGridOrders(
-              tick.eventTime,
-              true,
-              "short",
-            ),
-          );
-        } else {
-          this.cancelLegacyAnticipatoryEntryGridOrders(tick.eventTime, false, "short");
-        }
-        this.syncLegacyExitGridMemories(memory, activeShorts, tick.price, "short");
+        this.syncLegacyExitGridMemories(
+          memory,
+          activeShorts,
+          tick.price,
+          "short",
+        );
 
         for (const lot of activeShorts) {
           const grid = this.ensureLegacyExitGrid(memory, lot, tick.price);
-          grid.troughPrice = Math.min(grid.troughPrice ?? tick.price, tick.price);
+          grid.troughPrice = Math.min(
+            grid.troughPrice ?? tick.price,
+            tick.price,
+          );
 
           const resetTroughPrice = this.legacyExitGridResetTroughPrice(
             grid,
@@ -1648,14 +1882,29 @@ export class SimulatedExecutionEngine {
 
           if (events) {
             events.push(
-              ...this.cancelLegacyExitGridOrders(tick.eventTime, true, lot.id, "short"),
+              ...this.cancelLegacyExitGridOrders(
+                tick.eventTime,
+                true,
+                lot.id,
+                "short",
+              ),
             );
           } else {
-            this.cancelLegacyExitGridOrders(tick.eventTime, false, lot.id, "short");
+            this.cancelLegacyExitGridOrders(
+              tick.eventTime,
+              false,
+              lot.id,
+              "short",
+            );
           }
 
           orders.push(
-            ...this.createLegacyShortExitGridOrders(grid, lot, tick.eventTime, tick.price),
+            ...this.createLegacyShortExitGridOrders(
+              grid,
+              lot,
+              tick.eventTime,
+              tick.price,
+            ),
           );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
             break;
@@ -1665,26 +1914,27 @@ export class SimulatedExecutionEngine {
     }
 
     if (decision.exitSignal.signal === "sell") {
-      if (legacyConfig.longSideEnabled && activeLongQuantity > MIN_BASE_QUANTITY) {
+      if (
+        legacyConfig.longSideEnabled &&
+        activeLongQuantity > MIN_BASE_QUANTITY
+      ) {
         const activeLongs = this.activeLegacyLongLots(tick.price);
-        if (events) {
-          events.push(
-            ...this.cancelLegacyAnticipatoryEntryGridOrders(
-              tick.eventTime,
-              true,
-              "long",
-            ),
-          );
-        } else {
-          this.cancelLegacyAnticipatoryEntryGridOrders(tick.eventTime, false, "long");
-        }
-        this.syncLegacyExitGridMemories(memory, activeLongs, tick.price, "long");
+        this.syncLegacyExitGridMemories(
+          memory,
+          activeLongs,
+          tick.price,
+          "long",
+        );
 
         for (const lot of activeLongs) {
           const grid = this.ensureLegacyExitGrid(memory, lot, tick.price);
           grid.peakPrice = Math.max(grid.peakPrice, tick.price);
 
-          const resetPeakPrice = this.legacyExitGridResetPeakPrice(grid, lot, tick.price);
+          const resetPeakPrice = this.legacyExitGridResetPeakPrice(
+            grid,
+            lot,
+            tick.price,
+          );
           if (resetPeakPrice === undefined) {
             continue;
           }
@@ -1692,14 +1942,29 @@ export class SimulatedExecutionEngine {
 
           if (events) {
             events.push(
-              ...this.cancelLegacyExitGridOrders(tick.eventTime, true, lot.id, "long"),
+              ...this.cancelLegacyExitGridOrders(
+                tick.eventTime,
+                true,
+                lot.id,
+                "long",
+              ),
             );
           } else {
-            this.cancelLegacyExitGridOrders(tick.eventTime, false, lot.id, "long");
+            this.cancelLegacyExitGridOrders(
+              tick.eventTime,
+              false,
+              lot.id,
+              "long",
+            );
           }
 
           orders.push(
-            ...this.createLegacyLongExitGridOrders(grid, lot, tick.eventTime, tick.price),
+            ...this.createLegacyLongExitGridOrders(
+              grid,
+              lot,
+              tick.eventTime,
+              tick.price,
+            ),
           );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
             break;
@@ -1721,7 +1986,10 @@ export class SimulatedExecutionEngine {
       acted ||= anticipated.acted;
     }
 
-    if (decision.entrySignal.signal === "buy") {
+    if (
+      decision.entrySignal.signal === "buy" &&
+      settlement.positionIds.size === 0
+    ) {
       if (
         legacyConfig.exitGridPositionMode === "aggregate" &&
         activeLongQuantity > MIN_BASE_QUANTITY
@@ -1757,7 +2025,9 @@ export class SimulatedExecutionEngine {
           }
         }
         if (events && result.order && !options.deferMarketOrderFills) {
-          events.push(...this.immediateOrderEvents("BUY", result, tick.eventTime));
+          events.push(
+            ...this.immediateOrderEvents("BUY", result, tick.eventTime),
+          );
         }
       } else if (
         legacyConfig.longSideEnabled &&
@@ -1779,7 +2049,10 @@ export class SimulatedExecutionEngine {
       }
     }
 
-    if (decision.entrySignal.signal === "sell") {
+    if (
+      decision.entrySignal.signal === "sell" &&
+      settlement.positionIds.size === 0
+    ) {
       if (
         legacyConfig.shortSideEnabled &&
         this.openOrderIndexes.size < config.maxOpenOrders &&
@@ -1814,7 +2087,9 @@ export class SimulatedExecutionEngine {
             }
           }
           if (events && result.order && !options.deferMarketOrderFills) {
-            events.push(...this.immediateOrderEvents("SELL", result, tick.eventTime));
+            events.push(
+              ...this.immediateOrderEvents("SELL", result, tick.eventTime),
+            );
           }
         } else {
           const order = this.createShortSellOrder(
@@ -1838,7 +2113,11 @@ export class SimulatedExecutionEngine {
     }
 
     this.state.memory.lastSignal =
-      signal !== "hold" ? signal : anticipation?.side === "long" ? "buy" : "sell";
+      signal !== "hold"
+        ? signal
+        : anticipation?.side === "long"
+          ? "buy"
+          : "sell";
     this.state.memory.lastActionAt = tick.eventTime;
 
     if (events) {
@@ -1846,10 +2125,9 @@ export class SimulatedExecutionEngine {
         events.push({
           type: "order_created",
           at: tick.eventTime,
-          message:
-            order.reason.startsWith(LEGACY_EXIT_GRID_REASON)
-              ? `${order.side.toUpperCase()} exit grid order created at ${order.price}`
-              : `${order.side.toUpperCase()} ${order.type} order created: ${order.reason}`,
+          message: order.reason.startsWith(LEGACY_EXIT_GRID_REASON)
+            ? `${order.side.toUpperCase()} exit grid order created at ${order.price}`
+            : `${order.side.toUpperCase()} ${order.type} order created: ${order.reason}`,
           order: structuredClone(order),
         });
       }
@@ -1916,10 +2194,21 @@ export class SimulatedExecutionEngine {
       return undefined;
     }
 
-    this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-    this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    this.state.quoteFree = roundQuote(
+      this.state.quoteFree - estimatedQuoteCost,
+    );
+    this.state.quoteReserved = roundQuote(
+      this.state.quoteReserved + estimatedQuoteCost,
+    );
 
-    const order = this.buildOrder("buy", price, quantity, estimatedQuoteCost, createdAt, reason);
+    const order = this.buildOrder(
+      "buy",
+      price,
+      quantity,
+      estimatedQuoteCost,
+      createdAt,
+      reason,
+    );
     order.positionEffect = "open";
     Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
@@ -1941,7 +2230,11 @@ export class SimulatedExecutionEngine {
     const quantity = roundAsset(desiredQuantity);
     const quoteSize = quantity * marketPrice;
 
-    if (quantity <= 0 || quoteSize < config.minOrderQuote || quantity > this.state.baseFree) {
+    if (
+      quantity <= 0 ||
+      quoteSize < config.minOrderQuote ||
+      quantity > this.state.baseFree
+    ) {
       return undefined;
     }
 
@@ -1956,7 +2249,14 @@ export class SimulatedExecutionEngine {
     this.state.baseFree = roundAsset(this.state.baseFree - quantity);
     this.state.baseReserved = roundAsset(this.state.baseReserved + quantity);
 
-    const order = this.buildOrder("sell", price, quantity, 0, createdAt, reason);
+    const order = this.buildOrder(
+      "sell",
+      price,
+      quantity,
+      0,
+      createdAt,
+      reason,
+    );
     order.positionEffect = "close";
     this.state.orders.push(order);
     this.openOrderIndexes.add(this.state.orders.length - 1);
@@ -2013,7 +2313,14 @@ export class SimulatedExecutionEngine {
       return undefined;
     }
 
-    const order = this.buildOrder("sell", price, quantity, 0, createdAt, reason);
+    const order = this.buildOrder(
+      "sell",
+      price,
+      quantity,
+      0,
+      createdAt,
+      reason,
+    );
     order.positionEffect = "open";
     Object.assign(order, normalizedLotLifecycleFields(lifecycle));
     this.state.orders.push(order);
@@ -2055,8 +2362,12 @@ export class SimulatedExecutionEngine {
       return {};
     }
 
-    this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-    this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    this.state.quoteFree = roundQuote(
+      this.state.quoteFree - estimatedQuoteCost,
+    );
+    this.state.quoteReserved = roundQuote(
+      this.state.quoteReserved + estimatedQuoteCost,
+    );
 
     const order = this.buildOrder(
       "buy",
@@ -2107,7 +2418,10 @@ export class SimulatedExecutionEngine {
     );
     const quoteSize = Math.min(desiredQuoteSize, availableQuote);
 
-    if (!config.legacyValleyPeak.shortSideEnabled || quoteSize < config.minOrderQuote) {
+    if (
+      !config.legacyValleyPeak.shortSideEnabled ||
+      quoteSize < config.minOrderQuote
+    ) {
       return {};
     }
 
@@ -2118,7 +2432,15 @@ export class SimulatedExecutionEngine {
       return {};
     }
 
-    const order = this.buildOrder("sell", price, quantity, 0, createdAt, reason, "market");
+    const order = this.buildOrder(
+      "sell",
+      price,
+      quantity,
+      0,
+      createdAt,
+      reason,
+      "market",
+    );
     const index = this.state.orders.length;
     order.positionEffect = "open";
     Object.assign(order, normalizedLotLifecycleFields(options));
@@ -2148,8 +2470,15 @@ export class SimulatedExecutionEngine {
     reason: string,
     desiredQuantity: number,
   ): TradingOrder | undefined {
-    const price = roundQuote(marketPrice * (1 - this.state.config.limitOffsetBps / 10_000));
-    return this.createTriggeredBuyOrder(price, desiredQuantity, createdAt, reason);
+    const price = roundQuote(
+      marketPrice * (1 - this.state.config.limitOffsetBps / 10_000),
+    );
+    return this.createTriggeredBuyOrder(
+      price,
+      desiredQuantity,
+      createdAt,
+      reason,
+    );
   }
 
   private createTriggeredBuyOrder(
@@ -2184,14 +2513,24 @@ export class SimulatedExecutionEngine {
     const roundedPrice = this.normalizeOrderPrice(price, "buy", type);
     const quoteSize = roundedQuantity * roundedPrice;
 
-    if (roundedQuantity <= 0 || roundedPrice <= 0 || quoteSize < config.minOrderQuote) {
+    if (
+      roundedQuantity <= 0 ||
+      roundedPrice <= 0 ||
+      quoteSize < config.minOrderQuote
+    ) {
       return undefined;
     }
 
     const feeRate = config.feeBps / 10_000;
-    const estimatedQuoteCost = roundQuote(roundedQuantity * roundedPrice * (1 + feeRate));
-    this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-    this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    const estimatedQuoteCost = roundQuote(
+      roundedQuantity * roundedPrice * (1 + feeRate),
+    );
+    this.state.quoteFree = roundQuote(
+      this.state.quoteFree - estimatedQuoteCost,
+    );
+    this.state.quoteReserved = roundQuote(
+      this.state.quoteReserved + estimatedQuoteCost,
+    );
 
     const order = this.buildOrder(
       "buy",
@@ -2253,7 +2592,9 @@ export class SimulatedExecutionEngine {
     }
 
     this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
-    this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+    this.state.baseReserved = roundAsset(
+      this.state.baseReserved + roundedQuantity,
+    );
 
     const order = this.buildOrder(
       "sell",
@@ -2290,14 +2631,22 @@ export class SimulatedExecutionEngine {
 
     const feeRate = this.state.config.feeBps / 10_000;
     const estimatedQuoteCost =
-      side === "buy" ? roundQuote(roundedQuantity * roundedPrice * (1 + feeRate)) : 0;
+      side === "buy"
+        ? roundQuote(roundedQuantity * roundedPrice * (1 + feeRate))
+        : 0;
 
     if (side === "buy") {
-      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+      this.state.quoteFree = roundQuote(
+        this.state.quoteFree - estimatedQuoteCost,
+      );
+      this.state.quoteReserved = roundQuote(
+        this.state.quoteReserved + estimatedQuoteCost,
+      );
     } else {
       this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
-      this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+      this.state.baseReserved = roundAsset(
+        this.state.baseReserved + roundedQuantity,
+      );
     }
 
     const order = this.buildOrder(
@@ -2355,7 +2704,8 @@ export class SimulatedExecutionEngine {
     for (const lot of lots) {
       if (
         lot.remainingQuantity <= MIN_BASE_QUANTITY ||
-        !hasLotLifecycleControls(lot)
+        !hasLotLifecycleControls(lot) ||
+        !this.positionUsesClosingStrategy(lot.id)
       ) {
         continue;
       }
@@ -2503,14 +2853,21 @@ export class SimulatedExecutionEngine {
     events: BotEvent[] | undefined;
   }): { orders: TradingOrder[]; acted: boolean } {
     const orders: TradingOrder[] = [];
-    let acted = false;
-    const { memory, anticipation, tick, events } = input;
+    const { memory, anticipation, tick } = input;
     const legacyConfig = this.state.config.legacyValleyPeak;
 
     if (anticipation.side === "long") {
-      if (legacyConfig.shortSideEnabled && this.activeShortQuantity() > MIN_BASE_QUANTITY) {
+      if (
+        legacyConfig.shortSideEnabled &&
+        this.activeShortQuantity() > MIN_BASE_QUANTITY
+      ) {
         const activeShorts = this.activeLegacyShortLots(tick.price);
-        this.syncLegacyExitGridMemories(memory, activeShorts, tick.price, "short");
+        this.syncLegacyExitGridMemories(
+          memory,
+          activeShorts,
+          tick.price,
+          "short",
+        );
 
         for (const lot of activeShorts) {
           if (this.openLegacyExitGridOrders(lot.id, "short").length > 0) {
@@ -2527,13 +2884,6 @@ export class SimulatedExecutionEngine {
             continue;
           }
 
-          const cancelled = this.cancelLegacyAnticipatoryEntryGridOrders(
-            tick.eventTime,
-            events !== undefined,
-            "short",
-          );
-          events?.push(...cancelled);
-          acted ||= cancelled.length > 0;
           grid.troughPrice = resetTroughPrice;
           orders.push(
             ...this.createLegacyShortExitGridOrders(
@@ -2549,13 +2899,6 @@ export class SimulatedExecutionEngine {
         }
       }
 
-      const cancelledOpposite = this.cancelLegacyAnticipatoryEntryGridOrders(
-        tick.eventTime,
-        events !== undefined,
-        "short",
-      );
-      events?.push(...cancelledOpposite);
-      acted ||= cancelledOpposite.length > 0;
       orders.push(
         ...this.createLegacyAnticipatoryEntryGridOrders(
           anticipation,
@@ -2565,9 +2908,17 @@ export class SimulatedExecutionEngine {
         ),
       );
     } else {
-      if (legacyConfig.longSideEnabled && this.activeLongQuantity() > MIN_BASE_QUANTITY) {
+      if (
+        legacyConfig.longSideEnabled &&
+        this.activeLongQuantity() > MIN_BASE_QUANTITY
+      ) {
         const activeLongs = this.activeLegacyLongLots(tick.price);
-        this.syncLegacyExitGridMemories(memory, activeLongs, tick.price, "long");
+        this.syncLegacyExitGridMemories(
+          memory,
+          activeLongs,
+          tick.price,
+          "long",
+        );
 
         for (const lot of activeLongs) {
           if (this.openLegacyExitGridOrders(lot.id, "long").length > 0) {
@@ -2584,13 +2935,6 @@ export class SimulatedExecutionEngine {
             continue;
           }
 
-          const cancelled = this.cancelLegacyAnticipatoryEntryGridOrders(
-            tick.eventTime,
-            events !== undefined,
-            "long",
-          );
-          events?.push(...cancelled);
-          acted ||= cancelled.length > 0;
           grid.peakPrice = resetPeakPrice;
           orders.push(
             ...this.createLegacyLongExitGridOrders(
@@ -2606,13 +2950,6 @@ export class SimulatedExecutionEngine {
         }
       }
 
-      const cancelledOpposite = this.cancelLegacyAnticipatoryEntryGridOrders(
-        tick.eventTime,
-        events !== undefined,
-        "long",
-      );
-      events?.push(...cancelledOpposite);
-      acted ||= cancelledOpposite.length > 0;
       orders.push(
         ...this.createLegacyAnticipatoryEntryGridOrders(
           anticipation,
@@ -2623,7 +2960,7 @@ export class SimulatedExecutionEngine {
       );
     }
 
-    return { orders, acted: acted || orders.length > 0 };
+    return { orders, acted: orders.length > 0 };
   }
 
   private createLegacyAnticipatoryEntryGridOrders(
@@ -2632,72 +2969,135 @@ export class SimulatedExecutionEngine {
     currentPrice: number,
     targetEntryLeverage: number,
   ): TradingOrder[] {
-    const config = this.state.config;
-    const legacyConfig = config.legacyValleyPeak;
     if (
-      legacyConfig.anticipatoryGridWindowSec <= 0 ||
-      this.openLegacyAnticipatoryEntryGridOrders(anticipation.side).length > 0
+      this.state.config.legacyValleyPeak.anticipatoryGridWindowSec <= 0 ||
+      this.hasActivePositionEntryGrid(anticipation.side)
     ) {
       return [];
     }
 
-    const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
+    const legacyConfig = this.state.config.legacyValleyPeak;
+    return this.createPositionEntryGridOrders({
+      side: anticipation.side,
+      createdAt,
+      startPrice: currentPrice,
+      anticipatedPrice: anticipation.extremaPrice,
+      requestedQuote: legacyConfig.maxTradeQuote,
+      confidence: 0,
+      source: "strategy",
+      reason: `${LEGACY_ANTICIPATORY_ENTRY_GRID_REASON}; ${anticipation.side}; window ${Math.round(anticipation.windowSec)}s; extrema ${roundQuote(anticipation.extremaPrice)}`,
+      lifecycle: {},
+      targetEntryLeverage,
+    });
+  }
+
+  private createPositionEntryGridOrders(input: {
+    side: PositionLotSide;
+    createdAt: number;
+    startPrice: number;
+    anticipatedPrice: number;
+    requestedQuote: number;
+    confidence: number;
+    source: PositionLifecycle["source"];
+    reason: string;
+    lifecycle: OrderLifecycleFields;
+    targetEntryLeverage: number;
+  }): TradingOrder[] {
+    const config = this.state.config;
+    const availableSlots = Math.max(
+      0,
+      config.maxOpenOrders - this.openOrderIndexes.size,
+    );
     if (availableSlots <= 0) {
       return [];
     }
 
-    const priceOffset = config.limitOffsetBps / 10_000;
     const lowerPrice =
-      anticipation.side === "long"
-        ? roundQuote(anticipation.extremaPrice)
-        : roundQuote(currentPrice * (1 + priceOffset));
+      input.side === "long"
+        ? roundQuote(input.anticipatedPrice)
+        : roundQuote(input.startPrice);
     const upperPrice =
-      anticipation.side === "long"
-        ? roundQuote(currentPrice * Math.max(0.000001, 1 - priceOffset))
-        : roundQuote(anticipation.extremaPrice);
+      input.side === "long"
+        ? roundQuote(input.startPrice)
+        : roundQuote(input.anticipatedPrice);
     if (
       lowerPrice <= 0 ||
       upperPrice <= lowerPrice ||
-      !Number.isFinite(anticipation.extremaPrice)
+      !Number.isFinite(input.anticipatedPrice)
     ) {
       return [];
     }
 
     const availableQuote =
-      anticipation.side === "long"
-        ? this.longEntryBuyingPowerQuote(currentPrice, targetEntryLeverage)
-        : this.shortEntrySellingPowerQuote(currentPrice, targetEntryLeverage);
+      input.side === "long"
+        ? this.longEntryBuyingPowerQuote(
+            input.startPrice,
+            input.targetEntryLeverage,
+          )
+        : this.shortEntrySellingPowerQuote(
+            input.startPrice,
+            input.targetEntryLeverage,
+          );
     const totalQuote = roundQuote(
-      Math.min(legacyConfig.maxTradeQuote, Math.max(0, availableQuote)),
+      Math.min(
+        Math.max(0, input.requestedQuote),
+        Math.max(0, availableQuote),
+      ),
     );
     if (totalQuote < config.minOrderQuote) {
       return [];
     }
 
-    const orderCount = this.legacyAnticipatoryEntryGridOrderCount({
+    const distributedOrderCount = this.legacyAnticipatoryEntryGridOrderCount({
       lowerPrice,
       upperPrice,
-      currentPrice,
+      currentPrice: input.startPrice,
       totalQuote,
       availableSlots,
     });
+    const orderCount = input.confidence >= 1 ? 1 : distributedOrderCount;
     if (orderCount <= 0) {
       return [];
     }
 
+    const priceLevels: Array<{ price: number; weight: number }> = [];
+    for (let index = 0; index < orderCount; index += 1) {
+      const rawPrice = this.positionEntryGridOrderPrice(
+        input.side,
+        index,
+        orderCount,
+        lowerPrice,
+        upperPrice,
+        input.confidence,
+      );
+      const price = this.normalizeOrderPrice(
+        rawPrice,
+        input.side === "long" ? "buy" : "sell",
+        "limit",
+      );
+      const previousLevel = priceLevels.at(-1);
+      if (previousLevel?.price === price) {
+        previousLevel.weight += 1;
+      } else {
+        priceLevels.push({ price, weight: 1 });
+      }
+    }
+
     const orders: TradingOrder[] = [];
+    const positionId = `pos_${orderRunId(this.state.createdAt)}_${this.nextSequence().toString().padStart(6, "0")}`;
     let remainingQuote = totalQuote;
     const baseQuotePerOrder = roundQuote(totalQuote / orderCount);
-    const reason = `${LEGACY_ANTICIPATORY_ENTRY_GRID_REASON}; ${anticipation.side}; window ${Math.round(anticipation.windowSec)}s; extrema ${roundQuote(anticipation.extremaPrice)}`;
 
-    for (let index = 0; index < orderCount; index += 1) {
-      const price =
-        anticipation.side === "long"
-          ? this.legacyExitGridOrderPrice(index, orderCount, lowerPrice, upperPrice)
-          : this.legacyExitGridCoverOrderPrice(index, orderCount, lowerPrice, upperPrice);
-      let quoteSize = index === orderCount - 1
-        ? remainingQuote
-        : Math.min(baseQuotePerOrder, remainingQuote);
+    for (let index = 0; index < priceLevels.length; index += 1) {
+      const level = priceLevels[index];
+      const price = level.price;
+      let quoteSize =
+        index === priceLevels.length - 1
+          ? remainingQuote
+          : Math.min(
+              roundQuote(baseQuotePerOrder * level.weight),
+              remainingQuote,
+            );
       const remainingAfterOrder = roundQuote(remainingQuote - quoteSize);
       if (
         remainingAfterOrder > 0 &&
@@ -2710,34 +3110,58 @@ export class SimulatedExecutionEngine {
       }
 
       const order =
-        anticipation.side === "long"
+        input.side === "long"
           ? this.createLongEntryLimitOrder(
               price,
-              currentPrice,
-              createdAt,
-              reason,
+              input.startPrice,
+              input.createdAt,
+              input.reason,
               quoteSize,
-              {},
-              targetEntryLeverage,
+              input.lifecycle,
+              input.targetEntryLeverage,
             )
           : this.createShortEntryLimitOrder(
               price,
-              currentPrice,
-              createdAt,
-              reason,
+              input.startPrice,
+              input.createdAt,
+              input.reason,
               quoteSize,
-              {},
-              targetEntryLeverage,
+              input.lifecycle,
+              input.targetEntryLeverage,
             );
       if (!order) {
         break;
       }
 
+      order.positionId = positionId;
+      order.manual = input.source === "manual";
       orders.push(order);
       remainingQuote = roundQuote(remainingQuote - quoteSize);
       if (remainingQuote < config.minOrderQuote) {
         break;
       }
+    }
+
+    if (orders.length > 0) {
+      this.state.positionLifecycles.push({
+        id: positionId,
+        side: input.side,
+        phase: "created",
+        source: input.source,
+        createdAt: input.createdAt,
+        updatedAt: input.createdAt,
+        entryStartPrice: roundQuote(input.startPrice),
+        anticipatedEntryPrice: roundQuote(input.anticipatedPrice),
+        confidence: input.confidence,
+        requestedQuote: roundQuote(input.requestedQuote),
+        allocatedQuote: roundQuote(
+          orders.reduce(
+            (total, order) => total + order.price * order.quantity,
+            0,
+          ),
+        ),
+        entryOrderIds: orders.map((order) => order.id),
+      });
     }
 
     return orders;
@@ -2752,7 +3176,9 @@ export class SimulatedExecutionEngine {
   }): number {
     const config = this.state.config;
     const legacyConfig = config.legacyValleyPeak;
-    const quoteLimitedCount = Math.floor(input.totalQuote / Math.max(config.minOrderQuote, 1));
+    const quoteLimitedCount = Math.floor(
+      input.totalQuote / Math.max(config.minOrderQuote, 1),
+    );
     const maxOrderCount = Math.min(
       legacyConfig.anticipatoryGridOrderCount,
       input.availableSlots,
@@ -2775,64 +3201,118 @@ export class SimulatedExecutionEngine {
   }
 
   private activeLegacyLongLots(price: number): LegacyLongExitGridLot[] {
-    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
-      const totalBase = this.totalBase();
-      const averagePrice = cleanPositive(this.state.avgEntryPrice) || price;
-      if (totalBase <= MIN_BASE_QUANTITY || averagePrice <= 0) {
-        return [];
-      }
-
+    this.updateLegacyPositionLotCache();
+    const allLots = [
+      ...(this.legacyPositionLotCache?.longs.values() ?? []),
+    ].filter((lot) => lot.remainingQuantity > MIN_BASE_QUANTITY);
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
+      const managedLots = allLots.filter(
+        (lot) =>
+          this.state.positionLifecycles.some(
+            (position) => position.id === lot.id,
+          ) && this.positionUsesClosingStrategy(lot.id),
+      );
+      const aggregateLots = allLots.filter(
+        (lot) =>
+          !this.state.positionLifecycles.some(
+            (position) => position.id === lot.id,
+          ),
+      );
+      const totalBase = aggregateLots.reduce(
+        (total, lot) => total + lot.remainingQuantity,
+        0,
+      );
+      const totalCost = aggregateLots.reduce(
+        (total, lot) => total + lot.remainingCostQuote,
+        0,
+      );
+      const averagePrice =
+        totalBase > MIN_BASE_QUANTITY ? totalCost / totalBase : 0;
       const feeRate = this.state.config.feeBps / 10_000;
-      return [
-        {
-          id: "aggregate-long",
-          side: "long",
-          averagePrice,
-          originalQuantity: totalBase,
-          remainingQuantity: totalBase,
-          breakEvenSellPrice: averagePrice / Math.max(0.000001, 1 - feeRate),
-        },
-      ];
+      const aggregate: LegacyLongExitGridLot[] =
+        totalBase > MIN_BASE_QUANTITY && averagePrice > 0
+          ? [
+              {
+                id: "aggregate-long",
+                side: "long",
+                averagePrice,
+                originalQuantity: totalBase,
+                remainingQuantity: totalBase,
+                breakEvenSellPrice:
+                  averagePrice / Math.max(0.000001, 1 - feeRate),
+              },
+            ]
+          : [];
+      return [...aggregate, ...managedLots];
     }
 
-    this.updateLegacyPositionLotCache();
-    const lots = this.legacyPositionLotCache?.longs.values() ?? [];
-    return [...lots].filter((lot) => lot.remainingQuantity > MIN_BASE_QUANTITY);
+    return allLots.filter((lot) => this.positionUsesClosingStrategy(lot.id));
   }
 
   private activeLegacyShortLots(price: number): LegacyShortExitGridLot[] {
-    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
-      const totalShortBase = Math.max(0, -this.totalBase());
-      const averagePrice = cleanPositive(this.state.avgShortEntryPrice) || price;
-      if (totalShortBase <= MIN_BASE_QUANTITY || averagePrice <= 0) {
-        return [];
-      }
-
-      const feeAndSlippageRate =
-        (this.state.config.feeBps + this.state.config.positionRisk.marketSlippageBps) /
-        10_000;
-      return [
-        {
-          id: "aggregate-short",
-          side: "short",
-          averagePrice,
-          originalQuantity: totalShortBase,
-          remainingQuantity: totalShortBase,
-          breakEvenBuyPrice: roundQuote(
-            averagePrice / ((1 + feeAndSlippageRate) ** 2),
+    this.updateLegacyPositionLotCache();
+    const allLots = [
+      ...(this.legacyPositionLotCache?.shorts.values() ?? []),
+    ].filter((lot) => lot.remainingQuantity > MIN_BASE_QUANTITY);
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
+      const managedLots = allLots.filter(
+        (lot) =>
+          this.state.positionLifecycles.some(
+            (position) => position.id === lot.id,
+          ) && this.positionUsesClosingStrategy(lot.id),
+      );
+      const aggregateLots = allLots.filter(
+        (lot) =>
+          !this.state.positionLifecycles.some(
+            (position) => position.id === lot.id,
           ),
-        },
-      ];
+      );
+      const totalShortBase = aggregateLots.reduce(
+        (total, lot) => total + lot.remainingQuantity,
+        0,
+      );
+      const totalProceeds = aggregateLots.reduce(
+        (total, lot) => total + lot.remainingProceedsQuote,
+        0,
+      );
+      const averagePrice =
+        totalShortBase > MIN_BASE_QUANTITY
+          ? totalProceeds / totalShortBase
+          : 0;
+      const feeAndSlippageRate =
+        (this.state.config.feeBps +
+          this.state.config.positionRisk.marketSlippageBps) /
+        10_000;
+      const aggregate: LegacyShortExitGridLot[] =
+        totalShortBase > MIN_BASE_QUANTITY && averagePrice > 0
+          ? [
+              {
+                id: "aggregate-short",
+                side: "short",
+                averagePrice,
+                originalQuantity: totalShortBase,
+                remainingQuantity: totalShortBase,
+                breakEvenBuyPrice: roundQuote(
+                  averagePrice / (1 + feeAndSlippageRate) ** 2,
+                ),
+              },
+            ]
+          : [];
+      return [...aggregate, ...managedLots];
     }
 
-    this.updateLegacyPositionLotCache();
-    const lots = this.legacyPositionLotCache?.shorts.values() ?? [];
-    return [...lots].filter((lot) => lot.remainingQuantity > MIN_BASE_QUANTITY);
+    return allLots.filter((lot) => this.positionUsesClosingStrategy(lot.id));
   }
 
   private updateLegacyPositionLotCache(): void {
     const feeAndSlippageRate =
-      (this.state.config.feeBps + this.state.config.positionRisk.marketSlippageBps) / 10_000;
+      (this.state.config.feeBps +
+        this.state.config.positionRisk.marketSlippageBps) /
+      10_000;
     const feeFactor = (1 + feeAndSlippageRate) ** 2;
 
     if (
@@ -2885,7 +3365,9 @@ export class SimulatedExecutionEngine {
     }
   }
 
-  private refreshLegacyPositionLotCacheSummary(cache: LegacyPositionLotCache): void {
+  private refreshLegacyPositionLotCacheSummary(
+    cache: LegacyPositionLotCache,
+  ): void {
     let activeLongQuantity = 0;
     let longExposureQuantity = 0;
     let activeLongCostQuote = 0;
@@ -2934,7 +3416,10 @@ export class SimulatedExecutionEngine {
         continue;
       }
 
-      longInternalBorrowCapacityQuote += Math.max(0, lot.remainingProceedsQuote);
+      longInternalBorrowCapacityQuote += Math.max(
+        0,
+        lot.remainingProceedsQuote,
+      );
     }
 
     cache.activeLongQuantity = roundAsset(activeLongQuantity);
@@ -2943,8 +3428,12 @@ export class SimulatedExecutionEngine {
     cache.activeShortQuantity = roundAsset(activeShortQuantity);
     cache.activeShortProceedsQuote = roundQuote(activeShortProceedsQuote);
     cache.internalBorrowedQuantity = roundAsset(internalBorrowedQuantity);
-    cache.shortInternalBorrowCapacityQuantity = roundAsset(shortInternalBorrowCapacityQuantity);
-    cache.longInternalBorrowCapacityQuote = roundQuote(longInternalBorrowCapacityQuote);
+    cache.shortInternalBorrowCapacityQuantity = roundAsset(
+      shortInternalBorrowCapacityQuantity,
+    );
+    cache.longInternalBorrowCapacityQuote = roundQuote(
+      longInternalBorrowCapacityQuote,
+    );
   }
 
   private applyLegacyBuyFillToPositionCache(
@@ -3009,8 +3498,37 @@ export class SimulatedExecutionEngine {
       averagePrice,
       feeFactor,
     );
-    cache.longs.set(`long_${fill.id}`, {
-      id: `long_${fill.id}`,
+    const lotId = fill.positionId || `long_${fill.id}`;
+    const existing = cache.longs.get(lotId);
+    if (existing) {
+      const originalCost = existing.averagePrice * existing.originalQuantity;
+      existing.originalQuantity = roundAsset(
+        existing.originalQuantity + quantityLeft,
+      );
+      existing.remainingQuantity = roundAsset(
+        existing.remainingQuantity + quantityLeft,
+      );
+      existing.remainingCostQuote = roundQuote(
+        existing.remainingCostQuote + costLeft,
+      );
+      existing.averagePrice = roundQuote(
+        (originalCost + costLeft) / existing.originalQuantity,
+      );
+      existing.borrowAllocations.push(...borrowAllocations);
+      existing.borrowDepthRemaining = Math.max(
+        existing.borrowDepthRemaining,
+        this.inheritedLegacyLongBorrowDepth(borrowAllocations),
+      );
+      Object.assign(existing, normalizedLotLifecycleFields(fill));
+      existing.breakEvenSellPrice = roundQuote(
+        (existing.remainingCostQuote / existing.remainingQuantity) *
+          (1 + feeAndSlippageRate),
+      );
+      return;
+    }
+
+    cache.longs.set(lotId, {
+      id: lotId,
       side: "long",
       openedAt: fill.filledAt,
       averagePrice,
@@ -3019,7 +3537,8 @@ export class SimulatedExecutionEngine {
       remainingCostQuote: roundQuote(costLeft),
       ...normalizedLotLifecycleFields(fill),
       lentQuantity: 0,
-      borrowDepthRemaining: this.inheritedLegacyLongBorrowDepth(borrowAllocations),
+      borrowDepthRemaining:
+        this.inheritedLegacyLongBorrowDepth(borrowAllocations),
       borrowAllocations,
       breakEvenSellPrice: roundQuote(
         (costLeft / quantityLeft) * (1 + feeAndSlippageRate),
@@ -3089,8 +3608,39 @@ export class SimulatedExecutionEngine {
       averagePrice,
       feeAndSlippageRate,
     );
-    cache.shorts.set(`short_${fill.id}`, {
-      id: `short_${fill.id}`,
+    const lotId = fill.positionId || `short_${fill.id}`;
+    const existing = cache.shorts.get(lotId);
+    if (existing) {
+      const originalProceeds =
+        existing.averagePrice * existing.originalQuantity;
+      existing.originalQuantity = roundAsset(
+        existing.originalQuantity + quantityLeft,
+      );
+      existing.remainingQuantity = roundAsset(
+        existing.remainingQuantity + quantityLeft,
+      );
+      existing.remainingProceedsQuote = roundQuote(
+        existing.remainingProceedsQuote + proceedsLeft,
+      );
+      existing.averagePrice = roundQuote(
+        (originalProceeds + proceedsLeft) / existing.originalQuantity,
+      );
+      existing.borrowAllocations.push(...borrowAllocations);
+      existing.borrowDepthRemaining = Math.max(
+        existing.borrowDepthRemaining,
+        this.inheritedLegacyShortBorrowDepth(borrowAllocations),
+      );
+      Object.assign(existing, normalizedLotLifecycleFields(fill));
+      existing.breakEvenBuyPrice = roundQuote(
+        existing.remainingProceedsQuote /
+          existing.remainingQuantity /
+          feeFactor,
+      );
+      return;
+    }
+
+    cache.shorts.set(lotId, {
+      id: lotId,
       side: "short",
       openedAt: fill.filledAt,
       averagePrice,
@@ -3099,11 +3649,10 @@ export class SimulatedExecutionEngine {
       remainingProceedsQuote: roundQuote(proceedsLeft),
       ...normalizedLotLifecycleFields(fill),
       lentQuote: 0,
-      borrowDepthRemaining: this.inheritedLegacyShortBorrowDepth(borrowAllocations),
+      borrowDepthRemaining:
+        this.inheritedLegacyShortBorrowDepth(borrowAllocations),
       borrowAllocations,
-      breakEvenBuyPrice: roundQuote(
-        proceedsLeft / quantityLeft / feeFactor,
-      ),
+      breakEvenBuyPrice: roundQuote(proceedsLeft / quantityLeft / feeFactor),
     });
   }
 
@@ -3220,8 +3769,12 @@ export class SimulatedExecutionEngine {
 
       const borrowedQuote = roundQuote(borrowedQuantity * unitProceeds);
       source.lentQuantity = roundAsset(source.lentQuantity + borrowedQuantity);
-      source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
-      source.remainingCostQuote = roundQuote(source.remainingCostQuote - borrowedQuote);
+      source.remainingQuantity = roundAsset(
+        source.remainingQuantity - borrowedQuantity,
+      );
+      source.remainingCostQuote = roundQuote(
+        source.remainingCostQuote - borrowedQuote,
+      );
       source.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
         source,
         feeAndSlippageRate,
@@ -3278,14 +3831,18 @@ export class SimulatedExecutionEngine {
         source.remainingQuantity,
         source.remainingProceedsQuote / unitCost,
       );
-      const borrowedQuantity = roundAsset(Math.min(quantityLeft, affordableQuantity));
+      const borrowedQuantity = roundAsset(
+        Math.min(quantityLeft, affordableQuantity),
+      );
       if (borrowedQuantity <= MIN_BASE_QUANTITY) {
         continue;
       }
 
       const borrowedQuote = roundQuote(borrowedQuantity * unitCost);
       source.lentQuote = roundQuote(source.lentQuote + borrowedQuote);
-      source.remainingQuantity = roundAsset(source.remainingQuantity - borrowedQuantity);
+      source.remainingQuantity = roundAsset(
+        source.remainingQuantity - borrowedQuantity,
+      );
       source.remainingProceedsQuote = roundQuote(
         source.remainingProceedsQuote - borrowedQuote,
       );
@@ -3314,25 +3871,40 @@ export class SimulatedExecutionEngine {
   ): void {
     const allocations = short.borrowAllocations.filter(
       (allocation) =>
-        allocation.quantity > MIN_BASE_QUANTITY && allocation.quote > MIN_BASE_QUANTITY,
+        allocation.quantity > MIN_BASE_QUANTITY &&
+        allocation.quote > MIN_BASE_QUANTITY,
     );
     const totalBorrowedQuantity = roundAsset(
       allocations.reduce((total, allocation) => total + allocation.quantity, 0),
     );
-    const quantityToSettle = roundAsset(Math.min(closedQuantity, totalBorrowedQuantity));
-    if (quantityToSettle <= MIN_BASE_QUANTITY || totalBorrowedQuantity <= MIN_BASE_QUANTITY) {
+    const quantityToSettle = roundAsset(
+      Math.min(closedQuantity, totalBorrowedQuantity),
+    );
+    if (
+      quantityToSettle <= MIN_BASE_QUANTITY ||
+      totalBorrowedQuantity <= MIN_BASE_QUANTITY
+    ) {
       return;
     }
 
-    const settlementRatio = Math.min(1, quantityToSettle / totalBorrowedQuantity);
+    const settlementRatio = Math.min(
+      1,
+      quantityToSettle / totalBorrowedQuantity,
+    );
     let quantityLeft = quantityToSettle;
     let principalLeft = roundQuote(
-      allocations.reduce((total, allocation) => total + allocation.quote * settlementRatio, 0),
+      allocations.reduce(
+        (total, allocation) => total + allocation.quote * settlementRatio,
+        0,
+      ),
     );
 
     for (let index = 0; index < allocations.length; index += 1) {
       const allocation = allocations[index];
-      if (quantityLeft <= MIN_BASE_QUANTITY || principalLeft <= MIN_BASE_QUANTITY) {
+      if (
+        quantityLeft <= MIN_BASE_QUANTITY ||
+        principalLeft <= MIN_BASE_QUANTITY
+      ) {
         break;
       }
       const lastAllocation = index === allocations.length - 1;
@@ -3350,14 +3922,19 @@ export class SimulatedExecutionEngine {
           principalLeft,
         ),
       );
-      if (quantity <= MIN_BASE_QUANTITY || principalQuote <= MIN_BASE_QUANTITY) {
+      if (
+        quantity <= MIN_BASE_QUANTITY ||
+        principalQuote <= MIN_BASE_QUANTITY
+      ) {
         continue;
       }
       const coverQuote = roundQuote(quantity * unitCost);
       const long = cache.longs.get(allocation.longLotId);
       if (long) {
         const profitQuote = principalQuote - coverQuote;
-        long.lentQuantity = roundAsset(Math.max(0, long.lentQuantity - quantity));
+        long.lentQuantity = roundAsset(
+          Math.max(0, long.lentQuantity - quantity),
+        );
         long.remainingQuantity = roundAsset(long.remainingQuantity + quantity);
         const returnedQuote =
           profitQuote > 0
@@ -3366,7 +3943,9 @@ export class SimulatedExecutionEngine {
                   profitQuote * this.state.config.borrowerProfitShareToLender,
               )
             : coverQuote;
-        long.remainingCostQuote = roundQuote(long.remainingCostQuote + returnedQuote);
+        long.remainingCostQuote = roundQuote(
+          long.remainingCostQuote + returnedQuote,
+        );
         long.breakEvenSellPrice = this.legacyLongLotBreakEvenSellPrice(
           long,
           feeAndSlippageRate,
@@ -3382,7 +3961,8 @@ export class SimulatedExecutionEngine {
 
     short.borrowAllocations = short.borrowAllocations.filter(
       (allocation) =>
-        allocation.quantity > MIN_BASE_QUANTITY && allocation.quote > MIN_BASE_QUANTITY,
+        allocation.quantity > MIN_BASE_QUANTITY &&
+        allocation.quote > MIN_BASE_QUANTITY,
     );
   }
 
@@ -3395,25 +3975,40 @@ export class SimulatedExecutionEngine {
   ): void {
     const allocations = long.borrowAllocations.filter(
       (allocation) =>
-        allocation.quantity > MIN_BASE_QUANTITY && allocation.quote > MIN_BASE_QUANTITY,
+        allocation.quantity > MIN_BASE_QUANTITY &&
+        allocation.quote > MIN_BASE_QUANTITY,
     );
     const totalBorrowedQuantity = roundAsset(
       allocations.reduce((total, allocation) => total + allocation.quantity, 0),
     );
-    const quantityToSettle = roundAsset(Math.min(closedQuantity, totalBorrowedQuantity));
-    if (quantityToSettle <= MIN_BASE_QUANTITY || totalBorrowedQuantity <= MIN_BASE_QUANTITY) {
+    const quantityToSettle = roundAsset(
+      Math.min(closedQuantity, totalBorrowedQuantity),
+    );
+    if (
+      quantityToSettle <= MIN_BASE_QUANTITY ||
+      totalBorrowedQuantity <= MIN_BASE_QUANTITY
+    ) {
       return;
     }
 
-    const settlementRatio = Math.min(1, quantityToSettle / totalBorrowedQuantity);
+    const settlementRatio = Math.min(
+      1,
+      quantityToSettle / totalBorrowedQuantity,
+    );
     let quantityLeft = quantityToSettle;
     let principalLeft = roundQuote(
-      allocations.reduce((total, allocation) => total + allocation.quote * settlementRatio, 0),
+      allocations.reduce(
+        (total, allocation) => total + allocation.quote * settlementRatio,
+        0,
+      ),
     );
 
     for (let index = 0; index < allocations.length; index += 1) {
       const allocation = allocations[index];
-      if (quantityLeft <= MIN_BASE_QUANTITY || principalLeft <= MIN_BASE_QUANTITY) {
+      if (
+        quantityLeft <= MIN_BASE_QUANTITY ||
+        principalLeft <= MIN_BASE_QUANTITY
+      ) {
         break;
       }
       const lastAllocation = index === allocations.length - 1;
@@ -3431,15 +4026,22 @@ export class SimulatedExecutionEngine {
           principalLeft,
         ),
       );
-      if (quantity <= MIN_BASE_QUANTITY || principalQuote <= MIN_BASE_QUANTITY) {
+      if (
+        quantity <= MIN_BASE_QUANTITY ||
+        principalQuote <= MIN_BASE_QUANTITY
+      ) {
         continue;
       }
       const returnedQuote = roundQuote(quantity * unitProceeds);
       const short = cache.shorts.get(allocation.shortLotId);
       if (short) {
         const profitQuote = returnedQuote - principalQuote;
-        short.lentQuote = roundQuote(Math.max(0, short.lentQuote - principalQuote));
-        short.remainingQuantity = roundAsset(short.remainingQuantity + quantity);
+        short.lentQuote = roundQuote(
+          Math.max(0, short.lentQuote - principalQuote),
+        );
+        short.remainingQuantity = roundAsset(
+          short.remainingQuantity + quantity,
+        );
         const lenderQuote =
           profitQuote > 0
             ? roundQuote(
@@ -3465,7 +4067,8 @@ export class SimulatedExecutionEngine {
 
     long.borrowAllocations = long.borrowAllocations.filter(
       (allocation) =>
-        allocation.quantity > MIN_BASE_QUANTITY && allocation.quote > MIN_BASE_QUANTITY,
+        allocation.quantity > MIN_BASE_QUANTITY &&
+        allocation.quote > MIN_BASE_QUANTITY,
     );
   }
 
@@ -3517,7 +4120,9 @@ export class SimulatedExecutionEngine {
       : 0;
   }
 
-  private legacyShortLotBreakEvenBeforeFees(lot: LegacyTrackedShortLot): number {
+  private legacyShortLotBreakEvenBeforeFees(
+    lot: LegacyTrackedShortLot,
+  ): number {
     return lot.remainingQuantity > MIN_BASE_QUANTITY
       ? lot.remainingProceedsQuote / lot.remainingQuantity
       : 0;
@@ -3529,7 +4134,8 @@ export class SimulatedExecutionEngine {
   ): number {
     return lot.remainingQuantity > MIN_BASE_QUANTITY
       ? roundQuote(
-          (lot.remainingCostQuote / lot.remainingQuantity) * (1 + feeAndSlippageRate),
+          (lot.remainingCostQuote / lot.remainingQuantity) *
+            (1 + feeAndSlippageRate),
         )
       : 0;
   }
@@ -3539,7 +4145,9 @@ export class SimulatedExecutionEngine {
     feeFactor: number,
   ): number {
     return lot.remainingQuantity > MIN_BASE_QUANTITY
-      ? roundQuote(lot.remainingProceedsQuote / lot.remainingQuantity / feeFactor)
+      ? roundQuote(
+          lot.remainingProceedsQuote / lot.remainingQuantity / feeFactor,
+        )
       : 0;
   }
 
@@ -3648,13 +4256,16 @@ export class SimulatedExecutionEngine {
     currentPrice: number,
   ): number | undefined {
     const config = this.state.config.legacyValleyPeak;
-    const breakEvenSellPrice = cleanPositive(lot.breakEvenSellPrice) || grid.entryPrice;
-    const minimumPeakPrice = breakEvenSellPrice * (1 + config.exitGridMinProfitBps / 10_000);
+    const breakEvenSellPrice =
+      cleanPositive(lot.breakEvenSellPrice) || grid.entryPrice;
+    const minimumPeakPrice =
+      breakEvenSellPrice * (1 + config.exitGridMinProfitBps / 10_000);
     if (currentPrice <= minimumPeakPrice) {
       return undefined;
     }
 
-    const resetPrice = cleanPositive(grid.resetPrice) || cleanPositive(grid.gridPeakPrice);
+    const resetPrice =
+      cleanPositive(grid.resetPrice) || cleanPositive(grid.gridPeakPrice);
     if (grid.gridPeakPrice <= 0 || resetPrice <= 0) {
       return currentPrice;
     }
@@ -3672,18 +4283,17 @@ export class SimulatedExecutionEngine {
     currentPrice: number,
   ): number | undefined {
     const config = this.state.config.legacyValleyPeak;
-    const breakEvenBuyPrice = cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice;
-    const maximumTroughPrice = breakEvenBuyPrice * (1 - config.exitGridMinProfitBps / 10_000);
+    const breakEvenBuyPrice =
+      cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice;
+    const maximumTroughPrice =
+      breakEvenBuyPrice * (1 - config.exitGridMinProfitBps / 10_000);
     if (currentPrice >= maximumTroughPrice) {
       return undefined;
     }
 
-    const resetPrice = cleanPositive(grid.resetPrice) || cleanPositive(grid.gridTroughPrice);
-    if (
-      !grid.gridTroughPrice ||
-      grid.gridTroughPrice <= 0 ||
-      resetPrice <= 0
-    ) {
+    const resetPrice =
+      cleanPositive(grid.resetPrice) || cleanPositive(grid.gridTroughPrice);
+    if (!grid.gridTroughPrice || grid.gridTroughPrice <= 0 || resetPrice <= 0) {
       return currentPrice;
     }
 
@@ -3701,9 +4311,14 @@ export class SimulatedExecutionEngine {
     currentPrice: number,
   ): TradingOrder[] {
     const config = this.state.config;
-    const lowerPrice = roundQuote(cleanPositive(lot.breakEvenSellPrice) || grid.entryPrice);
+    const lowerPrice = roundQuote(
+      cleanPositive(lot.breakEvenSellPrice) || grid.entryPrice,
+    );
     const upperPrice = roundQuote(Math.max(grid.peakPrice, lowerPrice));
-    const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
+    const availableSlots = Math.max(
+      0,
+      config.maxOpenOrders - this.openOrderIndexes.size,
+    );
     const availableQuantity = Math.min(
       Math.max(0, lot.remainingQuantity),
       this.state.baseFree,
@@ -3716,7 +4331,11 @@ export class SimulatedExecutionEngine {
       availableSlots,
     });
 
-    if (orderCount <= 0 || upperPrice <= lowerPrice || availableQuantity <= MIN_BASE_QUANTITY) {
+    if (
+      orderCount <= 0 ||
+      upperPrice <= lowerPrice ||
+      availableQuantity <= MIN_BASE_QUANTITY
+    ) {
       return [];
     }
 
@@ -3726,7 +4345,7 @@ export class SimulatedExecutionEngine {
       type: OrderType;
       trigger?: "below";
     }> = [];
-    const specByPriceKey = new Map<string, typeof orderSpecs[number]>();
+    const specByPriceKey = new Map<string, (typeof orderSpecs)[number]>();
     let remainingQuantity = availableQuantity;
 
     for (let index = 0; index < orderCount; index += 1) {
@@ -3775,7 +4394,7 @@ export class SimulatedExecutionEngine {
           price: normalizedPrice,
           quantity,
           type,
-          trigger: isLimitOrder ? undefined : "below" as const,
+          trigger: isLimitOrder ? undefined : ("below" as const),
         };
         orderSpecs.push(spec);
         specByPriceKey.set(priceKey, spec);
@@ -3819,9 +4438,16 @@ export class SimulatedExecutionEngine {
     currentPrice: number,
   ): TradingOrder[] {
     const config = this.state.config;
-    const upperPrice = roundQuote(cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice);
-    const lowerPrice = roundQuote(Math.min(grid.troughPrice ?? upperPrice, upperPrice));
-    const availableSlots = Math.max(0, config.maxOpenOrders - this.openOrderIndexes.size);
+    const upperPrice = roundQuote(
+      cleanPositive(lot.breakEvenBuyPrice) || grid.entryPrice,
+    );
+    const lowerPrice = roundQuote(
+      Math.min(grid.troughPrice ?? upperPrice, upperPrice),
+    );
+    const availableSlots = Math.max(
+      0,
+      config.maxOpenOrders - this.openOrderIndexes.size,
+    );
     const availableQuantity = Math.max(0, lot.remainingQuantity);
     const orderCount = this.legacyExitGridOrderCount({
       lowerPrice,
@@ -3831,7 +4457,11 @@ export class SimulatedExecutionEngine {
       availableSlots,
     });
 
-    if (orderCount <= 0 || upperPrice <= lowerPrice || availableQuantity <= MIN_BASE_QUANTITY) {
+    if (
+      orderCount <= 0 ||
+      upperPrice <= lowerPrice ||
+      availableQuantity <= MIN_BASE_QUANTITY
+    ) {
       return [];
     }
 
@@ -3841,7 +4471,7 @@ export class SimulatedExecutionEngine {
       type: OrderType;
       trigger?: "above";
     }> = [];
-    const specByPriceKey = new Map<string, typeof orderSpecs[number]>();
+    const specByPriceKey = new Map<string, (typeof orderSpecs)[number]>();
     let remainingQuantity = availableQuantity;
 
     for (let index = 0; index < orderCount; index += 1) {
@@ -3890,7 +4520,7 @@ export class SimulatedExecutionEngine {
           price: normalizedPrice,
           quantity,
           type,
-          trigger: isLimitOrder ? undefined : "above" as const,
+          trigger: isLimitOrder ? undefined : ("above" as const),
         };
         orderSpecs.push(spec);
         specByPriceKey.set(priceKey, spec);
@@ -3935,7 +4565,10 @@ export class SimulatedExecutionEngine {
     availableSlots: number;
   }): number {
     const config = this.state.config.legacyValleyPeak;
-    const maxOrderCount = Math.min(config.exitGridOrderCount, input.availableSlots);
+    const maxOrderCount = Math.min(
+      config.exitGridOrderCount,
+      input.availableSlots,
+    );
     if (maxOrderCount <= 0) {
       return 0;
     }
@@ -3957,7 +4590,9 @@ export class SimulatedExecutionEngine {
       return;
     }
 
-    this.state.exitGridSpanTotal = roundQuote(this.state.exitGridSpanTotal + span);
+    this.state.exitGridSpanTotal = roundQuote(
+      this.state.exitGridSpanTotal + span,
+    );
     this.state.exitGridSpanCount += 1;
     this.state.exitGridOrderCountTotal += orderCount;
   }
@@ -3974,14 +4609,55 @@ export class SimulatedExecutionEngine {
 
     const progress = index / Math.max(1, orderCount - 1);
     if (
-      this.state.config.legacyValleyPeak.exitGridPriceDistribution === "geometric" &&
+      this.state.config.legacyValleyPeak.exitGridPriceDistribution ===
+        "geometric" &&
       lowerPrice > 0 &&
       upperPrice > lowerPrice
     ) {
-      return roundQuote(upperPrice * Math.pow(lowerPrice / upperPrice, progress));
+      return roundQuote(
+        upperPrice * Math.pow(lowerPrice / upperPrice, progress),
+      );
     }
 
     return roundQuote(upperPrice - (upperPrice - lowerPrice) * progress);
+  }
+
+  private positionEntryGridOrderPrice(
+    side: PositionLotSide,
+    index: number,
+    orderCount: number,
+    lowerPrice: number,
+    upperPrice: number,
+    confidence: number,
+  ): number {
+    if (orderCount <= 1) {
+      return side === "long" ? lowerPrice : upperPrice;
+    }
+
+    const progress = index / Math.max(1, orderCount - 1);
+    const normalizedConfidence = Math.min(1, Math.max(0, confidence));
+    const shapedProgress = Math.pow(
+      progress,
+      1 / (1 + 3 * normalizedConfidence),
+    );
+    if (
+      this.state.config.legacyValleyPeak.exitGridPriceDistribution ===
+        "geometric" &&
+      lowerPrice > 0 &&
+      upperPrice > lowerPrice
+    ) {
+      return side === "long"
+        ? roundQuote(
+            upperPrice * Math.pow(lowerPrice / upperPrice, shapedProgress),
+          )
+        : roundQuote(
+            lowerPrice * Math.pow(upperPrice / lowerPrice, shapedProgress),
+          );
+    }
+
+    return side === "long"
+      ? roundQuote(upperPrice - (upperPrice - lowerPrice) * shapedProgress)
+      : roundQuote(lowerPrice + (upperPrice - lowerPrice) * shapedProgress);
   }
 
   private legacyExitGridCoverOrderPrice(
@@ -3996,11 +4672,14 @@ export class SimulatedExecutionEngine {
 
     const progress = index / Math.max(1, orderCount - 1);
     if (
-      this.state.config.legacyValleyPeak.exitGridPriceDistribution === "geometric" &&
+      this.state.config.legacyValleyPeak.exitGridPriceDistribution ===
+        "geometric" &&
       lowerPrice > 0 &&
       upperPrice > lowerPrice
     ) {
-      return roundQuote(lowerPrice * Math.pow(upperPrice / lowerPrice, progress));
+      return roundQuote(
+        lowerPrice * Math.pow(upperPrice / lowerPrice, progress),
+      );
     }
 
     return roundQuote(lowerPrice + (upperPrice - lowerPrice) * progress);
@@ -4058,32 +4737,111 @@ export class SimulatedExecutionEngine {
     return events ?? NO_EVENTS;
   }
 
-  private cancelLegacyAnticipatoryEntryGridOrders(
+  private beginPositionEntryGridSettlements(
+    side: PositionLotSide,
     at: number,
     collectEvents: boolean,
-    side?: PositionLotSide,
-  ): BotEvent[] {
+  ): { events: BotEvent[]; positionIds: Set<string> } {
     const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+    const positionIds = new Set<string>();
 
-    for (const { index, order } of this.openLegacyAnticipatoryEntryGridOrders(side)) {
-      this.releaseOrderReserve(order);
-      order.status = "cancelled";
-      order.cancelledAt = at;
-      order.updatedAt = at;
-      order.reason = `${order.reason}; reset`;
-      this.openOrderIndexes.delete(index);
+    for (const position of this.state.positionLifecycles) {
+      if (position.side !== side || position.phase !== "created") {
+        continue;
+      }
+
+      position.phase = "settling";
+      position.updatedAt = at;
+      positionIds.add(position.id);
 
       if (events) {
         events.push({
-          type: "order_cancelled",
+          type: "position_phase_changed",
           at,
-          message: `${order.side.toUpperCase()} anticipatory entry grid order cancelled`,
-          order: structuredClone(order),
+          message: `${side.toUpperCase()} position ${position.id} settling on confirmed entry signal`,
+          positionId: position.id,
+          positionPhase: "settling",
         });
+      }
+
+      for (const orderId of position.entryOrderIds) {
+        const index = this.findOrderIndex(orderId);
+        const order =
+          index === undefined ? undefined : this.state.orders[index];
+        if (index === undefined || !order || order.status !== "open") {
+          continue;
+        }
+
+        this.releaseOrderReserve(order);
+        order.status = "cancelled";
+        order.cancelledAt = at;
+        order.updatedAt = at;
+        order.reason = `${order.reason}; position settling`;
+        this.openOrderIndexes.delete(index);
+        if (events) {
+          events.push({
+            type: "order_cancelled",
+            at,
+            message: `${order.side.toUpperCase()} entry grid order cancelled while ${position.id} settles`,
+            order: structuredClone(order),
+            positionId: position.id,
+            positionPhase: "settling",
+          });
+        }
       }
     }
 
-    return events ?? NO_EVENTS;
+    if (positionIds.size > 0) {
+      this.state.updatedAt = Math.max(this.state.updatedAt, at);
+    }
+    return { events: events ?? NO_EVENTS, positionIds };
+  }
+
+  private hasActivePositionEntryGrid(side: PositionLotSide): boolean {
+    return this.state.positionLifecycles.some(
+      (position) =>
+        position.side === side &&
+        (position.phase === "created" || position.phase === "settling"),
+    );
+  }
+
+  private positionUsesClosingStrategy(positionId: string): boolean {
+    const position = this.state.positionLifecycles.find(
+      (item) => item.id === positionId,
+    );
+    return !position || position.phase === "closing";
+  }
+
+  private isSettlingPositionEntryOrder(order: TradingOrder): boolean {
+    if (!order.positionId) {
+      return false;
+    }
+    const position = this.state.positionLifecycles.find(
+      (candidate) => candidate.id === order.positionId,
+    );
+    return (
+      position?.phase === "settling" &&
+      position.entryOrderIds.includes(order.id)
+    );
+  }
+
+  private refreshClosedPositionLifecycles(at: number): void {
+    this.updateLegacyPositionLotCache();
+    for (const position of this.state.positionLifecycles) {
+      if (position.phase !== "closing") {
+        continue;
+      }
+      const lot =
+        position.side === "long"
+          ? this.legacyPositionLotCache?.longs.get(position.id)
+          : this.legacyPositionLotCache?.shorts.get(position.id);
+      if (lot && lot.remainingQuantity > MIN_BASE_QUANTITY) {
+        continue;
+      }
+      position.phase = "closed";
+      position.updatedAt = at;
+      position.closedAt = at;
+    }
   }
 
   private openLegacyExitGridOrders(
@@ -4096,7 +4854,8 @@ export class SimulatedExecutionEngine {
       if (
         order?.status === "open" &&
         order.reason.startsWith(LEGACY_EXIT_GRID_REASON) &&
-        (!side || (side === "long" ? order.side === "sell" : order.side === "buy")) &&
+        (!side ||
+          (side === "long" ? order.side === "sell" : order.side === "buy")) &&
         (!lotId || order.targetPositionId === lotId)
       ) {
         orders.push({ index, order });
@@ -4105,31 +4864,10 @@ export class SimulatedExecutionEngine {
     return orders;
   }
 
-  private openLegacyAnticipatoryEntryGridOrders(
-    side?: PositionLotSide,
-  ): Array<{ index: number; order: TradingOrder }> {
-    const orders: Array<{ index: number; order: TradingOrder }> = [];
-    for (const index of this.openOrderIndexes) {
-      const order = this.state.orders[index];
-      const orderSide: PositionLotSide | undefined =
-        order?.side === "buy"
-          ? "long"
-          : order?.side === "sell" && order.positionEffect === "open"
-            ? "short"
-            : undefined;
-      if (
-        order?.status === "open" &&
-        order.positionEffect === "open" &&
-        order.reason.startsWith(LEGACY_ANTICIPATORY_ENTRY_GRID_REASON) &&
-        (!side || orderSide === side)
-      ) {
-        orders.push({ index, order });
-      }
-    }
-    return orders;
-  }
-
-  private executionPriceForOrderFill(order: TradingOrder, tickPrice: number): number {
+  private executionPriceForOrderFill(
+    order: TradingOrder,
+    tickPrice: number,
+  ): number {
     return roundQuote(
       orderExecutionPrice(
         order,
@@ -4204,14 +4942,12 @@ export class SimulatedExecutionEngine {
     const exposureBeforeFill = this.riskExposureQuote(fillPrice);
 
     try {
-      const fill = this.fillOrder(
-        order,
-        index,
-        filledAt,
-        actualExecutionPrice,
-      );
+      const fill = this.fillOrder(order, index, filledAt, actualExecutionPrice);
       if (!skipLeverageCheck) {
-        this.assertLeverageLimitForExposureIncrease(fillPrice, exposureBeforeFill);
+        this.assertLeverageLimitForExposureIncrease(
+          fillPrice,
+          exposureBeforeFill,
+        );
         this.recordEffectiveLeverage();
       }
       return { fill };
@@ -4264,7 +5000,8 @@ export class SimulatedExecutionEngine {
       this.state.baseFree = roundAsset(this.state.baseFree + order.quantity);
       if (closedShortQuantity > MIN_BASE_QUANTITY) {
         const entryPrice = this.shortEntryPriceForCloseOrder(order);
-        const feeForClosedQuantity = feeQuote * (closedShortQuantity / order.quantity);
+        const feeForClosedQuantity =
+          feeQuote * (closedShortQuantity / order.quantity);
         realizedPnl = roundQuote(
           (entryPrice - fillPrice) * closedShortQuantity - feeForClosedQuantity,
         );
@@ -4281,14 +5018,17 @@ export class SimulatedExecutionEngine {
           Math.max(0, order.quantity - closedLongQuantity),
         );
         if (openedShortQuantity > MIN_BASE_QUANTITY) {
-          this.state.baseFree = roundAsset(this.state.baseFree - openedShortQuantity);
+          this.state.baseFree = roundAsset(
+            this.state.baseFree - openedShortQuantity,
+          );
         }
       }
       const proceeds = roundQuote(quoteQuantity - feeQuote);
       this.state.quoteFree = roundQuote(this.state.quoteFree + proceeds);
       if (closedLongQuantity > MIN_BASE_QUANTITY) {
         const entryPrice = this.longEntryPriceForCloseOrder(order);
-        const feeForClosedQuantity = feeQuote * (closedLongQuantity / order.quantity);
+        const feeForClosedQuantity =
+          feeQuote * (closedLongQuantity / order.quantity);
         realizedPnl = roundQuote(
           (fillPrice - entryPrice) * closedLongQuantity - feeForClosedQuantity,
         );
@@ -4322,6 +5062,7 @@ export class SimulatedExecutionEngine {
       realizedPnl,
       filledAt,
       reason: order.reason,
+      positionId: order.positionId,
       targetPositionId: order.targetPositionId,
       positionEffect: order.positionEffect,
       ...normalizedLotLifecycleFields(order),
@@ -4350,7 +5091,8 @@ export class SimulatedExecutionEngine {
       return;
     }
 
-    const grid = this.state.memory.legacyValleyPeak?.exitGrids?.[order.targetPositionId];
+    const grid =
+      this.state.memory.legacyValleyPeak?.exitGrids?.[order.targetPositionId];
     if (!grid) {
       return;
     }
@@ -4388,10 +5130,12 @@ export class SimulatedExecutionEngine {
     const events = existingEvents ?? (collectEvents ? [] : undefined);
     const positions = analyzePositions(this.state, { currentPrice: fillPrice });
     const activeLongs = positions.longs.filter(
-      (lot) => lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
+      (lot) =>
+        lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
     );
     const activeShorts = positions.shorts.filter(
-      (lot) => lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
+      (lot) =>
+        lot.status !== "pending" && lot.remainingQuantity > MIN_BASE_QUANTITY,
     );
     if (activeLongs.length === 0 && activeShorts.length === 0) {
       this.cancelAllOpenOrdersForLiquidation(at, events);
@@ -4404,10 +5148,16 @@ export class SimulatedExecutionEngine {
     this.cancelAllOpenOrdersForLiquidation(at, events);
 
     const shortQuantity = roundAsset(
-      activeShorts.reduce((quantity, lot) => quantity + lot.remainingQuantity, 0),
+      activeShorts.reduce(
+        (quantity, lot) => quantity + lot.remainingQuantity,
+        0,
+      ),
     );
     const longQuantity = roundAsset(
-      activeLongs.reduce((quantity, lot) => quantity + lot.remainingQuantity, 0),
+      activeLongs.reduce(
+        (quantity, lot) => quantity + lot.remainingQuantity,
+        0,
+      ),
     );
 
     if (shortQuantity > MIN_BASE_QUANTITY) {
@@ -4471,7 +5221,11 @@ export class SimulatedExecutionEngine {
       return events ?? NO_EVENTS;
     }
 
-    const maxLeverage = clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+    const maxLeverage = clamp(
+      cleanPositive(this.state.config.maxLeverage) || 1,
+      1,
+      999,
+    );
     if (maxLeverage >= 999) {
       return events ?? NO_EVENTS;
     }
@@ -4484,9 +5238,15 @@ export class SimulatedExecutionEngine {
     return events ?? NO_EVENTS;
   }
 
-  private accountIsOverLeverageLimit(price: number, maxLeverage: number): boolean {
+  private accountIsOverLeverageLimit(
+    price: number,
+    maxLeverage: number,
+  ): boolean {
     const feeRate = this.state.config.feeBps / 10_000;
-    if (this.balanceModel().effectiveLeverage(this.state, price) > maxLeverage + 0.0001) {
+    if (
+      this.balanceModel().effectiveLeverage(this.state, price) >
+      maxLeverage + 0.0001
+    ) {
       return true;
     }
 
@@ -4502,7 +5262,8 @@ export class SimulatedExecutionEngine {
         feeRate,
         this.pendingLongEntryQuote(),
         this.pendingShortEntryQuote(),
-      ) > maxLeverage + 0.0001
+      ) >
+      maxLeverage + 0.0001
     );
   }
 
@@ -4595,11 +5356,17 @@ export class SimulatedExecutionEngine {
       side === "buy" ? roundQuote(quoteQuantity * (1 + feeRate)) : 0;
 
     if (side === "buy") {
-      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
-      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+      this.state.quoteFree = roundQuote(
+        this.state.quoteFree - estimatedQuoteCost,
+      );
+      this.state.quoteReserved = roundQuote(
+        this.state.quoteReserved + estimatedQuoteCost,
+      );
     } else {
       this.state.baseFree = roundAsset(this.state.baseFree - roundedQuantity);
-      this.state.baseReserved = roundAsset(this.state.baseReserved + roundedQuantity);
+      this.state.baseReserved = roundAsset(
+        this.state.baseReserved + roundedQuantity,
+      );
     }
 
     const order = this.buildOrder(
@@ -4638,7 +5405,9 @@ export class SimulatedExecutionEngine {
     }
 
     this.updateLegacyPositionLotCache();
-    const cachedLot = this.legacyPositionLotCache?.longs.get(order.targetPositionId);
+    const cachedLot = this.legacyPositionLotCache?.longs.get(
+      order.targetPositionId,
+    );
     return cleanPositive(cachedLot?.averagePrice) || this.state.avgEntryPrice;
   }
 
@@ -4648,8 +5417,12 @@ export class SimulatedExecutionEngine {
     }
 
     this.updateLegacyPositionLotCache();
-    const cachedLot = this.legacyPositionLotCache?.shorts.get(order.targetPositionId);
-    return cleanPositive(cachedLot?.averagePrice) || this.state.avgShortEntryPrice;
+    const cachedLot = this.legacyPositionLotCache?.shorts.get(
+      order.targetPositionId,
+    );
+    return (
+      cleanPositive(cachedLot?.averagePrice) || this.state.avgShortEntryPrice
+    );
   }
 
   private longCloseQuantityForOrder(order: TradingOrder): number {
@@ -4658,9 +5431,13 @@ export class SimulatedExecutionEngine {
     }
     if (order.targetPositionId) {
       this.updateLegacyPositionLotCache();
-      const cachedLot = this.legacyPositionLotCache?.longs.get(order.targetPositionId);
+      const cachedLot = this.legacyPositionLotCache?.longs.get(
+        order.targetPositionId,
+      );
       if (cachedLot) {
-        return roundAsset(Math.min(order.quantity, cachedLot.remainingQuantity));
+        return roundAsset(
+          Math.min(order.quantity, cachedLot.remainingQuantity),
+        );
       }
       return 0;
     }
@@ -4673,9 +5450,13 @@ export class SimulatedExecutionEngine {
     }
     if (order.targetPositionId) {
       this.updateLegacyPositionLotCache();
-      const cachedLot = this.legacyPositionLotCache?.shorts.get(order.targetPositionId);
+      const cachedLot = this.legacyPositionLotCache?.shorts.get(
+        order.targetPositionId,
+      );
       if (cachedLot) {
-        return roundAsset(Math.min(order.quantity, cachedLot.remainingQuantity));
+        return roundAsset(
+          Math.min(order.quantity, cachedLot.remainingQuantity),
+        );
       }
       return 0;
     }
@@ -4694,9 +5475,13 @@ export class SimulatedExecutionEngine {
     const longQuantity = cache.activeLongQuantity;
     const shortQuantity = cache.activeShortQuantity;
     this.state.avgEntryPrice =
-      longQuantity > 0 ? roundQuote(cache.activeLongCostQuote / longQuantity) : 0;
+      longQuantity > 0
+        ? roundQuote(cache.activeLongCostQuote / longQuantity)
+        : 0;
     this.state.avgShortEntryPrice =
-      shortQuantity > 0 ? roundQuote(cache.activeShortProceedsQuote / shortQuantity) : 0;
+      shortQuantity > 0
+        ? roundQuote(cache.activeShortProceedsQuote / shortQuantity)
+        : 0;
   }
 
   private cancelStaleOrders(at: number, collectEvents: boolean): BotEvent[] {
@@ -4709,6 +5494,15 @@ export class SimulatedExecutionEngine {
         continue;
       }
       if (at - order.createdAt < this.state.config.staleOrderMs) {
+        continue;
+      }
+      if (
+        order.positionId &&
+        this.state.positionLifecycles.some(
+          (position) =>
+            position.id === order.positionId && position.phase === "created",
+        )
+      ) {
         continue;
       }
 
@@ -4732,7 +5526,9 @@ export class SimulatedExecutionEngine {
   }
 
   private releaseOrderReserve(order: TradingOrder): void {
-    const remainingQuantity = roundAsset(Math.max(0, order.quantity - order.filledQuantity));
+    const remainingQuantity = roundAsset(
+      Math.max(0, order.quantity - order.filledQuantity),
+    );
     if (order.side === "buy") {
       const reserveQuote = remainingOrderReserveQuote(order, remainingQuantity);
       this.state.quoteReserved = roundQuote(
@@ -4762,7 +5558,9 @@ export class SimulatedExecutionEngine {
   }
 
   private activeLongQuantity(): number {
-    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
       return roundAsset(Math.max(0, this.totalBase()));
     }
 
@@ -4771,7 +5569,9 @@ export class SimulatedExecutionEngine {
   }
 
   private activeShortQuantity(): number {
-    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
       return roundAsset(Math.max(0, -this.totalBase()));
     }
 
@@ -4780,12 +5580,16 @@ export class SimulatedExecutionEngine {
   }
 
   private activeLongExposureQuote(marketPrice: number): number {
-    if (this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate") {
+    if (
+      this.state.config.legacyValleyPeak.exitGridPositionMode === "aggregate"
+    ) {
       return roundQuote(this.activeLongQuantity() * marketPrice);
     }
 
     this.updateLegacyPositionLotCache();
-    return roundQuote((this.legacyPositionLotCache?.longExposureQuantity ?? 0) * marketPrice);
+    return roundQuote(
+      (this.legacyPositionLotCache?.longExposureQuantity ?? 0) * marketPrice,
+    );
   }
 
   private activeShortExposureQuote(marketPrice: number): number {
@@ -4834,7 +5638,8 @@ export class SimulatedExecutionEngine {
       this.state.memory.lastExtremaSignal = signal;
       this.state.memory.lastExtremaSignalAt = input.eventTime;
       this.state.memory.lastExtremaSignalPrice = input.price;
-      this.state.memory.lastExtremaSignalReason = legacyValleyPeakDecisionReason(decision);
+      this.state.memory.lastExtremaSignalReason =
+        legacyValleyPeakDecisionReason(decision);
     }
 
     this.state.memory.legacyValleyPeakDebug = {
@@ -4877,7 +5682,11 @@ export class SimulatedExecutionEngine {
     side: PositionLotSide,
     marketPrice: number,
   ): EntryRiskProfile {
-    const maxLeverage = clamp(cleanPositive(this.state.config.maxLeverage) || 1, 1, 999);
+    const maxLeverage = clamp(
+      cleanPositive(this.state.config.maxLeverage) || 1,
+      1,
+      999,
+    );
     const legacyConfig = this.state.config.legacyValleyPeak;
     if (!legacyConfig.rangeLeverageEnabled || maxLeverage <= 1) {
       return {
@@ -4923,7 +5732,11 @@ export class SimulatedExecutionEngine {
       adverseDistance === undefined
         ? MIN_ENTRY_LEVERAGE
         : adverseDistance > 0
-          ? clamp(marketPrice / adverseDistance, MIN_ENTRY_LEVERAGE, maxLeverage)
+          ? clamp(
+              marketPrice / adverseDistance,
+              MIN_ENTRY_LEVERAGE,
+              maxLeverage,
+            )
           : maxLeverage;
     return {
       side,
@@ -4953,11 +5766,15 @@ export class SimulatedExecutionEngine {
     const padding = clamp(paddingPct, 0, 100) / 100;
     if (side === "long") {
       const minPrice = range?.minPrice;
-      return isPositiveNumber(minPrice) ? (minPrice ?? 0) * (1 - padding) : undefined;
+      return isPositiveNumber(minPrice)
+        ? (minPrice ?? 0) * (1 - padding)
+        : undefined;
     }
 
     const maxPrice = range?.maxPrice;
-    return isPositiveNumber(maxPrice) ? (maxPrice ?? 0) * (1 + padding) : undefined;
+    return isPositiveNumber(maxPrice)
+      ? (maxPrice ?? 0) * (1 + padding)
+      : undefined;
   }
 
   private priceRangePosition(
@@ -4973,7 +5790,11 @@ export class SimulatedExecutionEngine {
       return undefined;
     }
 
-    return clamp((marketPrice - range.minPrice) / (range.maxPrice - range.minPrice), 0, 1);
+    return clamp(
+      (marketPrice - range.minPrice) / (range.maxPrice - range.minPrice),
+      0,
+      1,
+    );
   }
 
   private longEntryBuyingPowerQuote(
@@ -4982,7 +5803,11 @@ export class SimulatedExecutionEngine {
   ): number {
     const config = this.state.config;
     const equity = this.equityAt(marketPrice);
-    if (!config.legacyValleyPeak.longSideEnabled || equity <= 0 || marketPrice <= 0) {
+    if (
+      !config.legacyValleyPeak.longSideEnabled ||
+      equity <= 0 ||
+      marketPrice <= 0
+    ) {
       return 0;
     }
 
@@ -5168,13 +5993,17 @@ export class SimulatedExecutionEngine {
     const maxPrices = this.priceMemoryLimit;
     this.state.memory.prices.push(price);
     if (this.state.memory.prices.length > maxPrices * 2) {
-      this.state.memory.prices.splice(0, this.state.memory.prices.length - maxPrices);
+      this.state.memory.prices.splice(
+        0,
+        this.state.memory.prices.length - maxPrices,
+      );
     }
   }
 
   private ensureLegacyValleyPeakMemory(): LegacyValleyPeakMemory {
     let memory = this.state.memory.legacyValleyPeak;
-    const rangeCount = this.state.config.legacyValleyPeak.averagingRangesSec.length;
+    const rangeCount =
+      this.state.config.legacyValleyPeak.averagingRangesSec.length;
     if (
       !memory ||
       memory.buyAverages.length !== rangeCount ||
@@ -5214,7 +6043,9 @@ function normalizeLoadedState(
   state: PaperBotState,
   overrides: PartialStrategyConfig,
 ): PaperBotState {
-  const config = createStrategyConfig(mergeStrategyOverrides(state.config, overrides));
+  const config = createStrategyConfig(
+    mergeStrategyOverrides(state.config, overrides),
+  );
   const normalized = structuredClone(state);
   normalized.config = config;
   normalized.symbol = config.symbol;
@@ -5228,6 +6059,7 @@ function normalizeLoadedState(
   );
   normalized.orders ??= [];
   normalized.fills ??= [];
+  normalized.positionLifecycles ??= [];
   normalized.quoteReserved ??= 0;
   normalized.baseReserved ??= 0;
   normalized.exitGridSpanTotal ??= 0;
@@ -5318,8 +6150,12 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
   const equity = roundQuote(state.quoteFree + state.quoteReserved + baseValue);
   const netPnl = roundQuote(equity - state.startingQuote);
   const unrealizedPnl = roundQuote(netPnl - state.realizedPnl);
-  const peakEquity = Math.max(state.metrics?.peakEquity ?? state.startingQuote, equity);
-  const drawdown = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
+  const peakEquity = Math.max(
+    state.metrics?.peakEquity ?? state.startingQuote,
+    equity,
+  );
+  const drawdown =
+    peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
   const totalClosedTrades = state.winningTrades + state.losingTrades;
   const exitGridSpanCount = Math.max(0, state.exitGridSpanCount ?? 0);
 
@@ -5328,12 +6164,16 @@ function calculateMetrics(state: PaperBotState): BotMetrics {
     realizedPnl: roundQuote(state.realizedPnl),
     unrealizedPnl,
     netPnl,
-    returnPct: state.startingQuote > 0 ? (netPnl / state.startingQuote) * 100 : 0,
+    returnPct:
+      state.startingQuote > 0 ? (netPnl / state.startingQuote) * 100 : 0,
     feesPaid: roundQuote(state.feesPaid),
     tradeCount: state.fills.length,
     winningTrades: state.winningTrades,
     losingTrades: state.losingTrades,
-    winRate: totalClosedTrades > 0 ? (state.winningTrades / totalClosedTrades) * 100 : 0,
+    winRate:
+      totalClosedTrades > 0
+        ? (state.winningTrades / totalClosedTrades) * 100
+        : 0,
     peakEquity,
     maxDrawdownPct: Math.max(state.metrics?.maxDrawdownPct ?? 0, drawdown),
     exposurePct: equity > 0 ? (exposureValue / equity) * 100 : 0,
@@ -5384,10 +6224,7 @@ function inferAverageShortEntryPrice(state: PaperBotState): number {
 }
 
 function priceMemoryLimit(config: StrategyConfig): number {
-  return Math.max(
-    50,
-    config.legacyValleyPeak.averagingRangesSec.length * 100,
-  );
+  return Math.max(50, config.legacyValleyPeak.averagingRangesSec.length * 100);
 }
 
 function emptyMetrics(startingQuote: number): BotMetrics {
@@ -5416,7 +6253,9 @@ function emptyMetrics(startingQuote: number): BotMetrics {
 function countLiquidatedPositions(fills: readonly TradeFill[]): number {
   return fills.reduce(
     (count, fill) =>
-      fill.liquidation ? count + Math.max(1, fill.liquidatedPositionCount ?? 1) : count,
+      fill.liquidation
+        ? count + Math.max(1, fill.liquidatedPositionCount ?? 1)
+        : count,
     0,
   );
 }
@@ -5453,12 +6292,20 @@ function lotLifecycleCloseReason(
   const lifetimeMs = cleanPositive(lot.lifetimeMs);
   if (lifetimeMs > 0 && tick.eventTime >= lot.openedAt + lifetimeMs) {
     const breakEvenSellPrice = cleanPositive(lot.breakEvenSellPrice);
-    if (lot.side === "long" && breakEvenSellPrice > 0 && tick.price >= breakEvenSellPrice) {
+    if (
+      lot.side === "long" &&
+      breakEvenSellPrice > 0 &&
+      tick.price >= breakEvenSellPrice
+    ) {
       return undefined;
     }
 
     const breakEvenBuyPrice = cleanPositive(lot.breakEvenBuyPrice);
-    if (lot.side === "short" && breakEvenBuyPrice > 0 && tick.price <= breakEvenBuyPrice) {
+    if (
+      lot.side === "short" &&
+      breakEvenBuyPrice > 0 &&
+      tick.price <= breakEvenBuyPrice
+    ) {
       return undefined;
     }
 
@@ -5486,7 +6333,10 @@ function normalizedLotLifecycleFields(
 }
 
 function hasLotLifecycleControls(
-  lot: Pick<LegacyExitGridLot, "lifetimeMs" | "stopLossPrice" | "takeProfitPrice">,
+  lot: Pick<
+    LegacyExitGridLot,
+    "lifetimeMs" | "stopLossPrice" | "takeProfitPrice"
+  >,
 ): boolean {
   return (
     cleanPositive(lot.lifetimeMs) > 0 ||
@@ -5496,7 +6346,9 @@ function hasLotLifecycleControls(
 }
 
 function cleanPositive(value: number | undefined): number {
-  return Number.isFinite(value) && (value as number) > 0 ? (value as number) : 0;
+  return Number.isFinite(value) && (value as number) > 0
+    ? (value as number)
+    : 0;
 }
 
 function isPositiveNumber(value: number | undefined): boolean {
@@ -5514,7 +6366,10 @@ function remainingOrderReserveQuote(
 }
 
 function orderRunId(createdAt: number): string {
-  const source = Number.isFinite(createdAt) && createdAt > 0 ? Math.floor(createdAt) : Date.now();
+  const source =
+    Number.isFinite(createdAt) && createdAt > 0
+      ? Math.floor(createdAt)
+      : Date.now();
   return source.toString(36).slice(-8);
 }
 
@@ -5557,7 +6412,10 @@ function decimalPrecision(value: number): number {
 }
 
 function isLeverageLimitError(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("Leverage limit exceeded:");
+  return (
+    error instanceof Error &&
+    error.message.startsWith("Leverage limit exceeded:")
+  );
 }
 
 function formatLeverageForError(value: number): string {

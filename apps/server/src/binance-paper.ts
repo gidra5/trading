@@ -556,6 +556,30 @@ export class BinancePaperTrading {
     });
   }
 
+  async cancelBotOrder(
+    market: BinanceMarketListing,
+    order: TradingOrder,
+  ): Promise<BinancePaperSnapshot> {
+    const clientOrderId = clientOrderIdForBotOrder(order.id);
+    try {
+      return await this.cancelOrder(market, {
+        clientOrderId,
+        algo: order.type === "stop-market",
+      });
+    } catch (error) {
+      const snapshot = await this.sync(market);
+      const remainsOpen = snapshot.openOrders.some(
+        (openOrder) =>
+          openOrder.localOrderId === order.id ||
+          openOrder.clientOrderId === clientOrderId,
+      );
+      if (remainsOpen) {
+        throw error;
+      }
+      return snapshot;
+    }
+  }
+
   private async assertReducibleFuturesPosition(
     environment: ResolvedPaperEnvironment,
     market: BinanceMarketListing,
