@@ -292,6 +292,7 @@ export function createInitialBotState(
   const state: PaperBotState = {
     ...core,
     startingQuote: config.startingQuote,
+    runStartingEquity: config.startingQuote,
     quoteFree: config.startingQuote,
     quoteReserved: 0,
     baseFree: 0,
@@ -366,7 +367,11 @@ export class SimulatedExecutionEngine {
     return this.liquidatedPositionCountValue;
   }
 
-  setStatus(status: BotStatus, at = Date.now()): BotEvent[] {
+  setStatus(
+    status: BotStatus,
+    at = Date.now(),
+    runStartingEquity?: number,
+  ): BotEvent[] {
     if (this.state.status === status) {
       if (status === "running" && !isPositiveNumber(this.state.runStartedAt)) {
         this.state.runStartedAt = at;
@@ -379,6 +384,10 @@ export class SimulatedExecutionEngine {
     this.state.updatedAt = at;
     if (status === "running") {
       this.state.runStartedAt = at;
+      this.state.runStartingEquity =
+        cleanPositive(runStartingEquity) ||
+        cleanPositive(this.state.metrics.equity) ||
+        this.state.startingQuote;
     }
     return [
       {
@@ -387,6 +396,14 @@ export class SimulatedExecutionEngine {
         message: `Bot ${status}`,
       },
     ];
+  }
+
+  setRunStartingEquity(equity: number, at = Date.now()): void {
+    if (!Number.isFinite(equity) || equity <= 0) {
+      return;
+    }
+    this.state.runStartingEquity = equity;
+    this.state.updatedAt = Math.max(this.state.updatedAt, at);
   }
 
   reset(overrides: PartialStrategyConfig = {}, at = Date.now()): BotEvent[] {
@@ -561,6 +578,81 @@ export class SimulatedExecutionEngine {
       recalculateMetrics(this.state);
     }
     return events;
+  }
+
+  createManagedPositionOrder(input: ManualTradeInput, at = Date.now()): BotEvent[] {
+    const price =
+      cleanPositive(input.price) ||
+      this.state.lastPrice ||
+      this.state.avgEntryPrice ||
+      this.state.avgShortEntryPrice;
+    const quantity = roundAsset(input.quantity);
+    const type: Extract<OrderType, "limit" | "market"> =
+      input.orderType === "limit" ? "limit" : "market";
+    const positionEffect =
+      input.targetPositionId || input.positionEffect === "close" ? "close" : "open";
+    const lifecycleFields =
+      positionEffect === "close" ? {} : normalizedLotLifecycleFields(input);
+    const reason = input.reason?.trim() || "manual managed exchange order";
+
+    if (price <= 0) {
+      throw new Error("Managed exchange order price must be positive.");
+    }
+    if (quantity <= 0) {
+      throw new Error("Managed exchange order quantity must be positive.");
+    }
+    if (input.side !== "buy" && input.side !== "sell") {
+      throw new Error("Managed exchange order side must be buy or sell.");
+    }
+
+    const normalizedPrice =
+      type === "limit" ? this.normalizeOrderPrice(price, input.side, type) : roundQuote(price);
+    const quoteSize = roundQuote(normalizedPrice * quantity);
+    if (quoteSize < this.state.config.minOrderQuote) {
+      throw new Error(
+        `Managed exchange order notional must be at least ${this.state.config.minOrderQuote} ${this.state.quoteAsset}.`,
+      );
+    }
+
+    const feeRate = this.state.config.feeBps / 10_000;
+    const estimatedQuoteCost =
+      input.side === "buy" ? roundQuote(quoteSize * (1 + feeRate)) : 0;
+    if (input.side === "buy") {
+      this.state.quoteFree = roundQuote(this.state.quoteFree - estimatedQuoteCost);
+      this.state.quoteReserved = roundQuote(this.state.quoteReserved + estimatedQuoteCost);
+    } else if (positionEffect === "close") {
+      this.state.baseFree = roundAsset(this.state.baseFree - quantity);
+      this.state.baseReserved = roundAsset(this.state.baseReserved + quantity);
+    }
+
+    const order = this.buildOrder(
+      input.side,
+      normalizedPrice,
+      quantity,
+      estimatedQuoteCost,
+      at,
+      reason,
+      type,
+    );
+
+    order.manual = true;
+    order.positionEffect = positionEffect;
+    if (input.targetPositionId) {
+      order.targetPositionId = input.targetPositionId;
+    }
+    Object.assign(order, lifecycleFields);
+    this.state.orders.push(order);
+    this.openOrderIndexes.add(this.state.orders.length - 1);
+    this.state.updatedAt = at;
+    recalculateMetrics(this.state);
+    return [
+      {
+        type: "order_created",
+        at,
+        message: `Manual ${input.side.toUpperCase()} ${type} order created`,
+        order: structuredClone(order),
+      },
+    ];
   }
 
   recordManualTrade(input: ManualTradeInput, at = Date.now()): BotEvent[] {
@@ -5149,7 +5241,12 @@ function normalizeLoadedState(
   normalized.runStartedAt = isPositiveNumber(normalized.runStartedAt)
     ? normalized.runStartedAt
     : normalized.createdAt;
-  return recalculateMetrics(normalized);
+  recalculateMetrics(normalized);
+  normalized.runStartingEquity =
+    cleanPositive(normalized.runStartingEquity) ||
+    cleanPositive(normalized.metrics.equity) ||
+    normalized.startingQuote;
+  return normalized;
 }
 
 function mergeStrategyOverrides(

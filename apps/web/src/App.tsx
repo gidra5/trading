@@ -142,6 +142,7 @@ export function App() {
   const bot = createMemo(() => snapshot()?.bot);
   const market = createMemo(() => snapshot()?.market);
   const metrics = createMemo(() => bot()?.metrics);
+  const runReturnPct = createMemo(() => snapshot()?.runPerformance?.returnPct ?? 0);
   const openOrders = createMemo(() =>
     (bot()?.orders ?? []).filter((order) => order.status === "open").slice().reverse(),
   );
@@ -733,9 +734,9 @@ export function App() {
           />
           <MetricCard label="Equity" value={`$${formatQuote(metrics()?.equity, 2)}`} />
           <MetricCard
-            label="Return"
-            value={formatPercent(metrics()?.returnPct)}
-            tone={(metrics()?.returnPct ?? 0) >= 0 ? "gain" : "loss"}
+            label="Run Return"
+            value={formatPercent(runReturnPct())}
+            tone={runReturnPct() >= 0 ? "gain" : "loss"}
           />
           <MetricCard label="Quote Free" value={`$${formatQuote(bot()?.quoteFree, 2)}`} />
           <MetricCard
@@ -818,6 +819,7 @@ export function App() {
           baseAsset={bot()?.baseAsset ?? "Base"}
           quoteAsset={bot()?.quoteAsset ?? "USDT"}
           currentPrice={market()?.lastPrice ?? bot()?.lastPrice ?? 0}
+          exchangeDriven={snapshot()?.execution.exchangeDriven}
           error={manualTradeError()}
           onRecordTrade={recordManualTrade}
         />
@@ -2997,6 +2999,7 @@ function PositionLedgerPanel(props: {
   baseAsset: string;
   quoteAsset: string;
   currentPrice: number;
+  exchangeDriven?: boolean;
   error?: string;
   onRecordTrade: (input: ManualTradeInput) => Promise<boolean>;
 }) {
@@ -3033,6 +3036,11 @@ function PositionLedgerPanel(props: {
     setSubmitting(true);
     const ok = await props.onRecordTrade({
       side: value.side,
+      orderType: props.exchangeDriven
+        ? value.priceMode === "limit"
+          ? "limit"
+          : "market"
+        : undefined,
       price,
       quantity,
       targetPositionId: value.targetPositionId,
@@ -3150,6 +3158,7 @@ function PositionLedgerPanel(props: {
             baseAsset={props.baseAsset}
             quoteAsset={props.quoteAsset}
             currentPrice={currentPrice()}
+            exchangeDriven={props.exchangeDriven}
             submitting={submitting()}
             onChange={setDraft}
             onCancel={() => setDraft(undefined)}
@@ -3261,6 +3270,7 @@ function ManualTradeForm(props: {
   baseAsset: string;
   quoteAsset: string;
   currentPrice: number;
+  exchangeDriven?: boolean;
   submitting: boolean;
   onChange: (draft: ManualTradeDraft) => void;
   onCancel: () => void;
@@ -3301,7 +3311,9 @@ function ManualTradeForm(props: {
     >
       <div class="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
-          <div class="muted-label">Manual Fill</div>
+          <div class="muted-label">
+            {props.exchangeDriven ? "Managed Order" : "Manual Fill"}
+          </div>
           <div class="flex items-center gap-2">
             <h3 class="text-base font-semibold">{props.draft.title}</h3>
             <Side side={props.draft.side} />
@@ -3310,7 +3322,7 @@ function ManualTradeForm(props: {
         <div class="flex flex-wrap gap-2">
           <button class={buttonPrimaryClass} type="submit" disabled={!canSubmit()}>
             <Check size={16} />
-            Record
+            {props.exchangeDriven ? "Submit" : "Record"}
           </button>
           <button class="btn" type="button" onClick={props.onCancel}>
             <X size={16} />

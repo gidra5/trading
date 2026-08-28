@@ -121,6 +121,11 @@ export interface RuntimeSnapshot {
   recentEvents: BotEvent[];
   backtest: BacktestProgressSnapshot;
   equityCurve: EquityPoint[];
+  runPerformance: {
+    startedAt: number;
+    startingEquity: number;
+    returnPct: number;
+  };
   execution: {
     mode: TradingExecutionMode;
     exchangeDriven: boolean;
@@ -202,7 +207,11 @@ export class TradingRuntime {
     this.warmupBotFromRecentCandles(initialState);
     this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
+    const runBaselineInitialized = this.ensureRunStartingEquity(savedState, exchangeSnapshot);
     this.recordLiveEquity(Date.now());
+    if (runBaselineInitialized) {
+      await this.flushState();
+    }
   }
 
   async switchMarket(
@@ -250,7 +259,11 @@ export class TradingRuntime {
     this.warmupBotFromRecentCandles(initialState);
     this.startHistoricalWarmup(initialState);
     await this.recoverExchangeState(exchangeSnapshot);
+    const runBaselineInitialized = this.ensureRunStartingEquity(savedState, exchangeSnapshot);
     this.recordLiveEquity(Date.now());
+    if (runBaselineInitialized) {
+      await this.flushState();
+    }
   }
 
   handleStatus(status: MarketStreamStatus): void {
@@ -340,6 +353,10 @@ export class TradingRuntime {
       ? exchangeDrivenPublicBotState(compactBot, bot, exchangeSnapshot, this.market)
       : compactBot;
     const positionState = exchangeDriven ? bot : publicBot;
+    const runStartingEquity =
+      finiteOrZero(bot.runStartingEquity) > 0
+        ? bot.runStartingEquity
+        : publicBot.metrics.equity;
     return {
       market: {
         id: this.market.id,
@@ -363,6 +380,14 @@ export class TradingRuntime {
       recentEvents: compactPublicEvents(this.recentEvents),
       backtest: this.backtest,
       equityCurve: this.liveEquityCurve,
+      runPerformance: {
+        startedAt: bot.runStartedAt,
+        startingEquity: runStartingEquity,
+        returnPct:
+          runStartingEquity > 0
+            ? ((publicBot.metrics.equity - runStartingEquity) / runStartingEquity) * 100
+            : 0,
+      },
       execution: this.publicExecutionSnapshot(exchangeSnapshot),
       exchange: exchangeSnapshot,
     };
@@ -371,10 +396,11 @@ export class TradingRuntime {
   async startBot(): Promise<BotEvent[]> {
     return this.withBotOperation(async () => {
       const events: BotEvent[] = [];
+      let exchangeSnapshot: BinancePaperSnapshot | undefined;
       if (this.isExchangeDrivenExecution()) {
-        const snapshot = await this.syncExecutionExchangeSnapshot();
-        if (snapshot) {
-          events.push(...(await this.applyExchangeSnapshot(snapshot)));
+        exchangeSnapshot = await this.syncExecutionExchangeSnapshot();
+        if (exchangeSnapshot) {
+          events.push(...(await this.applyExchangeSnapshot(exchangeSnapshot)));
         }
       }
 
@@ -383,10 +409,15 @@ export class TradingRuntime {
         this.liveEquityCurve = [];
         this.lastLiveEquitySampleAt = 0;
       }
-      const statusEvents = this.bot.setStatus("running");
+      const at = Date.now();
+      const statusEvents = this.bot.setStatus(
+        "running",
+        at,
+        this.currentRuntimeEquity(exchangeSnapshot),
+      );
       events.push(...statusEvents);
       if (wasStopped) {
-        this.recordLiveEquity(Date.now(), this.bot.view(), true);
+        this.recordLiveEquity(at, this.bot.view(), true, exchangeSnapshot);
       }
       this.recordEvents(statusEvents);
       await this.flushState();
@@ -448,6 +479,9 @@ export class TradingRuntime {
     this.startHistoricalWarmup();
     if (previousStatus === "stopped") {
       events.push(...this.bot.setStatus("stopped"));
+    } else {
+      this.bot.setRunStartingEquity(this.currentRuntimeEquity(resetSnapshot));
+      this.recordLiveEquity(Date.now(), this.bot.view(), true, resetSnapshot);
     }
     this.recordEvents(events);
     await this.flushState();
@@ -553,6 +587,11 @@ export class TradingRuntime {
     this.startHistoricalWarmup();
     if (previousStatus === "stopped") {
       events.push(...this.bot.setStatus("stopped"));
+    } else {
+      this.liveEquityCurve = [];
+      this.lastLiveEquitySampleAt = 0;
+      this.bot.setRunStartingEquity(this.currentRuntimeEquity());
+      this.recordLiveEquity(Date.now(), this.bot.view(), true);
     }
     this.recordEvents(events);
     await this.flushState();
@@ -560,12 +599,6 @@ export class TradingRuntime {
   }
 
   async recordManualTrade(input: ManualTradeInput): Promise<BotEvent[]> {
-    if (this.isExchangeDrivenExecution()) {
-      throw new Error(
-        "Manual local trades are simulation-only when exchange drives execution; submit an exchange order instead.",
-      );
-    }
-
     const quantity = Number(input.quantity);
     if (!Number.isFinite(quantity) || quantity <= 0) {
       throw new Error("Manual trade quantity must be positive.");
@@ -579,6 +612,14 @@ export class TradingRuntime {
     const lifetimeMs = normalizeOptionalPositiveNumber(input.lifetimeMs, "Lot lifetime");
     const stopLossPrice = normalizeOptionalPositiveNumber(input.stopLossPrice, "Stop loss");
     const takeProfitPrice = normalizeOptionalPositiveNumber(input.takeProfitPrice, "Take profit");
+    const normalizedInput: ManualTradeInput = {
+      ...input,
+      quantity,
+      price: input.price === undefined ? undefined : Number(input.price),
+      lifetimeMs,
+      stopLossPrice,
+      takeProfitPrice,
+    };
 
     if (input.targetPositionId) {
       const positions = analyzePositions(this.bot.view() as PaperBotState);
@@ -595,15 +636,27 @@ export class TradingRuntime {
       }
     }
 
-    const events = this.bot.recordManualTrade({
-      ...input,
-      quantity,
-      price: input.price === undefined ? undefined : Number(input.price),
-      lifetimeMs,
-      stopLossPrice,
-      takeProfitPrice,
-    });
+    if (this.isExchangeDrivenExecution()) {
+      return this.recordManagedExchangeOrder(normalizedInput);
+    }
+
+    const events = this.bot.recordManualTrade(normalizedInput);
     this.recordEvents(events);
+    await this.flushState();
+    return events;
+  }
+
+  private async recordManagedExchangeOrder(input: ManualTradeInput): Promise<BotEvent[]> {
+    const events = this.bot.createManagedPositionOrder(input);
+    if (events.length === 0) {
+      throw new Error("Managed exchange order could not be created.");
+    }
+
+    this.recordEvents(events);
+    await this.submitCreatedOrdersToPaperExchange(events, {
+      force: true,
+      throwOnFailure: true,
+    });
     await this.flushState();
     return events;
   }
@@ -975,6 +1028,27 @@ export class TradingRuntime {
     }
 
     this.lastLiveEquitySampleAt = time;
+  }
+
+  private currentRuntimeEquity(exchangeSnapshot?: BinancePaperSnapshot): number {
+    const state = this.bot.view();
+    if (!this.isExchangeDrivenExecution()) {
+      return state.metrics.equity;
+    }
+
+    const exchange = exchangeSnapshot ?? this.paperTrading?.snapshot(this.market);
+    return exchangeRuntimeEquity(exchange, this.market, state.lastPrice) ?? state.metrics.equity;
+  }
+
+  private ensureRunStartingEquity(
+    savedState: PaperBotState | undefined,
+    exchangeSnapshot?: BinancePaperSnapshot,
+  ): boolean {
+    if (finiteOrZero(savedState?.runStartingEquity) > 0) {
+      return false;
+    }
+    this.bot.setRunStartingEquity(this.currentRuntimeEquity(exchangeSnapshot));
+    return true;
   }
 
   private async submitCreatedOrdersToPaperExchange(
@@ -1971,6 +2045,7 @@ function rebaseBotStateCapital(
 
   const next = structuredClone(savedState);
   next.startingQuote = startingQuote;
+  next.runStartingEquity = startingQuote;
   next.quoteFree = startingQuote;
   next.quoteReserved = 0;
   next.baseFree = 0;

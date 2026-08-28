@@ -96,6 +96,11 @@ export interface RuntimeSnapshot {
   backtest: BacktestProgressSnapshot;
   correlations: CorrelationSnapshot;
   equityCurve: EquityPoint[];
+  runPerformance: {
+    startedAt: number;
+    startingEquity: number;
+    returnPct: number;
+  };
   execution: {
     mode: BotExecutionMode;
     exchangeDriven: boolean;

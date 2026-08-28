@@ -522,14 +522,24 @@ export class BinancePaperTrading {
       return undefined;
     }
 
-    const reduceOnly = order.positionEffect === "close" ? true : undefined;
+    const positionMode =
+      environment.product === "spot"
+        ? undefined
+        : await this.fetchPositionMode(environment);
+    const positionIncreaseAllowed = isOneWayLedgerLotClose(order, positionMode);
+    const reduceOnly =
+      order.positionEffect === "close" && !positionIncreaseAllowed ? true : undefined;
     const positionSide =
       environment.product === "spot"
         ? undefined
         : futuresPositionSideForBotOrder(order);
 
-    if (environment.product !== "spot" && order.positionEffect === "close") {
-      await this.assertReducibleFuturesPosition(environment, market, order);
+    if (
+      environment.product !== "spot" &&
+      order.positionEffect === "close" &&
+      !positionIncreaseAllowed
+    ) {
+      await this.assertReducibleFuturesPosition(environment, market, order, positionMode);
     }
 
     return this.placeOrder(market, {
@@ -550,8 +560,8 @@ export class BinancePaperTrading {
     environment: ResolvedPaperEnvironment,
     market: BinanceMarketListing,
     order: TradingOrder,
+    positionMode: BinancePaperPositionMode | undefined,
   ): Promise<void> {
-    const positionMode = await this.fetchPositionMode(environment);
     const snapshot = await this.latestSnapshotForSubmission(environment, market);
     const availableQuantity = reducibleFuturesQuantityForOrder(
       snapshot,
@@ -1504,6 +1514,24 @@ function futuresPositionSideForBotOrder(
     return order.side === "buy" ? "LONG" : "SHORT";
   }
   return undefined;
+}
+
+function isOneWayLedgerLotClose(
+  order: TradingOrder,
+  positionMode: BinancePaperPositionMode | undefined,
+): boolean {
+  if (
+    positionMode === "hedge" ||
+    order.positionEffect !== "close" ||
+    !order.targetPositionId
+  ) {
+    return false;
+  }
+
+  return (
+    order.targetPositionId !== "aggregate-long" &&
+    order.targetPositionId !== "aggregate-short"
+  );
 }
 
 function reducibleFuturesQuantityForOrder(

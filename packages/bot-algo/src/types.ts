@@ -473,6 +473,7 @@ export interface TradeFill {
 
 export interface ManualTradeInput {
   side: OrderSide;
+  orderType?: Extract<OrderType, "limit" | "market">;
   price?: number;
   quantity: number;
   reason?: string;
@@ -572,6 +573,7 @@ export interface BotCoreState {
 
 export interface PaperBotState extends BotCoreState {
   startingQuote: number;
+  runStartingEquity: number;
   quoteFree: number;
   quoteReserved: number;
   baseFree: number;
