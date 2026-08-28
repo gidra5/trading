@@ -892,7 +892,7 @@ def _maybe_prune_checkpoint_orphans(store_root: Path) -> None:
     training_root = store_root.parent
     interval_minutes = float(os.environ.get(
         "TRADING_STORAGE_GC_INTERVAL_MINUTES",
-        "15",
+        "1",
     ))
     if not math.isfinite(interval_minutes) or interval_minutes <= 0:
         raise ValueError("TRADING_STORAGE_GC_INTERVAL_MINUTES must be positive")
@@ -949,7 +949,7 @@ def _prune_checkpoint_orphans(store_root: Path) -> None:
         return
     grace_hours = float(os.environ.get(
         "TRADING_STORAGE_ORPHAN_GRACE_HOURS",
-        "1",
+        "0.01",
     ))
     if not math.isfinite(grace_hours) or grace_hours <= 0:
         raise ValueError(

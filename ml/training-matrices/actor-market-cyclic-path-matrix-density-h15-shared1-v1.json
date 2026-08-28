@@ -1,0 +1,13 @@
+{
+  "id": "actor-market-cyclic-path-matrix-density-h15-shared1-v1",
+  "label": "Recurrent actor-market + cyclic path matrix density - H15 - one shared block - joint actor/market W256 - 256k clean - batch 768",
+  "plans": [
+    "actor-market-cyclic-path-matrix-density-h15-shared1-w256-a128-c256-m128-k8-p8-b16-r8-q16-d64-o32-c128-256-featurelag3-train256k-batch768-nosam-ema4-cal64k-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/actor-market-cyclic-path-matrix-density-h15-shared1-v1/PAUSE",
+    "queueStatusFile": "data/training/matrices/actor-market-cyclic-path-matrix-density-h15-shared1-v1/queue-status.json",
+    "queueAfter": "cyclic-dense-compressed-path-matrix-density-h15-shared1-v2 completes",
+    "batchCandidates": [1024, 896, 800, 768, 640, 512]
+  }
+}

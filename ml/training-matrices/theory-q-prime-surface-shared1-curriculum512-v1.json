@@ -1,0 +1,10 @@
+{
+  "id": "theory-q-prime-surface-shared1-curriculum512-v1",
+  "label": "Theory q' recurrent return-action surface · 512-epoch NLSE/friction/horizon curriculum",
+  "runIds": [
+    "theory-q-prime-surface-shared1-curriculum512-a33-o32-drop5-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/theory-q-prime-surface-shared1-curriculum512-v1/PAUSE"
+  }
+}

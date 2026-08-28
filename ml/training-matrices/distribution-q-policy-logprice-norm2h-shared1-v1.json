@@ -1,0 +1,10 @@
+{
+  "id": "distribution-q-policy-logprice-norm2h-shared1-v1",
+  "label": "Frozen epoch-128 shared path-distribution fitted-Q policy",
+  "runIds": [
+    "distribution-q-policy-logprice-norm2h-shared1-a33-s256-fqi-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/distribution-q-policy-logprice-norm2h-shared1-v1/PAUSE"
+  }
+}

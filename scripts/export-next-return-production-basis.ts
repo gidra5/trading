@@ -71,11 +71,26 @@ interface SplitBuffer {
 
 class ReturnRing {
   readonly values = new Float64Array(MAX_WINDOW);
+  readonly absolutePrefix = new Float64Array(MAX_WINDOW + 1);
+  readonly squarePrefix = new Float64Array(MAX_WINDOW + 1);
+  readonly activePrefix = new Float64Array(MAX_WINDOW + 1);
   seen = 0;
+  absoluteTotal = 0;
+  squareTotal = 0;
+  activeTotal = 0;
+  zeroRunAge = 0;
 
   push(value: number): void {
     this.values[this.seen % this.values.length] = value;
     this.seen += 1;
+    this.absoluteTotal += Math.abs(value);
+    this.squareTotal += value * value;
+    this.activeTotal += value !== 0 ? 1 : 0;
+    this.zeroRunAge = value === 0 ? this.zeroRunAge + 1 : 0;
+    const prefixIndex = this.seen % this.absolutePrefix.length;
+    this.absolutePrefix[prefixIndex] = this.absoluteTotal;
+    this.squarePrefix[prefixIndex] = this.squareTotal;
+    this.activePrefix[prefixIndex] = this.activeTotal;
   }
 
   lag(lag: number): number {
@@ -85,15 +100,10 @@ class ReturnRing {
 
   moments(window: number): { meanAbsolute: number; rms: number; active: number } {
     const count = Math.min(window, this.seen, this.values.length);
-    let absolute = 0;
-    let square = 0;
-    let active = 0;
-    for (let lag = 0; lag < count; lag += 1) {
-      const value = this.lag(lag);
-      absolute += Math.abs(value);
-      square += value * value;
-      active += value !== 0 ? 1 : 0;
-    }
+    const priorIndex = (this.seen - count) % this.absolutePrefix.length;
+    const absolute = this.absoluteTotal - this.absolutePrefix[priorIndex]!;
+    const square = this.squareTotal - this.squarePrefix[priorIndex]!;
+    const active = this.activeTotal - this.activePrefix[priorIndex]!;
     return {
       meanAbsolute: count > 0 ? absolute / count : 0,
       rms: count > 0 ? Math.sqrt(square / count) : 0,
@@ -351,9 +361,7 @@ function featureRow(
     moments10.active / 10,
     moments60.active / 60,
   );
-  let zeroAge = 0;
-  while (zeroAge < Math.min(3_600, ring.seen) && ring.lag(zeroAge) === 0) zeroAge += 1;
-  values.push(Math.log1p(zeroAge));
+  values.push(Math.log1p(Math.min(3_600, ring.zeroRunAge)));
   const anchor = logRms(ring, 3_600);
   values.push(anchor);
   for (const window of VOLATILITY_WINDOWS.filter((value) => value !== 3_600)) values.push(logRms(ring, window) - anchor);

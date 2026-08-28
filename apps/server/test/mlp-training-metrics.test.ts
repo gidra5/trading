@@ -669,6 +669,83 @@ test("MLP training metrics discovers derived snapshots and matrix progress", asy
   }
 });
 
+test("multi-step comparisons display only the first lead", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mlp-training-first-lead-"));
+  const planFile = path.join(root, "ml", "training-plan.json");
+  const runDir = path.join(root, "data", "training", "runs", "multi-step");
+  const datasetDir = path.join(root, "data", "training", "datasets", "shared");
+  const plan = {
+    id: "multi-step",
+    label: "Multi-step",
+    runDir: "data/training/runs/multi-step",
+    datasetDir: "data/training/datasets/shared",
+    architecture: { returnCount: 15 },
+    training: { epochs: 32 },
+  };
+  await Promise.all([
+    mkdir(path.dirname(planFile), { recursive: true }),
+    mkdir(path.join(runDir, "logs"), { recursive: true }),
+    mkdir(path.join(runDir, "state"), { recursive: true }),
+    mkdir(datasetDir, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(planFile, JSON.stringify(plan)),
+    writeFile(path.join(runDir, "state", "plan.json"), JSON.stringify({
+      planSha256: "test",
+      plan,
+    })),
+    writeFile(path.join(runDir, "state", "status.json"), JSON.stringify({
+      stage: "training",
+    })),
+    writeFile(path.join(runDir, "logs", "training.jsonl"), `${JSON.stringify({
+      event: "minute-return-epoch",
+      epoch: 2,
+      train: { normalizedMse: 1.5, correlation: 0.01 },
+      validation: { normalizedMse: 1.6, correlation: 0.02 },
+      trainDistribution: {
+        negativeLogLikelihood: -10,
+        perLeadNegativeLogLikelihood: [-11, -9],
+        perLeadExpectation: [
+          { normalizedMse: 0.9, correlation: 0.11 },
+          { normalizedMse: 1.1, correlation: 0.03 },
+        ],
+      },
+      validationDistribution: {
+        negativeLogLikelihood: -9.5,
+        perLeadNegativeLogLikelihood: [-10.5, -8.5],
+        perLeadExpectation: [
+          { normalizedMse: 0.95, correlation: 0.12 },
+          { normalizedMse: 1.2, correlation: 0.02 },
+        ],
+      },
+      calibratedValidation: {
+        perLeadExpectation: [
+          { normalizedMse: 0.85, correlation: 0.13 },
+          { normalizedMse: 1.15, correlation: 0.04 },
+        ],
+      },
+    })}\n`),
+  ]);
+
+  try {
+    const reader = new MlpTrainingMetricsReader(planFile, root);
+    const comparison = await reader.compare(["ml/training-plan.json"]);
+    const run = comparison.runs[0];
+    assert.equal(run?.evaluationHorizonSteps, 1);
+    assert.deepEqual(run?.fit, [{
+      epoch: 2,
+      train: { normalizedMse: 0.9, correlation: 0.11 },
+      validation: { normalizedMse: 0.85, correlation: 0.13 },
+      trainNormalizedMse: 0.9,
+      validationNormalizedMse: 0.85,
+      trainNegativeLogLikelihood: -11,
+      validationNegativeLogLikelihood: -10.5,
+    }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("MLP training metrics discovers decoder plans with nested datasets", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mlp-training-decoder-"));
   const defaultPlanFile = path.join(root, "ml", "training-plan.json");

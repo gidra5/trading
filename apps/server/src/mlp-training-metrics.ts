@@ -27,6 +27,12 @@ const METRIC_EVENT_ALIASES = new Map([
   ["minute-return-dataset-selected", "dataset-complete"],
   ["minute-return-epoch", "epoch"],
   ["minute-return-complete", "training-complete"],
+  ["distribution-q-training-start", "training-start"],
+  ["distribution-q-optimization-epoch", "epoch"],
+  ["distribution-q-complete", "training-complete"],
+  ["theory-q-prime-training-start", "training-start"],
+  ["theory-q-prime-optimization-epoch", "epoch"],
+  ["theory-q-prime-complete", "training-complete"],
 ]);
 
 interface TrainingPlan {
@@ -40,6 +46,7 @@ interface TrainingPlan {
   architecture?: {
     dropout?: number;
     dropoutRate?: number;
+    returnCount?: number;
   };
   samplingIntervalMs?: number;
   predictionDelayMs?: number;
@@ -230,6 +237,11 @@ export interface MlpTrainingComparisonMetricValues {
 
 export interface MlpTrainingComparisonDistributionValues {
   negativeLogLikelihood?: number;
+  perLeadNegativeLogLikelihood?: number[];
+  meanCrps?: number;
+  normalizedCrps?: number;
+  perLeadMeanCrps?: number[];
+  perLeadNormalizedCrps?: number[];
   unitNegativeLogLikelihood?: number;
   bitsPerExample?: number;
   globalBaselineNegativeLogLikelihood?: number;
@@ -416,6 +428,7 @@ export interface MlpTrainingComparisonRun {
   parameterCount?: number;
   trainableParameterCount?: number;
   bestEpoch?: number;
+  evaluationHorizonSteps?: number;
   train?: MlpTrainingComparisonMetricValues;
   validation?: MlpTrainingComparisonMetricValues;
   test?: MlpTrainingComparisonMetricValues;
@@ -438,6 +451,9 @@ export interface MlpTrainingComparisonRun {
     trainNegativeLogLikelihood?: number;
     validationNegativeLogLikelihood?: number;
     onlineTrainNegativeLogLikelihood?: number;
+    trainNormalizedCrps?: number;
+    validationNormalizedCrps?: number;
+    onlineTrainNormalizedCrps?: number;
     bestTrainScore?: number;
   }>;
 }
@@ -670,6 +686,9 @@ export class MlpTrainingMetricsReader {
           readMetricLogs(files.logFiles, 0),
         ]);
         const result = storedResult ?? rootResult;
+        const firstStepComparison = (
+          files.plan.architecture?.returnCount ?? 1
+        ) > 1;
         const resultTrain = metricRecord(result?.train);
         const resultValidation = metricRecord(
           result?.bestValidation
@@ -794,26 +813,49 @@ export class MlpTrainingMetricsReader {
           const validationMetrics = metricRecord(event.validation);
           const trainDensity = distributionRecord(event.trainDistribution);
           const validationDensity = distributionRecord(event.validationDistribution);
+          const displayedTrain = firstStepComparison
+            ? trainDensity?.perLeadExpectation?.[0] ?? train
+            : train;
+          const displayedValidation = firstStepComparison
+            ? metricAtLead(event.calibratedValidation, 0)
+              ?? validationDensity?.perLeadExpectation?.[0]
+              ?? validationMetrics
+            : validationMetrics;
+          const trainNegativeLogLikelihood = firstStepComparison
+            ? trainDensity?.perLeadNegativeLogLikelihood?.[0]
+            : trainDensity?.negativeLogLikelihood;
+          const validationNegativeLogLikelihood = firstStepComparison
+            ? validationDensity?.perLeadNegativeLogLikelihood?.[0]
+            : validationDensity?.negativeLogLikelihood;
+          const trainNormalizedCrps = firstStepComparison
+            ? trainDensity?.perLeadNormalizedCrps?.[0]
+            : trainDensity?.normalizedCrps;
+          const validationNormalizedCrps = firstStepComparison
+            ? validationDensity?.perLeadNormalizedCrps?.[0]
+            : validationDensity?.normalizedCrps;
           const bestTrainScore = numberField(event.bestTrainScore);
           return [{
             epoch,
-            ...(train ? { train } : {}),
-            ...(validationMetrics ? { validation: validationMetrics } : {}),
-            ...(train?.normalizedMse === undefined
+            ...(displayedTrain ? { train: displayedTrain } : {}),
+            ...(displayedValidation ? { validation: displayedValidation } : {}),
+            ...(displayedTrain?.normalizedMse === undefined
               ? {}
-              : { trainNormalizedMse: train.normalizedMse }),
-            ...(validationMetrics?.normalizedMse === undefined
+              : { trainNormalizedMse: displayedTrain.normalizedMse }),
+            ...(displayedValidation?.normalizedMse === undefined
               ? {}
-              : { validationNormalizedMse: validationMetrics.normalizedMse }),
-            ...(trainDensity?.negativeLogLikelihood === undefined
+              : { validationNormalizedMse: displayedValidation.normalizedMse }),
+            ...(trainNegativeLogLikelihood === undefined
               ? {}
-              : { trainNegativeLogLikelihood: trainDensity.negativeLogLikelihood }),
-            ...(validationDensity?.negativeLogLikelihood === undefined
+              : { trainNegativeLogLikelihood }),
+            ...(validationNegativeLogLikelihood === undefined
               ? {}
-              : {
-                  validationNegativeLogLikelihood:
-                    validationDensity.negativeLogLikelihood,
-                }),
+              : { validationNegativeLogLikelihood }),
+            ...(trainNormalizedCrps === undefined
+              ? {}
+              : { trainNormalizedCrps }),
+            ...(validationNormalizedCrps === undefined
+              ? {}
+              : { validationNormalizedCrps }),
             ...(bestTrainScore === undefined ? {} : { bestTrainScore }),
           }];
         });
@@ -821,9 +863,15 @@ export class MlpTrainingMetricsReader {
         const liveEpoch = numberField(statusLatest?.epoch);
         const liveBatch = numberField(statusLatest?.batch);
         const liveBatches = numberField(statusLatest?.batches);
-        const liveNll = numberField(statusLatest?.onlineNegativeLogLikelihood);
-        const liveTrain = metricRecord(statusLatest?.onlineTrain);
-        if (files.running && liveEpoch !== undefined && liveNll !== undefined) {
+        const liveNll = numberField(firstStepComparison
+          ? statusLatest?.onlineFirstStepNegativeLogLikelihood
+          : statusLatest?.onlineNegativeLogLikelihood);
+        const liveCrps = numberField(statusLatest?.onlineNormalizedCrps);
+        const liveTrain = metricRecord(firstStepComparison
+          ? statusLatest?.onlineFirstStepTrain
+          : statusLatest?.onlineTrain);
+        if (files.running && liveEpoch !== undefined
+          && (liveNll !== undefined || liveCrps !== undefined)) {
           fit.push({
             epoch: liveEpoch,
             x: liveBatch !== undefined && liveBatches !== undefined && liveBatches > 0
@@ -834,7 +882,12 @@ export class MlpTrainingMetricsReader {
             ...(liveTrain?.normalizedMse === undefined
               ? {}
               : { trainNormalizedMse: liveTrain.normalizedMse }),
-            onlineTrainNegativeLogLikelihood: liveNll,
+            ...(liveNll === undefined
+              ? {}
+              : { onlineTrainNegativeLogLikelihood: liveNll }),
+            ...(liveCrps === undefined
+              ? {}
+              : { onlineTrainNormalizedCrps: liveCrps }),
           });
         }
         if (selectedValidation?.normalizedMse !== undefined
@@ -872,6 +925,7 @@ export class MlpTrainingMetricsReader {
           ...(parameterCount === undefined ? {} : { parameterCount }),
           ...(trainableParameterCount === undefined ? {} : { trainableParameterCount }),
           ...(bestEpoch === undefined ? {} : { bestEpoch }),
+          ...(firstStepComparison ? { evaluationHorizonSteps: 1 } : {}),
           ...(resultTrain ? { train: resultTrain } : {}),
           ...(selectedValidation
             ? { validation: selectedValidation }
@@ -1323,6 +1377,8 @@ function distributionRecord(
   const result: MlpTrainingComparisonDistributionValues = {};
   for (const key of [
     "negativeLogLikelihood",
+    "meanCrps",
+    "normalizedCrps",
     "unitNegativeLogLikelihood",
     "bitsPerExample",
     "globalBaselineNegativeLogLikelihood",
@@ -1332,6 +1388,18 @@ function distributionRecord(
   ] as const) {
     const number = numberField(source[key]);
     if (number !== undefined) result[key] = number;
+  }
+  for (const key of [
+    "perLeadNegativeLogLikelihood",
+    "perLeadMeanCrps",
+    "perLeadNormalizedCrps",
+  ] as const) {
+    if (!Array.isArray(source[key])) continue;
+    const values = source[key].flatMap((value) => {
+      const number = numberField(value);
+      return number === undefined ? [] : [number];
+    });
+    if (values.length === source[key].length) result[key] = values;
   }
   const expectation = metricRecord(source.expectation);
   const perLeadExpectation = Array.isArray(source.perLeadExpectation)
@@ -1347,6 +1415,15 @@ function distributionRecord(
   }
   if (mode) result.mode = mode;
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function metricAtLead(
+  value: unknown,
+  lead: number,
+): MlpTrainingComparisonMetricValues | undefined {
+  const source = recordField(value);
+  if (!source || !Array.isArray(source.perLeadExpectation)) return undefined;
+  return metricRecord(source.perLeadExpectation[lead]);
 }
 
 function autoregressiveEpisodeRecord(
@@ -1652,9 +1729,47 @@ async function readMetricLogs(files: readonly string[], requestedCursor: number)
       if (typeof value.event === "string") {
         const canonicalEvent = METRIC_EVENT_ALIASES.get(value.event) ?? value.event;
         if (METRIC_EVENTS.has(canonicalEvent)) {
-          events.push(canonicalEvent === value.event
-            ? value
-            : { ...value, event: canonicalEvent, sourceEvent: value.event });
+          if (value.event === "distribution-q-optimization-epoch"
+              || value.event === "theory-q-prime-optimization-epoch") {
+            const validation = recordField(value.validationAtTargetSchedule);
+            const qPrime = value.event === "theory-q-prime-optimization-epoch";
+            events.push({
+              ...value,
+              event: canonicalEvent,
+              sourceEvent: value.event,
+              train: {
+                loss: qPrime
+                  ? numberField(value.trainQPrimeMse)
+                  : numberField(value.trainTdHuber),
+                tdHuber: numberField(value.trainTdHuber),
+                qPrimeMse: numberField(value.trainQPrimeMse),
+                transitionNegativeLogLikelihood: numberField(
+                  value.trainTransitionNegativeLogLikelihood,
+                ),
+                crossEntropy: numberField(value.trainTransitionNegativeLogLikelihood),
+              },
+              ...(validation ? {
+                validation: {
+                  loss: qPrime
+                    ? numberField(validation.qPrimeMse)
+                    : numberField(validation.tdHuber),
+                  tdHuber: numberField(validation.tdHuber),
+                  qPrimeMse: numberField(validation.qPrimeMse),
+                  netLogReturnBps: numberField(validation.netLogReturnBps),
+                  grossHoldingLogReturnBps: numberField(
+                    validation.grossHoldingLogReturnBps,
+                  ),
+                  perfectCapture: numberField(validation.perfectCapture),
+                  maximumDrawdownBps: numberField(validation.maximumDrawdownBps),
+                  turnover: numberField(validation.turnover),
+                },
+              } : {}),
+            });
+          } else {
+            events.push(canonicalEvent === value.event
+              ? value
+              : { ...value, event: canonicalEvent, sourceEvent: value.event });
+          }
         }
       }
     } catch {

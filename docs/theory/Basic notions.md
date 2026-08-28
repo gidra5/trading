@@ -66,3 +66,15 @@ At any time $t$ we can have price $p_t$ for the asset in terms of quote. That is
 
 Given a price history, we can define a return of a single time step as relative increase of price:
 $$r_{t+1}=\frac {p_{t+1}-p_t} {p_t}=\frac {\Delta p_t} {p_{t}}=\frac {p_{t+1}} {p_{t}}-1$$
+
+
+Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
+
+
+
+Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
+
+it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret.
+
+This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
+

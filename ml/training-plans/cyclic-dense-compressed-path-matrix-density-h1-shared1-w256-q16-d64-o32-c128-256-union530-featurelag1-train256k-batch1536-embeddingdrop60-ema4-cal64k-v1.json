@@ -1,0 +1,78 @@
+{
+  "id": "cyclic-dense-compressed-path-matrix-density-h1-shared1-w256-q16-d64-o32-c128-256-union530-featurelag1-train256k-batch1536-embeddingdrop60-ema4-cal64k-v1",
+  "label": "Cyclic dense compressed path matrix density - 1 active 1s return - one shared block - current 530-channel union state - W256 - Q16 - D64 - O32 - DQ128 DO256 compression - 256k clean - batch 1536 - first market-embedding dropout 60% - no SAM - weight EMA 4 epochs - online affine 64k validation",
+  "datasetDir": "data/training/datasets/global-btc-production-471-next-1s-30d-v1",
+  "unionHistoryDatasetDir": "data/training/datasets/next-return-production-basis-history120-full-30d-v1",
+  "featureHistorySeconds": 1,
+  "examplesBySplit": { "train": 256000, "validation": 65536, "test": 65536 },
+  "runDir": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h1-shared1-w256-q16-d64-o32-c128-256-union530-featurelag1-train256k-batch1536-embeddingdrop60-ema4-cal64k-v1",
+  "subset": { "type": "fixed-clean-count", "examples": 256000 },
+  "architecture": {
+    "contract": "cyclic-dense-compressed-path-matrix-density-v1",
+    "inputFeatureLags": 1,
+    "marketWidth": 256,
+    "pathEmbeddingWidth": 16,
+    "pathCount": 64,
+    "returnCount": 1,
+    "outputKnots": 32,
+    "stageBlockCount": 1,
+    "pathCompressionWidth": 128,
+    "jointCompressionWidth": 256,
+    "marketState": "m0=dropout60(GNGLU(normalize(feature[t]),W)); one dense shared block emits the single next-active-return density",
+    "pathWeights": "q_0=softmax(row-dot(P_0,QD_0)/sqrt(Q))",
+    "conditionalReturns": "T_0=row-softmax(P_0 R_0/sqrt(Q)); J_0=q_0[:,None] times T_0; p_0=sum_D(J_0)",
+    "pathTransition": "The shared dense recurrent cell is retained from the H15 architecture but the supervised H1 rollout consumes only its first emission",
+    "matrixApproximation": "none; every GNGLU uses dense matrices at expected hidden width floor((input+output)/2)",
+    "outputPoints": "ordered market-conditioned unit-interval knots initialized from the fixed global 32-knot grid",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1536,
+    "evaluationBatchSize": 1024,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0.6,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": { "betas": [0.9, 0.999], "epsilon": 1e-8, "weightDecay": 0 }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": null,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "source": "trailing-union-train",
+    "examples": 64000,
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "targetFilter": "each start and the single target are exact-nonzero active returns",
+    "trainingLoss": "one-step dynamic marginal return-density NLL"
+  }
+}

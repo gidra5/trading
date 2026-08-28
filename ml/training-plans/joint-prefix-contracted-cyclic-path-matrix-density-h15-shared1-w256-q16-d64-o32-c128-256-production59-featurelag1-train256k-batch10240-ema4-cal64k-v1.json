@@ -1,0 +1,91 @@
+{
+  "id": "joint-prefix-contracted-cyclic-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-production59-featurelag1-train256k-batch10240-ema4-cal64k-v1",
+  "label": "Joint-prefix contracted cyclic path matrix density - proper joint NLL over 15 active 1s returns - one preceding 1s production-basis 59-feature state - one recurrent block shared across all steps - W256 - Q16 - D64 - O32 - DQ128 DO256 embedding compression - 256k clean - batch 10240 train and evaluation - shared-step compilation without CUDA Graphs - no dropout - no adversarial inputs or outputs - no auxiliary expectation loss - no SAM - weight EMA 4 epochs - online per-step affine 64k validation",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/joint-prefix-contracted-cyclic-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-production59-featurelag1-train256k-batch10240-ema4-cal64k-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "joint-prefix-contracted-cyclic-path-matrix-density-v1",
+    "inputFeatureLags": 1,
+    "marketWidth": 256,
+    "pathEmbeddingWidth": 16,
+    "pathCount": 64,
+    "returnCount": 15,
+    "outputKnots": 32,
+    "stageBlockCount": 1,
+    "recurrentActivationCheckpointing": true,
+    "pathCompressionWidth": 128,
+    "jointCompressionWidth": 256,
+    "marketState": "m0=GNGLU(feature[t],W); feature[t] is the single immediately preceding 1s production-basis 59-channel state; one dense recurrent block and an absolute-step embedding are shared across all 15 horizons",
+    "pathWeights": "at every step the market state emits QD_s and decodes q_s=P(rho_s)=softmax(row-dot(P_s,QD_s)/sqrt(Q)) from the current embedded paths",
+    "conditionalReturns": "T_s=row-softmax(P_s R_s/sqrt(Q)); J_s=q_s[:,None] times T_s; p_s=sum_D(J_s)",
+    "embeddingCompression": "the complete P_s and J_s matrices are independently compressed by dense uncapped GNGLUs to 128 and 256 values; P_s+1=shared-dense-GNGLU(concat(compress(P_s),m_s,compress(J_s),point-state_s))",
+    "jointPathContraction": "the forecast stream always compresses the complete J_s; a parallel realized-prefix stream contracts J_s with the observed triangular-component densities, normalizes the posterior path matrix, passes it through the same embedding transition, and lets the same next market query decode q_s+1; the 15 conditional log densities sum to log p(r_1:15|x) without sampled rollout",
+    "gradientMemory": "exact recurrent-step activation recomputation retains only step-boundary states, recomputes each shared block during reverse traversal, and accumulates all 15 exact unrolled-gradient contributions into the shared parameters",
+    "matrixApproximation": "none; every GNGLU uses dense matrices at expected hidden width floor((input+output)/2)",
+    "outputPoints": "ordered market-conditioned unit-interval knots initialized from the fixed global 32-knot grid",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "expectedReturnCorrelationLossWeight": 0,
+    "expectedReturnMseLossWeight": 0,
+    "distributionLoss": {
+      "type": "forward-contracted-joint-path-nll-v1"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "datasetDir": "data/training/datasets/next-return-production-basis-history3-calibration-tail-64k-v1",
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "targetFilter": "the single preceding-second input and all 15 following targets are chronological exact-nonzero active 1s returns",
+    "trainingLoss": "proper joint path NLL: mean of the 15 forward-contracted conditional log-density terms whose sum is log p(r_1:15|x); emitted marginals are not multiplied as independent returns"
+  }
+}

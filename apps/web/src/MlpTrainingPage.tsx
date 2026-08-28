@@ -6,14 +6,46 @@ import {
   onCleanup,
   onMount,
 } from "solid-js";
-import { Activity, ArrowLeft, BarChart3, Pause, Play, Plus, Search, X } from "lucide-solid";
+import {
+  Activity,
+  ArrowLeft,
+  BarChart3,
+  ChevronDown,
+  ChevronRight,
+  Pause,
+  Play,
+  Plus,
+  Search,
+  X,
+} from "lucide-solid";
 
 const apiBase = import.meta.env.DEV ? "/backend" : "";
 const POLL_MS = 2_000;
-const COMPARISON_COLORS = ["#38bdf8", "#f5b84b", "#a78bfa", "#34d399"] as const;
+const COMPARISON_COLORS = [
+  "#38bdf8",
+  "#f5b84b",
+  "#a78bfa",
+  "#34d399",
+  "#fb7185",
+  "#60a5fa",
+  "#f97316",
+  "#2dd4bf",
+  "#c084fc",
+  "#facc15",
+  "#4ade80",
+  "#f472b6",
+] as const;
 
 interface MetricValues {
   loss?: number;
+  tdHuber?: number;
+  qPrimeMse?: number;
+  transitionNegativeLogLikelihood?: number;
+  netLogReturnBps?: number;
+  grossHoldingLogReturnBps?: number;
+  perfectCapture?: number;
+  maximumDrawdownBps?: number;
+  turnover?: number;
   normalizedMse?: number;
   mse?: number;
   rmse?: number;
@@ -202,6 +234,11 @@ interface ComparisonMetricValues {
 
 interface ComparisonDistributionValues {
   negativeLogLikelihood?: number;
+  perLeadNegativeLogLikelihood?: number[];
+  meanCrps?: number;
+  normalizedCrps?: number;
+  perLeadMeanCrps?: number[];
+  perLeadNormalizedCrps?: number[];
   unitNegativeLogLikelihood?: number;
   bitsPerExample?: number;
   globalBaselineNegativeLogLikelihood?: number;
@@ -343,6 +380,7 @@ interface ComparisonResponse {
     parameterCount?: number;
     trainableParameterCount?: number;
     bestEpoch?: number;
+    evaluationHorizonSteps?: number;
     train?: ComparisonMetricValues;
     validation?: ComparisonMetricValues;
     test?: ComparisonMetricValues;
@@ -365,6 +403,9 @@ interface ComparisonResponse {
       trainNegativeLogLikelihood?: number;
       validationNegativeLogLikelihood?: number;
       onlineTrainNegativeLogLikelihood?: number;
+      trainNormalizedCrps?: number;
+      validationNormalizedCrps?: number;
+      onlineTrainNormalizedCrps?: number;
       bestTrainScore?: number;
     }>;
   }>;
@@ -467,19 +508,23 @@ type CalibrationVariant =
   | "online-matrix-affine-arithmetic";
 type CheckpointPolicy =
   | "validation-nll"
+  | "validation-crps"
   | "validation-mse"
   | "validation-correlation"
   | "train-nll"
   | "train-mse"
-  | "train-correlation";
+  | "train-correlation"
+  | "stopped-last";
 
 const CHECKPOINT_POLICIES: Array<{ value: CheckpointPolicy; label: string }> = [
   { value: "validation-nll", label: "Best validation NLL" },
+  { value: "validation-crps", label: "Best validation CRPS" },
   { value: "validation-mse", label: "Best validation MSE" },
   { value: "validation-correlation", label: "Best validation correlation" },
   { value: "train-nll", label: "Best train NLL" },
   { value: "train-mse", label: "Best train MSE" },
   { value: "train-correlation", label: "Best train correlation" },
+  { value: "stopped-last", label: "Stopped last checkpoint" },
 ];
 
 const CALIBRATION_VARIANTS: Array<{
@@ -521,6 +566,7 @@ export function MlpTrainingPage() {
   const [checkpointPolicy, setCheckpointPolicy] = createSignal<CheckpointPolicy>(
     "validation-nll",
   );
+  const [comparisonTableExpanded, setComparisonTableExpanded] = createSignal(false);
   const [calibrationVariant, setCalibrationVariant] = createSignal<CalibrationVariant>(
     "scale-only",
   );
@@ -542,6 +588,7 @@ export function MlpTrainingPage() {
   let clockTimer: number | undefined;
   let comparisonTimer: number | undefined;
   let disposed = false;
+  let followActiveRun = true;
   let requestGeneration = 0;
   let comparisonRequestGeneration = 0;
 
@@ -696,10 +743,12 @@ export function MlpTrainingPage() {
   const loadComparison = async (keys = comparisonRunKeys()) => {
     if (keys.length === 0) return;
     const generation = ++comparisonRequestGeneration;
-    const search = new URLSearchParams({ runs: keys.join(",") });
     try {
-      const response = await fetch(`${apiBase}/api/mlp-training/comparison?${search}`, {
+      const response = await fetch(`${apiBase}/api/mlp-training/comparison`, {
         cache: "no-store",
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ runs: keys }),
       });
       const payload = await response.json() as ComparisonResponse & { error?: string };
       if (!response.ok) {
@@ -727,7 +776,6 @@ export function MlpTrainingPage() {
   };
 
   const addComparisonRun = () => {
-    if (comparisonRunKeys().length >= 4) return;
     const nextKey = runs().find((run) => !comparisonRunKeys().includes(run.key))?.key;
     if (!nextKey) return;
     const next = [...comparisonRunKeys(), nextKey];
@@ -789,6 +837,21 @@ export function MlpTrainingPage() {
       const payload = await response.json() as MetricsResponse & { error?: string };
       if (!response.ok) throw new Error(payload.error ?? `Training metrics request failed: ${response.status}`);
       if (disposed || generation !== requestGeneration) return;
+      const refreshedSelectedRun = payload.runs.find(
+        (run) => run.key === payload.selectedRunKey,
+      );
+      const activeSuccessor = followActiveRun && requestedRunKey && !refreshedSelectedRun?.running
+        ? payload.runs.find((run) => run.running && run.key !== payload.selectedRunKey)
+        : undefined;
+      if (activeSuccessor) {
+        cursor = 0;
+        clearSeries();
+        setRuns(payload.runs);
+        setSnapshot(undefined);
+        setSelectedRunKey(activeSuccessor.key);
+        setError(undefined);
+        return;
+      }
       const previous = snapshot();
       const runChanged = previous !== undefined
         && (previous.selectedRunKey !== payload.selectedRunKey
@@ -817,6 +880,7 @@ export function MlpTrainingPage() {
 
   const selectRun = (runKey: string) => {
     if (!runKey || runKey === selectedRunKey()) return;
+    followActiveRun = false;
     requestGeneration += 1;
     if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     cursor = 0;
@@ -855,6 +919,11 @@ export function MlpTrainingPage() {
   ));
   const hasRegressionEpochs = createMemo(() => epochs().some(
     (point) => point.validation.normalizedMse !== undefined,
+  ));
+  const hasQPolicyEpochs = createMemo(() => epochs().some(
+    (point) => point.train.tdHuber !== undefined
+      || point.train.qPrimeMse !== undefined
+      || point.validation.netLogReturnBps !== undefined,
   ));
   const stage = createMemo(() => snapshot()?.status?.stage ?? "idle");
   const stageProgress = createMemo(() => {
@@ -939,6 +1008,34 @@ export function MlpTrainingPage() {
           values: run.fit.flatMap((point) => point.validationNegativeLogLikelihood === undefined
             ? []
             : [{ x: point.x ?? point.epoch + 1, y: point.validationNegativeLogLikelihood }]),
+        },
+      ];
+    })
+    .filter((series) => series.values.length > 0));
+  const comparisonCrpsFit = createMemo<PlotSeries[]>(() => (comparison()?.runs ?? [])
+    .flatMap((run, index) => {
+      const color = COMPARISON_COLORS[index % COMPARISON_COLORS.length]!;
+      return [
+        {
+          id: `${run.key}:train-crps`,
+          label: `${run.label} · Train CRPS`,
+          color,
+          values: run.fit.flatMap((point) => {
+            const value = point.onlineTrainNormalizedCrps
+              ?? point.trainNormalizedCrps;
+            return value === undefined
+              ? []
+              : [{ x: point.x ?? point.epoch + 1, y: value }];
+          }),
+        },
+        {
+          id: `${run.key}:validation-crps`,
+          label: `${run.label} · Validation CRPS`,
+          color,
+          dash: "7 5",
+          values: run.fit.flatMap((point) => point.validationNormalizedCrps === undefined
+            ? []
+            : [{ x: point.x ?? point.epoch + 1, y: point.validationNormalizedCrps }]),
         },
       ];
     })
@@ -1056,6 +1153,12 @@ export function MlpTrainingPage() {
     return [
       { label: "Training examples", values: comparedRuns.map((run) => formatCount(run.examples)) },
       {
+        label: "Displayed evaluation",
+        values: comparedRuns.map((run) => run.evaluationHorizonSteps === 1
+          ? "Next 1s only"
+          : "Run default"),
+      },
+      {
         label: "Parameters",
         values: comparedRuns.map((run) => formatCount(
           run.trainableParameterCount ?? run.parameterCount,
@@ -1073,11 +1176,13 @@ export function MlpTrainingPage() {
       { label: "Correlation (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.correlation, selection?.validation?.correlation, selection?.test?.correlation])) },
       { label: "Direction (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.directionAccuracy, selection?.validation?.directionAccuracy, selection?.test?.directionAccuracy], formatPercent)) },
       { label: "MAE (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.train?.mae, selection?.validation?.mae, selection?.test?.mae])) },
-      { label: "Expectation MSE skill (train / validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.expectation?.mseSkillVsZero, selection?.distribution?.validation?.expectation?.mseSkillVsZero, selection?.distribution?.test?.expectation?.mseSkillVsZero], formatPercent)) },
       ...[0, 1, 2].flatMap((lead) => [
+        { label: `Step ${lead + 1} normalized MSE (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.normalizedMse, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.normalizedMse, selection?.distribution?.test?.perLeadExpectation?.[lead]?.normalizedMse])) },
         { label: `Step ${lead + 1} MSE skill (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.mseSkillVsZero, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.mseSkillVsZero, selection?.distribution?.test?.perLeadExpectation?.[lead]?.mseSkillVsZero], formatPercent)) },
         { label: `Step ${lead + 1} correlation (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.correlation, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.correlation, selection?.distribution?.test?.perLeadExpectation?.[lead]?.correlation])) },
         { label: `Step ${lead + 1} direction (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadExpectation?.[lead]?.directionAccuracy, selection?.distribution?.validation?.perLeadExpectation?.[lead]?.directionAccuracy, selection?.distribution?.test?.perLeadExpectation?.[lead]?.directionAccuracy], formatPercent)) },
+        { label: `Step ${lead + 1} NLL (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadNegativeLogLikelihood?.[lead], selection?.distribution?.validation?.perLeadNegativeLogLikelihood?.[lead], selection?.distribution?.test?.perLeadNegativeLogLikelihood?.[lead]])) },
+        { label: `Step ${lead + 1} normalized CRPS (train / validation / test)`, values: selected.map((selection) => formatMetricTuple([selection?.distribution?.train?.perLeadNormalizedCrps?.[lead], selection?.distribution?.validation?.perLeadNormalizedCrps?.[lead], selection?.distribution?.test?.perLeadNormalizedCrps?.[lead]])) },
       ]),
       { label: "AR 15m episodes (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.episodes, selection?.autoregressiveEpisodes?.test?.episodes], formatCount)) },
       { label: "AR active candles / episode (validation / test)", values: selected.map((selection) => formatMetricTuple([selection?.autoregressiveEpisodes?.validation?.activeCandlesPerEpisode?.mean, selection?.autoregressiveEpisodes?.test?.activeCandlesPerEpisode?.mean])) },
@@ -1324,8 +1429,7 @@ export function MlpTrainingPage() {
             <button
               class="btn"
               type="button"
-              disabled={comparisonRunKeys().length >= 4
-                || comparisonRunKeys().length >= runs().length}
+              disabled={comparisonRunKeys().length >= runs().length}
               onClick={addComparisonRun}
             >
               <Plus size={16} /> Add run
@@ -1443,8 +1547,36 @@ export function MlpTrainingPage() {
                 </Show>
               </div>
             </div>
-            <div class="min-w-0 overflow-x-auto rounded border border-line">
-              <table class="w-full min-w-[48rem] border-collapse text-sm">
+            <div class="flex flex-wrap items-center justify-between gap-3 rounded border border-line bg-ink-900/25 px-3 py-2">
+              <div>
+                <div class="text-sm font-medium text-ink-100">Metrics table</div>
+                <div class="mt-0.5 text-xs text-ink-400">
+                  Calibrated and raw checkpoint results for the selected runs.
+                </div>
+              </div>
+              <button
+                class="btn"
+                type="button"
+                aria-controls="run-comparison-metrics-table"
+                aria-expanded={comparisonTableExpanded()}
+                data-testid="comparison-table-toggle"
+                onClick={() => setComparisonTableExpanded((expanded) => !expanded)}
+              >
+                <Show
+                  when={comparisonTableExpanded()}
+                  fallback={<ChevronRight size={16} />}
+                >
+                  <ChevronDown size={16} />
+                </Show>
+                {comparisonTableExpanded() ? "Collapse table" : "Expand table"}
+              </button>
+            </div>
+            <Show when={comparisonTableExpanded()}>
+              <div
+                id="run-comparison-metrics-table"
+                class="min-w-0 overflow-x-auto rounded border border-line"
+              >
+                <table class="w-full min-w-[48rem] border-collapse text-sm">
                 <thead class="bg-ink-900/80 text-left">
                   <tr>
                     <th class="px-3 py-3 text-xs font-medium uppercase tracking-wide text-ink-400">Metric</th>
@@ -1504,8 +1636,9 @@ export function MlpTrainingPage() {
                     )}
                   </For>
                 </tbody>
-              </table>
-            </div>
+                </table>
+              </div>
+            </Show>
 
             <div class="min-w-0">
               <Show when={comparisonFit().length > 0}>
@@ -1525,6 +1658,16 @@ export function MlpTrainingPage() {
                   subtitle="Training (solid) and validation (dashed) return-space negative log likelihood; lower is better"
                   xLabel="epoch"
                   series={comparisonNllFit()}
+                />
+              </Show>
+            </div>
+            <div class="min-w-0">
+              <Show when={comparisonCrpsFit().length > 0}>
+                <MetricChart
+                  title="CRPS distribution fit"
+                  subtitle="Training (solid) and validation (dashed) target-standard-deviation-normalized discrete CRPS; lower is better"
+                  xLabel="epoch"
+                  series={comparisonCrpsFit()}
                 />
               </Show>
             </div>
@@ -1588,15 +1731,65 @@ export function MlpTrainingPage() {
                 : "Plots will populate when refinement hands off to weight training"}
           />
           <Show when={trainSteps().length > 0 || epochs().length > 0
-            || comparisonFit().length > 0 || comparisonNllFit().length > 0}
+            || comparisonFit().length > 0 || comparisonNllFit().length > 0
+            || comparisonCrpsFit().length > 0}
           fallback={<WaitingForTraining stage={stage()} />}>
             <div class="grid min-w-0 gap-3 xl:grid-cols-2">
+              <Show when={hasQPolicyEpochs()}>
+                <MetricChart
+                  title="Q Bellman loss"
+                  subtitle="Squared q' surface error; legacy runs use Huber over all counterfactual exposures"
+                  scale="log"
+                  xLabel="epoch"
+                  series={[
+                    epochPlot("Train", "#38bdf8", epochs(), "train", "tdHuber"),
+                    epochPlot("Validation", "#f5b84b", epochs(), "validation", "tdHuber"),
+                    epochPlot("Train q' MSE", "#22c55e", epochs(), "train", "qPrimeMse"),
+                    epochPlot("Validation q' MSE", "#a78bfa", epochs(), "validation", "qPrimeMse"),
+                  ]}
+                />
+                <MetricChart
+                  title="Validation policy return"
+                  subtitle="Sequential realized log return at final target friction and gamma"
+                  unit="bps"
+                  xLabel="epoch"
+                  series={[
+                    epochPlot("Net after friction", "#22c55e", epochs(), "validation", "netLogReturnBps"),
+                    epochPlot("Gross holding", "#38bdf8", epochs(), "validation", "grossHoldingLogReturnBps"),
+                  ]}
+                />
+                <MetricChart
+                  title="Perfect-margin capture"
+                  subtitle="Net policy return divided by the absolute-move perfect-trader benchmark"
+                  unit="ratio"
+                  xLabel="epoch"
+                  series={[
+                    epochPlot("Capture", "#a78bfa", epochs(), "validation", "perfectCapture"),
+                  ]}
+                />
+                <MetricChart
+                  title="Validation maximum drawdown"
+                  unit="bps"
+                  xLabel="epoch"
+                  series={[
+                    epochPlot("Drawdown", "#fb7185", epochs(), "validation", "maximumDrawdownBps"),
+                  ]}
+                />
+              </Show>
               <Show when={comparisonNllFit().length > 0}>
                 <MetricChart
                   title="Negative log likelihood"
                   subtitle="Each selected run; solid training paths update within the current epoch, dashed paths are validation"
                   xLabel="epoch"
                   series={comparisonNllFit()}
+                />
+              </Show>
+              <Show when={comparisonCrpsFit().length > 0}>
+                <MetricChart
+                  title="Normalized CRPS"
+                  subtitle="Each selected run; solid training paths update within the current epoch, dashed paths are validation"
+                  xLabel="epoch"
+                  series={comparisonCrpsFit()}
                 />
               </Show>
               <Show when={hasCurriculumEpochs()}>
@@ -2274,11 +2467,11 @@ function MetricChart(props: {
   onCleanup(() => resizeObserver?.disconnect());
 
   return (
-    <article class="panel min-w-0 overflow-hidden">
+    <article class="training-metric-chart panel min-w-0 overflow-hidden">
       <div class="flex flex-wrap items-start justify-between gap-2">
         <div><h3 class="font-semibold">{props.title}</h3><Show when={props.subtitle}><p class="text-xs text-ink-300">{props.subtitle}</p></Show></div>
-        <div class="flex flex-col items-end gap-1.5">
-          <div class="flex flex-wrap justify-end gap-1 text-xs">
+        <div class="flex min-w-0 max-w-full flex-col items-end gap-1.5">
+          <div class="training-chart-legend flex max-w-full flex-wrap content-start justify-end gap-1 text-xs">
             <For each={available()}>{(series) => {
               const hidden = () => hiddenSeriesIds().has(series.seriesId);
               return <button
@@ -2428,6 +2621,14 @@ function metricValues(value: unknown): MetricValues {
     loss: numberValue(record.loss)
       ?? numberValue(record.normalizedMse)
       ?? numberValue(record.trainingCrossEntropy),
+    tdHuber: numberValue(record.tdHuber),
+    qPrimeMse: numberValue(record.qPrimeMse),
+    transitionNegativeLogLikelihood: numberValue(record.transitionNegativeLogLikelihood),
+    netLogReturnBps: numberValue(record.netLogReturnBps),
+    grossHoldingLogReturnBps: numberValue(record.grossHoldingLogReturnBps),
+    perfectCapture: numberValue(record.perfectCapture),
+    maximumDrawdownBps: numberValue(record.maximumDrawdownBps),
+    turnover: numberValue(record.turnover),
     normalizedMse: numberValue(record.normalizedMse),
     mse: numberValue(record.mse),
     rmse: numberValue(record.rmse),

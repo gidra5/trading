@@ -62,6 +62,19 @@ table {
   font-variant-numeric: tabular-nums;
 }
 
+.training-metric-chart {
+  overflow-anchor: none;
+}
+
+.training-chart-legend {
+  max-height: min(8rem, 24vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
+  padding-inline-start: 0.25rem;
+}
+
 .kama-inspector-workspace {
   display: flex;
   min-width: 0;

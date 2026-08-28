@@ -1,0 +1,113 @@
+{
+  "id": "structured-shared-io-feature-process-k1-2-k2-2-i530-obase14-derived530-w256-m128-p128-f128-pf256-nf256-unionbase-train256k-batch10240-mse-ema4-v1",
+  "label": "Structured shared-IO feature process - union530 primitive-consistent causal rollout - K1 2x1s input x 530 - K2 2x1s primitive output x 14 rederived to 530 - W256 - M128 - P128 - F128 - PF256 - NF256 - standardized derived-feature MSE - 256k clean - batch 10240 train and evaluation - no regularization - weight EMA 4 epochs",
+  "datasetDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-union530-base-rollout-v1",
+  "runDir": "data/training/runs/structured-shared-io-feature-process-k1-2-k2-2-i530-obase14-derived530-w256-m128-p128-f128-pf256-nf256-unionbase-train256k-batch10240-mse-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000,
+    "validationExamples": 65536,
+    "testExamples": 65536
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 530,
+    "outputFeatures": 14,
+    "derivedOutputFeatures": 530,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-book-spread-log-bps"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "numberedLayerSharing": "each parenthesized number in the diagram is one exact GNGLU module instance reused at every matching input/output block",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 maps NF to expected W; shared layer 2 decodes W only to primitive causal coordinates; differentiable fixed code reconstructs the complete future union530 state",
+    "baseConsistency": "BTC one-second candle geometry, return activity, aggregate trade flow, aggressor side, and book spread are decoded once; all affected engineered production channels are then derived from the same predicted primitive history",
+    "slowGlobalState": "all selected sequences stay within one immutable causal minute snapshot, so the 470 slow/global channels are exactly carried from the input state",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-derived-union530-feature-mse-v1",
+      "description": "decode only 14 primitive causal coordinates, differentiably reconstruct both complete 530-channel future states, then mean MSE over the two steps and all 530 channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "original chronological nonzero-target origin population, restricted only to consecutive K1/K2 rows that share the same already-completed causal global minute snapshot",
+    "availableExactSequences": {
+      "train": 297157,
+      "validation": 94136,
+      "test": 88354
+    }
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "pooled two-step complete derived 530-feature state",
+    "comparableMetrics": "step-1 and per-step return metrics remain directly comparable to the earlier structured 59-feature runs"
+  },
+  "alignment": {
+    "input": "two consecutive complete union530 states ending at each clean example origin",
+    "target": "the two consecutive complete union530 states at origin+1 and origin+2",
+    "causalDerivation": "only predicted primitive coordinates and observed history through the input origin enter the changing future channels; no observed future derived input is consumed"
+  }
+}

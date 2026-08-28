@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 
+from global_feature_training_dataset import IndexedGlobalFeatureDataset
 from normalized_glu_next_return import NormalizedGluNextReturn
 from trading_storage import (
     _prune_checkpoint_orphans,
@@ -180,9 +181,146 @@ class TemporalFeatureMatrix:
         )
 
 
+class IndexedGlobalFeatureMatrix:
+    """Expose one chronological split of a compact global-feature dataset."""
+
+    def __init__(
+        self,
+        dataset: IndexedGlobalFeatureDataset,
+        logical_rows: np.ndarray,
+    ) -> None:
+        self.dataset = dataset
+        self.logical_rows = np.asarray(logical_rows, dtype=np.int64)
+        self.shape = (
+            int(self.logical_rows.size),
+            int(dataset.manifest["featureCount"]),
+        )
+
+    def __getitem__(self, selected):
+        scalar = isinstance(selected, (int, np.integer))
+        if isinstance(selected, slice):
+            selected_rows = np.arange(*selected.indices(self.shape[0]), dtype=np.int64)
+        else:
+            selected_rows = np.asarray(selected, dtype=np.int64)
+            if scalar:
+                selected_rows = selected_rows.reshape(1)
+        values = self.dataset.read(self.logical_rows[selected_rows])["features"]
+        return values[0] if scalar else values
+
+
+class UnionTemporalFeatureMatrix:
+    """Join 59 production-basis and 471 global channels over one history."""
+
+    def __init__(
+        self,
+        old_timeline: np.memmap,
+        old_origin_rows: np.ndarray,
+        global_dataset: IndexedGlobalFeatureDataset,
+        global_physical_rows: np.ndarray,
+        *,
+        history_seconds: int,
+        old_channel_count: int,
+    ) -> None:
+        self.old_timeline = old_timeline
+        self.old_origin_rows = np.asarray(old_origin_rows, dtype=np.int64)
+        self.global_dataset = global_dataset
+        self.global_physical_rows = np.asarray(
+            global_physical_rows, dtype=np.int64
+        )
+        self.history_seconds = int(history_seconds)
+        self.old_channel_count = int(old_channel_count)
+        self.global_channel_count = int(global_dataset.manifest["featureCount"])
+        self.channel_count = self.old_channel_count + self.global_channel_count
+        self.offsets = np.arange(
+            1 - self.history_seconds, 1, dtype=np.int64
+        )
+        self.shape = (
+            int(self.global_physical_rows.size),
+            self.channel_count * self.history_seconds,
+        )
+
+    def __getitem__(self, selected):
+        scalar = isinstance(selected, (int, np.integer))
+        if isinstance(selected, slice):
+            selected_rows = np.arange(*selected.indices(self.shape[0]), dtype=np.int64)
+        else:
+            selected_rows = np.asarray(selected, dtype=np.int64)
+            if scalar:
+                selected_rows = selected_rows.reshape(1)
+        old_current = self.old_origin_rows[selected_rows]
+        global_current = self.global_physical_rows[selected_rows]
+        old_history_rows = old_current[:, None] + self.offsets[None, :]
+        global_history_rows = global_current[:, None] + self.offsets[None, :]
+        old_history = np.asarray(
+            self.old_timeline[old_history_rows], dtype=np.float32
+        )
+        source_rows = np.asarray(
+            self.global_dataset.source_rows[global_history_rows],
+            dtype=np.int64,
+        )
+        global_history = np.asarray(
+            self.global_dataset.matrix[
+                source_rows[..., None],
+                self.global_dataset.columns,
+            ],
+            dtype=np.float32,
+        )
+        output = np.empty(
+            (
+                selected_rows.size,
+                self.channel_count,
+                self.history_seconds,
+            ),
+            dtype=np.float32,
+        )
+        output[:, :self.old_channel_count] = old_history.transpose(0, 2, 1)
+        global_end = self.old_channel_count + global_history.shape[2]
+        output[:, self.old_channel_count:global_end] = global_history.transpose(
+            0, 2, 1
+        )
+        if self.global_dataset.spread is not None:
+            output[:, global_end] = np.asarray(
+                self.global_dataset.spread[global_history_rows],
+                dtype=np.float32,
+            )
+        elif global_end != self.channel_count:
+            raise ValueError("global union history is missing its final channel")
+        flattened = output.reshape(selected_rows.size, self.shape[1])
+        return flattened[0] if scalar else flattened
+
+
 class FeatureMatrixDataset:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        selection: str | None = None,
+        examples_by_split: dict[str, int] | None = None,
+        union_history_root: Path | None = None,
+        feature_history_seconds: int | None = None,
+    ) -> None:
         self.root = root
+        indexed_manifest = root / "dataset.json"
+        if union_history_root is not None:
+            if not indexed_manifest.is_file():
+                raise ValueError("union history requires an indexed global dataset")
+            self._initialize_union_history(
+                union_history_root,
+                history_seconds=int(feature_history_seconds or 0),
+                examples_by_split=examples_by_split,
+            )
+            return
+        if indexed_manifest.is_file():
+            self._initialize_indexed(
+                indexed_manifest,
+                selection=selection or "nonzero",
+                examples_by_split=examples_by_split,
+            )
+            return
+        if selection is not None or examples_by_split is not None:
+            raise ValueError(
+                "indexed dataset selection settings require dataset.json"
+            )
         self.manifest = json.loads((root / "manifest.json").read_text("utf-8"))
         self.feature_count = int(self.manifest["featureCount"])
         compact_temporal = self.manifest.get("storageLayout") \
@@ -234,6 +372,193 @@ class FeatureMatrixDataset:
         ):
             raise ValueError("feature-matrix splits are not chronological")
 
+    def _initialize_indexed(
+        self,
+        manifest_file: Path,
+        *,
+        selection: str,
+        examples_by_split: dict[str, int] | None,
+    ) -> None:
+        self.manifest = json.loads(manifest_file.read_text("utf-8"))
+        self.feature_count = int(self.manifest["featureCount"])
+        self.indexed_dataset = IndexedGlobalFeatureDataset(
+            self.root, selection=selection
+        )
+        limits = examples_by_split or {}
+        unknown = set(limits) - {"train", "validation", "test"}
+        if unknown:
+            raise ValueError(f"unknown indexed split limits: {sorted(unknown)}")
+        split_codes = {"train": 0, "validation": 1, "test": 2}
+        selected_physical = self.indexed_dataset.rows
+        selected_splits = np.asarray(
+            self.indexed_dataset.splits[selected_physical], dtype=np.uint8
+        )
+        self.splits = {}
+        for name, code in split_codes.items():
+            logical_rows = np.flatnonzero(selected_splits == code)
+            available = int(logical_rows.size)
+            limit = int(limits.get(name, available))
+            if limit < 1 or limit > available:
+                raise ValueError(
+                    f"indexed {name} split requested {limit:,} of "
+                    f"{available:,} available {selection} examples"
+                )
+            logical_rows = logical_rows[:limit]
+            physical_rows = selected_physical[logical_rows]
+            features = IndexedGlobalFeatureMatrix(
+                self.indexed_dataset, logical_rows
+            )
+            targets = np.asarray(
+                self.indexed_dataset.targets[physical_rows], dtype=np.float32
+            )
+            times = np.asarray(
+                self.indexed_dataset.origins[physical_rows], dtype=np.float64
+            )
+            if not np.isfinite(targets).all():
+                raise ValueError(f"{name} split contains non-finite targets")
+            if selection == "nonzero" and np.any(targets == 0):
+                raise ValueError(f"{name} split contains an exact-zero target")
+            if np.any(np.diff(times) <= 0):
+                raise ValueError(f"{name} timestamps are not strictly increasing")
+            self.splits[name] = ArraySplit(features, targets, times)
+        if not (
+            self.splits["train"].times[-1]
+            < self.splits["validation"].times[0]
+            < self.splits["test"].times[0]
+        ):
+            raise ValueError("indexed feature splits are not chronological")
+
+    def _initialize_union_history(
+        self,
+        history_root: Path,
+        *,
+        history_seconds: int,
+        examples_by_split: dict[str, int] | None,
+    ) -> None:
+        if history_seconds < 1:
+            raise ValueError("union feature history must be positive")
+        history_manifest = json.loads(
+            (history_root / "manifest.json").read_text("utf-8")
+        )
+        old_channel_count = int(history_manifest["temporalChannelCount"])
+        source_history_seconds = int(
+            history_manifest["featureHistorySeconds"]
+        )
+        if history_seconds > source_history_seconds:
+            raise ValueError(
+                "union history length exceeds its source timeline capacity"
+            )
+        global_dataset = IndexedGlobalFeatureDataset(self.root, selection="all")
+        global_channel_count = int(global_dataset.manifest["featureCount"])
+        self.feature_count = (
+            old_channel_count + global_channel_count
+        ) * history_seconds
+        self.indexed_dataset = global_dataset
+        self.union_history_manifest = history_manifest
+        self.manifest = {
+            "schemaVersion": 1,
+            "id": (
+                f'{global_dataset.manifest["id"]}-union-'
+                f'{old_channel_count + global_channel_count}x{history_seconds}'
+            ),
+            "purpose": (
+                "Causal temporal union of the production-basis channels and "
+                "the global BTC production feature union"
+            ),
+            "featureCount": self.feature_count,
+            "baseFeatureCount": old_channel_count + global_channel_count,
+            "featureHistorySeconds": history_seconds,
+            "sourceHistorySeconds": source_history_seconds,
+            "selectionModes": global_dataset.manifest.get("selectionModes", {}),
+            "featureStorage": global_dataset.manifest.get("featureStorage", {}),
+            "sources": {
+                "productionBasis": str(history_root),
+                "globalFeatures": str(self.root),
+            },
+        }
+        limits = examples_by_split or {}
+        unknown = set(limits) - {"train", "validation", "test"}
+        if unknown:
+            raise ValueError(f"unknown union split limits: {sorted(unknown)}")
+        all_origins = np.asarray(global_dataset.origins, dtype=np.int64)
+        all_splits = np.asarray(global_dataset.splits, dtype=np.uint8)
+        all_nonzero = np.asarray(global_dataset.nonzero, dtype=np.uint8) != 0
+        split_codes = {"train": 0, "validation": 1, "test": 2}
+        self.splits = {}
+        self.union_timelines: dict[str, np.memmap] = {}
+        expected_span_ms = (history_seconds - 1) * 1_000
+        for name, code in split_codes.items():
+            candidates = np.flatnonzero((all_splits == code) & all_nonzero)
+            candidates = candidates[candidates >= history_seconds - 1]
+            candidates = candidates[
+                all_origins[candidates]
+                - all_origins[candidates - (history_seconds - 1)]
+                == expected_span_ms
+            ]
+            history_times = np.memmap(
+                history_root / f"{name}.times.f64", dtype="<f8", mode="r"
+            )
+            history_origins = np.memmap(
+                history_root / f"{name}.origins.i32", dtype="<i4", mode="r"
+            )
+            # The compact production-basis exporter labels a completed candle
+            # by its right boundary, while the indexed global dataset labels
+            # that same causal state by the candle origin. Their targets agree
+            # at a +1 second production-basis timestamp offset.
+            history_target_times = all_origins[candidates] + 1_000
+            positions = np.searchsorted(history_times, history_target_times)
+            matched = positions < history_times.size
+            matched[matched] &= (
+                np.asarray(history_times[positions[matched]], dtype=np.int64)
+                == history_target_times[matched]
+            )
+            candidates = candidates[matched]
+            positions = positions[matched]
+            available = int(candidates.size)
+            limit = int(limits.get(name, available))
+            if limit < 1 or limit > available:
+                raise ValueError(
+                    f"union {name} split requested {limit:,} of "
+                    f"{available:,} aligned examples"
+                )
+            candidates = candidates[:limit]
+            positions = positions[:limit]
+            timeline_rows = int(history_manifest["timelineRowsBySplit"][name])
+            timeline = np.memmap(
+                history_root / f"{name}.timeline-features.f32",
+                dtype="<f4",
+                mode="r",
+                shape=(timeline_rows, old_channel_count),
+            )
+            old_origin_rows = np.asarray(
+                history_origins[positions], dtype=np.int64
+            )
+            if np.any(old_origin_rows < history_seconds - 1):
+                raise ValueError(f"union {name} history escapes its source timeline")
+            physical = np.asarray(candidates, dtype=np.int64)
+            features = UnionTemporalFeatureMatrix(
+                timeline,
+                old_origin_rows,
+                global_dataset,
+                physical,
+                history_seconds=history_seconds,
+                old_channel_count=old_channel_count,
+            )
+            targets = np.asarray(global_dataset.targets[physical], dtype=np.float32)
+            times = np.asarray(global_dataset.origins[physical], dtype=np.float64)
+            if not np.isfinite(targets).all() or np.any(targets == 0):
+                raise ValueError(f"union {name} targets are invalid")
+            if np.any(np.diff(times) <= 0):
+                raise ValueError(f"union {name} timestamps are not increasing")
+            self.union_timelines[name] = timeline
+            self.splits[name] = ArraySplit(features, targets, times)
+        if not (
+            self.splits["train"].times[-1]
+            < self.splits["validation"].times[0]
+            < self.splits["test"].times[0]
+        ):
+            raise ValueError("union feature splits are not chronological")
+
     def logical_count(self, split: str) -> int:
         return self.splits[split].count
 
@@ -284,7 +609,9 @@ def normalization(dataset: FeatureMatrixDataset) -> dict[str, np.ndarray | float
     targets = np.asarray(dataset.splits["train"].targets, dtype=np.float64)
     feature_sum = np.zeros(dataset.feature_count, dtype=np.float64)
     feature_square_sum = np.zeros(dataset.feature_count, dtype=np.float64)
-    normalization_batch_size = 1_024
+    normalization_batch_size = min(
+        1_024, max(1, 8_000_000 // dataset.feature_count)
+    )
     for start in range(0, features.shape[0], normalization_batch_size):
         batch = np.asarray(
             features[start:start + normalization_batch_size], dtype=np.float64
@@ -430,14 +757,35 @@ def main() -> None:
     run_root = (repo / plan["runDir"]).resolve()
     reporter = Reporter(run_root)
     plan_hash = canonical_hash(plan)
-    dataset_hash = hashlib.sha256(
-        (dataset_root / "manifest.json").read_bytes()
-    ).hexdigest()
+    dataset_manifest_file = (
+        dataset_root / "dataset.json"
+        if (dataset_root / "dataset.json").is_file()
+        else dataset_root / "manifest.json"
+    )
+    dataset_hasher = hashlib.sha256(dataset_manifest_file.read_bytes())
+    union_history_root = None
+    if plan.get("unionHistoryDatasetDir") is not None:
+        union_history_root = (
+            repo / str(plan["unionHistoryDatasetDir"])
+        ).resolve()
+        dataset_hasher.update(
+            (union_history_root / "manifest.json").read_bytes()
+        )
+        dataset_hasher.update(
+            str(plan.get("featureHistorySeconds")).encode("ascii")
+        )
+    dataset_hash = dataset_hasher.hexdigest()
     run_root.mkdir(parents=True, exist_ok=True)
     atomic_json({"plan": plan, "planSha256": plan_hash}, run_root / "state/plan.json")
     reporter.status("loading-data", planId=plan["id"])
     try:
-        dataset = FeatureMatrixDataset(dataset_root)
+        dataset = FeatureMatrixDataset(
+            dataset_root,
+            selection=plan.get("datasetSelection"),
+            examples_by_split=plan.get("examplesBySplit"),
+            union_history_root=union_history_root,
+            feature_history_seconds=plan.get("featureHistorySeconds"),
+        )
         stats = normalization(dataset)
         training = plan["training"]
         architecture = plan["architecture"]
@@ -750,10 +1098,21 @@ def main() -> None:
             "test": selected["test"],
             "checkpoint": selected["checkpoint"],
             "dataset": {
-                "contract": dataset.manifest["contract"],
-                "targetFilter": dataset.manifest["targetFilter"],
-                "includedSources": dataset.manifest["includedSources"],
-                "omittedForCoverage": dataset.manifest["omittedForCoverage"],
+                "id": dataset.manifest.get("id"),
+                "contract": dataset.manifest.get(
+                    "contract", dataset.manifest.get("purpose")
+                ),
+                "targetFilter": dataset.manifest.get(
+                    "targetFilter",
+                    dataset.manifest.get("selectionModes", {}).get("nonzeroRule"),
+                ),
+                "includedSources": dataset.manifest.get(
+                    "includedSources",
+                    [dataset.manifest.get("featureStorage", {}).get("matrix")],
+                ),
+                "omittedForCoverage": dataset.manifest.get(
+                    "omittedForCoverage", []
+                ),
             },
         }
         atomic_json(result, run_root / "state/result.json")

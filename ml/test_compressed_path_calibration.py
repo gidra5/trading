@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import torch
 
 from evaluate_compressed_path_checkpoint_metrics import (
     apply_affine_matrix,
@@ -15,10 +16,146 @@ from evaluate_compressed_path_checkpoint_metrics import (
     rolling_per_step_polynomial_predictions,
     rolling_polynomial_predictions,
 )
-from train_feature_compressed_path_density import rolling_online_per_step_affine
+from train_feature_compressed_path_density import (
+    embedding_dropout_probability_at_epoch,
+    expected_return_correlation_loss_weight_at_epoch,
+    expected_return_mse_loss_weight_at_epoch,
+    rolling_online_per_step_affine,
+    weighted_expected_return_correlation,
+    weighted_expected_return_normalized_mse,
+)
 
 
 class CompressedPathCalibrationTests(unittest.TestCase):
+    def test_weighted_expected_return_correlation_is_directional(self) -> None:
+        target = torch.tensor([[-2.0], [-1.0], [1.0], [2.0], [100.0]])
+        weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
+        positive = weighted_expected_return_correlation(
+            target.clone(), target, weights, target_std=1.0
+        )
+        negative = weighted_expected_return_correlation(
+            -target, target, weights, target_std=1.0
+        )
+        self.assertGreater(float(positive), 0.999999)
+        self.assertLess(float(negative), -0.999999)
+
+    def test_expected_return_correlation_has_finite_constant_start_gradient(self) -> None:
+        prediction = torch.zeros((4, 1), requires_grad=True)
+        target = torch.tensor([[-2.0], [-1.0], [1.0], [2.0]])
+        correlation = weighted_expected_return_correlation(
+            prediction, target, torch.ones(4), target_std=1.0
+        )
+        (1.0 - correlation).backward()
+        self.assertTrue(torch.isfinite(prediction.grad).all())
+        self.assertGreater(float(prediction.grad.abs().sum()), 0.0)
+
+    def test_expected_return_normalized_mse_ignores_padding(self) -> None:
+        prediction = torch.tensor([[1.0], [3.0], [100.0]])
+        target = torch.tensor([[0.0], [1.0], [-100.0]])
+        weights = torch.tensor([1.0, 1.0, 0.0])
+        loss = weighted_expected_return_normalized_mse(
+            prediction, target, weights, target_std=2.0
+        )
+        self.assertAlmostEqual(float(loss), 0.625)
+
+    def test_linear_expected_return_mse_weight_hits_exact_endpoints(self) -> None:
+        training = {
+            "expectedReturnMseLossWeight": 1.0,
+            "expectedReturnMseLossWeightSchedule": {
+                "type": "linear-v1",
+                "startWeight": 1.0,
+                "endWeight": 0.01,
+                "endEpoch": 24,
+            },
+        }
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 0), 1.0)
+        self.assertAlmostEqual(
+            expected_return_mse_loss_weight_at_epoch(training, 12), 0.505
+        )
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 24), 0.01)
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 48), 0.01)
+
+    def test_geometric_expected_return_mse_weight_hits_exact_endpoints(self) -> None:
+        training = {
+            "expectedReturnMseLossWeight": 1.0,
+            "expectedReturnMseLossWeightSchedule": {
+                "type": "geometric-v1",
+                "startWeight": 1.0,
+                "endWeight": 0.01,
+                "endEpoch": 48,
+            },
+        }
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 0), 1.0)
+        self.assertAlmostEqual(
+            expected_return_mse_loss_weight_at_epoch(training, 24), 0.1
+        )
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 48), 0.01)
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 96), 0.01)
+
+    def test_delayed_geometric_expected_return_mse_weight(self) -> None:
+        training = {
+            "expectedReturnMseLossWeight": 1.0,
+            "expectedReturnMseLossWeightSchedule": {
+                "type": "geometric-v1",
+                "startWeight": 1.0,
+                "endWeight": 0.01,
+                "startEpoch": 16,
+                "endEpoch": 32,
+            },
+        }
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 0), 1.0)
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 16), 1.0)
+        self.assertAlmostEqual(
+            expected_return_mse_loss_weight_at_epoch(training, 24), 0.1
+        )
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 32), 0.01)
+        self.assertEqual(expected_return_mse_loss_weight_at_epoch(training, 64), 0.01)
+
+    def test_delayed_geometric_expected_return_correlation_weight(self) -> None:
+        training = {
+            "expectedReturnCorrelationLossWeight": 1.0,
+            "expectedReturnCorrelationLossWeightSchedule": {
+                "type": "geometric-v1",
+                "startWeight": 1.0,
+                "endWeight": 0.01,
+                "startEpoch": 16,
+                "endEpoch": 32,
+            },
+        }
+        self.assertEqual(
+            expected_return_correlation_loss_weight_at_epoch(training, 16), 1.0
+        )
+        self.assertAlmostEqual(
+            expected_return_correlation_loss_weight_at_epoch(training, 24), 0.1
+        )
+        self.assertEqual(
+            expected_return_correlation_loss_weight_at_epoch(training, 32), 0.01
+        )
+
+    def test_geometric_keep_dropout_schedule_hits_exact_endpoints(self) -> None:
+        training = {
+            "embeddingDropoutProbability": 0.8,
+            "embeddingDropoutSchedule": {
+                "type": "geometric-keep-probability-v1",
+                "startProbability": 0.8,
+                "endProbability": 0.0,
+                "endEpoch": 256,
+            },
+        }
+        self.assertAlmostEqual(
+            embedding_dropout_probability_at_epoch(training, 0), 0.8
+        )
+        self.assertAlmostEqual(
+            embedding_dropout_probability_at_epoch(training, 128),
+            1.0 - np.sqrt(0.2),
+        )
+        self.assertEqual(
+            embedding_dropout_probability_at_epoch(training, 256), 0.0
+        )
+        self.assertEqual(
+            embedding_dropout_probability_at_epoch(training, 512), 0.0
+        )
+
     def test_training_online_affine_matches_checkpoint_evaluator(self) -> None:
         rng = np.random.default_rng(19)
         history_prediction = rng.normal(size=(80, 3))

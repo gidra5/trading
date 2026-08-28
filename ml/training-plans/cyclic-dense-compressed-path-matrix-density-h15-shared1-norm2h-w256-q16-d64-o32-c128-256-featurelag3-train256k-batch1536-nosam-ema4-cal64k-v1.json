@@ -1,0 +1,90 @@
+{
+  "id": "cyclic-dense-compressed-path-matrix-density-h15-shared1-norm2h-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v1",
+  "label": "Cyclic dense compressed path matrix density - 15 active 1s returns normalized by causal trailing 2h mean/variance - one recurrent block shared across all steps - lag-0/1/2 59-feature state plus normalization statistics - W256 - Q16 - D64 - O32 - DQ128 DO256 compression - 256k clean - batch 1536",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h15-shared1-norm2h-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v1",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "cyclic-dense-compressed-path-matrix-density-v1",
+    "inputFeatureLags": 3,
+    "marketWidth": 256,
+    "pathEmbeddingWidth": 16,
+    "pathCount": 64,
+    "returnCount": 15,
+    "outputKnots": 32,
+    "stageBlockCount": 1,
+    "pathCompressionWidth": 128,
+    "jointCompressionWidth": 256,
+    "marketState": "m0=GNGLU(concat(feature[t-2:t], trailingMean2h, trailingVariance2h),W); one dense recurrent cell is weight-shared across all 15 horizons with a learned absolute-step embedding",
+    "pathWeights": "q_s=softmax(row-dot(P_s,QD_s)/sqrt(Q))",
+    "conditionalReturns": "T_s=row-softmax(P_s R_s/sqrt(Q)); J_s=q_s[:,None] times T_s; p_s=sum_D(J_s)",
+    "pathTransition": "P_s and J_s are independently compressed by the same dense uncapped GNGLUs at every step to 128 and 256 values; P_s+1=shared-dense-GNGLU(concat(compress(P_s),m_s,compress(J_s),point-state_s))",
+    "matrixApproximation": "none; every GNGLU uses dense matrices at expected hidden width floor((input+output)/2)",
+    "outputPoints": "ordered market-conditioned unit-interval knots representing trailing-2h-normalized log returns",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "targetNormalization": {
+    "type": "causal-trailing-log-return-zscore",
+    "windowSeconds": 7200,
+    "population": "all completed one-second log returns including exact zeros",
+    "statisticsInputs": ["mean", "variance"],
+    "varianceFloor": 1e-16,
+    "training": "each complete future path uses the mean and variance available at its origin",
+    "inference": "use the latest complete trailing-window mean and variance for every forecast horizon",
+    "inverse": "rawLogReturn=mean+sqrt(variance)*normalizedLogReturn"
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1536,
+    "evaluationBatchSize": 1024,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": null,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "datasetDir": "data/training/datasets/next-return-production-basis-history3-calibration-tail-64k-v1",
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-trailing-2h-normalized-return-density-k32-v1.json",
+    "fit": 32,
+    "targetFilter": "each start and every path target are exact-nonzero active returns; normalization statistics include zero returns",
+    "trainingLoss": "mean conditional raw-return NLL across 15 steps, evaluated by transforming each target with its causal origin statistics and including the affine Jacobian"
+  }
+}

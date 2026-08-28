@@ -1,0 +1,10 @@
+{
+  "id": "distribution-q-policy-shared1-modelbased-curriculum64-v3",
+  "label": "Model-based recurrent non-normalized shared-one-block distribution Q-policy curriculum",
+  "runIds": [
+    "distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/distribution-q-policy-shared1-modelbased-curriculum64-v3/PAUSE"
+  }
+}

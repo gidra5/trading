@@ -1,0 +1,105 @@
+{
+  "id": "cyclic-dense-compressed-path-matrix-density-h1-shared1-w256-q16-d64-o32-c128-256-union530-basegraph-advinput-rms050-embeddingdrop80to0-geokeep-e48-expcorr1to001-geometric-e16to32-ema4-cal64k-v1",
+  "label": "Cyclic dense compressed path matrix density - 1 active 1s return - one shared block - 530-channel union reconstructed differentiably from primitive histories - adversarial primitive-history RMS strength 0.5 with consistent feature rederivation - W256 - Q16 - D64 - O32 - DQ128 DO256 compression - 256k clean plus equally weighted adversarial train - batch 1536 - first market-embedding dropout geometric keep schedule 80% to 0% at epoch 48 - NLL plus expected-return correlation loss weight held at 1 through epoch 16 then geometric to 0.01 at epoch 32 - no expected-return MSE loss - no SAM - weight EMA 4 epochs - online affine 64k validation",
+  "datasetDir": "data/training/datasets/union530-base-history-30d-v1",
+  "baseHistoryDatasetDir": "data/training/datasets/union530-base-history-30d-v1",
+  "featureHistorySeconds": 1,
+  "examplesBySplit": { "train": 256000, "validation": 65536, "test": 65536 },
+  "runDir": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h1-shared1-w256-q16-d64-o32-c128-256-union530-basegraph-advinput-rms050-embeddingdrop80to0-geokeep-e48-expcorr1to001-geometric-e16to32-ema4-cal64k-v1",
+  "subset": { "type": "fixed-clean-count", "examples": 256000 },
+  "architecture": {
+    "contract": "cyclic-dense-compressed-path-matrix-density-v1",
+    "inputFeatureLags": 1,
+    "marketWidth": 256,
+    "pathEmbeddingWidth": 16,
+    "pathCount": 64,
+    "returnCount": 1,
+    "outputKnots": 32,
+    "stageBlockCount": 1,
+    "pathCompressionWidth": 128,
+    "jointCompressionWidth": 256,
+    "marketState": "m0=dropout(epoch,GNGLU(normalize(feature_graph(primitive_history[t])),W)); keep(epoch)=0.2*5^(min(epoch,48)/48); dropout(epoch)=1-keep(epoch), then 0 after epoch 48; one dense shared block emits the single next-active-return density",
+    "pathWeights": "q_0=softmax(row-dot(P_0,QD_0)/sqrt(Q))",
+    "conditionalReturns": "T_0=row-softmax(P_0 R_0/sqrt(Q)); J_0=q_0[:,None] times T_0; p_0=sum_D(J_0)",
+    "pathTransition": "The shared dense recurrent cell is retained from the H15 architecture but the supervised H1 rollout consumes only its first emission",
+    "matrixApproximation": "none; every GNGLU uses dense matrices at expected hidden width floor((input+output)/2)",
+    "outputPoints": "ordered market-conditioned unit-interval knots initialized from the fixed global 32-knot grid",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1536,
+    "evaluationBatchSize": 1024,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0.8,
+    "embeddingDropoutSchedule": {
+      "type": "geometric-keep-probability-v1",
+      "startProbability": 0.8,
+      "endProbability": 0,
+      "endEpoch": 48
+    },
+    "expectedReturnCorrelationLossWeight": 1,
+    "expectedReturnCorrelationLossWeightSchedule": {
+      "type": "geometric-v1",
+      "startWeight": 1,
+      "endWeight": 0.01,
+      "startEpoch": 16,
+      "endEpoch": 32
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": { "betas": [0.9, 0.999], "epsilon": 1e-8, "weightDecay": 0 }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": {
+      "type": "base-history-projected-gradient-ascent-v1",
+      "space": "per-source-field-standardized-primitive-history",
+      "norm": "rms-l2",
+      "epsilonRms": 0.5,
+      "steps": 1,
+      "stepSizeRms": 0.5,
+      "randomStart": false,
+      "adversarialWeight": 0.5,
+      "attackExamples": 1536,
+      "sharedCausalTimeline": true,
+      "derivedFeatures": "recomputed-after-primitive-projection",
+      "target": "unchanged-next-return"
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "source": "trailing-union-train",
+    "examples": 64000,
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "targetFilter": "each start and the single target are exact-nonzero active returns",
+    "trainingLoss": "equal mixture of clean and primitive-history adversarial one-step dynamic marginal return-density NLL plus expected-return correlation loss with weight held at 1 through epoch 16 then geometrically decreasing to 0.01 at epoch 32"
+  }
+}

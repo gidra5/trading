@@ -1,0 +1,149 @@
+{
+  "id": "structured-production59-base17-attn8q256-k2-balanced-r50-d25-p25-bmask-train256k-b10240-ema4-v1",
+  "label": "Structured shared-IO feature process - production59 primitive-consistent causal rollout - layer 8 causal self-attention Q256 K256 V256 O256 - K1 2x1s input x 59 - K2 2x1s primitive output x 17 rederived to 59 - balanced 50% return / 25% other derived / 25% direct primitive MSE - minute primitives boundary-masked - W256 - M128 - P128 - F128 - PF256 - NF256 - 256k clean - batch 10240 train and evaluation - no regularization - weight EMA 4 epochs",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "baseHistoryDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/structured-production59-base17-attn8q256-k2-balanced-r50-d25-p25-bmask-train256k-b10240-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "each parenthesized number is one exact shared module reused at every matching block; layers other than 8 remain GNGLUs, while layer 8 is one shared causal self-attention module",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 causally self-attends over the generated NF-state prefix to emit expected W; shared layer 2 decodes W only to 17 primitive causal coordinates; differentiable fixed code reconstructs the complete future production59 state",
+    "baseConsistency": "BTC one-second candle geometry, return activity, aggregate trade flow, aggressor side, spot volume, completed futures-minute state, and ETH minute return are decoded once; every affected production channel is derived from the same predicted primitive history",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "balanced-return-derived-primitive-production59-mse-v1",
+      "description": "50% standardized two-step return MSE, 25% standardized MSE over the other 58 derived production channels, and 25% standardized direct primitive-coordinate MSE; the three minute-cadence primitive coordinates are supervised only when that output step completes a minute",
+      "weights": {
+        "return": 0.5,
+        "otherDerivedFeatures": 0.25,
+        "primitiveCoordinates": 0.25
+      },
+      "primitiveSupervision": {
+        "fastCoordinateIds": [
+          "btc-log-return-1s",
+          "btc-return-active-logit",
+          "btc-range-active-logit",
+          "btc-open-gap-log-return-1s",
+          "btc-high-excess-log-bps",
+          "btc-low-excess-log-bps",
+          "spot-buy-quote-volume-log",
+          "spot-sell-quote-volume-log",
+          "spot-buy-aggregate-count-log",
+          "spot-sell-aggregate-count-log",
+          "spot-last-side-sell-logit",
+          "spot-last-side-none-logit",
+          "spot-last-side-buy-logit",
+          "spot-base-volume-log"
+        ],
+        "boundaryCoordinatePeriodsSeconds": {
+          "btc-futures-minute-log-trade-count": 60,
+          "btc-futures-minute-range-log-bps": 60,
+          "eth-minute-log-return": 60
+        }
+      }
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "the exact original production59 dense chronological nonzero-target population",
+    "comparisonControl": "identical sample origins, K1/K2, latent widths, attention layer, optimizer, examples, batches, and EMA as the base-output attention predecessor; only the training objective changes"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "pooled two-step complete derived 59-feature state",
+    "comparableMetrics": "step-1 and per-step return metrics remain directly comparable to the direct-output and base-output production59 runs"
+  },
+  "alignment": {
+    "input": "the same two consecutive production59 timeline rows ending at each control example origin",
+    "target": "the same two complete chronological production59 rows at origin+1 and origin+2",
+    "causalDerivation": "only predicted primitive coordinates and observed history through the input origin enter changing future channels; predicted step 1 updates rolling state before step 2; no observed future derived feature is consumed",
+    "primitiveSupervision": "all per-second primitive coordinates are directly standardized and supervised; futures-minute and ETH-minute primitive coordinates receive direct loss only at their causal completion boundary; the hourly volume feature has no separate future primitive and remains derived from the causally accumulated per-second spot-volume coordinate",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s"
+  }
+}

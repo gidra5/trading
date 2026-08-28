@@ -1,0 +1,53 @@
+{
+  "id": "distribution-q-policy-logprice-norm2h-shared1-a33-s256-fqi-v1",
+  "label": "Frozen shared-one-block path distribution to 256-state full-information fitted-Q policy - 33 exposures - exact log-wealth reward - 17.5 bps friction",
+  "runDir": "data/training/runs/distribution-q-policy-logprice-norm2h-shared1-a33-s256-fqi-v1",
+  "cacheDir": "data/training/cache/distribution-q-policy-logprice-norm2h-shared1-a33-s256-fqi-v1",
+  "transition": {
+    "planFile": "ml/training-plans/cyclic-dense-compressed-path-matrix-density-h15-shared1-logprice-norm2h-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v1.json",
+    "checkpoint": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h15-shared1-logprice-norm2h-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v1/checkpoints/epoch-128.json",
+    "selection": "epoch-128-last-after-complete-evaluation",
+    "frozen": true,
+    "batchSize": 1536,
+    "representation": "for every one of 15 marginals concatenate all 32 component probabilities, all 32 learned component return values in bps, expectation, and entropy; append log causal scale"
+  },
+  "architecture": {
+    "contract": "frozen-path-distribution-full-information-fitted-q-v1",
+    "returnCount": 15,
+    "knotCount": 32,
+    "distributionFeatureWidth": 991,
+    "stateWidth": 256,
+    "actionCount": 33,
+    "network": "one GNGLU maps the complete frozen distribution to a shared 256-value state; one linear head emits post-rebalance Q-bar for every exposure"
+  },
+  "actionSpace": {
+    "type": "target-marked-exposure-grid",
+    "minimumExposure": -1.0,
+    "maximumExposure": 1.0,
+    "policy": "argmax_a(rebalanceLogReward(currentExposure,a)+Qbar(distributionState,a))"
+  },
+  "rl": {
+    "objective": "full-information-double-fitted-q-huber",
+    "discount": 0.995,
+    "frictionBps": 17.5,
+    "reward": "exact log wealth: rebalance friction plus passive holding return",
+    "portfolioTransition": "exact marked-exposure drift after each realized active return",
+    "counterfactualActions": "every historical transition supervises all 33 actions; no behavior-policy action extrapolation",
+    "target": "Double-Q action selection with Polyak target evaluation"
+  },
+  "training": {
+    "epochs": 128,
+    "batchSize": 4096,
+    "learningRate": 0.0003,
+    "weightDecay": 0.0001,
+    "targetUpdateTau": 0.01,
+    "gradientClip": 10.0,
+    "evaluationIntervalEpochs": 4,
+    "seed": 1337,
+    "device": "cuda"
+  },
+  "selection": {
+    "metric": "validationNetLogReturnBps",
+    "testPolicy": "sealed until the best validation checkpoint is selected"
+  }
+}

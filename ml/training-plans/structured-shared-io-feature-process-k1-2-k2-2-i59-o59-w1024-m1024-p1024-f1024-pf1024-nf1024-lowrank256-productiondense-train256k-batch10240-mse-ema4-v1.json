@@ -1,0 +1,93 @@
+{
+  "id": "structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w1024-m1024-p1024-f1024-pf1024-nf1024-lowrank256-productiondense-train256k-batch10240-mse-ema4-v1",
+  "label": "Structured shared-IO feature process - all latent widths 1024 - rank-256 trainable low-rank GNGLU maps - original production-basis dense nonzero-target dataset - K1 2x1s input x 59 - K2 2x1s output x 59 - standardized next-feature MSE - 256k clean - batch 10240 train and evaluation - no regularization - weight EMA 4 epochs",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w1024-m1024-p1024-f1024-pf1024-nf1024-lowrank256-productiondense-train256k-batch10240-mse-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 1024,
+    "marketWidth": 1024,
+    "prefixWidth": 1024,
+    "featureDistributionWidth": 1024,
+    "extendedPrefixWidth": 1024,
+    "nextFeatureDistributionWidth": 1024,
+    "linearFactorization": {
+      "type": "trainable-low-rank-v1",
+      "rank": 256,
+      "scope": "projection, value transform, gate transform, and output map in every numbered and unnumbered GNGLU block",
+      "rankCeiling": "each matrix uses min(256,input width,output width), so the 59-wide IO boundaries retain their complete attainable rank without redundant factors",
+      "identityBase": "value/gate transforms and rectangular output maps use fixed identity bases plus trainable low-rank residuals"
+    },
+    "numberedLayerSharing": "each parenthesized number in the diagram is one exact GNGLU module instance reused at every matching input/output block",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 maps NF to expected W; shared layer 2 decodes W to the complete next-second O-feature state",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings in this experiment; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "mean MSE over both predicted output steps and all 59 feature channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "original dense chronological clean-origin dataset with exact-zero next-return targets excluded",
+    "comparisonControl": "same K1/K2, optimizer, loss, examples, batches, and EMA as the all-512 predecessor; every latent width doubles to 1024 while all GNGLU matrices use trainable rank-256 factorization"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "pooled two-step complete 59-feature state"
+  },
+  "alignment": {
+    "input": "two consecutive timeline rows ending at each clean example origin",
+    "target": "the two complete chronological timeline rows at origin+1 and origin+2",
+    "futureExtension": "K1 uses consecutive rows ending at origin; K2 uses consecutive rows starting at origin+1"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "distribution-q-policy-shared1-joint-curriculum64-v2",
+  "label": "Joint non-normalized shared-one-block distribution Q-policy curriculum",
+  "plans": [
+    "ml/training-plans/distribution-q-policy-shared1-joint-curriculum64-a33-s256-v2.json"
+  ],
+  "pauseFile": "data/training/matrices/distribution-q-policy-shared1-joint-curriculum64-v2/PAUSE",
+  "execution": "sequential"
+}

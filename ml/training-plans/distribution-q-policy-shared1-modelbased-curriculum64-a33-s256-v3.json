@@ -1,0 +1,67 @@
+{
+  "id": "distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3",
+  "label": "Model-based recurrent raw-log-return shared-one-block path-density Q policy - 33 exposures - 64-epoch gamma/friction curriculum",
+  "runDir": "data/training/runs/distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "transition": {
+    "planFile": "ml/training-plans/cyclic-dense-compressed-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v2.json",
+    "checkpoint": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v2/checkpoints/selections/validation-nll.json",
+    "selection": "validation-nll-epoch-72",
+    "frozen": false,
+    "statisticsExamples": 8192,
+    "representation": "at one recurrent phase concatenate the conditioned 256-value market embedding, all 64x16 path embeddings, the 32 one-step probabilities, 32 learned component log-return values in bps, expectation, and entropy"
+  },
+  "architecture": {
+    "contract": "joint-path-distribution-model-based-fitted-q-v3",
+    "returnCount": 15,
+    "knotCount": 32,
+    "recurrentQFeatureWidth": 1346,
+    "stateWidth": 256,
+    "actionCount": 33,
+    "network": "the checkpoint-compatible cyclic density model emits and advances its full market+path recurrent state; one shared GNGLU projects state plus its one-step marginal to 256 values; one live-gradient linear head emits post-rebalance Q-bar for every exposure"
+  },
+  "actionSpace": {
+    "type": "target-marked-exposure-grid",
+    "minimumExposure": -1.0,
+    "maximumExposure": 1.0,
+    "policy": "argmax_a(rebalanceLogReward(currentExposure,a)+Qbar(recurrentState,a))"
+  },
+  "rl": {
+    "objective": "joint-density-regularized-model-based-distribution-integrated-double-fitted-q-huber",
+    "discountSchedule": {
+      "type": "linear",
+      "start": 0.01,
+      "end": 1.0,
+      "epochs": 64
+    },
+    "frictionScheduleBps": {
+      "type": "linear",
+      "start": 0.01,
+      "end": 17.5,
+      "epochs": 64
+    },
+    "reward": "expected exact log wealth integrated over the current learned one-second return mixture",
+    "marketTransition": "the density model's own shared recurrent market and path transition; no historical next feature row is used in a Bellman target",
+    "portfolioTransition": "exact marked-exposure drift for each return-mixture component",
+    "counterfactualActions": "every predicted transition supervises all 33 actions; recurrent phases 0..14 cycle across batches",
+    "target": "Double-Q action selection with Polyak target evaluation over the next predicted latent state; repeated one-second Bellman backups provide the long-horizon value"
+  },
+  "training": {
+    "epochs": 128,
+    "batchSize": 1536,
+    "learningRate": 0.0003,
+    "transitionLearningRate": 0.00001,
+    "transitionDensityLossWeight": 0.01,
+    "weightDecay": 0.0001,
+    "targetUpdateTau": 0.01,
+    "gradientClip": 10.0,
+    "evaluationIntervalEpochs": 4,
+    "seed": 1337,
+    "device": "cuda",
+    "compile": false
+  },
+  "selection": {
+    "metric": "validationNetLogReturnBpsAtTargetSchedule",
+    "testPolicy": "sealed until the best target-schedule validation checkpoint is selected"
+  }
+}

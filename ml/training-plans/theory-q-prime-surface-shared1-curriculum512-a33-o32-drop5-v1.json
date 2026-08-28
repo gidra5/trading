@@ -1,0 +1,76 @@
+{
+  "id": "theory-q-prime-surface-shared1-curriculum512-a33-o32-drop5-v1",
+  "label": "Theory q' recurrent return-action surface - NLSE curriculum T1s to 900s - friction 0 to 17.5bps - dropout 5%",
+  "runDir": "data/training/runs/theory-q-prime-surface-shared1-curriculum512-a33-o32-drop5-v1",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "transition": {
+    "sourceRunId": "distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3",
+    "requiredResult": "data/training/runs/distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3/state/result.json",
+    "checkpoint": "data/training/runs/distribution-q-policy-shared1-modelbased-curriculum64-a33-s256-v3/checkpoints/best-validation-net.json",
+    "basePlanFile": "ml/training-plans/cyclic-dense-compressed-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v2.json",
+    "baseCheckpoint": "data/training/runs/cyclic-dense-compressed-path-matrix-density-h15-shared1-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v2/checkpoints/selections/validation-nll.json",
+    "trainable": true,
+    "densityLossWeight": 0.01,
+    "state": "the complete checkpoint-compatible recurrent market and path state advances by its learned shared one-second transition"
+  },
+  "architecture": {
+    "contract": "recurrent-return-action-q-prime-surface-v1",
+    "marketWidth": 256,
+    "returnKnots": 32,
+    "actionCount": 33,
+    "dropout": 0.05,
+    "output": "one GNGLU maps the recurrent market embedding W to an O x A q' surface; the return axis uses piecewise-linear reconstruction on the density model's learned component-return grid and the action axis is uniform on [-1,1]",
+    "policy": "integrate the q' surface over the predicted return marginal, add the exact current-exposure rebalance log reward, then argmax over the uniform exposure grid"
+  },
+  "actionSpace": {
+    "type": "uniform-target-exposure-grid",
+    "minimumExposure": -1.0,
+    "maximumExposure": 1.0,
+    "count": 33
+  },
+  "rl": {
+    "estimatedFunction": "q'(market log-return state, target exposure); current portfolio state enters only through the exact rebalance reward outside q'",
+    "objective": "probability-weighted squared Bellman error over the complete O x A surface",
+    "continuation": "uniform-action normalized temperature-scaled log-sum-exp of log R(portfolio transition) + q' at the predicted next recurrent market state",
+    "rewardUnits": "raw log wealth",
+    "temperature": {
+      "epochs": [0, 63],
+      "start": 0.5,
+      "end": 0.01,
+      "interpolation": "geometric"
+    },
+    "difficulty": {
+      "epochs": [64, 511],
+      "temperature": 0.01,
+      "frictionBps": { "start": 1.0, "end": 17.5, "interpolation": "geometric" },
+      "horizonSeconds": { "start": 1.0, "end": 900.0, "interpolation": "geometric" },
+      "stepFractionOfHorizon": { "start": 1.0, "end": 0.06666666666666667, "interpolation": "geometric" },
+      "stepSeconds": { "start": 1.0, "end": 60.0, "interpolation": "geometric" },
+      "effectiveSteps": { "start": 1.0, "end": 15.0 },
+      "discount": "(N-1)/(N+1), from 0 to 14/16"
+    },
+    "nlse": "tau_eff * (logsumexp(value/tau_eff) - log(actionCount)), tau_eff=tau*sqrt(N)"
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1280,
+    "learningRate": 0.0003,
+    "transitionLearningRate": 0.00001,
+    "transitionDensityLossWeight": 0.01,
+    "weightDecay": 0.0001,
+    "targetUpdateTau": 0.01,
+    "gradientClip": 10.0,
+    "evaluationIntervalEpochs": 4,
+    "seed": 7331,
+    "device": "cuda",
+    "compile": false,
+    "resumeCompatiblePlanSha256": [
+      "467cb01b4a61cd7ed238043d84aadaa618087bd517288ec9ee4698aad63aebf7"
+    ]
+  },
+  "selection": {
+    "metric": "validationNetLogReturnBpsAtFinalTargetSchedule",
+    "validationSchedule": "every 4 epochs at temperature 0.01, friction 17.5bps, T=900s, dt=60s",
+    "testPolicy": "sealed until the best final-target validation checkpoint is selected"
+  }
+}

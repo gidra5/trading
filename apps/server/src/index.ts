@@ -141,14 +141,17 @@ server.get("/api/mlp-training/metrics", async (request, reply) => {
   }
 });
 
-server.get("/api/mlp-training/comparison", async (request, reply) => {
-  const query = request.query as { runs?: string };
-  const runKeys = query.runs?.split(",").map((value) => value.trim()).filter(Boolean) ?? [];
-  if (runKeys.length < 1 || runKeys.length > 4
-    || runKeys.some((runKey) => runKey.length > 512)
+server.post("/api/mlp-training/comparison", async (request, reply) => {
+  const body = request.body as { runs?: unknown } | undefined;
+  const runKeys = Array.isArray(body?.runs)
+    ? body.runs.filter((value): value is string => typeof value === "string")
+    : [];
+  if (runKeys.length < 1
+    || runKeys.length !== (Array.isArray(body?.runs) ? body.runs.length : 0)
+    || runKeys.some((runKey) => runKey.length < 1 || runKey.length > 512)
     || new Set(runKeys).size !== runKeys.length) {
     return reply.code(400).send({
-      error: "runs must contain between 1 and 4 distinct training run keys.",
+      error: "runs must contain one or more distinct training run keys.",
     });
   }
   try {
