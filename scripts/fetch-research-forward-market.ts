@@ -14,26 +14,19 @@ import {
 } from "@trading/storage";
 import { parseArchive } from "./fetch-binance-spot-agg-trades.js";
 import {
-  officialKlineSource,
   parseKlinesArchive,
 } from "./fetch-binance-usdm-klines.js";
 import { parseMetricsArchive } from "./fetch-binance-usdm-metrics.js";
 
-const SYMBOL = "BTCUSDT";
 const DAY_MS = 86_400_000;
 const SOURCES = ["spot-flow", "futures-klines", "futures-metrics"] as const;
 type Source = typeof SOURCES[number];
-
-const NAMESPACES: Record<Source, string> = {
-  "spot-flow": "research/trade-flow/spot-btcusdt/btcusdt/1s",
-  "futures-klines": "research/derivatives-klines/usdm-futures/btcusdt/1m",
-  "futures-metrics": "research/derivatives-metrics/usdm-futures/btcusdt/5m",
-};
 
 export async function run(args = process.argv.slice(2)): Promise<void> {
   if (args.includes("--help")) {
     console.log(`Usage: npm run fetch:research-forward-market -- [options]
 
+  --symbol BTCUSDT                  Binance symbol
   --ranges START..END,...           Inclusive UTC date ranges
   --only YYYY-MM-DD,...             Explicit UTC dates
   --sources spot-flow,futures-klines,futures-metrics
@@ -55,22 +48,25 @@ This command writes to research-only namespaces and never changes the sealed ora
     if (!SOURCES.includes(source)) throw new Error(`Unsupported source: ${source}`);
   }
   const quiet = args.includes("--quiet");
+  const symbol = (value("--symbol") ?? "BTCUSDT").toUpperCase();
+  if (!/^[A-Z0-9]{4,30}$/.test(symbol)) throw new Error(`Invalid symbol: ${symbol}`);
+  const namespaces = namespacesFor(symbol);
   const layout = new TradingStorageLayout(path.resolve(value("--data-dir") ?? "data"));
   const store = new SequentialShardStore(layout.marketStore);
-  const temporary = path.join(layout.marketTmp, "research-forward-market", SYMBOL.toLowerCase());
+  const temporary = path.join(layout.marketTmp, "research-forward-market", symbol.toLowerCase());
   await fs.mkdir(temporary, { recursive: true });
   const result: Record<Source, { stored: number; cached: number }> = Object.fromEntries(
     SOURCES.map((source) => [source, { stored: 0, cached: 0 }]),
   ) as Record<Source, { stored: number; cached: number }>;
   for (const date of dates) {
     for (const source of sources) {
-      if (await cached(store, NAMESPACES[source], date, source)) {
+      if (await cached(store, namespaces[source], date, source)) {
         result[source].cached += 1;
         continue;
       }
-      if (source === "spot-flow") await ingestSpotFlow(store, temporary, date);
-      if (source === "futures-klines") await ingestFuturesKlines(store, date);
-      if (source === "futures-metrics") await ingestFuturesMetrics(store, date);
+      if (source === "spot-flow") await ingestSpotFlow(store, temporary, date, symbol, namespaces);
+      if (source === "futures-klines") await ingestFuturesKlines(store, date, symbol, namespaces);
+      if (source === "futures-metrics") await ingestFuturesMetrics(store, date, symbol, namespaces);
       result[source].stored += 1;
       if (!quiet) console.log(`${date}: stored ${source}`);
     }
@@ -84,21 +80,23 @@ async function ingestSpotFlow(
   store: SequentialShardStore,
   temporary: string,
   date: string,
+  symbol: string,
+  namespaces: Record<Source, string>,
 ): Promise<void> {
-  const archiveName = `${SYMBOL}-aggTrades-${date}.zip`;
-  const csvName = `${SYMBOL}-aggTrades-${date}.csv`;
-  const url = `https://data.binance.vision/data/spot/daily/aggTrades/${SYMBOL}/${archiveName}`;
+  const archiveName = `${symbol}-aggTrades-${date}.zip`;
+  const csvName = `${symbol}-aggTrades-${date}.csv`;
+  const url = `https://data.binance.vision/data/spot/daily/aggTrades/${symbol}/${archiveName}`;
   const checksum = await fetchChecksum(url);
   const archiveFile = path.join(temporary, archiveName);
   try {
     const bytes = await downloadVerified(url, archiveFile, checksum);
     const parsed = await parseArchive(archiveFile, csvName, date);
     await putTradeFlowShard(store, {
-      namespace: NAMESPACES["spot-flow"],
+      namespace: namespaces["spot-flow"],
       key: date,
       seconds: parsed.seconds,
       stepMs: 1_000,
-      metadata: researchMetadata("spot-flow", url, checksum, bytes, {
+      metadata: researchMetadata("spot-flow", url, checksum, bytes, symbol, {
         sourceCsvRows: parsed.csvRows,
         sourceCsvBytes: parsed.csvBytes,
         sourceTimestampUnit: parsed.timestampUnit,
@@ -112,17 +110,21 @@ async function ingestSpotFlow(
 async function ingestFuturesKlines(
   store: SequentialShardStore,
   date: string,
+  symbol: string,
+  namespaces: Record<Source, string>,
 ): Promise<void> {
-  const source = officialKlineSource(date);
-  const checksum = await fetchChecksum(source.url);
-  const archive = await requestBuffer(source.url, 8_000_000);
-  verifyChecksum(source.url, archive, checksum);
-  const parsed = parseKlinesArchive(archive, source.csvName, date);
+  const archiveName = `${symbol}-1m-${date}.zip`;
+  const csvName = `${symbol}-1m-${date}.csv`;
+  const url = `https://data.binance.vision/data/futures/um/daily/klines/${symbol}/1m/${archiveName}`;
+  const checksum = await fetchChecksum(url);
+  const archive = await requestBuffer(url, 8_000_000);
+  verifyChecksum(url, archive, checksum);
+  const parsed = parseKlinesArchive(archive, csvName, date);
   await putDerivativesKlinesShard(store, {
-    namespace: NAMESPACES["futures-klines"],
+    namespace: namespaces["futures-klines"],
     key: date,
     rows: parsed.rows,
-    metadata: researchMetadata("futures-klines", source.url, checksum, archive.byteLength, {
+    metadata: researchMetadata("futures-klines", url, checksum, archive.byteLength, symbol, {
       sourceCsvRows: parsed.sourceCsvRows,
       observedGridRows: parsed.observedGridRows,
       missingGridRows: parsed.missingGridRows,
@@ -135,20 +137,22 @@ async function ingestFuturesKlines(
 async function ingestFuturesMetrics(
   store: SequentialShardStore,
   date: string,
+  symbol: string,
+  namespaces: Record<Source, string>,
 ): Promise<void> {
-  const archiveName = `${SYMBOL}-metrics-${date}.zip`;
-  const csvName = `${SYMBOL}-metrics-${date}.csv`;
-  const url = `https://data.binance.vision/data/futures/um/daily/metrics/${SYMBOL}/${archiveName}`;
+  const archiveName = `${symbol}-metrics-${date}.zip`;
+  const csvName = `${symbol}-metrics-${date}.csv`;
+  const url = `https://data.binance.vision/data/futures/um/daily/metrics/${symbol}/${archiveName}`;
   const checksum = await fetchChecksum(url);
   const archive = await requestBuffer(url, 2_000_000);
   verifyChecksum(url, archive, checksum);
-  const parsed = parseMetricsArchive(archive, csvName, date);
+  const parsed = parseMetricsArchive(archive, csvName, date, symbol);
   await putDerivativesMetricsShard(store, {
-    namespace: NAMESPACES["futures-metrics"],
+    namespace: namespaces["futures-metrics"],
     key: date,
     rows: parsed.rows,
     stepMs: 300_000,
-    metadata: researchMetadata("futures-metrics", url, checksum, archive.byteLength, {
+    metadata: researchMetadata("futures-metrics", url, checksum, archive.byteLength, symbol, {
       sourceCsvRows: parsed.sourceCsvRows,
       observedGridRows: parsed.observedGridRows,
       missingGridRows: parsed.missingGridRows,
@@ -162,6 +166,7 @@ function researchMetadata(
   url: string,
   checksum: string,
   bytes: number,
+  symbol: string,
   extra: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
@@ -172,7 +177,17 @@ function researchMetadata(
     sourceArchiveBytes: bytes,
     researchOnly: true,
     sealedOracleCorpus: false,
+    symbol,
     ...extra,
+  };
+}
+
+function namespacesFor(symbol: string): Record<Source, string> {
+  const normalized = symbol.toLowerCase();
+  return {
+    "spot-flow": `research/trade-flow/spot-${normalized}/${normalized}/1s`,
+    "futures-klines": `research/derivatives-klines/usdm-futures/${normalized}/1m`,
+    "futures-metrics": `research/derivatives-metrics/usdm-futures/${normalized}/5m`,
   };
 }
 

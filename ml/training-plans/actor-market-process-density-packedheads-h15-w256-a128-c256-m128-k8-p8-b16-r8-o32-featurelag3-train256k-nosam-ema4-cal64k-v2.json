@@ -1,0 +1,83 @@
+{
+  "id": "actor-market-process-density-packedheads-h15-w256-a128-c256-m128-k8-p8-b16-r8-o32-featurelag3-train256k-nosam-ema4-cal64k-v2",
+  "label": "Batched recurrent actor-market density - H15 - W256/A128/C256/M128 - packed linear actor heads - K1=K2=8 - P=R=8/B=16 - O32 - 256k clean",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/actor-market-process-density-packedheads-h15-w256-a128-c256-m128-k8-p8-b16-r8-o32-featurelag3-train256k-nosam-ema4-cal64k-v2",
+  "historyDir": "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "recurrent-actor-market-process-density-packed-linear-heads-v2",
+    "inputFeatureLags": 3,
+    "embeddingWidth": 256,
+    "actorWidth": 128,
+    "actorDecisionWidth": 256,
+    "marketWidth": 128,
+    "actorCount": 8,
+    "marketCount": 8,
+    "actionCount": 8,
+    "actionBasisWidth": 16,
+    "rewardWidth": 8,
+    "returnCount": 15,
+    "outputKnots": 32,
+    "certaintyMaximum": 0.95,
+    "stateInitialization": "z=GNGLU(concat(feature[t-2:t]),W); actors=GNGLU(z,K1*A); markets=GNGLU(z,K2*M)",
+    "quadratureOrder": 16,
+    "marketProcess": "one shared cell per horizon; actor slots flatten to batch*K1 for one A-to-C GNGLU and one packed linear decision projection; market slots flatten to batch*K2 for one transition call",
+    "outputDistribution": "GNGLU(flatten(markets),W) followed by one packed linear projection to mass logits q and ordered triangular-basis point parameters o; expectation is q dot component means",
+    "actorCertainty": "actor-specific learned minimum top-action probability in [1/P,0.95] applied to every actor-market P-way cosine distribution",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 512,
+    "evaluationBatchSize": 512,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "adversarialInput": null,
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "validationCalibration": {
+    "type": "online-affine-log-per-step",
+    "datasetDir": "data/training/datasets/next-return-production-basis-history3-calibration-tail-64k-v1",
+    "windowActiveReturns": 64000,
+    "ridge": 0,
+    "causal": true,
+    "usedForCheckpointSelection": ["validation-mse", "validation-correlation"]
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "targetFilter": "each start and every path target are exact-nonzero active returns",
+    "trainingLoss": "mean dynamic marginal return-density NLL across 15 recurrent steps"
+  }
+}

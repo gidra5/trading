@@ -142,11 +142,17 @@ export async function run(args = process.argv.slice(2)) {
   mempool.rows.sort((left, right) => left.availableAt - right.availableAt);
   community.rows.sort((left, right) => left.availableAt - right.availableAt);
 
+  const candidates = buildCandidates(dvol.rows, vix.rows, macro.rows, funding.rows, coinMetrics.rows, community.rows, mempool.rows);
+  const recentExport = value("--export-recent");
+  if (recentExport) {
+    const result = exportRecentCandidateMatrix(resolve(recentExport), candidates);
+    console.log(`Wrote ${path.relative(repoRoot, result.manifest)}`);
+    return result;
+  }
   console.error("Loading aligned primary candle segment...");
   const primary = loadSegment(PRIMARY_START, PRIMARY_END, 31);
   console.error("Loading aligned transfer candle segment...");
   const transfer = loadSegment(TRANSFER_START, TRANSFER_END, 31);
-  const candidates = buildCandidates(dvol.rows, vix.rows, macro.rows, funding.rows, coinMetrics.rows, community.rows, mempool.rows);
   const groups: GroupResult[] = [];
   const horizons = [1, 5, 15, 30, 60];
   const sourceGroups: Array<{ id: string; source: CandidateDefinition["source"]; horizons: number[] }> = [
@@ -256,6 +262,52 @@ export async function run(args = process.argv.slice(2)) {
   console.log(`Wrote ${path.relative(repoRoot, output)}`);
   console.log(`Wrote ${path.relative(repoRoot, report)}`);
   return artifact;
+}
+
+function exportRecentCandidateMatrix(outputDirectory: string, candidates: CandidateDefinition[]) {
+  const baseDirectory = resolve("data/runtime-cache/global-feature-basis-30d");
+  const baseManifest = JSON.parse(fs.readFileSync(path.join(baseDirectory, "manifest.json"), "utf8")) as {
+    datasets: Array<{ rows: number; files: { times: string } }>;
+  };
+  const dataset = baseManifest.datasets[0]!;
+  const timeBuffer = fs.readFileSync(path.join(baseDirectory, dataset.files.times));
+  const times = new Float64Array(
+    timeBuffer.buffer,
+    timeBuffer.byteOffset,
+    Math.floor(timeBuffer.byteLength / Float64Array.BYTES_PER_ELEMENT),
+  );
+  if (times.length !== dataset.rows) throw new Error("Recent origin-time count mismatch");
+  const startDay = new Date(times[0]!).toISOString().slice(0, 10);
+  const finalDay = new Date(times[times.length - 1]!).toISOString().slice(0, 10);
+  console.error(`Loading recent public-feature candle segment ${startDay} through ${finalDay}...`);
+  const segment = loadSegment(startDay, finalDay, 31);
+  const values = new Float32Array(times.length * candidates.length).fill(Number.NaN);
+  for (let row = 0; row < times.length; row += 1) {
+    const time = times[row]!;
+    const index = Math.floor((time - segment.firstTime) / MINUTE_MS);
+    for (let feature = 0; feature < candidates.length; feature += 1) {
+      values[row * candidates.length + feature] = candidates[feature]!.value(segment, index, time);
+    }
+    if ((row + 1) % 5_000 === 0 || row + 1 === times.length) {
+      console.error(`Recent external export ${row + 1}/${times.length} origins`);
+    }
+  }
+  fs.mkdirSync(outputDirectory, { recursive: true });
+  const matrix = path.join(outputDirectory, "features.f32");
+  fs.writeFileSync(matrix, Buffer.from(values.buffer, values.byteOffset, values.byteLength));
+  const manifest = path.join(outputDirectory, "manifest.json");
+  fs.writeFileSync(manifest, `${JSON.stringify({
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    source: "scripts/analyze-public-external-feature-information.ts buildCandidates",
+    sourceOrigins: "data/runtime-cache/global-feature-basis-30d",
+    rows: times.length,
+    columns: candidates.length,
+    dtype: "<f4",
+    file: path.basename(matrix),
+    features: candidates.map(({ value: _value, ...definition }) => definition),
+  }, null, 2)}\n`, "utf8");
+  return { manifest, matrix, rows: times.length, columns: candidates.length };
 }
 
 function analyzeGroup(

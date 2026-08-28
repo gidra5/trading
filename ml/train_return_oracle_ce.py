@@ -1810,10 +1810,9 @@ def train(
     centering_matrices = tuple(
         normalizer.weight
         for normalizer in model.value_centering_normalizers
+        if normalizer.weight is not None
     )
-    centering_is_learnable = any(
-        matrix.requires_grad for matrix in centering_matrices
-    )
+    centering_is_learnable = bool(centering_matrices)
     last_checkpoint = reporter.run_dir / "checkpoints" / "last.json"
     best_checkpoint = reporter.run_dir / "checkpoints" / "best.json"
     if checkpoint_exists(last_checkpoint):

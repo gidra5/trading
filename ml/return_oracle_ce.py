@@ -53,7 +53,7 @@ def distribution_layer_components(hidden: Tensor) -> tuple[Tensor, Tensor]:
 
 
 class LearnableCenteringNorm(nn.Module):
-    """Apply learnable centering and a positive learned-radius RMS family."""
+    """Apply fixed or learnable centering and a learned-radius RMS family."""
 
     def __init__(
         self,
@@ -62,6 +62,7 @@ class LearnableCenteringNorm(nn.Module):
         denominator_family: str = "sqrt",
         initial_scale: float = BRANCH_NORMALIZATION_INITIAL_RADIUS,
         minimum_scale: float = 1e-4,
+        learnable_centering: bool = True,
     ) -> None:
         super().__init__()
         if width <= 0:
@@ -80,22 +81,51 @@ class LearnableCenteringNorm(nn.Module):
         self.denominator_family = denominator_family
         self.initial_scale = float(initial_scale)
         self.minimum_scale = float(minimum_scale)
-        self.weight = nn.Parameter(torch.empty(width, width))
+        self.learnable_centering = bool(learnable_centering)
+        if self.learnable_centering:
+            self.weight = nn.Parameter(torch.empty(width, width))
+        else:
+            self.register_parameter("weight", None)
         self.raw_scale = nn.Parameter(torch.empty(()))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         width = self.normalized_shape[0]
-        with torch.no_grad():
-            self.weight.copy_(
-                torch.eye(width, device=self.weight.device)
-                - torch.full(
-                    (width, width),
-                    1.0 / width,
-                    device=self.weight.device,
+        if self.weight is not None:
+            with torch.no_grad():
+                self.weight.copy_(
+                    torch.eye(width, device=self.weight.device)
+                    - torch.full(
+                        (width, width),
+                        1.0 / width,
+                        device=self.weight.device,
+                    )
                 )
-            )
         self.reset_scale()
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, object],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Older fixed-centering checkpoints stored the canonical width-by-width
+        # projector. It is now represented exactly by mean subtraction.
+        if self.weight is None:
+            state_dict.pop(f"{prefix}weight", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def reset_scale(self) -> None:
         with torch.no_grad():
@@ -136,7 +166,10 @@ class LearnableCenteringNorm(nn.Module):
                 "learnable centering soft norm expects matching "
                 "[example, neuron] activations"
             )
-        centered = functional.linear(hidden, self.weight)
+        if self.weight is None:
+            centered = hidden - hidden.mean(dim=-1, keepdim=True)
+        else:
+            centered = functional.linear(hidden, self.weight)
         scale = self.scale()
         rms_over_scale_squared = (
             centered.float().square().mean(dim=-1, keepdim=True)
@@ -330,6 +363,7 @@ class ReturnOracleMlp(nn.Module):
                 denominator_family=normalization_family,
                 initial_scale=normalization_initial_scale,
                 minimum_scale=normalization_minimum_scale,
+                learnable_centering=self.learnable_centering,
             )
             for output_width in HIDDEN_WIDTHS
         ])
@@ -339,19 +373,18 @@ class ReturnOracleMlp(nn.Module):
                 denominator_family=normalization_family,
                 initial_scale=normalization_initial_scale,
                 minimum_scale=normalization_minimum_scale,
+                learnable_centering=self.learnable_centering,
             )
             for output_width in HIDDEN_WIDTHS
         ])
-        # Value and gate branches share one centering matrix per layer.
-        for value_normalizer, gate_normalizer in zip(
-            self.value_centering_normalizers,
-            self.gate_centering_normalizers,
-            strict=True,
-        ):
-            gate_normalizer.weight = value_normalizer.weight
-        if not self.learnable_centering:
-            for normalizer in self.value_centering_normalizers:
-                normalizer.weight.requires_grad_(False)
+        if self.learnable_centering:
+            # Value and gate branches share one centering matrix per layer.
+            for value_normalizer, gate_normalizer in zip(
+                self.value_centering_normalizers,
+                self.gate_centering_normalizers,
+                strict=True,
+            ):
+                gate_normalizer.weight = value_normalizer.weight
         self.value_norm_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(output_width))
             for output_width in HIDDEN_WIDTHS

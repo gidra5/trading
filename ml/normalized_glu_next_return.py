@@ -134,6 +134,7 @@ class NormalizedGluNextReturn(nn.Module):
                 denominator_family="sqrt",
                 initial_scale=initial_radius,
                 minimum_scale=minimum_radius,
+                learnable_centering=self.learnable_centering,
             )
             for width in self.widths
         ])
@@ -143,15 +144,10 @@ class NormalizedGluNextReturn(nn.Module):
                 denominator_family="sqrt",
                 initial_scale=initial_radius,
                 minimum_scale=minimum_radius,
+                learnable_centering=self.learnable_centering,
             )
             for width in self.widths
         ])
-        if not self.learnable_centering:
-            for normalizer in (
-                *self.value_centering_normalizers,
-                *self.gate_centering_normalizers,
-            ):
-                normalizer.weight.requires_grad_(False)
         self.value_norm_biases = nn.ParameterList([
             nn.Parameter(torch.zeros(width)) for width in self.widths
         ])
@@ -455,11 +451,12 @@ def depth_width_parameter_assignments(
             (value_normalizer, 0),
             (gate_normalizer, 1),
         ):
-            add(
-                normalizer.weight,
-                channel_assignment[:, None]
-                .expand_as(normalizer.weight).clone(),
-            )
+            if normalizer.weight is not None:
+                add(
+                    normalizer.weight,
+                    channel_assignment[:, None]
+                    .expand_as(normalizer.weight).clone(),
+                )
             add(
                 normalizer.raw_scale,
                 torch.full_like(

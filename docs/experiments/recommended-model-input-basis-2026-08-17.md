@@ -5,7 +5,13 @@ Objective: predict the complete BTCUSDT return distribution from 1s through 1h.
 
 ## Short answer
 
+> **2026-08-21 exhaustive registry update:** [global-btc-feature-basis-search-2026-08-21.md](global-btc-feature-basis-search-2026-08-21.md) reconciles **1,000,171 raw ledger coordinates** into **990,084 canonical unique candidates**, of which **989,335** are point-in-time safe with robust 30-day support. The complete streamed KKT audit certifies the selected additive group-lasso correction at 1s and 1m; both corrections improve all 7/7 transfer days by 0.121694 and 0.039923 bits/eligible-target respectively. The 15m and 1h broad corrections failed transfer and therefore keep their 3- and 2-input incumbents. The routed four-horizon production contract is **471 unique inputs**, not the full candidate registry. This is a global optimum only within the documented fixed-partition additive correction class; the reused seven-day transfer block is robustness evidence, so a later pristine calendar block is still required before deployment.
+
 > **2026-08-19 availability-aware update:** the current per-component contract for 1s, 1m, 15m, and 1h is in [all-feature-availability-audit-2026-08-19.md](all-feature-availability-audit-2026-08-19.md). It reconciles the 147-coordinate recent basis, 309 macro transforms, 76 clean live inputs, 102 spectral transforms, 3,471 dense EMA/RSI variants per larger target, public slow sources, and the overlapping 231-coordinate neural representation. The tables below remain the long-history core and taxonomy, but the newer document is canonical for exact routed inputs and availability fallbacks.
+
+> **2026-08-20 cross-asset update:** [binance-cross-asset-component-feature-bases-2026-08-20.md](binance-cross-asset-component-feature-bases-2026-08-20.md) uses the latest independent-scale study's 257-asset 1m basis plus ETH, SOL, XRP, and HYPE (261 unique assets), backfills the uniformly available per-asset sources, and globally refits all 76 component heads over 31,043 coordinates. The enlarged refit loses mean untouched-transfer information versus the current basis at every horizon, so it is **not** the new production contract. ETH supplies a small discovery shortlist; SOL is never selected, and selected XRP/HYPE rows do not beat the previous bases. These leads require a new later holdout before promotion.
+
+> **2026-08-22 prediction-market acquisition update:** [prediction-market-feature-data-2026-08-22.md](prediction-market-feature-data-2026-08-22.md) defines and validates exact point-in-time Kalshi question/probability state for the 1s and 1m models. These inputs are provisional and are not included in the production counts below until a 30-day causal backfill beats the existing bases on later transfer data.
 
 Do not pass every examined feature to the model. The matched 15m neural experiment became 0.233% worse when all 231 forward-market inputs were added together. The defensible basis is the smallest direct joint winner at each horizon, plus only those external coordinates that survive an untouched transfer block.
 
@@ -256,6 +262,7 @@ The endogenous basis and the recent 147-coordinate overlay have now been searche
 
 Full long-history results: `docs/experiments/global-return-feature-basis-2026-08-17.md`.  
 Full recent 30-day results: `docs/experiments/global-return-feature-basis-30d-2026-08-17.md`.
+Full 261-asset cross-market refit: `docs/experiments/binance-cross-asset-component-feature-bases-2026-08-20.md`.
 Fourier feature audit: `docs/experiments/fourier-return-feature-information-2026-08-17.md`.
 Imbalance and volatility-index audit: `docs/experiments/imbalance-and-volatility-index-audit-2026-08-17.md`.
 Dense lagged EMA/RSI audit: `docs/experiments/dense-lagged-indicator-audit-2026-08-18.md`.

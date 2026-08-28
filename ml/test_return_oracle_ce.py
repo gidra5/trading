@@ -223,7 +223,7 @@ class ReturnOracleCeTest(unittest.TestCase):
             learnable_centering=False,
         )
         self.assertTrue(all(
-            not normalizer.weight.requires_grad
+            normalizer.weight is None
             for normalizer in model.value_centering_normalizers
         ))
         self.assertEqual(parameter_count(model), 2_070_543)
@@ -236,6 +236,23 @@ class ReturnOracleCeTest(unittest.TestCase):
             sum(parameter.numel() for parameter in adamw_parameters),
             73_743,
         )
+
+    def test_fixed_centering_is_analytic_and_loads_legacy_weight(self) -> None:
+        learned = LearnableCenteringNorm(4)
+        fixed = LearnableCenteringNorm(4, learnable_centering=False)
+        hidden = torch.tensor([
+            [-4.0, -1.0, 2.0, 7.0],
+            [3.0, 3.0, -2.0, -4.0],
+        ])
+
+        self.assertIsNone(fixed.weight)
+        self.assertEqual(parameter_count(fixed), 1)
+        torch.testing.assert_close(fixed(hidden), learned(hidden))
+
+        incompatible = fixed.load_state_dict(learned.state_dict(), strict=True)
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        torch.testing.assert_close(fixed(hidden), learned(hidden))
 
     def test_hybrid_optimizer_routes_projection_and_a_matrices_to_muon(
         self,

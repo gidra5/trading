@@ -28,14 +28,29 @@ class CompressedPathOutput:
     areas_unit: tuple[Tensor, ...] | None = None
     component_means: tuple[Tensor, ...] | None = None
     arithmetic_component_means: tuple[Tensor, ...] | None = None
+    normalization_location: Tensor | None = None
+    normalization_scale: Tensor | None = None
+    # Proper joint-path models can contract the realized path while they
+    # propagate the complete prefix distribution.  Each column remains one
+    # normalized conditional log-density term so callers can sum it into the
+    # full path log likelihood without changing the metric contract.
+    joint_log_density_terms: Tensor | None = None
 
 
-def batched_triangular_basis_areas(knots: Tensor) -> Tensor:
+def batched_triangular_basis_areas(
+    knots: Tensor, *, validate_values: bool = True
+) -> Tensor:
     """Return triangular-basis areas for one ordered knot grid per example."""
     if knots.ndim != 2 or knots.shape[1] < 3:
         raise ValueError("dynamic density knots must have shape [batch, knots]")
     gaps = knots[:, 1:] - knots[:, :-1]
-    if not bool(torch.isfinite(knots).all()) or bool((gaps <= 0).any()):
+    # Value validation copies two scalar reductions back to the CPU. Keep it
+    # available for callers constructing arbitrary grids, but let hot model
+    # paths skip those synchronizations when the grid construction guarantees
+    # finite, increasing knots by design.
+    if validate_values and (
+        not bool(torch.isfinite(knots).all()) or bool((gaps <= 0).any())
+    ):
         raise ValueError("dynamic density knots must be finite and increasing")
     areas = torch.empty_like(knots)
     areas[:, 0] = gaps[:, 0] / 2
@@ -293,9 +308,30 @@ def path_log_density_terms(
 ) -> Tensor:
     if targets.ndim != 2 or targets.shape[1] != model.return_count:
         raise ValueError("path targets have the wrong shape")
+    if output.joint_log_density_terms is not None:
+        terms = output.joint_log_density_terms
+        if terms.shape != targets.shape or not terms.is_floating_point():
+            raise ValueError("contracted joint path terms have the wrong shape")
+        return terms
+    density_targets = targets
+    affine_log_jacobian: Tensor | float = 0.0
+    if output.normalization_location is not None \
+            or output.normalization_scale is not None:
+        if output.normalization_location is None \
+                or output.normalization_scale is None:
+            raise ValueError("incomplete conditional target normalization")
+        location = output.normalization_location.float()
+        scale = output.normalization_scale.float()
+        if location.shape != (targets.shape[0],) or scale.shape != location.shape:
+            raise ValueError("conditional normalization has the wrong shape")
+        density_targets = (
+            targets.float() - location[:, None]
+        ) / scale[:, None]
+        affine_log_jacobian = -torch.log(scale)[:, None]
     unit, log_jacobian = transform_returns_to_unit(
-        targets, model.density_transform
+        density_targets, model.density_transform
     )
+    log_jacobian = log_jacobian + affine_log_jacobian
     terms = []
     for step, log_masses in enumerate(output.log_masses):
         if output.knots_unit is None or output.areas_unit is None:

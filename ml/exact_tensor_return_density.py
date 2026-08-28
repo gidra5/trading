@@ -41,16 +41,15 @@ class TensorPathGluBlock(nn.Module):
             denominator_family="sqrt",
             initial_scale=initial_radius,
             minimum_scale=minimum_radius,
+            learnable_centering=learnable_centering,
         )
         self.gate_centering = LearnableCenteringNorm(
             hidden_width,
             denominator_family="sqrt",
             initial_scale=initial_radius,
             minimum_scale=minimum_radius,
+            learnable_centering=learnable_centering,
         )
-        if not learnable_centering:
-            self.value_centering.weight.requires_grad_(False)
-            self.gate_centering.weight.requires_grad_(False)
         self.value_bias = nn.Parameter(torch.zeros(hidden_width))
         self.gate_bias = nn.Parameter(torch.zeros(hidden_width))
         self.value_transform = nn.Linear(hidden_width, hidden_width, bias=False)

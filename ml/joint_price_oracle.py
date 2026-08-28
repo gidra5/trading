@@ -385,18 +385,13 @@ class OracleStyleGluLayer(nn.Module):
                 denominator_family=normalization_family,
                 initial_scale=normalization_initial_scale,
                 minimum_scale=normalization_minimum_scale,
+                learnable_centering=False,
             )
 
         self.value_normalizer = normalizer()
         self.gate_normalizer = normalizer()
         self.residual_value_normalizer = normalizer()
         self.residual_gate_normalizer = normalizer()
-        # Match the active return-oracle design: all paths into a target layer
-        # share C, while their radii and post-transform biases remain separate.
-        self.gate_normalizer.weight = self.value_normalizer.weight
-        self.residual_value_normalizer.weight = self.value_normalizer.weight
-        self.residual_gate_normalizer.weight = self.value_normalizer.weight
-        self.value_normalizer.weight.requires_grad_(False)
         self.value_transform = nn.Linear(
             output_width,
             output_width,

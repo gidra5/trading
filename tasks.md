@@ -280,11 +280,11 @@ ML model based on MLP:
 check how much information is in the feature sets of other assets. 
 higher order model - since we need many mappings (preceding -> next distribution) for all possible combinations of preceding paths, we can output actual 1-layer models, that we then use to sample paths from.
 
+We have defined a q(s, a) for the trading problem, as well as a rough model for the market state transition and returns. Next we should apply reinforcement learning to either learn q of the optimal policy, or optimize the policy directly, either with policy iteration or some deep RL learning method.
+
 Alternatives:
 1.  PatchTST
 2.  iTransformer, ipatch
-3.  encoder(-decoder)s
-4.  LSTM
 5.  DLinear https://arxiv.org/html/2606.27282v1?utm_source=chatgpt.com https://arxiv.org/abs/2305.10721?utm_source=chatgpt.com https://arxiv.org/html/2403.14587v2 https://arxiv.org/pdf/2205.13504
 6.  TiDE https://arxiv.org/abs/2304.08424
 7.  DUET
@@ -298,6 +298,12 @@ Alternatives:
 15.  GTR
 16.  DQRN https://arxiv.org/pdf/1807.02787
 17.  EarnHFT https://personal.ntu.edu.sg/boan/papers/AAAI24_EarnHFT.pdf
+18.  TimeKAN https://openreview.net/pdf?id=wTLc79YNbh
+19.  TimeBase https://openreview.net/pdf?id=HksnKo0iV9
+20.  xgboost
+
+integrate knot-representation of the function
+https://chatgpt.com/s/t_6a8e2efa0a008191b9d557e8bf4bcc3e
 
 Insufficient margin trades should not happen
 

@@ -194,31 +194,18 @@ class JointPriceOracleTest(unittest.TestCase):
         assert decoder_gradient is not None
         self.assertGreater(float(decoder_gradient.abs().sum()), 0)
 
-    def test_glu_paths_share_a_fixed_canonical_centering_matrix(
+    def test_glu_paths_use_analytic_fixed_centering(
         self,
     ) -> None:
         layer = self.model().forecast_backbone.trend_tide.layers[0]
-        self.assertIs(
-            layer.value_normalizer.weight,
-            layer.gate_normalizer.weight,
-        )
-        self.assertIs(
-            layer.value_normalizer.weight,
-            layer.residual_value_normalizer.weight,
-        )
-        self.assertIs(
-            layer.value_normalizer.weight,
-            layer.residual_gate_normalizer.weight,
-        )
-        self.assertFalse(layer.value_normalizer.weight.requires_grad)
-        width = layer.output_width
-        expected = (
-            torch.eye(width) - torch.full((width, width), 1.0 / width)
-        )
-        self.assertTrue(torch.allclose(
-            layer.value_normalizer.weight,
-            expected,
-        ))
+        for normalizer in (
+            layer.value_normalizer,
+            layer.gate_normalizer,
+            layer.residual_value_normalizer,
+            layer.residual_gate_normalizer,
+        ):
+            self.assertIsNone(normalizer.weight)
+            self.assertTrue(normalizer.raw_scale.requires_grad)
 
     def test_joint_objective_rewards_exact_policy_and_forecast(self) -> None:
         torch.manual_seed(11)

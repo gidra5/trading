@@ -429,18 +429,17 @@ class NormalizedGluNextReturnTest(unittest.TestCase):
             learnable_centering=False,
             dropout=0,
         )
-        expected = torch.eye(16) - torch.full((16, 16), 1 / 16)
         for normalizer in (
             *model.value_centering_normalizers,
             *model.gate_centering_normalizers,
         ):
-            self.assertFalse(normalizer.weight.requires_grad)
-            torch.testing.assert_close(normalizer.weight, expected)
+            self.assertIsNone(normalizer.weight)
             self.assertTrue(normalizer.raw_scale.requires_grad)
         _muon, adamw = optimizer_parameter_groups(model)
         adamw_ids = {id(parameter) for parameter in adamw}
-        self.assertNotIn(
-            id(model.value_centering_normalizers[0].weight), adamw_ids
+        self.assertIn(
+            id(model.value_centering_normalizers[0].raw_scale),
+            adamw_ids,
         )
 
     def test_depth_width_partition_freezes_three_quadrants_exactly(self) -> None:

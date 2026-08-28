@@ -167,6 +167,7 @@ export function parseMetricsArchive(
   archive: Buffer,
   expectedCsvName: string,
   day: string,
+  symbol = SYMBOL,
 ): {
   rows: SequentialDerivativesMetricRow[];
   csvBytes: number;
@@ -208,7 +209,7 @@ export function parseMetricsArchive(
   ) as Record<string, number>;
   lines.slice(1).forEach((line, sourceIndex) => {
     const columns = line.split(",").map((item) => item.trim());
-    if (columns.length !== 8 || columns[1] !== SYMBOL) {
+    if (columns.length !== 8 || columns[1] !== symbol) {
       throw new Error(`${day}: malformed futures-metrics row ${sourceIndex}.`);
     }
     const openTime = Date.parse(`${columns[0]!.replace(" ", "T")}Z`);

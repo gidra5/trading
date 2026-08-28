@@ -1,0 +1,10 @@
+{
+  "id": "cyclic-dense-compressed-path-matrix-density-h15-stages3-v1",
+  "label": "Cyclic dense compressed path matrix density · H15 · 3 shared stages · W256/Q16/D64/O32 · 256k clean · batch 1536",
+  "runIds": [
+    "cyclic-dense-compressed-path-matrix-density-h15-stages3-w256-q16-d64-o32-c128-256-featurelag3-train256k-batch1536-nosam-ema4-cal64k-v1"
+  ],
+  "control": {
+    "pauseFile": "data/training/matrices/cyclic-dense-compressed-path-matrix-density-h15-stages3-v1/PAUSE"
+  }
+}

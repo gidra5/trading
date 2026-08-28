@@ -278,79 +278,128 @@ Next is action value function. From definition, it describes expected score give
 $$\begin{aligned}
 q(s_t, a_t)&=\sum_{s'\in\mathcal S, r\in\mathcal R} p(s',r\ |\ s, a)[r+ w(s')*\sum_{a\in\mathcal A(s)} \pi(a\ |\ s')q(s',a)]
 \\
-&=\sum_{s_{m,t+1}\in\mathcal S_m, s_{o,t+1}\in\mathcal S_o} \sum_{a_{o,t+1}\in\mathcal A(s_{o,t+1}),a_{p,t+1}\in\mathcal A(s_{o,t+1})}p_{m}(s_{m,t+1}|s_{m,t})p_{o}(s_{o,t+1}|s_{o,t}, a_{o,t}, s_{m,t+1})[R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})+\pi(a_{t+1}\ |\ s_{m,t+1}, s_{o,t+1})q(s_{t+1},a_{t+1})]
+&=\sum_{s_{m,t+1}\in\mathcal S_m, s_{o,t+1}\in\mathcal S_o}p_{m}(s_{m,t+1}|s_{m,t})p_{o}(s_{o,t+1}|s_{o,t}, a_{o,t}, s_{m,t+1})[R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})+ \sum_{a_{t+1}\in\mathcal A(s_{o,t+1})}\pi(a_{t+1}\ |\ s_{t+1})q(s_{t+1},a_{t+1})]
 \end{aligned}$$
 
 Assume we ignore limit orders, then our q function simplifies:
 $$\begin{aligned}
 q(s_t, a_t)
-&=\sum_{s_{m,t+1}\in\mathcal S_m} \sum_{a_{t+1}\in\mathcal A}p_{m}(s_{m,t+1}|s_{m,t})[R(\Delta s_{m,t}, \Delta s_{p,t})+\pi(a_{t+1}\ |\ s_{m,t+1})q(s_{t+1},a_{t+1})]
+&=\sum_{s_{m,t+1}\in\mathcal S_m}p_{m}(s_{m,t+1}|s_{m,t})[R(\Delta s_{m,t}, \Delta s_{p,t})+ \sum_{a_{t+1}\in\mathcal A}\pi(a_{t+1}\ |\ s_{t+1})q(s_{t+1},a_{t+1})]
 \end{aligned}$$
 
 Then whats left to define is the $R$ function that defines the resulting return from advancing in time given the change in market, orders and taken action. And that is mostly what we already defined beforehand implicitly through transition rules. Thus we can defined it simply as:
 $$
 R(\Delta s_{m,t}, \Delta s_{p,t}, \Delta s_{o,t})=\Delta \log Q_t=\Delta V_{t}=\log R_t(x\to e)+h(e,\Delta s_{m,t})$$
-Where $x \to e$ is part of $\Delta s_{p,t}$, and $h$ is basically $h_{t,T,H}$ derived from market changes.
+Where $x \to e$ is part of $\Delta s_{p,t}$, and $h$ is basically $h_{t,T,H}$ derived from market changes $\Delta s_{m,t}$.
 
-We can split market state into price $p_t$, slow "real" price $\bar p_t$, trend $t_t$, volatility $v_t$, and  latent market state $s_{l,t}$. Actions can be identified by target exposure, as we discussed earlier. These two changes make sums into integrals:
+We can split market state into price $p_t$ and  latent market state $s_{l,t}$. Actions can be identified by target exposure, as we discussed earlier. These two changes make sums into integrals:
 $$\begin{aligned}
 q(s_t, a_t)
-&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{a\in E} \int_{\log v\in \mathbb R} \int_{t\in \mathbb R} \int_{\log\bar p\in E}\int_{\log p\in \mathbb R}d\bar p\ dv\ dt\ dp\ da\ p_{m}(s_{l,t+1}, p, \bar p, t, v|s_{t}, p_t)[R(\log p-\log p_{t}, \Delta s_{p,t})+\pi(a\ |\ s_{t+1})q(s_{t+1},a)]
-\end{aligned}$$
-# Perfect Policy
-We define policy as a distribution over all possible current and target exposures:$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)de}$$Where $R_{t,T}$ is a return from moving to the exposure $e$. The return itself is defined simply as oracle value minus transition cost:$$\begin{aligned}
-R_{t,T}(e_t\to e)=V_{t,T}(e)-C_t(e_t\to e)
+&=\sum_{s_{l,t+1}\in\mathcal S_m} \int_{p\in \mathbb R}dp\ p_{m}(s_{l,t+1}, p|s_{l,t}, p_t)[R(\log p-\log p_{t}, \Delta s_{p,t})+\int_{a\in E}da\ \pi(a\ |\ s_{t+1})q(s_{t+1},a)]
 \end{aligned}$$
 
+We can split market state further into slow "real" price $\bar p_t$, trend $t_t$ and volatility $v_t$, but for actual policy it does not seem to be at the core - either way we make decisions based on the overall market state.
 
-Note that the optimal path will always choose target exposure that corresponds to the mode of this distribution. Furthermore, it can assign the optimal exposure to move to, given any initial exposure and already accounts for the cost of transition as $C_t$ term.
+The action-value function might collapse the policy to almost uniform if we get timesteps too small. That will cause smaller returns per step and more steps overall in a given time window. That basically means the optimal policy prefers doing nothing, because any other action will incur penalty that is justified only much later in the process.
 
-For training we might want to also add a temperature parameter $\tau$:
-$$\pi_{t,T}(e_t\to e)=\frac {R_{t,T}(e_t\to e)^{1/\tau}} {\int_{E_-}^{E_+}R_{t,T}(e_t\to e)^{1/\tau}de}$$
+Another issue is that as horizon $T$ grows the oracle has more and more opportunities to find profits and make frequent trades, which makes overall policy high frequency at each step, while smoother, low frequency distribution might be preferrable because they are easier to learn. Temperature can help with this, but it blurs rather than removes the unnecessary detail.
 
-The distribution might become almost uniform if we get timesteps too small. That will cause smaller returns per step and more steps overall in a given time window. That basically means oracle can immediately fix any bad entry exposure, which will remove negative effects of bad choices. That also makes it incredibly high frequency in time - oracle can fix the issue with a small adjustment immediately and keep it on the optimal path.
+For that we further parametrize by time resolution $\Delta t$ and time horizon $T$. The forecast length then $N=T/{\Delta t}$. The time resolution is interpreted as forcing to hold for the duration $\Delta t$, instead of allowing finer adjustments.
 
-Another issue is that as amount of timesteps $T$ grows the oracle has more and more opportunities to find profits and make frequent trades, which makes overall policy high frequency at each step, while smoother, low frequency distribution might be preferrable. Temperature can help with this, but it blurs rather than removes the unnecessary detail.
+The horizon $T$ can be related to the discount factor similar to EMA length:
+$$\gamma=1-\frac {2} {N+1}=1-\frac {2} {T/\Delta t+1}=1-\frac {2\Delta t} {T+\Delta t}=\frac {T-\Delta t} {T+\Delta t}$$
+That makes effective horizon roughly equivalent to averaging N rewards, while not discarding later ones. Note that smaller horizon or larger time steps make the discount smaller.
 
-To fix these issue we may restrict oracle decision making. 
+But there is a tradeoff - predicting distant horizons is essential for meaningful policy, but gets very expensive and uninformative as we increase it. Using larger timesteps can make it easier to forecast cheaply, but trades even more accuracy for that.
 
-First introduce holding time $H$ - how long starting from the initial time should oracle passively wait. That forces it to delay "fixing" bad exposure and instead work with what we get after holding. That smoothens the distribution along its decision points and add more detail to it since now bad exposure can carry much more impact when met with unfavorable price move.
+With these restrictions we get a refined action-value function:
+$$\begin{aligned}
+q(s_t, a_t)
+&=\sum_{s_{l,t+1}\in\mathcal S_{m, \Delta t}} \int_{p_{t+1}\in \mathbb R}p_{m, \Delta t}(s_{l,t+1}, p_{t+1}|s_{l,t}, p_t)[R(\Delta\log p_{t}, \Delta s_{p,t})
++\gamma\int_{a\in E}da\ \pi(a\ |\ s_{t+1})q(s_{t+1},a)]dp_{t+1}\\
+&=\sum_{s_{l,t+1}\in\mathcal S_{m, \Delta t}} \int_{p_{t+1}\in \mathbb R}p_{m, \Delta t}(s_{l,t+1}, p_{t+1}|s_{l,t}, p_t)[\log R(s_{p,t}\to a_{t})+h(a_{t},\Delta\log p_{t})
++\gamma\int_{a\in E}da\ \pi(a\ |\ s_{t+1})q(s_{t+1},a)]dp_{t+1}\\
+&=\log R(s_{p,t}\to a_{t})+\sum_{s_{l,t+1}\in\mathcal S_{m, \Delta t}} \int_{p_{t+1}\in \mathbb R}p_{m, \Delta t}(s_{l,t+1}, p_{t+1}|s_{l,t}, p_t)[h(a_{t},\Delta\log p_{t})
++\gamma\int_{a\in E}da\ \pi(a\ |\ s_{t+1})q(s_{t+1},a)]dp_{t+1}
+\end{aligned}$$
 
-Second introduce resolution $R$ - how fine the oracle's candle view is. That forces oracle to make coarser decisions simply because there are less candles to work with and the get larger due to accumulation of inner movement. By controlling it we can control smoothness more directly, because it starts to isolate the most impactful actions. Otherwise small fluctuations that oracle can exploit will add more frequency to the distribution, that is not necessarily helping to choose optimally.
+Notice also that the $q$ function is basically factorized into current portfolio dependent state and post transition portion, dependent only on the market state:
+
+$$\begin{aligned}q(s_t,a_t)
+&=\log R(s_{p,t}\to a_{t})+q'(s_{m, t}, a_t)
+\end{aligned}$$
+Which means we need only to estimate $q'$, not the whole $q$. That doesnt remove dependent on the portfolio completely, since action describes the new portfolio state, and furthermore it can drift as price moves, but it means that the model does not need to be aware of the exact portfolio we hold currently. Although it might still be useful for creating a mixture of experts.
+
+From the state transition factorization it follows that the training process is a mix of offline and online:
+1. The market history is fixed and cannot be affected by the agent.
+2. The portfolio state is simulated and directly affected by the agent.
+
+We can discretize action and evaluate all at once, which makes it off-policy - we dont need to explicitly model/learn the policy because we dont need exploration based on it. We can explore all actions at once.
+
+That means we can learn the optimal q function directly.
+
+The optimal policy, as described by Bellman principle of optimality:
+$$\begin{aligned}
+q_*(s_t, a_t)
+&=\mathbb E[r_t+\gamma \max_a q_*(s_{t+1}, a)]\\
+&=\sum_{s_{l,t+1}\in\mathcal S_{m, \Delta t}} \int_{p_{t+1}\in \mathbb R}dp_{t+1}\ p_{m, \Delta t}(s_{l,t+1}, p_{t+1}|s_{l,t}, p_t)[R(\Delta\log p_{t}, \Delta s_{p,t})+\gamma\max_a q_*(s_{t+1},a)]\\
+&=\log R(s_{p,t}\to a_{t})+\sum_{s_{l,t+1}\in\mathcal S_{m, \Delta t}} \int_{p_{t+1}\in \mathbb R}dp_{t+1}\ p_{m, \Delta t}(s_{l,t+1}, p_{t+1}|s_{t}, p_t)[h(a_{t},\Delta\log p_{t})+\gamma\max_a q_*(s_{t+1},a)]\\
+&=\log R(s_{p,t}\to a_{t})+\mathbb E[h_t+\gamma \max_a q_*(s_{t+1}, a)]
+\end{aligned}$$
+And we can simply soft-enforce this equation as a loss term, which is equivalent to Q-learning:
+$$\begin{aligned}
+L&=\sum_{s_t,s_{t+1}, a} (q(s_t,a)-\mathbb E[r_t+\gamma \max_a q(s_{t+1}, a)])^2\\
+&=\sum_{s_t,s_{t+1}, a} (q'(s_{m,t},a)-\mathbb E[h_t+\gamma \max_a [\log R(s_{p,t}\to a_{t})+q'(s_{m, t}, a_t)]])^2
+\end{aligned}
+$$
+This naive formulation is rather unstable because of abrupt max function, coupled movement of target and the model, and high production costs of exposure changes. That means we want to replace max with softmax that gradually decreases temp, replace gamma with gradually increasing value up to intended horizons, and gradually increase the friction, so that the transition cost is never so strong that it is better to not trade at all.
+
+The variance in q values changes as $N$ changes, because we get more almost independent returns:
+$$std(\sum_k^N r_k)=\sigma\sqrt N$$
+so we need to scale softmax temp proportionally:
+$$\tau_{eff}=\tau \sqrt N$$
+We already established preferrable horizon and time step for the near optimal long horizon behavior - around 1h for excellent results and 15m for weaker ones, and around 1m time step.
+With that $\gamma$ varies from 0 to $(3600-60)/(3600+60)=3540/3660\approx0.967$
+
+Then loss changes to:
+$$\begin{aligned}
+L&=\sum_{s_t,s_{t+1}, a} (q(s_t,a)-\mathbb E[r_t+\frac {N-1} {N+1} NLSE_a\left(\frac {q(s_{t+1}, a)} {\tau\sqrt N}\right)])^2\\
+&=\sum_{s_t,s_{t+1}, a} (q'(s_{m,t},a)-\mathbb E[h_t+\frac {N-1} {N+1} NLSE_a \left(\frac {\log R(s_{p,t}\to a_{t})+q'(s_{m, t}, a_t)} {\tau\sqrt N}\right)])^2\\
+&NLSE_a(q_a)=\tau\log\left(\frac 1 K \sum_a e^{q_a/ \tau}\right)
+\end{aligned}
+$$
+Where $T$, $\Delta t$ and $\tau$ are on a schedule. Note that return and state variables depend on horizon $T$ as well, which makes all 3 of them an independent hyper parameter.
+
+Note that this is essentially starting from slowly adding an average action value function, that is the slowly concentrating on the max value.
+
+One useful constraint is that we might want to also increase difficulty when we hit a certain accuracy threshold, so that we keep ourselves around the accuracy we want to have in the end.
+
+We also might want to verify that it is at least capable of learning the trivial strategy when there is no friction - picking the action that is the most aligned with next predicted return.
+
+Note that since we have actual future history, we can compute optimal policy for a given episode directly, and then use it for further supervised learning
+
+Another kind of loss that can be applied is policy gradient loss:
+$$L=-\sum_t \log\pi(a_t|s_t)(q_*(s_t,a_t)-v_*(s_t))=-\sum_t \log(softmax_a(q(s_t,a)))(q_*(s_t,a_t)-v_*(s_t))$$
+Here $q_*$ and $v_*$ are optimal policy action value function and value function. Since we can actually compute directly optimal policy, we can use it as precise critic.
+
+And final Loss that is relevant, is that we can use some handcrafted policy to "guide" the training into areas it thinks are useful either because they are bad, or good.
 
 Now we need 
 
 
+28. p_t(a) is the oracle's preference for the exposure a at time t.
 
-      26. Let h_t,k(a) and d_t,k(a) be the log wealth multiplier and drifted exposure after passively holding a for k price moves, and let R_t(x->b) be the rebalance wealth multiplier.
+   29. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
 
-      27. The faithful recurrence is V_t,0(x)=ln R_t(x->0), V_t,k(x)=max_b[ln R_t(x->b)+h_t,1(b)+V_t+1,k-1(d_t,1(b))], and Q_t,H,T(a)=h_t,H'(a)+V_t+H',T-H'(d_t,H'(a)), with H'=min(H,T,remaining moves).
+30. we compute objective as oracle value distillation over all example windows
 
-      28. H applies only to the initially forced target. The optimal continuation may rebalance every candle and the final state closes to exact zero exposure.
+   31. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
 
-   29. Note that we can have asset vectors instead of singular values, encoding multiple assets per position. The evolution procedure idea is mostly the same, and oracle's exposure is chosen only for the asset where there is the most abs return and 0 for the rest. The assets each can have separate leverages that they must maintain, each define maintenance margin. The portfolio equity must be above the sum of all margins. Rebalancing between two assets incurs double fees, so we generally trade with the quote to rebalance. For now it is not needed, but the current implementation must be future proofed for this case.
+   32. w_t=W_t/mean_batch(W_t)
 
-30. Strategy defines a distribution over possible exposures, lets call it s_t(a). it decides which exposure is most preferable given the current state at this point in time. Then the bot will execute this strategy by choosing a single exposure a_t and rebalancing to match it. the chosen execution exposure is called a_t=exec(s_t(a)).
+   33. D_t=sum_x E[a-x|x] / (sum_x E[abs(a-x)|x]+eps), computed once per complete timestamp example from the exact cutoff-applied raw oracle map over every visible current-exposure/action cell and stored as aligned dataset metadata.
 
-31. it is then used to compare strategy with the oracle - pick best possible return exposure and compare with the perfect return corresponding to the chosen exposure. the difference between best and strategy returns is called strategy regret, which yields this formula:
-
-   32. R_t(a) = max_A(Q_t(A)) - Q_t(a)
-
-   33. This can be computed either as regret over the next time T, or as regret until the end of the current evaluation window. The first case might be more versatile, as the former is a special case
-
-34. p_t(a) is the oracle's preference for the exposure a at time t.
-
-   35. p_t(a)=exp(-R_t(a)/temp)/int(exp(-R_t(A)/temp)dA)
-
-36. we compute objective as oracle value distillation over all example windows
-
-   37. L​=−sum(t=1..N,w_t\*[int(p_t(a)\*log(s_t(a))da)])
-
-   38. w_t=W_t/mean_batch(W_t)
-
-   39. D_t=sum_x E[a-x|x] / (sum_x E[abs(a-x)|x]+eps), computed once per complete timestamp example from the exact cutoff-applied raw oracle map over every visible current-exposure/action cell and stored as aligned dataset metadata.
-
-   40. Build p_1m from completed UTC one-minute closes only. At second 59 it is
+   34. Build p_1m from completed UTC one-minute closes only. At second 59 it is
 
       exactly aligned; otherwise use the latest completed minute (a conservative
 
@@ -358,7 +407,7 @@ Now we need
 
       within-minute ordering.
 
-   41. W_t=(eps+abs(D_t)*persistenceMultiplier)*(1+lambda_resolution*JSD(p_1s,p_1m)).
+   35. W_t=(eps+abs(D_t)*persistenceMultiplier)*(1+lambda_resolution*JSD(p_1s,p_1m)).
 
       The completed-minute target and its visible-range JSD are stored
 
@@ -368,64 +417,64 @@ Now we need
 
       This is a ratio of the global signed and absolute displacement integrals, not a mean of separately normalized rows, so each row contributes in proportion to its expected actionable distance.
 
-      42. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
+      36. Important same-side advice accumulates causal, decaying evidence so each later repeated advice receives a larger bounded multiplier.
 
-      43. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
+      37. Opposite advice and long discontinuities reset the persistence evidence; no future timestamp may increase an older timestamp's weight.
 
-      44. Persist the resulting causal unnormalized whole-example W_t in the dataset; training may only normalize it by the current batch mean and must not reconstruct it from fitted parameters.
+      38. Persist the resulting causal unnormalized whole-example W_t in the dataset; training may only normalize it by the current batch mean and must not reconstruct it from fitted parameters.
 
-   45. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
+   39. The configurable mixed objective is L_mix=L_CE+lambda_H*entropyGap-lambda_S*stateMI-lambda_O*oracleMI.
 
-      46. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
+      40. entropyGap is the distance-imbalance-weighted squared positive excess max(0,H(s_t)-H(p_t))/log(|A|).
 
-      47. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
+      41. stateMI uses the normalized Gaussian total/conditional variance decomposition of s_t.
 
-      48. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
+      42. oracleMI can use the normalized Gaussian correlation approximation or precise normalized categorical MI over soft exposure bins.
 
-      49. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
+      43. Any component with lambda=0 is skipped; precise oracle MI retains p_t(a) and runs a separate binned GPU reduction.
 
-50. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence.
+44. can we use the exposure distribution for the bot execution specifically? i think we can use variance of the distribution around the realized target exposure as confidence.
 
-51. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price.
+45. We can also extend the value function to account for limit orders, which would allow us to use it as prediction of the future price.
 
-   52. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing.
+   46. limit order is defined in relative terms from current state. now the oracle could choose between making market, limit, both, or nothing.
 
-   53. it generally just outputs what is the preferred final state of the bot state (exposure and pending order), and then execution engine calculates the actual actions needed to achieve that from current state.
+   47. it generally just outputs what is the preferred final state of the bot state (exposure and pending order), and then execution engine calculates the actual actions needed to achieve that from current state.
 
-   54.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute.
+   48.  note that we need only one order to be modelled for the oracle. the limit order and market order value follow a bit different value calculations, since limit orders are passive - we dont do anything with them until they execute.
 
-   55.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
+   49.  the tradeoff between market and limit captures the tradeoff between immediate profit and opportunity cost.
 
-   56.  but this idea is for future iterations, not for now.
+   50.  but this idea is for future iterations, not for now.
 
-57.  the limit order model:
+51.  the limit order model:
 
-    58.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
+    52.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
 
-    59.  I want to design similar regret but for limit orders. i think he premise should be similar. Assume we create a limit order at chosen relative price from current in percents and a reserved exposure. If reserved exposure is borrowed we count borrowing fees each step we hold it before the execution. The reserved amount cant be used for market orders which defines opportunity cost (maybe computed in a similar way to regret). But executing limit order has less fees (potentially 0) than market orders. Then we compute regret as difference between optimal limit order and the chosen one. The optimal one balances opportunity cost such that we get the most profit. We also assume that after limit order is done we act as perfect margin trader.
+    53.  I want to design similar regret but for limit orders. i think he premise should be similar. Assume we create a limit order at chosen relative price from current in percents and a reserved exposure. If reserved exposure is borrowed we count borrowing fees each step we hold it before the execution. The reserved amount cant be used for market orders which defines opportunity cost (maybe computed in a similar way to regret). But executing limit order has less fees (potentially 0) than market orders. Then we compute regret as difference between optimal limit order and the chosen one. The optimal one balances opportunity cost such that we get the most profit. We also assume that after limit order is done we act as perfect margin trader.
 
-    60.  The limit order exposure delta is signed - negative is sell, positive is buy.
+    54.  The limit order exposure delta is signed - negative is sell, positive is buy.
 
-    61.  The oracle can trade optimally with unreserved assets during lifetime of the lo.
+    55.  The oracle can trade optimally with unreserved assets during lifetime of the lo.
 
-    62.  That essentially scales the optimal market trade return by 1-a
+    56.  That essentially scales the optimal market trade return by 1-a
 
-    63.  Then it can trade optimally with post execution equity
+    57.  Then it can trade optimally with post execution equity
 
-    64.  The limit order either executed until the duration T passed, or is cancelled at that time. That is the value horizon
+    58.  The limit order either executed until the duration T passed, or is cancelled at that time. That is the value horizon
 
-    65.  If candle fully crosses the target price, we execute it at that price.
+    59.  If candle fully crosses the target price, we execute it at that price.
 
-    66.  The "no order" is identified as any lo with size 0
+    60.  The "no order" is identified as any lo with size 0
 
-    67. Limit orders can execute at wicks, while market orders assumed to execute at close basically
+    61. Limit orders can execute at wicks, while market orders assumed to execute at close basically
 
-    68. Limit price is always positive
+    62. Limit price is always positive
 
-    69. Value of the lo is the same way as the mo = final equity over initial
+    63. Value of the lo is the same way as the mo = final equity over initial
 
-    70. Regret is difference between best value and chosen
+    64. Regret is difference between best value and chosen
 
-    71. Best value is the one where we setr just below wick top at every significant turn. That benefits both from volatility and from reduced fees
+    65. Best value is the one where we setr just below wick top at every significant turn. That benefits both from volatility and from reduced fees
 
-    72. We can decide if making limit order is profitable by comparing with empty lo?
+    66. We can decide if making limit order is profitable by comparing with empty lo?

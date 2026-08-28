@@ -11,6 +11,19 @@ from typing import Iterator
 import numpy as np
 import torch
 
+from causal_return_normalization import (
+    append_return_statistics,
+    trailing_log_price_statistics,
+    trailing_log_return_statistics,
+)
+from actor_market_process_density import (
+    ARCHITECTURE_CONTRACT as ACTOR_MARKET_PROCESS_ARCHITECTURE_CONTRACT,
+    ActorMarketProcessDensity,
+)
+from actor_market_path_matrix_density import (
+    ARCHITECTURE_CONTRACT as ACTOR_MARKET_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+    ActorMarketPathMatrixDensity,
+)
 from calibrate_next_return_output import AffineStatistics, AffineTransform
 from compressed_path_return_density import (
     CompressedPathOutput,
@@ -25,14 +38,22 @@ from recurrent_market_path_density import (
 )
 from low_rank_path_matrix_density import (
     ARCHITECTURE_CONTRACT as LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+    CYCLIC_DENSE_COMPRESSED_ARCHITECTURE_CONTRACT,
+    DIRECT_FACTORIZED_ARCHITECTURE_CONTRACT,
+    CyclicDenseCompressedPathMatrixDensity,
+    DirectFactorizedPathMatrixDensity,
     DynamicLowRankPathMatrixDensity,
 )
 from return_knot_density import KnotDensityContract
 from return_knot_density import inverse_unit_to_returns, triangular_basis_areas
 from trading_storage import load_torch_checkpoint
 from train_feature_compressed_path_density import (
+    ACTOR_MARKET_PATH_MATRIX_RUNNER_CONTRACT,
+    ACTOR_MARKET_PROCESS_RUNNER_CONTRACT,
     ImmediateFeatureActivePathDataset,
     PathMetrics,
+    CYCLIC_DENSE_COMPRESSED_PATH_MATRIX_RUNNER_CONTRACT,
+    DIRECT_FACTORIZED_PATH_MATRIX_RUNNER_CONTRACT,
     LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT,
     RECURRENT_MARKET_RUNNER_CONTRACT,
     RUNNER_CONTRACT,
@@ -105,7 +126,15 @@ class CalibrationPathDataset:
     """Immediate feature rows and chronological active-return calibration paths."""
 
     def __init__(
-        self, root: Path, return_count: int, feature_history: int = 1
+        self,
+        root: Path,
+        return_count: int,
+        feature_history: int = 1,
+        *,
+        history_root: Path | None = None,
+        normalization_window_seconds: int | None = None,
+        normalization_variance_floor: float = 1e-16,
+        normalization_statistic: str = "log-return",
     ) -> None:
         self.root = root
         self.return_count = int(return_count)
@@ -159,6 +188,28 @@ class CalibrationPathDataset:
             targets, self.return_count
         )
         self.times = times[: self.targets.shape[0]]
+        if normalization_window_seconds is None:
+            self.return_means = None
+            self.return_variances = None
+        else:
+            if history_root is None:
+                raise ValueError("normalized calibration requires candle history")
+            if normalization_statistic not in {"log-return", "log-price"}:
+                raise ValueError("unsupported normalization statistic")
+            statistics_function = (
+                trailing_log_price_statistics
+                if normalization_statistic == "log-price"
+                else trailing_log_return_statistics
+            )
+            self.return_means, self.return_variances = (
+                statistics_function(
+                    history_root,
+                    times,
+                    window_seconds=int(normalization_window_seconds),
+                    variance_floor=float(normalization_variance_floor),
+                )
+            )
+            self.feature_count += 2
 
     def logical_count(self, split: str) -> int:
         if split != "calibration":
@@ -182,10 +233,18 @@ class CalibrationPathDataset:
             count = min(count, int(limit))
         for start in range(0, count, batch_size):
             stop = min(count, start + batch_size)
+            feature_rows = np.asarray(
+                self.features[start:stop], dtype=np.float32
+            )
+            if self.return_means is not None \
+                    and self.return_variances is not None:
+                feature_rows = append_return_statistics(
+                    feature_rows,
+                    self.return_means[start:stop],
+                    self.return_variances[start:stop],
+                )
             yield (
-                torch.from_numpy(np.asarray(
-                    self.features[start:stop], dtype=np.float32
-                ).copy()),
+                torch.from_numpy(feature_rows.copy()),
                 torch.from_numpy(np.asarray(
                     self.targets[start:stop], dtype=np.float32
                 ).copy()),
@@ -197,7 +256,9 @@ def load_model(
     plan: dict, densities: tuple[KnotDensityContract, ...], checkpoint: dict,
     device: torch.device,
 ) -> CompressedPathReturnDensity | RecurrentMarketPathDensity \
-        | DynamicLowRankPathMatrixDensity:
+        | DynamicLowRankPathMatrixDensity | DirectFactorizedPathMatrixDensity \
+        | CyclicDenseCompressedPathMatrixDensity | ActorMarketProcessDensity \
+        | ActorMarketPathMatrixDensity:
     if checkpoint.get("planSha256") != canonical_hash(plan):
         raise ValueError("checkpoint belongs to a different training plan")
     architecture_contract = plan["architecture"].get("contract")
@@ -212,17 +273,127 @@ def load_model(
     low_rank_path_matrix = (
         architecture_contract == LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT
     )
+    direct_factorized_path_matrix = (
+        architecture_contract == DIRECT_FACTORIZED_ARCHITECTURE_CONTRACT
+    )
+    cyclic_dense_compressed_path_matrix = (
+        architecture_contract == CYCLIC_DENSE_COMPRESSED_ARCHITECTURE_CONTRACT
+    )
+    actor_market_process = (
+        architecture_contract == ACTOR_MARKET_PROCESS_ARCHITECTURE_CONTRACT
+    )
+    actor_market_path_matrix = (
+        architecture_contract == ACTOR_MARKET_PATH_MATRIX_ARCHITECTURE_CONTRACT
+    )
     expected_runner = (
-        LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT
-        if low_rank_path_matrix else (
+        ACTOR_MARKET_PATH_MATRIX_RUNNER_CONTRACT
+        if actor_market_path_matrix else (
+        ACTOR_MARKET_PROCESS_RUNNER_CONTRACT
+        if actor_market_process else (
+        CYCLIC_DENSE_COMPRESSED_PATH_MATRIX_RUNNER_CONTRACT
+        if cyclic_dense_compressed_path_matrix else (
+        DIRECT_FACTORIZED_PATH_MATRIX_RUNNER_CONTRACT
+        if direct_factorized_path_matrix else (
+            LOW_RANK_PATH_MATRIX_RUNNER_CONTRACT
+            if low_rank_path_matrix else (
             RECURRENT_MARKET_RUNNER_CONTRACT if recurrent_market else RUNNER_CONTRACT
-        )
+            )
+        ))))
     )
     if checkpoint.get("runnerContract") != expected_runner:
         raise ValueError("checkpoint runner contract changed")
     state = checkpoint["model"]
     architecture = plan["architecture"]
-    if low_rank_path_matrix:
+    if actor_market_path_matrix:
+        model = ActorMarketPathMatrixDensity(
+            state["feature_mean"], state["feature_std"], densities[0],
+            embedding_width=int(architecture["embeddingWidth"]),
+            actor_width=int(architecture["actorWidth"]),
+            actor_decision_width=int(architecture["actorDecisionWidth"]),
+            market_width=int(architecture["marketWidth"]),
+            actor_count=int(architecture["actorCount"]),
+            market_count=int(architecture["marketCount"]),
+            action_count=int(architecture["actionCount"]),
+            action_basis_width=int(architecture["actionBasisWidth"]),
+            reward_width=int(architecture["rewardWidth"]),
+            path_embedding_width=int(architecture["pathEmbeddingWidth"]),
+            path_count=int(architecture["pathCount"]),
+            return_count=int(architecture["returnCount"]),
+            stage_block_count=int(architecture["stageBlockCount"]),
+            path_compression_width=int(architecture["pathCompressionWidth"]),
+            joint_compression_width=int(architecture["jointCompressionWidth"]),
+            certainty_maximum=float(architecture["certaintyMaximum"]),
+            quadrature_order=int(architecture.get("quadratureOrder", 16)),
+            initial_radius=float(architecture["initialRadius"]),
+            minimum_radius=float(architecture["minimumRadius"]),
+            learnable_centering=bool(architecture["learnableCentering"]),
+        )
+    elif actor_market_process:
+        model = ActorMarketProcessDensity(
+            state["feature_mean"], state["feature_std"], densities[0],
+            embedding_width=int(architecture["embeddingWidth"]),
+            actor_width=int(architecture["actorWidth"]),
+            actor_decision_width=int(architecture["actorDecisionWidth"]),
+            market_width=int(architecture["marketWidth"]),
+            actor_count=int(architecture["actorCount"]),
+            market_count=int(architecture["marketCount"]),
+            action_count=int(architecture["actionCount"]),
+            action_basis_width=int(architecture["actionBasisWidth"]),
+            reward_width=int(architecture["rewardWidth"]),
+            return_count=int(architecture["returnCount"]),
+            certainty_maximum=float(architecture["certaintyMaximum"]),
+            quadrature_order=int(architecture.get("quadratureOrder", 16)),
+            initial_radius=float(architecture["initialRadius"]),
+            minimum_radius=float(architecture["minimumRadius"]),
+            learnable_centering=bool(architecture["learnableCentering"]),
+        )
+    elif cyclic_dense_compressed_path_matrix:
+        target_normalization = plan.get("targetNormalization")
+        model = CyclicDenseCompressedPathMatrixDensity(
+            state["feature_mean"], state["feature_std"], densities[0],
+            market_width=int(architecture["marketWidth"]),
+            path_embedding_width=int(architecture["pathEmbeddingWidth"]),
+            path_count=int(architecture["pathCount"]),
+            return_count=int(architecture["returnCount"]),
+            stage_block_count=int(architecture["stageBlockCount"]),
+            path_compression_width=int(architecture["pathCompressionWidth"]),
+            joint_compression_width=int(architecture["jointCompressionWidth"]),
+            initial_radius=float(architecture["initialRadius"]),
+            minimum_radius=float(architecture["minimumRadius"]),
+            learnable_centering=bool(architecture["learnableCentering"]),
+            input_dropout_probability=float(
+                plan["training"].get("inputDropoutProbability", 0.0)
+            ),
+            embedding_dropout_probability=float(
+                plan["training"].get("embeddingDropoutProbability", 0.0)
+            ),
+            target_normalization_variance_floor=(
+                None if target_normalization is None else float(
+                    target_normalization.get("varianceFloor", 1e-16)
+                )
+            ),
+            target_normalization_center=(
+                target_normalization is None
+                or target_normalization.get("type")
+                == "causal-trailing-log-return-zscore"
+            ),
+        )
+    elif direct_factorized_path_matrix:
+        model = DirectFactorizedPathMatrixDensity(
+            state["feature_mean"], state["feature_std"], densities[0],
+            market_width=int(architecture["marketWidth"]),
+            path_embedding_width=int(architecture["pathEmbeddingWidth"]),
+            path_count=int(architecture["pathCount"]),
+            return_count=int(architecture["returnCount"]),
+            factor_rank=int(architecture["factorRank"]),
+            hidden_width_threshold=int(
+                architecture["hiddenWidthThreshold"]
+            ),
+            initial_radius=float(architecture["initialRadius"]),
+            minimum_radius=float(architecture["minimumRadius"]),
+            learnable_centering=bool(architecture["learnableCentering"]),
+        )
+    elif low_rank_path_matrix:
         model = DynamicLowRankPathMatrixDensity(
             state["feature_mean"], state["feature_std"], densities[0],
             market_width=int(architecture["marketWidth"]),
@@ -323,6 +494,8 @@ def temperature_scaled_output(
         areas_unit=output.areas_unit,
         component_means=output.component_means,
         arithmetic_component_means=output.arithmetic_component_means,
+        normalization_location=output.normalization_location,
+        normalization_scale=output.normalization_scale,
     )
 
 
@@ -1219,15 +1392,46 @@ def main() -> None:
         RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
         RESIDUAL_RECURRENT_MARKET_ARCHITECTURE_CONTRACT,
         LOW_RANK_PATH_MATRIX_ARCHITECTURE_CONTRACT,
+        DIRECT_FACTORIZED_ARCHITECTURE_CONTRACT,
+        CYCLIC_DENSE_COMPRESSED_ARCHITECTURE_CONTRACT,
+        ACTOR_MARKET_PROCESS_ARCHITECTURE_CONTRACT,
+        ACTOR_MARKET_PATH_MATRIX_ARCHITECTURE_CONTRACT,
     }
     feature_history = int(architecture.get("inputFeatureLags", 1))
     dataset_root = resolve(repo, Path(plan["datasetDir"]))
+    history_root = resolve(repo, Path(plan["historyDir"]))
+    target_normalization = plan.get("targetNormalization")
+    if target_normalization is None:
+        normalization_window_seconds = None
+        normalization_variance_floor = 1e-16
+    else:
+        normalization_type = target_normalization.get("type")
+        if normalization_type not in {
+            "causal-trailing-log-return-zscore",
+            "causal-trailing-log-price-zscore-difference",
+        }:
+            raise ValueError("unsupported target normalization")
+        normalization_window_seconds = int(target_normalization["windowSeconds"])
+        normalization_variance_floor = float(
+            target_normalization.get("varianceFloor", 1e-16)
+        )
+        normalization_statistic = (
+            "log-price"
+            if normalization_type
+            == "causal-trailing-log-price-zscore-difference"
+            else "log-return"
+        )
+    if target_normalization is None:
+        normalization_statistic = "log-return"
     evaluation_dataset = ImmediateFeatureActivePathDataset(
         dataset_root,
-        resolve(repo, Path(plan["historyDir"])),
+        history_root,
         int(architecture["returnCount"]),
         feature_history,
         int(plan["subset"]["examples"]),
+        normalization_window_seconds,
+        normalization_variance_floor,
+        normalization_statistic,
     )
     stats = training_statistics(
         evaluation_dataset, int(plan["training"]["evaluationBatchSize"])
@@ -1248,7 +1452,13 @@ def main() -> None:
     )
     calibration_root = resolve(repo, args.calibration_dir)
     calibration_dataset = CalibrationPathDataset(
-        calibration_root, int(architecture["returnCount"]), feature_history
+        calibration_root,
+        int(architecture["returnCount"]),
+        feature_history,
+        history_root=history_root,
+        normalization_window_seconds=normalization_window_seconds,
+        normalization_variance_floor=normalization_variance_floor,
+        normalization_statistic=normalization_statistic,
     )
     available_calibration = calibration_dataset.logical_count("calibration")
     if any(window > available_calibration for window in calibration_windows):
