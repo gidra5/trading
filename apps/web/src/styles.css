@@ -8,6 +8,20 @@
   text-rendering: optimizeLegibility;
 }
 
+.header-metric-exact {
+  display: none;
+}
+
+@media (min-width: 1440px) {
+  .header-metric-compact {
+    display: none;
+  }
+
+  .header-metric-exact {
+    display: inline;
+  }
+}
+
 body {
   min-width: 320px;
   min-height: 100vh;

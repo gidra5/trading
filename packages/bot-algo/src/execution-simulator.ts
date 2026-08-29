@@ -4878,6 +4878,7 @@ export class SimulatedExecutionEngine {
 
   private fillOpenOrders(tick: PriceTick, collectEvents: boolean): BotEvent[] {
     const events: BotEvent[] | undefined = collectEvents ? [] : undefined;
+    this.mergeFillableCloseOrdersAtTick(tick);
 
     for (const index of this.openOrderIndexes) {
       const order = this.state.orders[index];
@@ -4924,6 +4925,47 @@ export class SimulatedExecutionEngine {
     }
 
     return events ?? NO_EVENTS;
+  }
+
+  private mergeFillableCloseOrdersAtTick(tick: PriceTick): void {
+    const primaryByExecution = new Map<
+      string,
+      { index: number; order: TradingOrder }
+    >();
+
+    for (const index of [...this.openOrderIndexes]) {
+      const order = this.state.orders[index];
+      if (
+        order?.status !== "open" ||
+        order.positionEffect !== "close" ||
+        !order.targetPositionId ||
+        order.filledQuantity > MIN_BASE_QUANTITY ||
+        !canFillOrderAtTick(order, tick.price)
+      ) {
+        continue;
+      }
+
+      const executionPrice = this.executionPriceForOrderFill(order, tick.price);
+      const key = `${order.targetPositionId}:${order.side}:${executionPrice}`;
+      const primary = primaryByExecution.get(key);
+      if (!primary) {
+        primaryByExecution.set(key, { index, order });
+        continue;
+      }
+
+      primary.order.quantity = roundAsset(primary.order.quantity + order.quantity);
+      primary.order.estimatedQuoteCost = roundQuote(
+        primary.order.estimatedQuoteCost + order.estimatedQuoteCost,
+      );
+      primary.order.updatedAt = tick.eventTime;
+      primary.order.reason = `${primary.order.reason}; merged close order ${order.id}`;
+
+      order.status = "cancelled";
+      order.cancelledAt = tick.eventTime;
+      order.updatedAt = tick.eventTime;
+      order.reason = `${order.reason}; merged into ${primary.order.id}`;
+      this.openOrderIndexes.delete(index);
+    }
   }
 
   private tryFillOrder(

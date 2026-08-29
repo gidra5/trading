@@ -79,6 +79,15 @@ import type {
 const apiBase = "/backend";
 const wsUrl = websocketUrl(apiBase, "/ws");
 const SOCKET_SNAPSHOT_APPLY_MS = 500;
+const MARKET_CATALOG_CACHE_KEY = "trading.market-catalog.v1";
+const marketGroups: MarketGroup[] = [
+  "spot",
+  "bstocks",
+  "futures",
+  "tradfi",
+  "options",
+  "predictions",
+];
 const buttonBaseClass =
   "inline-flex min-h-9 select-none items-center justify-center gap-2 whitespace-nowrap rounded-2 px-3 py-2 text-sm font-semibold transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45 disabled:active:translate-y-0";
 const buttonPrimaryClass =
@@ -109,6 +118,33 @@ interface BacktestSettings {
 type CorrelationSortMode = "abs-desc" | "abs-asc" | "value-desc" | "value-asc";
 type AppPage = "dashboard" | "correlations" | "backtest";
 
+interface CachedMarketCatalog {
+  catalog: BinanceMarketCatalog;
+  loadedGroups: MarketGroup[];
+}
+
+function readCachedMarketCatalog(): CachedMarketCatalog | undefined {
+  try {
+    const value = JSON.parse(localStorage.getItem(MARKET_CATALOG_CACHE_KEY) ?? "null") as
+      | CachedMarketCatalog
+      | null;
+    if (!value || !Array.isArray(value.catalog?.markets) || !Array.isArray(value.loadedGroups)) {
+      return undefined;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeCachedMarketCatalog(value: CachedMarketCatalog): void {
+  try {
+    localStorage.setItem(MARKET_CATALOG_CACHE_KEY, JSON.stringify(value));
+  } catch {
+    // The in-memory cache remains usable when browser storage is unavailable.
+  }
+}
+
 const appPagePaths: Record<AppPage, string> = {
   dashboard: "/",
   correlations: "/correlations",
@@ -137,6 +173,7 @@ const defaultBacktestSettings: BacktestSettings = {
 };
 
 export function App() {
+  const cachedMarketCatalog = readCachedMarketCatalog();
   const [activePage, setActivePage] = createSignal<AppPage>(
     appPageFromPath(window.location.pathname),
   );
@@ -156,7 +193,13 @@ export function App() {
   const [configError, setConfigError] = createSignal<string>();
   const [manualTradeError, setManualTradeError] = createSignal<string>();
   const [exchangeError, setExchangeError] = createSignal<string>();
-  const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog>();
+  const [marketCatalog, setMarketCatalog] = createSignal<BinanceMarketCatalog | undefined>(
+    cachedMarketCatalog?.catalog,
+  );
+  const [loadedMarketGroups, setLoadedMarketGroups] = createSignal<MarketGroup[]>(
+    cachedMarketCatalog?.loadedGroups ?? [],
+  );
+  const [loadingMarketGroups, setLoadingMarketGroups] = createSignal<MarketGroup[]>([]);
   const [marketError, setMarketError] = createSignal<string>();
   const [switchingMarketId, setSwitchingMarketId] = createSignal<string>();
   const [correlationSortMode, setCorrelationSortMode] =
@@ -248,16 +291,59 @@ export function App() {
     applySnapshot((await response.json()) as RuntimeSnapshot);
   };
 
-  const loadMarkets = async (refresh = false) => {
-    setMarketError(undefined);
-    const response = await fetch(`${apiBase}/api/markets${refresh ? "?refresh=1" : ""}`);
-    const payload = await response.json();
-    if (!response.ok) {
-      setMarketError(payload.error ?? "Market list request failed");
+  const loadMarkets = async (
+    requestedGroups: MarketGroup[] = marketGroups,
+    refresh = false,
+  ) => {
+    const currentlyLoading = new Set(loadingMarketGroups());
+    const currentlyLoaded = new Set(loadedMarketGroups());
+    const groups = requestedGroups.filter(
+      (group, index) =>
+        requestedGroups.indexOf(group) === index &&
+        !currentlyLoading.has(group) &&
+        (refresh || !currentlyLoaded.has(group)),
+    );
+    if (groups.length === 0) {
       return;
     }
 
-    setMarketCatalog(payload as BinanceMarketCatalog);
+    setMarketError(undefined);
+    setLoadingMarketGroups((current) => [...new Set([...current, ...groups])]);
+    try {
+      const params = new URLSearchParams({ groups: groups.join(",") });
+      if (refresh) {
+        params.set("refresh", "1");
+      }
+      const response = await fetch(`${apiBase}/api/markets?${params}`);
+      const payload = await response.json();
+      if (!response.ok) {
+        setMarketError(payload.error ?? "Market list request failed");
+        return;
+      }
+
+      const incoming = payload as BinanceMarketCatalog;
+      const requestedSet = new Set(groups);
+      const retained = refresh
+        ? (marketCatalog()?.markets ?? []).filter((item) => !requestedSet.has(item.group))
+        : marketCatalog()?.markets ?? [];
+      const mergedMarkets = new Map(retained.map((item) => [item.id, item]));
+      for (const item of incoming.markets) {
+        mergedMarkets.set(item.id, item);
+      }
+      const catalog: BinanceMarketCatalog = {
+        ...incoming,
+        markets: [...mergedMarkets.values()],
+      };
+      const nextLoadedGroups = [...new Set([...loadedMarketGroups(), ...groups])];
+      setMarketCatalog(catalog);
+      setLoadedMarketGroups(nextLoadedGroups);
+      writeCachedMarketCatalog({ catalog, loadedGroups: nextLoadedGroups });
+    } catch (error) {
+      setMarketError(error instanceof Error ? error.message : "Market list request failed");
+    } finally {
+      const completed = new Set(groups);
+      setLoadingMarketGroups((current) => current.filter((group) => !completed.has(group)));
+    }
   };
 
   const flushSocketSnapshot = () => {
@@ -680,10 +766,12 @@ export function App() {
   onMount(() => {
     popStateHandler = () => setActivePage(appPageFromPath(window.location.pathname));
     window.addEventListener("popstate", popStateHandler);
-    void loadInitial().catch(() => setConnection("offline"));
-    void loadMarkets().catch((error) =>
-      setMarketError(error instanceof Error ? error.message : "Market list request failed"),
-    );
+    void loadInitial()
+      .then(() => loadMarkets([market()?.group ?? "spot"]))
+      .catch((error) => {
+        setConnection("offline");
+        setMarketError(error instanceof Error ? error.message : "State request failed");
+      });
     connect();
     runClockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
   });
@@ -707,101 +795,101 @@ export function App() {
 
   return (
     <main class="min-h-screen bg-ink-950 text-ink-100">
-      <div class="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-4 lg:px-6">
-        <header class="flex flex-col gap-3 border-b border-line pb-4 lg:flex-row lg:items-center lg:justify-between">
-          <div class="flex min-w-0 flex-col gap-3">
-            <AssetSelector
-              catalog={marketCatalog()}
-              selectedMarketId={market()?.id}
-              selectedSymbol={market()?.symbol ?? "BTCUSDT"}
-              disabled={Boolean(switchingMarketId())}
-              error={marketError()}
-              onSelect={(marketId) => void selectMarket(marketId)}
-              onRefresh={() => void loadMarkets(true)}
-            />
-            <div class="flex flex-wrap items-center gap-2">
-              <StatusPill label={market()?.venue ?? "spot"} active />
-              <StatusPill label={connection()} active={connection() === "live"} />
-              <StatusPill
-                label={market()?.connected ? "Binance live" : "Binance offline"}
-                active={Boolean(market()?.connected)}
-              />
-              <StatusPill
-                label={exchangeStatusLabel(exchange())}
-                active={Boolean(exchange()?.connected)}
-              />
-              <StatusPill
-                label={snapshot()?.execution?.exchangeDriven ? "Binance execution" : "Simulated execution"}
-                active={Boolean(snapshot()?.execution?.exchangeDriven)}
-              />
-              <StatusPill label={bot()?.status ?? "starting"} active={bot()?.status === "running"} />
-            </div>
-            <Show when={isBotRunning()} fallback={<div class="text-sm text-ink-400">Bot stopped</div>}>
-              <div class="text-sm text-ink-300">
-                Start: {formatDateTime(botRunStartedAt())}
-                <span class="mx-2">·</span>
-                Duration: {formatDuration(botRunDurationMs())}
-              </div>
-            </Show>
-          </div>
-
-          <div class="flex flex-wrap items-center gap-2">
-            <button class={buttonPrimaryClass} type="button" onClick={() => void controlBot("start")}>
-              <Play size={16} />
-              Start
-            </button>
-            <button class={buttonDangerClass} type="button" onClick={() => void controlBot("stop")}>
-              <Square size={16} />
-              Stop
-            </button>
-            <button class="btn" type="button" onClick={() => void controlBot("reset")}>
-              <RotateCcw size={16} />
-              Reset
-            </button>
-            <button
-              class="btn"
-              type="button"
+      <header class="sticky top-0 z-50 grid w-full grid-cols-1 items-center gap-x-2 gap-y-1.5 border-b border-line bg-ink-950/96 px-3 py-1.5 shadow-[0_10px_24px_rgba(0,0,0,0.24)] backdrop-blur sm:grid-cols-[minmax(0,1fr)_auto] lg:grid-cols-[auto_auto_minmax(0,1fr)] lg:px-4 xl:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
+          <div class="flex min-w-0 flex-wrap items-center gap-1 sm:col-start-1 sm:row-start-1">
+            <HeaderIconButton label="Start bot" tone="primary" onClick={() => void controlBot("start")}>
+              <Play size={15} />
+            </HeaderIconButton>
+            <HeaderIconButton label="Stop bot" tone="danger" onClick={() => void controlBot("stop")}>
+              <Square size={15} />
+            </HeaderIconButton>
+            <HeaderIconButton label="Reset bot" onClick={() => void controlBot("reset")}>
+              <RotateCcw size={15} />
+            </HeaderIconButton>
+            <HeaderIconButton
+              label="Close profitable positions and pause"
               disabled={!hasClosablePositions()}
               onClick={() => void closeBotPositions(false)}
             >
-              <MinusCircle size={16} />
-              Close Profitable + Pause
-            </button>
-            <button
-              class={buttonDangerClass}
-              type="button"
+              <MinusCircle size={15} />
+            </HeaderIconButton>
+            <HeaderIconButton
+              label="Force close all positions"
+              tone="danger"
               disabled={!hasClosablePositions()}
               onClick={() => void closeBotPositions(true)}
             >
-              <MinusCircle size={16} />
-              Force Close All
-            </button>
+              <X size={15} />
+            </HeaderIconButton>
+            <BotStatusDropdown
+              status={bot()?.status ?? "starting"}
+              startedAt={botRunStartedAt()}
+              runtimeMs={botRunDurationMs()}
+              venue={market()?.venue ?? "spot"}
+              connection={connection()}
+              marketConnected={Boolean(market()?.connected)}
+              exchangeLabel={exchangeStatusLabel(exchange())}
+              exchangeConnected={Boolean(exchange()?.connected)}
+              exchangeDriven={Boolean(snapshot()?.execution?.exchangeDriven)}
+            />
           </div>
-        </header>
 
-        <AppNavigation activePage={activePage()} onNavigate={navigate} />
+          <AppNavigation activePage={activePage()} onNavigate={navigate} />
+
+          <div class="flex min-w-0 flex-col gap-1.5 sm:col-span-2 sm:row-start-3 sm:flex-row sm:items-center sm:justify-end lg:col-span-1 lg:col-start-3 lg:row-start-1">
+            <div class="grid min-w-0 grid-cols-3 gap-x-2 sm:grid-cols-6 lg:flex lg:w-auto lg:items-center lg:gap-3">
+              <HeaderMetric
+                label={`Last ${market()?.quoteAsset ?? "USDT"}`}
+                value={formatCompactHeaderNumber(market()?.lastPrice, "", 2)}
+                exactValue={formatQuote(market()?.lastPrice, 2)}
+                tone={latestCandleTone(market()?.candles)}
+              />
+              <HeaderMetric
+                label="Equity"
+                value={formatCompactHeaderNumber(metrics()?.equity, "$", 0)}
+                exactValue={`$${formatQuote(metrics()?.equity, 2)}`}
+              />
+              <HeaderMetric
+                label="Run return"
+                value={formatPercent(runReturnPct())}
+                tone={signedTone(runReturnPct())}
+              />
+              <HeaderMetric
+                label="Quote free"
+                value={formatCompactHeaderNumber(bot()?.quoteFree, "$", 0)}
+                exactValue={`$${formatQuote(bot()?.quoteFree, 2)}`}
+              />
+              <HeaderMetric
+                label={`${bot()?.baseAsset ?? "Base"} free`}
+                value={formatQuote(bot()?.baseFree, 5)}
+              />
+              <HeaderMetric label="Open orders" value={openOrders().length.toString()} />
+            </div>
+
+            <AssetSelector
+              catalog={marketCatalog()}
+              loadedGroups={loadedMarketGroups()}
+              loadingGroups={loadingMarketGroups()}
+              selectedMarketId={market()?.id}
+              selectedSymbol={market()?.displaySymbol ?? market()?.symbol ?? "BTC/USDT"}
+              selectedGroup={market()?.group ?? "spot"}
+              disabled={Boolean(switchingMarketId())}
+              error={marketError()}
+              onSelect={(marketId) => void selectMarket(marketId)}
+              onRequestGroup={(group) =>
+                void loadMarkets(group === "all" ? marketGroups : [group])
+              }
+              onRefresh={(group) =>
+                void loadMarkets(group === "all" ? marketGroups : [group], true)
+              }
+            />
+          </div>
+      </header>
+
+      <div class="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-4 lg:px-6">
 
         <Show when={activePage() === "dashboard"}>
           <>
-        <section class="grid grid-cols-2 gap-3 lg:grid-cols-6">
-          <MetricCard
-            label="Last Price"
-            value={`${formatQuote(market()?.lastPrice, 2)} ${market()?.quoteAsset ?? "USDT"}`}
-          />
-          <MetricCard label="Equity" value={`$${formatQuote(metrics()?.equity, 2)}`} />
-          <MetricCard
-            label="Run Return"
-            value={formatPercent(runReturnPct())}
-            tone={runReturnPct() >= 0 ? "gain" : "loss"}
-          />
-          <MetricCard label="Quote Free" value={`$${formatQuote(bot()?.quoteFree, 2)}`} />
-          <MetricCard
-            label={`${bot()?.baseAsset ?? "Base"} Free`}
-            value={formatAsset(bot()?.baseFree)}
-          />
-          <MetricCard label="Open Orders" value={openOrders().length.toString()} />
-        </section>
-
         <LiveEquityPanel points={liveEquityCurve()} />
 
         <AlgorithmPanel
@@ -927,12 +1015,12 @@ function AppNavigation(props: {
   onNavigate: (page: AppPage) => void;
 }) {
   return (
-    <nav aria-label="Primary navigation" class="flex flex-wrap gap-1 rounded-2 border border-line bg-ink-900 p-1">
+    <nav aria-label="Primary navigation" class="flex w-full flex-wrap justify-center justify-self-stretch gap-0.5 rounded-2 bg-ink-900 p-0.5 sm:col-span-2 sm:row-start-2 sm:w-auto sm:justify-self-center lg:col-span-1 lg:col-start-2 lg:row-start-1">
       <For each={appNavigationItems}>
         {(item) => (
           <a
             aria-current={props.activePage === item.page ? "page" : undefined}
-            class="rounded-2 px-3 py-2 text-sm font-semibold transition"
+            class="rounded-2 px-2.5 py-1.5 text-base font-semibold transition"
             classList={{
               "bg-accent text-ink-950": props.activePage === item.page,
               "text-ink-300 hover:bg-ink-800 hover:text-ink-100":
@@ -961,6 +1049,87 @@ function AppNavigation(props: {
   );
 }
 
+function HeaderIconButton(props: {
+  label: string;
+  tone?: "primary" | "danger";
+  disabled?: boolean;
+  onClick: () => void;
+  children: JSX.Element;
+}) {
+  return (
+    <button
+      aria-label={props.label}
+      title={props.label}
+      class="inline-flex h-8 w-8 select-none items-center justify-center rounded-2 transition active:translate-y-px focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-45"
+      classList={{
+        "bg-accent text-ink-950 hover:bg-accent/88 focus-visible:ring-accent/55":
+          props.tone === "primary",
+        "bg-loss/12 text-loss hover:bg-loss/22 focus-visible:ring-loss/40": props.tone === "danger",
+        "bg-transparent text-ink-200 hover:bg-ink-800 hover:text-ink-100 focus-visible:ring-ink-600/55": !props.tone,
+      }}
+      disabled={props.disabled}
+      type="button"
+      onClick={props.onClick}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function BotStatusDropdown(props: {
+  status: string;
+  startedAt?: number;
+  runtimeMs?: number;
+  venue: string;
+  connection: "connecting" | "live" | "offline";
+  marketConnected: boolean;
+  exchangeLabel: string;
+  exchangeConnected: boolean;
+  exchangeDriven: boolean;
+}) {
+  const running = () => props.status === "running";
+  return (
+    <details class="group relative z-40">
+      <summary
+        aria-label={
+          running()
+            ? `Bot running; runtime ${formatDuration(props.runtimeMs)}`
+            : `Bot ${props.status}`
+        }
+        class="flex h-8 cursor-pointer list-none items-center justify-center gap-2 rounded-2 bg-transparent px-2 font-mono text-base text-ink-300 transition hover:bg-ink-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink-600/55"
+        title={running() ? `Started ${formatDateTime(props.startedAt)}` : `Bot ${props.status}`}
+      >
+        <span
+          class="h-2.5 w-2.5 rounded-full shadow-[0_0_0_3px_rgba(255,255,255,0.04)]"
+          classList={{ "bg-gain": running(), "bg-warn": !running() }}
+        />
+        <Show when={running()}>
+          <span class="whitespace-nowrap">{formatDuration(props.runtimeMs)}</span>
+        </Show>
+      </summary>
+      <div class="absolute left-0 top-full mt-2 flex w-64 flex-wrap gap-2 rounded-2 border border-line bg-ink-900 p-3 shadow-xl">
+        <StatusPill label={`Bot ${props.status}`} active={running()} />
+        <Show when={running()}>
+          <div class="w-full border-b border-line pb-2 text-xs text-ink-300">
+            Started {formatDateTime(props.startedAt)}
+          </div>
+        </Show>
+        <StatusPill label={props.venue} active />
+        <StatusPill label={props.connection} active={props.connection === "live"} />
+        <StatusPill
+          label={props.marketConnected ? "Binance live" : "Binance offline"}
+          active={props.marketConnected}
+        />
+        <StatusPill label={props.exchangeLabel} active={props.exchangeConnected} />
+        <StatusPill
+          label={props.exchangeDriven ? "Binance execution" : "Simulated execution"}
+          active={props.exchangeDriven}
+        />
+      </div>
+    </details>
+  );
+}
+
 function AnalysisPageHeader(props: {
   eyebrow: string;
   title: string;
@@ -975,23 +1144,83 @@ function AnalysisPageHeader(props: {
   );
 }
 
-function MetricCard(props: {
+type HeaderMetricTone = "gain" | "loss" | "neutral";
+
+function formatCompactHeaderNumber(
+  value: number | undefined,
+  prefix = "",
+  digits = 0,
+): string {
+  if (!Number.isFinite(value)) {
+    return "-";
+  }
+
+  const finite = value as number;
+  if (Math.abs(finite) < 1_000) {
+    return `${prefix}${formatQuote(finite, digits)}`;
+  }
+
+  const magnitude = Math.abs(finite);
+  const [divisor, suffix] =
+    magnitude >= 1_000_000_000
+      ? [1_000_000_000, "B"]
+      : magnitude >= 1_000_000
+        ? [1_000_000, "M"]
+        : [1_000, "K"];
+  const truncated = Math.trunc((finite / divisor) * 10) / 10;
+  return `${prefix}${formatQuote(truncated, 1)}${suffix}`;
+}
+
+function signedTone(value: number | undefined): HeaderMetricTone {
+  if (!Number.isFinite(value) || value === 0) {
+    return "neutral";
+  }
+  return (value as number) > 0 ? "gain" : "loss";
+}
+
+function latestCandleTone(candles: readonly Candle[] | undefined): HeaderMetricTone {
+  const candle = candles?.[candles.length - 1];
+  if (!candle || candle.close === candle.open) {
+    return "neutral";
+  }
+  return candle.close > candle.open ? "gain" : "loss";
+}
+
+function headerMetricColor(tone: HeaderMetricTone | undefined): string {
+  if (tone === "gain") {
+    return "#4ade80";
+  }
+  if (tone === "loss") {
+    return "#fb7185";
+  }
+  return "#f4f6fb";
+}
+
+function HeaderMetric(props: {
   label: string;
   value: string;
-  tone?: "gain" | "loss" | "neutral";
+  exactValue?: string;
+  tone?: HeaderMetricTone;
 }) {
+  const accessibleValue = () => props.exactValue ?? props.value;
+  const toneColor = createMemo(() => headerMetricColor(props.tone));
   return (
-    <div class="panel-tight">
-      <div class="muted-label">{props.label}</div>
+    <div
+      class="group relative min-w-0 px-1 text-right lg:shrink-0"
+      aria-label={`${props.label}: ${accessibleValue()}`}
+    >
       <div
-        class="metric-value mt-1 truncate"
-        classList={{
-          "text-gain": props.tone === "gain",
-          "text-loss": props.tone === "loss",
-        }}
+        class="whitespace-nowrap font-mono text-[15px] leading-8 tracking-[-0.03em] tabular-nums"
+        style={`color: ${toneColor()} !important`}
       >
-        {props.value}
+        <span class={props.exactValue ? "header-metric-compact" : undefined}>{props.value}</span>
+        {props.exactValue ? (
+          <span class="header-metric-exact">{props.exactValue}</span>
+        ) : null}
       </div>
+      <span class="pointer-events-none absolute right-1 top-full z-60 mt-1 whitespace-nowrap rounded-2 bg-ink-700 px-2 py-1 text-xs font-medium text-ink-100 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+        {props.label} · {accessibleValue()}
+      </span>
     </div>
   );
 }
@@ -1486,31 +1715,36 @@ function ExchangePaperPanel(props: {
 
 const marketGroupFilters: Array<MarketGroup | "all"> = [
   "all",
-  "spot",
-  "bstocks",
-  "futures",
-  "tradfi",
-  "options",
-  "predictions",
+  ...marketGroups,
 ];
 
 function AssetSelector(props: {
   catalog?: BinanceMarketCatalog;
+  loadedGroups: MarketGroup[];
+  loadingGroups: MarketGroup[];
   selectedMarketId?: string;
   selectedSymbol: string;
+  selectedGroup: MarketGroup;
   disabled?: boolean;
   error?: string;
   onSelect: (marketId: string) => void;
-  onRefresh: () => void;
+  onRequestGroup: (group: MarketGroup | "all") => void;
+  onRefresh: (group: MarketGroup | "all") => void;
 }) {
   const [query, setQuery] = createSignal("");
   const [group, setGroup] = createSignal<MarketGroup | "all">("all");
+  let dropdown: HTMLDetailsElement | undefined;
   const selected = createMemo(() =>
     props.catalog?.markets.find((market) => market.id === props.selectedMarketId),
   );
   const filteredMarkets = createMemo(() => {
     const normalizedQuery = query().trim().toLowerCase();
     const selectedMarket = selected();
+
+    if (!normalizedQuery && group() === "all") {
+      return selectedMarket ? [selectedMarket] : [];
+    }
+
     const filtered =
       props.catalog?.markets.filter((market) => {
         if (group() !== "all" && market.group !== group()) {
@@ -1522,91 +1756,147 @@ function AssetSelector(props: {
         return true;
       }) ?? [];
 
-    if (selectedMarket && !filtered.some((market) => market.id === selectedMarket.id)) {
-      return [selectedMarket, ...filtered];
-    }
-
-    return filtered;
+    return filtered.slice(0, 200);
   });
   const countForGroup = (value: MarketGroup | "all") =>
     value === "all"
-      ? props.catalog?.markets.length ?? 0
+      ? Object.values(props.catalog?.counts ?? {}).reduce((total, count) => total + count, 0)
       : props.catalog?.counts[value] ?? 0;
+  const requestedGroups = (value: MarketGroup | "all") =>
+    value === "all" ? marketGroups : [value];
+  const groupIsLoading = (value: MarketGroup | "all") =>
+    requestedGroups(value).some((item) => props.loadingGroups.includes(item));
+  const groupIsLoaded = (value: MarketGroup | "all") =>
+    requestedGroups(value).every((item) => props.loadedGroups.includes(item));
+  const selectGroup = (value: MarketGroup | "all") => {
+    setGroup(value);
+    props.onRequestGroup(value);
+  };
+  const selectMarket = (marketId: string) => {
+    props.onSelect(marketId);
+    dropdown?.removeAttribute("open");
+  };
 
   return (
-    <div class="min-w-0 lg:min-w-150">
-      <div class="flex items-center justify-between gap-3">
-        <div class="min-w-0">
-          <div class="muted-label">Asset</div>
-          <h1 class="truncate text-2xl font-semibold tabular-nums">
-            {selected()?.displaySymbol ?? props.selectedSymbol}
-          </h1>
+    <details
+      ref={(element) => (dropdown = element)}
+      class="group relative z-50 min-w-0 w-full sm:w-auto"
+      onToggle={(event) => {
+        if (event.currentTarget.open) {
+          setGroup("all");
+          setQuery("");
+          props.onRequestGroup(props.selectedGroup);
+        }
+      }}
+    >
+      <summary class="flex min-h-8 w-full min-w-28 cursor-pointer list-none items-center justify-between gap-1.5 rounded-2 bg-transparent px-2 py-1 text-base font-semibold tabular-nums text-ink-100 transition hover:bg-ink-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ink-600/55 sm:w-auto">
+        <span class="truncate">{selected()?.displaySymbol ?? props.selectedSymbol}</span>
+        <ChevronDown size={15} class="shrink-0 transition group-open:rotate-180" />
+      </summary>
+
+      <div class="absolute right-0 top-[calc(100%+0.5rem)] w-[min(36rem,calc(100vw-2rem))] rounded-2 border border-line bg-ink-900 p-3 text-left shadow-2xl">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <div class="muted-label">Asset</div>
+            <div class="font-semibold text-ink-100">
+              {selected()?.displaySymbol ?? props.selectedSymbol}
+            </div>
+          </div>
+          <button
+            class="btn px-2.5"
+            onClick={() => props.onRefresh(group())}
+            disabled={props.disabled || groupIsLoading(group())}
+            aria-label={`Refresh ${marketGroupLabel(group())} assets`}
+            title={`Refresh ${marketGroupLabel(group())} assets`}
+            type="button"
+          >
+            <RefreshCw size={16} classList={{ "animate-spin": groupIsLoading(group()) }} />
+          </button>
         </div>
-        <button
-          class="btn px-2.5"
-          onClick={props.onRefresh}
-          disabled={props.disabled}
-          type="button"
-        >
-          <RefreshCw size={16} />
-        </button>
-      </div>
 
-      <div class="mt-2 flex flex-wrap gap-1.5">
-        <For each={marketGroupFilters}>
-          {(item) => (
-            <button
-              class="rounded-2 border px-2.5 py-1 text-xs uppercase tracking-wide transition"
-              classList={{
-                "border-accent bg-accent/18 text-ink-100": group() === item,
-                "border-line bg-ink-800 text-ink-300 hover:border-accent": group() !== item,
-              }}
-              onClick={() => setGroup(item)}
-              type="button"
-            >
-              {marketGroupLabel(item)} {countForGroup(item)}
-            </button>
-          )}
-        </For>
-      </div>
+        <div class="mt-3 flex flex-wrap gap-1.5">
+          <For each={marketGroupFilters}>
+            {(item) => (
+              <button
+                class="rounded-2 border px-2.5 py-1 text-xs uppercase tracking-wide transition"
+                classList={{
+                  "border-accent bg-accent/18 text-ink-100": group() === item,
+                  "border-line bg-ink-800 text-ink-300 hover:border-accent": group() !== item,
+                }}
+                onClick={() => selectGroup(item)}
+                type="button"
+              >
+                {marketGroupLabel(item)} {countForGroup(item)}
+                <Show when={groupIsLoading(item)}>…</Show>
+              </button>
+            )}
+          </For>
+        </div>
 
-      <div class="mt-2 grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,240px)_minmax(0,1fr)]">
-        <label class="relative min-w-0">
+        <label class="relative mt-3 block min-w-0">
           <Search size={15} class="pointer-events-none absolute left-2.5 top-2.5 text-ink-300" />
           <input
             class="w-full rounded-2 border border-line bg-ink-800 py-2 pl-8 pr-2 text-sm text-ink-100"
             aria-label="Search markets"
             value={query()}
             placeholder="Search BTC, TSLA, XAU..."
-            onInput={(event) => setQuery(event.currentTarget.value)}
+            onInput={(event) => {
+              const value = event.currentTarget.value;
+              setQuery(value);
+              if (value.trim()) {
+                props.onRequestGroup(group());
+              }
+            }}
           />
         </label>
-        <select
-          class="w-full rounded-2 border border-line bg-ink-800 px-3 py-2 text-sm text-ink-100 disabled:opacity-60"
-          value={props.selectedMarketId ?? ""}
-          disabled={props.disabled || !props.catalog}
-          onInput={(event) => props.onSelect(event.currentTarget.value)}
-        >
-          <Show when={props.catalog} fallback={<option value="">Loading Binance markets...</option>}>
+
+        <div class="mt-2 max-h-72 space-y-1 overflow-y-auto">
+          <Show
+            when={filteredMarkets().length > 0}
+            fallback={
+              <div class="rounded-2 bg-ink-800 px-3 py-4 text-center text-sm text-ink-400">
+                {groupIsLoading(group())
+                  ? "Loading assets…"
+                  : groupIsLoaded(group())
+                    ? "No matching assets"
+                    : "Choose a category to load assets"}
+              </div>
+            }
+          >
             <For each={filteredMarkets()}>
-              {(market) => (
-                <option
-                  value={market.id}
-                  disabled={!market.supportsLiveStream}
-                  title={market.unavailableReason}
+              {(item) => (
+                <button
+                  class="flex w-full items-center justify-between gap-3 rounded-2 border px-3 py-2 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-45"
+                  classList={{
+                    "border-accent bg-accent/12": item.id === props.selectedMarketId,
+                    "border-transparent bg-ink-800 hover:border-line":
+                      item.id !== props.selectedMarketId,
+                  }}
+                  disabled={!item.supportsLiveStream}
+                  title={item.unavailableReason}
+                  type="button"
+                  onClick={() => selectMarket(item.id)}
                 >
-                  {marketOptionLabel(market)}
-                </option>
+                  <span class="min-w-0 truncate font-semibold text-ink-100">
+                    {item.displaySymbol}
+                  </span>
+                  <span class="shrink-0 truncate text-xs text-ink-400">
+                    {venueLabel(item.venue)} · {item.symbol}
+                  </span>
+                </button>
               )}
             </For>
           </Show>
-        </select>
-      </div>
+        </div>
 
-      <Show when={props.error ?? firstCatalogWarning(props.catalog)}>
-        {(message) => <div class="mt-2 text-xs text-warn">{message()}</div>}
-      </Show>
-    </div>
+        <Show when={filteredMarkets().length === 200}>
+          <div class="mt-2 text-xs text-ink-400">Showing the first 200 matches.</div>
+        </Show>
+        <Show when={props.error ?? firstCatalogWarning(props.catalog)}>
+          {(message) => <div class="mt-2 text-xs text-warn">{message()}</div>}
+        </Show>
+      </div>
+    </details>
   );
 }
 
@@ -3679,6 +3969,12 @@ function PositionListItem(props: {
       ? `${label} ${executedOrderCount(gridOrders)}/${gridOrders.length} executed`
       : `${label} waiting`;
   };
+  const realizedPositionQuote = () =>
+    props.lot.side === "long"
+      ? props.lot.remainingCostQuote
+      : props.lot.remainingProceedsQuote;
+  const realizedPositionSize = () =>
+    `$${formatQuote(realizedPositionQuote(), 2)} / ${formatAsset(props.lot.remainingQuantity)} ${props.baseAsset}`;
   const breakEvenPrice = () => lotBreakEvenPrice(props.lot);
   const possible = () =>
     props.lot.side === "long"
@@ -3692,7 +3988,7 @@ function PositionListItem(props: {
   return (
     <details class="group rounded-2 border border-line bg-ink-900">
       <summary class="cursor-pointer list-none p-3">
-        <div class="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.25fr)_minmax(7rem,.6fr)_minmax(8rem,.65fr)_minmax(9rem,.7fr)_auto] lg:items-center">
+        <div class="grid min-w-0 grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1.2fr)_minmax(6.5rem,.5fr)_minmax(10rem,.75fr)_minmax(8rem,.65fr)_minmax(9rem,.7fr)_auto] lg:items-center">
           <div class="flex min-w-0 items-center gap-2">
             <ChevronRight class="shrink-0 transition-transform group-open:rotate-90" size={16} />
             <span
@@ -3713,6 +4009,10 @@ function PositionListItem(props: {
           <PositionSummaryValue
             label="Lifecycle"
             value={props.lifecycle?.phase ?? "lifecycle error"}
+          />
+          <PositionSummaryValue
+            label="Realized size"
+            value={realizedPositionSize()}
           />
           <PositionSummaryValue
             label="Break-even"

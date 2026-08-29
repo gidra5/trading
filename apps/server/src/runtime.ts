@@ -524,6 +524,16 @@ export class TradingRuntime {
       ) {
         const snapshot = await this.paperTrading!.closeOpenPositions(this.market, options);
         await this.applyExchangeSnapshot(snapshot);
+      } else if (exchangeCanSubmit) {
+        const closeEvents = this.bot.createPositionCloseOrders(options, at);
+        events.push(...closeEvents);
+        this.recordEvents(events);
+        await this.submitCreatedOrdersToPaperExchange(closeEvents, {
+          force: true,
+          throwOnFailure: true,
+        });
+        await this.flushState();
+        return events;
       }
       this.recordEvents(events);
       await this.flushState();

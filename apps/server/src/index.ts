@@ -39,6 +39,14 @@ const server = Fastify({
 const MAX_RANDOM_PAIR_COUNT = 25;
 const MARKET_CATALOG_RESPONSE_TIMEOUT_MS = 5_000;
 const DASHBOARD_WS_HEARTBEAT_MS = 30_000;
+const MARKET_GROUP_VALUES = new Set<MarketGroup>([
+  "spot",
+  "bstocks",
+  "futures",
+  "tradfi",
+  "options",
+  "predictions",
+]);
 const HEARTBEAT_LOG_MS = Math.max(0, Number(process.env.TRADING_HEARTBEAT_LOG_MS ?? 60_000));
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
 let tcpConnectionCount = 0;
@@ -115,15 +123,21 @@ server.get("/api/diagnostics", async () => diagnosticsSnapshot());
 server.get("/api/state", async () => publicSnapshot());
 
 server.get("/api/markets", async (request) => {
-  const query = request.query as { refresh?: string };
+  const query = request.query as { refresh?: string; groups?: string };
   const refresh = query.refresh === "1" || query.refresh === "true";
+  const requestedGroups = new Set(
+    (query.groups ?? "")
+      .split(",")
+      .map((group) => group.trim())
+      .filter(isMarketGroup),
+  );
   const catalogRequest = marketCatalog.list(refresh).catch((error) => {
     const message = error instanceof Error ? error.message : "Binance market catalog failed.";
     server.log.warn({ error: message }, "Binance market catalog request failed");
     return fallbackMarketCatalog(activeMarket, message);
   });
 
-  return Promise.race([
+  const catalog = await Promise.race([
     catalogRequest,
     delay(MARKET_CATALOG_RESPONSE_TIMEOUT_MS).then(() =>
       fallbackMarketCatalog(
@@ -132,6 +146,15 @@ server.get("/api/markets", async (request) => {
       ),
     ),
   ]);
+
+  if (requestedGroups.size === 0) {
+    return catalog;
+  }
+
+  return {
+    ...catalog,
+    markets: catalog.markets.filter((market) => requestedGroups.has(market.group)),
+  };
 });
 
 server.post("/api/market", async (request, reply) => {
@@ -702,6 +725,10 @@ function countCatalogGroups(
       return counts;
     }, {}),
   };
+}
+
+function isMarketGroup(value: string): value is MarketGroup {
+  return MARKET_GROUP_VALUES.has(value as MarketGroup);
 }
 
 function delay(ms: number): Promise<void> {
