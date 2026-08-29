@@ -16,7 +16,11 @@ from train_structured_feature_process import (
     build_dataset,
     comparable_policy_metrics,
     evaluate,
+    evaluate_feature_embedding_density,
+    persist_embedding_density_evaluation,
     persist_structured_feature_evaluation,
+    uses_base_support_embedding_density,
+    uses_embedding_density_objective,
     validate_plan,
 )
 
@@ -31,6 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument(
+        "--allow-stopped-training-status",
+        action="store_true",
+        help=(
+            "Evaluate after the exact training process was externally stopped "
+            "even if its last durable status still says training."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -66,6 +78,7 @@ def model_from_state(
             "layer8FunctionApproximator"
         ),
         recurrent_memory=architecture.get("recurrentMemory"),
+        feature_embedding_density=architecture.get("featureEmbeddingDensity"),
     )
     model.load_state_dict(state)
     model.eval()
@@ -83,7 +96,8 @@ def main() -> None:
     run_root = (repo / plan["runDir"]).resolve()
     status_file = run_root / "state/status.json"
     status = json.loads(status_file.read_text(encoding="utf-8"))
-    if status.get("stage") == "training":
+    if status.get("stage") == "training" \
+            and not args.allow_stopped_training_status:
         raise ValueError("refusing to evaluate a run still marked as training")
     dataset = build_dataset(plan, repo)
     device = torch.device(args.device)
@@ -92,7 +106,28 @@ def main() -> None:
     batch_size = int(args.batch_size or plan["training"]["evaluationBatchSize"])
     if hasattr(dataset, "rollout"):
         dataset.statistics(batch_size)
-    checkpoint_specs = (
+    uses_embedding_density = uses_embedding_density_objective(plan)
+    uses_base_support_density = uses_base_support_embedding_density(plan)
+    checkpoint_specs = ((
+        "best-validation-nll",
+        run_root / "checkpoints/selections/validation-nll.json",
+        "model",
+    ), *(
+        (
+            (
+                "best-validation-mse",
+                run_root / "checkpoints/selections/validation-mse.json",
+                "model",
+            ),
+            (
+                "best-validation-correlation",
+                run_root / "checkpoints/selections/validation-correlation.json",
+                "model",
+            ),
+        )
+        if uses_base_support_density else ()
+    ), ("last", run_root / "checkpoints/last.json", "emaModel")) \
+        if uses_embedding_density else (
         (
             "best-validation-mse",
             run_root / "checkpoints/selections/validation-mse.json",
@@ -115,8 +150,12 @@ def main() -> None:
         model = model_from_state(plan, checkpoint[state_key], device)
         parameter_count = sum(value.numel() for value in model.parameters())
         selection_score = checkpoint.get("score")
+        evaluator = (
+            evaluate_feature_embedding_density
+            if uses_embedding_density else evaluate
+        )
         evaluations = {
-            split: evaluate(
+            split: evaluator(
                 model, dataset, split, batch_size=batch_size, device=device
             )
             for split in ("train", "validation", "test")
@@ -131,11 +170,22 @@ def main() -> None:
                 if label == "best-validation-correlation"
                 else "featureState.normalizedMse"
                 if label == "best-validation-mse"
+                else "validation.negativeLogLikelihood"
+                if label == "best-validation-nll"
                 else None
             ),
             "checkpointPolicy": label,
             "checkpoint": str(checkpoint_file.relative_to(repo)).replace("\\", "/"),
-            **comparable_policy_metrics(evaluations),
+            **(
+                {
+                    "density": evaluations,
+                    **comparable_policy_metrics(evaluations),
+                }
+                if uses_base_support_density
+                else {"distribution": evaluations}
+                if uses_embedding_density
+                else comparable_policy_metrics(evaluations)
+            ),
         }
         del model, checkpoint
         gc.collect()
@@ -143,7 +193,11 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    artifact, result = persist_structured_feature_evaluation(
+    persistence = (
+        persist_embedding_density_evaluation
+        if uses_embedding_density else persist_structured_feature_evaluation
+    )
+    artifact, result = persistence(
         repo=repo,
         run_root=run_root,
         plan=plan,
@@ -167,8 +221,18 @@ def main() -> None:
         "evaluation": {
             "artifact": result["evaluationArtifact"],
             "bestEpoch": result["bestEpoch"],
-            "bestTest": result["test"],
-            "lastTest": policies["last"]["test"],
+            "bestTest": (
+                result["density"]["test"]
+                if uses_base_support_density
+                else result["distribution"]["test"]
+                if uses_embedding_density else result["test"]
+            ),
+            "lastTest": (
+                policies["last"]["density"]["test"]
+                if uses_base_support_density
+                else policies["last"]["distribution"]["test"]
+                if uses_embedding_density else policies["last"]["test"]
+            ),
             "seconds": time.monotonic() - started,
         },
     })
@@ -178,9 +242,24 @@ def main() -> None:
         "planId": plan["id"],
         "selectionPolicy": result["selectionPolicy"],
         "bestEpoch": result["bestEpoch"],
-        "bestValidation": result["validation"],
-        "bestTest": result["test"],
-        "lastTest": policies["last"]["test"],
+        "bestValidation": (
+            result["density"]["validation"]
+            if uses_base_support_density
+            else result["distribution"]["validation"]
+            if uses_embedding_density else result["validation"]
+        ),
+        "bestTest": (
+            result["density"]["test"]
+            if uses_base_support_density
+            else result["distribution"]["test"]
+            if uses_embedding_density else result["test"]
+        ),
+        "lastTest": (
+            policies["last"]["density"]["test"]
+            if uses_base_support_density
+            else policies["last"]["distribution"]["test"]
+            if uses_embedding_density else policies["last"]["test"]
+        ),
         "policies": sorted(policies),
         "evaluationArtifact": result["evaluationArtifact"],
         "seconds": time.monotonic() - started,

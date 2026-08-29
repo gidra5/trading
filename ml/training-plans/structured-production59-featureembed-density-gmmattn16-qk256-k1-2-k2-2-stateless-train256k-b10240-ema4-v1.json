@@ -1,0 +1,135 @@
+{
+  "id": "structured-production59-featureembed-density-gmmattn16-qk256-k1-2-k2-2-stateless-train256k-b10240-ema4-v1",
+  "label": "Structured shared-IO feature process - production59 - stateless numbered layers - K1 2x1s input x 59 - K2 2x1s embedding density - layer 8 causal self-attention Q/K/V/O256 anchors - realized feature state encoded by shared layer 1 as stop-gradient Q256 - NF256 derives 16 K256 Gaussian component offsets and scalar mixture-value logits - fixed sigma 4 normalized mixture NLL - W256 M128 P128 F128 PF256 NF256 - 256k clean - batch 10240 train/evaluation - no regularization - EMA 4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "baseHistoryDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/structured-production59-featureembed-density-gmmattn16-qk256-k1-2-k2-2-stateless-train256k-b10240-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "heads": 1,
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "causality": "output step s attends only to generated NF states <=s"
+    },
+    "featureEmbeddingDensity": {
+      "type": "conditional-gaussian-mixture-attention-v1",
+      "components": 16,
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 1,
+      "fixedStandardDeviation": 4.0,
+      "normalizationEpsilon": 1e-08,
+      "queryNormalization": "unit-rms",
+      "targetEncoderGradient": "stop-gradient",
+      "keySource": "current NF state offsets around the causal layer-8 expected-embedding anchor",
+      "valueSource": "current NF state scalar logits normalized across components",
+      "normalization": "softmax mixture values and exact isotropic Gaussian component normalizers"
+    },
+    "numberedLayerSharing": "each parenthesized numbered layer is one exact shared stateless GNGLU reused at every matching block; no layer carries private recurrent memory",
+    "densityState": "shared layer 7 maps PF to NF; causal layer 8 maps the generated NF prefix to a W anchor; the separate density attention derives sixteen K offsets and mixture-value logits from NF and evaluates the shared-layer-1 encoding of each realized future production59 feature state",
+    "pointDecoder": "layer 2 is retained only for architectural compatibility; the training objective does not decode or supervise a deterministic feature point",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "conditional-feature-embedding-gaussian-mixture-nll-v1",
+      "description": "mean exact normalized Gaussian-mixture negative log likelihood of both realized future production59 states after shared-layer-1 encoding; no feature-space MSE auxiliary loss",
+      "targetSpace": "shared-layer-1 unit-RMS feature embedding",
+      "steps": 2
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "the exact production59 dense chronological nonzero-target population with two observed rows and two realized future rows per origin",
+    "comparisonControl": "same K1/K2, latent widths, data population, optimizer, examples, and EMA as the stateless two-step attention model; deterministic MSE supervision is replaced by embedding-density NLL"
+  },
+  "evaluation": {
+    "headline": "realized layer-1 feature-embedding negative log likelihood",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "lowest full-validation two-step embedding NLL",
+    "pointMetrics": "not reported because this experiment defines only a normalized embedding density and no feature-space expectation decoder"
+  },
+  "alignment": {
+    "input": "two consecutive production59 rows ending at each control origin",
+    "target": "the complete chronological production59 rows at origin+1 and origin+2, encoded by the exact shared layer 1",
+    "causality": "step-s NF and its causal layer-8 anchor use no generated NF state after s; target embeddings are used only by the likelihood evaluator",
+    "antiCollapse": "the target-side shared-layer-1 query is stop-gradient; layer 1 remains trained through the causal input path",
+    "normalization": "attention values are softmax mixture masses and every key is a fixed-scale normalized Gaussian component, so the reported score includes a finite partition function"
+  }
+}

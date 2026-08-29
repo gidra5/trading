@@ -17,6 +17,8 @@ from normalized_glu_next_return import optimizer_parameter_groups
 from structured_feature_process import (
     CausalKnotBasisGramLossLayer8,
     CausalSelfAttentionLayer8,
+    ConditionalEmbeddingBaseSupportGaussianMixture,
+    ConditionalEmbeddingGaussianMixtureAttention,
     DualStateGatedExchangeCell,
     LowRankTensorPathGluBlock,
     StructuredSharedIoFeatureProcess,
@@ -27,6 +29,7 @@ from train_structured_feature_process import (
     FeatureMetricAccumulator,
     FeatureSequenceMetricAccumulator,
     StructuredFeatureSequenceDataset,
+    derive_base_support_feature_states,
     production59_balanced_objective,
     weighted_standardized_mse,
 )
@@ -42,6 +45,7 @@ class StructuredFeatureProcessTest(unittest.TestCase):
         layer8_attention: dict[str, int | str] | None = None,
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
+        feature_embedding_density: dict[str, object] | None = None,
     ):
         return StructuredSharedIoFeatureProcess(
             torch.zeros(5),
@@ -63,7 +67,174 @@ class StructuredFeatureProcessTest(unittest.TestCase):
             layer8_attention=layer8_attention,
             layer8_function_approximator=layer8_function_approximator,
             recurrent_memory=recurrent_memory,
+            feature_embedding_density=feature_embedding_density,
         )
+
+    def test_feature_embedding_attention_is_normalized_mixture_nll(
+        self,
+    ) -> None:
+        attention = {
+            "type": "causal-self-attention-v1",
+            "queryWidth": 12,
+            "keyWidth": 12,
+            "valueWidth": 12,
+            "outputWidth": 12,
+        }
+        density = {
+            "type": "conditional-gaussian-mixture-attention-v1",
+            "components": 4,
+            "queryWidth": 12,
+            "keyWidth": 12,
+            "valueWidth": 1,
+            "fixedStandardDeviation": 2.0,
+            "normalizationEpsilon": 1e-8,
+            "queryNormalization": "unit-rms",
+            "targetEncoderGradient": "stop-gradient",
+        }
+        torch.manual_seed(101)
+        model = self.make_model(
+            2, 2,
+            layer8_attention=attention,
+            feature_embedding_density=density,
+        )
+        self.assertIsInstance(
+            model.embedding_density_attention,
+            ConditionalEmbeddingGaussianMixtureAttention,
+        )
+        inputs = torch.randn(7, 2, 5)
+        targets = torch.randn(7, 2, 5, requires_grad=True)
+        log_density = model.feature_embedding_log_density(inputs, targets)
+        self.assertEqual(log_density.shape, (7, 2))
+        self.assertTrue(bool(torch.isfinite(log_density).all()))
+        (-log_density.mean()).backward()
+        self.assertIsNone(targets.grad)
+        for parameter in model.embedding_density_attention.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+        for parameter in model.layer8.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+    def test_base_support_density_has_exact_base_expectation_and_nll(
+        self,
+    ) -> None:
+        attention = {
+            "type": "causal-self-attention-v1",
+            "queryWidth": 12,
+            "keyWidth": 12,
+            "valueWidth": 12,
+            "outputWidth": 12,
+        }
+        density = {
+            "type": "causal-base-support-gaussian-mixture-density-v2",
+            "components": 4,
+            "queryWidth": 12,
+            "keyWidth": 12,
+            "valueWidth": 5,
+            "fixedStandardDeviation": 2.0,
+            "normalizationEpsilon": 1e-8,
+            "queryNormalization": "unit-rms",
+            "targetEncoderGradient": "stop-gradient",
+            "keyConstruction": (
+                "causal-derived-feature-state-through-shared-layer1"
+            ),
+        }
+        torch.manual_seed(103)
+        model = self.make_model(
+            2, 2,
+            layer8_attention=attention,
+            feature_embedding_density=density,
+        )
+        self.assertIsInstance(
+            model.embedding_density_attention,
+            ConditionalEmbeddingBaseSupportGaussianMixture,
+        )
+        inputs = torch.randn(7, 2, 5)
+        targets = torch.randn(7, 2, 5, requires_grad=True)
+        raw_components, log_weights = \
+            model.feature_embedding_base_distribution(inputs)
+        self.assertEqual(raw_components.shape, (7, 2, 4, 5))
+        self.assertEqual(log_weights.shape, (7, 2, 4))
+        torch.testing.assert_close(
+            torch.logsumexp(log_weights, dim=-1),
+            torch.zeros(7, 2),
+        )
+        log_density = model.feature_embedding_log_density_from_base_support(
+            targets, raw_components, log_weights,
+        )
+        expected = model.expected_raw_base_features(
+            raw_components, log_weights,
+        )
+        torch.testing.assert_close(
+            expected,
+            (log_weights.exp().unsqueeze(-1) * raw_components).sum(dim=-2),
+        )
+        self.assertTrue(bool(torch.isfinite(log_density).all()))
+        (-log_density.mean()).backward()
+        self.assertIsNone(targets.grad)
+        for parameter in model.embedding_density_attention.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+        for parameter in model.layer8.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+    def test_base_support_paths_are_rederived_component_by_component(
+        self,
+    ) -> None:
+        class ToyDataset:
+            output_steps = 2
+            base_coordinate_count = 5
+            feature_count = 5
+
+            @staticmethod
+            def derive(base, inputs, context):
+                del inputs
+                return base + context["offset"][:, None]
+
+        raw_components = torch.arange(
+            3 * 2 * 4 * 5, dtype=torch.float32,
+        ).reshape(3, 2, 4, 5)
+        inputs = torch.zeros(3, 2, 5)
+        offset = torch.tensor([
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10],
+            [11, 12, 13, 14, 15],
+        ], dtype=torch.float32)
+        derived = derive_base_support_feature_states(
+            ToyDataset(), raw_components, inputs, {"offset": offset},
+        )
+        torch.testing.assert_close(
+            derived, raw_components + offset[:, None, None],
+        )
+
+    def test_feature_embedding_density_rejects_recurrent_layer_state(
+        self,
+    ) -> None:
+        density = {
+            "type": "conditional-gaussian-mixture-attention-v1",
+            "components": 4,
+            "queryWidth": 12,
+            "keyWidth": 12,
+            "valueWidth": 1,
+            "fixedStandardDeviation": 2.0,
+            "normalizationEpsilon": 1e-8,
+            "queryNormalization": "unit-rms",
+            "targetEncoderGradient": "stop-gradient",
+        }
+        recurrent = {
+            "type": "dual-state-gated-exchange-v1",
+            "hiddenWidth": 4,
+            "layers": [1, 2, 3, 4, 5, 6, 7, 9, 10, 11],
+            "activation": "sigmoid",
+            "mix": "a*t+b*(t-1)",
+        }
+        with self.assertRaisesRegex(ValueError, "requires stateless"):
+            self.make_model(
+                2, 2,
+                recurrent_memory=recurrent,
+                feature_embedding_density=density,
+            )
 
     def test_layer8_causal_attention_uses_prefix_nf_states(self) -> None:
         attention = {

@@ -51,6 +51,12 @@ from structured_union530_base import (
 
 RUNNER_CONTRACT = "structured-shared-io-feature-process-training-v1"
 OBJECTIVE_CONTRACT = "mean-standardized-next-feature-mse-v1"
+FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT = (
+    "conditional-feature-embedding-gaussian-mixture-nll-v1"
+)
+BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT = (
+    "conditional-feature-embedding-base-support-gaussian-mixture-nll-v2"
+)
 COMPARABLE_RETURN_CHANNEL = 0
 COMPARABLE_EVALUATION_SCOPE = "next-completed-1s-signed-log-return"
 FEATURE_STATE_EVALUATION_SCOPE = "complete-next-feature-state"
@@ -58,6 +64,18 @@ FEATURE_STATE_EVALUATION_SCOPE = "complete-next-feature-state"
 
 def objective_contract(plan: dict) -> str:
     return str(plan["training"]["loss"]["type"])
+
+
+def uses_embedding_density_objective(plan: dict) -> bool:
+    return objective_contract(plan) in {
+        FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+        BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+    }
+
+
+def uses_base_support_embedding_density(plan: dict) -> bool:
+    return objective_contract(plan) \
+        == BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT
 
 
 def is_union530_base_plan(plan: dict) -> bool:
@@ -601,6 +619,176 @@ def evaluate(
     return metrics.result()
 
 
+def derive_base_support_feature_states(
+    dataset: StructuredUnion530BaseDataset,
+    raw_base_components: Tensor,
+    inputs: Tensor,
+    context: Mapping[str, Tensor],
+) -> Tensor:
+    """Causally rederive each base-support path into complete feature states."""
+    if raw_base_components.ndim != 4:
+        raise ValueError("base support must have [batch,step,component,feature]")
+    batch, steps, components, base_width = raw_base_components.shape
+    if steps != dataset.output_steps \
+            or base_width != dataset.base_coordinate_count \
+            or inputs.shape[0] != batch:
+        raise ValueError("base-support rollout dimensions changed")
+    expanded_base = raw_base_components.permute(0, 2, 1, 3).reshape(
+        batch * components, steps, base_width,
+    )
+    expanded_inputs = inputs[:, None].expand(
+        batch, components, *inputs.shape[1:],
+    ).reshape(batch * components, *inputs.shape[1:])
+    expanded_context: dict[str, Tensor] = {}
+    for name, value in context.items():
+        if value.ndim < 1 or value.shape[0] != batch:
+            raise ValueError(f"base-support context {name} has the wrong batch")
+        expanded_context[name] = value[:, None].expand(
+            batch, components, *value.shape[1:],
+        ).reshape(batch * components, *value.shape[1:])
+    derived = dataset.derive(
+        expanded_base, expanded_inputs, expanded_context,
+    )
+    return derived.reshape(
+        batch, components, steps, dataset.feature_count,
+    ).permute(0, 2, 1, 3)
+
+
+def base_support_density_outputs(
+    model: StructuredSharedIoFeatureProcess,
+    dataset: StructuredUnion530BaseDataset,
+    inputs: Tensor,
+    targets: Tensor,
+    context: Mapping[str, Tensor],
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return log PDF, exact expected base, expected state, and components."""
+    raw_components, log_weights = model.feature_embedding_base_distribution(
+        inputs
+    )
+    component_feature_states = derive_base_support_feature_states(
+        dataset, raw_components, inputs, context,
+    )
+    log_density = model.feature_embedding_log_density_from_base_support(
+        targets, component_feature_states, log_weights,
+    )
+    expected_base = model.expected_raw_base_features(
+        raw_components, log_weights,
+    )
+    expected_features = (
+        log_weights.exp().unsqueeze(-1) * component_feature_states
+    ).sum(dim=-2)
+    return log_density, expected_base, expected_features, component_feature_states
+
+
+@torch.no_grad()
+def evaluate_feature_embedding_density(
+    model: StructuredSharedIoFeatureProcess,
+    dataset: StructuredFeatureSequenceDataset | StructuredUnion530BaseDataset,
+    split: str,
+    *,
+    batch_size: int,
+    device: torch.device,
+    limit: int | None = None,
+) -> dict:
+    """Evaluate embedding NLL and any exact base-support expectation."""
+    model.eval()
+    base_support = model.feature_embedding_density is not None \
+        and model.feature_embedding_density.get("type") \
+        == "causal-base-support-gaussian-mixture-density-v2"
+    expectation_metrics: FeatureSequenceMetricAccumulator | None = None
+    base_metrics: FeatureSequenceMetricAccumulator | None = None
+    if base_support:
+        if not isinstance(dataset, StructuredUnion530BaseDataset):
+            raise ValueError("base-support density requires a causal base dataset")
+        if dataset.derived_output_mean is None \
+                or dataset.derived_output_std is None:
+            raise ValueError("base-support evaluation requires dataset statistics")
+        expectation_metrics = FeatureSequenceMetricAccumulator(
+            dataset.derived_output_mean,
+            dataset.derived_output_std,
+            output_steps=dataset.output_steps,
+        )
+        base_metrics = FeatureSequenceMetricAccumulator(
+            model.output_mean,
+            model.output_std,
+            output_steps=dataset.output_steps,
+        )
+    total_nll = 0.0
+    total_examples = 0
+    per_step_nll = torch.zeros(dataset.output_steps, dtype=torch.float64)
+    per_step_examples = torch.zeros(dataset.output_steps, dtype=torch.float64)
+    for batch in dataset.iter_batches(
+        split, batch_size, shuffle=False, seed=0, limit=limit, pad=False,
+    ):
+        if isinstance(batch, StructuredUnion530Batch):
+            inputs, targets, weights = batch.inputs, batch.targets, batch.weights
+            context = {
+                name: value.to(device, non_blocking=True)
+                for name, value in batch.context.items()
+            }
+        else:
+            inputs, targets, weights = batch
+            context = None
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        weights = weights.to(device, non_blocking=True)
+        if base_support:
+            assert isinstance(dataset, StructuredUnion530BaseDataset) \
+                and context is not None \
+                and expectation_metrics is not None \
+                and base_metrics is not None
+            log_density, expected_base, expected_features, _ = \
+                base_support_density_outputs(
+                    model, dataset, inputs, targets, context,
+                )
+            expectation_metrics.add(expected_features, targets, weights)
+            base_metrics.add(
+                expected_base, context["baseTargets"], weights,
+            )
+        else:
+            log_density = model.feature_embedding_log_density(inputs, targets)
+        nll = -log_density
+        active = weights[:, None]
+        total_nll += float((nll * active).sum().detach())
+        valid = int(weights.sum().item())
+        total_examples += valid * dataset.output_steps
+        per_step_nll += (nll * active).sum(dim=0).detach().cpu().double()
+        per_step_examples += active.sum(dim=0).detach().cpu().double()
+    mean_nll = total_nll / max(1, total_examples)
+    per_step = (
+        per_step_nll / per_step_examples.clamp_min(1.0)
+    ).tolist()
+    density = model.embedding_density_attention
+    if density is None:
+        raise AssertionError("embedding density evaluator disappeared")
+    result = {
+        "negativeLogLikelihood": mean_nll,
+        "perLeadNegativeLogLikelihood": per_step,
+        "bitsPerExample": mean_nll / math.log(2.0),
+        "unitNegativeLogLikelihood": mean_nll / density.embedding_width,
+        "examples": int(total_examples),
+        "steps": int(dataset.output_steps),
+        "embeddingWidth": int(density.embedding_width),
+        "components": int(density.component_count),
+        "densitySpace": "layer-1-unit-rms-feature-embedding",
+    }
+    if base_support:
+        assert expectation_metrics is not None and base_metrics is not None
+        expectation = expectation_metrics.result()
+        base_expectation = base_metrics.result()
+        result.update({
+            "expectationType": "mixture-weighted-causal-base-support-v2",
+            "nextReturn": expectation["nextReturn"],
+            "returnPath": expectation["returnPath"],
+            "featureState": expectation["featureState"],
+            "perStepNextReturn": expectation["perStepNextReturn"],
+            "perStepFeatureState": expectation["perStepFeatureState"],
+            "baseFeatureState": base_expectation["featureState"],
+            "perStepBaseFeatureState": base_expectation["perStepFeatureState"],
+        })
+    return result
+
+
 def comparable_policy_metrics(evaluations: dict[str, dict]) -> dict:
     expected = {"train", "validation", "test"}
     if set(evaluations) != expected:
@@ -759,6 +947,107 @@ def persist_structured_feature_evaluation(
     return artifact, result
 
 
+def persist_embedding_density_evaluation(
+    *,
+    repo: Path,
+    run_root: Path,
+    plan: dict,
+    dataset: StructuredFeatureSequenceDataset | StructuredUnion530BaseDataset,
+    parameter_count: int,
+    policies: dict[str, dict],
+    generated_at: str,
+) -> tuple[dict, dict]:
+    base_support = uses_base_support_embedding_density(plan)
+    required = (
+        {
+            "best-validation-nll",
+            "best-validation-mse",
+            "best-validation-correlation",
+            "last",
+        }
+        if base_support else {"best-validation-nll", "last"}
+    )
+    if set(policies) != required:
+        raise ValueError(
+            f"embedding-density evaluation policies changed: {sorted(policies)}"
+        )
+    artifact_file = (
+        repo / "data/benchmarks" / f'{plan["id"]}-completed-eval.json'
+    ).resolve()
+    artifact = {
+        "contract": (
+            "structured-feature-embedding-base-support-density-evaluation-v2"
+            if base_support
+            else "structured-feature-embedding-density-evaluation-v1"
+        ),
+        "generatedAt": generated_at,
+        "planId": plan["id"],
+        "selectionPolicy": "best-validation-nll",
+        "selectionDoesNotUseTest": True,
+        "completedAfterEpoch": int(policies["last"]["epoch"]),
+        "examplesBySplit": dataset.counts,
+        "featureCount": dataset.feature_count,
+        "parameterCount": int(parameter_count),
+        "evaluationScope": "realized-layer-1-feature-embedding-density",
+        "policies": policies,
+    }
+    atomic_json(artifact, artifact_file)
+    atomic_json(artifact, run_root / "state/stopped-evaluation.json")
+    comparison_policies = {
+        "validation-nll": policies["best-validation-nll"],
+        "last": policies["last"],
+    }
+    if base_support:
+        comparison_policies.update({
+            "validation-mse": policies["best-validation-mse"],
+            "validation-correlation": policies[
+                "best-validation-correlation"
+            ],
+        })
+    atomic_json({
+        "contract": "embedding-density-checkpoint-selection-comparison-v1",
+        "policies": comparison_policies,
+    }, run_root / "state/checkpoint-selection-comparison.json")
+    best = policies["best-validation-nll"]
+    result = {
+        "contract": (
+            "structured-feature-embedding-base-support-density-dashboard-result-v2"
+            if base_support
+            else "structured-feature-embedding-density-dashboard-result-v1"
+        ),
+        "planId": plan["id"],
+        "selectionPolicy": "best-validation-nll",
+        "selectionMetric": "distribution.validation.negativeLogLikelihood",
+        "selectionDoesNotUseTest": True,
+        "evaluationScope": "realized-layer-1-feature-embedding-density",
+        "examples": dataset.counts["train"],
+        "examplesBySplit": dataset.counts,
+        "featureCount": dataset.feature_count,
+        "parameterCount": int(parameter_count),
+        "trainableParameterCount": int(parameter_count),
+        "bestEpoch": int(best["epoch"]),
+        "completedAfterEpoch": int(policies["last"]["epoch"]),
+        "bestValidationScore": float(best["selectionScore"]),
+        **(
+            {
+                "density": best["density"],
+                "train": best["train"],
+                "validation": best["validation"],
+                "test": best["test"],
+                "featureState": best["featureState"],
+                "distribution": best["distribution"],
+                "perStepFeatureState": best["perStepFeatureState"],
+            }
+            if base_support else {"distribution": best["distribution"]}
+        ),
+        "evaluationArtifact": str(artifact_file.relative_to(repo)).replace(
+            "\\", "/"
+        ),
+    }
+    atomic_json(result, run_root / "state/result.json")
+    return artifact, result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan", type=Path, required=True)
@@ -874,6 +1163,44 @@ def validate_plan(plan: dict) -> None:
             raise ValueError(
                 "recurrent-memory cells do not use linear factorization"
             )
+    embedding_density = architecture.get("featureEmbeddingDensity")
+    if embedding_density is not None:
+        density_type = embedding_density.get("type") \
+            if isinstance(embedding_density, dict) else None
+        density_value_width = int(embedding_density.get("valueWidth", 0)) \
+            if isinstance(embedding_density, dict) else 0
+        density_type_valid = (
+            density_type == "conditional-gaussian-mixture-attention-v1"
+            and density_value_width == 1
+        ) or (
+            density_type == "causal-base-support-gaussian-mixture-density-v2"
+            and density_value_width == int(architecture["outputFeatures"])
+            and embedding_density.get("keyConstruction")
+            == "causal-derived-feature-state-through-shared-layer1"
+            and is_derived_base_plan(plan)
+        )
+        if not isinstance(embedding_density, dict) \
+                or not density_type_valid \
+                or int(embedding_density.get("components", 0)) <= 1 \
+                or int(embedding_density.get("queryWidth", 0)) \
+                != int(architecture["featureWidth"]) \
+                or int(embedding_density.get("keyWidth", 0)) \
+                != int(architecture["featureWidth"]) \
+                or float(embedding_density.get(
+                    "fixedStandardDeviation", 0,
+                )) <= 0 \
+                or float(embedding_density.get(
+                    "normalizationEpsilon", 0,
+                )) <= 0 \
+                or embedding_density.get("queryNormalization") \
+                != "unit-rms" \
+                or embedding_density.get("targetEncoderGradient") \
+                != "stop-gradient":
+            raise ValueError("invalid feature-embedding density configuration")
+        if recurrent_memory is not None:
+            raise ValueError(
+                "feature-embedding density run must not carry recurrent layer state"
+            )
     training = plan["training"]
     loss_type = training.get("loss", {}).get("type")
     expected_losses = (
@@ -882,12 +1209,22 @@ def validate_plan(plan: dict) -> None:
         else {
             PRODUCTION59_OBJECTIVE_CONTRACT,
             PRODUCTION59_BALANCED_OBJECTIVE_CONTRACT,
+            FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+            BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
         }
         if is_production59_base_plan(plan)
         else {OBJECTIVE_CONTRACT}
     )
     if loss_type not in expected_losses:
         raise ValueError("structured feature objective changed")
+    if (loss_type in {
+        FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+        BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+    }) \
+            != (embedding_density is not None):
+        raise ValueError(
+            "feature-embedding density architecture/objective must be paired"
+        )
     if is_union530_base_plan(plan):
         if int(architecture["inputFeatures"]) != 530 \
                 or int(architecture["outputFeatures"]) != BASE_COORDINATE_COUNT \
@@ -947,6 +1284,7 @@ def replace_completed_smoke(run_root: Path) -> None:
         run_root / "checkpoints/last.json",
         run_root / "checkpoints/selections/validation-mse.json",
         run_root / "checkpoints/selections/validation-correlation.json",
+        run_root / "checkpoints/selections/validation-nll.json",
         run_root / "state/plan.json",
         run_root / "state/result.json",
         status_file,
@@ -1066,6 +1404,9 @@ def main() -> None:
                 "layer8FunctionApproximator"
             ),
             recurrent_memory=architecture.get("recurrentMemory"),
+            feature_embedding_density=architecture.get(
+                "featureEmbeddingDensity"
+            ),
         ).to(device)
         parameter_count = sum(value.numel() for value in model.parameters())
         trainable_count = sum(
@@ -1078,10 +1419,27 @@ def main() -> None:
         ema_half_life = float(training["weightEma"]["halfLifeEpochs"])
         ema_decay = mean_teacher_ema_decay(ema_half_life, steps_per_epoch)
         ema = {name: value.detach().clone() for name, value in model.state_dict().items()}
-        best = {
-            "validation-mse": {"score": math.inf, "epoch": -1},
-            "validation-correlation": {"score": -math.inf, "epoch": -1},
-        }
+        uses_embedding_density = uses_embedding_density_objective(plan)
+        uses_base_support_density = uses_base_support_embedding_density(plan)
+        best = (
+            {
+                "validation-nll": {"score": math.inf, "epoch": -1},
+                **(
+                    {
+                        "validation-mse": {"score": math.inf, "epoch": -1},
+                        "validation-correlation": {
+                            "score": -math.inf, "epoch": -1,
+                        },
+                    }
+                    if uses_base_support_density else {}
+                ),
+            }
+            if uses_embedding_density
+            else {
+                "validation-mse": {"score": math.inf, "epoch": -1},
+                "validation-correlation": {"score": -math.inf, "epoch": -1},
+            }
+        )
         last_file = run_root / "checkpoints/last.json"
         start_epoch = 0
         global_step = 0
@@ -1110,13 +1468,15 @@ def main() -> None:
                 )
         uses_layer8_auxiliary_loss = gram_identity_loss_weight > 0
         training_forward = (
-            model.forward_with_auxiliary_loss
+            model.feature_embedding_log_density
+            if uses_embedding_density and not uses_base_support_density
+            else model.forward_with_auxiliary_loss
             if uses_layer8_auxiliary_loss
             else model
         )
         training_model = training_forward
         compile_scope = "disabled"
-        if args.compile_mode != "none":
+        if args.compile_mode != "none" and not uses_base_support_density:
             compile_cache = (repo / "data/training/cache/torchinductor").resolve()
             compile_cache.mkdir(parents=True, exist_ok=True)
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(compile_cache)
@@ -1130,6 +1490,8 @@ def main() -> None:
                 training_forward, **compile_arguments
             )
             compile_scope = "fixed-shape-training-only"
+        elif uses_base_support_density:
+            compile_scope = "eager-causal-base-support-density"
 
         reporter.emit({
             "event": "training-start",
@@ -1140,7 +1502,10 @@ def main() -> None:
             "trainableParameters": trainable_count,
             "architecture": architecture,
             "objective": objective_contract(plan),
-            "distributionLoss": None,
+            "distributionLoss": (
+                architecture.get("featureEmbeddingDensity")
+                if uses_embedding_density else None
+            ),
             "samRho": 0,
             "inputDropoutProbability": 0,
             "embeddingDropoutProbability": 0,
@@ -1203,47 +1568,85 @@ def main() -> None:
                 weights = weights.to(device, non_blocking=True)
                 for optimizer in optimizers:
                     optimizer.zero_grad(set_to_none=True)
-                if uses_layer8_auxiliary_loss:
+                if uses_embedding_density:
+                    if uses_base_support_density:
+                        if not isinstance(dataset, StructuredUnion530BaseDataset) \
+                                or context is None:
+                            raise AssertionError(
+                                "base-support density requires causal context"
+                            )
+                        log_density, expected_base, expected_features, _ = \
+                            base_support_density_outputs(
+                                model, dataset, inputs, targets, context,
+                            )
+                    else:
+                        log_density = training_model(inputs, targets)
+                    active = weights[:, None]
+                    loss = -(log_density * active).sum() / (
+                        active.sum().clamp_min(1.0) * dataset.output_steps
+                    )
+                    prediction = None
+                    layer8_gram_identity_loss = None
+                    components = {
+                        "objective": loss,
+                        "embeddingNegativeLogLikelihood": loss,
+                    }
+                    if uses_base_support_density:
+                        standardized_expected_base = (
+                            expected_base - model.output_mean
+                        ) / model.output_std
+                        standardized_base_target = model.standardized_targets(
+                            context["baseTargets"]
+                        )
+                        components["expectedBaseNormalizedMse"] = \
+                            weighted_standardized_mse(
+                                standardized_expected_base,
+                                standardized_base_target,
+                                weights,
+                            )
+                elif uses_layer8_auxiliary_loss:
                     prediction, layer8_gram_identity_loss = \
                         training_model(inputs)
                 else:
                     prediction = training_model(inputs)
                     layer8_gram_identity_loss = None
-                standardized_direct = prediction
-                if derived_base:
-                    direct = model.raw_outputs(prediction)
-                    prediction = dataset.derive(direct, inputs, context)
-                    assert derived_output_mean is not None \
-                        and derived_output_std is not None
-                    prediction = (
-                        prediction - derived_output_mean
-                    ) / derived_output_std
-                    standardized_target = (
-                        targets - derived_output_mean
-                    ) / derived_output_std
-                else:
-                    standardized_target = model.standardized_targets(targets)
-                if objective_contract(plan) \
-                        == PRODUCTION59_BALANCED_OBJECTIVE_CONTRACT:
-                    if context is None:
-                        raise AssertionError(
-                            "balanced production59 objective requires context"
+                if not uses_embedding_density:
+                    assert prediction is not None
+                    standardized_direct = prediction
+                    if derived_base:
+                        direct = model.raw_outputs(prediction)
+                        prediction = dataset.derive(direct, inputs, context)
+                        assert derived_output_mean is not None \
+                            and derived_output_std is not None
+                        prediction = (
+                            prediction - derived_output_mean
+                        ) / derived_output_std
+                        standardized_target = (
+                            targets - derived_output_mean
+                        ) / derived_output_std
+                    else:
+                        standardized_target = model.standardized_targets(targets)
+                    if objective_contract(plan) \
+                            == PRODUCTION59_BALANCED_OBJECTIVE_CONTRACT:
+                        if context is None:
+                            raise AssertionError(
+                                "balanced production59 objective requires context"
+                            )
+                        components = production59_balanced_objective(
+                            prediction,
+                            standardized_target,
+                            standardized_direct,
+                            model.standardized_targets(context["baseTargets"]),
+                            weights,
+                            context,
+                            training["loss"],
                         )
-                    components = production59_balanced_objective(
-                        prediction,
-                        standardized_target,
-                        standardized_direct,
-                        model.standardized_targets(context["baseTargets"]),
-                        weights,
-                        context,
-                        training["loss"],
-                    )
-                    loss = components["objective"]
-                else:
-                    loss = weighted_standardized_mse(
-                        prediction, standardized_target, weights
-                    )
-                    components = {"objective": loss}
+                        loss = components["objective"]
+                    else:
+                        loss = weighted_standardized_mse(
+                            prediction, standardized_target, weights
+                        )
+                        components = {"objective": loss}
                 if layer8_gram_identity_loss is not None:
                     data_objective = loss
                     loss = data_objective + (
@@ -1279,30 +1682,54 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             with use_state(model, ema):
-                train_evaluation = evaluate(
+                evaluation_function = (
+                    evaluate_feature_embedding_density
+                    if uses_embedding_density else evaluate
+                )
+                train_evaluation = evaluation_function(
                     model, dataset, "train", batch_size=evaluation_batch_size,
                     device=device,
                     limit=smoke_limit if smoke_limit is not None else int(
                         training["epochTrainEvaluationExamples"]
                     ),
                 )
-                validation_evaluation = evaluate(
+                validation_evaluation = evaluation_function(
                     model, dataset, "validation",
                     batch_size=evaluation_batch_size, device=device,
                     limit=smoke_limit,
                 )
-            train_metrics = train_evaluation["nextReturn"]
-            validation_metrics = validation_evaluation["nextReturn"]
-            train_feature_state = train_evaluation["featureState"]
-            validation_feature_state = validation_evaluation["featureState"]
-            candidates = {
-                "validation-mse": float(
-                    validation_feature_state["normalizedMse"]
-                ),
-                "validation-correlation": float(
-                    validation_feature_state["correlation"]
-                ),
-            }
+            if uses_embedding_density:
+                candidates = {
+                    "validation-nll": float(
+                        validation_evaluation["negativeLogLikelihood"]
+                    ),
+                }
+                if uses_base_support_density:
+                    candidates.update({
+                        "validation-mse": float(
+                            validation_evaluation["featureState"][
+                                "normalizedMse"
+                            ]
+                        ),
+                        "validation-correlation": float(
+                            validation_evaluation["featureState"][
+                                "correlation"
+                            ]
+                        ),
+                    })
+            else:
+                train_metrics = train_evaluation["nextReturn"]
+                validation_metrics = validation_evaluation["nextReturn"]
+                train_feature_state = train_evaluation["featureState"]
+                validation_feature_state = validation_evaluation["featureState"]
+                candidates = {
+                    "validation-mse": float(
+                        validation_feature_state["normalizedMse"]
+                    ),
+                    "validation-correlation": float(
+                        validation_feature_state["correlation"]
+                    ),
+                }
             for policy, score in candidates.items():
                 improved = score > best[policy]["score"] \
                     if policy.endswith("correlation") else score < best[policy]["score"]
@@ -1330,53 +1757,112 @@ def main() -> None:
                 "evaluationHorizon": {"steps": 1, "seconds": 1, "lead": 0},
                 "modelInputSteps": dataset.input_steps,
                 "modelOutputSteps": dataset.output_steps,
-                "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
-                "train": train_metrics,
-                "validation": validation_metrics,
-                "trainDistribution": {
-                    "expectation": train_evaluation["returnPath"],
-                    "perLeadExpectation": train_evaluation[
-                        "perStepNextReturn"
-                    ],
-                },
-                "validationDistribution": {
-                    "expectation": validation_evaluation["returnPath"],
-                    "perLeadExpectation": validation_evaluation[
-                        "perStepNextReturn"
-                    ],
-                },
-                "featureState": {
-                    "evaluationScope": FEATURE_STATE_EVALUATION_SCOPE,
-                    "train": compact_feature_state_metrics(train_feature_state),
-                    "validation": compact_feature_state_metrics(
-                        validation_feature_state
-                    ),
-                },
-                "perStepFeatureState": {
-                    "train": [
-                        compact_feature_state_metrics(value)
-                        for value in train_evaluation["perStepFeatureState"]
-                    ],
-                    "validation": [
-                        compact_feature_state_metrics(value)
-                        for value in validation_evaluation[
-                            "perStepFeatureState"
-                        ]
-                    ],
-                },
                 "onlineObjective": objective_sum / example_count,
                 "onlineObjectiveComponents": {
                     name: value / example_count
                     for name, value in objective_component_sums.items()
                 },
                 "objective": objective_contract(plan),
-                "checkpointSelectionScope": FEATURE_STATE_EVALUATION_SCOPE,
-                "bestFeatureStateValidationMse": best["validation-mse"]["score"],
-                "bestFeatureStateValidationCorrelation": (
-                    best["validation-correlation"]["score"]
-                ),
                 "parameterCount": parameter_count,
             }
+            if uses_embedding_density:
+                event.update({
+                    "evaluationScope": "realized-layer-1-feature-embedding-density",
+                    "trainDistribution": train_evaluation,
+                    "validationDistribution": validation_evaluation,
+                    "onlineNegativeLogLikelihood": (
+                        objective_component_sums[
+                            "embeddingNegativeLogLikelihood"
+                        ] / example_count
+                    ),
+                    "onlineFirstStepNegativeLogLikelihood": (
+                        objective_component_sums[
+                            "embeddingNegativeLogLikelihood"
+                        ] / example_count
+                    ),
+                    "checkpointSelectionScope": "validation-embedding-nll",
+                    "bestValidationNegativeLogLikelihood": best[
+                        "validation-nll"
+                    ]["score"],
+                })
+                if uses_base_support_density:
+                    event.update({
+                        "train": train_evaluation["nextReturn"],
+                        "validation": validation_evaluation["nextReturn"],
+                        "featureState": {
+                            "evaluationScope": FEATURE_STATE_EVALUATION_SCOPE,
+                            "train": compact_feature_state_metrics(
+                                train_evaluation["featureState"]
+                            ),
+                            "validation": compact_feature_state_metrics(
+                                validation_evaluation["featureState"]
+                            ),
+                        },
+                        "perStepFeatureState": {
+                            "train": [
+                                compact_feature_state_metrics(value)
+                                for value in train_evaluation[
+                                    "perStepFeatureState"
+                                ]
+                            ],
+                            "validation": [
+                                compact_feature_state_metrics(value)
+                                for value in validation_evaluation[
+                                    "perStepFeatureState"
+                                ]
+                            ],
+                        },
+                        "bestFeatureStateValidationMse": best[
+                            "validation-mse"
+                        ]["score"],
+                        "bestFeatureStateValidationCorrelation": best[
+                            "validation-correlation"
+                        ]["score"],
+                    })
+            else:
+                event.update({
+                    "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
+                    "train": train_metrics,
+                    "validation": validation_metrics,
+                    "trainDistribution": {
+                        "expectation": train_evaluation["returnPath"],
+                        "perLeadExpectation": train_evaluation[
+                            "perStepNextReturn"
+                        ],
+                    },
+                    "validationDistribution": {
+                        "expectation": validation_evaluation["returnPath"],
+                        "perLeadExpectation": validation_evaluation[
+                            "perStepNextReturn"
+                        ],
+                    },
+                    "featureState": {
+                        "evaluationScope": FEATURE_STATE_EVALUATION_SCOPE,
+                        "train": compact_feature_state_metrics(train_feature_state),
+                        "validation": compact_feature_state_metrics(
+                            validation_feature_state
+                        ),
+                    },
+                    "perStepFeatureState": {
+                        "train": [
+                            compact_feature_state_metrics(value)
+                            for value in train_evaluation["perStepFeatureState"]
+                        ],
+                        "validation": [
+                            compact_feature_state_metrics(value)
+                            for value in validation_evaluation[
+                                "perStepFeatureState"
+                            ]
+                        ],
+                    },
+                    "checkpointSelectionScope": FEATURE_STATE_EVALUATION_SCOPE,
+                    "bestFeatureStateValidationMse": best[
+                        "validation-mse"
+                    ]["score"],
+                    "bestFeatureStateValidationCorrelation": best[
+                        "validation-correlation"
+                    ]["score"],
+                })
             reporter.emit(event)
             reporter.status("training", planId=plan["id"], latest=event)
             if args.smoke_batches is not None:
@@ -1391,27 +1877,54 @@ def main() -> None:
                 weights_only=False,
             )
             model.load_state_dict(selected["model"])
+            completion_evaluator = (
+                evaluate_feature_embedding_density
+                if uses_embedding_density else evaluate
+            )
             evaluations = {
-                split: evaluate(
+                split: completion_evaluator(
                     model, dataset, split, batch_size=evaluation_batch_size,
                     device=device,
                 )
                 for split in ("train", "validation", "test")
             }
-            policies[f"best-{policy}"] = {
-                "epoch": int(selected["epoch"]),
-                "selectionScore": float(selected["score"]),
-                "selectionMetric": (
-                    "featureState.correlation" if policy.endswith("correlation")
-                    else "featureState.normalizedMse"
-                ),
-                "checkpointPolicy": f"best-{policy}",
-                **comparable_policy_metrics(evaluations),
-            }
+            if uses_embedding_density:
+                policies[f"best-{policy}"] = {
+                    "epoch": int(selected["epoch"]),
+                    "selectionScore": float(selected["score"]),
+                    "selectionMetric": (
+                        "featureState.correlation"
+                        if policy.endswith("correlation")
+                        else "featureState.normalizedMse"
+                        if policy.endswith("mse")
+                        else "validation.negativeLogLikelihood"
+                    ),
+                    "checkpointPolicy": f"best-{policy}",
+                    **(
+                        {
+                            "density": evaluations,
+                            **comparable_policy_metrics(evaluations),
+                        }
+                        if uses_base_support_density
+                        else {"distribution": evaluations}
+                    ),
+                }
+            else:
+                policies[f"best-{policy}"] = {
+                    "epoch": int(selected["epoch"]),
+                    "selectionScore": float(selected["score"]),
+                    "selectionMetric": (
+                        "featureState.correlation"
+                        if policy.endswith("correlation")
+                        else "featureState.normalizedMse"
+                    ),
+                    "checkpointPolicy": f"best-{policy}",
+                    **comparable_policy_metrics(evaluations),
+                }
         last = load_torch_checkpoint(last_file, map_location=device, weights_only=False)
         model.load_state_dict(last["emaModel"])
         last_evaluations = {
-            split: evaluate(
+            split: completion_evaluator(
                 model, dataset, split, batch_size=evaluation_batch_size,
                 device=device,
             )
@@ -1422,10 +1935,24 @@ def main() -> None:
             "selectionScore": None,
             "selectionMetric": None,
             "checkpointPolicy": "last",
-            **comparable_policy_metrics(last_evaluations),
+            **(
+                {
+                    "density": last_evaluations,
+                    **comparable_policy_metrics(last_evaluations),
+                }
+                if uses_base_support_density
+                else {"distribution": last_evaluations}
+                if uses_embedding_density
+                else comparable_policy_metrics(last_evaluations)
+            ),
         }
         completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        artifact, result = persist_structured_feature_evaluation(
+        persistence = (
+            persist_embedding_density_evaluation
+            if uses_embedding_density
+            else persist_structured_feature_evaluation
+        )
+        artifact, result = persistence(
             repo=repo,
             run_root=run_root,
             plan=plan,
@@ -1448,8 +1975,26 @@ def main() -> None:
             evaluation={
                 "artifact": result["evaluationArtifact"],
                 "bestEpoch": result["bestEpoch"],
-                "bestTest": result["test"],
-                "lastTest": artifact["policies"]["last"]["test"],
+                **(
+                    {
+                        "bestTest": (
+                            result["density"]["test"]
+                            if uses_base_support_density
+                            else result["distribution"]["test"]
+                        ),
+                        "lastTest": (
+                            artifact["policies"]["last"]["density"]["test"]
+                            if uses_base_support_density
+                            else artifact["policies"]["last"][
+                                "distribution"
+                            ]["test"]
+                        ),
+                    }
+                    if uses_embedding_density else {
+                        "bestTest": result["test"],
+                        "lastTest": artifact["policies"]["last"]["test"],
+                    }
+                ),
             },
         )
     except BaseException as error:

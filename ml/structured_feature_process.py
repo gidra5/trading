@@ -432,6 +432,230 @@ class CausalSelfAttentionLayer8(nn.Module):
         )
 
 
+class ConditionalEmbeddingGaussianMixtureAttention(nn.Module):
+    """Evaluate a normalized PDF at a candidate feature embedding.
+
+    The candidate feature state is encoded by shared layer (1) and acts as the
+    query.  The current NF state produces multiple key offsets and scalar value
+    logits.  The causal layer-8 expectation is the common key anchor.  Values
+    are normalized with a softmax and each key is the mean of an isotropic
+    Gaussian with a fixed standard deviation, so the final log-sum-exp is an
+    actual normalized mixture log density rather than an unbounded attention
+    score.
+    """
+
+    def __init__(
+        self,
+        state_width: int,
+        embedding_width: int,
+        component_count: int,
+        *,
+        fixed_standard_deviation: float,
+        normalization_epsilon: float,
+    ) -> None:
+        super().__init__()
+        if min(int(state_width), int(embedding_width), int(component_count)) <= 0:
+            raise ValueError("embedding-density attention dimensions must be positive")
+        if min(float(fixed_standard_deviation), float(normalization_epsilon)) <= 0:
+            raise ValueError("embedding-density attention scales must be positive")
+        self.state_width = int(state_width)
+        self.embedding_width = int(embedding_width)
+        self.component_count = int(component_count)
+        self.fixed_standard_deviation = float(fixed_standard_deviation)
+        self.normalization_epsilon = float(normalization_epsilon)
+        self.key = nn.Linear(
+            self.state_width,
+            self.component_count * self.embedding_width,
+        )
+        self.value = nn.Linear(self.state_width, self.component_count)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Small, nonidentical offsets retain the causal-attention expectation as
+        # the initial center while breaking component symmetry immediately.
+        nn.init.normal_(
+            self.key.weight,
+            std=1e-3 / math.sqrt(self.state_width),
+        )
+        nn.init.normal_(self.key.bias, std=1e-3)
+        nn.init.normal_(
+            self.value.weight,
+            std=1e-3 / math.sqrt(self.state_width),
+        )
+        nn.init.zeros_(self.value.bias)
+
+    def _unit_rms(self, values: Tensor) -> Tensor:
+        return F.normalize(
+            values, dim=-1, eps=self.normalization_epsilon,
+        ) * math.sqrt(self.embedding_width)
+
+    def distribution_parameters(
+        self,
+        states: Tensor,
+        anchors: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if states.ndim != 3 or states.shape[-1] != self.state_width:
+            raise ValueError(
+                "embedding-density states must have shape "
+                "[batch,steps,state_width]"
+            )
+        if anchors.shape != (*states.shape[:2], self.embedding_width):
+            raise ValueError("embedding-density anchors have the wrong shape")
+        key_offsets = self.key(states).reshape(
+            *states.shape[:2], self.component_count, self.embedding_width,
+        )
+        keys = self._unit_rms(anchors.unsqueeze(-2) + key_offsets)
+        log_weights = F.log_softmax(self.value(states), dim=-1)
+        return keys, log_weights
+
+    def forward(
+        self,
+        queries: Tensor,
+        states: Tensor,
+        anchors: Tensor,
+    ) -> Tensor:
+        if queries.shape != (*states.shape[:2], self.embedding_width):
+            raise ValueError("embedding-density queries have the wrong shape")
+        queries = self._unit_rms(queries)
+        keys, log_weights = self.distribution_parameters(states, anchors)
+        difference = queries.unsqueeze(-2) - keys
+        variance = self.fixed_standard_deviation**2
+        log_normalizer = self.embedding_width * math.log(
+            self.fixed_standard_deviation * math.sqrt(2.0 * math.pi)
+        )
+        component_log_density = (
+            -0.5 * difference.square().sum(dim=-1) / variance
+            - log_normalizer
+        )
+        return torch.logsumexp(log_weights + component_log_density, dim=-1)
+
+    def muon_parameters(self) -> tuple[Tensor, Tensor]:
+        return self.key.weight, self.value.weight
+
+
+class ConditionalEmbeddingBaseSupportGaussianMixture(nn.Module):
+    """A normalized embedding density whose atoms carry base-feature values.
+
+    The causal NF state emits mixture masses and standardized base-coordinate
+    offsets around the ordinary layer-(8)/(2) point prediction. The caller
+    causally rederives every base-coordinate component into a complete feature
+    state and encodes that state with shared layer (1). Those encoded states
+    are the Gaussian means. Consequently the same component masses define both
+    a proper density in embedding space and an exact expected base state.
+    """
+
+    def __init__(
+        self,
+        state_width: int,
+        embedding_width: int,
+        base_width: int,
+        component_count: int,
+        *,
+        fixed_standard_deviation: float,
+        normalization_epsilon: float,
+    ) -> None:
+        super().__init__()
+        dimensions = (
+            state_width, embedding_width, base_width, component_count,
+        )
+        if any(int(value) <= 0 for value in dimensions):
+            raise ValueError("base-support density dimensions must be positive")
+        if min(float(fixed_standard_deviation), float(normalization_epsilon)) <= 0:
+            raise ValueError("base-support density scales must be positive")
+        self.state_width = int(state_width)
+        self.embedding_width = int(embedding_width)
+        self.base_width = int(base_width)
+        self.component_count = int(component_count)
+        self.fixed_standard_deviation = float(fixed_standard_deviation)
+        self.normalization_epsilon = float(normalization_epsilon)
+        self.base_offset = nn.Linear(
+            self.state_width,
+            self.component_count * self.base_width,
+        )
+        self.mass_logit = nn.Linear(self.state_width, self.component_count)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(
+            self.base_offset.weight,
+            std=1e-3 / math.sqrt(self.state_width),
+        )
+        nn.init.normal_(self.base_offset.bias, std=1e-3)
+        nn.init.normal_(
+            self.mass_logit.weight,
+            std=1e-3 / math.sqrt(self.state_width),
+        )
+        nn.init.zeros_(self.mass_logit.bias)
+
+    def _unit_rms(self, values: Tensor) -> Tensor:
+        return F.normalize(
+            values, dim=-1, eps=self.normalization_epsilon,
+        ) * math.sqrt(self.embedding_width)
+
+    def distribution_parameters(
+        self,
+        states: Tensor,
+        standardized_base_anchors: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if states.ndim != 3 or states.shape[-1] != self.state_width:
+            raise ValueError(
+                "base-support density states must have shape "
+                "[batch,steps,state_width]"
+            )
+        if standardized_base_anchors.shape != (
+            *states.shape[:2], self.base_width,
+        ):
+            raise ValueError("base-support density anchors have the wrong shape")
+        offsets = self.base_offset(states).reshape(
+            *states.shape[:2], self.component_count, self.base_width,
+        )
+        components = standardized_base_anchors.unsqueeze(-2) + offsets
+        log_weights = F.log_softmax(self.mass_logit(states), dim=-1)
+        return components, log_weights
+
+    def log_density(
+        self,
+        queries: Tensor,
+        component_embeddings: Tensor,
+        log_weights: Tensor,
+    ) -> Tensor:
+        if queries.ndim != 3 or queries.shape[-1] != self.embedding_width:
+            raise ValueError("base-support density queries have the wrong shape")
+        expected_component_shape = (
+            *queries.shape[:2], self.component_count, self.embedding_width,
+        )
+        if component_embeddings.shape != expected_component_shape:
+            raise ValueError("base-support component embeddings have the wrong shape")
+        if log_weights.shape != (*queries.shape[:2], self.component_count):
+            raise ValueError("base-support mixture masses have the wrong shape")
+        queries = self._unit_rms(queries)
+        keys = self._unit_rms(component_embeddings)
+        difference = queries.unsqueeze(-2) - keys
+        variance = self.fixed_standard_deviation**2
+        log_normalizer = self.embedding_width * math.log(
+            self.fixed_standard_deviation * math.sqrt(2.0 * math.pi)
+        )
+        component_log_density = (
+            -0.5 * difference.square().sum(dim=-1) / variance
+            - log_normalizer
+        )
+        return torch.logsumexp(log_weights + component_log_density, dim=-1)
+
+    def expected_base(
+        self, standardized_components: Tensor, log_weights: Tensor
+    ) -> Tensor:
+        if standardized_components.shape[:-1] != log_weights.shape:
+            raise ValueError("base-support expectation shapes have changed")
+        if standardized_components.shape[-1] != self.base_width:
+            raise ValueError("base-support expectation width has changed")
+        return (
+            log_weights.exp().unsqueeze(-1) * standardized_components
+        ).sum(dim=-2)
+
+    def muon_parameters(self) -> tuple[Tensor, Tensor]:
+        return self.base_offset.weight, self.mass_logit.weight
+
+
 class CausalKnotBasisGramLossLayer8(nn.Module):
     """Causal Q/K/V function approximator with a learned orthogonal DoG basis.
 
@@ -659,6 +883,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         layer8_attention: dict[str, int | str] | None = None,
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
+        feature_embedding_density: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         if input_mean.ndim != 1 or input_std.shape != input_mean.shape:
@@ -705,6 +930,11 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         )
         self.recurrent_memory = (
             None if recurrent_memory is None else dict(recurrent_memory)
+        )
+        self.feature_embedding_density = (
+            None
+            if feature_embedding_density is None
+            else dict(feature_embedding_density)
         )
         if self.layer8_attention is not None \
                 and self.layer8_function_approximator is not None:
@@ -882,6 +1112,63 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             value_input_width=self.next_feature_distribution_width,
             gate_input_width=self.market_width,
         )
+        if self.feature_embedding_density is None:
+            self.embedding_density_attention = None
+        else:
+            density = self.feature_embedding_density
+            density_type = density.get("type")
+            common_valid = (
+                int(density.get("queryWidth", 0)) == self.feature_width
+                and int(density.get("keyWidth", 0)) == self.feature_width
+                and density.get("queryNormalization") == "unit-rms"
+                and density.get("targetEncoderGradient") == "stop-gradient"
+            )
+            legacy_valid = (
+                density_type == "conditional-gaussian-mixture-attention-v1"
+                and int(density.get("valueWidth", 0)) == 1
+            )
+            base_support_valid = (
+                density_type
+                == "causal-base-support-gaussian-mixture-density-v2"
+                and int(density.get("valueWidth", 0)) == self.output_width
+                and density.get("keyConstruction")
+                == "causal-derived-feature-state-through-shared-layer1"
+            )
+            if not common_valid or not (legacy_valid or base_support_valid):
+                raise ValueError("invalid feature-embedding density attention")
+            if self.recurrent_memory is not None:
+                raise ValueError(
+                    "feature-embedding density requires stateless numbered layers"
+                )
+            if legacy_valid:
+                self.embedding_density_attention = (
+                    ConditionalEmbeddingGaussianMixtureAttention(
+                        self.next_feature_distribution_width,
+                        self.feature_width,
+                        int(density["components"]),
+                        fixed_standard_deviation=float(
+                            density["fixedStandardDeviation"]
+                        ),
+                        normalization_epsilon=float(
+                            density["normalizationEpsilon"]
+                        ),
+                    )
+                )
+            else:
+                self.embedding_density_attention = (
+                    ConditionalEmbeddingBaseSupportGaussianMixture(
+                        self.next_feature_distribution_width,
+                        self.feature_width,
+                        self.output_width,
+                        int(density["components"]),
+                        fixed_standard_deviation=float(
+                            density["fixedStandardDeviation"]
+                        ),
+                        normalization_epsilon=float(
+                            density["normalizationEpsilon"]
+                        ),
+                    )
+                )
 
         # Unnumbered seed blocks at the top of the diagram.
         self.initial_market = _gnglu(
@@ -1084,6 +1371,116 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         trace = self._forward_trace(inputs, include_auxiliary_loss=True)
         return trace.outputs, trace.layer8_gram_identity_loss
 
+    def feature_embedding_log_density(
+        self,
+        inputs: Tensor,
+        raw_target_features: Tensor,
+    ) -> Tensor:
+        """Evaluate each realized future feature state under the NF density."""
+        if self.embedding_density_attention is None:
+            raise RuntimeError("feature-embedding density attention is disabled")
+        if not isinstance(
+            self.embedding_density_attention,
+            ConditionalEmbeddingGaussianMixtureAttention,
+        ):
+            raise RuntimeError(
+                "base-support density requires causally derived component features"
+            )
+        if raw_target_features.shape != (
+            inputs.shape[0], self.output_steps, self.input_width,
+        ):
+            raise ValueError("feature-embedding density targets have the wrong shape")
+        trace = self._forward_trace(inputs)
+        normalized_targets = (
+            raw_target_features.float() - self.input_mean
+        ) / self.input_std
+        # The same numbered layer (1) supplies the target query.  Stopping this
+        # branch is essential: otherwise a trainable encoder can minimize NLL
+        # by mapping every possible feature state to one identical point.
+        queries = torch.stack(tuple(
+            self.layer1(normalized_targets[:, step]).detach()
+            for step in range(self.output_steps)
+        ), dim=1)
+        states = torch.stack(trace.next_feature_distribution_states, dim=1)
+        anchors = torch.stack(trace.expected_feature_embeddings, dim=1)
+        return self.embedding_density_attention(queries, states, anchors)
+
+    def feature_embedding_base_distribution(
+        self, inputs: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Return raw causal base support and log masses for every output step."""
+        density = self.embedding_density_attention
+        if not isinstance(
+            density, ConditionalEmbeddingBaseSupportGaussianMixture,
+        ):
+            raise RuntimeError("base-support embedding density is disabled")
+        trace = self._forward_trace(inputs)
+        states = torch.stack(trace.next_feature_distribution_states, dim=1)
+        standardized_components, log_weights = density.distribution_parameters(
+            states, trace.outputs,
+        )
+        raw_components = (
+            standardized_components * self.output_std + self.output_mean
+        )
+        return raw_components, log_weights
+
+    def feature_embedding_log_density_from_base_support(
+        self,
+        raw_target_features: Tensor,
+        raw_component_feature_states: Tensor,
+        log_weights: Tensor,
+    ) -> Tensor:
+        """Evaluate targets after base support was causally rederived to features."""
+        density = self.embedding_density_attention
+        if not isinstance(
+            density, ConditionalEmbeddingBaseSupportGaussianMixture,
+        ):
+            raise RuntimeError("base-support embedding density is disabled")
+        if raw_target_features.ndim != 3 \
+                or raw_target_features.shape[1:] != (
+                    self.output_steps, self.input_width,
+                ):
+            raise ValueError("base-support density targets have the wrong shape")
+        expected_components = (
+            raw_target_features.shape[0], self.output_steps,
+            density.component_count, self.input_width,
+        )
+        if raw_component_feature_states.shape != expected_components:
+            raise ValueError("derived component feature states have the wrong shape")
+        normalized_targets = (
+            raw_target_features.float() - self.input_mean
+        ) / self.input_std
+        queries = torch.stack(tuple(
+            self.layer1(normalized_targets[:, step]).detach()
+            for step in range(self.output_steps)
+        ), dim=1)
+        flattened_components = raw_component_feature_states.reshape(
+            -1, self.input_width,
+        )
+        normalized_components = (
+            flattened_components.float() - self.input_mean
+        ) / self.input_std
+        component_embeddings = self.layer1(normalized_components).reshape(
+            *expected_components[:-1], self.feature_width,
+        )
+        return density.log_density(
+            queries, component_embeddings, log_weights,
+        )
+
+    def expected_raw_base_features(
+        self, raw_components: Tensor, log_weights: Tensor
+    ) -> Tensor:
+        density = self.embedding_density_attention
+        if not isinstance(
+            density, ConditionalEmbeddingBaseSupportGaussianMixture,
+        ):
+            raise RuntimeError("base-support embedding density is disabled")
+        if raw_components.shape != (
+            *log_weights.shape, self.output_width,
+        ):
+            raise ValueError("raw base-support expectation shapes have changed")
+        return (log_weights.exp().unsqueeze(-1) * raw_components).sum(dim=-2)
+
     def trace(self, inputs: Tensor) -> StructuredFeatureProcessTrace:
         return self._forward_trace(inputs)
 
@@ -1118,9 +1515,11 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             self.layer11,
             self.initial_market,
             self.initial_prefix,
+            self.embedding_density_attention,
         )
         return tuple(
             parameter
             for block in blocks
+            if block is not None
             for parameter in block.muon_parameters()
         )
