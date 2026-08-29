@@ -1066,12 +1066,20 @@ export class BinancePaperTrading {
             : undefined;
     const minNotional = filters.minNotional ?? 0;
     let adjustedQuantity = quantity;
+    const requestedQuantity = Number(positionInput.quantity);
+    const requestedNotional = effectivePrice
+      ? effectivePrice * requestedQuantity
+      : 0;
+    const requestedQuantityAlreadyMetMinimum =
+      minNotional > 0 &&
+      requestedNotional + Math.max(Number.EPSILON, minNotional * 1e-12) >= minNotional;
 
     if (
       minNotional > 0 &&
       effectivePrice &&
       effectivePrice * adjustedQuantity < minNotional &&
-      positionInput.allowMinNotionalQuantityIncrease !== false
+      (positionInput.allowMinNotionalQuantityIncrease !== false ||
+        requestedQuantityAlreadyMetMinimum)
     ) {
       adjustedQuantity = normalizeQuantity(
         minNotional / effectivePrice,
