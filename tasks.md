@@ -130,6 +130,7 @@ PORT=3001 TRADING_DATA_DIR=/var/lib/trading/prod TRADING_MARKET_ID=usdm-futures:
 TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://207.180.247.128:3001 pm2 restart trading-web-prod --update-env
 
 pm2 restart trading-server trading-web trading-server-prod trading-web-prod --update-env
+pm2 restart trading-server-prod trading-web-prod --update-env
 
 PORT=3001 TRADING_DATA_DIR=/var/lib/trading/prod npm run start -w @trading/server
 TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://127.0.0.1:3001 npm run start -w @trading/web
@@ -137,4 +138,4 @@ TRADING_WEB_PORT=4173 TRADING_BACKEND_URL=http://127.0.0.1:3001 npm run start -w
 PORT=3002 TRADING_DATA_DIR=/var/lib/trading/stage npm run start -w @trading/server
 TRADING_WEB_PORT=4174 TRADING_BACKEND_URL=http://127.0.0.1:3002 npm run start -w @trading/web
 
-npm run build -w @trading/server -w @trading/bot-algo -w @trading/web
+npm run build
