@@ -1,0 +1,138 @@
+{
+  "id": "structured-production59-featureembed-density-basesupport-gmmattn64-all512-k1-2-k2-2-stateless-train256k-b1536-ema4-v6",
+  "label": "Structured shared-IO feature process - production59 - stateless numbered layers - K1 2x1s input x 59 - K2 2x1s embedding density - all latent widths 512 - layer 8 causal self-attention Q/K/V/O512 - 64 causal base-support paths x 17 primitive coordinates rederived to 59 and encoded by shared layer 1 as Gaussian keys - scalar softmax component masses - exact expected base features - fixed sigma 4 normalized mixture NLL - 256k clean - batch 1536 train/evaluation - no regularization - EMA 4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "baseHistoryDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/structured-production59-featureembed-density-basesupport-gmmattn64-all512-k1-2-k2-2-stateless-train256k-b1536-ema4-v6",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 512,
+    "marketWidth": 512,
+    "prefixWidth": 512,
+    "featureDistributionWidth": 512,
+    "extendedPrefixWidth": 512,
+    "nextFeatureDistributionWidth": 512,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "heads": 1,
+      "queryWidth": 512,
+      "keyWidth": 512,
+      "valueWidth": 512,
+      "outputWidth": 512,
+      "causality": "output step s attends only to generated NF states <=s"
+    },
+    "featureEmbeddingDensity": {
+      "type": "causal-base-support-gaussian-mixture-density-v2",
+      "components": 64,
+      "queryWidth": 512,
+      "keyWidth": 512,
+      "valueWidth": 17,
+      "fixedStandardDeviation": 4.0,
+      "normalizationEpsilon": 1e-8,
+      "queryNormalization": "unit-rms",
+      "targetEncoderGradient": "stop-gradient",
+      "keyConstruction": "causal-derived-feature-state-through-shared-layer1",
+      "baseValueSource": "current NF state emits 64 standardized 17-coordinate offsets around the layer-8/layer-2 base center",
+      "keySource": "each base support path is causally rederived to the complete production59 path and encoded by the exact shared layer 1",
+      "massSource": "current NF state emits 64 scalar logits normalized by softmax",
+      "expectation": "sum of component mass times raw 17-coordinate base support"
+    },
+    "numberedLayerSharing": "each parenthesized numbered layer is one exact shared stateless GNGLU reused at every matching block; no layer carries private recurrent memory",
+    "densityState": "shared layer 7 maps PF to NF; causal layer 8 and shared layer 2 give the base center; NF produces component base offsets and masses; causal rollout plus shared layer 1 turns component base paths into embedding-space Gaussian keys",
+    "pointDecoder": "layer 2 supplies only the common base-support center; reported point predictions are exact mixture expectations of the component base values",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1536,
+    "evaluationBatchSize": 1536,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "conditional-feature-embedding-base-support-gaussian-mixture-nll-v2",
+      "description": "mean exact normalized Gaussian-mixture negative log likelihood of both realized future production59 states after shared-layer-1 encoding; all 64 keys originate from causal base-feature support, and no MSE auxiliary loss is optimized",
+      "targetSpace": "shared-layer-1 unit-RMS feature embedding",
+      "steps": 2
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "the exact production59 dense chronological nonzero-target population with two observed rows and two realized future rows per origin",
+    "comparisonControl": "same K1/K2, data population, optimizer, examples, EMA, and exact base-support embedding NLL as the 24-key W256 run; all latent and attention widths become 512 and component count becomes 64"
+  },
+  "evaluation": {
+    "headline": "realized layer-1 feature-embedding negative log likelihood",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "lowest full-validation two-step embedding NLL, with additional durable best expected-feature MSE and correlation checkpoints",
+    "pointMetrics": "mixture-weighted expected 17-coordinate base state and mixture-weighted expected causally derived 59-feature state",
+    "comparableHeadline": "next-completed-1s return-only normalized MSE and correlation"
+  },
+  "alignment": {
+    "input": "two consecutive production59 rows ending at each control origin",
+    "target": "the complete chronological production59 rows at origin+1 and origin+2, encoded by the exact shared layer 1",
+    "causality": "every component is a two-step primitive path rederived from only the observed prefix and that component's earlier primitive value; target embeddings are used only as stop-gradient likelihood queries",
+    "supportMeaning": "each Gaussian mean has an attached raw 17-coordinate base value, so expected base features use the same probability masses as NLL",
+    "normalization": "component masses use softmax and every embedding key is a fixed-scale normalized Gaussian component with its exact finite normalizer"
+  }
+}

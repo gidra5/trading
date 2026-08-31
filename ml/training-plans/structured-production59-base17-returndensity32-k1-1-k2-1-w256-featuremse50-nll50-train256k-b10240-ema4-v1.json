@@ -1,0 +1,127 @@
+{
+  "id": "structured-production59-base17-returndensity32-k1-1-k2-1-w256-featuremse50-nll50-train256k-b10240-ema4-v1",
+  "label": "Structured shared-IO hybrid - preceding 1s production59 state - next 1s primitive-consistent 17-coordinate output rederived to 59 - dedicated 32-knot return density on expected W256 embedding - 50% standardized derived-feature MSE + 50% return NLL - K1 1 - K2 1 - W256 M128 P128 F128 PF256 NF256 - 256k clean - batch 10240 train and evaluation - no regularization - EMA 4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "baseHistoryDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/structured-production59-base17-returndensity32-k1-1-k2-1-w256-featuremse50-nll50-train256k-b10240-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 1,
+    "outputSteps": 1,
+    "returnCount": 1,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "returnDensity": {
+      "type": "fixed-knot-piecewise-linear-return-density-v1",
+      "latentSource": "expected-feature-embedding",
+      "knotCount": 32
+    },
+    "numberedLayerSharing": "each parenthesized number is one exact shared GNGLU module; K1=K2=1 activates layers 1, 2, 3, 4, 7 and the two initial-state GNGLUs once",
+    "initialState": "the immediately preceding completed production59 W embedding seeds M and P; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 maps NF to the expected W embedding; layer 2 decodes W to 17 primitive causal coordinates, and differentiable fixed code reconstructs all 59 next-state features",
+    "returnDensityState": "a dedicated GNGLU reads the same expected W embedding and emits 32 fixed-knot log-density heights for the next completed 1s signed log return",
+    "baseConsistency": "all derived production59 channels are reconstructed causally from the predicted primitive coordinates and observed history through the input second",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "equal-structured-feature-mse-return-density-nll-v1",
+      "description": "50% mean standardized MSE over the causally rederived next 59-feature state plus 50% proper continuous fixed-knot next-return NLL",
+      "featureObjective": "mean-standardized-derived-production59-feature-mse-v1",
+      "weights": {
+        "derivedFeatureMse": 0.5,
+        "returnDensityNll": 0.5
+      }
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "target": "next completed 1s BTC signed log return at production59 channel 0",
+    "expectation": "mixture mass dotted with exact triangular-basis component return means"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s return expectation from the dedicated density head",
+    "checkpointSelection": [
+      "best-validation-nll",
+      "best-validation-mse",
+      "best-validation-correlation",
+      "last"
+    ],
+    "featureMetrics": "the primitive decoder is separately evaluated on its complete causally reconstructed 59-feature state",
+    "comparison": "validation next-1s MSE skill, correlation, direction accuracy, and NLL are directly comparable with earlier one-step return-density runs"
+  },
+  "alignment": {
+    "input": "exactly the complete production59 timeline row at the clean example origin",
+    "target": "the complete chronological production59 row at origin+1",
+    "causalDerivation": "no target-derived feature enters either branch; only the predicted 17 primitive coordinates and history ending at the input origin reconstruct the next state"
+  }
+}

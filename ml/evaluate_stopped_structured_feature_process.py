@@ -9,6 +9,7 @@ import time
 
 import torch
 
+from return_knot_density import KnotDensityContract
 from structured_feature_process import StructuredSharedIoFeatureProcess
 from trading_storage import load_torch_checkpoint
 from train_normalized_glu_next_return import atomic_json
@@ -17,10 +18,13 @@ from train_structured_feature_process import (
     comparable_policy_metrics,
     evaluate,
     evaluate_feature_embedding_density,
+    evaluate_structured_return_density,
     persist_embedding_density_evaluation,
+    persist_structured_return_density_evaluation,
     persist_structured_feature_evaluation,
     uses_base_support_embedding_density,
     uses_embedding_density_objective,
+    uses_structured_return_density_objective,
     validate_plan,
 )
 
@@ -47,7 +51,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def model_from_state(
-    plan: dict, state: dict[str, torch.Tensor], device: torch.device
+    plan: dict,
+    state: dict[str, torch.Tensor],
+    device: torch.device,
+    return_density_contract: KnotDensityContract | None = None,
 ) -> StructuredSharedIoFeatureProcess:
     architecture = plan["architecture"]
     model = StructuredSharedIoFeatureProcess(
@@ -79,6 +86,11 @@ def model_from_state(
         ),
         recurrent_memory=architecture.get("recurrentMemory"),
         feature_embedding_density=architecture.get("featureEmbeddingDensity"),
+        return_density=architecture.get("returnDensity"),
+        return_density_contract=return_density_contract,
+        recurrent_activation_checkpointing=bool(
+            architecture.get("recurrentActivationCheckpointing", False)
+        ),
     )
     model.load_state_dict(state)
     model.eval()
@@ -108,6 +120,14 @@ def main() -> None:
         dataset.statistics(batch_size)
     uses_embedding_density = uses_embedding_density_objective(plan)
     uses_base_support_density = uses_base_support_embedding_density(plan)
+    uses_return_density = uses_structured_return_density_objective(plan)
+    return_density = (
+        KnotDensityContract.load(
+            (repo / plan["density"]["source"]).resolve(),
+            fit=str(plan["density"]["fit"]),
+        )
+        if uses_return_density else None
+    )
     checkpoint_specs = ((
         "best-validation-nll",
         run_root / "checkpoints/selections/validation-nll.json",
@@ -129,6 +149,23 @@ def main() -> None:
     ), ("last", run_root / "checkpoints/last.json", "emaModel")) \
         if uses_embedding_density else (
         (
+            "best-validation-nll",
+            run_root / "checkpoints/selections/validation-nll.json",
+            "model",
+        ),
+        (
+            "best-validation-mse",
+            run_root / "checkpoints/selections/validation-mse.json",
+            "model",
+        ),
+        (
+            "best-validation-correlation",
+            run_root / "checkpoints/selections/validation-correlation.json",
+            "model",
+        ),
+        ("last", run_root / "checkpoints/last.json", "emaModel"),
+    ) if uses_return_density else (
+        (
             "best-validation-mse",
             run_root / "checkpoints/selections/validation-mse.json",
             "model",
@@ -147,26 +184,46 @@ def main() -> None:
         checkpoint = load_torch_checkpoint(
             checkpoint_file, map_location="cpu", weights_only=False
         )
-        model = model_from_state(plan, checkpoint[state_key], device)
+        model = model_from_state(
+            plan,
+            checkpoint[state_key],
+            device,
+            return_density,
+        )
         parameter_count = sum(value.numel() for value in model.parameters())
         selection_score = checkpoint.get("score")
-        evaluator = (
-            evaluate_feature_embedding_density
-            if uses_embedding_density else evaluate
-        )
-        evaluations = {
-            split: evaluator(
-                model, dataset, split, batch_size=batch_size, device=device
+        if uses_return_density:
+            if return_density is None:
+                raise AssertionError("structured return-density contract is missing")
+            evaluations = {
+                split: evaluate_structured_return_density(
+                    model, dataset, split, batch_size=batch_size,
+                    device=device, density=return_density,
+                )
+                for split in ("train", "validation", "test")
+            }
+        else:
+            evaluator = (
+                evaluate_feature_embedding_density
+                if uses_embedding_density else evaluate
             )
-            for split in ("train", "validation", "test")
-        }
+            evaluations = {
+                split: evaluator(
+                    model, dataset, split, batch_size=batch_size, device=device
+                )
+                for split in ("train", "validation", "test")
+            }
         policies[label] = {
             "epoch": int(checkpoint["epoch"]),
             "selectionScore": (
                 None if selection_score is None else float(selection_score)
             ),
             "selectionMetric": (
-                "featureState.correlation"
+                "returnDensityExpectation.correlation"
+                if uses_return_density and label == "best-validation-correlation"
+                else "returnDensityExpectation.normalizedMse"
+                if uses_return_density and label == "best-validation-mse"
+                else "featureState.correlation"
                 if label == "best-validation-correlation"
                 else "featureState.normalizedMse"
                 if label == "best-validation-mse"
@@ -177,6 +234,12 @@ def main() -> None:
             "checkpointPolicy": label,
             "checkpoint": str(checkpoint_file.relative_to(repo)).replace("\\", "/"),
             **(
+                {
+                    "density": evaluations,
+                    **comparable_policy_metrics(evaluations),
+                }
+                if uses_return_density
+                else
                 {
                     "density": evaluations,
                     **comparable_policy_metrics(evaluations),
@@ -194,7 +257,9 @@ def main() -> None:
 
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     persistence = (
-        persist_embedding_density_evaluation
+        persist_structured_return_density_evaluation
+        if uses_return_density
+        else persist_embedding_density_evaluation
         if uses_embedding_density else persist_structured_feature_evaluation
     )
     artifact, result = persistence(
@@ -223,12 +288,16 @@ def main() -> None:
             "bestEpoch": result["bestEpoch"],
             "bestTest": (
                 result["density"]["test"]
+                if uses_return_density
+                else result["density"]["test"]
                 if uses_base_support_density
                 else result["distribution"]["test"]
                 if uses_embedding_density else result["test"]
             ),
             "lastTest": (
                 policies["last"]["density"]["test"]
+                if uses_return_density
+                else policies["last"]["density"]["test"]
                 if uses_base_support_density
                 else policies["last"]["distribution"]["test"]
                 if uses_embedding_density else policies["last"]["test"]
@@ -244,18 +313,24 @@ def main() -> None:
         "bestEpoch": result["bestEpoch"],
         "bestValidation": (
             result["density"]["validation"]
+            if uses_return_density
+            else result["density"]["validation"]
             if uses_base_support_density
             else result["distribution"]["validation"]
             if uses_embedding_density else result["validation"]
         ),
         "bestTest": (
             result["density"]["test"]
+            if uses_return_density
+            else result["density"]["test"]
             if uses_base_support_density
             else result["distribution"]["test"]
             if uses_embedding_density else result["test"]
         ),
         "lastTest": (
             policies["last"]["density"]["test"]
+            if uses_return_density
+            else policies["last"]["density"]["test"]
             if uses_base_support_density
             else policies["last"]["distribution"]["test"]
             if uses_embedding_density else policies["last"]["test"]

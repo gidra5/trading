@@ -1,0 +1,139 @@
+{
+  "id": "structured-production59-base17-jointpath15-q64d16o32-k1-1-k2-15-w256-featuremse50-jointnll50-train256k-b1536-ema4-v1",
+  "label": "Structured shared-IO hybrid - preceding 1s production59 state - 15-step primitive-consistent feature rollout plus exact joint-prefix path density over 15 active 1s returns - 64 prefix paths x D16 x 32 return knots - one recurrent density block and numbered structured blocks shared across all steps - 50% standardized derived-feature MSE + 50% proper joint return NLL - K1 1 - K2 15 - W256 M128 P128 F128 PF256 NF256 - 256k clean - batch 1536 train and evaluation - exact activation recomputation - no regularization - EMA 4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "baseHistoryDir": "data/training/datasets/union530-base-history-30d-v1",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/structured-production59-base17-jointpath15-q64d16o32-k1-1-k2-15-w256-featuremse50-jointnll50-train256k-b1536-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 1,
+    "outputSteps": 15,
+    "returnCount": 15,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "recurrentActivationCheckpointing": true,
+    "returnDensity": {
+      "type": "joint-prefix-contracted-path-matrix-return-density-v1",
+      "latentSource": "expected-feature-embedding",
+      "knotCount": 32,
+      "returnCount": 15,
+      "marketWidth": 256,
+      "pathEmbeddingWidth": 16,
+      "pathCount": 64,
+      "stageBlockCount": 1,
+      "pathCompressionWidth": 128,
+      "jointCompressionWidth": 256,
+      "recurrentActivationCheckpointing": true,
+      "initialRadius": 0.0031622776601683794,
+      "minimumRadius": 0.0001,
+      "learnableCentering": false
+    },
+    "numberedLayerSharing": "each parenthesized structured layer is one exact shared GNGLU module across all 15 output steps; the joint-density head likewise reuses one exact path-matrix recurrent block across all 15 return steps",
+    "initialState": "the immediately preceding completed production59 W embedding seeds M and P; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layers 7 and 8 produce each expected W embedding; shared layer 2 decodes 17 primitive causal coordinates and differentiable fixed code reconstructs every 59-feature state",
+    "jointPathContraction": "the first expected W embedding initializes a 64-path D16 return-density state; every step constructs J_t=q_t*T_t, the forecast stream compresses the complete J_t, and a parallel realized-prefix stream contracts J_t with the observed continuous triangular-component density before the same recurrent transition; the 15 conditional terms sum exactly to log p(r_1:15|x) without sampled rollout or independent-marginal approximation",
+    "gradientMemory": "exact non-reentrant activation recomputation is used for the structured numbered layers and the joint-density recurrent step; reverse traversal recomputes the same arithmetic and accumulates the exact 15-step unrolled gradient into shared parameters",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 1536,
+    "evaluationBatchSize": 1536,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "equal-structured-feature-mse-joint-path-nll-v2",
+      "description": "50% mean standardized MSE over all 15 causally rederived production59 states plus 50% exact forward-contracted joint-path NLL averaged over its 15 conditional terms",
+      "featureObjective": "mean-standardized-derived-production59-feature-mse-v1",
+      "weights": {
+        "derivedFeatureMse": 0.5,
+        "returnDensityNll": 0.5
+      }
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "density": {
+    "source": "data/benchmarks/one-second-return-knot-scaling-v1.json",
+    "fit": 32,
+    "target": "the 15 chronological completed 1s BTC signed log returns at production59 channel 0",
+    "trainingLoss": "proper joint path NLL from exact forward contraction; emitted forecast marginals are used for expectations but are never multiplied as independent returns"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s return expectation from the unconditioned joint-path forecast stream",
+    "checkpointSelection": [
+      "best-validation-nll",
+      "best-validation-mse",
+      "best-validation-correlation",
+      "last"
+    ],
+    "featureMetrics": "all 15 primitive decodes are separately evaluated after causal reconstruction into complete 59-feature states",
+    "comparison": "step-1 validation MSE skill, correlation, direction accuracy, and NLL remain directly comparable with the one-step hybrid and historical path-density runs; per-step rows expose leads 1 through 15"
+  },
+  "alignment": {
+    "input": "exactly the complete production59 timeline row at the clean example origin",
+    "target": "the 15 complete chronological production59 rows at origin+1 through origin+15",
+    "causalDerivation": "no target-derived feature enters the forecast stream; only predicted primitive coordinates and history ending at the input origin reconstruct the 15 feature states; realized returns enter only the parallel density contraction used to evaluate the joint likelihood"
+  }
+}

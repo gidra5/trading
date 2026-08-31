@@ -14,6 +14,11 @@ from materialize_sparse_timeline_episode_dataset import (
     sparse_episode_origins,
 )
 from normalized_glu_next_return import optimizer_parameter_groups
+from return_knot_density import (
+    KnotDensityContract,
+    ReturnTransform,
+    component_log_masses,
+)
 from structured_feature_process import (
     CausalKnotBasisGramLossLayer8,
     CausalSelfAttentionLayer8,
@@ -31,6 +36,7 @@ from train_structured_feature_process import (
     StructuredFeatureSequenceDataset,
     derive_base_support_feature_states,
     production59_balanced_objective,
+    structured_feature_return_density_objective,
     weighted_standardized_mse,
 )
 
@@ -46,6 +52,9 @@ class StructuredFeatureProcessTest(unittest.TestCase):
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
         feature_embedding_density: dict[str, object] | None = None,
+        return_density: dict[str, object] | None = None,
+        return_density_contract: KnotDensityContract | None = None,
+        recurrent_activation_checkpointing: bool = False,
     ):
         return StructuredSharedIoFeatureProcess(
             torch.zeros(5),
@@ -68,7 +77,141 @@ class StructuredFeatureProcessTest(unittest.TestCase):
             layer8_function_approximator=layer8_function_approximator,
             recurrent_memory=recurrent_memory,
             feature_embedding_density=feature_embedding_density,
+            return_density=return_density,
+            return_density_contract=return_density_contract,
+            recurrent_activation_checkpointing=(
+                recurrent_activation_checkpointing
+            ),
         )
+
+    def test_scalar_return_density_reads_expected_feature_embedding(
+        self,
+    ) -> None:
+        density = {
+            "type": "fixed-knot-piecewise-linear-return-density-v1",
+            "latentSource": "expected-feature-embedding",
+            "knotCount": 5,
+        }
+        torch.manual_seed(107)
+        model = self.make_model(1, 1, return_density=density)
+        areas = torch.tensor([0.1, 0.2, 0.25, 0.3, 0.15])
+        masses = torch.tensor([0.05, 0.15, 0.4, 0.3, 0.1])
+        model.initialize_return_density_prior(areas, masses)
+        inputs = torch.randn(7, 1, 5)
+        predictions, logits = model.forward_with_return_density(inputs)
+        self.assertEqual(predictions.shape, (7, 1, 5))
+        self.assertEqual(logits.shape, (7, 1, 5))
+        torch.testing.assert_close(
+            component_log_masses(logits, areas),
+            masses.log().expand(7, 1, 5),
+        )
+        loss = predictions.square().mean() + logits.square().mean()
+        loss.backward()
+        for parameter in model.return_density_head.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+    def test_structured_feature_return_density_objective_is_equal_weight(
+        self,
+    ) -> None:
+        feature_mse = torch.tensor(2.0, requires_grad=True)
+        return_nll = torch.tensor(-8.0, requires_grad=True)
+        components = structured_feature_return_density_objective(
+            feature_mse,
+            return_nll,
+            {
+                "featureObjective": (
+                    "mean-standardized-derived-production59-feature-mse-v1"
+                ),
+                "weights": {
+                    "derivedFeatureMse": 0.5,
+                    "returnDensityNll": 0.5,
+                },
+            },
+        )
+        self.assertEqual(float(components["objective"].detach()), -3.0)
+        components["objective"].backward()
+        self.assertEqual(float(feature_mse.grad), 0.5)
+        self.assertEqual(float(return_nll.grad), 0.5)
+
+    def test_joint_path_return_density_emits_exact_conditional_terms(
+        self,
+    ) -> None:
+        contract = KnotDensityContract(
+            transform=ReturnTransform(
+                alpha=2.0, location_bps=0.0, scale_bps=1.0,
+            ),
+            knots_unit=np.linspace(0.0, 1.0, 5),
+            prior_component_masses=np.full(5, 0.2),
+            source_file="test",
+            source_fit="5",
+        )
+        density = {
+            "type": (
+                "joint-prefix-contracted-path-matrix-return-density-v1"
+            ),
+            "latentSource": "expected-feature-embedding",
+            "knotCount": 5,
+            "returnCount": 3,
+            "marketWidth": 12,
+            "pathEmbeddingWidth": 4,
+            "pathCount": 5,
+            "stageBlockCount": 1,
+            "pathCompressionWidth": 6,
+            "jointCompressionWidth": 7,
+            "recurrentActivationCheckpointing": True,
+            "initialRadius": 0.0031622776601683794,
+            "minimumRadius": 1e-4,
+            "learnableCentering": False,
+        }
+        torch.manual_seed(109)
+        model = self.make_model(
+            1,
+            3,
+            return_density=density,
+            return_density_contract=contract,
+            recurrent_activation_checkpointing=True,
+        )
+        inputs = torch.randn(4, 1, 5)
+        targets = torch.randn(4, 3) * 5e-5
+        prediction, output = model.forward_with_joint_return_density(
+            inputs, targets
+        )
+        self.assertEqual(prediction.shape, (4, 3, 5))
+        self.assertEqual(output.expectations.shape, (4, 3))
+        self.assertIsNotNone(output.joint_log_density_terms)
+        self.assertEqual(output.joint_log_density_terms.shape, (4, 3))
+        loss = prediction.square().mean() \
+            - output.joint_log_density_terms.mean()
+        loss.backward()
+        self.assertIsNotNone(model.layer1.output.weight.grad)
+        for parameter in model.return_density_head.muon_parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
+
+    def test_checkpointed_rollout_matches_unrolled_gradients(self) -> None:
+        torch.manual_seed(113)
+        plain = self.make_model(1, 4)
+        checkpointed = self.make_model(
+            1, 4, recurrent_activation_checkpointing=True
+        )
+        checkpointed.load_state_dict(plain.state_dict())
+        plain.train()
+        checkpointed.train()
+        inputs = torch.randn(5, 1, 5)
+        plain_output = plain(inputs)
+        checkpointed_output = checkpointed(inputs)
+        torch.testing.assert_close(plain_output, checkpointed_output)
+        plain_output.square().mean().backward()
+        checkpointed_output.square().mean().backward()
+        plain_gradients = dict(plain.named_parameters())
+        for name, parameter in checkpointed.named_parameters():
+            torch.testing.assert_close(
+                plain_gradients[name].grad,
+                parameter.grad,
+                rtol=2e-5,
+                atol=2e-6,
+            )
 
     def test_feature_embedding_attention_is_normalized_mixture_nll(
         self,
@@ -594,6 +737,17 @@ class StructuredFeatureProcessTest(unittest.TestCase):
         self.assertAlmostEqual(headline["mseSkillVsZero"], 0.75)
         self.assertAlmostEqual(headline["directionAccuracy"], 1.0)
         self.assertAlmostEqual(headline["correlation"], 1.0)
+        deciles = headline["directionByAbsoluteTargetDecile"]
+        self.assertEqual(len(deciles), 2)
+        self.assertEqual(sum(row["examples"] for row in deciles), 2)
+        populated = [row for row in deciles if row["examples"]]
+        self.assertTrue(populated)
+        self.assertTrue(all(row["directionAccuracy"] == 1.0 for row in populated))
+        self.assertTrue(all(
+            row["magnitudeWeightedDirectionAccuracy"] == 1.0
+            for row in populated
+        ))
+        self.assertTrue(all(row["signedReturnCapture"] == 1.0 for row in populated))
         self.assertEqual(result["featureState"]["featureCount"], 2)
 
     def test_sequence_metrics_headline_step_one_and_report_every_step(self) -> None:

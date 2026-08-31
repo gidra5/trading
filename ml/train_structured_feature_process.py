@@ -18,6 +18,13 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 
 from normalized_glu_next_return import optimizer_parameter_groups
+from return_knot_density import (
+    KnotDensityContract,
+    component_log_masses,
+    component_return_means,
+    return_negative_log_likelihood,
+    triangular_basis_areas,
+)
 from structured_feature_process import (
     ARCHITECTURE_CONTRACT,
     StructuredSharedIoFeatureProcess,
@@ -57,6 +64,12 @@ FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT = (
 BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT = (
     "conditional-feature-embedding-base-support-gaussian-mixture-nll-v2"
 )
+STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT = (
+    "equal-structured-feature-mse-return-density-nll-v1"
+)
+STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT = (
+    "equal-structured-feature-mse-joint-path-nll-v2"
+)
 COMPARABLE_RETURN_CHANNEL = 0
 COMPARABLE_EVALUATION_SCOPE = "next-completed-1s-signed-log-return"
 FEATURE_STATE_EVALUATION_SCOPE = "complete-next-feature-state"
@@ -76,6 +89,18 @@ def uses_embedding_density_objective(plan: dict) -> bool:
 def uses_base_support_embedding_density(plan: dict) -> bool:
     return objective_contract(plan) \
         == BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT
+
+
+def uses_structured_return_density_objective(plan: dict) -> bool:
+    return objective_contract(plan) in {
+        STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+        STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+    }
+
+
+def uses_joint_structured_return_density_objective(plan: dict) -> bool:
+    return objective_contract(plan) \
+        == STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT
 
 
 def is_union530_base_plan(plan: dict) -> bool:
@@ -306,6 +331,8 @@ class FeatureMetricAccumulator:
         self.sum_square_error = torch.zeros(width, dtype=torch.float64)
         self.sum_absolute_error = torch.zeros(width, dtype=torch.float64)
         self.direction_correct = torch.zeros(width, dtype=torch.float64)
+        self.return_predictions: list[Tensor] = []
+        self.return_targets: list[Tensor] = []
 
     def add(self, prediction: Tensor, target: Tensor, weights: Tensor) -> None:
         active = weights.detach().cpu().bool()
@@ -328,6 +355,58 @@ class FeatureMetricAccumulator:
         self.direction_correct += (
             (prediction >= 0) == (target >= 0)
         ).double().sum(0)
+        self.return_predictions.append(
+            prediction[:, COMPARABLE_RETURN_CHANNEL].clone()
+        )
+        self.return_targets.append(target[:, COMPARABLE_RETURN_CHANNEL].clone())
+
+    def _absolute_return_magnitude_deciles(self) -> list[dict]:
+        if not self.return_predictions:
+            return []
+        prediction = torch.cat(self.return_predictions)
+        target = torch.cat(self.return_targets)
+        absolute_target = target.abs()
+        order = torch.argsort(absolute_target, stable=True)
+        count = int(order.numel())
+        bucket_count = min(10, count)
+        deciles: list[dict] = []
+        for index in range(bucket_count):
+            start = count * index // bucket_count
+            stop = count * (index + 1) // bucket_count
+            selected = order[start:stop]
+            bucket_prediction = prediction[selected]
+            bucket_target = target[selected]
+            bucket_absolute_target = absolute_target[selected]
+            correct = (
+                (bucket_prediction >= 0) == (bucket_target >= 0)
+            ).double()
+            absolute_weight = float(bucket_absolute_target.sum())
+            signed_capture = float(
+                (torch.sign(bucket_prediction) * bucket_target).sum()
+            )
+            error = bucket_prediction - bucket_target
+            zero_mse = float(bucket_target.square().mean())
+            mse = float(error.square().mean())
+            deciles.append({
+                "index": index,
+                "quantileLow": index / bucket_count,
+                "quantileHigh": (index + 1) / bucket_count,
+                "examples": int(selected.numel()),
+                "minimumAbsoluteTarget": float(bucket_absolute_target.min()),
+                "maximumAbsoluteTarget": float(bucket_absolute_target.max()),
+                "meanAbsoluteTarget": float(bucket_absolute_target.mean()),
+                "directionAccuracy": float(correct.mean()),
+                "magnitudeWeightedDirectionAccuracy": float(
+                    (correct * bucket_absolute_target).sum() / absolute_weight
+                ) if absolute_weight > 0 else 0.0,
+                "signedReturnCapture": signed_capture / absolute_weight
+                if absolute_weight > 0 else 0.0,
+                "mse": mse,
+                "zeroBaselineMse": zero_mse,
+                "mseSkillVsZero": 1.0 - mse / zero_mse
+                if zero_mse > 0 else 0.0,
+            })
+        return deciles
 
     def result(self) -> dict:
         count = self.count.clamp_min(1.0)
@@ -400,6 +479,9 @@ class FeatureMetricAccumulator:
             "channelIndex": channel,
             "channelId": "return-lag-0s",
             "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
+            "directionByAbsoluteTargetDecile": (
+                self._absolute_return_magnitude_deciles()
+            ),
         }
         if not all(math.isfinite(value) for value in (
             feature_state["normalizedMse"], feature_state["mse"],
@@ -464,6 +546,31 @@ def weighted_standardized_mse(
 ) -> Tensor:
     per_example = (prediction - target).square().mean(dim=(1, 2))
     return (per_example * weights).sum() / weights.sum().clamp_min(1)
+
+
+def structured_feature_return_density_objective(
+    feature_mse: Tensor,
+    return_density_nll: Tensor,
+    config: Mapping[str, object],
+) -> dict[str, Tensor]:
+    """Combine causal 59-feature reconstruction and scalar return NLL 50/50."""
+    expected_weights = {
+        "derivedFeatureMse": 0.5,
+        "returnDensityNll": 0.5,
+    }
+    if config.get("weights") != expected_weights \
+            or config.get("featureObjective") \
+            != PRODUCTION59_OBJECTIVE_CONTRACT:
+        raise ValueError("structured return-density objective changed")
+    objective = (
+        expected_weights["derivedFeatureMse"] * feature_mse
+        + expected_weights["returnDensityNll"] * return_density_nll
+    )
+    return {
+        "objective": objective,
+        "derivedFeatureMse": feature_mse,
+        "returnDensityNegativeLogLikelihood": return_density_nll,
+    }
 
 
 def _weighted_masked_mean(
@@ -617,6 +724,128 @@ def evaluate(
         )
         metrics.add(prediction, targets, weights)
     return metrics.result()
+
+
+@torch.no_grad()
+def evaluate_structured_return_density(
+    model: StructuredSharedIoFeatureProcess,
+    dataset: StructuredProduction59BaseDataset,
+    split: str,
+    *,
+    batch_size: int,
+    device: torch.device,
+    density: KnotDensityContract,
+    limit: int | None = None,
+) -> dict:
+    """Evaluate return-density expectations and causal feature reconstruction."""
+    model.eval()
+    if dataset.derived_output_mean is None \
+            or dataset.derived_output_std is None:
+        raise ValueError("structured density evaluation requires statistics")
+    feature_metrics = FeatureSequenceMetricAccumulator(
+        dataset.derived_output_mean,
+        dataset.derived_output_std,
+        output_steps=dataset.output_steps,
+    )
+    return_metrics = FeatureSequenceMetricAccumulator(
+        dataset.derived_output_mean[:1],
+        dataset.derived_output_std[:1],
+        output_steps=dataset.output_steps,
+    )
+    knots = torch.from_numpy(density.knots_unit).to(device=device).float()
+    areas = triangular_basis_areas(knots)
+    means = torch.from_numpy(component_return_means(
+        density.knots_unit, density.transform,
+    )).to(device=device).float()
+    total_nll = 0.0
+    total_examples = 0
+    per_step_nll = torch.zeros(dataset.output_steps, dtype=torch.float64)
+    per_step_examples = torch.zeros(dataset.output_steps, dtype=torch.float64)
+    for batch in dataset.iter_batches(
+        split, batch_size, shuffle=False, seed=0, limit=limit, pad=False,
+    ):
+        inputs, targets, weights = (
+            batch.inputs.to(device, non_blocking=True),
+            batch.targets.to(device, non_blocking=True),
+            batch.weights.to(device, non_blocking=True),
+        )
+        context = {
+            name: value.to(device, non_blocking=True)
+            for name, value in batch.context.items()
+        }
+        joint_path_density = (
+            isinstance(model.return_density, dict)
+            and model.return_density.get("type")
+            == "joint-prefix-contracted-path-matrix-return-density-v1"
+        )
+        if joint_path_density:
+            standardized_base, density_output = \
+                model.forward_with_joint_return_density(
+                    inputs,
+                    targets[:, :, COMPARABLE_RETURN_CHANNEL],
+                )
+            if density_output.joint_log_density_terms is None:
+                raise RuntimeError(
+                    "joint path density did not emit contracted terms"
+                )
+            nll = -density_output.joint_log_density_terms
+            expected_return = density_output.expectations
+        else:
+            standardized_base, density_logits = \
+                model.forward_with_return_density(inputs)
+            nll, log_masses, _ = return_negative_log_likelihood(
+                density_logits,
+                targets[:, :, COMPARABLE_RETURN_CHANNEL],
+                knots,
+                areas,
+                density.transform,
+            )
+            expected_return = log_masses.exp() @ means
+        raw_base = model.raw_outputs(standardized_base)
+        feature_prediction = dataset.derive(raw_base, inputs, context)
+        feature_metrics.add(feature_prediction, targets, weights)
+        return_metrics.add(
+            expected_return.unsqueeze(-1),
+            targets[:, :, COMPARABLE_RETURN_CHANNEL:COMPARABLE_RETURN_CHANNEL + 1],
+            weights,
+        )
+        active = weights[:, None]
+        total_nll += float((nll * active).sum().detach())
+        valid = int(weights.sum().item())
+        total_examples += valid * dataset.output_steps
+        per_step_nll += (nll * active).sum(dim=0).detach().cpu().double()
+        per_step_examples += active.sum(dim=0).detach().cpu().double()
+    mean_nll = total_nll / max(1, total_examples)
+    density_expectation = return_metrics.result()
+    feature_prediction = feature_metrics.result()
+    return {
+        "negativeLogLikelihood": mean_nll,
+        "perLeadNegativeLogLikelihood": (
+            per_step_nll / per_step_examples.clamp_min(1.0)
+        ).tolist(),
+        "bitsPerExample": mean_nll / math.log(2.0),
+        "examples": int(total_examples),
+        "steps": int(dataset.output_steps),
+        "components": int(knots.numel()),
+        "densitySpace": "continuous-next-1s-signed-log-return",
+        "expectationType": (
+            "joint-prefix-path-matrix-marginal-mean"
+            if isinstance(model.return_density, dict)
+            and model.return_density.get("type")
+            == "joint-prefix-contracted-path-matrix-return-density-v1"
+            else "fixed-knot-component-return-mean"
+        ),
+        "nextReturn": density_expectation["nextReturn"],
+        "returnPath": density_expectation["returnPath"],
+        "perStepNextReturn": density_expectation["perStepNextReturn"],
+        "featureState": feature_prediction["featureState"],
+        "perStepFeatureState": feature_prediction["perStepFeatureState"],
+        "featurePredictionNextReturn": feature_prediction["nextReturn"],
+        "featurePredictionReturnPath": feature_prediction["returnPath"],
+        "perStepFeaturePredictionNextReturn": feature_prediction[
+            "perStepNextReturn"
+        ],
+    }
 
 
 def derive_base_support_feature_states(
@@ -1048,6 +1277,90 @@ def persist_embedding_density_evaluation(
     return artifact, result
 
 
+def persist_structured_return_density_evaluation(
+    *,
+    repo: Path,
+    run_root: Path,
+    plan: dict,
+    dataset: StructuredProduction59BaseDataset,
+    parameter_count: int,
+    policies: dict[str, dict],
+    generated_at: str,
+) -> tuple[dict, dict]:
+    """Persist all return-PDF and feature-reconstruction checkpoint policies."""
+    required = {
+        "best-validation-nll",
+        "best-validation-mse",
+        "best-validation-correlation",
+        "last",
+    }
+    if set(policies) != required:
+        raise ValueError(
+            f"structured return-density policies changed: {sorted(policies)}"
+        )
+    artifact_file = (
+        repo / "data/benchmarks" / f'{plan["id"]}-completed-eval.json'
+    ).resolve()
+    artifact = {
+        "contract": "structured-feature-return-density-evaluation-v1",
+        "generatedAt": generated_at,
+        "planId": plan["id"],
+        "selectionPolicy": "best-validation-mse",
+        "selectionDoesNotUseTest": True,
+        "completedAfterEpoch": int(policies["last"]["epoch"]),
+        "examplesBySplit": dataset.counts,
+        "featureCount": dataset.feature_count,
+        "parameterCount": int(parameter_count),
+        "headlineEvaluationScope": COMPARABLE_EVALUATION_SCOPE,
+        "densityEvaluationScope": "continuous-next-1s-signed-log-return",
+        "checkpointSelectionMetric": "return-density expectation validation",
+        "policies": policies,
+    }
+    atomic_json(artifact, artifact_file)
+    atomic_json(artifact, run_root / "state/stopped-evaluation.json")
+    atomic_json({
+        "contract": "structured-return-density-checkpoint-comparison-v1",
+        "policies": {
+            "validation-nll": policies["best-validation-nll"],
+            "validation-mse": policies["best-validation-mse"],
+            "validation-correlation": policies[
+                "best-validation-correlation"
+            ],
+            "last": policies["last"],
+        },
+    }, run_root / "state/checkpoint-selection-comparison.json")
+    best = policies["best-validation-mse"]
+    result = {
+        "contract": "structured-feature-return-density-dashboard-result-v1",
+        "planId": plan["id"],
+        "selectionPolicy": "best-validation-mse",
+        "selectionMetric": "returnDensityExpectation.normalizedMse",
+        "selectionDoesNotUseTest": True,
+        "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
+        "examples": dataset.counts["train"],
+        "examplesBySplit": dataset.counts,
+        "featureCount": dataset.feature_count,
+        "parameterCount": int(parameter_count),
+        "trainableParameterCount": int(parameter_count),
+        "bestEpoch": int(best["epoch"]),
+        "completedAfterEpoch": int(policies["last"]["epoch"]),
+        "bestValidationScore": float(best["selectionScore"]),
+        "headlineValidationScore": float(best["validation"]["normalizedMse"]),
+        "density": best["density"],
+        "train": best["train"],
+        "validation": best["validation"],
+        "test": best["test"],
+        "featureState": best["featureState"],
+        "distribution": best["distribution"],
+        "perStepFeatureState": best["perStepFeatureState"],
+        "evaluationArtifact": str(artifact_file.relative_to(repo)).replace(
+            "\\", "/"
+        ),
+    }
+    atomic_json(result, run_root / "state/result.json")
+    return artifact, result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan", type=Path, required=True)
@@ -1201,6 +1514,36 @@ def validate_plan(plan: dict) -> None:
             raise ValueError(
                 "feature-embedding density run must not carry recurrent layer state"
             )
+    return_density = architecture.get("returnDensity")
+    if return_density is not None:
+        density_type = return_density.get("type") \
+            if isinstance(return_density, dict) else None
+        common_valid = (
+            isinstance(return_density, dict)
+            and return_density.get("latentSource")
+            == "expected-feature-embedding"
+            and int(return_density.get("knotCount", 0)) >= 3
+            and embedding_density is None
+            and recurrent_memory is None
+        )
+        scalar_valid = density_type \
+            == "fixed-knot-piecewise-linear-return-density-v1"
+        joint_valid = (
+            density_type
+            == "joint-prefix-contracted-path-matrix-return-density-v1"
+            and int(return_density.get("returnCount", 0))
+            == int(architecture["outputSteps"])
+            and int(return_density.get("stageBlockCount", 0)) == 1
+            and bool(return_density.get(
+                "recurrentActivationCheckpointing", False
+            ))
+            and all(int(return_density.get(name, 0)) > 0 for name in (
+                "marketWidth", "pathEmbeddingWidth", "pathCount",
+                "pathCompressionWidth", "jointCompressionWidth",
+            ))
+        )
+        if not common_valid or not (scalar_valid or joint_valid):
+            raise ValueError("invalid structured return-density head")
     training = plan["training"]
     loss_type = training.get("loss", {}).get("type")
     expected_losses = (
@@ -1211,6 +1554,8 @@ def validate_plan(plan: dict) -> None:
             PRODUCTION59_BALANCED_OBJECTIVE_CONTRACT,
             FEATURE_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
             BASE_SUPPORT_EMBEDDING_DENSITY_OBJECTIVE_CONTRACT,
+            STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+            STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT,
         }
         if is_production59_base_plan(plan)
         else {OBJECTIVE_CONTRACT}
@@ -1224,6 +1569,14 @@ def validate_plan(plan: dict) -> None:
             != (embedding_density is not None):
         raise ValueError(
             "feature-embedding density architecture/objective must be paired"
+        )
+    if (loss_type in {
+        STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+        STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+    }) \
+            != (return_density is not None):
+        raise ValueError(
+            "scalar return-density architecture/objective must be paired"
         )
     if is_union530_base_plan(plan):
         if int(architecture["inputFeatures"]) != 530 \
@@ -1257,6 +1610,40 @@ def validate_plan(plan: dict) -> None:
             }:
                 raise ValueError(
                     "balanced production59 objective configuration changed"
+                )
+        if loss_type in {
+            STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+            STRUCTURED_FEATURE_JOINT_RETURN_DENSITY_OBJECTIVE_CONTRACT,
+        }:
+            loss = training["loss"]
+            density = plan.get("density")
+            scalar_density = loss_type \
+                == STRUCTURED_FEATURE_RETURN_DENSITY_OBJECTIVE_CONTRACT
+            expected_output_steps = 1 if scalar_density else 15
+            if int(architecture["inputSteps"]) != 1 \
+                    or int(architecture["outputSteps"]) \
+                    != expected_output_steps \
+                    or loss.get("weights") != {
+                        "derivedFeatureMse": 0.5,
+                        "returnDensityNll": 0.5,
+                    } \
+                    or loss.get("featureObjective") \
+                    != PRODUCTION59_OBJECTIVE_CONTRACT \
+                    or not isinstance(density, dict) \
+                    or not isinstance(density.get("source"), str) \
+                    or int(density.get("fit", 0)) \
+                    != int(return_density["knotCount"]):
+                raise ValueError(
+                    "structured return-density experiment configuration changed"
+                )
+            if not scalar_density and (
+                not bool(architecture.get(
+                    "recurrentActivationCheckpointing", False
+                ))
+                or int(return_density.get("returnCount", 0)) != 15
+            ):
+                raise ValueError(
+                    "structured joint return-density recurrence changed"
                 )
     if int(training["batchSize"]) != int(training["evaluationBatchSize"]):
         raise ValueError("training and evaluation batch sizes must be equal")
@@ -1376,6 +1763,16 @@ def main() -> None:
             dataset.derived_output_std.to(device)
             if derived_base else None
         )
+        uses_return_density = uses_structured_return_density_objective(plan)
+        uses_joint_return_density = \
+            uses_joint_structured_return_density_objective(plan)
+        return_density = (
+            KnotDensityContract.load(
+                (repo / plan["density"]["source"]).resolve(),
+                fit=str(plan["density"]["fit"]),
+            )
+            if uses_return_density else None
+        )
         model = StructuredSharedIoFeatureProcess(
             torch.from_numpy(stats["inputMean"]),
             torch.from_numpy(stats["inputStd"]),
@@ -1407,7 +1804,30 @@ def main() -> None:
             feature_embedding_density=architecture.get(
                 "featureEmbeddingDensity"
             ),
+            return_density=architecture.get("returnDensity"),
+            return_density_contract=return_density,
+            recurrent_activation_checkpointing=bool(
+                architecture.get("recurrentActivationCheckpointing", False)
+            ),
         ).to(device)
+        if return_density is not None and not uses_joint_return_density:
+            return_knots = torch.from_numpy(
+                return_density.knots_unit
+            ).to(device=device).float()
+            return_areas = triangular_basis_areas(return_knots)
+            return_prior_masses = torch.from_numpy(
+                return_density.prior_component_masses
+            ).to(device=device).float()
+            model.initialize_return_density_prior(
+                return_areas, return_prior_masses,
+            )
+            return_component_means = torch.from_numpy(component_return_means(
+                return_density.knots_unit, return_density.transform,
+            )).to(device=device).float()
+        else:
+            return_knots = None
+            return_areas = None
+            return_component_means = None
         parameter_count = sum(value.numel() for value in model.parameters())
         trainable_count = sum(
             value.numel() for value in model.parameters() if value.requires_grad
@@ -1422,6 +1842,14 @@ def main() -> None:
         uses_embedding_density = uses_embedding_density_objective(plan)
         uses_base_support_density = uses_base_support_embedding_density(plan)
         best = (
+            {
+                "validation-nll": {"score": math.inf, "epoch": -1},
+                "validation-mse": {"score": math.inf, "epoch": -1},
+                "validation-correlation": {
+                    "score": -math.inf, "epoch": -1,
+                },
+            }
+            if uses_return_density else
             {
                 "validation-nll": {"score": math.inf, "epoch": -1},
                 **(
@@ -1468,7 +1896,11 @@ def main() -> None:
                 )
         uses_layer8_auxiliary_loss = gram_identity_loss_weight > 0
         training_forward = (
-            model.feature_embedding_log_density
+            model.forward_with_joint_return_density
+            if uses_joint_return_density
+            else model.forward_with_return_density
+            if uses_return_density
+            else model.feature_embedding_log_density
             if uses_embedding_density and not uses_base_support_density
             else model.forward_with_auxiliary_loss
             if uses_layer8_auxiliary_loss
@@ -1476,7 +1908,17 @@ def main() -> None:
         )
         training_model = training_forward
         compile_scope = "disabled"
-        if args.compile_mode != "none" and not uses_base_support_density:
+        if uses_joint_return_density and args.compile_mode != "none":
+            compile_cache = (repo / "data/training/cache/torchinductor").resolve()
+            compile_cache.mkdir(parents=True, exist_ok=True)
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(compile_cache)
+            os.environ["TRITON_CACHE_DIR"] = str(compile_cache / "triton")
+            model.return_density_head.compile_shared_recurrent_step(
+                mode="default",
+                dynamic=False,
+            )
+            compile_scope = "joint-head-shared-recurrent-step"
+        elif args.compile_mode != "none" and not uses_base_support_density:
             compile_cache = (repo / "data/training/cache/torchinductor").resolve()
             compile_cache.mkdir(parents=True, exist_ok=True)
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(compile_cache)
@@ -1505,6 +1947,17 @@ def main() -> None:
             "distributionLoss": (
                 architecture.get("featureEmbeddingDensity")
                 if uses_embedding_density else None
+            ),
+            "returnDensityLoss": (
+                {
+                    **architecture["returnDensity"],
+                    "source": plan["density"]["source"],
+                    "fit": plan["density"]["fit"],
+                    "objectiveWeight": training["loss"]["weights"][
+                        "returnDensityNll"
+                    ],
+                }
+                if uses_return_density else None
             ),
             "samRho": 0,
             "inputDropoutProbability": 0,
@@ -1568,7 +2021,75 @@ def main() -> None:
                 weights = weights.to(device, non_blocking=True)
                 for optimizer in optimizers:
                     optimizer.zero_grad(set_to_none=True)
-                if uses_embedding_density:
+                if uses_return_density:
+                    if not isinstance(dataset, StructuredProduction59BaseDataset) \
+                            or context is None \
+                            or return_density is None:
+                        raise AssertionError(
+                            "structured return density requires production59 context"
+                        )
+                    if uses_joint_return_density:
+                        standardized_direct, density_output = training_model(
+                            inputs,
+                            targets[:, :, COMPARABLE_RETURN_CHANNEL],
+                        )
+                    else:
+                        if return_knots is None or return_areas is None:
+                            raise AssertionError(
+                                "scalar return-density grid is missing"
+                            )
+                        standardized_direct, density_logits = training_model(
+                            inputs
+                        )
+                    direct = model.raw_outputs(standardized_direct)
+                    derived_prediction = dataset.derive(
+                        direct, inputs, context,
+                    )
+                    assert derived_output_mean is not None \
+                        and derived_output_std is not None
+                    standardized_prediction = (
+                        derived_prediction - derived_output_mean
+                    ) / derived_output_std
+                    standardized_target = (
+                        targets - derived_output_mean
+                    ) / derived_output_std
+                    feature_mse = weighted_standardized_mse(
+                        standardized_prediction, standardized_target, weights,
+                    )
+                    if uses_joint_return_density:
+                        if density_output.joint_log_density_terms is None:
+                            raise RuntimeError(
+                                "joint path density did not emit contracted terms"
+                            )
+                        per_step_return_nll = \
+                            -density_output.joint_log_density_terms
+                    else:
+                        per_step_return_nll, _log_masses, \
+                            _unit_log_density = \
+                            return_negative_log_likelihood(
+                                density_logits,
+                                targets[:, :, COMPARABLE_RETURN_CHANNEL],
+                                return_knots,
+                                return_areas,
+                                return_density.transform,
+                            )
+                    active = weights[:, None]
+                    return_nll = (per_step_return_nll * active).sum() / (
+                        active.sum().clamp_min(1.0) * dataset.output_steps
+                    )
+                    first_step_return_nll = (
+                        per_step_return_nll[:, 0] * weights
+                    ).sum() / weights.sum().clamp_min(1.0)
+                    components = structured_feature_return_density_objective(
+                        feature_mse, return_nll, training["loss"],
+                    )
+                    components[
+                        "returnDensityFirstStepNegativeLogLikelihood"
+                    ] = first_step_return_nll
+                    loss = components["objective"]
+                    prediction = None
+                    layer8_gram_identity_loss = None
+                elif uses_embedding_density:
                     if uses_base_support_density:
                         if not isinstance(dataset, StructuredUnion530BaseDataset) \
                                 or context is None:
@@ -1610,7 +2131,7 @@ def main() -> None:
                 else:
                     prediction = training_model(inputs)
                     layer8_gram_identity_loss = None
-                if not uses_embedding_density:
+                if not uses_embedding_density and not uses_return_density:
                     assert prediction is not None
                     standardized_direct = prediction
                     if derived_base:
@@ -1682,23 +2203,65 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             with use_state(model, ema):
-                evaluation_function = (
-                    evaluate_feature_embedding_density
-                    if uses_embedding_density else evaluate
-                )
-                train_evaluation = evaluation_function(
-                    model, dataset, "train", batch_size=evaluation_batch_size,
-                    device=device,
-                    limit=smoke_limit if smoke_limit is not None else int(
-                        training["epochTrainEvaluationExamples"]
+                if uses_return_density:
+                    assert isinstance(dataset, StructuredProduction59BaseDataset) \
+                        and return_density is not None
+                    train_evaluation = evaluate_structured_return_density(
+                        model, dataset, "train",
+                        batch_size=evaluation_batch_size,
+                        device=device,
+                        density=return_density,
+                        limit=(
+                            smoke_limit if smoke_limit is not None else int(
+                                training["epochTrainEvaluationExamples"]
+                            )
+                        ),
+                    )
+                    validation_evaluation = \
+                        evaluate_structured_return_density(
+                            model, dataset, "validation",
+                            batch_size=evaluation_batch_size,
+                            device=device,
+                            density=return_density,
+                            limit=smoke_limit,
+                        )
+                else:
+                    evaluation_function = (
+                        evaluate_feature_embedding_density
+                        if uses_embedding_density else evaluate
+                    )
+                    train_evaluation = evaluation_function(
+                        model, dataset, "train", batch_size=evaluation_batch_size,
+                        device=device,
+                        limit=smoke_limit if smoke_limit is not None else int(
+                            training["epochTrainEvaluationExamples"]
+                        ),
+                    )
+                    validation_evaluation = evaluation_function(
+                        model, dataset, "validation",
+                        batch_size=evaluation_batch_size, device=device,
+                        limit=smoke_limit,
+                    )
+            if uses_return_density:
+                train_metrics = train_evaluation["nextReturn"]
+                validation_metrics = validation_evaluation["nextReturn"]
+                train_feature_state = train_evaluation["featureState"]
+                validation_feature_state = validation_evaluation["featureState"]
+                validation_correlation = validation_metrics["correlation"]
+                candidates = {
+                    "validation-nll": float(
+                        validation_evaluation["negativeLogLikelihood"]
                     ),
-                )
-                validation_evaluation = evaluation_function(
-                    model, dataset, "validation",
-                    batch_size=evaluation_batch_size, device=device,
-                    limit=smoke_limit,
-                )
-            if uses_embedding_density:
+                    "validation-mse": float(
+                        validation_metrics["normalizedMse"]
+                    ),
+                    "validation-correlation": (
+                        -math.inf
+                        if validation_correlation is None
+                        else float(validation_correlation)
+                    ),
+                }
+            elif uses_embedding_density:
                 candidates = {
                     "validation-nll": float(
                         validation_evaluation["negativeLogLikelihood"]
@@ -1765,7 +2328,84 @@ def main() -> None:
                 "objective": objective_contract(plan),
                 "parameterCount": parameter_count,
             }
-            if uses_embedding_density:
+            if uses_return_density:
+                event.update({
+                    "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
+                    "train": train_metrics,
+                    "validation": validation_metrics,
+                    "trainDistribution": {
+                        "negativeLogLikelihood": train_evaluation[
+                            "negativeLogLikelihood"
+                        ],
+                        "perLeadNegativeLogLikelihood": train_evaluation[
+                            "perLeadNegativeLogLikelihood"
+                        ],
+                        "expectation": train_evaluation["returnPath"],
+                        "perLeadExpectation": train_evaluation[
+                            "perStepNextReturn"
+                        ],
+                    },
+                    "validationDistribution": {
+                        "negativeLogLikelihood": validation_evaluation[
+                            "negativeLogLikelihood"
+                        ],
+                        "perLeadNegativeLogLikelihood": validation_evaluation[
+                            "perLeadNegativeLogLikelihood"
+                        ],
+                        "expectation": validation_evaluation["returnPath"],
+                        "perLeadExpectation": validation_evaluation[
+                            "perStepNextReturn"
+                        ],
+                    },
+                    "featurePredictionNextReturn": {
+                        "train": train_evaluation[
+                            "featurePredictionNextReturn"
+                        ],
+                        "validation": validation_evaluation[
+                            "featurePredictionNextReturn"
+                        ],
+                    },
+                    "featureState": {
+                        "evaluationScope": FEATURE_STATE_EVALUATION_SCOPE,
+                        "train": compact_feature_state_metrics(train_feature_state),
+                        "validation": compact_feature_state_metrics(
+                            validation_feature_state
+                        ),
+                    },
+                    "perStepFeatureState": {
+                        "train": [
+                            compact_feature_state_metrics(value)
+                            for value in train_evaluation["perStepFeatureState"]
+                        ],
+                        "validation": [
+                            compact_feature_state_metrics(value)
+                            for value in validation_evaluation[
+                                "perStepFeatureState"
+                            ]
+                        ],
+                    },
+                    "onlineNegativeLogLikelihood": (
+                        objective_component_sums[
+                            "returnDensityNegativeLogLikelihood"
+                        ] / example_count
+                    ),
+                    "onlineFirstStepNegativeLogLikelihood": (
+                        objective_component_sums[
+                            "returnDensityFirstStepNegativeLogLikelihood"
+                        ] / example_count
+                    ),
+                    "checkpointSelectionScope": (
+                        "validation return-density expectation and NLL"
+                    ),
+                    "bestValidationNegativeLogLikelihood": best[
+                        "validation-nll"
+                    ]["score"],
+                    "bestValidationMse": best["validation-mse"]["score"],
+                    "bestValidationCorrelation": best[
+                        "validation-correlation"
+                    ]["score"],
+                })
+            elif uses_embedding_density:
                 event.update({
                     "evaluationScope": "realized-layer-1-feature-embedding-density",
                     "trainDistribution": train_evaluation,
@@ -1877,18 +2517,46 @@ def main() -> None:
                 weights_only=False,
             )
             model.load_state_dict(selected["model"])
-            completion_evaluator = (
-                evaluate_feature_embedding_density
-                if uses_embedding_density else evaluate
-            )
-            evaluations = {
-                split: completion_evaluator(
-                    model, dataset, split, batch_size=evaluation_batch_size,
-                    device=device,
+            if uses_return_density:
+                assert isinstance(dataset, StructuredProduction59BaseDataset) \
+                    and return_density is not None
+                evaluations = {
+                    split: evaluate_structured_return_density(
+                        model, dataset, split,
+                        batch_size=evaluation_batch_size,
+                        device=device,
+                        density=return_density,
+                    )
+                    for split in ("train", "validation", "test")
+                }
+            else:
+                completion_evaluator = (
+                    evaluate_feature_embedding_density
+                    if uses_embedding_density else evaluate
                 )
-                for split in ("train", "validation", "test")
-            }
-            if uses_embedding_density:
+                evaluations = {
+                    split: completion_evaluator(
+                        model, dataset, split, batch_size=evaluation_batch_size,
+                        device=device,
+                    )
+                    for split in ("train", "validation", "test")
+                }
+            if uses_return_density:
+                policies[f"best-{policy}"] = {
+                    "epoch": int(selected["epoch"]),
+                    "selectionScore": float(selected["score"]),
+                    "selectionMetric": (
+                        "returnDensityExpectation.correlation"
+                        if policy.endswith("correlation")
+                        else "returnDensityExpectation.normalizedMse"
+                        if policy.endswith("mse")
+                        else "validation.negativeLogLikelihood"
+                    ),
+                    "checkpointPolicy": f"best-{policy}",
+                    "density": evaluations,
+                    **comparable_policy_metrics(evaluations),
+                }
+            elif uses_embedding_density:
                 policies[f"best-{policy}"] = {
                     "epoch": int(selected["epoch"]),
                     "selectionScore": float(selected["score"]),
@@ -1923,19 +2591,38 @@ def main() -> None:
                 }
         last = load_torch_checkpoint(last_file, map_location=device, weights_only=False)
         model.load_state_dict(last["emaModel"])
-        last_evaluations = {
-            split: completion_evaluator(
-                model, dataset, split, batch_size=evaluation_batch_size,
-                device=device,
-            )
-            for split in ("train", "validation", "test")
-        }
+        if uses_return_density:
+            assert isinstance(dataset, StructuredProduction59BaseDataset) \
+                and return_density is not None
+            last_evaluations = {
+                split: evaluate_structured_return_density(
+                    model, dataset, split,
+                    batch_size=evaluation_batch_size,
+                    device=device,
+                    density=return_density,
+                )
+                for split in ("train", "validation", "test")
+            }
+        else:
+            last_evaluations = {
+                split: completion_evaluator(
+                    model, dataset, split, batch_size=evaluation_batch_size,
+                    device=device,
+                )
+                for split in ("train", "validation", "test")
+            }
         policies["last"] = {
             "epoch": int(last["epoch"]),
             "selectionScore": None,
             "selectionMetric": None,
             "checkpointPolicy": "last",
             **(
+                {
+                    "density": last_evaluations,
+                    **comparable_policy_metrics(last_evaluations),
+                }
+                if uses_return_density
+                else
                 {
                     "density": last_evaluations,
                     **comparable_policy_metrics(last_evaluations),
@@ -1948,7 +2635,9 @@ def main() -> None:
         }
         completed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         persistence = (
-            persist_embedding_density_evaluation
+            persist_structured_return_density_evaluation
+            if uses_return_density
+            else persist_embedding_density_evaluation
             if uses_embedding_density
             else persist_structured_feature_evaluation
         )
@@ -1976,6 +2665,14 @@ def main() -> None:
                 "artifact": result["evaluationArtifact"],
                 "bestEpoch": result["bestEpoch"],
                 **(
+                    {
+                        "bestTest": result["density"]["test"],
+                        "lastTest": artifact["policies"]["last"][
+                            "density"
+                        ]["test"],
+                    }
+                    if uses_return_density
+                    else
                     {
                         "bestTest": (
                             result["density"]["test"]

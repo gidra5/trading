@@ -6,8 +6,13 @@ import math
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from exact_tensor_return_density import TensorPathGluBlock
+from low_rank_path_matrix_density import (
+    JointPrefixContractedCyclicPathMatrixDensity,
+)
+from return_knot_density import KnotDensityContract
 from return_oracle_ce import LearnableCenteringNorm, fused_glu
 
 
@@ -884,6 +889,9 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
         feature_embedding_density: dict[str, object] | None = None,
+        return_density: dict[str, object] | None = None,
+        return_density_contract: KnotDensityContract | None = None,
+        recurrent_activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if input_mean.ndim != 1 or input_std.shape != input_mean.shape:
@@ -936,9 +944,29 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             if feature_embedding_density is None
             else dict(feature_embedding_density)
         )
+        self.return_density = (
+            None if return_density is None else dict(return_density)
+        )
+        self.recurrent_activation_checkpointing = bool(
+            recurrent_activation_checkpointing
+        )
+        if self.feature_embedding_density is not None \
+                and self.return_density is not None:
+            raise ValueError(
+                "feature-embedding and scalar return densities are exclusive"
+            )
         if self.layer8_attention is not None \
                 and self.layer8_function_approximator is not None:
             raise ValueError("layer 8 cannot be both attention and a function unit")
+        if self.recurrent_activation_checkpointing and (
+            self.recurrent_memory is not None
+            or self.layer8_attention is not None
+            or self.layer8_function_approximator is not None
+        ):
+            raise ValueError(
+                "structured activation checkpointing currently requires "
+                "stateless numbered GNGLUs and a GNGLU layer 8"
+            )
         recurrent_layer_numbers: frozenset[int] = frozenset()
         recurrent_hidden_width: int | None = None
         if self.recurrent_memory is not None:
@@ -1170,6 +1198,66 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                     )
                 )
 
+        if self.return_density is None:
+            self.return_density_head = None
+        else:
+            density = self.return_density
+            density_type = density.get("type")
+            common_valid = (
+                density.get("latentSource") == "expected-feature-embedding"
+                and int(density.get("knotCount", 0)) >= 3
+            )
+            if density_type \
+                    == "fixed-knot-piecewise-linear-return-density-v1":
+                if not common_valid:
+                    raise ValueError("invalid scalar return-density head")
+                self.return_density_head = _gnglu(
+                    self.feature_width,
+                    int(density["knotCount"]),
+                    **options,
+                )
+            elif density_type \
+                    == "joint-prefix-contracted-path-matrix-return-density-v1":
+                if not common_valid \
+                        or return_density_contract is None \
+                        or int(density.get("returnCount", 0)) \
+                        != self.output_steps \
+                        or int(density.get("knotCount", 0)) \
+                        != int(return_density_contract.knots_unit.size):
+                    raise ValueError("invalid joint path return-density head")
+                self.return_density_head = (
+                    JointPrefixContractedCyclicPathMatrixDensity(
+                        torch.zeros(self.feature_width),
+                        torch.ones(self.feature_width),
+                        return_density_contract,
+                        market_width=int(density["marketWidth"]),
+                        path_embedding_width=int(
+                            density["pathEmbeddingWidth"]
+                        ),
+                        path_count=int(density["pathCount"]),
+                        return_count=int(density["returnCount"]),
+                        stage_block_count=int(density["stageBlockCount"]),
+                        path_compression_width=int(
+                            density["pathCompressionWidth"]
+                        ),
+                        joint_compression_width=int(
+                            density["jointCompressionWidth"]
+                        ),
+                        initial_radius=float(density["initialRadius"]),
+                        minimum_radius=float(density["minimumRadius"]),
+                        learnable_centering=bool(
+                            density["learnableCentering"]
+                        ),
+                        recurrent_activation_checkpointing=bool(
+                            density.get(
+                                "recurrentActivationCheckpointing", False
+                            )
+                        ),
+                    )
+                )
+            else:
+                raise ValueError("unsupported structured return-density head")
+
         # Unnumbered seed blocks at the top of the diagram.
         self.initial_market = _gnglu(
             self.feature_width, self.market_width, **options
@@ -1200,6 +1288,14 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         ) -> Tensor:
             layer = getattr(self, f"layer{number}")
             if not isinstance(layer, DualStateGatedExchangeCell):
+                if self.recurrent_activation_checkpointing \
+                        and self.training and torch.is_grad_enabled():
+                    return activation_checkpoint(
+                        layer,
+                        joined_input,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
                 return layer(joined_input)
             actual_value_input = (
                 joined_input if value_input is None else value_input
@@ -1220,8 +1316,23 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             for step in range(self.input_steps)
         )
 
-        market = self.initial_market(embeddings[0])
-        prefix = self.initial_prefix(embeddings[0])
+        if self.recurrent_activation_checkpointing \
+                and self.training and torch.is_grad_enabled():
+            market = activation_checkpoint(
+                self.initial_market,
+                embeddings[0],
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+            prefix = activation_checkpoint(
+                self.initial_prefix,
+                embeddings[0],
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        else:
+            market = self.initial_market(embeddings[0])
+            prefix = self.initial_prefix(embeddings[0])
         feature_distribution = apply_numbered_layer(
             3,
             torch.cat((embeddings[0], market), dim=-1),
@@ -1336,7 +1447,18 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                     approximations = self.layer8(causal_sequence)
                 expected_embedding = approximations[:, -1]
             else:
-                expected_embedding = self.layer8(next_feature_distribution)
+                if self.recurrent_activation_checkpointing \
+                        and self.training and torch.is_grad_enabled():
+                    expected_embedding = activation_checkpoint(
+                        self.layer8,
+                        next_feature_distribution,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                else:
+                    expected_embedding = self.layer8(
+                        next_feature_distribution
+                    )
             output = apply_numbered_layer(2, expected_embedding)
             next_feature_distribution_states.append(next_feature_distribution)
             expected_feature_embeddings.append(expected_embedding)
@@ -1370,6 +1492,80 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         """Return predictions and the layer-8 Gram-identity penalty."""
         trace = self._forward_trace(inputs, include_auxiliary_loss=True)
         return trace.outputs, trace.layer8_gram_identity_loss
+
+    def forward_with_return_density(
+        self, inputs: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Return primitive predictions and fixed-knot return-density logits."""
+        if self.return_density_head is None \
+                or isinstance(
+                    self.return_density_head,
+                    JointPrefixContractedCyclicPathMatrixDensity,
+                ):
+            raise RuntimeError("scalar return-density head is disabled")
+        trace = self._forward_trace(inputs)
+        logits = torch.stack(tuple(
+            self.return_density_head(embedding)
+            for embedding in trace.expected_feature_embeddings
+        ), dim=1)
+        return trace.outputs, logits
+
+    def forward_with_joint_return_density(
+        self,
+        inputs: Tensor,
+        target_returns: Tensor,
+    ):
+        """Return feature predictions and exact contracted joint-path terms."""
+        head = self.return_density_head
+        if not isinstance(
+            head, JointPrefixContractedCyclicPathMatrixDensity
+        ):
+            raise RuntimeError("joint path return-density head is disabled")
+        if target_returns.shape != (inputs.shape[0], self.output_steps):
+            raise ValueError("joint path targets have the wrong shape")
+        trace = self._forward_trace(inputs)
+        density_output = head(
+            trace.expected_feature_embeddings[0], target_returns
+        )
+        return trace.outputs, density_output
+
+    def forward_joint_return_density_marginals(self, inputs: Tensor):
+        """Return feature predictions and uncontracted path marginals."""
+        head = self.return_density_head
+        if not isinstance(
+            head, JointPrefixContractedCyclicPathMatrixDensity
+        ):
+            raise RuntimeError("joint path return-density head is disabled")
+        trace = self._forward_trace(inputs)
+        return trace.outputs, head(trace.expected_feature_embeddings[0])
+
+    def initialize_return_density_prior(
+        self, basis_areas: Tensor, component_masses: Tensor
+    ) -> None:
+        """Initialize the conditional head to the selected global density."""
+        head = self.return_density_head
+        if head is None or isinstance(
+            head, JointPrefixContractedCyclicPathMatrixDensity
+        ):
+            raise RuntimeError("scalar return-density head is disabled")
+        if basis_areas.ndim != 1 \
+                or component_masses.shape != basis_areas.shape \
+                or basis_areas.numel() != int(self.return_density["knotCount"]) \
+                or bool((basis_areas <= 0).any()) \
+                or bool((component_masses <= 0).any()):
+            raise ValueError("invalid return-density prior")
+        prior_log_heights = torch.log(
+            component_masses.float() / basis_areas.float()
+        )
+        with torch.no_grad():
+            output = head.output
+            if isinstance(output, RankFactorizedLinear):
+                output.right.zero_()
+                assert output.bias is not None
+                output.bias.copy_(prior_log_heights)
+            else:
+                output.weight.zero_()
+                output.bias.copy_(prior_log_heights)
 
     def feature_embedding_log_density(
         self,
@@ -1516,6 +1712,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             self.initial_market,
             self.initial_prefix,
             self.embedding_density_attention,
+            self.return_density_head,
         )
         return tuple(
             parameter
