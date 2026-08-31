@@ -109,6 +109,7 @@ export interface StrategyConfig {
   maxPositionQuote: number;
   limitOffsetBps: number;
   priceTickSize: number;
+  quantityStepSize: number;
   maxOpenOrders: number;
   cooldownMs: number;
   staleOrderMs: number;

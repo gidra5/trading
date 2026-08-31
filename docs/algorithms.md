@@ -552,8 +552,9 @@ valley/peak detector drives a different execution model:
 
 The default distribution is a uniform price grid with geometric size decay:
 
-- `exitGridPriceDistribution = "uniform"` spaces prices evenly from peak down to
-  break-even or entry.
+- `exitGridPriceDistribution = "uniform"` spaces prices from peak down to
+  break-even or entry, with the exit signal's normalized close fraction used as
+  confidence to concentrate levels and order mass nearer the detected extremum.
 - `exitGridPriceDistribution = "geometric"` spaces prices by equal percentage ratios
   across the same interval.
 - `exitGridSizeDistribution = "geometric"` sells `exitGridSellFraction` of remaining
@@ -562,9 +563,11 @@ The default distribution is a uniform price grid with geometric size decay:
   ladder moves down from peak toward break-even.
 - `exitGridSizeDistribution = "constant"` divides remaining quantity evenly across the
   remaining levels.
-- if a planned partial exit would create or place a below-`minOrderQuote` remainder,
-  the ladder sweeps the whole remaining lot at that grid level when the full remainder
-  is tradable.
+- the complete remaining lot is allocated when the grid is created. The number of
+  levels is capped by minimum notional, quantity step, price step, and available order
+  slots. Every level receives a valid minimum quantity before the residual is
+  distributed, so an undersized intermediate slice cannot collapse the rest of the
+  position into one order.
 
 The simulator represents exit-grid levels beyond the current market as regular limit
 orders. Levels already behind the current market are stop-market orders with an

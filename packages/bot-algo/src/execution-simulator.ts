@@ -62,6 +62,7 @@ export const defaultStrategyConfig: StrategyConfig = {
   maxPositionQuote: Number.POSITIVE_INFINITY,
   limitOffsetBps: 2,
   priceTickSize: 0,
+  quantityStepSize: 0,
   maxOpenOrders: 1024,
   cooldownMs: 300_000,
   staleOrderMs: 30 * 24 * 60 * 60 * 1000,
@@ -238,6 +239,8 @@ export function createStrategyConfig(
       overrides.limitOffsetBps ?? defaultStrategyConfig.limitOffsetBps,
     priceTickSize:
       overrides.priceTickSize ?? defaultStrategyConfig.priceTickSize,
+    quantityStepSize:
+      overrides.quantityStepSize ?? defaultStrategyConfig.quantityStepSize,
     maxOpenOrders:
       overrides.maxOpenOrders ?? defaultStrategyConfig.maxOpenOrders,
     cooldownMs: overrides.cooldownMs ?? defaultStrategyConfig.cooldownMs,
@@ -274,6 +277,7 @@ export function createStrategyConfig(
   );
   config.limitOffsetBps = Math.max(0, config.limitOffsetBps);
   config.priceTickSize = cleanPositive(config.priceTickSize);
+  config.quantityStepSize = cleanPositive(config.quantityStepSize);
   config.maxOpenOrders = Math.max(1, Math.round(config.maxOpenOrders));
   config.cooldownMs = Math.max(0, config.cooldownMs);
   config.staleOrderMs = Math.max(1_000, config.staleOrderMs);
@@ -1860,6 +1864,11 @@ export class SimulatedExecutionEngine {
         legacyConfig.shortSideEnabled &&
         activeShortQuantity > MIN_BASE_QUANTITY
       ) {
+        const exitConfidence = clamp(
+          decision.exitSignal.coverQuantity / activeShortQuantity,
+          0,
+          1,
+        );
         const activeShorts = this.activeLegacyShortLots(tick.price);
         this.syncLegacyExitGridMemories(
           memory,
@@ -1909,6 +1918,7 @@ export class SimulatedExecutionEngine {
               lot,
               tick.eventTime,
               tick.price,
+              exitConfidence,
             ),
           );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
@@ -1923,6 +1933,11 @@ export class SimulatedExecutionEngine {
         legacyConfig.longSideEnabled &&
         activeLongQuantity > MIN_BASE_QUANTITY
       ) {
+        const exitConfidence = clamp(
+          decision.exitSignal.quantity / activeLongQuantity,
+          0,
+          1,
+        );
         const activeLongs = this.activeLegacyLongLots(tick.price);
         this.syncLegacyExitGridMemories(
           memory,
@@ -1969,6 +1984,7 @@ export class SimulatedExecutionEngine {
               lot,
               tick.eventTime,
               tick.price,
+              exitConfidence,
             ),
           );
           if (this.openOrderIndexes.size >= config.maxOpenOrders) {
@@ -4306,6 +4322,7 @@ export class SimulatedExecutionEngine {
     lot: LegacyLongExitGridLot,
     createdAt: number,
     currentPrice: number,
+    confidence = 0,
   ): TradingOrder[] {
     const config = this.state.config;
     const lowerPrice = roundQuote(
@@ -4316,9 +4333,9 @@ export class SimulatedExecutionEngine {
       0,
       config.maxOpenOrders - this.openOrderIndexes.size,
     );
-    const availableQuantity = Math.min(
-      Math.max(0, lot.remainingQuantity),
-      this.state.baseFree,
+    const availableQuantity = this.normalizeExitGridQuantity(
+      Math.min(Math.max(0, lot.remainingQuantity), this.state.baseFree),
+      "floor",
     );
     const orderCount = this.legacyExitGridOrderCount({
       lowerPrice,
@@ -4338,12 +4355,10 @@ export class SimulatedExecutionEngine {
 
     const orderSpecs: Array<{
       price: number;
-      quantity: number;
       type: OrderType;
       trigger?: "below";
     }> = [];
-    const specByPriceKey = new Map<string, (typeof orderSpecs)[number]>();
-    let remainingQuantity = availableQuantity;
+    const priceKeys = new Set<string>();
 
     for (let index = 0; index < orderCount; index += 1) {
       const price = this.legacyExitGridOrderPrice(
@@ -4351,64 +4366,34 @@ export class SimulatedExecutionEngine {
         orderCount,
         lowerPrice,
         upperPrice,
+        confidence,
       );
       const isLimitOrder = price > currentPrice;
       const type: OrderType = isLimitOrder ? "limit" : "stop-market";
       const normalizedPrice = this.normalizeOrderPrice(price, "sell", type);
       const priceKey = `${type}:${normalizedPrice}`;
-      const desiredQuantity = this.legacyExitGridOrderQuantity(
-        index,
-        orderCount,
-        remainingQuantity,
-      );
-      let quantity = roundAsset(
-        closeQuantityWithoutMinimumNotionalRemainder({
-          requestedQuantity: desiredQuantity,
-          availableQuantity: remainingQuantity,
-          executionPrice: normalizedPrice,
-          minNotional: config.minOrderQuote,
-          quantityEpsilon: MIN_BASE_QUANTITY,
-        }),
-      );
-
-      if (quantity <= MIN_BASE_QUANTITY) {
-        break;
-      }
-      if (quantity * normalizedPrice < config.minOrderQuote) {
-        if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
-          quantity = remainingQuantity;
-        } else if (index === orderCount - 1 && orderSpecs.length === 0) {
-          break;
-        } else {
-          continue;
-        }
-      }
-
-      const existingSpec = specByPriceKey.get(priceKey);
-      if (existingSpec) {
-        existingSpec.quantity = roundAsset(existingSpec.quantity + quantity);
-      } else {
-        const spec = {
+      if (!priceKeys.has(priceKey)) {
+        orderSpecs.push({
           price: normalizedPrice,
-          quantity,
           type,
           trigger: isLimitOrder ? undefined : ("below" as const),
-        };
-        orderSpecs.push(spec);
-        specByPriceKey.set(priceKey, spec);
-      }
-
-      remainingQuantity = roundAsset(remainingQuantity - quantity);
-      if (remainingQuantity <= MIN_BASE_QUANTITY) {
-        break;
+        });
+        priceKeys.add(priceKey);
       }
     }
 
+    const quantities = this.legacyExitGridOrderQuantities(
+      orderSpecs.map((spec) => spec.price),
+      availableQuantity,
+      confidence,
+    );
+
     const orders: TradingOrder[] = [];
-    for (const spec of orderSpecs) {
+    for (let index = 0; index < quantities.length; index += 1) {
+      const spec = orderSpecs[index];
       const order = this.createSellCloseOrderAtPrice(
         spec.price,
-        spec.quantity,
+        quantities[index],
         createdAt,
         `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; peak ${upperPrice}`,
         lot.id,
@@ -4434,6 +4419,7 @@ export class SimulatedExecutionEngine {
     lot: LegacyShortExitGridLot,
     createdAt: number,
     currentPrice: number,
+    confidence = 0,
   ): TradingOrder[] {
     const config = this.state.config;
     const upperPrice = roundQuote(
@@ -4446,7 +4432,10 @@ export class SimulatedExecutionEngine {
       0,
       config.maxOpenOrders - this.openOrderIndexes.size,
     );
-    const availableQuantity = Math.max(0, lot.remainingQuantity);
+    const availableQuantity = this.normalizeExitGridQuantity(
+      Math.max(0, lot.remainingQuantity),
+      "floor",
+    );
     const orderCount = this.legacyExitGridOrderCount({
       lowerPrice,
       upperPrice,
@@ -4465,12 +4454,10 @@ export class SimulatedExecutionEngine {
 
     const orderSpecs: Array<{
       price: number;
-      quantity: number;
       type: OrderType;
       trigger?: "above";
     }> = [];
-    const specByPriceKey = new Map<string, (typeof orderSpecs)[number]>();
-    let remainingQuantity = availableQuantity;
+    const priceKeys = new Set<string>();
 
     for (let index = 0; index < orderCount; index += 1) {
       const price = this.legacyExitGridCoverOrderPrice(
@@ -4478,64 +4465,34 @@ export class SimulatedExecutionEngine {
         orderCount,
         lowerPrice,
         upperPrice,
+        confidence,
       );
       const isLimitOrder = price < currentPrice;
       const type: OrderType = isLimitOrder ? "limit" : "stop-market";
       const normalizedPrice = this.normalizeOrderPrice(price, "buy", type);
       const priceKey = `${type}:${normalizedPrice}`;
-      const desiredQuantity = this.legacyExitGridOrderQuantity(
-        index,
-        orderCount,
-        remainingQuantity,
-      );
-      let quantity = roundAsset(
-        closeQuantityWithoutMinimumNotionalRemainder({
-          requestedQuantity: desiredQuantity,
-          availableQuantity: remainingQuantity,
-          executionPrice: normalizedPrice,
-          minNotional: config.minOrderQuote,
-          quantityEpsilon: MIN_BASE_QUANTITY,
-        }),
-      );
-
-      if (quantity <= MIN_BASE_QUANTITY) {
-        break;
-      }
-      if (quantity * normalizedPrice < config.minOrderQuote) {
-        if (remainingQuantity * normalizedPrice >= config.minOrderQuote) {
-          quantity = remainingQuantity;
-        } else if (index === orderCount - 1 && orderSpecs.length === 0) {
-          break;
-        } else {
-          continue;
-        }
-      }
-
-      const existingSpec = specByPriceKey.get(priceKey);
-      if (existingSpec) {
-        existingSpec.quantity = roundAsset(existingSpec.quantity + quantity);
-      } else {
-        const spec = {
+      if (!priceKeys.has(priceKey)) {
+        orderSpecs.push({
           price: normalizedPrice,
-          quantity,
           type,
           trigger: isLimitOrder ? undefined : ("above" as const),
-        };
-        orderSpecs.push(spec);
-        specByPriceKey.set(priceKey, spec);
-      }
-
-      remainingQuantity = roundAsset(remainingQuantity - quantity);
-      if (remainingQuantity <= MIN_BASE_QUANTITY) {
-        break;
+        });
+        priceKeys.add(priceKey);
       }
     }
 
+    const quantities = this.legacyExitGridOrderQuantities(
+      orderSpecs.map((spec) => spec.price),
+      availableQuantity,
+      confidence,
+    );
+
     const orders: TradingOrder[] = [];
-    for (const spec of orderSpecs) {
+    for (let index = 0; index < quantities.length; index += 1) {
+      const spec = orderSpecs[index];
       const order = this.createBuyCloseOrderAtPrice(
         spec.price,
-        spec.quantity,
+        quantities[index],
         createdAt,
         `${LEGACY_EXIT_GRID_REASON}; lot ${lot.id}; entry ${roundQuote(grid.entryPrice)}; trough ${lowerPrice}`,
         lot.id,
@@ -4564,9 +4521,19 @@ export class SimulatedExecutionEngine {
     availableSlots: number;
   }): number {
     const config = this.state.config.legacyValleyPeak;
+    const minimumQuantity = this.minimumExitGridOrderQuantity(
+      input.lowerPrice,
+    );
+    const quantityLimitedCount =
+      minimumQuantity > MIN_BASE_QUANTITY
+        ? Math.floor(
+            (input.availableQuantity + MIN_BASE_QUANTITY) / minimumQuantity,
+          )
+        : Number.MAX_SAFE_INTEGER;
     const maxOrderCount = Math.min(
       config.exitGridOrderCount,
       input.availableSlots,
+      quantityLimitedCount,
     );
     if (maxOrderCount <= 0) {
       return 0;
@@ -4601,12 +4568,17 @@ export class SimulatedExecutionEngine {
     orderCount: number,
     lowerPrice: number,
     upperPrice: number,
+    confidence = 0,
   ): number {
     if (orderCount <= 1) {
       return lowerPrice;
     }
 
-    const progress = index / Math.max(1, orderCount - 1);
+    const linearProgress = index / Math.max(1, orderCount - 1);
+    const progress = Math.pow(
+      linearProgress,
+      1 + 3 * clamp(confidence, 0, 1),
+    );
     if (
       this.state.config.legacyValleyPeak.exitGridPriceDistribution ===
         "geometric" &&
@@ -4664,12 +4636,17 @@ export class SimulatedExecutionEngine {
     orderCount: number,
     lowerPrice: number,
     upperPrice: number,
+    confidence = 0,
   ): number {
     if (orderCount <= 1) {
       return lowerPrice;
     }
 
-    const progress = index / Math.max(1, orderCount - 1);
+    const linearProgress = index / Math.max(1, orderCount - 1);
+    const progress = Math.pow(
+      linearProgress,
+      1 + 3 * clamp(confidence, 0, 1),
+    );
     if (
       this.state.config.legacyValleyPeak.exitGridPriceDistribution ===
         "geometric" &&
@@ -4684,27 +4661,99 @@ export class SimulatedExecutionEngine {
     return roundQuote(lowerPrice + (upperPrice - lowerPrice) * progress);
   }
 
-  private legacyExitGridOrderQuantity(
-    index: number,
-    orderCount: number,
-    remainingQuantity: number,
-  ): number {
-    if (index >= orderCount - 1) {
-      return remainingQuantity;
-    }
-
+  private legacyExitGridOrderQuantities(
+    prices: readonly number[],
+    availableQuantity: number,
+    confidence: number,
+  ): number[] {
     const config = this.state.config.legacyValleyPeak;
-    const slotsLeft = Math.max(1, orderCount - index);
-    if (config.exitGridSizeDistribution === "constant") {
-      return remainingQuantity / slotsLeft;
+    const activePrices = [...prices];
+    let minimumQuantities: number[] = [];
+
+    while (activePrices.length > 0) {
+      minimumQuantities = activePrices.map((price) =>
+        this.minimumExitGridOrderQuantity(price),
+      );
+      const minimumTotal = roundAsset(
+        minimumQuantities.reduce((total, quantity) => total + quantity, 0),
+      );
+      if (minimumTotal <= availableQuantity + MIN_BASE_QUANTITY) {
+        break;
+      }
+      activePrices.pop();
     }
 
-    if (config.exitGridSizeDistribution === "linear") {
-      const remainingWeight = (slotsLeft * (slotsLeft + 1)) / 2;
-      return remainingQuantity * (slotsLeft / remainingWeight);
+    if (activePrices.length === 0) {
+      return [];
     }
 
-    return remainingQuantity * config.exitGridSellFraction;
+    const minimumTotal = roundAsset(
+      minimumQuantities.reduce((total, quantity) => total + quantity, 0),
+    );
+    let residual = this.normalizeExitGridQuantity(
+      Math.max(0, availableQuantity - minimumTotal),
+      "floor",
+    );
+    const normalizedConfidence = clamp(confidence, 0, 1);
+    const weights = activePrices.map((_, index) => {
+      const progress =
+        activePrices.length <= 1 ? 0 : index / (activePrices.length - 1);
+      let distributionWeight = 1;
+      if (config.exitGridSizeDistribution === "linear") {
+        distributionWeight = activePrices.length - index;
+      } else if (config.exitGridSizeDistribution === "geometric") {
+        distributionWeight = Math.pow(
+          Math.max(0.000001, 1 - config.exitGridSellFraction),
+          index,
+        );
+      }
+      const confidenceWeight = 1 + normalizedConfidence * (1 - progress) * 3;
+      return distributionWeight * confidenceWeight;
+    });
+
+    const quantities: number[] = [];
+    let remainingWeight = weights.reduce((total, weight) => total + weight, 0);
+    for (let index = 0; index < activePrices.length; index += 1) {
+      const extra =
+        index === activePrices.length - 1
+          ? residual
+          : this.normalizeExitGridQuantity(
+              residual * (weights[index] / Math.max(remainingWeight, 1e-12)),
+              "floor",
+            );
+      quantities.push(roundAsset(minimumQuantities[index] + extra));
+      residual = roundAsset(Math.max(0, residual - extra));
+      remainingWeight -= weights[index];
+    }
+    return quantities;
+  }
+
+  private minimumExitGridOrderQuantity(price: number): number {
+    const minimumNotional = this.state.config.minOrderQuote;
+    if (price <= 0 || minimumNotional <= 0) {
+      return MIN_BASE_QUANTITY;
+    }
+    return this.normalizeExitGridQuantity(minimumNotional / price, "ceil");
+  }
+
+  private normalizeExitGridQuantity(
+    quantity: number,
+    mode: "floor" | "ceil",
+  ): number {
+    const positiveQuantity = Math.max(0, quantity);
+    const step = this.state.config.quantityStepSize;
+    if (step <= 0) {
+      const scale = 100_000_000;
+      return mode === "ceil"
+        ? Math.ceil(positiveQuantity * scale - 1e-12) / scale
+        : Math.floor(positiveQuantity * scale + 1e-12) / scale;
+    }
+    const scaled = positiveQuantity / step;
+    const normalized =
+      mode === "ceil"
+        ? Math.ceil(scaled - 1e-12)
+        : Math.floor(scaled + 1e-12);
+    return roundAsset(normalized * step);
   }
 
   private cancelLegacyExitGridOrders(
@@ -6260,6 +6309,7 @@ function mergeStrategyOverrides(
     maxPositionQuote: overrides.maxPositionQuote ?? base.maxPositionQuote,
     limitOffsetBps: overrides.limitOffsetBps ?? base.limitOffsetBps,
     priceTickSize: overrides.priceTickSize ?? base.priceTickSize,
+    quantityStepSize: overrides.quantityStepSize ?? base.quantityStepSize,
     maxOpenOrders: overrides.maxOpenOrders ?? base.maxOpenOrders,
     cooldownMs: overrides.cooldownMs ?? base.cooldownMs,
     staleOrderMs: overrides.staleOrderMs ?? base.staleOrderMs,

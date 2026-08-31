@@ -1648,6 +1648,20 @@ export class TradingRuntime {
         priceTickSize,
       });
     }
+    const quantityStepSize =
+      snapshot.symbolFilters?.marketStepSize ||
+      snapshot.symbolFilters?.stepSize;
+    if (
+      quantityStepSize !== undefined &&
+      Number.isFinite(quantityStepSize) &&
+      quantityStepSize > 0 &&
+      quantityStepSize !== next.quantityStepSize
+    ) {
+      next = createStrategyConfig({
+        ...next,
+        quantityStepSize,
+      });
+    }
     const minOrderQuote = snapshot.symbolFilters?.minNotional;
     if (minOrderQuote && minOrderQuote > 0) {
       next = createStrategyConfig({
