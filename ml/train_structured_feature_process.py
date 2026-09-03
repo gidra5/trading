@@ -16,6 +16,18 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
+from hindsight_noise import (
+    TARGET_FREE_SCHEDULE_TYPE,
+    advance_hindsight_curriculum,
+    corrupt_standardized_hindsight,
+    evaluation_noise_rng,
+    expand_hindsight_samples,
+    gaussian_hindsight,
+    hindsight_variance_for_epoch,
+    initial_hindsight_curriculum,
+    validate_hindsight_plan,
+)
+from teacher_embedding_hindsight import TeacherEmbeddingDataset
 
 from normalized_glu_next_return import optimizer_parameter_groups
 from return_knot_density import (
@@ -136,18 +148,73 @@ def build_dataset(plan: dict, repo: Path):
             input_steps=int(architecture["inputSteps"]),
             output_steps=int(architecture["outputSteps"]),
         )
-    return StructuredFeatureSequenceDataset(
+    source = StructuredFeatureSequenceDataset(
         (repo / plan["datasetDir"]).resolve(),
         input_steps=int(architecture["inputSteps"]),
         output_steps=int(architecture["outputSteps"]),
         train_examples=int(plan["subset"]["examples"]),
     )
+    return TeacherEmbeddingDataset(source, plan["hindsightTeacher"], repo) \
+        if plan.get("hindsightTeacher") is not None else source
 
 
 def canonical_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("utf-8")).hexdigest()
+
+
+def run_epoch_limit(run_root: Path, plan: dict) -> int:
+    """Extend a run's total epoch budget without changing checkpoint identity."""
+    planned = plan["training"]["epochs"]
+    if type(planned) is not int or planned < 1:
+        raise ValueError("training epochs must be a positive integer")
+    extension_file = run_root / "state/epoch-limit.json"
+    if not extension_file.is_file():
+        return planned
+    extension = json.loads(extension_file.read_text(encoding="utf-8"))
+    if extension.get("planSha256") != canonical_hash(plan):
+        raise ValueError("epoch limit belongs to a different training plan")
+    epochs = extension.get("epochs")
+    if type(epochs) is not int or epochs < planned:
+        raise ValueError("epoch limit must be an integer at least the planned total")
+    return epochs
+
+
+def target_free_continuation(run_root: Path, plan: dict, epochs: int) -> dict | None:
+    """Validate a pinned, explicitly requested teacher-only continuation phase."""
+    phase_file = run_root / "state/target-free-phase.json"
+    if not phase_file.is_file():
+        return None
+    phase = json.loads(phase_file.read_text(encoding="utf-8"))
+    if phase.get("type") != "fixed-target-free-continuation-v1" \
+            or phase.get("planSha256") != canonical_hash(plan) \
+            or plan.get("hindsightTeacher") is None \
+            or phase.get("replacementFraction") != 1.0:
+        raise ValueError("invalid target-free continuation configuration")
+    start, count = phase.get("sourceCompletedEpochs"), phase.get("additionalEpochs")
+    if type(start) is not int or start < 1 or type(count) is not int or count < 1 \
+            or phase.get("totalEpochs") != start + count or epochs != start + count:
+        raise ValueError("target-free continuation epoch budget does not match")
+    pointer = require_under(run_root / phase["sourceCheckpoint"],
+                            run_root / "checkpoints/milestones", "pinned source checkpoint")
+    if not checkpoint_exists(pointer):
+        raise ValueError("target-free continuation source checkpoint is missing")
+    metadata = json.loads(pointer.read_text(encoding="utf-8"))
+    if metadata["object"]["contentHash"] != phase.get("sourceObjectSha256"):
+        raise ValueError("target-free continuation source checkpoint changed")
+    return phase
+
+
+def validate_target_free_resume(phase: dict, saved: dict, checkpoint_hash: str) -> None:
+    start = int(saved["epoch"]) + 1
+    if not phase["sourceCompletedEpochs"] <= start <= phase["totalEpochs"]:
+        raise ValueError("checkpoint lies outside the target-free continuation")
+    if start == phase["sourceCompletedEpochs"]:
+        if checkpoint_hash != phase["sourceObjectSha256"]:
+            raise ValueError("target-free continuation must begin at the pinned checkpoint")
+    elif saved.get("targetFreePhase") != phase:
+        raise ValueError("checkpoint belongs to a different target-free phase")
 
 
 class StructuredFeatureSequenceDataset:
@@ -544,7 +611,7 @@ class FeatureSequenceMetricAccumulator:
 def weighted_standardized_mse(
     prediction: Tensor, target: Tensor, weights: Tensor
 ) -> Tensor:
-    per_example = (prediction - target).square().mean(dim=(1, 2))
+    per_example = (prediction - target).square().flatten(1).mean(dim=1)
     return (per_example * weights).sum() / weights.sum().clamp_min(1)
 
 
@@ -685,6 +752,10 @@ def evaluate(
     limit: int | None = None,
 ) -> dict:
     model.eval()
+    hindsight_rng = (
+        evaluation_noise_rng(model.hindsight_conditioning, split)
+        if model.hindsight_conditioning is not None else None
+    )
     derived_base = isinstance(dataset, StructuredUnion530BaseDataset)
     output_mean = (
         dataset.derived_output_mean if derived_base else model.output_mean
@@ -717,13 +788,144 @@ def evaluate(
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         weights = weights.to(device, non_blocking=True)
-        direct = model.raw_outputs(model(inputs))
+        if hindsight_rng is None:
+            prediction_standardized = model(inputs)
+        elif isinstance(dataset, TeacherEmbeddingDataset):
+            noise = dataset.hindsight(inputs, batch.teacher_context, targets=None,
+                fraction=1.0, samples=model.hindsight_sample_count, rng=hindsight_rng)
+            variance = torch.ones((inputs.shape[0], 1), device=device)
+            prediction_standardized = model(inputs, noise, variance)
+        else:
+            # Held-out targets are used only below, to measure the prediction.
+            noise, variance = gaussian_hindsight(
+                hindsight_rng, inputs.shape[0], model.output_steps,
+                model.output_width, device,
+                samples=model.hindsight_sample_count,
+            )
+            prediction_standardized = model(inputs, noise, variance)
+        direct = model.raw_outputs(prediction_standardized)
         prediction = (
             dataset.derive(direct, inputs, context)
             if derived_base else direct
         )
         metrics.add(prediction, targets, weights)
-    return metrics.result()
+    result = metrics.result()
+    if hindsight_rng is not None:
+        result["hindsightEvaluation"] = {
+            "noiseVariance": 1.0,
+            "targetContribution": 0.0,
+            "noiseSeedBase": int(model.hindsight_conditioning["evaluationSeed"]),
+            "noiseStream": split,
+            "mode": "one-pass-frozen-teacher-component-embeddings"
+            if isinstance(dataset, TeacherEmbeddingDataset) else "one-pass-pure-gaussian-noise",
+            "parameterMeaning": "teacher-replacement-fraction"
+            if isinstance(dataset, TeacherEmbeddingDataset) else "gaussian-noise-variance",
+        }
+    return result
+
+
+@torch.no_grad()
+def evaluate_hindsight_reconstruction(
+    model: StructuredSharedIoFeatureProcess,
+    dataset: StructuredFeatureSequenceDataset,
+    schedule: dict,
+    *,
+    split: str,
+    variance: float,
+    batch_size: int,
+    device: torch.device,
+    limit: int | None = None,
+) -> dict:
+    """Target-assisted diagnostic, separate from pure-noise forecast metrics."""
+    if split not in ("train", "validation"):
+        raise ValueError("hindsight reconstruction split must be train or validation")
+    model.eval()
+    noise_seed = int(schedule["probeSeed"]) + int(split == "validation")
+    rng = np.random.default_rng(noise_seed)
+    metrics = FeatureSequenceMetricAccumulator(
+        model.output_mean, model.output_std, output_steps=model.output_steps,
+    )
+    probe_limit = int(schedule["probeExamples"])
+    if limit is not None:
+        probe_limit = min(probe_limit, limit)
+    for batch in dataset.iter_batches(
+        split, batch_size, shuffle=False, seed=0, limit=probe_limit, pad=False,
+    ):
+        inputs, targets, weights = batch
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        weights = weights.to(device, non_blocking=True)
+        if isinstance(dataset, TeacherEmbeddingDataset):
+            noisy_hindsight = dataset.hindsight(inputs, batch.teacher_context,
+                targets=targets if variance < 1 else None, fraction=variance,
+                samples=model.hindsight_sample_count, rng=rng)
+        else:
+            noise, _ = gaussian_hindsight(
+                rng, inputs.shape[0], model.output_steps, model.output_width, device,
+                samples=model.hindsight_sample_count,
+            )
+            noisy_hindsight = corrupt_standardized_hindsight(
+                expand_hindsight_samples(model.standardized_targets(targets), model.hindsight_sample_count),
+                noise, variance,
+            )
+        variance_input = torch.full(
+            (inputs.shape[0], 1), variance, dtype=inputs.dtype, device=device,
+        )
+        prediction = model.raw_outputs(model(inputs, noisy_hindsight, variance_input))
+        metrics.add(prediction, targets, weights)
+    result = metrics.result()
+    return {
+        "evaluationScope": "target-assisted-hindsight-reconstruction",
+        "split": split,
+        "weightSource": "raw-training-weights",
+        "noiseVariance": variance,
+        "noiseSeed": noise_seed,
+        "targetContribution": 1.0 - variance if isinstance(dataset, TeacherEmbeddingDataset)
+        else math.sqrt(1.0 - variance),
+        "parameterMeaning": "teacher-replacement-fraction"
+        if isinstance(dataset, TeacherEmbeddingDataset) else "gaussian-noise-variance",
+        "usedForCurriculum": False,
+        "usedForCheckpointSelection": False,
+        "metric": "nextReturn.correlation",
+        "examples": result["nextReturn"]["examples"],
+        "correlation": result["nextReturn"]["correlation"],
+        "normalizedMse": result["nextReturn"]["normalizedMse"],
+        "mseSkillVsZero": result["nextReturn"]["mseSkillVsZero"],
+        "nextReturn": {
+            key: value for key, value in result["nextReturn"].items()
+            if key != "directionByAbsoluteTargetDecile"
+        },
+        "perStepNextReturn": [
+            {key: value for key, value in step.items()
+             if key != "directionByAbsoluteTargetDecile"}
+            for step in result["perStepNextReturn"]
+        ],
+        "perStepReturnCorrelation": [
+            step["correlation"] for step in result["perStepNextReturn"]
+        ],
+    }
+
+
+def evaluate_hindsight_curriculum_probe(
+    model: StructuredSharedIoFeatureProcess,
+    dataset: StructuredFeatureSequenceDataset,
+    schedule: dict,
+    *,
+    variance: float,
+    batch_size: int,
+    device: torch.device,
+    limit: int | None = None,
+) -> dict:
+    """Only this training-split probe may control the noise curriculum."""
+    result = evaluate_hindsight_reconstruction(
+        model, dataset, schedule, split="train", variance=variance,
+        batch_size=batch_size, device=device, limit=limit,
+    )
+    result.update({
+        "evaluationScope": "training-hindsight-reconstruction-probe",
+        "usedForCurriculum": True,
+    })
+    return result
 
 
 @torch.no_grad()
@@ -1022,7 +1224,7 @@ def comparable_policy_metrics(evaluations: dict[str, dict]) -> dict:
     expected = {"train", "validation", "test"}
     if set(evaluations) != expected:
         raise ValueError(f"structured evaluation splits changed: {sorted(evaluations)}")
-    return {
+    result = {
         "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
         "featureStateEvaluationScope": FEATURE_STATE_EVALUATION_SCOPE,
         "train": evaluations["train"]["nextReturn"],
@@ -1045,6 +1247,11 @@ def comparable_policy_metrics(evaluations: dict[str, dict]) -> dict:
             for split in ("train", "validation", "test")
         },
     }
+    if "hindsightEvaluation" in evaluations["validation"]:
+        result["hindsightEvaluation"] = {
+            split: evaluations[split]["hindsightEvaluation"] for split in expected
+        }
+    return result
 
 
 def compact_feature_state_metrics(metrics: dict) -> dict:
@@ -1086,6 +1293,8 @@ def checkpoint_payload(
     global_step: int,
     plan_hash: str,
     best: dict,
+    hindsight_curriculum: dict | None = None,
+    target_free_phase: dict | None = None,
 ) -> dict:
     return {
         "model": model.state_dict(),
@@ -1096,6 +1305,11 @@ def checkpoint_payload(
         "best": best,
         "planSha256": plan_hash,
         "runnerContract": RUNNER_CONTRACT,
+        **({"targetFreePhase": dict(target_free_phase)} if target_free_phase is not None else {}),
+        **(
+            {"hindsightCurriculum": dict(hindsight_curriculum)}
+            if hindsight_curriculum is not None else {}
+        ),
     }
 
 
@@ -1113,6 +1327,7 @@ def persist_structured_feature_evaluation(
     required = {"best-validation-mse", "best-validation-correlation", "last"}
     if set(policies) != required:
         raise ValueError(f"structured evaluation policies changed: {sorted(policies)}")
+    selects_next_return = plan["architecture"].get("hindsightConditioning") is not None
     artifact_file = (
         repo / "data/benchmarks" / f'{plan["id"]}-completed-eval.json'
     ).resolve()
@@ -1127,7 +1342,10 @@ def persist_structured_feature_evaluation(
         "featureCount": dataset.feature_count,
         "parameterCount": int(parameter_count),
         "headlineEvaluationScope": COMPARABLE_EVALUATION_SCOPE,
-        "checkpointSelectionMetric": "featureState.validation",
+        "checkpointSelectionMetric": (
+            "nextReturn.validation" if selects_next_return
+            else "featureState.validation"
+        ),
         "policies": policies,
     }
     atomic_json(artifact, artifact_file)
@@ -1150,7 +1368,10 @@ def persist_structured_feature_evaluation(
         ),
         "planId": plan["id"],
         "selectionPolicy": "best-validation-mse",
-        "selectionMetric": "featureState.normalizedMse",
+        "selectionMetric": (
+            "nextReturn.normalizedMse" if selects_next_return
+            else "featureState.normalizedMse"
+        ),
         "selectionDoesNotUseTest": True,
         "evaluationScope": COMPARABLE_EVALUATION_SCOPE,
         "examples": dataset.counts["train"],
@@ -1386,6 +1607,7 @@ def validate_plan(plan: dict) -> None:
     architecture = plan["architecture"]
     if architecture.get("contract") != ARCHITECTURE_CONTRACT:
         raise ValueError("structured feature architecture contract changed")
+    validate_hindsight_plan(plan)
     expected_positive = (
         "inputSteps", "outputSteps", "inputFeatures", "outputFeatures",
         "featureWidth", "marketWidth", "prefixWidth",
@@ -1806,6 +2028,7 @@ def main() -> None:
             ),
             return_density=architecture.get("returnDensity"),
             return_density_contract=return_density,
+            hindsight_conditioning=architecture.get("hindsightConditioning"),
             recurrent_activation_checkpointing=bool(
                 architecture.get("recurrentActivationCheckpointing", False)
             ),
@@ -1834,7 +2057,8 @@ def main() -> None:
         )
         optimizer_parameter_groups(model)
         optimizers = build_optimizers(model, training, device)
-        epochs = int(training["epochs"])
+        epochs = run_epoch_limit(run_root, plan)
+        target_free_phase = target_free_continuation(run_root, plan, epochs)
         steps_per_epoch = math.ceil(dataset.counts["train"] / batch_size)
         ema_half_life = float(training["weightEma"]["halfLifeEpochs"])
         ema_decay = mean_teacher_ema_decay(ema_half_life, steps_per_epoch)
@@ -1871,11 +2095,19 @@ def main() -> None:
         last_file = run_root / "checkpoints/last.json"
         start_epoch = 0
         global_step = 0
+        hindsight_schedule = (
+            {"type": TARGET_FREE_SCHEDULE_TYPE}
+            if target_free_phase is not None else training.get("hindsightNoiseSchedule")
+        )
+        hindsight_curriculum = initial_hindsight_curriculum(hindsight_schedule)
         if checkpoint_exists(last_file):
             saved = load_torch_checkpoint(last_file, map_location=device, weights_only=False)
             if saved.get("planSha256") != plan_hash \
                     or saved.get("runnerContract") != RUNNER_CONTRACT:
                 raise ValueError("structured feature checkpoint contract changed")
+            if target_free_phase is not None:
+                pointer = json.loads(last_file.read_text(encoding="utf-8"))
+                validate_target_free_resume(target_free_phase, saved, pointer["object"]["contentHash"])
             model.load_state_dict(saved["model"])
             ema = saved["emaModel"]
             for optimizer, state in zip(optimizers, saved["optimizers"], strict=True):
@@ -1883,6 +2115,15 @@ def main() -> None:
             start_epoch = int(saved["epoch"]) + 1
             global_step = int(saved["globalStep"])
             best = saved["best"]
+            if hindsight_curriculum is not None:
+                hindsight_curriculum = saved.get("hindsightCurriculum")
+                if not isinstance(hindsight_curriculum, dict):
+                    raise ValueError("checkpoint is missing its hindsight curriculum")
+                hindsight_variance_for_epoch(
+                    hindsight_schedule, start_epoch, hindsight_curriculum,
+                )
+        elif target_free_phase is not None:
+            raise ValueError("target-free continuation requires its saved checkpoint")
 
         layer8_function = architecture.get("layer8FunctionApproximator")
         gram_identity_loss_weight = 0.0
@@ -1904,6 +2145,8 @@ def main() -> None:
             if uses_embedding_density and not uses_base_support_density
             else model.forward_with_auxiliary_loss
             if uses_layer8_auxiliary_loss
+            else model.forward_samples
+            if model.hindsight_sample_count > 1
             else model
         )
         training_model = training_forward
@@ -1940,6 +2183,10 @@ def main() -> None:
             "planId": plan["id"],
             "startEpoch": start_epoch,
             "epochs": epochs,
+            "originalPlanEpochs": training["epochs"],
+            "epochLimitSource": (
+                "state/epoch-limit.json" if epochs != training["epochs"] else "plan"
+            ),
             "parameters": parameter_count,
             "trainableParameters": trainable_count,
             "architecture": architecture,
@@ -1964,6 +2211,11 @@ def main() -> None:
             "embeddingDropoutProbability": 0,
             "adversarialInput": None,
             "adversarialOutput": None,
+            "hindsightConditioning": architecture.get("hindsightConditioning"),
+            "hindsightTeacher": plan.get("hindsightTeacher"),
+            "hindsightNoiseSchedule": hindsight_schedule,
+            "targetFreePhase": target_free_phase,
+            "hindsightCurriculum": hindsight_curriculum,
             "layer8AuxiliaryLoss": (
                 {
                     "type": "gram-identity-mean-square-v1",
@@ -1994,9 +2246,22 @@ def main() -> None:
             else args.smoke_batches * batch_size
         for epoch in range(start_epoch, epochs):
             model.train()
+            hindsight_variance = (
+                hindsight_variance_for_epoch(
+                    hindsight_schedule, epoch, hindsight_curriculum,
+                )
+                if model.hindsight_conditioning is not None else None
+            )
+            hindsight_generator = (
+                torch.Generator(device=device).manual_seed(seed + 1_000_003 + epoch)
+                if hindsight_variance is not None else None
+            )
+            teacher_rng = np.random.default_rng(seed + 1_000_003 + epoch) \
+                if isinstance(dataset, TeacherEmbeddingDataset) else None
             objective_sum = 0.0
             objective_component_sums: dict[str, float] = {}
             example_count = 0
+            optimization_started = time.monotonic()
             for batch in dataset.iter_batches(
                 "train", batch_size, shuffle=True, seed=seed + epoch,
                 limit=smoke_limit,
@@ -2128,6 +2393,29 @@ def main() -> None:
                 elif uses_layer8_auxiliary_loss:
                     prediction, layer8_gram_identity_loss = \
                         training_model(inputs)
+                elif hindsight_variance is not None:
+                    if isinstance(dataset, TeacherEmbeddingDataset):
+                        noisy_hindsight = dataset.hindsight(inputs, batch.teacher_context,
+                            targets=targets if hindsight_variance < 1 else None,
+                            fraction=hindsight_variance, samples=model.hindsight_sample_count,
+                            rng=teacher_rng)
+                    else:
+                        clean_hindsight = expand_hindsight_samples(
+                            model.standardized_targets(targets), model.hindsight_sample_count,
+                        )
+                        hindsight_noise = torch.randn(
+                            clean_hindsight.shape, device=device,
+                            dtype=clean_hindsight.dtype, generator=hindsight_generator,
+                        )
+                        noisy_hindsight = corrupt_standardized_hindsight(
+                            clean_hindsight, hindsight_noise, hindsight_variance,
+                        )
+                    variance_input = torch.full(
+                        (inputs.shape[0], 1), hindsight_variance,
+                        dtype=inputs.dtype, device=device,
+                    )
+                    prediction = training_model(inputs, noisy_hindsight, variance_input)
+                    layer8_gram_identity_loss = None
                 else:
                     prediction = training_model(inputs)
                     layer8_gram_identity_loss = None
@@ -2147,6 +2435,10 @@ def main() -> None:
                         ) / derived_output_std
                     else:
                         standardized_target = model.standardized_targets(targets)
+                        if model.hindsight_sample_count > 1:
+                            standardized_target = expand_hindsight_samples(
+                                standardized_target, model.hindsight_sample_count,
+                            )
                     if objective_contract(plan) \
                             == PRODUCTION59_BALANCED_OBJECTIVE_CONTRACT:
                         if context is None:
@@ -2201,7 +2493,36 @@ def main() -> None:
                 global_step += 1
 
             if device.type == "cuda":
+                torch.cuda.synchronize()
+            optimization_seconds = time.monotonic() - optimization_started
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
+            hindsight_gate_probe = None
+            hindsight_validation_reconstruction = None
+            hindsight_validation_seconds = 0.0
+            next_hindsight_variance = hindsight_variance
+            if hindsight_curriculum is not None:
+                hindsight_gate_probe = evaluate_hindsight_curriculum_probe(
+                    model, dataset, hindsight_schedule,
+                    variance=hindsight_variance,
+                    batch_size=evaluation_batch_size, device=device,
+                    limit=smoke_limit,
+                )
+                hindsight_curriculum = advance_hindsight_curriculum(
+                    hindsight_schedule, hindsight_curriculum,
+                    epoch=epoch, correlation=hindsight_gate_probe["correlation"],
+                )
+                next_hindsight_variance = hindsight_variance_for_epoch(
+                    hindsight_schedule, epoch + 1, hindsight_curriculum,
+                )
+                reconstruction_started = time.monotonic()
+                hindsight_validation_reconstruction = evaluate_hindsight_reconstruction(
+                    model, dataset, hindsight_schedule,
+                    split="validation", variance=hindsight_variance,
+                    batch_size=evaluation_batch_size, device=device,
+                    limit=smoke_limit,
+                )
+                hindsight_validation_seconds = time.monotonic() - reconstruction_started
             with use_state(model, ema):
                 if uses_return_density:
                     assert isinstance(dataset, StructuredProduction59BaseDataset) \
@@ -2285,12 +2606,18 @@ def main() -> None:
                 validation_metrics = validation_evaluation["nextReturn"]
                 train_feature_state = train_evaluation["featureState"]
                 validation_feature_state = validation_evaluation["featureState"]
+                selection_metrics = (
+                    validation_metrics if model.hindsight_conditioning is not None
+                    else validation_feature_state
+                )
+                selection_correlation = selection_metrics["correlation"]
                 candidates = {
                     "validation-mse": float(
-                        validation_feature_state["normalizedMse"]
+                        selection_metrics["normalizedMse"]
                     ),
-                    "validation-correlation": float(
-                        validation_feature_state["correlation"]
+                    "validation-correlation": (
+                        -math.inf if selection_correlation is None
+                        else float(selection_correlation)
                     ),
                 }
             for policy, score in candidates.items():
@@ -2309,6 +2636,8 @@ def main() -> None:
             save_torch_checkpoint(checkpoint_payload(
                 model, ema, optimizers, epoch=epoch, global_step=global_step,
                 plan_hash=plan_hash, best=best,
+                hindsight_curriculum=hindsight_curriculum,
+                target_free_phase=target_free_phase,
             ), last_file)
             event = {
                 "event": "minute-return-epoch",
@@ -2503,6 +2832,58 @@ def main() -> None:
                         "validation-correlation"
                     ]["score"],
                 })
+            if hindsight_variance is not None:
+                event["hindsight"] = {
+                    "trainingNoiseVariance": hindsight_variance,
+                    "signalScale": 1.0 - hindsight_variance if isinstance(dataset, TeacherEmbeddingDataset)
+                    else math.sqrt(1.0 - hindsight_variance),
+                    "noiseScale": hindsight_variance if isinstance(dataset, TeacherEmbeddingDataset)
+                    else math.sqrt(hindsight_variance),
+                    "parameterMeaning": "teacher-replacement-fraction"
+                    if isinstance(dataset, TeacherEmbeddingDataset) else "gaussian-noise-variance",
+                    "conditioningSource": "frozen-teacher-component-centers"
+                    if isinstance(dataset, TeacherEmbeddingDataset) else "independent-gaussian",
+                    "sampleInputWidth": model.hindsight_input_width,
+                    "evaluationNoiseVariance": 1.0,
+                    "evaluationTargetContribution": 0.0,
+                    "scheduleType": hindsight_schedule["type"],
+                    "denoisingPasses": 1,
+                    "layer2ResidualPasses": model.readout_residual_passes,
+                    "layer2ParameterSharing": "across-forecast-steps-only",
+                    "layer13Enabled": model.layer13 is not None,
+                    "layer13Count": (1 + len(model.layer13_refinements)) if model.layer13 is not None else 0,
+                    "sampleCount": model.hindsight_sample_count,
+                    "sampleEmbeddingWidth": model.readout_sample_width,
+                    "samplePrediction": "arithmetic-mean",
+                    "sampleObjective": "mean-per-sample-mse",
+                }
+                if hindsight_gate_probe is not None:
+                    event["hindsight"].update({
+                        "gateProbe": hindsight_gate_probe,
+                        "validationReconstruction": hindsight_validation_reconstruction,
+                        "validationReconstructionSeconds": hindsight_validation_seconds,
+                        "optimizationSeconds": optimization_seconds,
+                        "requiredCorrelation": hindsight_schedule["requiredCorrelation"],
+                        "varianceIncrement": hindsight_schedule["varianceIncrement"],
+                        "nextTrainingNoiseVariance": next_hindsight_variance,
+                        "noiseIncreased": next_hindsight_variance > hindsight_variance,
+                    })
+                elif target_free_phase is not None:
+                    event["hindsight"].update({
+                        "gateEnabled": False,
+                        "trainingTargetContribution": 0.0,
+                        "nextTrainingNoiseVariance": 1.0,
+                        "phaseEpoch": epoch - target_free_phase["sourceCompletedEpochs"] + 1,
+                        "phaseEpochs": target_free_phase["additionalEpochs"],
+                        "optimizationSeconds": optimization_seconds,
+                    })
+                else:
+                    event["hindsight"]["scheduleEndEpoch"] = hindsight_schedule["endEpoch"]
+                event["checkpointSelectionScope"] = COMPARABLE_EVALUATION_SCOPE
+                event["bestValidationMse"] = best["validation-mse"]["score"]
+                event["bestValidationCorrelation"] = best["validation-correlation"]["score"]
+                event.pop("bestFeatureStateValidationMse", None)
+                event.pop("bestFeatureStateValidationCorrelation", None)
             reporter.emit(event)
             reporter.status("training", planId=plan["id"], latest=event)
             if args.smoke_batches is not None:

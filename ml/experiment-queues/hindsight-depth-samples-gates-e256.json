@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "status": "cancelled",
+  "cancellation": {
+    "requestedAt": "2026-09-03T09:52:20.079Z",
+    "reason": "User skipped the remaining sweep and requested a fresh 0.99-gate run combining three total layer13 blocks and sixteen affine256 samples.",
+    "interruptedPlanId": "structured-production59-w256-hindsight-r128-gate0p9-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+    "interruptedCompletedEpochs": 58,
+    "skippedPlanIds": [
+      "structured-production59-w256-hindsight-r128-gate0p8-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "structured-production59-w256-hindsight-r128-gate0p5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "structured-production59-w256-hindsight-r128-gate0p3-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "structured-production59-w256-hindsight-r128-gate0p27-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1"
+    ],
+    "replacementPlanId": "structured-production59-w256-hindsight-r128-depth13x3-samples16-affine256-gate0p99-k2x2-h512-train256k-b10240-e256-ema4-v1",
+    "automationDeleted": true
+  },
+  "id": "hindsight-depth-samples-gates-e256",
+  "initialPlanId": "structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-residual-r128-s1-layer2h512-layer13h512-nocarry-corrgate-train256k-b10240-ema4-v8",
+  "initialCompletedEpochs": 259,
+  "createdAt": "2026-09-02T22:10:11.624Z",
+  "baselinePlan": "ml/training-plans/structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-residual-r128-s1-layer2h512-layer13h512-nocarry-corrgate-train256k-b10240-ema4-v8.json",
+  "controls": {
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "features": 59,
+    "registers": 128,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "seed": 1337,
+    "freshRuns": true,
+    "varianceIncrement": 0.01,
+    "softerGateBaseline": "original one-sample, one layer13",
+    "depthInterpretation": "add 2/3/4 to existing layer13 = total3/4/5; independent by depth, shared across forecast time"
+  },
+  "runs": [
+    {
+      "planId": "structured-production59-w256-hindsight-r128-depth13x3-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-depth13x3-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "depth",
+      "description": "2 additional layer13 blocks (3 total)",
+      "samples": 1,
+      "layer13Count": 3,
+      "gate": 0.9998074776513175,
+      "epochs": 256,
+      "expectedParameters": 7539438
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-depth13x4-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-depth13x4-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "depth",
+      "description": "3 additional layer13 blocks (4 total)",
+      "samples": 1,
+      "layer13Count": 4,
+      "gate": 0.9998074776513175,
+      "epochs": 256,
+      "expectedParameters": 8353195
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-depth13x5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-depth13x5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "depth",
+      "description": "4 additional layer13 blocks (5 total)",
+      "samples": 1,
+      "layer13Count": 5,
+      "gate": 0.9998074776513175,
+      "epochs": 256,
+      "expectedParameters": 9166952
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-samples4-affine256-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-samples4-affine256-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "samples",
+      "description": "4 independent noisy samples, affine256 compression",
+      "samples": 4,
+      "layer13Count": 1,
+      "gate": 0.9998074776513175,
+      "epochs": 256,
+      "expectedParameters": 6638826
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-samples16-affine256-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-samples16-affine256-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "samples",
+      "description": "16 independent noisy samples, affine256 compression",
+      "samples": 16,
+      "layer13Count": 1,
+      "gate": 0.9998074776513175,
+      "epochs": 256,
+      "expectedParameters": 7002030
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p99-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p99-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.99",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.99,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p95-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p95-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.95",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.95,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p9-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p9-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.9",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.9,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p8-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p8-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.8",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.8,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.5",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.5,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p3-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p3-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.3",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.3,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    },
+    {
+      "planId": "structured-production59-w256-hindsight-r128-gate0p27-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+      "plan": "ml/training-plans/structured-production59-w256-hindsight-r128-gate0p27-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1.json",
+      "group": "gate",
+      "description": "original S1, one layer13, correlation gate 0.27",
+      "samples": 1,
+      "layer13Count": 1,
+      "gate": 0.27,
+      "epochs": 256,
+      "expectedParameters": 5911924
+    }
+  ]
+}

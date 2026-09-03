@@ -1,9 +1,47 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { MlpTrainingMetricsReader } from "../src/mlp-training-metrics.js";
+
+test("resumed epoch extensions override the original plan in all progress views", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "mlp-epoch-extension-"));
+  const planFile = path.join(root, "ml", "training-plan.json");
+  const runDir = path.join(root, "data", "training", "runs", "extended");
+  await mkdir(path.dirname(planFile), { recursive: true });
+  await mkdir(path.join(runDir, "state"), { recursive: true });
+  await mkdir(path.join(runDir, "logs"), { recursive: true });
+  const plan = {
+    id: "extended", label: "Original 256 epochs",
+    runDir: "data/training/runs/extended", datasetDir: "data/training/datasets/extended",
+    training: { epochs: 256 },
+  };
+  try {
+    await writeFile(planFile, JSON.stringify(plan));
+    await writeFile(path.join(runDir, "state", "status.json"), JSON.stringify({
+      pid: process.pid, stage: "training", latest: { epoch: 170, epochs: 512 },
+    }));
+    await writeFile(path.join(runDir, "state", "display.json"), JSON.stringify({
+      label: "Extended 512 epochs", epochs: 512,
+    }));
+    await writeFile(path.join(runDir, "logs", "training.jsonl"), `${JSON.stringify({
+      event: "minute-return-epoch", epoch: 170, epochs: 512,
+    })}\n`);
+    const reader = new MlpTrainingMetricsReader(planFile, root);
+    const result = await reader.read(0);
+    assert.equal(result.plan.epochs, 512);
+    assert.equal(result.plan.label, "Extended 512 epochs");
+    assert.equal(result.runs[0]?.epochs, 512);
+    const comparison = await reader.compare([result.runs[0]!.key]);
+    assert.equal(comparison.runs[0]?.epochs, 512);
+    assert.equal(JSON.parse(await readFile(planFile, "utf8")).training.epochs, 256);
+    await writeFile(path.join(runDir, "state", "status.json"), JSON.stringify({ stage: "complete" }));
+    assert.equal((await reader.read(0)).plan.epochs, 512);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("MLP training metrics stream only complete new metric events", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "mlp-training-metrics-"));

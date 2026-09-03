@@ -1,0 +1,143 @@
+{
+  "id": "structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-residual-r128-s1-layer2h512x2-independent-no13-nocarry-corrgate-train256k-b10240-ema4-v7",
+  "label": "Structured W256 self-attention - 2x1s input/output x59 - residual hindsight S1 x59 + R128 reset each second - TWO INDEPENDENT layer2 hidden512 passes shared only across forecast steps - no layer13 - corr-gated variance +0.01 - train256k - equal batch10240 - EMA4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-residual-r128-s1-layer2h512x2-independent-no13-nocarry-corrgate-train256k-b10240-ema4-v7",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "Each structural numbered layer shares parameters across forecast steps. The two layer-(2) readout positions have independent parameters: layer2 is pass one, layer2_refinements[0] is pass two. Each position separately reuses its weights across output seconds. Layer12 is a shared learned register initializer reset before each output second. No layer13.",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "Layer7 maps PF to NF and layer8 causally self-attends generated NF states to emit W256. For each output second, initialize the R128+O59 stream from learned registers and the matching noisy feature sample. Apply independently learned layer2 passes A then B: concatenate fixed W256, current full stream and fixed variance (444 inputs), map through hidden512 to a 187-coordinate residual and add it to the stream. Emit 59 sample coordinates only after B. A and B have disjoint parameters but each is shared across output seconds. Full register/sample state and gradients flow from A to B, then reset at the next output second. Nothing from the hindsight readout enters the structured recurrence.",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings in this experiment; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false,
+    "hindsightConditioning": {
+      "type": "layer2-register-residual-hindsight-v1",
+      "injectionLayer": 2,
+      "registerLayer": 12,
+      "registerWidth": 128,
+      "registerInitialization": "learned-zero-vector",
+      "carryRegisters": false,
+      "layer13Enabled": false,
+      "sampleCount": 1,
+      "sampleRepresentation": "full-output-feature-vector",
+      "residualHiddenWidth": 512,
+      "residualProjectionInitScale": 0.001,
+      "source": "Each predicted second independently concatenates the same learned R128 initial vector with its one noisy standardized O59 hindsight sample; scalar variance conditions only layer 2.",
+      "readout": "z0 = concat(layer12, noisy_features); z1 = z0 + layer2_A(concat(expected_W, z0, variance)); z2 = z1 + layer2_B(concat(expected_W, z1, variance)); output = z2[128:]. A and B are independently initialized and trained; each has fixed shared weights across output seconds. W/variance stay fixed across passes; full gradients through z1. Reset before the next output second; no layer13.",
+      "initialization": "Layer12 starts at zeros and is trainable. Each readout GNGLU is independently initialized; both final projections start as rectangular identity times 0.001 with zero output bias. Literal unit residual addition, no gain multipliers. Other modules retain the predecessor's initialization order and seed.",
+      "evaluationVariance": 1,
+      "evaluationSeed": 918273,
+      "residualPasses": 2,
+      "residualParameterSharing": "across-forecast-steps-only"
+    }
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "mean MSE over both predicted output steps and all 59 feature channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "hindsightNoiseSchedule": {
+      "type": "correlation-gated-noise-variance-v1",
+      "startEpoch": 0,
+      "startVariance": 0,
+      "endVariance": 1,
+      "varianceIncrement": 0.01,
+      "requiredCorrelation": 0.9998074776513175,
+      "requiredCorrelationFormula": "2^(-1/3600)",
+      "probeSplit": "train",
+      "probeMetric": "nextReturn.correlation",
+      "probeWeightSource": "raw-training-weights",
+      "probeExamples": 65536,
+      "probeSeed": 982451653,
+      "advance": "check once after each complete epoch; if threshold met, increment variance once for the next epoch, capped at 1; otherwise hold indefinitely within the run epoch budget",
+      "corruption": "sqrt(1-v)*standardized_target + sqrt(v)*independent_standard_normal",
+      "prediction": "clean standardized features in one model forward, with two independently learned layer-2 residual updates per predicted second at fixed variance; no resampling or noise-level change between updates"
+    }
+  },
+  "sampling": {
+    "description": "original dense chronological clean-origin dataset with exact-zero next-return targets excluded",
+    "comparisonControl": "Fresh initialization. Correct the predecessor's unintended pass-to-pass weight tying: pass A and pass B have separate parameters, with each reused only across forecast seconds. Same dataset, base model initialization order/seed, R128/S1x59, widths, residual initialization, full-feature MSE, batch, optimizer, noise gate, EMA and evaluation. No layer13 or cross-second register carry."
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [
+      1,
+      2
+    ],
+    "checkpointSelection": "pure-noise validation step-1 next-return MSE and correlation; test never selects",
+    "hindsight": "All forecast evaluations use variance 1 and fixed split-specific Gaussian streams independent of targets. The training-only current-noise reconstruction probe controls the curriculum. A separate current-noise validation reconstruction diagnostic uses raw weights and a distinct seed; it does not affect the curriculum, loss, or checkpoint selection."
+  },
+  "alignment": {
+    "input": "two consecutive timeline rows ending at each clean example origin",
+    "target": "the two complete chronological timeline rows at origin+1 and origin+2",
+    "futureExtension": "K1 uses consecutive rows ending at origin; K2 uses consecutive rows starting at origin+1",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s",
+    "hindsight": "Each output step independently resets registers to the same learned layer12 vector and uses only its matching noisy O59 row. Neither updated registers nor samples carry to another output step or change W/M/P/F/PF/NF trajectories."
+  },
+  "basisPlanId": "structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w256-m128-p128-f128-pf256-nf256-layer8-selfattn256-productiondense-train256k-batch10240-mse-ema4-v1",
+  "predecessorPlanId": "structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-residual-r128-s1-layer2h512x2-no13-nocarry-corrgate-train256k-b10240-ema4-v6"
+}

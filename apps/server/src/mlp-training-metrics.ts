@@ -75,6 +75,7 @@ interface TrainingRunCatalog {
 
 interface TrainingRunDisplayMetadata {
   label?: string;
+  epochs?: number;
 }
 
 interface TrainingMatrixManifest {
@@ -1295,10 +1296,21 @@ export class MlpTrainingMetricsReader {
     const runDir = path.resolve(this.repoRoot, plan.runDir);
     const datasetDir = path.resolve(this.repoRoot, configuredDatasetDir);
     const statusFile = path.join(runDir, "state", "status.json");
-    const [status, planStat] = await Promise.all([
+    const [status, planStat, display] = await Promise.all([
       readOptionalJson<TrainingStatus>(statusFile),
       fs.stat(sourceFile),
+      readOptionalJson<TrainingRunDisplayMetadata>(path.join(runDir, "state", "display.json")),
     ]);
+    const runtimeEpochs = numberField(status?.latest?.epochs)
+      ?? numberField(status?.epochs) ?? numberField(display?.epochs);
+    const displayLabel = display?.label?.trim();
+    const effectivePlan = {
+      ...plan,
+      ...(displayLabel ? { label: displayLabel } : {}),
+      ...(runtimeEpochs !== undefined && Number.isInteger(runtimeEpochs) && runtimeEpochs > 0
+        ? { training: { ...plan.training, epochs: runtimeEpochs } }
+        : {}),
+    };
     const updatedAt = validTimestamp(status?.updatedAt)
       ?? validTimestamp(status?.completedAt)
       ?? validTimestamp(status?.failedAt)
@@ -1306,7 +1318,7 @@ export class MlpTrainingMetricsReader {
       ?? planStat.mtime.toISOString();
     return {
       key,
-      plan,
+      plan: effectivePlan,
       runDir,
       datasetDir,
       statusFile,

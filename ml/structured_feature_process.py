@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from exact_tensor_return_density import TensorPathGluBlock
+from hindsight_noise import validate_hindsight_readout
 from low_rank_path_matrix_density import (
     JointPrefixContractedCyclicPathMatrixDensity,
 )
@@ -807,9 +808,13 @@ def _gnglu(
     minimum_radius: float,
     learnable_centering: bool,
     linear_rank: int | None,
+    hidden_width: int | None = None,
 ) -> TensorPathGluBlock | LowRankTensorPathGluBlock:
     """Build one dense or trainable-low-rank expected-width GNGLU."""
-    hidden_width = (int(input_width) + int(output_width)) // 2
+    if hidden_width is None:
+        hidden_width = (int(input_width) + int(output_width)) // 2
+    if type(hidden_width) is not int or hidden_width <= 0:
+        raise ValueError("GNGLU hidden width must be a positive integer")
     if linear_rank is not None:
         return LowRankTensorPathGluBlock(
             int(input_width),
@@ -847,7 +852,12 @@ class StructuredFeatureProcessTrace:
     extended_prefix_states: tuple[Tensor, ...]
     next_feature_distribution_states: tuple[Tensor, ...]
     expected_feature_embeddings: tuple[Tensor, ...]
+    readout_initial_streams: tuple[Tensor, ...]
+    # Indexed by output step, then residual update (layer 2, refinements/13).
+    readout_residuals: tuple[tuple[Tensor, ...], ...]
+    readout_updated_streams: tuple[tuple[Tensor, ...], ...]
     outputs: Tensor
+    sample_outputs: Tensor
     layer8_gram_identity_loss: Tensor
 
 
@@ -855,7 +865,8 @@ class StructuredSharedIoFeatureProcess(nn.Module):
     """Structured K1-input/K2-output latent feature process from the diagram.
 
     Parenthesized diagram numbers correspond one-to-one with ``layer1`` through
-    ``layer11``. Repeated calls reuse those exact module instances. The two
+    ``layer11``; optional ``layer12`` is the learned readout register vector.
+    Repeated calls reuse those exact parameters. The two
     unnumbered seed projections initialize market and prefix state from the
     first observed feature embedding.
 
@@ -892,6 +903,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         return_density: dict[str, object] | None = None,
         return_density_contract: KnotDensityContract | None = None,
         recurrent_activation_checkpointing: bool = False,
+        hindsight_conditioning: dict | None = None,
     ) -> None:
         super().__init__()
         if input_mean.ndim != 1 or input_std.shape != input_mean.shape:
@@ -947,6 +959,15 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         self.return_density = (
             None if return_density is None else dict(return_density)
         )
+        self.hindsight_conditioning = (
+            None if hindsight_conditioning is None else dict(hindsight_conditioning)
+        )
+        if self.hindsight_conditioning is not None:
+            validate_hindsight_readout(self.hindsight_conditioning)
+            if self.recurrent_memory is not None:
+                raise ValueError("hindsight readout must not carry per-layer hidden state")
+            if self.linear_rank is not None:
+                raise ValueError("residual hindsight readout requires dense GNGLUs")
         self.recurrent_activation_checkpointing = bool(
             recurrent_activation_checkpointing
         )
@@ -1033,9 +1054,44 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         self.layer1 = numbered_layer(
             1, self.input_width, self.feature_width
         )
-        self.layer2 = numbered_layer(
-            2, self.feature_width, self.output_width
+        self.readout_register_width = 0
+        self.readout_residual_passes = 1
+        self.hindsight_sample_count = (
+            self.hindsight_conditioning["sampleCount"] if self.hindsight_conditioning else 1
         )
+        self.hindsight_input_width = (
+            self.hindsight_conditioning.get("sampleInputWidth", self.output_width)
+            if self.hindsight_conditioning else self.output_width
+        )
+        self.readout_sample_width = (
+            self.hindsight_conditioning["sampleEmbeddingWidth"]
+            if self.hindsight_sample_count > 1 else self.output_width
+        )
+
+        def new_readout_layer(*, stream_only: bool = False) -> nn.Module:
+            stream_width = self.readout_register_width + self.readout_sample_width
+            layer = _gnglu(
+                stream_width if stream_only else self.feature_width + stream_width + 1,
+                stream_width,
+                hidden_width=self.hindsight_conditioning[
+                    "layer13HiddenWidth" if stream_only else "residualHiddenWidth"
+                ], **options,
+            )
+            # Small initialization only, not a multiplier on future updates.
+            with torch.no_grad():
+                layer.output.weight.mul_(
+                    self.hindsight_conditioning["residualProjectionInitScale"]
+                )
+            return layer
+
+        if self.hindsight_conditioning is None:
+            self.register_parameter("layer12", None)
+            self.layer2 = numbered_layer(2, self.feature_width, self.output_width)
+        else:
+            self.readout_register_width = self.hindsight_conditioning["registerWidth"]
+            self.readout_residual_passes = self.hindsight_conditioning.get("residualPasses", 1)
+            self.layer12 = nn.Parameter(torch.zeros(self.readout_register_width))
+            self.layer2 = new_readout_layer()
         self.layer3 = numbered_layer(
             3,
             self.feature_width + self.market_width,
@@ -1265,9 +1321,62 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         self.initial_prefix = _gnglu(
             self.feature_width, self.prefix_width, **options
         )
+        # Initialize the extra readout positions after existing modules, so
+        # adding depth preserves their seeded initialization. Each position
+        # owns independent weights and is reused across forecast seconds only.
+        self.layer2_refinements = nn.ModuleList(
+            new_readout_layer() for _ in range(self.readout_residual_passes - 1)
+        )
+        self.layer13 = (
+            new_readout_layer(stream_only=True)
+            if self.hindsight_conditioning is not None
+            and self.hindsight_conditioning["layer13Enabled"] else None
+        )
+        self.layer13_refinements = nn.ModuleList(
+            new_readout_layer(stream_only=True)
+            for _ in range(self.hindsight_conditioning.get("layer13Count", 1) - 1)
+        ) if self.layer13 is not None else nn.ModuleList()
+        self.hindsight_embed = self.hindsight_unembed = None
+        if self.hindsight_sample_count > 1:
+            flat_input_width = self.hindsight_sample_count * self.hindsight_input_width
+            flat_output_width = self.hindsight_sample_count * self.output_width
+            self.hindsight_embed = nn.Linear(flat_input_width, self.readout_sample_width)
+            self.hindsight_unembed = nn.Linear(self.readout_sample_width, flat_output_width)
+            if self.output_width > self.readout_sample_width:
+                raise ValueError("sample bottleneck must fit the common clean feature vector")
+            # At zero noise, identical samples pass through exactly. Remaining
+            # embedding rows retain random weights, so decoder columns receive
+            # gradients immediately instead of creating dead zero/zero pairs.
+            with torch.no_grad():
+                self.hindsight_embed.bias.zero_()
+                self.hindsight_unembed.bias.zero_()
+                if self.hindsight_conditioning["sampleRepresentation"] == "full-output-feature-vector":
+                    self.hindsight_embed.weight[:self.output_width].copy_(
+                        torch.eye(self.output_width).repeat(1, self.hindsight_sample_count)
+                        / self.hindsight_sample_count
+                    )
+                    self.hindsight_unembed.weight.zero_()
+                    self.hindsight_unembed.weight[:, :self.output_width].copy_(
+                        torch.eye(self.output_width).repeat(self.hindsight_sample_count, 1)
+                    )
+                else:
+                    # Embeddings and features are different coordinates: no
+                    # identity decoder is assumed or inserted. Initialize a
+                    # mean-pooled random affine projection; both affines learn.
+                    projection = torch.empty(self.readout_sample_width, self.hindsight_input_width)
+                    nn.init.kaiming_uniform_(projection, a=math.sqrt(5))
+                    self.hindsight_embed.weight.copy_(
+                        projection.repeat(1, self.hindsight_sample_count) / self.hindsight_sample_count
+                    )
+                    output_projection = self.hindsight_unembed.weight[:self.output_width].clone()
+                    self.hindsight_unembed.weight.copy_(
+                        output_projection.repeat(self.hindsight_sample_count, 1)
+                    )
 
     def _forward_trace(
-        self, inputs: Tensor, *, include_auxiliary_loss: bool = False
+        self, inputs: Tensor, *, include_auxiliary_loss: bool = False,
+        noisy_hindsight: Tensor | None = None,
+        noise_variance: Tensor | None = None,
     ) -> StructuredFeatureProcessTrace:
         if inputs.ndim != 3 or inputs.shape[1:] != (
             self.input_steps,
@@ -1278,7 +1387,29 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                 f"[batch,{self.input_steps},{self.input_width}]"
             )
         normalized = (inputs.float() - self.input_mean) / self.input_std
+        if self.hindsight_conditioning is not None:
+            if noisy_hindsight is None or noise_variance is None:
+                raise ValueError("hindsight model requires explicit noise and variance")
+            expected_shape = (inputs.shape[0], self.output_steps, self.hindsight_input_width)
+            if self.hindsight_sample_count > 1:
+                expected_shape = (
+                    inputs.shape[0], self.output_steps, self.hindsight_sample_count,
+                    self.hindsight_input_width,
+                )
+            if noisy_hindsight.shape != expected_shape \
+                    or noise_variance.shape != (inputs.shape[0], 1):
+                raise ValueError("hindsight inputs have incompatible shapes")
+        elif noisy_hindsight is not None or noise_variance is not None:
+            raise ValueError("model has no hindsight readout")
         recurrent_hidden: dict[int, Tensor] = {}
+
+        def apply_stateless_layer(layer: nn.Module, joined_input: Tensor) -> Tensor:
+            if self.recurrent_activation_checkpointing \
+                    and self.training and torch.is_grad_enabled():
+                return activation_checkpoint(
+                    layer, joined_input, use_reentrant=False, preserve_rng_state=True,
+                )
+            return layer(joined_input)
 
         def apply_numbered_layer(
             number: int,
@@ -1288,15 +1419,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         ) -> Tensor:
             layer = getattr(self, f"layer{number}")
             if not isinstance(layer, DualStateGatedExchangeCell):
-                if self.recurrent_activation_checkpointing \
-                        and self.training and torch.is_grad_enabled():
-                    return activation_checkpoint(
-                        layer,
-                        joined_input,
-                        use_reentrant=False,
-                        preserve_rng_state=True,
-                    )
-                return layer(joined_input)
+                return apply_stateless_layer(layer, joined_input)
             actual_value_input = (
                 joined_input if value_input is None else value_input
             )
@@ -1384,6 +1507,9 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         next_feature_distribution_states: list[Tensor] = []
         expected_feature_embeddings: list[Tensor] = []
         outputs: list[Tensor] = []
+        readout_initial_streams: list[Tensor] = []
+        readout_residuals: list[tuple[Tensor, ...]] = []
+        readout_updated_streams: list[tuple[Tensor, ...]] = []
         layer8_gram_identity_losses: list[Tensor] = []
         next_feature_distribution: Tensor | None = None
         for output_step in range(self.output_steps):
@@ -1459,11 +1585,59 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                     expected_embedding = self.layer8(
                         next_feature_distribution
                     )
-            output = apply_numbered_layer(2, expected_embedding)
+            # Neither hindsight nor its variance enters attention or the
+            # recurrent states. Only this matching step's final readout sees it.
+            if self.hindsight_conditioning is None:
+                output = apply_numbered_layer(2, expected_embedding)
+            else:
+                # Reset to the same learned layer-12 vector at EVERY predicted
+                # second. Updated registers never carry across output steps.
+                sample_state = noisy_hindsight[:, output_step]
+                if self.hindsight_embed is not None:
+                    sample_state = self.hindsight_embed(sample_state.flatten(1))
+                initial_stream = torch.cat((
+                    self.layer12.unsqueeze(0).expand(inputs.shape[0], -1),
+                    sample_state,
+                ), dim=-1)
+                updated_stream = initial_stream
+                step_residuals: list[Tensor] = []
+                step_updated_streams: list[Tensor] = []
+                for readout_layer in (self.layer2, *self.layer2_refinements):
+                    # Independent weights per pass, shared across seconds.
+                    # Preserve the full register+sample stream and its gradient
+                    # between passes, but never between predicted seconds.
+                    residual = apply_stateless_layer(readout_layer, torch.cat((
+                        expected_embedding, updated_stream, noise_variance,
+                    ), dim=-1))
+                    updated_stream = updated_stream + residual
+                    step_residuals.append(residual)
+                    step_updated_streams.append(updated_stream)
+                for stream_layer in (
+                    (self.layer13, *self.layer13_refinements)
+                    if self.layer13 is not None else ()
+                ):
+                    # Layer 13 sees ONLY the updated register+sample stream:
+                    # no direct W, variance, or fresh hindsight concatenation.
+                    residual = apply_stateless_layer(stream_layer, updated_stream)
+                    updated_stream = updated_stream + residual
+                    step_residuals.append(residual)
+                    step_updated_streams.append(updated_stream)
+                # Only sample coordinates are emitted/lossed.
+                output = updated_stream[:, self.readout_register_width:]
+                if self.hindsight_unembed is not None:
+                    output = self.hindsight_unembed(output).reshape(
+                        inputs.shape[0], self.hindsight_sample_count, self.output_width,
+                    )
+                readout_initial_streams.append(initial_stream)
+                readout_residuals.append(tuple(step_residuals))
+                readout_updated_streams.append(tuple(step_updated_streams))
             next_feature_distribution_states.append(next_feature_distribution)
             expected_feature_embeddings.append(expected_embedding)
             outputs.append(output)
 
+        sample_outputs = torch.stack(outputs, dim=1)
+        if self.hindsight_sample_count == 1:
+            sample_outputs = sample_outputs.unsqueeze(2)
         return StructuredFeatureProcessTrace(
             feature_embeddings=embeddings,
             market_states=tuple(market_states),
@@ -1474,7 +1648,11 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                 next_feature_distribution_states
             ),
             expected_feature_embeddings=tuple(expected_feature_embeddings),
-            outputs=torch.stack(outputs, dim=1),
+            readout_initial_streams=tuple(readout_initial_streams),
+            readout_residuals=tuple(readout_residuals),
+            readout_updated_streams=tuple(readout_updated_streams),
+            outputs=sample_outputs.mean(dim=2),
+            sample_outputs=sample_outputs,
             layer8_gram_identity_loss=(
                 torch.stack(layer8_gram_identity_losses).mean()
                 if layer8_gram_identity_losses
@@ -1482,9 +1660,23 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             ),
         )
 
-    def forward(self, inputs: Tensor) -> Tensor:
+    def forward(
+        self, inputs: Tensor, noisy_hindsight: Tensor | None = None,
+        noise_variance: Tensor | None = None,
+    ) -> Tensor:
         """Return standardized predictions with shape ``[B,K2,O]``."""
-        return self._forward_trace(inputs).outputs
+        return self._forward_trace(
+            inputs, noisy_hindsight=noisy_hindsight,
+            noise_variance=noise_variance,
+        ).outputs
+
+    def forward_samples(
+        self, inputs: Tensor, noisy_hindsight: Tensor, noise_variance: Tensor,
+    ) -> Tensor:
+        """All decoded samples, for supervision before (not after) averaging."""
+        return self._forward_trace(
+            inputs, noisy_hindsight=noisy_hindsight, noise_variance=noise_variance,
+        ).sample_outputs
 
     def forward_with_auxiliary_loss(
         self, inputs: Tensor
@@ -1677,8 +1869,13 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             raise ValueError("raw base-support expectation shapes have changed")
         return (log_weights.exp().unsqueeze(-1) * raw_components).sum(dim=-2)
 
-    def trace(self, inputs: Tensor) -> StructuredFeatureProcessTrace:
-        return self._forward_trace(inputs)
+    def trace(
+        self, inputs: Tensor, noisy_hindsight: Tensor | None = None,
+        noise_variance: Tensor | None = None,
+    ) -> StructuredFeatureProcessTrace:
+        return self._forward_trace(
+            inputs, noisy_hindsight=noisy_hindsight, noise_variance=noise_variance,
+        )
 
     def raw_outputs(self, standardized_outputs: Tensor) -> Tensor:
         if standardized_outputs.ndim != 3 or standardized_outputs.shape[1:] != (
@@ -1700,6 +1897,9 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         blocks = (
             self.layer1,
             self.layer2,
+            *self.layer2_refinements,
+            self.layer13,
+            *self.layer13_refinements,
             self.layer3,
             self.layer4,
             self.layer5,

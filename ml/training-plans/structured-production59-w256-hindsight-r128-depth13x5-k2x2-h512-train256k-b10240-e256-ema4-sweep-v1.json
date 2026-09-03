@@ -1,0 +1,145 @@
+{
+  "id": "structured-production59-w256-hindsight-r128-depth13x5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+  "label": "Structured W256 self-attention - 2x1s input/output x59 - hindsight S1 R128 reset - layer2 h512 + 5 independent layer13 h512 - gate 0.9998074776513175 - 256 epochs - batch10240 - EMA4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/structured-production59-w256-hindsight-r128-depth13x5-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "Every residual position owns independent parameters; its weights are shared across forecast seconds only. Registers reset independently at each forecast second.",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "Reset z0=concat(learned R128,one noisy full59 sample). z+=layer2(concat(W256,z,variance)); then 5 independent stream-only layer13 updates z+=layer13_j(z). Emit final59 sample coordinates. Independent weights per depth position, shared across forecast seconds only. No register or sample carry across seconds.",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings in this experiment; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false,
+    "hindsightConditioning": {
+      "type": "layer2-register-residual-hindsight-v1",
+      "injectionLayer": 2,
+      "registerLayer": 12,
+      "registerWidth": 128,
+      "registerInitialization": "learned-zero-vector",
+      "carryRegisters": false,
+      "layer13Enabled": true,
+      "sampleCount": 1,
+      "sampleRepresentation": "full-output-feature-vector",
+      "residualHiddenWidth": 512,
+      "residualProjectionInitScale": 0.001,
+      "source": "Each predicted second independently concatenates the same learned R128 initial vector with its one noisy standardized O59 hindsight sample; scalar variance conditions only layer 2.",
+      "readout": "Reset z0=concat(learned R128,one noisy full59 sample). z+=layer2(concat(W256,z,variance)); then 5 independent stream-only layer13 updates z+=layer13_j(z). Emit final59 sample coordinates. Independent weights per depth position, shared across forecast seconds only. No register or sample carry across seconds.",
+      "initialization": "Learned layer12 initialized to zeros. Layer2 and layer13 independently initialized; both final projections start at rectangular identity*0.001, bias zero. Literal unit residual additions. Existing backbone/first readout initialization order and seed are unchanged.",
+      "evaluationVariance": 1,
+      "evaluationSeed": 918273,
+      "residualPasses": 1,
+      "residualParameterSharing": "across-forecast-steps-only",
+      "layer13HiddenWidth": 512,
+      "layer13Count": 5
+    }
+  },
+  "training": {
+    "epochs": 256,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "mean MSE over both predicted output steps and all 59 feature channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "hindsightNoiseSchedule": {
+      "type": "correlation-gated-noise-variance-v1",
+      "startEpoch": 0,
+      "startVariance": 0,
+      "endVariance": 1,
+      "varianceIncrement": 0.01,
+      "requiredCorrelation": 0.9998074776513175,
+      "requiredCorrelationFormula": "2^(-1/3600)",
+      "probeSplit": "train",
+      "probeMetric": "nextReturn.correlation",
+      "probeWeightSource": "raw-training-weights",
+      "probeExamples": 65536,
+      "probeSeed": 982451653,
+      "advance": "check once after each complete epoch; if threshold met, increment variance once for the next epoch, capped at 1; otherwise hold indefinitely within the run epoch budget",
+      "corruption": "sqrt(1-v)*standardized_target + sqrt(v)*independent_standard_normal",
+      "prediction": "One corruption level and one forward pass; conditioned layer2 then independently learned stream-only layer13 residual blocks. No extra diffusion iteration."
+    }
+  },
+  "sampling": {
+    "description": "original dense chronological clean-origin dataset with exact-zero next-return targets excluded",
+    "comparisonControl": "Fresh seed-1337 run; 4 additional layer13 blocks (5 total). One variable group relative to v8 baseline; exactly 256 epochs. No warm start."
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [
+      1,
+      2
+    ],
+    "checkpointSelection": "pure-noise validation step-1 next-return MSE and correlation; test never selects",
+    "hindsight": "All forecast evaluations use variance 1 and fixed split-specific Gaussian streams independent of targets. The training-only current-noise reconstruction probe controls the curriculum. A separate current-noise validation reconstruction diagnostic uses raw weights and a distinct seed; it does not affect the curriculum, loss, or checkpoint selection."
+  },
+  "alignment": {
+    "input": "two consecutive timeline rows ending at each clean example origin",
+    "target": "the two complete chronological timeline rows at origin+1 and origin+2",
+    "futureExtension": "K1 uses consecutive rows ending at origin; K2 uses consecutive rows starting at origin+1",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s",
+    "hindsight": "Reset z0=concat(learned R128,one noisy full59 sample). z+=layer2(concat(W256,z,variance)); then 5 independent stream-only layer13 updates z+=layer13_j(z). Emit final59 sample coordinates. Independent weights per depth position, shared across forecast seconds only. No register or sample carry across seconds."
+  },
+  "basisPlanId": "structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w256-m128-p128-f128-pf256-nf256-layer8-selfattn256-productiondense-train256k-batch10240-mse-ema4-v1",
+  "predecessorPlanId": "structured-production59-w256-hindsight-r128-depth13x4-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1"
+}

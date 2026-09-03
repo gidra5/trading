@@ -1,0 +1,170 @@
+{
+  "id": "structured-production59-w256-teacher64-embed512-r128-depth13x3-s16-affine256-gate099-k2x2-train256k-b10240-e256-ema4-v1",
+  "label": "Structured W256 self-attention - frozen 64-key W512 teacher embeddings directly compressed - K1=K2=2 x59 - S16 centers affine256 R128 reset - layer2 h512 + 3 independent layer13 h512 - replacement gate 0.99 step0.01 - 256 epochs - batch10240 - EMA4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/structured-production59-w256-teacher64-embed512-r128-depth13x3-s16-affine256-gate099-k2x2-train256k-b10240-e256-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "Every residual position owns independent parameters; its weights are shared across forecast seconds only. Registers reset independently at each forecast second.",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "Encode true future full59 states with the frozen teacher layer1 and unit-RMS normalization. Replace them linearly with 16 independently sampled teacher component-center embeddings (512 each), using prior softmax masses and no Gaussian jitter. Concat8192 -> learned affine256; concatenate reset R128; conditioned layer2 then 3 independently learned stream-only layer13 blocks; existing affine unembedding to 16x59 outputs. No intermediate embedding-to-feature decoder and no state carry across forecast seconds.",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings in this experiment; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false,
+    "hindsightConditioning": {
+      "type": "layer2-register-residual-hindsight-v1",
+      "injectionLayer": 2,
+      "registerLayer": 12,
+      "registerWidth": 128,
+      "registerInitialization": "learned-zero-vector",
+      "carryRegisters": false,
+      "layer13Enabled": true,
+      "sampleCount": 16,
+      "sampleRepresentation": "frozen-teacher-component-embedding",
+      "residualHiddenWidth": 512,
+      "residualProjectionInitScale": 0.001,
+      "source": "Encode true future full59 states with the frozen teacher layer1 and unit-RMS normalization. Replace them linearly with 16 independently sampled teacher component-center embeddings (512 each), using prior softmax masses and no Gaussian jitter. Concat8192 -> learned affine256; concatenate reset R128; conditioned layer2 then 3 independently learned stream-only layer13 blocks; existing affine unembedding to 16x59 outputs. No intermediate embedding-to-feature decoder and no state carry across forecast seconds.",
+      "readout": "Encode true future full59 states with the frozen teacher layer1 and unit-RMS normalization. Replace them linearly with 16 independently sampled teacher component-center embeddings (512 each), using prior softmax masses and no Gaussian jitter. Concat8192 -> learned affine256; concatenate reset R128; conditioned layer2 then 3 independently learned stream-only layer13 blocks; existing affine unembedding to 16x59 outputs. No intermediate embedding-to-feature decoder and no state carry across forecast seconds.",
+      "initialization": "Learned zero R128; mean-pooled random affine512-to256 initialization shared across the 16 sample positions, freely learned thereafter; existing final affine256-to59 initialized identically across sample outputs. No exact feature passthrough is assumed. Small layer2/layer13 residual projections as before.",
+      "evaluationVariance": 1,
+      "evaluationSeed": 918273,
+      "residualPasses": 1,
+      "residualParameterSharing": "across-forecast-steps-only",
+      "layer13HiddenWidth": 512,
+      "layer13Count": 3,
+      "sampleEmbeddingWidth": 256,
+      "sampleCompression": "concatenated-affine-v1",
+      "sampleObjective": "mean-per-sample-mse",
+      "samplePrediction": "arithmetic-mean",
+      "sampleInputWidth": 512
+    }
+  },
+  "training": {
+    "epochs": 256,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "Mean standardized MSE over examples, both forecast steps, every decoded sample, and all59 channels. Predictions are averaged only for reported metrics and the correlation gate; not before the training loss."
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "hindsightNoiseSchedule": {
+      "type": "correlation-gated-noise-variance-v1",
+      "startEpoch": 0,
+      "startVariance": 0,
+      "endVariance": 1,
+      "varianceIncrement": 0.01,
+      "requiredCorrelation": 0.99,
+      "probeSplit": "train",
+      "probeMetric": "nextReturn.correlation",
+      "probeWeightSource": "raw-training-weights",
+      "probeExamples": 65536,
+      "probeSeed": 982451653,
+      "advance": "check once after each complete epoch; if threshold met, increment variance once for the next epoch, capped at 1; otherwise hold indefinitely within the run epoch budget",
+      "corruption": "z=(1-v)*frozen_teacher_encode(true_features)+v*sampled_frozen_teacher_component_center; v is replacement fraction, not Gaussian variance. Endpoint v=1 never reads targets.",
+      "prediction": "One corruption level and one forward pass; conditioned layer2 then independently learned stream-only layer13 residual blocks. No extra diffusion iteration.",
+      "parameterMeaning": "teacher-replacement-fraction"
+    }
+  },
+  "sampling": {
+    "description": "original dense chronological clean-origin dataset with exact-zero next-return targets excluded",
+    "comparisonControl": "Fresh seed1337 student with original dense train256000 and K1=K2=2, same 3-layer13/S16/affine256/0.99 gate controls; frozen teacher embedding prior replaces raw-feature Gaussian corruption. The retained teacher trained on the same training split, so training-gate results are not out-of-fold; held-out forecasting is the performance criterion."
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [
+      1,
+      2
+    ],
+    "checkpointSelection": "teacher-only validation step-1 next-return MSE and correlation; test never selects",
+    "hindsight": "Forecast evaluation uses replacement fraction1 with deterministic split-specific component sampling and no targets. Training-only current-fraction reconstruction gates advances. Validation current-fraction reconstruction is target-assisted and diagnostic only."
+  },
+  "alignment": {
+    "input": "two consecutive timeline rows ending at each clean example origin",
+    "target": "the two complete chronological timeline rows at origin+1 and origin+2",
+    "futureExtension": "K1 uses consecutive rows ending at origin; K2 uses consecutive rows starting at origin+1",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s",
+    "hindsight": "Encode true future full59 states with the frozen teacher layer1 and unit-RMS normalization. Replace them linearly with 16 independently sampled teacher component-center embeddings (512 each), using prior softmax masses and no Gaussian jitter. Concat8192 -> learned affine256; concatenate reset R128; conditioned layer2 then 3 independently learned stream-only layer13 blocks; existing affine unembedding to 16x59 outputs. No intermediate embedding-to-feature decoder and no state carry across forecast seconds."
+  },
+  "basisPlanId": "structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w256-m128-p128-f128-pf256-nf256-layer8-selfattn256-productiondense-train256k-batch10240-mse-ema4-v1",
+  "predecessorPlanId": "structured-production59-w256-hindsight-r128-depth13x3-samples16-affine256-gate0p99-k2x2-h512-train256k-b10240-e256-ema4-v1",
+  "experimentBasisPlanId": "structured-production59-w256-hindsight-r128-gate0p99-k2x2-h512-train256k-b10240-e256-ema4-sweep-v1",
+  "hindsightTeacher": {
+    "type": "frozen-base-support-component-centers-v1",
+    "sourcePlanId": "structured-production59-featureembed-density-basesupport-gmmattn64-all512-k1-2-k2-2-stateless-train256k-b1536-ema4-v6",
+    "sourceCheckpoint": "data/training/runs/structured-production59-featureembed-density-basesupport-gmmattn64-all512-k1-2-k2-2-stateless-train256k-b1536-ema4-v6/checkpoints/selections/validation-correlation.json",
+    "plan": "data/training/runs/structured-production59-w256-teacher64-embed512-r128-depth13x3-s16-affine256-gate099-k2x2-train256k-b10240-e256-ema4-v1/state/teacher-plan.json",
+    "planSha256": "6550d96a1e1562c715d6102cb26880429dbb23abacd9c94cced6c9c7094a6f78",
+    "checkpoint": "data/training/runs/structured-production59-w256-teacher64-embed512-r128-depth13x3-s16-affine256-gate099-k2x2-train256k-b10240-e256-ema4-v1/checkpoints/dependencies/teacher.json",
+    "checkpointSha256": "c3f71a19c1c0072da72ea5ac056e2fe0bfb03163bf875e81a08c3c4c1682edc2",
+    "checkpointPolicy": "best-validation-correlation",
+    "completedEpoch": 13,
+    "embeddingWidth": 512,
+    "components": 64,
+    "inferenceBatchSize": 512,
+    "blend": "linear-embedding-replacement",
+    "gaussianJitter": 0,
+    "teacherTrainingOverlap": "same-training-split",
+    "targetSpace": "frozen-teacher-layer1-unit-rms",
+    "selectionInformation": "checkpoint originally selected by validation feature-wide correlation; no test selection"
+  }
+}

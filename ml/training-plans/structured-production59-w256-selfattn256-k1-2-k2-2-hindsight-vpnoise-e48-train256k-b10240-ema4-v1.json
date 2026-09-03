@@ -1,0 +1,124 @@
+{
+  "id": "structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-vpnoise-e48-train256k-b10240-ema4-v1",
+  "label": "Structured W256 causal self-attention - 2x1s input / 2x1s output x59 - one-pass hindsight denoising - variance 0 to 1 cosine through epoch 48 - pure Gaussian validation - 256k - equal batch 10240 - EMA4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "runDir": "data/training/runs/structured-production59-w256-selfattn256-k1-2-k2-2-hindsight-vpnoise-e48-train256k-b10240-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "each parenthesized number is one exact shared module reused at every matching block; layers other than 8 remain GNGLUs, while layer 8 is one shared causal self-attention module",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 causally self-attends over the generated NF-state prefix to emit expected W; shared layer 2 decodes W to the complete next-second O-feature state; add shared hindsight projection to NF before layer 8 and before recurrent propagation",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings in this experiment; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false,
+    "hindsightConditioning": {
+      "type": "per-step-standardized-hindsight-v1",
+      "source": "clean standardized future target features during training only",
+      "projection": "one shared GNGLU (59 noisy features + scalar noise variance) to NF256, added after layer 7 at the matching output step",
+      "noiseLevelInput": "scalar variance v in [0,1]",
+      "evaluationVariance": 1,
+      "evaluationSeed": 918273
+    }
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "mean MSE over both predicted output steps and all 59 feature channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32",
+    "hindsightNoiseSchedule": {
+      "type": "cosine-noise-variance-v1",
+      "startEpoch": 0,
+      "endEpoch": 48,
+      "startVariance": 0,
+      "endVariance": 1,
+      "afterEnd": "constant-one",
+      "formula": "v(epoch)=sin(pi/2 * min(epoch,48)/48)^2",
+      "corruption": "sqrt(1-v)*standardized_target + sqrt(v)*independent_standard_normal",
+      "prediction": "clean standardized features in one forward pass; no iterative denoising"
+    }
+  },
+  "sampling": {
+    "description": "original dense chronological clean-origin dataset with exact-zero next-return targets excluded",
+    "comparisonControl": "same dataset, structured recurrence, self-attention, widths, loss, batch, optimizer and EMA as basisPlanId; added a shared noisy-hindsight side projection and scalar variance input"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [
+      1,
+      2
+    ],
+    "checkpointSelection": "pure-noise validation step-1 next-return MSE and correlation; test never selects",
+    "hindsight": "all evaluations use variance 1 and fixed split-specific Gaussian streams independent of targets, including during the warmup curriculum"
+  },
+  "alignment": {
+    "input": "two consecutive timeline rows ending at each clean example origin",
+    "target": "the two complete chronological timeline rows at origin+1 and origin+2",
+    "futureExtension": "K1 uses consecutive rows ending at origin; K2 uses consecutive rows starting at origin+1",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s",
+    "hindsight": "training side token s corrupts target row origin+s+1; held-out targets never create side inputs. Each output can use its own and previous noisy tokens, never later tokens."
+  },
+  "basisPlanId": "structured-shared-io-feature-process-k1-2-k2-2-i59-o59-w256-m128-p128-f128-pf256-nf256-layer8-selfattn256-productiondense-train256k-batch10240-mse-ema4-v1"
+}

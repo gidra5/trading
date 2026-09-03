@@ -88,6 +88,7 @@ def model_from_state(
         feature_embedding_density=architecture.get("featureEmbeddingDensity"),
         return_density=architecture.get("returnDensity"),
         return_density_contract=return_density_contract,
+        hindsight_conditioning=architecture.get("hindsightConditioning"),
         recurrent_activation_checkpointing=bool(
             architecture.get("recurrentActivationCheckpointing", False)
         ),
