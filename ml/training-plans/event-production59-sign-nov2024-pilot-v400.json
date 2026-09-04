@@ -1,0 +1,131 @@
+{
+  "id": "event-production59-sign-nov2024-pilot-v400",
+  "label": "Historical production59/base17 sign pilot: Nov 2-3 2024 fit, Nov 4 validation, Nov 5 test",
+  "datasetDir": "data/training/datasets/event-production59-nov2024-pilot-v399",
+  "baseHistoryDir": "data/training/datasets/event-production59-nov2024-pilot-v399",
+  "datasetContract": "structured-production59-base-rollout-v1",
+  "runDir": "data/training/runs/event-production59-sign-nov2024-pilot-v400",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 65536
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 17,
+    "derivedOutputFeatures": 59,
+    "baseOutputCoordinateIds": [
+      "btc-log-return-1s",
+      "btc-return-active-logit",
+      "btc-range-active-logit",
+      "btc-open-gap-log-return-1s",
+      "btc-high-excess-log-bps",
+      "btc-low-excess-log-bps",
+      "spot-buy-quote-volume-log",
+      "spot-sell-quote-volume-log",
+      "spot-buy-aggregate-count-log",
+      "spot-sell-aggregate-count-log",
+      "spot-last-side-sell-logit",
+      "spot-last-side-none-logit",
+      "spot-last-side-buy-logit",
+      "spot-base-volume-log",
+      "btc-futures-minute-log-trade-count",
+      "btc-futures-minute-range-log-bps",
+      "eth-minute-log-return"
+    ],
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 128,
+    "featureDistributionWidth": 128,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "each parenthesized number is one exact shared module reused at every matching block; layers other than 8 remain GNGLUs, while layer 8 is one shared causal self-attention module",
+    "initialState": "the first observed W embedding seeds M and P with two unnumbered GNGLUs; shared layer 3 produces F and shared layer 4 produces PF",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 causally self-attends over the generated NF-state prefix to emit expected W; shared layer 2 decodes W only to 17 primitive causal coordinates; differentiable fixed code reconstructs the complete future production59 state",
+    "baseConsistency": "BTC one-second candle geometry, return activity, aggregate trade flow, aggressor side, spot volume, completed futures-minute state, and ETH minute return are decoded once; every affected production channel is derived from the same predicted primitive history",
+    "latentSemantics": "P, F, PF, and NF remain unconstrained latent embeddings; no probability decoder or density loss is imposed",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 8,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 8192,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-derived-production59-feature-mse-v1",
+      "description": "decode only 17 primitive causal coordinates, differentiably reconstruct both complete 59-channel future states, then mean MSE over the two steps and all 59 channels after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-07,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "epsilon": 1e-08,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "First 65536 constructible active-next-second origins in the historical fit split. Zeros remain in the chronological input timeline. No checkpoint from 2026 is used.",
+    "comparisonControl": "Same 4.13M parameter architecture, loss, optimizer, batch sizes, seed, and EMA as the remembered self-attention production59/base17 model. Reduced sample count and eight-epoch pilot budget measure feasibility and early validation learning; not a full reproduction."
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [
+      1,
+      2
+    ],
+    "checkpointSelection": "pooled two-step complete derived 59-feature state",
+    "comparableMetrics": "step-1 and per-step return metrics remain directly comparable to the direct-output production59 runs"
+  },
+  "alignment": {
+    "input": "the same two consecutive production59 timeline rows ending at each control example origin",
+    "target": "the same two complete chronological production59 rows at origin+1 and origin+2",
+    "causalDerivation": "only predicted primitive coordinates and observed history through the input origin enter changing future channels; predicted step 1 updates rolling state before step 2; no observed future derived feature is consumed",
+    "attentionCausality": "output step s attends only to generated NF states at output steps <= s"
+  },
+  "research": {
+    "sourcePlan": "ml/training-plans/structured-shared-io-feature-process-k1-2-k2-2-i59-obase17-derived59-w256-m128-p128-f128-pf256-nf256-layer8-selfattn256-productiondense-train256k-batch10240-mse-ema4-v1.json",
+    "decisionRule": "Assess runtime and validation learning before extending the budget. Do not tune using test metrics. A sign improvement alone does not establish after-cost account growth.",
+    "excludedInspectorFitWindows": true
+  }
+}

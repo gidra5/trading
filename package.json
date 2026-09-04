@@ -8,6 +8,10 @@
     "packages/*"
   ],
   "scripts": {
+    "research:event-policy": "node --conditions=development --import tsx scripts/research-event-policy.ts",
+    "research:event-policy:replay": "node --conditions=development --import tsx scripts/replay-event-policy.ts",
+    "research:event-policy:audit": "node --conditions=development --import tsx scripts/audit-event-policy.ts",
+    "test:event-policy": "node --conditions=development --import tsx --test packages/bot-algo/test/event-policy.test.ts scripts/research-event-policy.test.ts",
     "setup": "npm install && node scripts/bootstrap-ml.mjs && npm run build",
     "dev": "concurrently -n server,web -c green,cyan \"npm run dev -w @trading/server\" \"npm run dev -w @trading/web\"",
     "build": "npm run build -w @trading/bot-algo && npm run build -w @trading/storage && npm run build -w @trading/server && npm run build -w @trading/web",

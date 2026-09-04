@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   readCandleShardReferenceSync,
@@ -274,10 +275,10 @@ function phasePair(value: number, period: number): [number, number] {
   return [Math.sin(angle), Math.cos(angle)];
 }
 
-function splitOf(time: number): number {
-  if (time >= START && time < TRAIN_END) return 0;
-  if (time >= TRAIN_END && time < VALIDATION_END) return 1;
-  if (time >= VALIDATION_END && time < END) return 2;
+function splitOf(time: number, boundaries: readonly number[]): number {
+  for (let split = 0; split < 3; split++) {
+    if (time >= boundaries[split]! && time < boundaries[split + 1]!) return split;
+  }
   return -1;
 }
 
@@ -298,9 +299,9 @@ function candleRef(symbol: string, day: string): string {
   return ref(path.join(SPOT_1M, `spot-${symbol}`, symbol, "1m"), day);
 }
 
-function days(): string[] {
+function days(start: number, end: number): string[] {
   const result: string[] = [];
-  for (let time = START; time < END; time += DAY_MS) result.push(new Date(time).toISOString().slice(0, 10));
+  for (let time = start; time < end; time += DAY_MS) result.push(new Date(time).toISOString().slice(0, 10));
   return result;
 }
 
@@ -418,6 +419,19 @@ function featureRow(
 }
 
 export function run(args = process.argv.slice(2)): void {
+  const dateArgument = (name: string, fallback: number) => {
+    const position = args.indexOf(name);
+    const value = position < 0 ? fallback : Date.parse(args[position + 1] ?? "");
+    if (!Number.isSafeInteger(value) || value % 1000) throw new Error(`Invalid ${name}`);
+    return value;
+  };
+  const start = dateArgument("--start", START), trainEnd = dateArgument("--train-end", TRAIN_END);
+  const validationEnd = dateArgument("--validation-end", VALIDATION_END), end = dateArgument("--end", END);
+  const boundaries = [start, trainEnd, validationEnd, end];
+  if (boundaries.some(value => value % DAY_MS) || boundaries.some((value, i) => i > 0 && value <= boundaries[i - 1]!))
+    throw new Error("Split boundaries must be increasing UTC midnights");
+  const calibrationStart = dateArgument("--calibration-start", Math.max(start, Math.min(CALIBRATION_START, trainEnd - DAY_MS / 2)));
+  if (calibrationStart < start || calibrationStart >= trainEnd) throw new Error("Calibration interval escapes training range");
   const calibrationOnly = args.includes("--calibration-only");
   const calibrationTail = args.includes("--calibration-tail");
   const allFeatureHistory = args.includes("--all-feature-history");
@@ -454,6 +468,7 @@ export function run(args = process.argv.slice(2)): void {
     ? (calibrationOnly ? TEMPORAL_CALIBRATION_OUTPUT : TEMPORAL_OUTPUT)
     : (calibrationOnly ? CALIBRATION_OUTPUT : OUTPUT);
   const output = path.resolve(repoRoot, outputArg >= 0 ? args[outputArg + 1]! : defaultOutput);
+  if (fs.existsSync(output)) throw new Error(`Output already exists: ${output}`);
   const snapshotDefinitions = definitions();
   const featureDefinitions = calibrationTail && !allFeatureHistory
     ? [snapshotDefinitions[HISTORY_RETURNS - 1]!, ...snapshotDefinitions.slice(HISTORY_RETURNS)]
@@ -501,13 +516,13 @@ export function run(args = process.argv.slice(2)): void {
   let completedHourLogVolume = Number.NaN;
   let completedHourBoundary = Number.NaN;
   let completedMinuteBoundary = Number.NaN;
-  let calibrationIntervalStart = CALIBRATION_START;
-  const calibrationScanStart = TRAIN_END - Math.max(
-    TRAIN_END - CALIBRATION_START,
+  let calibrationIntervalStart = calibrationStart;
+  const calibrationScanStart = trainEnd - Math.max(
+    trainEnd - calibrationStart,
     Math.ceil(calibrationExamples / 0.2) * 1_000 + MAX_WINDOW * 1_000,
   );
 
-  for (const day of days()) {
+  for (const day of days(start, end)) {
     if (calibrationTail
       && Date.parse(`${day}T00:00:00.000Z`) < calibrationScanStart - DAY_MS) continue;
     const seconds = readCandleShardReferenceSync(ref(SPOT_1S, day));
@@ -525,7 +540,9 @@ export function run(args = process.argv.slice(2)): void {
       if (pending) {
         const target = Math.fround(Math.log(candle.close / pending.close));
         const buffer = buffers[pending.split]!;
-        if (target !== 0 && (calibrationTail || buffer.rows < exampleCounts[pending.split]!)) {
+        const targetEnd = candle.openTime + 1000;
+        const splitEnd = calibrationOnly ? trainEnd : boundaries[pending.split + 1]!;
+        if (targetEnd < splitEnd && target !== 0 && (calibrationTail || buffer.rows < exampleCounts[pending.split]!)) {
           const outputRow = calibrationTail
             ? buffer.rows % exampleCounts[pending.split]!
             : buffer.rows;
@@ -585,9 +602,9 @@ export function run(args = process.argv.slice(2)): void {
       }
       previousClose = candle.close;
       const split = calibrationOnly
-        ? (candle.openTime >= (calibrationTail ? calibrationScanStart : CALIBRATION_START)
-          && candle.openTime < TRAIN_END ? 0 : -1)
-        : splitOf(candle.openTime);
+        ? (candle.openTime >= (calibrationTail ? calibrationScanStart : calibrationStart)
+          && candle.openTime < trainEnd ? 0 : -1)
+        : splitOf(candle.openTime, boundaries);
       const ready = ring.seen >= MAX_WINDOW && ethReturns.seen >= 60 && futures.valid
         && trade.valid && Number.isFinite(completedHourLogVolume)
         && Number.isFinite(completedHourBoundary)
@@ -635,7 +652,7 @@ export function run(args = process.argv.slice(2)): void {
         : undefined;
     }
     console.error(`${day}: ${buffers.map((buffer) => buffer.rows.toLocaleString()).join(" / ")} clean ${splitNames.join("/")} rows`);
-    if (calibrationTail && Date.parse(`${day}T00:00:00.000Z`) + DAY_MS >= TRAIN_END) break;
+    if (calibrationTail && Date.parse(`${day}T00:00:00.000Z`) + DAY_MS >= trainEnd) break;
     if (!calibrationTail
       && buffers.every((buffer, split) => buffer.rows === exampleCounts[split])) break;
   }
@@ -700,13 +717,13 @@ export function run(args = process.argv.slice(2)): void {
     examples: calibrationExamples,
     interval: {
       start: new Date(calibrationIntervalStart).toISOString(),
-      endExclusive: new Date(TRAIN_END).toISOString(),
+      endExclusive: new Date(trainEnd).toISOString(),
     },
     relationship: {
       training: "strictly after the source model's retained training examples; evaluators verify timestamps",
       validation: calibrationTail
-        ? `the final ${calibrationExamples.toLocaleString("en-US")} clean active-return examples immediately before the 2026-08-03 validation boundary`
-        : "strictly before the 2026-08-03 validation boundary",
+        ? `the final ${calibrationExamples.toLocaleString("en-US")} clean active-return examples immediately before the ${new Date(trainEnd).toISOString()} validation boundary`
+        : `strictly before the ${new Date(trainEnd).toISOString()} validation boundary`,
       test: "untouched",
     },
     features: featureDefinitions,
@@ -738,9 +755,9 @@ export function run(args = process.argv.slice(2)): void {
       ? Object.fromEntries(SPLIT_NAMES.map((name, split) => [name, buffers[split]!.timelineRows]))
       : undefined,
     splits: {
-      train: { start: new Date(START).toISOString(), endExclusive: new Date(TRAIN_END).toISOString() },
-      validation: { start: new Date(TRAIN_END).toISOString(), endExclusive: new Date(VALIDATION_END).toISOString() },
-      test: { start: new Date(VALIDATION_END).toISOString(), endExclusive: new Date(END).toISOString() },
+      train: { start: new Date(start).toISOString(), endExclusive: new Date(trainEnd).toISOString() },
+      validation: { start: new Date(trainEnd).toISOString(), endExclusive: new Date(validationEnd).toISOString() },
+      test: { start: new Date(validationEnd).toISOString(), endExclusive: new Date(end).toISOString() },
     },
     includedSources: ["BTCUSDT spot 1s/1m", "BTCUSDT spot aggregate trade flow 1s", "BTCUSDT USD-M futures 1m", "ETHUSDT spot 1m", "UTC calendar"],
     omittedForCoverage: [
@@ -757,6 +774,22 @@ export function run(args = process.argv.slice(2)): void {
     }])),
   };
   fs.writeFileSync(path.join(output, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  if (compactTemporal) {
+    const sources = {
+      btcSecond: SPOT_1S, tradeFlow: FLOW, futuresMinute: FUTURES,
+      btcMinute: path.join(SPOT_1M, "spot-btcusdt/btcusdt/1m").replaceAll("\\", "/"),
+      ethMinute: path.join(SPOT_1M, "spot-ethusdt/ethusdt/1m").replaceAll("\\", "/"),
+    };
+    const sourceReferences = days(start, end).flatMap(day => Object.values(sources).map(source => {
+      const file = `${source}/${day}.json`;
+      return { file, sha256: createHash("sha256").update(fs.readFileSync(path.resolve(repoRoot, file))).digest("hex") };
+    }));
+    fs.writeFileSync(path.join(output, "dataset.json"), JSON.stringify({
+      contract: "production59-base-history-v1", sources, sourceReferences,
+      baseHistory: { secondStartMs: start, secondEndExclusiveMs: end,
+        secondRows: (end - start) / 1000, minuteRows: (end - start) / 60000 },
+    }, null, 2));
+  }
   console.log(`Wrote ${path.relative(repoRoot, output)}: ${featureDefinitions.length} features x ${exampleCounts.map((value) => value.toLocaleString()).join("/")} clean ${splitNames.join("/")} examples.`);
 }
 

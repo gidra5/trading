@@ -15,7 +15,7 @@ from differentiable_union530_features import (
     reconstruct_global470,
     spread_from_top_of_book,
 )
-from union530_base_dataset import Union530BaseHistoryDataset
+from union530_base_dataset import Production59BaseHistoryDataset, Union530BaseHistoryDataset
 
 
 DATASET_CONTRACT = "structured-union530-base-rollout-v1"
@@ -968,7 +968,7 @@ class StructuredProduction59BaseDataset(StructuredUnion530BaseDataset):
         self.output_steps = int(output_steps)
         self.root = timeline_root.resolve()
         self.base_history_root = base_history_root.resolve()
-        self.base = Union530BaseHistoryDataset(self.base_history_root)
+        self.base = Production59BaseHistoryDataset(self.base_history_root)
         self.rollout = Production59BaseRollout(self.base.second_start_ms)
         self.manifest = json.loads(
             (self.root / "manifest.json").read_text(encoding="utf-8")

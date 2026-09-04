@@ -134,6 +134,12 @@ https://chatgpt.com/c/6a58d7b3-dd44-83eb-b172-a7aec93cf050
 https://chatgpt.com/c/6a58fb11-2eb0-83ed-8bfb-807dca191a58
 https://chatgpt.com/c/6a58fd5c-bda4-83eb-bd94-3d7c853ac950
 
+denoising
+input/output distributions via knot-value representation
+multiple denoising steps
+in context learning
+diffusion
+
 ML model based on MLP:
 1. Historic inputs:
    1. normalize into log returns

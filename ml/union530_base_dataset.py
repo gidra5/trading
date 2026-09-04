@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import gc
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -168,69 +169,79 @@ class DerivedUnionFeatureView:
         return output[0] if scalar else output
 
 
-class Union530BaseHistoryDataset:
-    """Base-only histories plus aligned example indices for the 530 graph."""
+class Production59BaseHistoryDataset:
+    """The five primitive source histories needed by the production59 graph.
+
+    A union530 source manifest can supply the same histories without opening
+    its unrelated global-feature matrices or example population.
+    """
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory.resolve()
-        self.manifest = json.loads(
-            (self.directory / "dataset.json").read_text(encoding="utf-8")
-        )
-        if self.manifest.get("contract") != BASE_CONTRACT:
-            raise ValueError("unexpected union530 base-history contract")
-        examples = self.manifest["examples"]
-        self.rows = int(examples["rows"])
-        self.origins = self._memmap(examples["origins"], "<f8", (self.rows,))
-        self.targets = self._memmap(examples["targets"], "<f4", (self.rows,))
-        self.minute_source_rows = self._memmap(
-            examples["minuteSourceRows"], "<u4", (self.rows,)
-        )
-        self.split_codes = self._memmap(examples["splits"], "u1", (self.rows,))
-        self.nonzero = self._memmap(examples["nonzero"], "u1", (self.rows,))
-        self.top_of_book = self._memmap(
-            examples["topOfBook"], "<f8", (self.rows, 2)
-        )
-        self.feature_ids = tuple(self.manifest["features"]["ids"])
-        self.production_specs = tuple(self.manifest["features"]["productionGraph"])
-        self.global_specs = tuple(self.manifest["features"]["globalGraph"])
-        if len(self.feature_ids) != 530 or len(self.production_specs) != 59 \
-                or len(self.global_specs) != 471:
-            raise ValueError("union530 base-history feature catalog changed")
+        self.manifest = json.loads((self.directory / "dataset.json").read_text(encoding="utf-8"))
+        contract = self.manifest.get("contract")
+        if contract not in ("production59-base-history-v1", BASE_CONTRACT):
+            raise ValueError("unexpected production59 source-history contract")
         history = self.manifest["baseHistory"]
         self.second_start_ms = int(history["secondStartMs"])
         self.second_end_ms = int(history["secondEndExclusiveMs"])
         self.second_rows = int(history["secondRows"])
         self.minute_rows = int(history["minuteRows"])
+        duration = self.second_end_ms - self.second_start_ms
+        if duration <= 0 or self.second_start_ms % 86_400_000 or self.second_end_ms % 86_400_000 \
+                or self.second_rows * 1_000 != duration or self.minute_rows * 60_000 != duration:
+            raise ValueError("source history must contain complete consecutive UTC days")
         self._numpy_cache: dict[str, Any] = {}
+        if contract == "production59-base-history-v1":
+            self.sources = self.manifest["sources"]
+            if set(self.sources) != {"btcSecond", "tradeFlow", "futuresMinute", "btcMinute", "ethMinute"}:
+                raise ValueError("production59 source catalog changed")
+            references = self.manifest["sourceReferences"]
+            expected = {f"{source}/{day}.json" for source in self.sources.values() for day in self._days()}
+            if len(references) != len(expected) or {row["file"] for row in references} != expected:
+                raise ValueError("production59 source references do not cover the history")
+            for row in references:
+                raw = _resolve(row["file"]).read_bytes()
+                if hashlib.sha256(raw).hexdigest() != row["sha256"]:
+                    raise ValueError(f"production59 source reference changed: {row['file']}")
+                reference = json.loads(raw)
+                axis = reference["sequence"]
+                day = datetime.strptime(Path(row["file"]).stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                step = 1_000 if row["file"].endswith(f"/1s/{day.date()}.json") else 60_000
+                if axis["start"] != int(day.timestamp() * 1_000) or axis["step"] != step \
+                        or axis["count"] * step != 86_400_000:
+                    raise ValueError(f"production59 source axis is misaligned: {row['file']}")
+        else:
+            self._sources_from_union()
 
-    def _memmap(self, spec: Mapping[str, Any], dtype: str, shape: tuple[int, ...]) -> np.memmap:
-        path = _resolve(str(spec["file"]))
-        return np.memmap(path, dtype=dtype, mode="r", shape=shape)
-
-    def split(self, name: str, limit: int | None = None) -> ExampleSplit:
-        code = {"train": 0, "validation": 1, "test": 2}[name]
-        physical = np.flatnonzero(
-            (np.asarray(self.split_codes) == code)
-            & (np.asarray(self.nonzero) != 0)
+    def _sources_from_union(self) -> None:
+        production = self.manifest["features"]["productionGraph"]
+        btc_candle_source = next(
+            value for spec in production for value in spec["baseSources"]
+            if "candles/spot-btcusdt" in value and value.endswith("/1s")
         )
-        if limit is not None:
-            if limit < 1 or limit > physical.size:
-                raise ValueError(f"{name} requested {limit:,} of {physical.size:,} examples")
-            physical = physical[:limit]
-        return ExampleSplit(
-            physical_rows=physical,
-            targets=np.asarray(self.targets[physical], dtype=np.float32),
-            origins=np.asarray(self.origins[physical], dtype=np.float64),
+        flow_source = next(
+            value for spec in production for value in spec["baseSources"]
+            if "trade-flow/spot-btcusdt" in value
         )
-
-    def second_indices(self, physical_rows: np.ndarray) -> np.ndarray:
-        indices = (
-            (np.asarray(self.origins[physical_rows], dtype=np.int64) - self.second_start_ms)
-            // 1_000
+        futures_source = next(
+            value for spec in production for value in spec["baseSources"]
+            if "derivatives-klines" in value
         )
-        if np.any(indices < 0) or np.any(indices >= self.second_rows):
-            raise ValueError("example origins escape the second base axis")
-        return indices
+        btc_minute_source = next(
+            value for spec in production for value in spec["baseSources"]
+            if value.endswith("/1m") and "spot-btcusdt" in value
+            and spec["id"].startswith("futures-")
+        )
+        eth_minute_source = next(
+            value for spec in production for value in spec["baseSources"]
+            if value.endswith("/1m") and "spot-ethusdt" in value
+            and spec["id"].startswith("eth-")
+            and value != btc_minute_source
+        )
+        self.sources = dict(btcSecond=btc_candle_source, tradeFlow=flow_source,
+                            futuresMinute=futures_source, btcMinute=btc_minute_source,
+                            ethMinute=eth_minute_source)
 
     def _days(self) -> list[str]:
         return _dates(self.second_start_ms, self.second_end_ms)
@@ -268,6 +279,92 @@ class Union530BaseHistoryDataset:
                 raise ValueError("trade-flow base shape changed")
             self._numpy_cache[key] = cached
         return cached
+
+    @staticmethod
+    def tensor(values: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.as_tensor(np.asarray(values).copy(), device=device, dtype=dtype)
+
+    def production_base(
+        self,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> Production59Base:
+        btc_candle_source = self.sources["btcSecond"]
+        flow_source = self.sources["tradeFlow"]
+        futures_source = self.sources["futuresMinute"]
+        btc_minute_source = self.sources["btcMinute"]
+        eth_minute_source = self.sources["ethMinute"]
+        candles = self.candle_history(btc_candle_source, "1s")
+        flow = self.trade_history(flow_source)
+        btc_minute = self.candle_history(btc_minute_source, "1m")
+        eth_minute = self.candle_history(eth_minute_source, "1m")
+        futures = self.futures_history(futures_source)
+        return Production59Base(
+            btc_second_candles=self.tensor(candles, device, dtype),
+            btc_trade_flow={
+                name: self.tensor(values, device, dtype) for name, values in flow.items()
+            },
+            btc_minute_candles=self.tensor(btc_minute, device, dtype),
+            eth_minute_candles=self.tensor(eth_minute, device, dtype),
+            btc_futures_minute=self.tensor(futures, device, dtype),
+            start_ms=self.second_start_ms,
+        )
+
+
+class Union530BaseHistoryDataset(Production59BaseHistoryDataset):
+    """Base-only histories plus aligned example indices for the 530 graph."""
+
+    def __init__(self, directory: Path) -> None:
+        super().__init__(directory)
+        if self.manifest.get("contract") != BASE_CONTRACT:
+            raise ValueError("unexpected union530 base-history contract")
+        examples = self.manifest["examples"]
+        self.rows = int(examples["rows"])
+        self.origins = self._memmap(examples["origins"], "<f8", (self.rows,))
+        self.targets = self._memmap(examples["targets"], "<f4", (self.rows,))
+        self.minute_source_rows = self._memmap(
+            examples["minuteSourceRows"], "<u4", (self.rows,)
+        )
+        self.split_codes = self._memmap(examples["splits"], "u1", (self.rows,))
+        self.nonzero = self._memmap(examples["nonzero"], "u1", (self.rows,))
+        self.top_of_book = self._memmap(
+            examples["topOfBook"], "<f8", (self.rows, 2)
+        )
+        self.feature_ids = tuple(self.manifest["features"]["ids"])
+        self.production_specs = tuple(self.manifest["features"]["productionGraph"])
+        self.global_specs = tuple(self.manifest["features"]["globalGraph"])
+        if len(self.feature_ids) != 530 or len(self.production_specs) != 59 \
+                or len(self.global_specs) != 471:
+            raise ValueError("union530 base-history feature catalog changed")
+
+    def _memmap(self, spec: Mapping[str, Any], dtype: str, shape: tuple[int, ...]) -> np.memmap:
+        path = _resolve(str(spec["file"]))
+        return np.memmap(path, dtype=dtype, mode="r", shape=shape)
+
+    def split(self, name: str, limit: int | None = None) -> ExampleSplit:
+        code = {"train": 0, "validation": 1, "test": 2}[name]
+        physical = np.flatnonzero(
+            (np.asarray(self.split_codes) == code)
+            & (np.asarray(self.nonzero) != 0)
+        )
+        if limit is not None:
+            if limit < 1 or limit > physical.size:
+                raise ValueError(f"{name} requested {limit:,} of {physical.size:,} examples")
+            physical = physical[:limit]
+        return ExampleSplit(
+            physical_rows=physical,
+            targets=np.asarray(self.targets[physical], dtype=np.float32),
+            origins=np.asarray(self.origins[physical], dtype=np.float64),
+        )
+
+    def second_indices(self, physical_rows: np.ndarray) -> np.ndarray:
+        indices = (
+            (np.asarray(self.origins[physical_rows], dtype=np.int64) - self.second_start_ms)
+            // 1_000
+        )
+        if np.any(indices < 0) or np.any(indices >= self.second_rows):
+            raise ValueError("example origins escape the second base axis")
+        return indices
 
     def raw_matrix(self, source: str, columns: int, rows: int) -> np.memmap:
         key = f"matrix:{source}:{columns}:{rows}"
@@ -310,55 +407,6 @@ class Union530BaseHistoryDataset:
             )
             self._numpy_cache[key] = cached
         return cached
-
-    @staticmethod
-    def tensor(values: np.ndarray, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        return torch.as_tensor(np.asarray(values).copy(), device=device, dtype=dtype)
-
-    def production_base(
-        self,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> Production59Base:
-        production = self.production_specs
-        btc_candle_source = next(
-            value for spec in production for value in spec["baseSources"]
-            if "candles/spot-btcusdt" in value and value.endswith("/1s")
-        )
-        flow_source = next(
-            value for spec in production for value in spec["baseSources"]
-            if "trade-flow/spot-btcusdt" in value
-        )
-        futures_source = next(
-            value for spec in production for value in spec["baseSources"]
-            if "derivatives-klines" in value
-        )
-        btc_minute_source = next(
-            value for spec in production for value in spec["baseSources"]
-            if value.endswith("/1m") and "spot-btcusdt" in value
-            and spec["id"].startswith("futures-")
-        )
-        eth_minute_source = next(
-            value for spec in production for value in spec["baseSources"]
-            if value.endswith("/1m") and "spot-ethusdt" in value
-            and spec["id"].startswith("eth-")
-            and value != btc_minute_source
-        )
-        candles = self.candle_history(btc_candle_source, "1s")
-        flow = self.trade_history(flow_source)
-        btc_minute = self.candle_history(btc_minute_source, "1m")
-        eth_minute = self.candle_history(eth_minute_source, "1m")
-        futures = self.futures_history(futures_source)
-        return Production59Base(
-            btc_second_candles=self.tensor(candles, device, dtype),
-            btc_trade_flow={
-                name: self.tensor(values, device, dtype) for name, values in flow.items()
-            },
-            btc_minute_candles=self.tensor(btc_minute, device, dtype),
-            eth_minute_candles=self.tensor(eth_minute, device, dtype),
-            btc_futures_minute=self.tensor(futures, device, dtype),
-            start_ms=self.second_start_ms,
-        )
 
     def production_base_from_global(self, base: Global471Base) -> Production59Base:
         production = self.production_specs
