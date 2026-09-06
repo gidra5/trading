@@ -8,6 +8,70 @@ export const EVENT_FUTURES_PRICE_INPUTS = ["futures-spot-basis-bps", "futures-re
 export const EVENT_FUTURES_FLOW_INPUTS = ["futures-log1p-trade-count-1m", "futures-taker-quote-imbalance-1m", "futures-taker-quote-imbalance-5m"] as const;
 export const EVENT_FUTURES_DEVIATION_INPUTS = ["futures-basis-minus-ema5-bps", "futures-basis-minus-ema15-bps", "futures-basis-minus-ema60-bps"] as const;
 export const EVENT_CANDLE_SHAPE_INPUTS = ["spot-close-location-1m", "futures-close-location-1m"] as const;
+export const EVENT_NATIVE_FUTURES_ACTIVITY_INPUTS = ["futures-log1p-trade-count-1m", "futures-range-1m-bps"] as const;
+export const EVENT_NATIVE_FUTURES_CENTERED_INPUTS = ["futures-relative-return-1m-bps", "futures-relative-return-5m-bps",
+  "futures-basis-minus-ema5-bps", "futures-basis-minus-ema15-bps", "futures-basis-minus-ema60-bps"] as const;
+export const EVENT_NATIVE_FUTURES_FLOW_INPUTS = ["futures-taker-quote-imbalance-1m", "futures-taker-quote-imbalance-5m"] as const;
+
+export interface NativeSecondEventFuturesFeatures {
+  /** Absolute basis and spot-relative futures returns over completed minutes. */
+  price: number[];
+  /** Completed-minute futures activity and aggressor flow. */
+  flow: number[];
+  rangeBps: number;
+  deviations: number[];
+  completedMinuteOpenTime: number;
+}
+
+/** Futures state available at a native-second decision. The current unfinished
+ * minute is never read: every futures row and matching spot close belongs to a
+ * minute whose close timestamp is strictly before the decision boundary. */
+export function eventNativeSecondFuturesFeatures(candles: readonly EventCandle[], index: number,
+  rowAt: (openTime: number) => SequentialDerivativesKlineRow | undefined): NativeSecondEventFuturesFeatures | null {
+  const candle = candles[index];
+  if (!candle || !Number.isSafeInteger(candle.openTime)) return null;
+  const availableAt = candle.openTime + 1_000;
+  const completedMinuteOpenTime = Math.floor(availableAt / 60_000) * 60_000 - 60_000;
+  const paired: { spot: EventCandle; futures: SequentialDerivativesKlineRow }[] = [];
+  for (let lag = 0; lag < 240; lag++) {
+    const minuteOpen = completedMinuteOpenTime - lag * 60_000;
+    const spotOpen = minuteOpen + 59_000;
+    const offset = (candle.openTime - spotOpen) / 1_000;
+    if (!Number.isSafeInteger(offset) || offset < 0) return null;
+    const spot = candles[index - offset], futures = rowAt(minuteOpen);
+    if (!spot || spot.openTime !== spotOpen || !(spot.close > 0) || !Number.isFinite(spot.close)
+      || !futures || futures.openTime !== minuteOpen || futures.close === null
+      || !(futures.close > 0) || !Number.isFinite(futures.close)) return null;
+    paired.push({ spot, futures });
+  }
+  const recent = paired.slice(0, 6);
+  for (const { futures } of recent) {
+    if (futures.high === null || futures.low === null || !(futures.high > 0) || !(futures.low > 0)
+      || !Number.isFinite(futures.high) || !Number.isFinite(futures.low) || futures.high < futures.low
+      || futures.tradeCount === null || !Number.isSafeInteger(futures.tradeCount) || futures.tradeCount < 0
+      || futures.quoteVolume === null || !Number.isFinite(futures.quoteVolume) || futures.quoteVolume < 0
+      || futures.takerBuyQuoteVolume === null || !Number.isFinite(futures.takerBuyQuoteVolume)
+      || futures.takerBuyQuoteVolume < 0 || futures.takerBuyQuoteVolume > futures.quoteVolume) return null;
+  }
+  const current = recent[0], basis = paired.map(({ spot, futures }) => Math.log(futures.close! / spot.close) * 1e4);
+  const price = [basis[0],
+    (Math.log(current.futures.close! / recent[1].futures.close!)
+      - Math.log(current.spot.close / recent[1].spot.close)) * 1e4,
+    (Math.log(current.futures.close! / recent[5].futures.close!)
+      - Math.log(current.spot.close / recent[5].spot.close)) * 1e4];
+  const imbalance = (rows: typeof recent) => {
+    const volume = rows.reduce((sum, row) => sum + row.futures.quoteVolume!, 0);
+    const buy = rows.reduce((sum, row) => sum + row.futures.takerBuyQuoteVolume!, 0);
+    return volume ? 2 * buy / volume - 1 : 0;
+  };
+  const means = [0, 0, 0], rates = [5, 15, 60].map(span => 2 / (span + 1));
+  for (let reverse = paired.length - 1; reverse >= 0; reverse--)
+    for (let j = 0; j < means.length; j++)
+      means[j] = reverse === paired.length - 1 ? basis[reverse] : means[j] + rates[j] * (basis[reverse] - means[j]);
+  return { price, flow: [Math.log1p(current.futures.tradeCount!), imbalance(recent.slice(0, 1)), imbalance(recent.slice(0, 5))],
+    rangeBps: Math.log(current.futures.high! / current.futures.low!) * 1e4,
+    deviations: means.map(mean => basis[0] - mean), completedMinuteOpenTime };
+}
 
 /** Close location in the latest completed spot/futures minute. A flat, valid
  * candle is neutral; absent or malformed source data is never a zero value. */

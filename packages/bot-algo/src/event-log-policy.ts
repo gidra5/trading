@@ -364,13 +364,16 @@ function compileEventOperator(p: EventPolicy): EventOperatorRow[] {
 /** Fitted finite-state Bellman iteration over complete next-move distributions.
  * max is INSIDE the conditional next-state expectation, never over a realized
  * future path. Inventory, equity and price are retained on an interpolation grid.
- * Every depth includes cash settlement at its terminal boundary. */
+ * The terminal boundary is proportional cash settlement by default, or marked
+ * wealth when explicitly requested for comparison with the exact solvers. */
 export function buildEventPolicy(model: EventDistribution, costs: EventCosts,
-  options: { depths: number; referenceEquity: number; referencePrice: number; actionSteps?: number }): EventPolicy {
+  options: { depths: number; referenceEquity: number; referencePrice: number; actionSteps?: number;
+    terminal?: "friction" | "marked" }): EventPolicy {
   validateEventCosts(costs);
   validateEventDistribution(model);
-  const steps = options.actionSteps ?? 10, L = costs.maxLeverage;
-  if (!Number.isInteger(options.depths) || options.depths < 0 || options.referenceEquity <= 0 || options.referencePrice <= 0 || steps < 1) throw new Error("Invalid Bellman grid");
+  const steps = options.actionSteps ?? 10, L = costs.maxLeverage, terminal = options.terminal ?? "friction";
+  if (!Number.isInteger(options.depths) || options.depths < 0 || options.referenceEquity <= 0 || options.referencePrice <= 0
+    || steps < 1 || !["friction", "marked"].includes(terminal)) throw new Error("Invalid Bellman grid");
   const targets = Array.from({ length: 2 * steps + 1 }, (_, i) => (i - steps) * L / steps);
   const p: EventPolicy = { model, costs, targets,
     equities: [0.25, 0.5, 1, 2, 4].map(v => v * options.referenceEquity),
@@ -385,7 +388,8 @@ export function buildEventPolicy(model: EventDistribution, costs: EventCosts,
   for (let leaf = 0; leaf < model.kernels.length; leaf++) for (let w = 0; w < p.equities.length; w++)
     for (let price = 0; price < p.prices.length; price++) for (let x = 0; x < p.exposures.length; x++) {
       const settlement = 1 - Math.abs(p.exposures[x]) * (costs.feeBps + costs.slippageBps) / 1e4;
-      previous[offset(p, leaf, w, price, x)] = settlement > 0 ? Math.log(settlement) : -Infinity;
+      previous[offset(p, leaf, w, price, x)] = terminal === "marked" ? 0
+        : settlement > 0 ? Math.log(settlement) : -Infinity;
     }
   for (let depth = 1; depth <= options.depths; depth++) {
     const holds = new Float64Array(size);

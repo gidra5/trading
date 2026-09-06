@@ -20,7 +20,10 @@ for (const row of captured.results) {
     ...a, path: law.paths[a.path] })), account = config.probe.account, step = law.costs.quantityStep;
   const hold = saved.results.find((r: any) => r.request === 0); assert.ok(hold.complete && hold.finite);
   const incumbent = Math.max(...saved.results.map((r: any) => r.value));
-  const upper = hold.value + 1e-10; assert.ok(upper < incumbent);
+  // These regions are pathwise identical to hold, so their value is the
+  // already exact hold value. Equality is enough to remove them from a search
+  // for an action that strictly improves the incumbent.
+  const upper = hold.value; assert.ok(upper <= incumbent + 1e-12);
   const reference = kernel.map((a: any) => evaluateEventExecutionPath(a.path, account, 0));
   const pruned: Array<readonly [number, number]> = [], remaining: Array<readonly [number, number]> = [];
   let compared = 0;

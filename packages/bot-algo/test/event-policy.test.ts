@@ -28,7 +28,58 @@ import { EventPositionLedger } from "../src/event-positions.js";
 import { eventCashHorizon } from "../src/event-cash-horizon.js";
 import { eventMarginalCrps, prepareEventCrps } from "../src/event-crps.js";
 import { eventAverageUniqueness } from "../src/event-sampling.js";
+import { eventConformalResidualRadius, eventIntervalConfidence, eventRelativeUncertaintyConfidence,
+  eventUncertaintyRiskFloor } from "../src/event-uncertainty.js";
 import { reestimateEventTree, scaleEventMean, validateEventClock, type EventClock } from "../src/event-distribution.js";
+
+test("event conformal residual radius uses the finite-sample corrected order statistic", () => {
+  const rows = [5, 1, 3, 2, 8, 4].map(realized => ({ predicted: 0, realized }));
+  assert.equal(eventConformalResidualRadius(rows, .5), 4);
+  assert.equal(eventConformalResidualRadius(rows, .75), 8);
+  assert.equal(eventConformalResidualRadius(rows, .9), Infinity);
+  assert.throws(() => eventConformalResidualRadius([], .75), /nonempty/);
+  assert.throws(() => eventConformalResidualRadius(rows, 1), /coverage/);
+  assert.throws(() => eventConformalResidualRadius([{ predicted: 0, realized: NaN }], .5), /finite/);
+});
+
+test("forecast uncertainty continuously withdraws risk and protects accumulated profit", () => {
+  assert.equal(eventIntervalConfidence(40, -10, 90), 0);
+  assert.equal(eventIntervalConfidence(-40, -90, 10), 0);
+  near(eventIntervalConfidence(40, 20, 60), .5);
+  near(eventIntervalConfidence(.7, .6, .8, .5), .5);
+  assert.equal(eventIntervalConfidence(40, 40, 40), 1);
+  assert.throws(() => eventIntervalConfidence(1, 2, 3), /interval/);
+
+  near(eventRelativeUncertaintyConfidence(40, -10, 90), 40 / 90);
+  near(eventRelativeUncertaintyConfidence(-40, -90, 10), 40 / 90);
+  near(eventRelativeUncertaintyConfidence(.7, .6, .8, .5), 2 / 3);
+  assert.equal(eventRelativeUncertaintyConfidence(40, 40, 40), 1);
+  assert.equal(eventRelativeUncertaintyConfidence(0, -10, 10), 0);
+  assert.throws(() => eventRelativeUncertaintyConfidence(1, 2, 3), /interval/);
+
+  const uncertain = eventUncertaintyRiskFloor({ initialEquity: 10_000,
+    liquidatableHighWater: 10_200, maximumInitialRiskBps: 10,
+    minimumProtectedProfitFraction: .5, confidence: 0 });
+  assert.equal(uncertain.floor, 10_200);
+  assert.equal(uncertain.effectiveInitialRiskBps, 0);
+  assert.equal(uncertain.protectedProfitFraction, 1);
+  const partial = eventUncertaintyRiskFloor({ initialEquity: 10_000,
+    liquidatableHighWater: 10_200, maximumInitialRiskBps: 10,
+    minimumProtectedProfitFraction: .5, confidence: .4 });
+  near(partial.floor, 10_160);
+  near(partial.protectedProfitFraction, .8);
+  const certain = eventUncertaintyRiskFloor({ initialEquity: 10_000,
+    liquidatableHighWater: 10_200, maximumInitialRiskBps: 10,
+    minimumProtectedProfitFraction: .5, confidence: 1 });
+  assert.equal(certain.floor, 10_100);
+  const seed = eventUncertaintyRiskFloor({ initialEquity: 10_000,
+    liquidatableHighWater: 10_000, maximumInitialRiskBps: 10,
+    minimumProtectedProfitFraction: .5, confidence: .4 });
+  assert.equal(seed.floor, 9_996);
+  assert.throws(() => eventUncertaintyRiskFloor({ initialEquity: 10_000,
+    liquidatableHighWater: 10_000, maximumInitialRiskBps: 10,
+    minimumProtectedProfitFraction: .5, confidence: 2 }), /risk state/);
+});
 
 test("event uniqueness agrees with per-return concurrency and excludes shared endpoints", () => {
   const rows = [{ start: 0, end: 3 }, { start: 2, end: 4 }, { start: 4, end: 5 }, { start: 1000000000, end: 1000000001 }];
@@ -1264,6 +1315,10 @@ test("completed-event features exclude the current target, gaps and out-of-lookb
   const gap = { originTime: 86_460_000, availableAt: 86_520_000, return: 0.02, duration: 1 };
   h.observe(gap, gap.availableAt); const g = h.features(gap.availableAt);
   near(g[0], 1 / 16); assert.equal(g[1], 1);
+  const native = new EventCompletedHistory(0);
+  native.observe({ originTime: 0, availableAt: 1_000, return: .001, duration: 1 / 60 }, 1_000);
+  const nativeFeatures = native.features(1_000);
+  near(nativeFeatures[0], 1 / 16); assert.equal(nativeFeatures[1], 1);
 });
 
 test("projected continuation preserves conditional paths and rebuilds deeper values under the new law", () => {
@@ -1373,6 +1428,15 @@ test("Bellman diagnostics recognize the zero-return zero-friction fixed policy",
     assert.equal(t.convergence!.valueIncrementSpan, 0);
   }
   assert.deepEqual(restoreEventPolicy(serializeEventPolicy(p)).tables.map(t => t.convergence), p.tables.map(t => t.convergence));
+});
+
+test("Bellman grid can use the same marked terminal boundary as the exact finite-horizon solvers", () => {
+  const model = constantModel([0]), options = { depths: 1, referenceEquity: 10000, referencePrice: 100 };
+  const friction = buildEventPolicy(model, { ...costs, maxLeverage: 1 }, options);
+  const marked = buildEventPolicy(model, { ...costs, maxLeverage: 1 }, { ...options, terminal: "marked" });
+  const account = { equity: 10000, price: 100, exposure: 1 };
+  assert.ok(decideEvent(friction, 0, account, 1).value < 0);
+  near(decideEvent(marked, 0, account, 1).value, 0);
 });
 
 test("compiled Bellman operator retains even subnormal positive-probability ruin", () => {
@@ -1726,6 +1790,38 @@ test("honest estimation does not reuse partition returns as estimated edge", () 
   assert.throws(() => reestimateEventTree(model, [{ ...opposite[0], label: 7 }], 32), /population/);
   assert.throws(() => trainEventDistribution(rows, model.clock,
     { maxDepth: 1, minLeaf: 20, prior: 0, estimationSamples: [] }), /nonempty/);
+});
+
+test("honest tree rejects partitions without separate estimation covariate support", () => {
+  const row = (i: number, feature: number, value: number): MoveSample => ({
+    start: i, end: i + 1,
+    features: [feature, ...new Array(EVENT_FEATURES.length - 1).fill(0)],
+    nextFeatures: [feature, ...new Array(EVENT_FEATURES.length - 1).fill(0)],
+    return: value, low: Math.min(0, value), high: Math.max(0, value), duration: 1,
+    label: value < 0 ? 0 : 12,
+  });
+  const partition = Array.from({ length: 200 }, (_, i) => row(i, i < 100 ? -1 : 1, i < 100 ? -.01 : .01));
+  const estimation = Array.from({ length: 100 }, (_, i) => row(1000 + i, 1, i % 2 ? -.01 : .01));
+  const ordinary = trainEventDistribution(partition, { thresholdBps: 20, maxCandles: 10 },
+    { maxDepth: 1, minLeaf: 20, prior: 0, criterion: "mean", estimationSamples: estimation });
+  assert.equal(ordinary.kernels.length, 2);
+  assert.deepEqual(ordinary.counts, [0, 100]);
+  const supported = trainEventDistribution(partition, ordinary.clock,
+    { maxDepth: 1, minLeaf: 20, prior: 0, criterion: "mean", estimationSamples: estimation,
+      minimumEstimationLeaf: 20 });
+  assert.equal(supported.kernels.length, 1);
+  assert.deepEqual(supported.counts, [100]);
+  const changedOutcomes = estimation.map(sample => ({ ...sample, return: -sample.return,
+    low: -sample.high, high: -sample.low, label: sample.return > 0 ? 0 : 12 }));
+  const changed = trainEventDistribution(partition, ordinary.clock,
+    { maxDepth: 1, minLeaf: 20, prior: 0, criterion: "mean", estimationSamples: changedOutcomes,
+      minimumEstimationLeaf: 20 });
+  assert.deepEqual(changed.nodes, supported.nodes);
+  assert.throws(() => trainEventDistribution(partition, ordinary.clock,
+    { maxDepth: 1, minLeaf: 20, prior: 0, minimumEstimationLeaf: 20 }), /explicit estimation/);
+  assert.throws(() => trainEventDistribution(partition, ordinary.clock,
+    { maxDepth: 1, minLeaf: 20, prior: 0, estimationSamples: estimation,
+      minimumEstimationLeaf: 0 }), /positive integer/);
 });
 
 test("joint forest states retain normalized transition and class probabilities", () => {

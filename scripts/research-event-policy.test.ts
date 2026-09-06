@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventSecondBasis } from "./event-second-basis.js";
-import { eventCandleShapes, eventFuturesFeatures, eventFuturesBasisDeviations, eventFittedFuturesInputs } from "./event-futures-basis.js";
+import { eventCandleShapes, eventFuturesFeatures, eventFuturesBasisDeviations, eventFittedFuturesInputs,
+  eventNativeSecondFuturesFeatures } from "./event-futures-basis.js";
 import { eventSecondDynamics, eventSecondDynamicsAt } from "./event-second-dynamics.js";
 import { IndicatorEngine, buildSignalDefinitions } from "./analyze-technical-indicator-predictiveness.js";
 import { eventMartingaleCandles } from "./screen-event-martingale.js";
@@ -17,13 +18,17 @@ import { buildEventOutcomeLookahead, buildEventPolicy, buildEventSignLookahead, 
 import { eventFeatures, eventFeatureWarmup, eventMoveLabel, observeMove, validateEventDistribution, reestimateEventTreeWithSources,
   EVENT_FEATURES, EVENT_SECOND_INPUTS, type EventCandle, type EventDistribution } from "../packages/bot-algo/src/event-distribution.js";
 import { nativeSecondEventFeatures, NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_CONTEXT_FEATURES,
-  NATIVE_SECOND_CONTEXT_LAGS, nativeSecondContextFeatures, NATIVE_SECOND_DAY_CONTEXT_FEATURES,
-  NATIVE_SECOND_DAY_CONTEXT_LAGS, nativeSecondDayContextFeatures } from "../packages/bot-algo/src/event-second-features.js";
+  NATIVE_SECOND_CONTEXT_LAGS, nativeSecondContextFeatures, NATIVE_SECOND_FLOW_CONTEXT_FEATURES,
+  nativeSecondFlowContextFeatures, NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES,
+  nativeSecondFlowVwapContextFeatures, NATIVE_SECOND_SELECTED_SIGN_FEATURES,
+  nativeSecondSelectedSignFeatures, NATIVE_SECOND_DAY_CONTEXT_FEATURES,
+  NATIVE_SECOND_DAY_CONTEXT_LAGS, nativeSecondDayContextFeatures,
+  NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES, nativeSecondVolatilityContextFeatures } from "../packages/bot-algo/src/event-second-features.js";
 import type { EventSignHead } from "../packages/bot-algo/src/event-sign.js";
 import { eventSizeSignGroup } from "../packages/bot-algo/src/event-size-sign.js";
 import { decideFittedEvent, trainEventFittedValue } from "../packages/bot-algo/src/event-fitted-value.js";
 import { eventOriginScore, eventRefitOrigins } from "./research-event-refits.js";
-import { eventFitPeriods, eventSourceDays, mergeEventSourceRanges } from "./event-fit-periods.js";
+import { eventFitPeriods, eventFittingExclusions, eventSourceDays, mergeEventSourceRanges } from "./event-fit-periods.js";
 import { decideEventOneStep } from "../packages/bot-algo/src/event-one-step.js";
 import { markUnavailableEventSeconds, validateEventSourceSecond, validateEventMarketClosures,
   type EventMarketClosure } from "../packages/bot-algo/src/event-market-availability.js";
@@ -33,6 +38,8 @@ import { prepareEventExecutionUpper } from "../packages/bot-algo/src/event-execu
 import { prepareEventExecutionBackup } from "../packages/bot-algo/src/event-execution-backup.js";
 import { prepareEventExecutionPartitions } from "../packages/bot-algo/src/event-execution-partitions.js";
 import { prepareEventExecutionBoxUpper } from "../packages/bot-algo/src/event-execution-box.js";
+import { prepareEventExecutionRiskNeutralUpper } from "../packages/bot-algo/src/event-execution-risk-upper.js";
+import { prepareEventExecutionMeanSegmentUpper } from "../packages/bot-algo/src/event-execution-mean-segment.js";
 import { maximizeEventAcceptanceSequence } from "../packages/bot-algo/src/event-execution-acceptance.js";
 import { eventAffineSegmentSupports } from "../packages/bot-algo/src/event-affine-segment.js";
 
@@ -278,16 +285,22 @@ test("execution request search matches exhaustive lattices with outcome-dependen
       return { probability, path: summarizeEventExecutionPath(bars, 0, 5, costs, sample % 5 !== 0) };
     });
     const solve = prepareEventExecutionOneStep(kernel, terminal, { captureRegions: true }), upper = prepareEventExecutionUpper(kernel);
+    const mean = prepareEventExecutionOneStep(kernel, terminal, { objective: "mean" });
+    const alternativeProbabilities = kernel.map((_, index) => kernel[kernel.length - 1 - index].probability);
+    const robust = prepareEventExecutionOneStep(kernel, terminal, { alternativeProbabilities: [alternativeProbabilities] });
     for (const quantity of [-10, -4, -.125, 0, .125, 2, 6, 12]) {
       const account = { equity: 40, price: 10, exposure: quantity / 4 }, result = solve(account);
       const maximum = Math.ceil(costs.maxNotional / Math.min(...kernel.map(a => a.path.openRatio * account.price)) / costs.quantityStep) + 4;
       const value = (k: number) => kernel.reduce((s, a) => s + a.probability
         * evaluateEventExecutionPath(a.path, account, k * costs.quantityStep, terminal).logGrowth, 0);
       let best = -Infinity;
+      let bestMean = -Infinity;
       assert.ok("requestRegions" in result);
       const regions = result.requestRegions;
       for (let k = -maximum; k <= maximum; k++) {
         const score = value(k); best = Math.max(best, score);
+        if (Number.isFinite(score)) bestMean = Math.max(bestMean, kernel.reduce((sum, atom) => sum + atom.probability
+          * evaluateEventExecutionPath(atom.path, account, k * costs.quantityStep, terminal).equity / account.equity, 0));
         if (Math.abs(k) <= result.search.maximumLots) assert.equal(regions.some(([lo, hi]) => k >= lo && k <= hi), Number.isFinite(score),
           `region coverage ${terminal}, L=${leverage}, sample=${sample}, Q=${quantity}, lot=${k}`);
       }
@@ -309,9 +322,55 @@ test("execution request search matches exhaustive lattices with outcome-dependen
       else assert.equal(result.value, best);
       assert.ok(upper(account) >= best - 1e-10, `opening-information upper ${terminal}, L=${leverage}, sample=${sample}, Q=${quantity}`);
       assert.equal(result.value, value(Math.round(result.quantity / costs.quantityStep))); checked++;
+      const meanResult = mean(account); assert.equal(meanResult.objective, "mean-terminal-equity-ratio");
+      assert.ok(meanResult.value === bestMean || Math.abs(meanResult.value - bestMean) < 1e-11,
+        `execution mean optimum ${terminal}, L=${leverage}, sample=${sample}, Q=${quantity}: ${meanResult.value} vs ${bestMean}`);
+      const minimumLiquidatableEquity = account.equity * (sample % 2 ? .98 : .9);
+      const constrained = solve(account, { minimumLiquidatableEquity });
+      let constrainedBest = -Infinity;
+      for (let k = -maximum; k <= maximum; k++) {
+        let score = 0;
+        for (const atom of kernel) {
+          const next = evaluateEventExecutionPath(atom.path, account, k * costs.quantityStep, terminal);
+          const closeRate = (costs.feeBps + costs.slippageBps) / 10_000;
+          const liquidatableEquity = next.equity - Math.abs(next.quantity) * next.price * closeRate;
+          if (!Number.isFinite(next.logGrowth) || liquidatableEquity < minimumLiquidatableEquity - 1e-8) {
+            score = -Infinity; break;
+          }
+          score += atom.probability * next.logGrowth;
+        }
+        constrainedBest = Math.max(constrainedBest, score);
+      }
+      assert.ok(constrained.value === constrainedBest || Math.abs(constrained.value - constrainedBest) < 1e-11,
+        `risk-constrained optimum ${terminal}, L=${leverage}, sample=${sample}, Q=${quantity}: ${constrained.value} vs ${constrainedBest}`);
+      const selectedConstrained = kernel.map(atom => evaluateEventExecutionPath(atom.path, account, constrained.quantity, terminal));
+      assert.ok(constrained.value === -Infinity || selectedConstrained.every(next =>
+        next.equity - Math.abs(next.quantity) * next.price * (costs.feeBps + costs.slippageBps) / 10_000
+          >= minimumLiquidatableEquity - 1e-8));
+      const robustResult = robust(account, { minimumLiquidatableEquity });
+      let robustBest = -Infinity;
+      for (let k = -maximum; k <= maximum; k++) {
+        const outcomes = kernel.map(atom => evaluateEventExecutionPath(atom.path, account, k * costs.quantityStep, terminal));
+        const closeRate = (costs.feeBps + costs.slippageBps) / 10_000;
+        if (outcomes.some(next => !Number.isFinite(next.logGrowth)
+          || next.equity - Math.abs(next.quantity) * next.price * closeRate < minimumLiquidatableEquity - 1e-8)) continue;
+        const base = outcomes.reduce((sum, next, index) => sum + kernel[index].probability * next.logGrowth, 0);
+        const alternative = outcomes.reduce((sum, next, index) => sum + alternativeProbabilities[index] * next.logGrowth, 0);
+        robustBest = Math.max(robustBest, Math.min(base, alternative));
+      }
+      assert.ok(robustResult.value === robustBest || Math.abs(robustResult.value - robustBest) < 1e-11,
+        `robust risk-constrained optimum ${terminal}, L=${leverage}, sample=${sample}, Q=${quantity}: ${robustResult.value} vs ${robustBest}`);
     }
   }
   assert.equal(checked, 960);
+  assert.throws(() => prepareEventExecutionOneStep([{ probability: 1, path: summarizeEventExecutionPath(
+    seconds().slice(0, 2), 0, 1, DEFAULT_EVENT_COSTS) }])({ equity: 100, price: 100, exposure: 0 },
+    { minimumLiquidatableEquity: -1 }), /minimum liquidatable equity/);
+  const valid = [{ probability: 1, path: summarizeEventExecutionPath(seconds().slice(0, 2), 0, 1, DEFAULT_EVENT_COSTS) }];
+  assert.throws(() => prepareEventExecutionOneStep(valid, "marked", { alternativeProbabilities: [[.5]] }),
+    /alternative execution probabilities/);
+  assert.throws(() => prepareEventExecutionOneStep(valid, "marked", { objective: "mean", alternativeProbabilities: [[1]] }),
+    /Robust mean/);
 });
 
 test("opening-information bound retains joint outcomes, fees and above-cap holds", () => {
@@ -336,6 +395,44 @@ test("opening-information bound retains joint outcomes, fees and above-cap holds
   const doomed = { ...flat, exposure: 201 };
   assert.equal(prepareEventExecutionUpper(positive)(doomed), -Infinity);
   assert.throws(() => prepareEventExecutionUpper([{ probability: 1 + 1e-9, path: positive[0].path }]), /normalized/);
+});
+
+test("risk-neutral execution relaxation bounds every common request and is convex in balances", () => {
+  let seed = 739120;
+  const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
+  for (let sample = 0; sample < 40; sample++) {
+    const costs = { ...DEFAULT_EVENT_COSTS, feeBps: sample % 3 ? 12 : 0, slippageBps: 0,
+      maxLeverage: 3, maintenanceMargin: .04, minQuantity: .25, quantityStep: .25,
+      minNotional: sample % 2 ? 5 : 0, maxNotional: 25,
+      longBorrowBpsPerDay: 7200, shortBorrowBpsPerDay: 14400 };
+    const kernel = [.2, .3, .5].map((probability, j) => {
+      const bars: EventCandle[] = [{ openTime: 0, open: 10, high: 10, low: 10, close: 10, volume: 1 }];
+      for (let i = 1; i <= 4; i++) {
+        const open = bars[i - 1].close * (.82 + .36 * random()), close = open * (.82 + .36 * random());
+        bars.push({ openTime: i * 1000, open, close, low: Math.min(open, close) * .96,
+          high: Math.max(open, close) * 1.04, volume: 1 });
+      }
+      if (sample % 5 === 0 && j === 1) bars[1].carriedMark = true;
+      return { probability, path: summarizeEventExecutionPath(bars, 0, 4, costs) };
+    });
+    const upper = prepareEventExecutionRiskNeutralUpper(kernel), price = 10;
+    const endpoints = [[30 + 40 * random(), -3 + 6 * random()], [30 + 40 * random(), -3 + 6 * random()]];
+    const account = ([cash, quantity]: number[]) => {
+      const equity = cash + quantity * price; return { equity, price, exposure: quantity * price / equity };
+    };
+    if (endpoints.some(([cash, quantity]) => cash + quantity * price <= 5)) { sample--; continue; }
+    for (const balance of endpoints) {
+      const a = account(balance), bound = upper(a);
+      for (let lots = -14; lots <= 14; lots++) {
+        const expected = kernel.reduce((sum, atom) => sum + atom.probability
+          * evaluateEventExecutionPath(atom.path, a, lots * costs.quantityStep).equity, 0);
+        assert.ok(bound >= expected - 1e-8, `risk upper sample=${sample}, lots=${lots}: ${bound} < ${expected}`);
+      }
+    }
+    const middle = endpoints[0].map((value, i) => (value + endpoints[1][i]) / 2);
+    assert.ok(upper(account(middle)) <= (upper(account(endpoints[0])) + upper(account(endpoints[1]))) / 2 + 1e-8,
+      `risk upper convexity sample=${sample}`);
+  }
 });
 
 test("execution Bellman backup bounds complete policies and prunes only against achievable values", () => {
@@ -463,6 +560,45 @@ test("balance-box upper dominates exhaustive common-request policies across inve
     }
   }
   assert.equal(checked, 3000);
+});
+
+test("mean-equity segment bound preserves one account coordinate and covers exact request policies", () => {
+  let seed = 904731;
+  const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 2 ** 32; };
+  for (let sample = 0; sample < 60; sample++) {
+    const costs = { ...DEFAULT_EVENT_COSTS, feeBps: sample % 3 ? 13 : 0, slippageBps: 0,
+      maxLeverage: [1, 3, 5][sample % 3], maintenanceMargin: .04,
+      minQuantity: .25, quantityStep: .25, minNotional: sample % 2 ? 5 : 0,
+      maxNotional: [8, 25, 70][sample % 3], longBorrowBpsPerDay: 14400, shortBorrowBpsPerDay: 86400 };
+    const kernel = [.2, .3, .5].map((probability, j) => {
+      const bars: EventCandle[] = [{ openTime: 0, open: 10, high: 10, low: 10, close: 10, volume: 1 }];
+      for (let i = 1; i <= 4; i++) {
+        const open = bars[i - 1].close * (.85 + .3 * random()), close = open * (.85 + .3 * random());
+        bars.push({ openTime: i * 1000, open, close, low: Math.min(open, close) * .97,
+          high: Math.max(open, close) * 1.03, volume: 1 });
+      }
+      if (sample % 5 === 0 && j === 1) bars[1].carriedMark = true;
+      return { probability, path: summarizeEventExecutionPath(bars, 0, 4, costs) };
+    });
+    const vertices = [[25 + 35 * random(), -2 + 4 * random()], [25 + 35 * random(), -2 + 4 * random()]] as const;
+    if (vertices.some(([cash, quantity]) => cash + 10 * quantity <= 3)) { sample--; continue; }
+    const bound = prepareEventExecutionMeanSegmentUpper(kernel)({ price: 10, vertices });
+    assert.equal(bound.complete, true);
+    for (const t of [0, .25, .5, .75, 1]) {
+      const cash = vertices[0][0] + t * (vertices[1][0] - vertices[0][0]);
+      const quantity = vertices[0][1] + t * (vertices[1][1] - vertices[0][1]);
+      const equity = cash + quantity * 10, account = { equity, price: 10, exposure: quantity * 10 / equity };
+      let exact = -Infinity;
+      for (let lots = -40; lots <= 40; lots++) {
+        const outcomes = kernel.map(atom => evaluateEventExecutionPath(atom.path, account, lots * costs.quantityStep));
+        if (outcomes.some(row => !Number.isFinite(row.logGrowth))) continue;
+        exact = Math.max(exact, outcomes.reduce((sum, row, i) => sum + kernel[i].probability * row.equity, 0));
+      }
+      assert.ok(bound.upperTerminalEquity >= exact - 1e-8,
+        `mean segment sample=${sample}, t=${t}: ${bound.upperTerminalEquity} < ${exact}`);
+      if (t === 0 || t === 1) assert.ok(bound.endpointUpperTerminalEquities[t] >= exact - 1e-8);
+    }
+  }
 });
 
 test("affine balance-segment supports match exhaustive primal breakpoints", () => {
@@ -677,7 +813,23 @@ test("fit periods use the latest admissible whole-day block including feature hi
   // A non-midnight exclusion moves to the preceding whole-day boundary.
   const halfDay = { id: "partial-day", startTime: start - day / 2, endTime: start + day };
   assert.equal(eventFitPeriods(start, 4, history, [halfDay]).calibrationEnd, start - day);
+  const sevenDayCalibration = eventFitPeriods(start, 4, history, [future], 7);
+  assert.equal(sevenDayCalibration.fitEnd, start - 7 * day);
+  assert.equal(sevenDayCalibration.calibrationStart, start - 7 * day);
+  assert.equal(sevenDayCalibration.calibrationEnd, start);
+  assert.throws(() => eventFitPeriods(start, 4, history, [], 0), /periods/);
   assert.throws(() => eventFitPeriods(start + 1, 4, history, []), /periods/);
+});
+
+test("native fitting can retain unscored fit windows while excluding every scored window", () => {
+  const catalog = [
+    { id: "fit-full", startTime: 0, endTime: 10 },
+    { id: "sideways-test", startTime: 10, endTime: 20 },
+    { id: "latest", startTime: 20, endTime: 30 },
+  ];
+  assert.deepEqual(eventFittingExclusions(catalog, "all-catalog").map(row => row.id), ["fit-full", "sideways-test"]);
+  assert.deepEqual(eventFittingExclusions(catalog, "non-fit").map(row => row.id), ["sideways-test"]);
+  assert.throws(() => eventFittingExclusions(catalog, "bad" as any), /exclusion mode/);
 });
 
 test("native source blocks merge overlaps while omitted gaps cannot become returns or features", () => {
@@ -715,6 +867,30 @@ test("native slow context uses exact historical endpoints and purges its full su
   assert.throws(() => nativeSecondContextFeatures(c, i), /endpoint/);
 });
 
+test("native multiscale volatility context is causal and uses exact rolling return variances", () => {
+  let price = 100;
+  const c = Array.from({ length: 14420 }, (_, i) => {
+    if (i) price *= Math.exp(((i % 11) - 5) * 0.000002);
+    return { openTime: i * 1000, open: price, high: price, low: price, close: price, volume: 1 };
+  });
+  const clock = { ...secondModel().clock, maxCandles: 1 }, i = 14400;
+  const values = eventFeatures(c, i, NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES, clock);
+  assert.equal(eventFeatureWarmup(clock, NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES), 14400);
+  assert.deepEqual(values.slice(0, NATIVE_SECOND_CONTEXT_FEATURES.length), nativeSecondContextFeatures(c, i));
+  const level = (window: number) => {
+    let square = 0;
+    for (let j = i - window + 1; j <= i; j++) square += Math.log(c[j].close / c[j - 1].close) ** 2;
+    return Math.log1p(Math.sqrt(square / window) * 10000);
+  };
+  const anchor = level(3600);
+  const expected = [anchor, level(900) - anchor, level(1800) - anchor, level(14400) - anchor];
+  values.slice(-4).forEach((value, index) => assert.ok(Math.abs(value - expected[index]) < 1e-12));
+  c[i + 1].close *= 2;
+  assert.deepEqual(nativeSecondVolatilityContextFeatures(c, i), values);
+  const broken = c.map(row => ({ ...row })); broken[i - 100].openTime++;
+  assert.throws(() => nativeSecondVolatilityContextFeatures(broken, i), /missing seconds/);
+});
+
 test("native second features require their declared clock and cannot read future or cross missing seconds", () => {
   const c = seconds(), m = secondModel();
   const before = eventFeatures(c, 63, m.featureNames, m.clock);
@@ -728,6 +904,73 @@ test("native second features require their declared clock and cannot read future
   assert.throws(() => validateEventDistribution({ ...m, clock: model.clock }), /interval/);
   c[12].openTime++;
   assert.throws(() => nativeSecondEventFeatures(c, 63), /contiguous/);
+});
+
+test("native trade-flow context uses only the completed matching second", () => {
+  const c = Array.from({ length: 14420 }, (_, i) => ({ openTime: i * 1000,
+    open: 100 + i / 1000, high: 100 + i / 1000, low: 100 + i / 1000, close: 100 + i / 1000, volume: 1,
+    nativeTradeFlow: { availableAt: i * 1000 + 1000, aggregateCountImbalance: i === 14400 ? -0.25 : 0,
+      lastAggressorSide: i === 14400 ? -1 : 0, buyerSellerVwapGap: i === 14400 ? 0.0002 : 0 } }));
+  const clock = { ...secondModel().clock, maxCandles: 1 }, i = 14400;
+  const values = eventFeatures(c, i, NATIVE_SECOND_FLOW_CONTEXT_FEATURES, clock);
+  assert.equal(eventFeatureWarmup(clock, NATIVE_SECOND_FLOW_CONTEXT_FEATURES), 14400);
+  assert.deepEqual(values.slice(0, NATIVE_SECOND_CONTEXT_FEATURES.length), nativeSecondContextFeatures(c, i));
+  assert.deepEqual(values.slice(-2), [-0.25, -1]);
+  const vwapValues = eventFeatures(c, i, NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES, clock);
+  assert.deepEqual(vwapValues.slice(-3), [-0.25, -1, 0.0002]);
+  c[i + 1].nativeTradeFlow.aggregateCountImbalance = 1;
+  assert.deepEqual(nativeSecondFlowContextFeatures(c, i), values);
+  c[i].nativeTradeFlow.availableAt++;
+  assert.throws(() => nativeSecondFlowContextFeatures(c, i), /trade flow/);
+  c[i].nativeTradeFlow.availableAt--;
+  c[i].nativeTradeFlow.aggregateCountImbalance = 2;
+  assert.throws(() => eventFeatures(c, i, NATIVE_SECOND_FLOW_CONTEXT_FEATURES, clock), /trade flow/);
+  c[i].nativeTradeFlow.aggregateCountImbalance = -0.25;
+  c[i].nativeTradeFlow.buyerSellerVwapGap = 3;
+  assert.throws(() => nativeSecondFlowVwapContextFeatures(c, i), /VWAP/);
+  c[i].nativeTradeFlow.buyerSellerVwapGap = 0.0002;
+  delete (c[i] as Partial<typeof c[number]>).nativeTradeFlow;
+  assert.throws(() => eventFeatures(c, i, NATIVE_SECOND_FLOW_CONTEXT_FEATURES, clock), /trade flow/);
+  assert.throws(() => eventFeatures(c, i, NATIVE_SECOND_FLOW_CONTEXT_FEATURES, model.clock), /interval/);
+});
+
+test("selected native sign features are causal and reproduce audited price and rich-flow transforms", () => {
+  let price = 100;
+  const c = Array.from({ length: 14420 }, (_, i) => {
+    const logReturn = i ? ((i % 5) - 2) * 0.00001 : 0;
+    price *= Math.exp(logReturn);
+    return { openTime: i * 1000, open: price, high: price, low: price, close: price, volume: 1,
+      nativeTradeFlow: { availableAt: i * 1000 + 1000, aggregateCountImbalance: 1 / 3,
+        lastAggressorSide: 1, buyerSellerVwapGap: 0,
+        aggressiveBuyQuoteVolume: 2, aggressiveSellQuoteVolume: 1,
+        aggressiveBuyMaxAggregateQuantity: 2, aggressiveSellMaxAggregateQuantity: 1 } };
+  });
+  const clock = { ...secondModel().clock, maxCandles: 1 }, i = 14400;
+  Object.assign(c[i - 1].nativeTradeFlow!, { lastAggressorSide: -1 });
+  Object.assign(c[i].nativeTradeFlow!, { aggregateCountImbalance: -0.25, lastAggressorSide: 1,
+    aggressiveBuyQuoteVolume: 6, aggressiveSellQuoteVolume: 2,
+    aggressiveBuyMaxAggregateQuantity: 5, aggressiveSellMaxAggregateQuantity: 1 });
+  const values = eventFeatures(c, i, NATIVE_SECOND_SELECTED_SIGN_FEATURES, clock);
+  assert.equal(eventFeatureWarmup(clock, NATIVE_SECOND_SELECTED_SIGN_FEATURES), 14400);
+  assert.deepEqual(values.slice(0, NATIVE_SECOND_CONTEXT_FEATURES.length), nativeSecondContextFeatures(c, i));
+  const returns = Array.from({ length: 16 }, (_, offset) => Math.log(c[i - 15 + offset].close / c[i - 16 + offset].close));
+  const expectedHaar = (returns[14] - returns[15])
+    / (Math.SQRT2 * Math.sqrt(returns.reduce((sum, value) => sum + value * value, 0)));
+  let buyEma = 2, sellEma = 1;
+  buyEma += 2 / 3 * (6 - buyEma); sellEma += 2 / 3 * (2 - sellEma);
+  assert.ok(Math.abs(values.at(-8)! - returns[14] * 10000) < 1e-10);
+  assert.ok(Math.abs(values.at(-7)! - expectedHaar) < 1e-12);
+  assert.deepEqual(values.slice(-6, -3), [-0.25, 1, -1]);
+  assert.ok(Math.abs(values.at(-3)! - 0.5) < 1e-12);
+  assert.ok(Math.abs(values.at(-1)! - (5 - 1) / (5 + 1)) < 1e-12);
+  assert.ok(Math.abs(values.at(-2)! - (buyEma - sellEma) / (buyEma + sellEma)) < 1e-12);
+  c[i + 1].close *= 2;
+  assert.deepEqual(nativeSecondSelectedSignFeatures(c, i), values);
+  delete c[i].nativeTradeFlow!.aggressiveBuyQuoteVolume;
+  assert.throws(() => nativeSecondSelectedSignFeatures(c, i), /rich native trade flow/);
+  c[i].nativeTradeFlow!.aggressiveBuyQuoteVolume = 6;
+  c[i - 1].nativeTradeFlow!.availableAt++;
+  assert.throws(() => nativeSecondSelectedSignFeatures(c, i), /trade flow/);
 });
 
 test("native day context preserves shorter features, rejects bad endpoints and purges the whole day", () => {
@@ -952,6 +1195,35 @@ test("futures event inputs use completed contiguous minutes and distinguish miss
   rows.set(missingTime, saved);
   for (const r of rows.values()) { r.quoteVolume = 0; r.takerBuyQuoteVolume = 0; r.tradeCount = 0; }
   assert.deepEqual(eventFuturesFeatures(c, 5, t => rows.get(t))!.flow, [0, 0, 0]);
+});
+
+test("native-second futures inputs use only fully completed paired minutes", () => {
+  const count = 241 * 60 + 31;
+  const c: EventCandle[] = Array.from({ length: count }, (_, i) => ({ openTime: i * 1_000,
+    open: 100, high: 100, low: 100, close: 100, volume: 1 }));
+  const rows = new Map<number, SequentialDerivativesKlineRow>();
+  for (let minute = 0; minute < 242; minute++) rows.set(minute * 60_000, {
+    openTime: minute * 60_000, open: 101, high: 102, low: 100, close: 101,
+    baseVolume: 10, quoteVolume: 1_000, tradeCount: 100,
+    takerBuyBaseVolume: 6, takerBuyQuoteVolume: 600,
+  });
+  const index = count - 2, result = eventNativeSecondFuturesFeatures(c, index, time => rows.get(time))!;
+  assert.equal(result.completedMinuteOpenTime, 240 * 60_000);
+  assert.ok(Math.abs(result.price[0] - Math.log(1.01) * 1e4) < 1e-12);
+  assert.deepEqual(result.price.slice(1), [0, 0]);
+  assert.equal(result.flow[0], Math.log1p(100));
+  assert.ok(Math.abs(result.flow[1] - .2) < 1e-12 && Math.abs(result.flow[2] - .2) < 1e-12);
+  assert.ok(Math.abs(result.rangeBps - Math.log(1.02) * 1e4) < 1e-12);
+  result.deviations.forEach(value => assert.ok(Math.abs(value) < 1e-12));
+  rows.get(241 * 60_000)!.close = 999;
+  c[index + 1].close = 999;
+  assert.deepEqual(eventNativeSecondFuturesFeatures(c, index, time => rows.get(time)), result);
+  const missing = rows.get(100 * 60_000)!;
+  rows.delete(100 * 60_000);
+  assert.equal(eventNativeSecondFuturesFeatures(c, index, time => rows.get(time)), null);
+  rows.set(100 * 60_000, missing);
+  c[100 * 60 + 59].openTime++;
+  assert.equal(eventNativeSecondFuturesFeatures(c, index, time => rows.get(time)), null);
 });
 
 test("candle close locations use aligned completed OHLC and distinguish flat from invalid sources", () => {

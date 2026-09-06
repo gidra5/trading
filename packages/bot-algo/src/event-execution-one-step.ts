@@ -31,13 +31,31 @@ export function cloneEventExecutionAtoms(input: readonly EventExecutionAtom[]) {
  * is concave. No-action remains admissible above the entry leverage cap, as in
  * the replay; it still bears maintenance/liquidation risk. */
 export function prepareEventExecutionOneStep(input: readonly EventExecutionAtom[], terminal: "marked" | "market" = "marked",
-  options: { captureRegions?: boolean } = {}) {
+  options: { captureRegions?: boolean; objective?: "log" | "mean";
+    alternativeProbabilities?: readonly (readonly number[])[] } = {}) {
   if (!["marked", "market"].includes(terminal)) throw new Error("Invalid execution terminal");
+  if (options.objective && !["log", "mean"].includes(options.objective)) throw new Error("Invalid execution objective");
   const atoms = cloneEventExecutionAtoms(input), costs = input[0].path.costs;
   const c = { ...costs }, step = c.quantityStep, fee = (c.feeBps + c.slippageBps) / 10000;
-  return (account: EventAccount) => {
+  const objective = options.objective ?? "log";
+  const retained = input.map((atom, index) => atom.probability > 0 ? index : -1).filter(index => index >= 0);
+  const probabilityModels = [atoms.map(atom => atom.probability)];
+  for (const probabilities of options.alternativeProbabilities ?? []) {
+    if (probabilities.length !== input.length || probabilities.some(probability => !Number.isFinite(probability) || probability < 0)
+      || Math.abs(probabilities.reduce((sum, probability) => sum + probability, 0) - 1) > 1e-8
+      || input.some((atom, index) => atom.probability <= 0 && probabilities[index] > 0))
+      throw new Error("Invalid alternative execution probabilities");
+    probabilityModels.push(retained.map(index => probabilities[index]));
+  }
+  if (objective === "mean" && probabilityModels.length > 1)
+    throw new Error("Robust mean execution objective is not supported");
+  return (account: EventAccount, solveOptions: { minimumLiquidatableEquity?: number } = {}) => {
     const { equity: E, price: P, exposure: x } = account;
     if (!(E > 0 && P > 0) || ![E, P, x].every(Number.isFinite)) throw new Error("Invalid execution account");
+    const minimumLiquidatableEquity = solveOptions.minimumLiquidatableEquity;
+    if (minimumLiquidatableEquity !== undefined
+      && (!Number.isFinite(minimumLiquidatableEquity) || minimumLiquidatableEquity < 0))
+      throw new Error("Invalid minimum liquidatable equity");
     const Q = x * E / P, roundedQ = Math.round(Q / step) * step;
     const rows = atoms.map(atom => {
       const p = atom.path, open = P * p.openRatio, close = P * p.closeRatio;
@@ -54,21 +72,24 @@ export function prepareEventExecutionOneStep(input: readonly EventExecutionAtom[
       || !Number.isSafeInteger(Math.round(Q / step) + maximum) || !Number.isSafeInteger(Math.round(Q / step) - maximum))
       throw new Error("Execution request lattice exceeds integer precision");
     const search = { evaluatedOrders: 0, regions: 0, searchedIntervals: 0, derivativeEvaluations: 0, maximumLots: maximum };
-    const visited = new Set<number>(), guards = new Set<number>([-maximum, 0, maximum]);
+    const visited = new Set<number>(), scores = new Map<number, number>(), guards = new Set<number>([-maximum, 0, maximum]);
     const feasiblePoints = new Set<number>(), feasibleIntervals: Array<readonly [number, number]> = [];
     let best = 0, value = -Infinity;
     const consider = (k: number) => {
-      if (!Number.isSafeInteger(k) || Math.abs(k) > maximum || visited.has(k)) return;
+      if (!Number.isSafeInteger(k) || Math.abs(k) > maximum) return -Infinity;
+      if (visited.has(k)) return scores.get(k) ?? -Infinity;
       visited.add(k); search.evaluatedOrders++;
       const request = k * step;
       if (Math.abs(request / step - Math.round(request / step)) > 1e-7) throw new Error("Execution request lost lot precision");
-      let score = 0;
+      const modelScores = probabilityModels.map(() => 0);
+      let score = -Infinity;
       // The same scalar transition as evaluateEventExecutionPath, with the
       // account/opening constants prepared once and no diagnostic objects per
       // candidate/outcome. Final scores are checked against that reference.
-      for (const row of rows) {
+      for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+        const row = rows[rowIndex];
         const p = row.path, G = row.open;
-        if (row.openingRuin) { score = -Infinity; break; }
+        if (row.openingRuin) break;
         let quantity = Q, equity = row.equity;
         if (request && p.openingAvailable) {
           const turnover = Math.abs(request) * G, cost = turnover * fee;
@@ -80,21 +101,35 @@ export function prepareEventExecutionOneStep(input: readonly EventExecutionAtom[
         const cash = equity - quantity * G, borrowedLong = quantity > 0 && cash < 0;
         const riskCash = quantity >= 0 ? cash + quantity * P * (1 - c.maintenanceMargin)
           * (borrowedLong ? p.minimumDiscountedLongLow : p.lowRatio) : cash + quantity * P * p.maximumShortMaintenancePrice;
-        if (!(riskCash > 0)) { score = -Infinity; break; }
+        if (!(riskCash > 0)) break;
         const borrowing = borrowedLong ? -cash * (p.longDebtGrowth - 1) : quantity < 0 ? -quantity * P * p.shortBorrowPriceIntegral : 0;
         equity = cash + quantity * row.close - borrowing;
-        if (!(equity > 0)) { score = -Infinity; break; }
+        if (!(equity > 0)) break;
         const notional = Math.abs(quantity) * row.close;
-        if (terminal === "market" && p.terminalAvailable && quantity && Math.abs(quantity) >= c.minQuantity - 1e-12 && notional >= c.minNotional - 1e-8)
-          equity -= notional * fee;
-        if (!(equity > 0)) { score = -Infinity; break; }
-        score += row.probability * Math.log(equity / E);
+        let remainingQuantity = quantity;
+        if (terminal === "market" && p.terminalAvailable && quantity && Math.abs(quantity) >= c.minQuantity - 1e-12 && notional >= c.minNotional - 1e-8) {
+          equity -= notional * fee; remainingQuantity = 0;
+        }
+        if (!(equity > 0)) break;
+        // Reserve one executable close at the terminal mark. This makes the
+        // floor comparable across marked and already-settled accounts without
+        // treating unrealized PnL as bankable equity.
+        const liquidatableEquity = equity - Math.abs(remainingQuantity) * row.close * fee;
+        if (minimumLiquidatableEquity !== undefined
+          && liquidatableEquity < minimumLiquidatableEquity - 1e-8) break;
+        const payoff = objective === "log" ? Math.log(equity / E) : equity / E;
+        for (let model = 0; model < probabilityModels.length; model++)
+          modelScores[model] += probabilityModels[model][rowIndex] * payoff;
+        if (rowIndex === rows.length - 1) score = Math.min(...modelScores);
       }
+      scores.set(k, score);
       if (options.captureRegions && Number.isFinite(score)) feasiblePoints.add(k);
       if (score > value || score === value && Math.abs(k) < Math.abs(best)) { best = k; value = score; }
+      return score;
     };
     const finish = () => {
-      const result = { quantity: best * step, value, feasible: Number.isFinite(value), terminal, complete: true, search };
+      const result = { quantity: best * step, value, feasible: Number.isFinite(value), terminal, complete: true, search,
+        ...(objective === "mean" ? { objective: "mean-terminal-equity-ratio" as const } : {}) };
       if (!options.captureRegions) return result;
       // Every non-singleton interval retains a fixed acceptance and funding
       // branch for every outcome. Do not merge adjacent intervals across a
@@ -171,10 +206,15 @@ export function prepareEventExecutionOneStep(input: readonly EventExecutionAtom[
         const assetPrice = P * (p.closeRatio + (q < 0 ? p.shortBorrowPriceIntegral : 0));
         let a = cash0 * cashFactor + q0 * assetPrice, b = cash1 * cashFactor + q1 * assetPrice;
         positive(a, b);
-        if (terminal === "market" && p.terminalAvailable && Math.abs(q) >= c.minQuantity - 1e-12
-          && Math.abs(q) * P * p.closeRatio >= c.minNotional - 1e-8) {
+        const terminalCloses = terminal === "market" && p.terminalAvailable && Math.abs(q) >= c.minQuantity - 1e-12
+          && Math.abs(q) * P * p.closeRatio >= c.minNotional - 1e-8;
+        if (terminalCloses) {
           const closeCost = Math.sign(q) * P * p.closeRatio * fee;
           a -= q0 * closeCost; b -= q1 * closeCost; positive(a, b);
+        }
+        if (minimumLiquidatableEquity !== undefined) {
+          const reservedClose = terminalCloses ? 0 : Math.sign(q) * P * p.closeRatio * fee;
+          positive(a - q0 * reservedClose - minimumLiquidatableEquity + 1e-8, b - q1 * reservedClose);
         }
         if (low > high) break;
         affine.push({ a, b, probability: atom.probability });
@@ -182,6 +222,19 @@ export function prepareEventExecutionOneStep(input: readonly EventExecutionAtom[
       if (low > high) continue;
       if (options.captureRegions) feasibleIntervals.push([low, high]);
       search.searchedIntervals++; consider(low); consider(high);
+      if (objective === "mean") continue;
+      if (probabilityModels.length > 1) {
+        // The lower envelope of concave expected-log objectives is concave.
+        // Compare adjacent lattice values to find its (possibly kinked) peak.
+        while (low < high) {
+          const k = Math.floor((low + high) / 2);
+          search.derivativeEvaluations++;
+          if (consider(k) <= consider(k + 1)) low = k + 1;
+          else high = k;
+        }
+        for (let k = low - 1; k <= low + 1; k++) consider(k);
+        continue;
+      }
       while (low < high) {
         const k = Math.floor((low + high) / 2); let delta = 0;
         search.derivativeEvaluations++;

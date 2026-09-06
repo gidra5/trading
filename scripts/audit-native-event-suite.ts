@@ -28,7 +28,8 @@ fs.mkdirSync(output, { recursive: true });
 const save = (file: string, value: unknown) => fs.writeFileSync(path.join(output, file), JSON.stringify(value, null, 2));
 save("config.json", { contract: "native-event-coverage-suite-v1", mode, sourceName, sourceConfigHash, windows, catalog, budget,
   protocol: { candleIntervalMs: 1000, thresholdBps: 48, maxCandles: 3600, features: NATIVE_SECOND_CONTEXT_FEATURES,
-    fitDays: 4, estimation: "later-fit-stride", extraEstimationDays: 0, weighting: "uniqueness", priorMode: "matched-ratio", costs: DEFAULT_EVENT_COSTS },
+    fitDays: 4, estimation: "later-fit-stride", extraEstimationDays: 0, weighting: "uniqueness", priorMode: "matched-ratio",
+    fittingExclusions: "non-fit", costs: DEFAULT_EVENT_COSTS },
   maxProbeSeconds: 2,
   method: "Screen all requested windows with the same date-only admissible fit and separate calibration, native 48bp/3600s events and frozen uniqueness-weighted joint law. Replay consumes saved laws and profiles every first calibration leaf plus first held account. Scale only when all probes meet 0.001bp and each takes <=2s. Returns and accuracy never select coverage. Preserve budget stops and data failures and continue other windows. Child processes run sequentially with saved logs and complete source/model artifacts. Full replay retains next-open execution; certificates concern finite decision-price marked-terminal H2, not stationary or execution-optimal control, independent holdouts or profitability." });
 save("sources.json", Object.fromEntries(["scripts/audit-native-event-suite.ts", "scripts/research-native-second-events.ts",
@@ -55,7 +56,7 @@ for (const window of windows) {
     if (mode === "screen") {
       run(window.id, phase, "scripts/research-native-second-events.ts", ["--window", window.id, "--clock", "barrier",
         "--threshold-bps", "48", "--max-candles", "3600", "--test-hours", "24", "--features", "context",
-        "--fit-days", "4", "--estimation", "later-fit-stride", "--output", `${prefix}/fit`]);
+        "--fit-days", "4", "--estimation", "later-fit-stride", "--exclusions", "non-fit", "--output", `${prefix}/fit`]);
       phase = "law";
       run(window.id, phase, "scripts/reestimate-native-event-law.ts", ["--source", `${prefix}/fit`, "--extra-days", "0",
         "--sampling", "stride", "--weighting", "uniqueness", "--prior-mode", "matched-ratio", "--output", `${prefix}/law`]);

@@ -1,10 +1,17 @@
 /** A causal event clock and a small distribution tree. All returns are arithmetic. */
 import { NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_WARMUP, nativeSecondEventFeatures,
   NATIVE_SECOND_CONTEXT_FEATURES, NATIVE_SECOND_CONTEXT_WARMUP, nativeSecondContextFeatures,
+  NATIVE_SECOND_FLOW_CONTEXT_FEATURES, nativeSecondFlowContextFeatures,
+  NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES, nativeSecondFlowVwapContextFeatures,
+  NATIVE_SECOND_SELECTED_SIGN_FEATURES, nativeSecondSelectedSignFeatures,
+  NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES, nativeSecondVolatilityContextFeatures,
   NATIVE_SECOND_DAY_CONTEXT_FEATURES, NATIVE_SECOND_DAY_CONTEXT_WARMUP, nativeSecondDayContextFeatures } from "./event-second-features.js";
 export interface EventCandle {
   openTime: number; open: number; high: number; low: number; close: number; volume: number;
   secondBasis?: { availableAt: number; values: number[] };
+  nativeTradeFlow?: { availableAt: number; aggregateCountImbalance: number; lastAggressorSide: number;
+    buyerSellerVwapGap?: number; aggressiveBuyQuoteVolume?: number; aggressiveSellQuoteVolume?: number;
+    aggressiveBuyMaxAggregateQuantity?: number; aggressiveSellMaxAggregateQuantity?: number };
   /** Explicit replay-only carry during declared unavailability; never an observed trade price. */
   carriedMark?: true;
 }
@@ -20,9 +27,14 @@ export const eventBaseFeatures = (clock: EventClock): readonly string[] => event
 export function eventFeatureWarmup(clock: EventClock, names: readonly string[]): number {
   const dayContext = names.length === NATIVE_SECOND_DAY_CONTEXT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_DAY_CONTEXT_FEATURES[i]);
   const context = names.length === NATIVE_SECOND_CONTEXT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_CONTEXT_FEATURES[i]);
-  const native = dayContext || context || names.length === NATIVE_SECOND_EVENT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_EVENT_FEATURES[i]);
+  const flowContext = names.length === NATIVE_SECOND_FLOW_CONTEXT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_FLOW_CONTEXT_FEATURES[i]);
+  const flowVwapContext = names.length === NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES[i]);
+  const selectedSign = names.length === NATIVE_SECOND_SELECTED_SIGN_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_SELECTED_SIGN_FEATURES[i]);
+  const volatilityContext = names.length === NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES.length
+    && names.every((name, i) => name === NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES[i]);
+  const native = dayContext || volatilityContext || selectedSign || flowVwapContext || flowContext || context || names.length === NATIVE_SECOND_EVENT_FEATURES.length && names.every((name, i) => name === NATIVE_SECOND_EVENT_FEATURES[i]);
   if (native !== (eventCandleIntervalMs(clock) === 1000)) throw new Error("Incompatible candle interval and feature contract");
-  return dayContext ? NATIVE_SECOND_DAY_CONTEXT_WARMUP : context ? NATIVE_SECOND_CONTEXT_WARMUP : native ? NATIVE_SECOND_WARMUP : 1440;
+  return dayContext ? NATIVE_SECOND_DAY_CONTEXT_WARMUP : volatilityContext || selectedSign || flowVwapContext || flowContext || context ? NATIVE_SECOND_CONTEXT_WARMUP : native ? NATIVE_SECOND_WARMUP : 1440;
 }
 export function validateEventClock(clock: EventClock): void {
   if (!Number.isFinite(clock.thresholdBps) || clock.thresholdBps <= 0 || !Number.isInteger(clock.maxCandles) || clock.maxCandles < 1
@@ -75,7 +87,7 @@ export function eventMoveLabel(value: number, duration: number, clock: EventCloc
   return direction * 3 + (duration <= bins[0] ? 0 : duration <= bins[1] ? 1 : 2);
 }
 const usesSecondBasis = (names: readonly string[]) => names[EVENT_FEATURES.length] === EVENT_SECOND_INPUTS[0];
-const validFeatureNames = (names: readonly string[]) => [EVENT_FEATURES, EVENT_SECOND_FEATURES, EVENT_PATH_FEATURES, EVENT_RUN_FEATURES, EVENT_RUN_VOLATILITY_FEATURES, NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_CONTEXT_FEATURES, NATIVE_SECOND_DAY_CONTEXT_FEATURES]
+const validFeatureNames = (names: readonly string[]) => [EVENT_FEATURES, EVENT_SECOND_FEATURES, EVENT_PATH_FEATURES, EVENT_RUN_FEATURES, EVENT_RUN_VOLATILITY_FEATURES, NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_CONTEXT_FEATURES, NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES, NATIVE_SECOND_FLOW_CONTEXT_FEATURES, NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES, NATIVE_SECOND_SELECTED_SIGN_FEATURES, NATIVE_SECOND_DAY_CONTEXT_FEATURES]
   .some(expected => names.length === expected.length && names.every((name, i) => name === expected[i]));
 export function hasEventSecondBasis(candle: EventCandle): boolean {
   const basis = candle.secondBasis, decisionTime = candle.openTime + 60_000;
@@ -130,8 +142,19 @@ export function eventFeatures(c: readonly EventCandle[], i: number, names: reado
   if (clock) eventFeatureWarmup(clock, names);
   if (names[0] === NATIVE_SECOND_EVENT_FEATURES[0]) {
     if (!clock || eventCandleIntervalMs(clock) !== 1000) throw new Error("Native features require an explicit second clock");
-    if (names.length === NATIVE_SECOND_DAY_CONTEXT_FEATURES.length) return nativeSecondDayContextFeatures(c, i);
-    return names.length === NATIVE_SECOND_CONTEXT_FEATURES.length ? nativeSecondContextFeatures(c, i) : nativeSecondEventFeatures(c, i);
+    if (names.length === NATIVE_SECOND_DAY_CONTEXT_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_DAY_CONTEXT_FEATURES[index])) return nativeSecondDayContextFeatures(c, i);
+    if (names.length === NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES[index])) return nativeSecondFlowVwapContextFeatures(c, i);
+    if (names.length === NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES[index])) return nativeSecondVolatilityContextFeatures(c, i);
+    if (names.length === NATIVE_SECOND_SELECTED_SIGN_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_SELECTED_SIGN_FEATURES[index])) return nativeSecondSelectedSignFeatures(c, i);
+    if (names.length === NATIVE_SECOND_FLOW_CONTEXT_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_FLOW_CONTEXT_FEATURES[index])) return nativeSecondFlowContextFeatures(c, i);
+    return names.length === NATIVE_SECOND_CONTEXT_FEATURES.length
+      && names.every((name, index) => name === NATIVE_SECOND_CONTEXT_FEATURES[index])
+      ? nativeSecondContextFeatures(c, i) : nativeSecondEventFeatures(c, i);
   }
   if (i < 1440) throw new Error("Event features require one day of causal warmup");
   if (usesSecondBasis(names) && !hasEventSecondBasis(c[i])) throw new Error("Missing, stale or future one-second features");
@@ -429,7 +452,11 @@ export function eventLeaf(model: Pick<EventDistribution, "nodes" | "forest" | "p
 export function trainEventDistribution(partitionSamples: readonly MoveSample[], clock: EventClock,
   options: { maxDepth: number; minLeaf: number; prior: number; criterion?: "distribution" | "mean"; honestyFraction?: number;
     /** Explicit separately purged outcomes; callers own temporal splitting. */
-    estimationSamples?: readonly MoveSample[]; featureNames?: readonly string[] }): EventDistribution {
+    estimationSamples?: readonly MoveSample[];
+    /** Optional covariate-support guard for honest trees. Candidate splits still
+     * use only partition outcomes, but both children must contain this many
+     * separate estimation feature rows before either child can be created. */
+    minimumEstimationLeaf?: number; featureNames?: readonly string[] }): EventDistribution {
   const samples = options.estimationSamples ? [...partitionSamples, ...options.estimationSamples] : partitionSamples;
   if (!samples.length || options.prior < 0 || options.minLeaf < 1 || options.maxDepth < 0) throw new Error("Invalid distribution training inputs");
   const featureNames = options.featureNames ?? EVENT_FEATURES;
@@ -438,6 +465,9 @@ export function trainEventDistribution(partitionSamples: readonly MoveSample[], 
     || s.nextFeatures.length !== featureNames.length)) throw new Error("Incompatible training feature contract");
   const honesty = options.honestyFraction ?? 0;
   if (!(honesty >= 0 && honesty < 1)) throw new Error("Invalid honest estimation fraction");
+  if (options.minimumEstimationLeaf !== undefined && (!Number.isInteger(options.minimumEstimationLeaf)
+    || options.minimumEstimationLeaf < 1 || !options.estimationSamples))
+    throw new Error("Minimum estimation leaf requires explicit estimation samples and a positive integer");
   if (options.estimationSamples && (honesty || !partitionSamples.length || !options.estimationSamples.length))
     throw new Error("Explicit estimation requires nonempty separate populations and no fractional split");
   // A chronological honest split prevents a return observation from both
@@ -449,7 +479,7 @@ export function trainEventDistribution(partitionSamples: readonly MoveSample[], 
   if (!partitionRows.length || !estimationRows.length) throw new Error("Empty honest partition or estimation split");
   const nodes: DistributionNode[] = [], groups: number[][] = [];
   const impurity = (counts: number[], n: number) => n ? n - counts.reduce((s, v) => s + v * v, 0) / n : 0;
-  const build = (rows: number[], depth: number): number => {
+  const build = (rows: number[], supportRows: number[], depth: number): number => {
     const index = nodes.length;
     const node: DistributionNode = { feature: -1, cut: 0, left: -1, right: -1, leaf: -1 };
     nodes.push(node);
@@ -457,11 +487,14 @@ export function trainEventDistribution(partitionSamples: readonly MoveSample[], 
     for (const row of rows) counts[samples[row].label]++;
     const sum = rows.reduce((s, i) => s + samples[i].return, 0);
     let best = options.criterion === "mean" ? -sum * sum / rows.length : impurity(counts, rows.length), feature = -1, cut = 0;
-    if (depth < options.maxDepth && rows.length >= options.minLeaf * 2) {
+    if (depth < options.maxDepth && rows.length >= options.minLeaf * 2
+      && (!options.minimumEstimationLeaf || supportRows.length >= options.minimumEstimationLeaf * 2)) {
       for (let f = 0; f < featureNames.length; f++) {
         const ordered = rows.slice().sort((a, b) => samples[a].features[f] - samples[b].features[f]);
+        const support = options.minimumEstimationLeaf
+          ? supportRows.slice().sort((a, b) => samples[a].features[f] - samples[b].features[f]) : [];
         const left = new Array<number>(15).fill(0), right = counts.slice();
-        let leftSum = 0;
+        let leftSum = 0, supportLeft = 0;
         for (let j = 0; j < ordered.length - 1; j++) {
           left[samples[ordered[j]].label]++; right[samples[ordered[j]].label]--;
           leftSum += samples[ordered[j]].return;
@@ -469,22 +502,31 @@ export function trainEventDistribution(partitionSamples: readonly MoveSample[], 
           if (n < options.minLeaf || rows.length - n < options.minLeaf) continue;
           const a = samples[ordered[j]].features[f], b = samples[ordered[j + 1]].features[f];
           if (a === b) continue;
+          const candidateCut = (a + b) / 2;
+          if (options.minimumEstimationLeaf) {
+            while (supportLeft < support.length
+              && samples[support[supportLeft]].features[f] <= candidateCut) supportLeft++;
+            if (supportLeft < options.minimumEstimationLeaf
+              || support.length - supportLeft < options.minimumEstimationLeaf) continue;
+          }
           const score = options.criterion === "mean"
             ? -leftSum * leftSum / n - (sum - leftSum) ** 2 / (rows.length - n)
             : impurity(left, n) + impurity(right, rows.length - n);
-          if (score < best - 1e-12) { best = score; feature = f; cut = (a + b) / 2; }
+          if (score < best - 1e-12) { best = score; feature = f; cut = candidateCut; }
         }
       }
     }
     if (feature < 0) { node.leaf = groups.length; groups.push(rows); }
     else {
       node.feature = feature; node.cut = cut;
-      node.left = build(rows.filter(r => samples[r].features[feature] <= cut), depth + 1);
-      node.right = build(rows.filter(r => samples[r].features[feature] > cut), depth + 1);
+      node.left = build(rows.filter(r => samples[r].features[feature] <= cut),
+        supportRows.filter(r => samples[r].features[feature] <= cut), depth + 1);
+      node.right = build(rows.filter(r => samples[r].features[feature] > cut),
+        supportRows.filter(r => samples[r].features[feature] > cut), depth + 1);
     }
     return index;
   };
-  build(partitionRows, 0);
+  build(partitionRows, estimationRows, 0);
   if (separate) {
     for (const group of groups) group.length = 0;
     for (const i of estimationRows) groups[eventLeaf({ nodes }, samples[i].features)].push(i);

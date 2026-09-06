@@ -1,17 +1,80 @@
 # Native-second event policy — historical experiments
 
-Latest checkpoint, v506–v513: ordered acceptance and coupled financial wealth
+Latest forecast/policy checkpoint, v676–v691: a strictly earlier minute-event
+direction expert transfers positively to the 48 bp/four-hour native target. A
+log-odds ensemble with the native return-weighted fast head reaches +2.3409%
+return-MSE skill and 58.61% magnitude-weighted direction on the untouched
+seven-day calibration half, but no one-event mean clears the 24 bp round trip.
+Causal H2 integration reveals why that economic gate matters: the unguarded
+ensemble loses 21.57% on the seven-day selection segment. Treating the eight
+selection-eligible coefficient pairs as a forecast interval and scaling a 50 bp
+loss budget by signal-to-interval width cuts the selected policy to two fills;
+it returns +0.000050% on selection and +0.000258% on untouched holdout. On the
+three-day non-fit July inspector window it loses 0.000618% with 0.000800%
+drawdown. The capital rule successfully contains the adverse events, but the
+ensemble remains economically rejected. The frozen native H1 policy's sparse
+holding behavior should be preserved; the slow/fast law is retained as a useful
+forecast candidate and uncertainty source, not an action-ranking replacement.
+See the final section for exact execution results and artifacts.
+
+Earlier forecast checkpoint, v670–v675: a calibration-only competing-risk
+screen separates barrier arrival from barrier direction and weights the two
+heads independently. Exact 15m/30m/60m/4h volatility state improves the first
+seven-day selection block, but the selected law fails the untouched seven-day
+block: return-MSE skill is -0.6912%, group NLL worsens to 1.10212 and
+magnitude-weighted direction falls to 43.99%. Its largest mean is only 6.54 bp,
+so no forecast clears even the 12 bp one-way cost. The screen is rejected before
+test or policy replay. The result isolates the remaining problem as unstable
+cost-sized direction rather than missing capital protection or barrier-arrival
+modeling. See the final section for the factorization and artifacts.
+
+Earlier checkpoint, v563–v615: the four-day law remains cash under exact
+next-open H1 execution, while compact positive quadrature makes bounded H2
+experiments practical. Propagating the event sign head into current and
+successor kernels turns a 4.03% failed replay into a near-flat **-0.001795%**
+one-day result, but fees still exceed positive gross trading PnL. A
+chronologically selected sign/magnitude ensemble improves return-MSE skill from
+-20.28% to -9.11% on 24 held-out decisions, then crosses a discrete Bellman
+action threshold and loses 3.35% in the matching execution replay. It is
+rejected. A fitted-support risk floor, based on net liquidatable high-water
+equity and including the next flatten cost, blocks that catastrophic exposure.
+A tighter 0.1 bp risk budget also reduces the sign-only loss. The exact H2
+version carries branch-specific liquidatable-equity high-water and floor state
+through its child optimizer; it returns -0.000699% with 0.000778% drawdown. A
+1 bp version limits the rejected ensemble's former 3.35% loss to 0.00815%.
+Full profit protection collapses the same H2 policy to cash. V611 estimates a
+90% block-bootstrap interval for the base/sign blend. After correcting a second
+sign-probability inversion in the experimental H2 replay, all 25 scored decisions
+have intervals spanning both directions. V615 therefore forbids opening,
+enlarging or reversing exposure and remains cash. These budgets and uncertainty
+rules were inspected after the held-out replay and are diagnostics.
+Position decomposition remains the exact lifecycle/accounting representation;
+the account-level Bellman coordinator still owns the feasible net action. See
+the final section for chronology, limitations and artifacts.
+
+Earlier checkpoint, v514–v521: all **22** remaining singleton November root
+regions are classified; two are exact and twenty are certified inferior, leaving
+the incumbent unchanged at **0.234902 bp** for -0.72268 BTC. Twelve exact samples
+inside the four unresolved intervals reach at most **0.146346 bp**, but do not
+certify the unsampled lots. The first whole-interval relaxation costs 124.76 s
+and returns a useless **118.603 bp** upper, so the remaining intervals are not
+scaled. Target inventory is stable on none of 1,270 outcome rows; target exposure
+is stable within 0.001 on only 18.43% of mass. Synthetic exhaustive tests find
+**325** H2 concavity violations in 2,860 finite triples. Position decomposition
+is retained for lifecycle accounting and signal classification; the full
+single-asset value curve stays in the account optimizer. Exact nonanticipativity
+cuts are the next computational route. Forecasts, historical returns and global
+H2 status remain unchanged.
+
+Earlier checkpoint, v506–v513: ordered acceptance and coupled financial wealth
 reduce November's first one-lot bound slack from **25.54 to 0.335 bp**. The exact
-H1 solver now exposes its complete feasible request regions: 59 in the November
-control and 381 in July. Hold-equivalent regions eliminate **33 and 179** of
-those regions, but only about 0.6% of their finite lot domains. The remaining
-root search is still substantial. July's first nonconstant H2 region exceeds
-the compute budget and retains a null full value. Four predefined small
-inventory seeds are all bounded below November's existing incumbent; their
-lower policies are independently rescored on **5,274,568 joint paths**. All
-**162 focused tests** and workspace typechecks pass. These are conditional
-optimization results, not global H2 optimality or a new profitable backtest.
-Forecasts and historical returns remain unchanged; see the final section.
+H1 solver exposes complete feasible request regions: 59 in November and 381 in
+July. Hold-equivalent regions eliminate **33 and 179** regions, but only about
+0.6% of their finite lot domains. Four predefined small inventory seeds are
+bounded below November's incumbent and their lower policies are independently
+rescored on **5,274,568 joint paths**. All **162 focused tests** and workspace
+typechecks pass. These are conditional optimization results, not global H2
+optimality or a new profitable backtest.
 
 Earlier checkpoint, v501–v505: account-region bounds now preserve uncertain
 order acceptance, cash/inventory dependence and shared acceptance at identical
@@ -2515,3 +2578,1026 @@ the existing 960 small execution problems. Native H1 and historical backtest
 returns remain unchanged. Full root optimization, deeper Bellman convergence,
 the matched position-policy comparison and subsequent forecast improvement
 remain required.
+
+## Position-coordinate decision and common-root failure modes (v514–v521)
+
+### Finish the isolated November roots first
+
+V514 evaluates only the 22 singleton regions left by the complete H1 cover and
+hold-equivalent pruning. The existing zero and -0.72268 BTC controls first warm
+the exact continuation cache. The incumbent lot -72,268 reproduces its saved H2
+value, **0.2349019024 bp**. The adjacent lot -72,267 is evaluated exactly and is
+lower by about **0.000001005 bp**. The other 20 singleton roots are certified
+unable to beat the achievable incumbent. This takes 69.02 seconds and leaves
+only four non-singleton regions:
+
+`[-72,263,-10]`, `[10,14,520]`, `[14,525,14,555]`, and `[14,560,72,263]`.
+
+The incumbent is still a fixed-model H2 candidate. Classifying every singleton
+does not bound the requests inside those four intervals.
+
+### Reject the scalar whole-interval bound before scaling it
+
+V515 applies the ordered, coupled account-segment upper to the first full
+interval with zero adaptive subdivisions. All 1,222 distinct live successor
+segments vary across the interval, so it still initializes 1,222 child box
+queries. The pass takes **124.76 seconds**. Its upper is **118.6030 bp**, compared
+with the incumbent's 0.2349 bp, and 261 child boxes retain unfinished relaxed
+searches. The upper remains valid, but it is far too loose to prune. The process
+is stopped before repeating this cost on the other three intervals.
+
+The dominant relaxation error is now clear. Each first-outcome branch may choose
+a different root point before the branch values are summed. A target-coordinate
+rename cannot restore that lost root nonanticipativity.
+
+### Exact shape probes and failed fixed-root upper
+
+V516 evaluates the two endpoints and midpoint of every unresolved interval with
+the exact H1 continuation optimizer. All twelve requests complete in 91.82
+seconds. The negative interval has H2 values **-9.9585, -3.8444, and +0.14635
+bp** from left to right. The first positive interval starts at +0.14231 bp and
+falls below zero; both larger positive intervals are negative at every sampled
+point. The largest sample is therefore 0.14635 bp, 0.08856 bp below the incumbent.
+
+These monotone samples motivate a shape theorem but cannot supply one. V517
+evaluates the continuous opening-information child upper on a 33-point grid per
+interval. At exact sample points its slack is **43.02–49.85 bp**, so every region
+still has sampled upper values above the incumbent. This cheaper upper also
+fails the refinement gate.
+
+### Does the position coordinate preserve useful policy structure?
+
+For a fixed account, current inventory plus signed request and current inventory
+plus signed target are bijective on the lot lattice. A complete target-position
+value curve followed by the same account-level coordinator therefore represents
+the same physical single-asset decisions as the global request value curve. It
+does not improve equity by itself. Lifecycle decomposition remains useful after
+selection because it attributes entries, reductions, exits, fees, borrowing and
+PnL without changing the net exchange order.
+
+The possible computational benefit was that child targets might remain fixed as
+the root request changes. V519 tests the exact child policies at the endpoints
+and midpoint of the first large interval:
+
+- the child request is identical on 9.77% of outcome mass;
+- target inventory is identical on **0 of 1,270** outcome rows;
+- intended target exposure is identical within 1e-6 on **0** rows;
+- only **18.43%** of mass stays within 0.001 exposure;
+- the largest target-exposure range is about **10.0003**.
+
+Thus neither target inventory nor signed target exposure supplies a stable local
+policy coordinate for this interval. Compressing the complete value curve to a
+position-local optimum would discard material state dependence. This agrees with
+v498, where a small list of scenario optima missed a profitable common request.
+The evidence supports the current architecture: the account optimizer owns the
+full value curve and feasibility; `EventPositionLedger` records the selected
+physical fills and classifies lifecycle changes.
+
+### Integer recourse invalidates the concavity shortcut
+
+V520 tests discrete H2 concavity on 60 deterministic-seed synthetic execution
+laws, eight account states per law, and the exact H1 request regions. Among 2,860
+finite adjacent-lot triples inside 529 guarded regions, **325** have a positive
+second difference. The largest is 0.05689 log units. Fixing the first execution
+branch is therefore insufficient: the optimal integer child action creates a
+discontinuous, nonconcave recourse value. Endpoint maxima, derivative bisection,
+or a tangent proof over the whole H2 region would be invalid.
+
+This matches the general mixed-integer recourse literature. Hassanzadeh and
+Ralphs describe the second-stage value function as discontinuous and nonconvex
+and recover exact cuts from branch-and-bound trees in
+[A Generalization of Benders' Algorithm for Two-Stage Stochastic Optimization
+Problems With Mixed Integer Recourse](https://optimization-online.org/2014/08/4474/).
+Boland et al. compute bounds by relaxing nonanticipativity and optimizing its
+Lagrangian dual in
+[Combining Progressive Hedging with a Frank-Wolfe Method](https://optimization-online.org/2016/03/5391/).
+Deng and Xie's
+[ReLU Lagrangian cuts](https://optimization-online.org/2024/11/on-the-relu-lagrangian-cuts-for-stochastic-mixed-integer-programming/)
+give a newer exact-cut route for stochastic mixed-integer programs. These papers
+do not directly solve the executor's log-affine acceptance problem, but they
+support the required structure: keep scenario recourse, add cuts that enforce a
+common root action, and branch only where the resulting bound remains material.
+
+V521 validates the source-bound artifacts and records the architecture decision.
+The next prototype should build a nonanticipativity Lagrangian or branch-tree cut
+from the existing exact one-step subproblems and test it only on the November
+control. The whole-interval account box, fixed-root opening-information upper,
+stable-target restriction and H2 concavity assumption have all failed measured
+gates. Forecast fitting, the 28-window replay and historical returns are unchanged.
+Global H2 optimization and deeper convergence remain open.
+
+## Risk-neutral bounds, sign transfer and admissible fitting (v522–v546)
+
+### Locate the bound slack before building a larger optimizer
+
+V527 decomposes exact fixed-root H2 values under the unchanged November law. At
+the -0.72268 BTC incumbent, the exact log value is **0.234902 bp** and Jensen's
+upper from exact mean terminal equity is **0.239173 bp**, a gap of only
+**0.004271 bp**. At -0.00010 BTC the corresponding values are 0.146346 and
+0.148549 bp, a 0.002202 bp gap. The existing opening-informed continuation upper
+has about **48.4 bp** of slack. Log utility is therefore not what makes the bound
+useless; allowing a different child decision after seeing its opening is.
+
+V525 preserves one common child request while relaxing its financial result in
+arithmetic wealth. The one-bin bound prunes `[14,525,14,555]` at -13.1871 bp and
+`[14,560,72,263]` at -13.2421 bp. The two intervals near cash remain unresolved
+at 9.6215 and 9.6066 bp. Nine request bins in v526 cost roughly ten times as much
+and improve those uppers by only about 0.04 bp, so maximum-size eligibility is
+not the dominant relaxation.
+
+V529 keeps a shared root endpoint through all first-event outcomes and prunes
+`[-72,263,-36,137]` at -0.125959 bp. Near the fill switch, v534 leaves the
+two-lot interval `[-11,-10]` unresolved but prunes the singleton `[-10,-10]`.
+This refinement is converging to individual-lot evaluation. V535 independently
+tests the required risk-neutral convexity theorem on 60 synthetic laws and eight
+accounts per law: **480 of 3,133** finite adjacent-lot triples violate it, with a
+minimum second difference of -0.137445. These results justify stopping this
+search route. The two positive intervals and the far negative half now have
+valid fixed-model certificates; the remaining intervals do not have a global H2
+certificate.
+
+### Transfer the remembered 1-second sign model to decision-sized events
+
+V537 uses the frozen v401 validation and test predictions from the later
+structured sign family. It evaluates barriers of 24 and 48 bp, timeouts of 60,
+300 and 900 seconds, four feature sets and a fixed L2 penalty. The first two
+thirds of validation fit each head; the final third selects a specification only
+when sign information is positive in aggregate and in at least 60% of
+timeout-sized blocks. Test is consulted once after selection.
+
+Only the 24 bp, 900-second primitive-feature head passes validation: 0.015922
+bits/row, four of five positive blocks, 1.521% return-MSE skill and an 18.339 bp
+largest forecast mean. On test it reverses to **-0.021403 bits/row**, has 53.08%
+plain and 54.65% magnitude-weighted sign accuracy, and is positive in only six
+of sixteen blocks. Return-MSE skill remains +1.682%, but the maximum forecast
+mean is **16.361 bp**, below the 24 bp round-trip screen, so it produces no
+actionable entries. The remembered model is useful evidence about short-horizon
+structure, but this transfer does not justify installing it as the event
+direction or reversal head.
+
+### Treat explicit fit windows as training data, then test the consequence
+
+The native fitting protocol previously excluded every catalog interval, even
+those named `fit-*` that are never scored. V538 adds an explicit exclusion mode
+and makes `non-fit` the default: scored calibration/test windows remain purged,
+while unscored fit windows can supply causal history. The old strict behavior is
+still available as `all-catalog`. Only the July `shape-flat-low-bias-low-2025-07`
+window materially changes because of overlap with `fit-full`; its fit-to-test
+gap falls from **107 days to zero**.
+
+The fresh latest-day estimate still predicts the wrong first scored day and
+loses **7.9311%**, so merely making the fit recent does not solve the forecast.
+V543 instead estimates the unchanged four-leaf law from four admissible days:
+11,280 stride rows with uniqueness mass 103.1653. Calibration return CRPS falls
+from 16.8463 to 15.443 and the test-prefix CRPS from 17.5498 to 13.1552, although
+test return-MSE skill is still -16.331%. Its H1 policy stays cash on calibration
+and test.
+
+V544 compiles the exact execution law from all 11,280 samples. V545 then replays
+all three July test days: **74 decisions, zero fills, zero return and zero
+drawdown**, compared with the old exact H1 replay's -4.49% return and 11.44%
+drawdown. Twelve submitted requests are canceled because their required openings
+are unavailable; none fill. V546 independently checks every chosen value and
+reconciles account and position transitions with zero value and equity error.
+
+This is loss avoidance, not a profitable strategy. It also means a 28-window
+rerun would be wasteful because the exclusion change affects only this one
+scored window. The result narrows the next work to forecasting a cost-sized move
+law with stable out-of-sample value. Position decomposition stays in the ledger
+and lifecycle signal layer because it exactly conserves account wealth. It does
+not impose independent per-position optima, stable-target assumptions or local
+action restrictions; the account-level Bellman coordinator retains the complete
+feasible action curve and remains the authority for expected log wealth.
+
+The v522–v546 additions are covered by the focused event-policy tests,
+TypeScript typechecks for `bot-algo`, `storage`, `server` and `web`, and a syntax
+check of the frozen sign-transfer analysis. No live-trading decision follows
+from these results. Reliable profitability, full H2 certification and deeper
+convergence remain open.
+
+## Calibration-selected law and causal direction heads (v547–v562)
+
+### Select history length without consulting the scored window
+
+The robust four-day estimate in v543 was compared with otherwise identical 2-,
+7- and 15-day laws using calibration CRPS as the frozen selection measure. The
+four-day law remains best at **15.443 bp**, versus 16.544, 15.889 and 16.333 bp.
+The two-day law is the only alternative that trades in the short screen, and it
+then loses 7.9311% on test. The 7- and 15-day laws remain cash. This supports the
+four-day law on pre-test evidence; their scored-window behavior is diagnostic,
+not part of the selection.
+
+V550 tests a lower 24 bp event barrier on the same July chronology. Its
+calibration return-MSE skill is **-4.435%** and class NLL is 1.6763 versus a
+1.6032 unconditional baseline. It also remains cash on test. Reducing the event
+size does not create a forecast edge and is rejected before any wider replay.
+
+### Test direct conditional-mean learners before scaling Bellman
+
+V551 fits shallow honest mean trees and ridge projections on the partition days,
+then scores them only on calibration. None passes the preregistered requirement
+of positive return-MSE skill plus lower class NLL and CRPS than the honest
+unconditional law. The best ridge MSE skill is **-1.105%** at penalty 0.1. Its
+largest expected move is 4.32 bp, well below execution cost, so the branch does
+not justify a policy backtest.
+
+The repository's strongest transferable 1-second direction features were then
+implemented causally: completed-second aggregate trade-count imbalance and last
+aggressor side. Every row requires a same-second immutable trade-flow reference
+with `availableAt = openTime + 1000`; missing, future or invalid observations are
+rejected. The depth-two event tree in v552 chooses neither flow feature and is
+identical to the candle-only tree. In v553 the flow ridge improves modestly over
+the candle ridge, reaching **-0.920%** calibration MSE skill and 15.8623 bp CRPS,
+but remains negative and its largest expected move is 4.60 bp. Flow is useful
+directional information, but the conditional mean is still too small and noisy
+to trade.
+
+V561–v562 add buyer-minus-seller VWAP gap, the remaining fast input promoted by
+the earlier repository-wide 1-second transfer study. This is a new versioned
+feature contract; the original two-flow contract remains valid for saved-model
+reproduction. The VWAP law is fit and scored on calibration only and records
+`scoredTestLoaded: false`. The tree again ignores flow and exactly reproduces
+the candle law. The return-weighted sign blend has +2.449% calibration MSE
+skill, a largest expected move of **11.944 bp**, and zero rows above the 12 bp
+one-way cost. It is indistinguishable from the prior flow screen economically
+and is rejected without consulting the held-out window.
+
+### Isolate the remembered high-accuracy sign behavior
+
+V554–v558 fit a separate penalized logistic sign head while leaving the joint
+event magnitude, duration, extrema and successor law frozen. Training uses the
+partition interval only. The calibration-only scan fixes four penalties
+{0.01, 0.1, 1, 10}, two objectives and blends {0, 0.5, 1}. Ordinary heads fail.
+Return-weighted heads are stable when blended 50/50 with the event law, with
+calibration return-MSE skill from +2.315% to +2.493%. The frozen selection rule
+picks penalty 0.01 and blend 0.5.
+
+V559–v560 consult the held-out prefix once for that selected head. It obtains
+**75.00% plain sign accuracy** on 24 event decisions, reproducing the kind of
+headline accuracy remembered from the later sign work. The economic diagnostics
+do not pass:
+
+- magnitude-weighted direction accuracy is **59.13%**;
+- sign log loss is 0.63684, but return-MSE skill is **-20.28%**;
+- the largest absolute expected move is **11.974 bp**;
+- zero decisions clear the **12 bp one-way** fee-plus-slippage cost, and zero
+  clear the 24 bp round trip.
+
+The unblended sign head has +5.75% test MSE skill but only 45.83% plain sign
+accuracy and an 8.14 bp largest expected move. Selecting it after seeing test
+would violate chronology and still would not create an actionable entry. The
+separate sign model is therefore preserved as a reproducible diagnostic, not
+installed in Bellman.
+
+These results resolve the position-decomposition choice for the current branch.
+For a fixed account, signed request and signed target inventory are bijective;
+the representation itself cannot change the optimal action. The ledger remains
+because it exactly accounts for lots, debt, fees, borrowing, entries, reductions,
+exits and reversals. Independent virtual-position optima and target-agreement
+rules remain excluded because v519 measured strong dependence on the full
+account state. The account-level Bellman coordinator alone selects the feasible
+net order from the complete action curve. In this test that choice is cash,
+which preserves wealth when the 75% sign statistic has no fee-sized expected
+edge.
+
+The v547–v562 work is covered by **166 focused tests**, including causal
+trade-flow availability and future-isolation checks, and TypeScript typechecks
+for every workspace package. No live-trading decision follows from these
+results. Reliable profitability and a stable cost-sized forecast remain open.
+
+## Final refit, compact H2, forecast ensembles and drawdown state (v563–v615)
+
+### Refit only after the calibration choice is frozen
+
+V563 promotes the already selected four-day law through the calibration day and
+then consults the final day. Its return MSE skill is -7.931%; exact H1 makes 12
+trades, holds a 5x long and loses 11.13% peak to trough. Adding raw day context
+in v564 worsens calibration. The robust day context in v565 also fails the
+calibration gate. These results reject a calendar-label patch and show that a
+final refit can make the selected model worse even when its structure is held
+fixed.
+
+V566 replaces raw calendar identity with a causal rolling partition. The robust
+v567 law improves calibration CRPS from 14.1718 to **13.4878 bp**, but calibration
+return-MSE skill is still -13.4468%. The two visited leaf means are +9.2184 and
++0.2684 bp. Exact H1 compilation in v568 produces 11,280 observed paths; v569
+replays 25 final-day decisions with zero fills, fees, drawdown or return. Six
+requests are canceled by unavailable next openings. The exact one-step policy
+therefore remains cash in realized wealth terms.
+
+V572 compresses the four execution leaves from 1,805/9,663/193/127 atoms to
+119/154/66/59 positive observed-path atoms. It preserves the selected moments
+to a maximum error of 5.24e-12. Compact H1 agrees with the full law at leaf 0;
+the leaf-1 discrepancy is a 0.03093 bp value difference and defines an explicit
+approximation error rather than an exact certificate. Compact H2 values at cash
+are 0.02411 bp for leaf 0 and 0.29993 bp for leaf 1.
+
+The coarse grids and singleton searches in v575–v580 retain +0.45398 BTC at
+leaf 0 with 3.19581 bp and find -0.00005 BTC at leaf 1 with 0.30552 bp. Four
+non-singleton request intervals remain per leaf. The guarded recursive search in
+v583/v584 deliberately stops at its 180-second cap: it improves leaf 1 to
++0.00012 BTC and 0.32313 bp but does not close the global upper bounds. Full-law
+rescoring in v585/v586 proves that the leaf-0 +0.45398 BTC request beats cash,
+with a 3.03936 bp lower value, but the exact fixed-request upper remains 11.2517
+bp. This is useful evidence for the action, not global H2 optimality.
+
+### Propagate direction through the Bellman path
+
+V587 applies a compact receding-H2 candidate policy with exact realized
+next-open accounting. It loses **4.0298%**, pays 59.87 in fees and reaches 5.76%
+drawdown. A 0.22835 BTC long stays open through the day and loses 341.31 gross.
+The leaf-0 sign is correct on 8 of 10 events, yet two large adverse moves make
+its realized mean negative; leaf 1 is positive on only 5 of 15 events. This
+isolates stale sign and severity forecasts, rather than ledger accounting, as
+the primary failure.
+
+V588 preserves every per-decision sign forecast. The selected 50/50 sign blend
+is correct on 75% of events, but the unequal positive and negative conditional
+magnitudes keep its expected return positive on many events that its direction
+score classifies as down. V589 reweights only the observed root and cuts the
+loss to -0.00686%. V590 attaches the same causal sign calculation to every
+observed estimation path; v591 compresses the enriched law. V592 then reweights
+both the current root and every H2 successor. It loses only **0.001795%**, with
+positive gross trading PnL of 0.10846, but 0.28682 in fees and 0.00118 in
+borrowing overwhelm that edge. V593's 0.03093 bp hold deadband worsens the loss
+to 0.005224% because it preserves wrong inventory. This repeats the earlier
+finding that blanket hysteresis can reduce turnover while increasing adverse
+persistence.
+
+### Combine sign and magnitude by measured reliability
+
+The exact saved one-second comparison proposed by the user cannot be reproduced
+from the current files without retraining. The compressed-path model's causal
+12k affine calibration recorded **6.340% validation / 7.041% test** step-1 MSE
+skill, while the structured production59/base17 family recorded 75–77%
+validation direction accuracy. Their original datasets and checkpoint files
+have since been cleaned; aggregate result JSON remains, but aligned per-example
+predictions do not. The November v401 export contains only the historical
+structured model. Scaling GPU training merely to recreate an unproven stack is
+therefore deferred.
+
+V594/v595 test the same idea at the current event horizon, where aligned
+predictions are available. The magnitude input is the frozen event law's
+expected absolute return under the full sign-head probability. Direction is the
+selected 50/50 probability blend. Candidate transforms fit on the first half of
+calibration, select on the second half by return MSE, refit on all calibration,
+and consult the 24-event test once. This respects the repository's measured
+sign/magnitude dependence: positive and negative conditional magnitudes stay
+separate rather than assuming independence.
+
+The selected transform is
+
+\[
+\hat r = 1.579656\,(2p_{dir}-1)\,
+  \left[p_{mag}E(|r|\mid r>0,x)+(1-p_{mag})E(|r|\mid r<0,x)\right].
+\]
+
+It improves full-calibration MSE skill from +2.493% to +4.002% and final test
+skill from **-20.281% to -9.113%**, while retaining 75% direction accuracy. The
+test maximum rises to 13.361 bp. This is a real forecast improvement, but skill
+is still negative and the fitted scale moves from 0.762 on early calibration to
+1.580 after the full refit, which is a stability warning.
+
+That warning matters economically. Mapping the ensemble mean back into each
+joint execution kernel and propagating it through H2 loses **3.3530%** on the
+matching one-day replay in v597, with 59.86 in fees and 4.88% drawdown. The
+three-day extrapolation in v596 loses 0.5864%. A small improvement in average
+MSE crossed a discrete action boundary and created a roughly 0.229 BTC long.
+The ensemble is rejected and the lower-loss v592 sign policy remains the useful
+experimental reference.
+
+### Preserve bankable profits and shrink uncertain actions
+
+V598–v602 add a path-dependent risk guard around the candidate Bellman policy.
+The state contains initial equity and a high-water mark of **net liquidatable
+equity**, after reserving the current flatten cost. Every proposed root order is
+evaluated across all fitted execution paths and reserves the cost of flattening
+again at the next decision. A request is admissible only if its worst supported
+next equity clears
+
+\[
+F_t = \begin{cases}
+W_0(1-b), & H_t\le W_0,\\
+W_0 + \rho(H_t-W_0), & H_t>W_0,
+\end{cases}
+\]
+
+where `b` is initial risk capital and `rho` is the fraction of bankable peak
+profit protected. If no candidate is admissible, the guard selects the request
+with the highest worst supported equity. This is a safety filter around the
+candidate H2 values; the hypothetical child optimizer does not yet carry the
+floor as Bellman state, so this is not the globally optimal risk-constrained H2
+policy.
+
+Two implementation details are material. V598 initially omitted the next
+flatten cost; v599 adds it. V600 then appeared to improve the sign policy to
+-0.000170%, but its peak used marked equity. At 05:00 the apparent 0.0092 profit
+was already negative after liquidation costs, so that result is rejected as a
+lucky early exit. V601 uses liquidatable equity and correctly reproduces the
+unconstrained v592 result under a 1 bp initial budget because every small action
+fits inside that budget.
+
+V602 is a deliberately labeled post-test diagnostic at 0.1 bp initial risk and
+50% profit protection. It reduces the loss to **0.000598%**, trades from 20 to
+7, fees from 0.28682 to 0.06558 and drawdown from 0.001986% to 0.000689%. Final
+equity is 9,999.94018, above the fitted-support floor of 9,999.90. It cannot be
+selected or promoted after seeing this day. A valid follow-up must choose `b`
+and `rho` entirely on an earlier replay and then freeze them for a fresh window.
+
+This risk state is consistent with Busseti, Ryu and Boyd's
+[risk-constrained Kelly formulation](https://stanford.edu/~boyd/papers/pdf/kelly.pdf):
+maximize expected log growth while constraining drawdown risk, rather than
+replacing the growth objective with an unrelated score. The current hard floor
+is more conservative on the fitted support. It is also model-dependent. No
+nonzero position can literally guarantee preservation against unbounded gaps;
+the reported guarantee covers only the saved execution paths and explicit cost
+stress.
+
+V603–v606 then carry the floor through the H2 continuation. The reusable exact
+one-event optimizer accepts an absolute minimum liquidatable equity and clips
+every affine order region against that floor. Exhaustive enumeration across the
+existing 960 randomized account/terminal cases verifies the constrained optimum
+and selected order. At every first-event outcome, H2 updates that branch's
+liquidatable high-water mark, raises its child floor when the branch makes a new
+peak, and globally optimizes the child action subject to the new floor. The root
+action remains a compact candidate search, so this is exact conditional H2
+evaluation of each candidate rather than a global root-action certificate.
+
+V604 repeats the 0.1 bp / 50% post-test diagnostic with the complete state. It
+returns **-0.000699%**, executes 7 trades, pays 0.05238 in fees and has
+0.000778% maximum drawdown. Its lowest realized liquidatable endpoint is
+9,999.93006, above the fixed 9,999.90 floor. Return is slightly worse than
+v602's root-only -0.000598%; lower turnover did not compensate for worse gross
+trade selection.
+
+V605 applies the complete H2 guard to the rejected magnitude ensemble with a 1
+bp initial budget and 50% profit protection. It returns **-0.008150%**, pays
+0.26031 in fees and has 0.008227% maximum drawdown. The lowest realized
+liquidatable endpoint is 9,999.18496, above the 9,999 floor. This contains the
+unconstrained v597 loss of 3.3530% and modestly improves on the root-only v599
+loss of 0.009585%, but it still loses money.
+
+V606 tests the user's literal no-giveback principle by setting `rho=1` with the
+same 0.1 bp initial budget. It makes **zero trades**, pays no costs, has no
+drawdown and returns 0%. Every child law retains an adverse outcome and closing
+costs, so preserving each new branch peak exactly removes the continuation value
+that justified the entry. This is direct evidence that complete peak protection
+gets in the way of account growth for this fitted law. A partial protected
+fraction can trade, but its value must be selected before evaluation.
+
+Current decision: keep the sign-conditioned joint law and successor propagation;
+reject the magnitude ensemble and fixed hold deadband; retain the lifecycle
+ledger; and keep the account-level coordinator. The implementation now matches
+the requested risk-state structure for the two-event horizon. The next empirical
+gate is still a strictly pre-test choice of `b` and `rho`, followed by a fresh
+native window. Longer Bellman horizons must carry the same state at every
+recursion. No live-trading policy is promoted.
+
+### Global root coverage and explicit forecast uncertainty — v607 through v615
+
+V607 globally enumerates every floor-admissible root lot under the compact law
+with the literal `rho=1` protection rule. All 25 decisions are certified and the
+policy remains cash. V608 repeats the enumeration with partial protection, but
+only 17 of 25 realized states have a feasible constrained H2 continuation; its
+result is not a complete H2 certificate. Transition-equivalent root requests
+are then collapsed before child evaluation. V610 uses that optimization with a
+1 bp initial budget and `rho=0.5`: 16,312 admissible lots collapse to 2,739
+distinct first-event account transitions, and all 25 roots are evaluated in
+191.52 seconds. The fitted-law optimum loses **0.008665%**, pays 0.58411 in fees
+and reaches 0.009195% drawdown. This showed that missing root candidates were
+not the cause of the loss under that compiled law.
+
+A later audit found that v589–v593, v604, and v607–v610 do not represent the
+intended sign law. `adjustedProbability` and `directionProbability` are already
+ordinary `P(up)` values, but the experimental replay passed them through
+`eventProbabilityFromReturnWeight` a second time. Their exact execution and
+risk-accounting results remain valid for the distorted saved probability law;
+their returns are rejected as evidence about the intended sign forecast. The
+sign screen itself and the mean-mapped ensemble path are unaffected. V613 and
+later use direct ordinary sign reweighting and assert that the resulting atom
+mass reproduces the requested `P(up)`.
+
+V611 fits the convex base/head expected-return blend on 2,760 calibration rows
+and block-bootstraps contiguous one-hour groups. The calibration-only central
+weight is 0.615621; its 90% interval is `[0.233858, 1]`. The interval contains
+zero expected return on 85.11% of calibration rows and 79.17% of the 24 scored
+rows. Mean robust absolute forecast is only 0.23645 bp on calibration and
+0.20134 bp on the scored day; no row clears the 12 bp one-way cost. The central
+scored return-MSE skill is -10.69%. The full-head endpoint happens to have
++5.75% scored MSE skill, but selecting that endpoint after observing this day
+would be leakage.
+
+The exact one-event optimizer now accepts multiple probability laws and chooses
+one order that maximizes worst expected log wealth. Its ambiguity-set result is
+checked against exhaustive enumeration together with the liquidatable-equity
+floor in all 960 randomized account/terminal cases. H2 applies the ambiguity
+set recursively to causal successor forecasts. V613 uses this corrected nested
+maximin policy with a 1 bp initial budget and 50% profit protection. It still
+loses **0.003049%**, makes 16 trades, pays 0.18191 in fees and reaches 0.003961%
+drawdown. V614 additionally requires paired worst-case improvement over holding
+under the same probability endpoint. It loses **0.002467%**, makes 19 trades
+and pays 0.20791. Its traded paired advantages range from only 0.001262 to
+0.134772 bp, with a 0.023351 bp mean. This is optimizer's-curse evidence: the
+fitted continuation values report tiny common gains that are not stable in the
+realized path.
+
+V615 makes forecast ambiguity an exposure constraint. When the 90% ordinary
+sign interval crosses 50%, a request may retain or reduce same-side quantity,
+but cannot open, enlarge or reverse risk. All 25 intervals cross 50% on this
+day. Starting from cash therefore removes every executable risk-increasing
+request; 201 compact candidates are filtered and 75 hold-equivalent candidates
+are evaluated in 6.49 seconds. The result is **0% return, zero trades, zero fees
+and zero drawdown**. This implements the requested withdrawal behavior and
+prevents either of the observed adverse events from consuming equity. It does
+not satisfy the profit objective. The next productive step is to narrow a
+strictly pre-test forecast interval with better causal sign or magnitude
+information; relaxing the guard or scaling global search cannot create
+fee-positive evidence from the current interval.
+
+### Full-window withdrawal and separate selected sign inputs — v616 through v626
+
+V616 freezes the v615 rule across the complete three-day July inspector window.
+Seventy-two of 74 direction intervals span 50%. The other two still have no
+positive robust value after execution costs. The policy remains cash at all 74
+decisions: **0% return, zero fees and zero drawdown** in 23.75 planner seconds.
+This is the desired response to unresolved uncertainty, but it also confirms
+that the current forecast cannot fund a trade. The 1 bp initial loss allowance
+and 50% liquidatable-profit floor remain branch state throughout H2. Exact
+`rho=1` peak protection remains rejected by v606 because it removes every
+entry under the two-sided saved law; protecting half of each peak prevents one
+supported adverse event from erasing all accumulated profit while leaving some
+risk budget for growth.
+
+The next screen keeps the final-refit event tree as the magnitude, duration,
+extrema and successor law and gives only the sign head a new versioned causal
+feature basis. The added coordinates are the previous completed-second return,
+normalized adjacent-return Haar contrast over 16 completed seconds, the last
+aggressor side two seconds old, current taker quote-volume imbalance, its
+separate-buy/sell EMA(2), and current maximum aggregate-size skew. Existing
+aggregate-count imbalance and current last side remain. These were selected
+before this run from the long-window feature audits; no scored-window feature
+selection is used. Rich trade-flow fields retain exact close availability and
+the EMA is reconstructed from 64 completed bins. A dedicated causality test
+covers values, future mutation, missing fields and stale timestamps.
+
+At penalty 0.01, the 50/50 base/head blend improves calibration
+magnitude-weighted direction from **56.9822% to 57.7281%**, return-MSE skill
+from **2.4935% to 2.6398%**, and one-way-cost exceedances from 7 to 12 of 2,760.
+The 90% blend interval becomes `[0.238613, 1]`; ambiguous calibration rows fall
+from 85.11% to **82.68%**. The first scored day is still weak: 87.5% ambiguous,
+-10.72% central MSE skill and zero robust moves over 12 bp. Compiled v620 and
+quadrature v621 preserve the magnitude law while evaluating the new sign
+features independently. Full-window H2 v622 again has 72 ambiguous and two
+unambiguous decisions. Their central expected moves are only 4.18 and 5.81 bp;
+even minimum legal entries have negative worst-case value. The result is again
+**0% with no trades, fees or drawdown**.
+
+A bounded calibration-only penalty check selects 0.001 over 0.01 and 0.1 by
+the declared economic diagnostics: 57.8244% magnitude-weighted direction,
+2.7149% MSE skill and 17 cost exceedances. Its frozen first-day and bootstrap
+runs v625–v626 still have an interval `[0.240013, 1]`, 81.01% ambiguous
+calibration rows, 83.33% ambiguous test rows and no robust cost-clearing move.
+Further tuning of this linear head is therefore stopped. The new features carry
+some signal, but the historical production59 75–77% result is not a substitute:
+that model predicts active next-second signs, and its saved largest-move decile
+is only about 57% accurate. Its dedicated event-transfer screen was already
+negative. The next forecast iteration needs a causal nonlinear or sequence
+model trained directly on cost-sized event outcomes, with calibration
+uncertainty as part of its promotion gate.
+
+### Nonlinear mean rejection and a larger protected event target — v627 through v650
+
+V627 initially fit its nonlinear-head blend on the magnitude law's own
+estimation day, where the base law is in-sample; its zero blend weights are
+therefore rejected as a split-design error. V628 corrects the chronology: a
+depth-two boosted mean head trains on the three partition days, the first half
+of calibration fits the convex base/head blend, and the second half selects
+among 12 predeclared small configurations. The selected eight-tree head has
++3.696% second-half MSE skill and improves over the base by 13.486%, with eight
+of 12 positive hourly blocks. It does not transfer in v629: first-day skill is
+-10.971%, magnitude-weighted direction is 47.381%, and no forecast clears the
+24 bp round trip. The head is rejected.
+
+A selective-prediction diagnostic also fails. On calibration, the top 2% by
+absolute predicted return reaches 94.74% magnitude-weighted direction but only
+23.851 bp mean gross return, 0.149 bp below round-trip cost. Its sole selected
+test event is wrong and loses 48.486 bp gross. Expanding sign training from
+three to 15 contiguous days in v630 dilutes the current regime: calibration
+weighted direction falls from 57.824% to 55.926% and MSE skill from 2.715% to
+2.175%. A 30-day run is not justified.
+
+V631 raises the barrier to 96 bp while retaining a one-hour timeout. More than
+96% of calibration labels time out, so the median absolute return remains only
+15.808 bp and calibration MSE skill is -11.350%. V632 instead pairs the 96 bp
+barrier with a four-hour timeout. A 50/50 selected sign blend appears promising
+on calibration (+12.416% MSE skill, 63.928% weighted direction and 631 of 2,400
+rows over round-trip cost), but v635 reverses to -86.475% MSE skill on the six
+non-overlapping first-day events. The calibrated blend-weight interval in v636
+is `[0.375483, 0.784893]`; it is confidently wrong on the largest event. Blend
+coefficient uncertainty alone does not cover regime error.
+
+The four-day average-uniqueness magnitude law is stronger than that separate
+head. V637 improves calibration CRPS from 38.513 to 27.611 bp, obtains +16.991%
+return-MSE skill and earns +2.0026% in exact H1. The separate sign head reduces
+weighted calibration direction from 67.069% to 39.382%, so it is rejected for
+this target. The frozen law still fails the first scored day in v639: it enters
+near 5x after a +17.30 bp event, holds through the next -97.33 bp event and
+returns -4.5107%. This is exactly the small-win/large-adverse-loss pattern the
+capital rule must contain.
+
+V640–v650 compile that law to observed execution paths and test the combined
+response. A 1 bp initial risk budget and 50% liquidatable-peak protection shrink
+the full-window H2 policy from near 5x to less than 0.01x. The complete
+zero-deadband lattice in v644 covers all 19 decisions and 10,371 admissible lots;
+drawdown falls from the unconstrained control's 8.4373% to 0.00947%, though tiny
+fee-dominated orders still lose 0.00724%. On preceding calibration the only
+opening action has 0.24376 bp of constrained H2 advantage. Freezing a 0.20 bp
+minimum-advantage deadband leaves the positive calibration replay unchanged and
+removes the earlier adverse test entry. V650 covers all 19 decisions and 10,789
+admissible lots and exactly reproduces v649: **+0.000028% net, 0.006352%
+drawdown, three fills and 0.19692 fees** over all three July days. Once its
+liquidatable equity peaks, the branch floor rises and the remaining decisions
+stay cash.
+
+This validates the mechanism, not reliable profitability. The unconstrained
+full-window control eventually recovers to +1.0021%, so the 1 bp budget gives up
+material upside while preventing its large interim drawdown. The next policy
+iteration should make the initial budget depend on a pre-test estimate of
+forecast uncertainty and skip minimum-size orders whose robust advantage cannot
+absorb calibration error. A replay integration bug found during this work is
+fixed: magnitude models that use trade-flow features now load and hash those
+shards even when no separate sign head is attached.
+
+The literature search found a direct recent proposal in
+[Conformal Kelly](https://arxiv.org/abs/2608.01494): use a slowly estimated
+conformal residual width as the scale in fractional Kelly and cut leverage when
+downside coverage deteriorates. Its sealed-data coverage transferred but its
+claimed growth advantage did not, so only the uncertainty mechanism is adopted.
+This is also consistent with
+[distributionally robust Kelly](https://arxiv.org/abs/1812.10371), which
+maximizes the worst expected log growth across an ambiguity set, and the
+[risk-averse calibration](https://proceedings.mlr.press/v267/kiyani25a.html)
+result that a maximin action is the correct policy for a risk-averse decision
+maker given a prediction set.
+
+V651 fits a 75% split-conformal absolute-residual radius from the six ordered,
+non-overlapping pre-test calibration events. The finite-sample corrected radius
+is **79.189 bp**. All four leaf-mean intervals span zero; for example the
+strongest 42.955 bp leaf becomes `[-36.234, 122.143]` bp. V652 propagates both
+endpoints through current and successor H2 kernels and applies the same
+exposure-withdrawal rule. It remains cash at all 19 decisions and returns 0%
+with no fees or drawdown. This is the honest uncertainty-selected result. The
+tiny positive v650 result remains a useful mechanism diagnostic, but its 0.20
+bp deadband was inspected on this research window and is not promoted. More
+independent pre-test cost-sized events or a substantially narrower residual law
+are required before conformal sizing can permit nonzero risk.
+
+V653 extends the chronology helper from one to a declared seven-day calibration
+block while preserving one day as the default. The 96 bp/four-hour tree then
+has 19,680 calibration stride origins, or roughly 42 non-overlapping event
+decisions. Its apparent one-day edge disappears before test: return-MSE skill is
+-8.894%, direction is 52.40% and CRPS is 27.643 bp. Applying the same four-day
+average-uniqueness re-estimation in v654 worsens CRPS to 31.234 bp and loses
+14.4384% in calibration H1. The 96 bp target is therefore rejected without a
+second test consultation. The one-day v637 selection was a narrow favorable
+slice, not stable evidence. Future event candidates must pass the broader
+calibration chronology before conformal sizing or Bellman compilation.
+
+### Confidence-scaled profit preservation — v659
+
+V659 makes the capital floor respond continuously to the saved forecast
+interval. Directional confidence is the fraction of the point forecast that
+remains after moving the adverse endpoint toward zero. An interval which
+touches or crosses zero has confidence zero; a point interval has confidence
+one. Confidence scales both the maximum initial-risk allowance and the
+unprotected share of liquidatable high-water profit. With maximum initial risk
+`b`, minimum protected-profit fraction `rho`, confidence `c`, initial equity
+`W0`, and high-water profit `P`, the active floor is
+
+\[
+F_t = \begin{cases}
+W_0(1-cb), & P=0,\\
+W_0 + [1-c(1-\rho)]P, & P>0.
+\end{cases}
+\]
+
+The same calculation is carried into every H2 child using that successor
+state's causal uncertainty interval. Root and child feasibility still reserve
+the next flatten cost and check every saved adverse execution path. Therefore
+zero confidence forces withdrawal to the current liquidatable high-water mark,
+while narrower intervals smoothly restore the declared risk budget. Unit tests
+cover intervals on both sides of zero, partial confidence, seed risk and profit
+protection.
+
+The frozen 75% conformal test is intentionally unchanged. All 19 July decision
+intervals cross zero, so all 19 confidence values are zero, effective initial
+risk is zero bp, and the protected-profit fraction is 100%. V659 therefore
+returns **0% with zero trades, fees and drawdown**, versus the same unconstrained
+control's +1.0021% return and 8.4373% drawdown. This is the correct action for
+the measured uncertainty and prevents the two adverse events from consuming
+prior equity, but it cannot turn an unresolved forecast into profitable risk.
+The guarantee is conditional on the saved execution-path support; an unbounded
+market gap cannot be covered by nonzero exposure. The remaining bottleneck is
+still a causal cost-sized forecast whose pre-test interval excludes zero.
+
+Artifact: `data/benchmarks/event-native-barrier96-4h-h2-conformal75-dynamic-risk-july-v659/summary.json`.
+
+### Broader 48 bp chronology and completed-event sequence screen — v660 through v662
+
+V660 starts a new calibration-only branch with a 48 bp barrier, one-hour
+timeout, seven fit days and seven later calibration days. It uses the selected
+native sign/flow basis and a separate final fit day for distribution
+estimation. No July inspector candle is loaded. The 20,040 calibration stride
+origins contain more observations than the 96 bp branch, but 17,586 (87.75%)
+still time out. The frozen four-leaf model has **-1.1525%** calibration
+return-MSE skill, **49.2437%** nonzero direction accuracy, and leaf means from
+**-4.5404 to +5.1296 bp**. It fails before policy compilation.
+
+V661 tests the specific sequence hypothesis rather than adding more price
+transforms. It converts the fit and calibration populations into causal,
+non-overlapping event chains: 235 fit events and 177 calibration events. Each
+row can observe at most sixteen prior completed events within one day, including
+their signs, sizes, durations and path efficiency. The calibration chain is
+split chronologically into 88 selection and 89 untouched validation events.
+None of the twelve fixed ridge mean specifications passes the selection gate.
+The numerically best regularized context/history head improves the already weak
+base by 0.1182% on selection but remains **-0.1157%** versus predicting zero;
+weaker penalties overfit substantially.
+
+V662 evaluates the requested separate-sign combination on the same sealed
+chronology. Causal logistic heads use ordinary or return-weighted sign loss;
+their probabilities are blended with the frozen leaf-specific positive and
+negative magnitudes and active mass. Sixteen candidates pass the selection
+gate. The selected 50/50 return-weighted blend reaches **+0.2828%** MSE skill
+versus zero, **+0.5158%** improvement over the base and **+0.01164 bits** of
+sign information on selection. On untouched validation it remains +2.5287%
+versus zero but falls **0.8569% behind the base**, improves on only one of four
+UTC days, and adds just +0.00348 sign bits. Its largest mean is **3.3223 bp**
+and its 75% absolute-residual radius is **30.3243 bp**, leaving zero directional
+or cost-clearing intervals. The candidate is rejected without loading the test
+window.
+
+A heteroscedastic interval refit is not run for this branch. Even a hypothetical
+zero-width interval could preserve at most the 3.3223 bp point-forecast margin,
+which is below the 24 bp round-trip cost. Rescaling uncertainty cannot create
+economic edge absent from the mean. The documented external-feature audit also
+does not provide a ready substitute: historical spot books do not cover this
+2025 chronology, archived futures depth has only a narrow next-second sign
+result, and the current native basis already includes the supported spot-flow,
+volatility and activity inputs. The sequence branch is therefore stopped before
+backtesting; the confidence-scaled capital guard remains the correct active
+behavior until a forecast passes the pre-test economic gate.
+
+Artifacts:
+
+- `data/benchmarks/event-native-barrier48-selected-history-cal7-july-v660/summary.json`
+- `data/benchmarks/event-native-barrier48-history-mean-cal7-july-v661/summary.json`
+- `data/benchmarks/event-native-barrier48-history-sign-magnitude-cal7-july-v662/summary.json`
+
+### Futures increment, softer capital sizing, and honest leaf support — v663 through v669
+
+V663 tests archived futures information that was absent from the native spot
+basis. A causal adapter exposes only the latest fully completed futures minute
+paired with the matching completed spot minute. The fixed views cover futures
+activity, centered basis and relative returns, and taker imbalance. A causality
+test verifies that changing the unfinished or future minute cannot change the
+features. The 48 bp/one-hour screen has 235 fit-chain and 177 calibration-chain
+events. One activity candidate passes the first 88-event selection half, but on
+the untouched 89-event half it is **1.2126% worse than the frozen law**, improves
+only two of four days, and adds just 0.00103 sign-information bits over its
+matched base-only head. Its largest expected move is 2.931 bp against a 30.003
+bp 75% residual radius. It is rejected without loading the test window.
+
+V664 raises the 48 bp timeout from one to four hours. The seven-day calibration
+timeout share falls from 87.75% to **44.34%**, but MSE skill remains -1.9029%
+and direction accuracy is 51.7581%. V665 expands calibration to 14 days. The
+39,840 stride origins contain 194 non-overlapping event-chain observations;
+timeout share falls to **32.21%**, but MSE skill worsens to -3.0254%, direction
+is 50.5447%, and one of four tree leaves has zero separate estimation rows.
+V666 repeats the incremental futures screen on 97 fit and 194 calibration-chain
+events. No candidate passes selection. The best incremental-MSE specification
+adds only 0.01297% over its matched base head, loses 0.21784% to the frozen law,
+and has negative incremental sign information. Futures activity and basis are
+therefore not promoted for either tested event clock.
+
+V667–v668 evaluate a softer form of the requested uncertainty response. The
+central forecast ranks actions while the conformal interval scales only the
+loss budget by
+
+\[
+c_{\mathrm{soft}} = \frac{|\mu|}{|\mu|+r},
+\]
+
+where `r` is the maximum distance from the point forecast to either interval
+endpoint. The same high-water floor and every saved adverse execution path,
+including flatten cost, still constrain root and H2 child actions. With
+`rho=0.5`, a supported adverse event can consume at most half of accumulated
+liquidatable high-water profit, and less when uncertainty is wider. The frozen
+0.20 bp action-value threshold in v667 rejects every trade and returns 0%. A
+zero-threshold diagnostic in v668 permits two tiny long round trips. Both have
+positive gross price P&L totaling **$0.0087355**, but **$0.0388402** of fees
+make net return **-0.0003010%** with 0.0007774% drawdown. The capital rule removes
+the large-loss pattern, while the existing evidence threshold correctly
+rejects the remaining fee-dominated actions. Soft sizing is retained as a
+diagnostic option, not promoted over the robust withdrawal rule; the scored
+window had already been inspected.
+
+V669 adds an honest covariate-support constraint to tree construction. Split
+scores still use only partition outcomes, but a split is inadmissible unless
+both children contain at least 128 rows from the separate estimation population.
+Changing estimation outcomes while holding their features fixed leaves the tree
+unchanged. On the 14-day calibration chronology the empty four-leaf partition
+becomes a fully supported three-leaf partition with counts 128, 2,290 and 201.
+This does not fix prediction: direction remains 50.5447%, MSE skill changes from
+-3.0254% to **-3.0417%**, and return CRPS improves only from 24.1754 to
+24.1668 bp. The constraint is useful structural hygiene but is rejected as a
+forecast improvement. No v663–v669 result changes a live bot, and no new test
+window was loaded for the forecast screens.
+
+Artifacts:
+
+- `data/benchmarks/event-native-barrier48-futures-sign-cal7-july-v663/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-selected-cal7-july-v664/forecast.json`
+- `data/benchmarks/event-native-barrier48-4h-selected-cal14-july-v665/forecast.json`
+- `data/benchmarks/event-native-barrier48-4h-futures-sign-cal14-july-v666/summary.json`
+- `data/benchmarks/event-native-barrier96-4h-h2-conformal75-soft-sizing-july-v667/summary.json`
+- `data/benchmarks/event-native-barrier96-4h-h2-conformal75-soft-sizing-zero-july-v668/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-selected-cal14-support128-july-v669/forecast.json`
+
+### Competing risks and independently weighted direction — v670 through v675
+
+The preceding joint tree asks one shallow partition to predict direction,
+duration and timeout behavior together. V670 therefore factorizes each frozen
+48 bp / four-hour leaf into three masses: down-barrier hit, timeout and
+up-barrier hit. Two penalized logistic heads estimate
+`P(barrier before timeout)` and `P(up | barrier)`. Reweighting changes only
+those masses; the leaf's conditional returns, duration, extrema, paths and
+successor states remain intact.
+
+The first prototype confirms that factorization can shrink a bad mean. On its
+untouched calibration half, return-MSE skill changes from -2.1192% to +0.0413%.
+That apparent gain is insufficient: group NLL worsens from 1.09235 to 1.18125,
+and every predicted mean falls below round-trip cost. A probability model that
+collapses toward zero can improve squared error without supplying a trade.
+
+The repository's recommended basis specifically calls for explicit multiscale
+volatility. `NATIVE_SECOND_VOLATILITY_CONTEXT_FEATURES` now adds causal
+15-minute, 30-minute, one-hour and four-hour rolling return volatility. It uses
+one-hour log-RMS volatility as the anchor and three scale contrasts. A segmented
+prefix-sum cache makes all four coordinates O(1) per origin after one linear
+source pass, while rejecting history that crosses missing seconds. Tests verify
+the exact rolling variances, declared four-hour support and future invariance.
+
+V675 is the honest final screen. It fits on the pre-estimation partition interval,
+selects penalties plus separate arrival/direction blend weights on the first
+seven calibration days, and requires pooled NLL and MSE gains on at least 60%
+of UTC-day blocks. The untouched later seven days are read once. Independent
+blend weights directly test weighting the arrival/magnitude and direction
+experts by their separate evidence.
+
+| Metric | Frozen joint leaf | Selected competing risks |
+| --- | ---: | ---: |
+| Selection return-MSE skill | -3.6730% | +0.4109% |
+| Selection group NLL | 1.19643 | 1.00838 |
+| Selection magnitude-weighted direction | 47.95% | 54.83% |
+| Holdout return-MSE skill | -2.1192% | -0.6912% |
+| Holdout group NLL | 1.09235 | 1.10212 |
+| Holdout magnitude-weighted direction | 53.54% | 43.99% |
+| Holdout maximum absolute mean | 34.672 bp | 6.537 bp |
+| Holdout means above 12 / 24 bp | 994 / 994 | 0 / 0 |
+
+The selected full-weight heads reduce holdout MSE by 1.3983% relative to the
+frozen law, and improve five of seven daily MSE blocks, but fail the NLL,
+direction and economic gates. Arrival is regime-dependent: timeout frequency
+rises from 20.38% in selection to 44.34% in holdout, while the selected head
+predicts 16.68% and 29.35%. Keeping the frozen direction while changing only
+arrival preserves its 53.54% weighted direction accuracy, but does not improve
+mean skill. Conversely, using the new direction head creates the MSE shrinkage
+by removing cost-sized means and flips the useful direction signal. This is a
+clean rejection, not a policy loss requiring more Bellman computation.
+
+Preserve the factorized evaluation and multiscale volatility implementation for
+future models, but do not integrate this head into execution. The next forecast
+candidate must improve cost-sized direction on chronological blocks; uncertainty
+sizing already handles capital withdrawal once such an edge exists.
+
+Artifacts:
+
+- `data/benchmarks/event-native-barrier48-4h-competing-risks-independent-blends-july-v675/summary.json`
+
+```powershell
+node --conditions=development --import tsx scripts/screen-native-event-competing-risks.ts --source event-native-barrier48-4h-selected-cal14-july-v665 --features volatility-context --output event-native-barrier48-4h-competing-risks-independent-blends-july-v675
+```
+
+### Slower direction transfer, reliability ensemble and uncertainty withdrawal — v676 through v691
+
+The later 75–77% structured next-second classifier did not transfer directly to
+the 48 bp event horizon in v537. V676–v678 therefore test a different use of
+scale: train the old fixed minute-event specification strictly before native
+calibration and use only its probability that a 120 bp barrier resolves upward
+within one day. The model uses 5,731 events, four leaves and only the last fully
+completed minute at each native origin. The first prototype mislabeled its
+forecast field and is discarded. The corrected v678 selects full slow weight
+and unit log-odds scale on the first seven days.
+
+The slow model is the first positive direction transfer in this branch. Its
+untouched later-half return-MSE skill is **+2.0359%**, versus -2.1192% for the
+frozen native law; group NLL improves from 1.09235 to **1.08103**, and
+magnitude-weighted direction rises from 53.54% to **59.62%**. It improves MSE on
+five of seven days, but NLL on only three. Its maximum mean is 9.281 bp and no
+forecast clears even the 12 bp one-way cost, so slow direction alone is not an
+economic policy.
+
+V679 recreates the native return-weighted fast sign head without reading the
+inspector window. V680 combines slow and fast probabilities in symmetric
+log-odds space,
+
+\[
+p_{up}=\sigma\!\left(a\,\operatorname{logit}(p_{slow})
+  +b\,\operatorname{logit}(p_{fast})\right).
+\]
+
+The selection rule chooses `a=1`, `b=0.5`. On the untouched later seven days,
+return-MSE skill is **+2.3409%**, sign NLL is **0.68505**, and
+magnitude-weighted direction is **58.61%**. MSE improves on five of seven days
+and NLL on four. Six stride origins clear 12 bp, but none clears the 24 bp round
+trip; the maximum mean is 13.743 bp. This supports combining direction experts
+according to measured reliability, but does not yet support trading each event.
+
+V681 corrects the execution-law compiler for `native-second-event-screen-v2`:
+v665 partitions on earlier fit days but estimates its kernels from the final
+`later-fit-stride` day. Reconstructing all seven fit days was both wasteful and
+the wrong empirical law. The corrected compiler uses the exact 2,619 estimation
+events, completes in 1.99 seconds, and reproduces every saved return, duration,
+extrema and successor probability. V682 compresses the four kernels from
+253/2,415/125/326 paths to 129/204/90/136 observed paths, with maximum declared
+moment error `4.49e-12`. Each path carries the causal slow and fast forecasts at
+its start and successor endpoint, so H2 does not assume that the current signal
+persists. V692/V693 reproduce that law and compression after pinning hashes for
+the slow model/config and fast head/config; a four-decision v694 replay verifies
+the provenance-complete loading path.
+
+Every coefficient pair that passed v680's first-half MSE/NLL/day-stability gate
+forms an eight-model forecast set. The selected pair ranks actions. Its minimum
+and maximum probabilities define the interval used by soft confidence,
+
+\[
+c=\frac{|p-0.5|}{|p-0.5|+
+  \max(p-p_{low},p_{high}-p)}.
+\]
+
+The existing liquidatable-equity state then scales a maximum 50 bp initial loss
+budget by `c`. After a peak, it protects
+`1-c(1-rho)` of profit with `rho=0.5`. Root and successor actions must clear
+that floor under every fitted execution path after reserving a flatten cost.
+Thus high disagreement withdraws exposure continuously, and a supported adverse
+event cannot erase all accumulated liquidatable profit.
+
+The action results separate forecast quality from capital control:
+
+| Replay | Native H1 control | Ensemble H2 | Trades | Fees | Max drawdown |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Seven-day selection, no guard (v686) | +21.5580% | **-21.5651%** | 57 | $135.48 | 42.2845% |
+| Seven-day selection, 50 bp soft guard (v687) | +21.5580% | **+0.000050%** | 2 | $0.0249 | 0.000223% |
+| Untouched seven-day holdout, frozen guard (v689) | +8.6268% | **+0.000258%** | 2 | $0.0256 | 0.000247% |
+| Three-day non-fit inspector test, frozen guard (v691) | 0% | **-0.000618%** | 4 | $0.0260 | 0.000800% |
+
+Raising the maximum risk to 100 bp in v688 changes no fill because exchange
+minimum quantity already binds. V690 keeps the native distribution for H2
+ranking and uses the ensemble only for uncertainty. Even a 1,000 bp maximum
+seed budget makes only two fills and returns +0.000125% on selection: a small
+early profit raises the floor, after which the worst fitted loss from the
+minimum order exceeds the permitted giveback. This is correct profit protection
+but also shows a cold-start/minimum-lot limitation.
+
+V691 is the decisive rejection. The guard contains the damage, but two short
+round trips lose gross price P&L and fees. The second entry has only 0.00091 bp
+of fitted H2 advantage and is followed by a +49.66 bp event. The other entry's
+advantage is 0.00945 bp. These values are far below the previously selected
+0.20 bp evidence threshold, repeating the optimizer's-curse result from v614
+and the fee-dominated result from v668. Scaling leverage or enumerating more
+root lots cannot make those advantages reliable.
+
+Current decision: retain the slow expert, the reliability-weighted combination,
+causal successor enrichment, lifecycle position attribution, and the
+uncertainty/high-water mechanism. Do not replace the native action law with the
+ensemble, and do not promote v691. The next forecast iteration should preserve
+the native H1 policy's sparse multi-event holding behavior and use the ensemble
+as a calibrated prior or veto only after an action-value uncertainty bound
+clears costs. Exact peak protection remains intentionally partial: v606 already
+showed that protecting 100% of each new peak forces cash under a two-sided law.
+
+Artifacts:
+
+- `data/benchmarks/event-native-barrier48-4h-slow-direction-calibrated-july-v678/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-july-v680/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-execution-law-july-v681/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-execution-compact-july-v682/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-h2-central-selection7-july-v686/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-h2-soft-risk50-profit50-selection7-july-v687/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-h2-soft-risk50-profit50-holdout7-july-v689/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-h2-base-with-ensemble-risk1000-profit50-selection7-july-v690/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-h2-soft-risk50-profit50-test3-july-v691/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-execution-law-provenance-july-v692/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-execution-compact-provenance-july-v693/summary.json`
+- `data/benchmarks/event-native-barrier48-4h-direction-ensemble-h2-provenance-smoke-july-v694/summary.json`

@@ -33,7 +33,8 @@ export class EventCompletedHistory {
   observe(event: CompletedHistoryEvent, now: number): void {
     if (!Number.isFinite(event.originTime) || !Number.isFinite(event.availableAt) || !Number.isFinite(now)
       || event.originTime < this.lastAvailable || event.originTime < this.lastForecast || event.availableAt > now
-      || !Number.isInteger(event.duration) || event.duration < 1 || event.availableAt !== event.originTime + event.duration * 60_000
+      || !Number.isFinite(event.duration) || event.duration <= 0
+      || Math.abs(event.availableAt - event.originTime - event.duration * 60_000) > 1e-7
       || !(event.return > -1) || !Number.isFinite(event.return)) throw new Error("Event history requires ordered completed outcomes");
     if (event.originTime > this.lastAvailable) this.history = [];
     this.history.push({ ...event });

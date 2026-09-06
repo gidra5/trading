@@ -72,6 +72,7 @@ export * from "./event-execution-backup.js";
 export * from "./event-execution-partitions.js";
 export * from "./event-second-features.js";
 export * from "./event-sampling.js";
+export * from "./event-uncertainty.js";
 export * from "./event-cash-horizon.js";
 export * from "./event-hidden.js";
 export * from "./event-run-model.js";

@@ -4,12 +4,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { KamaInspector } from "../apps/server/src/kama-inspector.js";
-import { NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_CONTEXT_FEATURES, NATIVE_SECOND_DAY_CONTEXT_FEATURES } from "../packages/bot-algo/src/event-second-features.js";
+import { NATIVE_SECOND_EVENT_FEATURES, NATIVE_SECOND_CONTEXT_FEATURES, NATIVE_SECOND_FLOW_CONTEXT_FEATURES,
+  NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES, NATIVE_SECOND_DAY_CONTEXT_FEATURES,
+  NATIVE_SECOND_SELECTED_SIGN_FEATURES,
+  usesNativeSecondTradeFlowFeatures } from "../packages/bot-algo/src/event-second-features.js";
 import { distributionMetrics, eventLeaf, eventFeatureWarmup, trainEventDistribution, type EventClock, type MoveSample } from "../packages/bot-algo/src/event-distribution.js";
 import { buildEventPolicy, DEFAULT_EVENT_COSTS, serializeEventPolicy } from "../packages/bot-algo/src/event-log-policy.js";
 import { eventMarginalCrps } from "../packages/bot-algo/src/event-crps.js";
 import { loadNativeEventCandles, makeSamples, replayEventPolicy } from "./research-event-policy.js";
-import { eventFitPeriods, eventSourceDays, mergeEventSourceRanges } from "./event-fit-periods.js";
+import { eventFitPeriods, eventFittingExclusions, eventSourceDays, mergeEventSourceRanges, type EventExclusionMode } from "./event-fit-periods.js";
 
 const arg = (key: string, fallback = "") => { const i = process.argv.indexOf(`--${key}`); return i < 0 ? fallback : process.argv[i + 1]; };
 const root = path.resolve(__dirname, ".."), output = path.resolve(root, "data/benchmarks", arg("output"));
@@ -17,18 +20,34 @@ assert.ok(arg("output") && !fs.existsSync(output), "Specify a new --output direc
 const catalog = new KamaInspector(path.join(root, "data")).catalog().windows;
 const window = catalog.find(w => w.id === arg("window"));
 assert.ok(window && window.id !== "latest" && !window.id.startsWith("fit-"), "Specify a non-fit --window");
-const mode = arg("clock", "run"), fitDays = Number(arg("fit-days", "2")), testHours = Number(arg("test-hours", "1"));
+const mode = arg("clock", "run"), fitDays = Number(arg("fit-days", "2"));
+const calibrationDays = Number(arg("calibration-days", "1")), testHours = Number(arg("test-hours", "1"));
+const calibrationOnly = process.argv.includes("--calibration-only");
+const finalRefit = process.argv.includes("--final-refit");
+assert.ok(!finalRefit || calibrationOnly, "Final refit exposes its held-out day only as a calibration-only evaluation");
+assert.ok(!finalRefit || calibrationDays === 1, "Final refit currently requires the one-day calibration protocol");
+const exclusionMode = arg("exclusions", "non-fit") as EventExclusionMode;
 const stride = Number(arg("stride", "30")), maxCandles = mode === "next-second" ? 1 : Number(arg("max-candles", "60"));
 assert.ok(["run", "next-second", "barrier"].includes(mode) && Number.isInteger(fitDays) && fitDays >= 1 && fitDays <= 7);
-assert.ok(["fast", "context", "day-context"].includes(arg("features", "fast")));
+assert.ok(Number.isInteger(calibrationDays) && calibrationDays >= 1 && calibrationDays <= 14);
+assert.ok(["all-catalog", "non-fit"].includes(exclusionMode), "Invalid fitting exclusion mode");
+assert.ok(["fast", "context", "flow-context", "flow-vwap-context", "selected-sign", "day-context"].includes(arg("features", "fast")));
 const featureNames = arg("features", "fast") === "day-context" ? NATIVE_SECOND_DAY_CONTEXT_FEATURES
+  : arg("features", "fast") === "flow-vwap-context" ? NATIVE_SECOND_FLOW_VWAP_CONTEXT_FEATURES
+  : arg("features", "fast") === "selected-sign" ? NATIVE_SECOND_SELECTED_SIGN_FEATURES
+  : arg("features", "fast") === "flow-context" ? NATIVE_SECOND_FLOW_CONTEXT_FEATURES
   : arg("features", "fast") === "context" ? NATIVE_SECOND_CONTEXT_FEATURES : NATIVE_SECOND_EVENT_FEATURES;
+const includeTradeFlow = usesNativeSecondTradeFlowFeatures(featureNames);
 const estimationMode = arg("estimation", "shared"), separateEstimation = estimationMode !== "shared";
+const minimumEstimationLeaf = Number(arg("minimum-estimation-leaf", "0"));
 assert.ok(["shared", "later-fit-chain", "later-fit-stride"].includes(estimationMode) && (!separateEstimation || fitDays >= 2));
+assert.ok(Number.isSafeInteger(minimumEstimationLeaf) && minimumEstimationLeaf >= 0
+  && (!minimumEstimationLeaf || separateEstimation),
+"Minimum estimation leaf requires a separate estimation population");
 assert.ok(Number.isFinite(testHours) && testHours > 0 && testHours <= 24 && Number.isInteger(testHours * 3600));
 assert.ok(Number.isInteger(stride) && stride >= 1 && stride <= 60);
 const DAY = 86400000, start = window.startTime, end = Math.min(window.endTime, start + testHours * 3600000);
-const excluded = catalog.filter(w => w.id !== "latest");
+const excluded = eventFittingExclusions(catalog, exclusionMode);
 const clock: EventClock = { candleIntervalMs: 1000, thresholdBps: Number(arg("threshold-bps", "1")),
   maxCandles, ...(mode === "run" ? { runClock: true } : {}) };
 if (arg("duration-bins-seconds")) {
@@ -36,10 +55,15 @@ if (arg("duration-bins-seconds")) {
   assert.ok(bins.length === 2 && bins.every(v => Number.isFinite(v) && v > 0) && bins[0] < bins[1]);
   clock.durationBinsMinutes = [bins[0] / 60, bins[1] / 60];
 }
-const warmup = eventFeatureWarmup(clock, featureNames), periods = eventFitPeriods(start, fitDays, (warmup + 1) * 1000, excluded);
+const warmup = eventFeatureWarmup(clock, featureNames), historyMs = (warmup + 1) * 1000;
+const selectedPeriods = eventFitPeriods(start, fitDays, historyMs, excluded, calibrationDays);
+if (finalRefit) assert.equal(selectedPeriods.calibrationEnd, start, "Final refit requires an adjacent selected calibration day");
+const periods = finalRefit ? { ...selectedPeriods,
+  fitStart: selectedPeriods.fitStart + DAY, fitEnd: selectedPeriods.fitEnd + DAY,
+  calibrationStart: start, calibrationEnd: end, sourceStart: selectedPeriods.fitStart + DAY - historyMs } : selectedPeriods;
 const { fitStart, fitEnd, calibrationEnd, sourceStart } = periods;
 const sourceRanges = mergeEventSourceRanges([{ start: sourceStart, end: calibrationEnd },
-  { start: start - (warmup + 1) * 1000, end }]);
+  ...(calibrationOnly ? [] : [{ start: start - (warmup + 1) * 1000, end }])]);
 fs.mkdirSync(output, { recursive: true });
 const save = (file: string, value: unknown) => fs.writeFileSync(path.join(output, file), JSON.stringify(value,
   (_, v) => typeof v === "number" && !Number.isFinite(v) ? String(v) : v, 2));
@@ -47,13 +71,19 @@ const refs = [];
 for (const day of eventSourceDays(sourceRanges)) {
   const file = path.join(root, "data/market/immutable/refs/candles/spot-btcusdt/btcusdt/1s", `${new Date(day).toISOString().slice(0, 10)}.json`);
   refs.push({ file, sha256: createHash("sha256").update(fs.readFileSync(file)).digest("hex") });
+  if (includeTradeFlow) {
+    const flowFile = path.join(root, "data/market/immutable/refs/trade-flow/spot-btcusdt/btcusdt/1s", `${new Date(day).toISOString().slice(0, 10)}.json`);
+    refs.push({ file: flowFile, sha256: createHash("sha256").update(fs.readFileSync(flowFile)).digest("hex") });
+  }
 }
-save("config.json", { contract: "native-second-event-screen-v1", window, start, end, fullWindow: end === window.endTime,
+save("config.json", { contract: "native-second-event-screen-v2", window, calibrationDays,
+  ...(calibrationOnly ? {} : { start, end, fullWindow: end === window.endTime }), scoredTestLoaded: !calibrationOnly,
+  finalRefit, calibrationRole: finalRefit ? "final-held-out" : "model-selection",
   fitStart, fitEnd, calibrationStart: fitEnd, calibrationEnd, fitPeriods: periods, excluded, stride, clock,
   featureNames, warmupCandles: warmup, sourceRanges, sourceReferences: refs, costs: DEFAULT_EVENT_COSTS,
-  estimationMode,
+  estimationMode, minimumEstimationLeaf, exclusionMode,
   estimation: separateEstimation ? `Partition on earlier fit days; estimate on the final fit day using ${estimationMode === "later-fit-chain" ? "a complete non-overlapping event chain" : "the same fixed-stride origins"}. The following calibration day remains diagnostic only.` : "Partition and estimate from the same fixed-stride fit population.",
-  method: "Native completed 1s OHLCV, declared bounded feature support, fixed-stride training origins, purged complete input/target support against all inspector windows including fit windows. Choose the latest whole-day fit/calibration block whose full feature support avoids every catalog exclusion, recording any backward date shifts without consulting returns. A depth-2 distribution tree is frozen before a separate diagnostic calibration day and the test prefix; neither segment selects or recalibrates it. Replay observes every causal run boundary (including its revealing candle) or each observed price barrier/timeout or every next second. Timeouts are decision boundaries, not claims that a run ended. Move and borrowing durations remain physical minutes; class-duration bins use seconds. Orders are fixed at the completed close and attempted at the next open. Exact marked-terminal H1, with actual fee-paying terminal replay settlement. This bounded screen is not full-window coverage, the production59 sign model, or a minute-versus-second comparison." });
+  method: `Native completed 1s OHLCV, declared bounded feature support, fixed-stride training origins, purged complete input/target support against ${exclusionMode === "all-catalog" ? "all inspector windows including fit windows" : "all non-fit inspector windows; unscored fit-* intervals remain admissible historical input"}. Choose the latest whole-day fit/calibration block whose full feature support avoids every declared exclusion, recording any backward date shifts without consulting returns. A depth-2 distribution tree is frozen before a separate diagnostic calibration day${calibrationOnly ? "; calibration-only mode never loads the scored window" : " and the test prefix; neither segment selects or recalibrates it"}. Replay observes every causal run boundary (including its revealing candle) or each observed price barrier/timeout or every next second. Timeouts are decision boundaries, not claims that a run ended. Move and borrowing durations remain physical minutes; class-duration bins use seconds. Orders are fixed at the completed close and attempted at the next open. Exact marked-terminal H1, with actual fee-paying terminal replay settlement. This bounded screen is not full-window coverage, the production59 sign model, or a minute-versus-second comparison.` });
 save("sources.json", Object.fromEntries(["scripts/research-native-second-events.ts", "scripts/research-event-policy.ts", "scripts/event-fit-periods.ts",
   "packages/bot-algo/src/event-distribution.ts", "packages/bot-algo/src/event-second-features.ts", "packages/bot-algo/src/event-log-policy.ts",
   "packages/bot-algo/src/event-one-step.ts", "packages/bot-algo/src/event-positions.ts", "packages/bot-algo/src/event-crps.ts"]
@@ -61,7 +91,7 @@ save("sources.json", Object.fromEntries(["scripts/research-native-second-events.
 const timing: Record<string, number> = {}, timed = <T>(label: string, fn: () => T): T => {
   const begin = performance.now(), value = fn(); timing[label] = (performance.now() - begin) / 1000; return value;
 };
-const candles = timed("loadSeconds", () => loadNativeEventCandles(sourceRanges));
+const candles = timed("loadSeconds", () => loadNativeEventCandles(sourceRanges, includeTradeFlow));
 const training = timed("trainingSampleSeconds", () => makeSamples(candles, clock, fitStart,
   separateEstimation ? fitEnd - DAY : fitEnd, excluded, stride, "stride", featureNames));
 const estimation = separateEstimation ? timed("estimationSampleSeconds", () =>
@@ -71,14 +101,17 @@ if (estimation) {
   assert.ok(estimation.length && training.every(row => row.end < estimation[0].start));
   if (estimationMode === "later-fit-chain") assert.ok(estimation.every((row, i) => !i || row.start >= estimation[i - 1].end));
 }
-const calibration = timed("calibrationSampleSeconds", () => makeSamples(candles, clock, fitEnd, calibrationEnd, excluded, stride, "stride", featureNames));
-// The known test window is intentionally scored; it remains excluded from fitting.
-const test = timed("testSampleSeconds", () => makeSamples(candles, clock, start, end, [], 1, "chain", featureNames));
-assert.ok(training.length >= 256 && calibration.length > 0 && test.length > 0);
+const calibration = timed("calibrationSampleSeconds", () => makeSamples(candles, clock, fitEnd, calibrationEnd,
+  finalRefit ? [] : excluded, stride, "stride", featureNames));
+// Full mode intentionally scores the known window; calibration-only mode never loads it.
+const test = calibrationOnly ? undefined
+  : timed("testSampleSeconds", () => makeSamples(candles, clock, start, end, [], 1, "chain", featureNames));
+assert.ok(training.length >= 256 && calibration.length > 0 && (calibrationOnly || test!.length > 0));
 const distribution = timed("trainSeconds", () => trainEventDistribution(training, clock,
-  { maxDepth: 2, minLeaf: 128, prior: 32, criterion: "distribution", featureNames, estimationSamples: estimation }));
+  { maxDepth: 2, minLeaf: 128, prior: 32, criterion: "distribution", featureNames, estimationSamples: estimation,
+    ...(minimumEstimationLeaf ? { minimumEstimationLeaf } : {}) }));
 const policy = buildEventPolicy(distribution, DEFAULT_EVENT_COSTS,
-  { depths: 0, referenceEquity: 10000, referencePrice: candles[test[0].start].close });
+  { depths: 0, referenceEquity: 10000, referencePrice: candles[(test ?? calibration)[0].start].close });
 save("model.json", serializeEventPolicy(policy));
 const quantiles = (values: number[]) => {
   const sorted = values.slice().sort((a, b) => a - b);
@@ -103,12 +136,19 @@ const describe = (samples: MoveSample[]) => {
     nonzero, nonzeroDirectionAccuracy: correctNonzero / nonzero, timedOut,
     durationSeconds: quantiles(samples.map(s => s.duration * 60)), absoluteReturnBps: quantiles(samples.map(s => Math.abs(s.return) * 10000)) };
 };
-const forecast = { training: describe(training), ...(estimation ? { estimation: describe(estimation) } : {}), calibration: describe(calibration), test: describe(test),
+const forecast = { training: describe(training), ...(estimation ? { estimation: describe(estimation) } : {}), calibration: describe(calibration),
+  ...(test ? { test: describe(test) } : {}),
   leaves: distribution.kernels.map((k, i) => ({ leaf: i, count: distribution.counts[i], atoms: k.length,
     meanReturnBps: k.reduce((s, a) => s + a.probability * a.return * 10000, 0),
     meanDurationSeconds: k.reduce((s, a) => s + a.probability * a.duration * 60, 0) })) };
 save("forecast.json", forecast);
-console.log(JSON.stringify({ phase: "forecast", rows: candles.length, training: training.length, test: test.length, timing }));
+console.log(JSON.stringify({ phase: "forecast", rows: candles.length, training: training.length, ...(test ? { test: test.length } : {}), timing }));
+if (!test) {
+  const summary = { window, scoredTestLoaded: false, candles: candles.length, training: training.length,
+    estimation: estimation?.length, calibration: calibration.length, timing,
+    processMemoryMiB: Object.fromEntries(Object.entries(process.memoryUsage()).map(([key, value]) => [key, value / 1048576])) };
+  save("summary.json", summary); console.log(JSON.stringify(summary));
+} else {
 const { trace, positions, ...metrics } = timed("replaySeconds", () => replayEventPolicy(candles, policy, start, end, 1,
   { trace: true, oneStepTerminal: "marked", onDecision: row => {
     if (Number(row.time) % 300000 < 1000) save("progress.json", { time: row.time, end, equity: row.equityAfter });
@@ -120,3 +160,4 @@ const summary = { window, start, end, fullWindow: end === window.endTime, candle
   allDecisionsFeasible: trace.every((r: any) => r.order.feasible && Number.isFinite(r.order.value)),
   processMemoryMiB: Object.fromEntries(Object.entries(process.memoryUsage()).map(([key, value]) => [key, value / 1048576])) };
 save("summary.json", summary); console.log(JSON.stringify(summary));
+}

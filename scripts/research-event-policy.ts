@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { readCandleShardReferenceSync } from "../packages/storage/src/candles.js";
+import { readTradeFlowShardReferenceSync } from "../packages/storage/src/trade-flow.js";
 import { KamaInspector } from "../apps/server/src/kama-inspector.js";
 import { calibrateEventMean, distributionMetrics, EVENT_FEATURES, EVENT_SECOND_FEATURES, EVENT_PATH_FEATURES, EVENT_RUN_FEATURES, eventFeatures, eventLeaf, eventHiddenNext, observeMove, scaleEventMean, trainEventDistribution, trainEventForest, trainEventProjection, trainEventBoost,
   eventCandleIntervalMs, eventFeatureWarmup, eventBaseFeatures,
@@ -84,6 +85,10 @@ export function replayEventPolicy(c: readonly EventCandle[], p: EventPolicy, sta
     oneStepTerminal?: EventTerminal;
     /** Full empirical execution paths with an unchanged original joint projection. */
     executionOneStep?: readonly (readonly (EventExecutionAtom & { next: number })[])[];
+    /** Experimental execution-aware request policy. Replay still applies the
+     * same next-open fills, account constraints, fees, borrowing and ledger. */
+    executionDecision?: (leaf: number, account: { equity: number; price: number; exposure: number }, time: number) =>
+      { quantity: number; value: number; feasible: boolean; complete: boolean; [key: string]: unknown };
     /** Receding two-event planning; each trace retains its finite-horizon value gap. */
     twoStep?: { terminal: "marked" | "friction"; maxEvaluations: number; tolerance?: number;
       /** Reuse the recursive continuous relaxation to tighten root bounds. */
@@ -121,6 +126,10 @@ export function replayEventPolicy(c: readonly EventCandle[], p: EventPolicy, sta
       || path.seconds / 60 !== old.duration || Math.min(1, path.lowRatio) - 1 !== old.low || Math.max(1, path.highRatio) - 1 !== old.high
       || (Object.keys(p.costs) as Array<keyof typeof p.costs>).some(key => path.costs[key] !== p.costs[key]);
   }))) throw new Error("Execution law changed the frozen joint forecast or account costs");
+  if (options.executionDecision && (interval !== 1000 || options.executionOneStep || options.oneStepTerminal
+    || options.twoStep || options.threeStep || options.fitted || options.sign || options.sizeSign || options.severity
+    || options.updates || options.adaptive || p.model.hidden || options.quoteEntries))
+    throw new Error("Experimental execution policy requires a frozen native-second model");
   const execution = options.executionOneStep?.map(kernel => prepareEventExecutionOneStep(kernel, options.oneStepTerminal as "marked" | "market"));
   const executionRequest = (leaf: number, account: { equity: number; price: number; exposure: number }) => {
     const request = execution![leaf](account), before = account.exposure * account.equity / account.price, after = before + request.quantity;
@@ -273,7 +282,8 @@ export function replayEventPolicy(c: readonly EventCandle[], p: EventPolicy, sta
       && (account.exposure !== 0 || (optionController === 1 && !options.fitted.replanCash)));
     const composition = options.fitted?.sampledAlternative && !optionHolding ? decideFittedEventControllers(
       [options.fitted.policy, options.fitted.sampledAlternative], signObservation!.values, account, depth, leaf) : undefined;
-    const decision = forcedWait ? undefined : execution ? executionRequest(leaf, account)
+    const decision = forcedWait ? undefined : options.executionDecision ? options.executionDecision(leaf, account, time)
+      : execution ? executionRequest(leaf, account)
       : options.oneStepTerminal ? decideEventOneStep(decisionPolicy.model.kernels[leaf], account, p.costs, options.oneStepTerminal)
       : options.twoStep ? twoStepDepth === 1
         ? decideEventOneStep(decisionPolicy.model.kernels[leaf], account, p.costs, options.twoStep.terminal)
@@ -381,6 +391,7 @@ export function replayEventPolicy(c: readonly EventCandle[], p: EventPolicy, sta
       const row = { time, endTime: c[traceEndIndex].openTime + interval, leaf,
       ...(interruptedByUnavailable ? { interruptedByUnavailable: true } : {}),
       ...(options.oneStepTerminal ? { optimizer: execution ? "execution-one-event-lots" : "one-event-lots", terminal: options.oneStepTerminal } : {}),
+      ...(options.executionDecision ? { optimizer: "experimental-execution-policy" } : {}),
       ...(options.twoStep ? { optimizer: twoStepDepth === 2 ? "two-event-bounds" : "one-event-lots", terminal: options.twoStep.terminal } : {}),
       ...(options.twoStep?.countdown ? { decisionDepth: twoStepDepth } : {}),
       ...(options.threeStep ? { optimizer: "three-event-bounds", terminal: options.threeStep.terminal } : {}),
@@ -480,11 +491,41 @@ export function loadEventCandles(start: number, end: number, intervalMs: 1000 | 
 
 /** Validate each native source block in full. Deliberate gaps between blocks
  * remain gaps; feature and outcome timestamp guards reject crossing them. */
-export function loadNativeEventCandles(ranges: readonly EventSourceRange[]): EventCandle[] {
+export function loadNativeEventCandles(ranges: readonly EventSourceRange[], includeTradeFlow = false): EventCandle[] {
   const candles: EventCandle[] = [];
   for (const range of mergeEventSourceRanges(ranges))
     for (const row of loadEventCandles(range.start, range.end, 1000)) candles.push(row);
   if (!candles.length) throw new Error("No native event source ranges");
+  if (includeTradeFlow) {
+    const byTime = new Map(candles.map(row => [row.openTime, row]));
+    const directory = path.join(root, "data/market/immutable/refs/trade-flow/spot-btcusdt/btcusdt/1s");
+    for (const range of mergeEventSourceRanges(ranges)) {
+      for (let day = Math.floor(range.start / DAY) * DAY; day < range.end; day += DAY) {
+        const file = path.join(directory, `${new Date(day).toISOString().slice(0, 10)}.json`);
+        if (!fs.existsSync(file)) throw new Error(`Missing native trade-flow shard: ${file}`);
+        for (const flow of readTradeFlowShardReferenceSync(file)) {
+          const candle = byTime.get(flow.openTime);
+          if (!candle) continue;
+          const buy = flow.aggressiveBuyAggregateTradeCount, sell = flow.aggressiveSellAggregateTradeCount;
+          const buyVwap = flow.aggressiveBuyBaseVolume > 0
+            ? flow.aggressiveBuyQuoteVolume / flow.aggressiveBuyBaseVolume : 0;
+          const sellVwap = flow.aggressiveSellBaseVolume > 0
+            ? flow.aggressiveSellQuoteVolume / flow.aggressiveSellBaseVolume : 0;
+          candle.nativeTradeFlow = {
+            availableAt: flow.openTime + 1000,
+            aggregateCountImbalance: buy + sell ? (buy - sell) / (buy + sell) : 0,
+            lastAggressorSide: flow.lastAggressorSide,
+            buyerSellerVwapGap: buyVwap > 0 && sellVwap > 0 ? 2 * (buyVwap - sellVwap) / (buyVwap + sellVwap) : 0,
+            aggressiveBuyQuoteVolume: flow.aggressiveBuyQuoteVolume,
+            aggressiveSellQuoteVolume: flow.aggressiveSellQuoteVolume,
+            aggressiveBuyMaxAggregateQuantity: flow.aggressiveBuyMaxAggregateQuantity,
+            aggressiveSellMaxAggregateQuantity: flow.aggressiveSellMaxAggregateQuantity,
+          };
+        }
+      }
+    }
+    if (candles.some(row => !row.nativeTradeFlow)) throw new Error("Native candle/trade-flow coverage mismatch");
+  }
   return candles;
 }
 
