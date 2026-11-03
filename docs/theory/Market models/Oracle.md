@@ -7,20 +7,28 @@ The usual setup is to assume $e_t=0$, but it is not required. In this way we can
 
 We may also interpret it as "forcing" exposure at time $t$ and then proceeding optimally.
 
-Note that since we optimize *returns* and not simply equity, we can safely scale everything by $Q_t$, effectively setting it to 1. 
+Since we optimize returns, we can normalize equity to $Q_t=1$ provided that absolute quote-order bounds, pending-order notionals and reserved equity are scaled with it. With fixed absolute bounds, retain account size or the corresponding normalized bounds in the state.
+
+While not strictly necessary for transition rules to work, all price changes are on a grid with fixed price step $\Delta p$, such that $p_t=n_t\Delta p,\ n_t\in\mathbb N$. It mostly affects optimal policy, not the transition rules themselves.
 # Transition rules
 Before we move to the oracle policy, we need to define how oracle can transition between states each time step.
 
-It can be split in five phases:
-1. Targeting phase - decide what should be the exposure for the duration of the time step.
-2. Rebalancing phase - given target exposure rebalance portfolio to match it.
-3. Maintenance phase - apply maintenance costs due to debt, financing, etc.
-4. Liquidation phase - check liquidation conditions. If they are met, the equity goes to 0 and return becomes negative.
-5. Finalization phase - once we arrive at the last time step, oracle should simulate moving to 0 exposure.
+With pending limit orders, a decision at tick $t$ follows this order:
+
+1. Arrival fills - execute eligible resting orders crossed by the move from $p_{t-1}$ to $p_t$, at their limit prices and maker fees.
+2. Cancellation - remove requested orders from the unfilled book and release their reservations.
+3. Targeting and market rebalancing - choose the target from the account after those fills, then execute the actual market quote change at $p_t$ with taker fees.
+4. Placement - append new passive orders and reserve their equity. They can first fill at tick $t+1$.
+5. Funding and marking - apply the signed-asset funding multiplier and mark the account at $p_{t+1}$.
+6. Liquidation - check the funded, newly marked account. The formalized zero-equity liquidation rule also clears its pending orders.
+
+Finalization is a separate terminal procedure using explicit valid closing and cancellation actions. The limit-order extension below specifies the state and execution rules. The market-only model is the case with an empty pending book and no placements.
 ### Targeting phase
 Suppose we have some policy $\pi_t(e_t\to e)$ that defines how we should favor transitioning from $e_t$ to $e$. Then the optimal decision is: $$e'=\arg\max\limits_{e} \pi_t(e_t\to e)$$
 ### Rebalancing phase
 Once we have decided on the target exposure $e_r$, we should rebalance portfolio $\phi_t$ to $\phi_t'$ such that after applying fees we will be at the current target. For that we need to consider buying and selling cases separately.
+
+There may be additional constraints on $dq$ in the form of min and max order sizes. Basically requiring $|dq|\in[dq_{min}, dq_{max}]$. In case we go outside it, we clamp it into the range. 
 #### Buying
 Let $dq$ be the cost and $da$ be the received amount. Then small size market order will guarantee that:$$da=\frac {(1-f)dq} p$$Where $f$ is the friction (fees, slippage, price impact). Equity will reduce proportionally to the cost:$$Q'=Q-f*dq$$And asset value $u$ will change according to this:$$u'=a*p+(1-f)*dq$$Relating these two relations we get an expression for $dq$:$$dq=\frac {u-p*a} {1-f+f*a}$$That means we buy if the condition $u>p*a$ is true.
 
@@ -41,6 +49,129 @@ $$
 \end{cases}
 $$
 In the buy branch $s$ is gross quote spent. In the sell branch $s$ is gross asset value sold.
+### Limit-order state and actions
+
+The finite-tick limit-order model uses the account and an ordered list of resting orders:
+
+$$
+S_t=((q_t,a_t,p_t),\ p_{t-1},\ O_t).
+$$
+
+The previous price is needed to distinguish a crossing from merely being on one side of a limit. An order is
+
+$$
+o=(id,\ side,\ \ell,\ N,\ \tau),\qquad \ell>0,\quad N>0,
+$$
+
+where $\ell$ is its fixed execution price, $N$ is its fixed gross quote notional, and $\tau$ is its placement tick. For a buy, $N$ is quote spent before the received-asset fee; for a sell, $N/\ell$ is the asset quantity sold before the received-quote fee. These quantities are continuous in this model. A separate asset-quantity lattice is not assumed.
+
+The executed action is $u_t=(dq_t^{market},C_t,P_t)$: one actual signed market quote change, cancellation IDs, and an ordered list of new orders. A target-exposure policy computes its market request from the account after arrival fills. The raw Lean transition receives the already selected actual $dq_t^{market}$; it does not itself clamp the request or choose a target.
+
+Admissible new orders have $\tau=t$ and are strictly passive at placement:
+
+$$
+\ell<p_t\quad\text{for buys},\qquad \ell>p_t\quad\text{for sells}.
+$$
+
+Limit prices obey the allowed price set, including $\ell=n\Delta p$ with positive integer $n$ when the fixed grid is used. There are at most $K$ simultaneously active orders. Passivity, the price set and the slot bound are action-feasibility conditions; they are not enforced by silently changing a submitted order.
+
+### Arrival fills and activation
+
+An order can fill at decision $t$ only if $\tau+1\le t$. Its crossing condition uses the single observed tick move:
+
+$$
+\operatorname{crossed}(o,p_{t-1},p_t)=
+\begin{cases}
+p_t\le\ell\le p_{t-1}\ \land\ p_t<p_{t-1},&side=buy,\\
+p_{t-1}\le\ell\le p_t\ \land\ p_{t-1}<p_t,&side=sell.
+\end{cases}
+$$
+
+Thus an upward move fills only sells, a downward move only buys, and a flat move fills neither. Touching an endpoint counts when the move is non-flat. No candle wick, hidden intratick path, queue priority or probabilistic fill is inferred.
+
+Let $J_t$ be the list of orders satisfying both eligibility and crossing. Every such order fills completely, in its existing book order, and is removed from $O_t$. There are no partial fills in this transition. The fill set is determined before current cancellations or placements: cancellation cannot undo a fill already triggered at arrival, and a new order cannot fill in the decision that creates it.
+
+At tick $t$, use $0\le f_t^{maker}<f_t^{taker}<1$ and $b_t^{maker}=1-f_t^{maker}$. Each fill applies Oracle's received-amount fee rule at its own limit price:
+
+$$
+\operatorname{fill}_t((q,a,p_t),o)=
+\begin{cases}
+\left(q-N,\ a+b_t^{maker}N/\ell,\ p_t\right),&side=buy,\\[3pt]
+\left(q+b_t^{maker}N,\ a-N/\ell,\ p_t\right),&side=sell.
+\end{cases}
+$$
+
+Execution uses $\ell$, while the account remains marked at $p_t$. Its resulting equity therefore includes the difference between execution and mark prices as well as the fee. The maker fee is the fee of the fill tick; it is not fixed at placement.
+
+### Cancellation, market execution and placement
+
+After the arrival fills, remove from the unfilled book every order whose ID is in $C_t$. Cancellation is free and changes neither quote nor asset balances. It releases the removed orders' reservations. Keeping an order preserves its ID, limit price, notional and placement time.
+
+Execute $dq_t^{market}$ on the account after all fills, at the current mark $p_t$ and fee $f_t^{taker}$, using the buy/sell map above. Negative $dq$ spends quote buying; positive $dq$ receives quote selling; zero is a no-op. Append $P_t$ only after this market execution. In the Lean machine:
+
+$$
+\begin{aligned}
+\phi_t^{arrived}&=\operatorname{fillAll}_{f_t^{maker}}(J_t,\phi_t),\\
+\phi_t^{reb}&=\operatorname{executeQuote}_{f_t^{taker},p_t}
+  (dq_t^{market},\phi_t^{arrived}),\\
+O_t^{reb}&=\operatorname{cancel}_{C_t}(O_t\setminus J_t)\mathbin{+\!+}P_t.
+\end{aligned}
+$$
+
+Here removal preserves the relative order of surviving entries and $+\!+$ appends the new list. A reservation for a filled or canceled order ends when that order leaves the book.
+
+### Reserved equity and aggregate order limits
+
+For leverage parameter $L>0$, a resting order reserves $N/L$ of the shared account equity. For the whole book:
+
+$$
+R_t=\sum_{o\in O_t}\frac{N_o}{L},\qquad Q_t^{free}=q_t+a_tp_t-R_t.
+$$
+
+Reservation is an availability constraint, not a quote debit or an execution fee. It cannot also fund other actions while the order remains active. Placement, cancellation and reservation alone do not alter $(q,a)$. Reservations and the collateral required by existing positions must be checked against the shared account, alongside its exposure constraints. There is no additional borrowing charge on reserved equity in this funding model.
+
+For an actual limit fill, its bounded quote movement is
+
+$$
+dq_o=\begin{cases}-N_o,&side=buy,\\(1-f_t^{maker})N_o,&side=sell.\end{cases}
+$$
+
+Nonzero physical orders must meet their quote-size minimum. Limit fills and the market action consume one shared per-decision maximum:
+
+$$
+|dq_t^{market}|+\sum_{o\in J_t}|dq_o|\le dq_{max,t}.
+$$
+
+Opposite executed trades do not erase consumed capacity or fees. Splitting orders does not renew the allowance. The raw fill machine executes the specified full fills; it does not partially fill, round, defer or cancel an order to repair a violated cap. Admissibility must exclude an action/history whose committed fills and market action cannot satisfy the constraints. The numerical reserve formulas and their reciprocal-price identities are present in Lean; integrating all these admissibility checks into the complete policy theorem is separate from the raw transition.
+
+### Funding, marking and liquidation with a pending book
+
+After the rebalance, apply Oracle funding with $k_t>0$ and then the next mark:
+
+$$
+\phi_t^{moved}=(q_t^{reb},\ k_ta_t^{reb},\ p_{t+1}).
+$$
+
+Original resting orders keep their notionals, prices and placement ticks through funding. Only held signed asset balances are funded. The next state's previous-price field becomes $p_t$.
+
+Use the taker fee to compute fee-aware liquidation data at $p_{t+1}$. If raw equity and effective equity are positive and effective exposure lies within $[l_t,u_t]$, the next state is
+
+$$
+S_{t+1}=(\phi_t^{moved},\ p_t,\ O_t^{reb}).
+$$
+
+Otherwise the zero-account liquidation convention gives
+
+$$
+S_{t+1}=((0,0,p_{t+1}),\ p_t,\ []).
+$$
+
+Liquidation therefore occurs before the next arrival-fill phase: orders on an account liquidated by that move are cleared rather than filled afterward. The reciprocal-machine theorem is stated for $l_t\le0$ and $u_t\ge1$.
+
+### Lean specification scope
+
+These definitions are in `TradingTheory.LimitOrderSymmetry` (`Order`, `triggered`, `fillAll`, `reserve`) and `TradingTheory.LimitOrderMachine` (`State`, `Action`, `rebalance`, `finish`, `run`) in the `codex/ml2-lean` worktree. At this documentation update, the local order-symmetry module has compiled; the complete machine proof is still being completed. The raw transition definitions do not themselves establish that a submitted plan satisfies passivity, price grids, reservations, slot limits or aggregate order caps.
+
 ### Maintenance phase
 This is the cost of simply holding the existing position, simply labeled as the mapping $\operatorname{maint}(q,a)$. There are two models that correspond to borrowing and funding mechanisms, which we will name correspondingly.
 
@@ -99,8 +230,12 @@ $$
 Finally, once oracle is done, it closes the remaining portfolio by applying the same fee-aware rebalance rule with target exposure $0$:
 $$(q_{t+T}^{flat},a_{t+T}^{flat})=\operatorname{reb}_{p_{t+T},f}((q_{t+T},a_{t+T}),0)$$
 
+With order-size constraints, closing must use valid non-overshooting orders over the available decisions. A completed policy **must end with exactly zero asset holdings in every asset and no pending orders**. Closing, including its fees, is part of the policy objective and feasibility. The terminal arrival is processed before cancellation; its fills consume the same aggregate decision cap as the final market close. There is no extra closing tick or capacity exemption. The policy must reduce earlier if the final decision cannot close everything.
+
+A zero exposure target does not guarantee zero holdings after clamping. Physical execution preserves any residual, including dust below the minimum; such a residual makes the completed policy infeasible. It must never be silently written off, rounded to zero, or valued as a successful cash terminal result. At each supported future branch, Bellman viability requires a valid path to this flat terminal condition. A backtest can report terminal wealth only after verifying it; an unfinished replay reports marked wealth separately. Historical counterexamples explicitly using a marked-residual objective concern that previous objective. The Lean `run` has no implicit final execution, so its closing and cancellation actions must be included explicitly or provided by the specified terminal finalizer.
 
 ### Recursion over exposure state
+The scalar exposure recursion below describes the market-only specialization. With limit orders, it must retain the pending book, previous tick price and available equity as well; exposure alone does not determine future fills or feasible actions.
 We can express the transition rules a bit nicer in the equity-exposure space with transform $\varPsi_t$:
 $$\begin{aligned}
 \varPsi_t(q,a)=\left(q+ap_t,\frac{ap_t}{q+ap_t}\right)\\
@@ -245,19 +380,19 @@ That kind of suggests that whatever policy we choose, it will probably need to h
 
 In the simplest case we might define state as the LOB that evolves independently, since our market impact is negligible in case of small equity. And the agents state itself - portfolio describing allocation of equity across assets. For simplicity assume only one asset.
 
-As mentioned before it may also include a set of pending limit orders, but for simplicity we omit them as well for now.
+For the limit-order extension, retain the pending book and previous tick price as specified above. The market-only specialization omits the book.
 
 Some actors that participate in the market may act based on the historic states, so that means we might want to include all of the prior LOB history as well.
 
 To formalize - set of states is, in most general case, a cartesian product of market states, limit order states and portfolio states $\mathcal S=\mathcal S_{market}\times \mathcal S_{portfolio} \times \mathcal S_{orders}$. And in the particular case considered here it is simplified to $\mathcal S=(market: \mathcal S_{market},\ quote: \mathbb{R},\ asset: \mathbb{R})$
 
-The agent's set of actions is the set of target portfolio and orders states $\mathcal A(s)=\mathcal S_{portfolio}\times \mathcal S_{orders}$, and it is independent of the current state as a whole. That also implies that it is a composite action, consisting of portfolio action and order action. But it still may refer to it for convenience, since it is nice for noop expression. We might want to also express actions as portfolio state deltas, which may feel more natural, but harder to properly manage as action space. So instead we opt for expressing the end result we want and then deriving the necessary changes.
+Desired actions can be parametrized by target portfolio and order states. The feasible subset $\mathcal A(s)$ depends on the current account, resting orders, available equity and execution constraints. The limit-order transition represents execution by a market quote change, cancellation IDs and new orders; a target-state policy derives those actions from the current state.
 
 The agent's reward is mainly defined by the return we get by keeping the selected state. That is defined by market movement and order execution, if any. The reward is then the delta between prev equity and the new, calculated as mark-to-market value of all assets+canceling of pending orders. We could generically say its $\mathcal R=\mathbb R$, but more concretely its derived from market return.
 
 Now to the transition distribution. Its effective behavior is mostly described by what we already discussed in prev section. To fit the RL formulation we can a bit adjust it.
 
-First, market changes and portfolio changes are independent, and further more market changes are independent of our actions. Returns and portfolio changes are deterministic in terms of the changes to the state and action. The order state changes are not deterministic in market change/action, essentially because it is not guaranteed to execute fully even if price actually touched it. That suggests the following composition:
+Market changes are assumed independent of our actions. Conditional on the observed market move and action, the full-fill tick model above has deterministic order, portfolio and reward transitions; its order-transition distribution is a point mass. A richer queue or partial-fill model could instead use a stochastic order-transition distribution in the following general composition:
 $$
 p(s_{t+1}, r_{t} | s_t, a_t)=p_{m}(s_{m,t+1}|s_{m,t})p_{o}(s_{o,t+1}|s_{o,t}, a_{o,t}, s_{m,t+1})\delta_{s_{p,t+1}}\delta_{r,t}
 $$
@@ -448,6 +583,8 @@ Now we need
    50.  but this idea is for future iterations, not for now.
 
 51.  the limit order model:
+
+The dated notes below explore additional variants. The current finite-tick transition specification above uses signed-asset funding, full fills from consecutive tick prices and a finite pending book; reserve borrowing charges, candle-wick execution and a universal one-active-order reduction are not assumptions of that specification.
 
     52.  [7/26/2026 12:16 AM] Roman Храновський: Currently i compute a regret for each forced target exposure and use that as a distribution to be learned for the strategy. And values are computed as holding target distribution for H time, then continuing optimally for T time. Regret is then the difference between the optimal target exposure and the actual chosen target exposure.
 
