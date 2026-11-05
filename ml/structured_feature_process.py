@@ -896,6 +896,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
         minimum_radius: float,
         learnable_centering: bool,
         linear_rank: int | None = None,
+        layer4_parallel_branches: dict[str, object] | None = None,
         layer8_attention: dict[str, int | str] | None = None,
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
@@ -940,6 +941,36 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             next_feature_distribution_width
         )
         self.linear_rank = None if linear_rank is None else int(linear_rank)
+        self.layer4_parallel_branches = (
+            None
+            if layer4_parallel_branches is None
+            else dict(layer4_parallel_branches)
+        )
+        if self.layer4_parallel_branches is None:
+            self.layer4_branch_count = 2
+            self.layer4_branch_width = None
+        else:
+            branches = self.layer4_parallel_branches
+            if branches.get("type") \
+                    != "independent-current-feature-gnglu-v1" \
+                    or branches.get("combination") \
+                    != "concatenate-into-shared-layer-4":
+                raise ValueError("unsupported layer-4 parallel branches")
+            self.layer4_branch_count = int(branches.get("count", 0))
+            self.layer4_branch_width = int(branches.get("width", 0))
+            if self.layer4_branch_count < 2 \
+                    or self.layer4_branch_width <= 0:
+                raise ValueError("layer-4 parallel branch dimensions are invalid")
+            if any(width != self.layer4_branch_width for width in (
+                self.feature_width,
+                self.prefix_width,
+                self.feature_distribution_width,
+                self.next_feature_distribution_width,
+            )):
+                raise ValueError(
+                    "parallel layer-4 branches require W, P, F, and NF "
+                    "to equal the branch width"
+                )
         self.layer8_attention = (
             None if layer8_attention is None else dict(layer8_attention)
         )
@@ -1016,6 +1047,10 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             if self.linear_rank is not None:
                 raise ValueError(
                     "dual-state recurrent cells do not use low-rank GNGLUs"
+                )
+            if self.layer4_parallel_branches is not None:
+                raise ValueError(
+                    "parallel layer-4 branches currently require stateless GNGLUs"
                 )
         self.register_buffer("input_mean", input_mean.float().clone())
         self.register_buffer("input_std", input_std.float().clone())
@@ -1099,9 +1134,20 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             value_input_width=self.feature_width,
             gate_input_width=self.market_width,
         )
+        self.layer4_source_branches = nn.ModuleList(
+            _gnglu(
+                self.feature_width,
+                self.layer4_branch_width,
+                **options,
+            )
+            for _ in range(self.layer4_branch_count - 2)
+        ) if self.layer4_parallel_branches is not None else nn.ModuleList()
         self.layer4 = numbered_layer(
             4,
-            self.prefix_width + self.feature_distribution_width,
+            self.prefix_width
+            + self.feature_distribution_width
+            + len(self.layer4_source_branches)
+            * int(self.layer4_branch_width or 0),
             self.extended_prefix_width,
             value_input_width=self.prefix_width,
             gate_input_width=self.feature_distribution_width,
@@ -1434,6 +1480,27 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             recurrent_hidden[number] = hidden
             return value
 
+        def apply_layer4(
+            source: Tensor,
+            prefix_state: Tensor,
+            feature_distribution_state: Tensor,
+        ) -> Tensor:
+            additional = tuple(
+                apply_stateless_layer(branch, source)
+                for branch in self.layer4_source_branches
+            )
+            joined = torch.cat((
+                prefix_state,
+                feature_distribution_state,
+                *additional,
+            ), dim=-1)
+            return apply_numbered_layer(
+                4,
+                joined,
+                prefix_state,
+                feature_distribution_state,
+            )
+
         embeddings = tuple(
             apply_numbered_layer(1, normalized[:, step])
             for step in range(self.input_steps)
@@ -1462,11 +1529,8 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             embeddings[0],
             market,
         )
-        extended_prefix = apply_numbered_layer(
-            4,
-            torch.cat((prefix, feature_distribution), dim=-1),
-            prefix,
-            feature_distribution,
+        extended_prefix = apply_layer4(
+            embeddings[0], prefix, feature_distribution
         )
 
         market_states = [market]
@@ -1493,11 +1557,8 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                 embedding,
                 market,
             )
-            extended_prefix = apply_numbered_layer(
-                4,
-                torch.cat((prefix, feature_distribution), dim=-1),
-                prefix,
-                feature_distribution,
+            extended_prefix = apply_layer4(
+                embedding, prefix, feature_distribution
             )
             market_states.append(market)
             prefix_states.append(prefix)
@@ -1538,9 +1599,8 @@ class StructuredSharedIoFeatureProcess(nn.Module):
                     next_feature_distribution,
                     market,
                 )
-                extended_prefix = apply_numbered_layer(
-                    4,
-                    torch.cat((prefix, feature_distribution), dim=-1),
+                extended_prefix = apply_layer4(
+                    next_feature_distribution,
                     prefix,
                     feature_distribution,
                 )
@@ -1902,6 +1962,7 @@ class StructuredSharedIoFeatureProcess(nn.Module):
             *self.layer13_refinements,
             self.layer3,
             self.layer4,
+            *self.layer4_source_branches,
             self.layer5,
             self.layer6,
             self.layer7,

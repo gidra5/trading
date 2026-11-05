@@ -6,6 +6,17 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
+    "./oracle-crra": {
+      "types": "./dist/oracle-crra-bot.d.ts",
+      "development": "./src/oracle-crra-bot.ts",
+      "import": "./dist/oracle-crra-bot.js",
+      "default": "./src/oracle-crra-bot.ts"
+    },
+    "./trading-api": {
+      "types": "./src/trading-api.ts",
+      "development": "./src/trading-api.ts",
+      "import": "./dist/trading-api.js"
+    },
     ".": {
       "types": "./src/index.ts",
       "development": "./src/index.ts",
@@ -51,6 +62,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:oracle": "tsc -p tsconfig.oracle.json",
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

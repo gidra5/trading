@@ -12,6 +12,9 @@ const stopRequestFile = path.join(runtimeRoot, "stop-request");
 const collectorScript = path.join(repoRoot, "scripts/collect-live-external-features.ts");
 const watcherScript = path.join(repoRoot, "scripts/watch-live-external-early-screen.ts");
 const collectorOutput = path.join(repoRoot, "data/market/mutable/external-live");
+const collectorArgs = readJson(path.join(runtimeRoot, "collector-config.json"))?.args ?? [];
+if (!Array.isArray(collectorArgs) || collectorArgs.some((argument) => typeof argument !== "string")) throw new Error("Invalid collector-config.json args");
+const fullQuality = collectorArgs.includes("--universe") || collectorArgs[collectorArgs.indexOf("--quality") + 1] === "full";
 const startedAt = Date.now();
 let stopping = false;
 let child;
@@ -22,7 +25,7 @@ let lastExit = null;
 await fsp.mkdir(runtimeRoot, { recursive: true });
 await fsp.rm(stopRequestFile, { force: true });
 await writeStatus();
-startWatcher();
+if (!fullQuality && !collectorArgs.includes("--output-dir") && !collectorArgs.includes("--compression")) startWatcher();
 
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
@@ -32,6 +35,7 @@ while (!stopping) {
     "--conditions=development",
     "--import", "tsx",
     collectorScript,
+    ...collectorArgs,
     "--output-dir", collectorOutput,
     "--status-file", collectorStatusFile,
   ], {

@@ -1,0 +1,169 @@
+{
+  "intermediate_files": [
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\13443378a118787bfa89-particles-128-seed-71391.npz",
+      "bytes": 6105827,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\13443378a118787bfa89-particles-128-seed-91337.npz",
+      "bytes": 6105896,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\13443378a118787bfa89-particles-512-seed-71391.npz",
+      "bytes": 6105748,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\13443378a118787bfa89-particles-512-seed-91337.npz",
+      "bytes": 6105937,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\1679c3e51a473c38c594-particles-128-seed-71391.npz",
+      "bytes": 6101093,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\1679c3e51a473c38c594-particles-128-seed-91337.npz",
+      "bytes": 6101137,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\1679c3e51a473c38c594-particles-512-seed-71391.npz",
+      "bytes": 6101123,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\1679c3e51a473c38c594-particles-512-seed-91337.npz",
+      "bytes": 6100999,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\2923e94b0f53c7b6c90f-particles-128-seed-71391.npz",
+      "bytes": 6097958,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\2923e94b0f53c7b6c90f-particles-128-seed-91337.npz",
+      "bytes": 6098299,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\2923e94b0f53c7b6c90f-particles-512-seed-71391.npz",
+      "bytes": 6096975,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\2923e94b0f53c7b6c90f-particles-512-seed-91337.npz",
+      "bytes": 6097277,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\61ba4135ff48dd0b057d-particles-128-seed-71391.npz",
+      "bytes": 6098316,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\61ba4135ff48dd0b057d-particles-128-seed-91337.npz",
+      "bytes": 6098516,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\61ba4135ff48dd0b057d-particles-512-seed-71391.npz",
+      "bytes": 6097687,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\61ba4135ff48dd0b057d-particles-512-seed-91337.npz",
+      "bytes": 6097868,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\893990bda528113b989d-particles-128-seed-71391.npz",
+      "bytes": 6105624,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\893990bda528113b989d-particles-128-seed-91337.npz",
+      "bytes": 6105604,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\893990bda528113b989d-particles-512-seed-71391.npz",
+      "bytes": 6105793,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\893990bda528113b989d-particles-512-seed-91337.npz",
+      "bytes": 6106115,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\dc73444cd7f8d8d695b5-particles-128-seed-71391.npz",
+      "bytes": 6095336,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\dc73444cd7f8d8d695b5-particles-128-seed-91337.npz",
+      "bytes": 6095367,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\dc73444cd7f8d8d695b5-particles-512-seed-71391.npz",
+      "bytes": 6094868,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\dc73444cd7f8d8d695b5-particles-512-seed-91337.npz",
+      "bytes": 6094817,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f441021380ddf6c14b3c-particles-128-seed-71391.npz",
+      "bytes": 6099337,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f441021380ddf6c14b3c-particles-128-seed-91337.npz",
+      "bytes": 6099525,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f441021380ddf6c14b3c-particles-512-seed-71391.npz",
+      "bytes": 6099668,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f441021380ddf6c14b3c-particles-512-seed-91337.npz",
+      "bytes": 6099483,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f4d3040611b81a8cf16a-particles-128-seed-71391.npz",
+      "bytes": 6098970,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f4d3040611b81a8cf16a-particles-128-seed-91337.npz",
+      "bytes": 6098802,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f4d3040611b81a8cf16a-particles-512-seed-71391.npz",
+      "bytes": 6098514,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    },
+    {
+      "path": "E:\\Projects\\trading\\data\\benchmarks\\hawkes-joint-1s-2026-10-03\\bounded-selection\\ranking\\f4d3040611b81a8cf16a-particles-512-seed-91337.npz",
+      "bytes": 6098186,
+      "reason": "Intermediate shortlist per-second particle arrays; aggregate ranking JSON and conditional comparison evidence included."
+    }
+  ],
+  "other_omitted_categories": [
+    "Original raw aggregate-trade exports (complete derived count cache and coverage audit included)",
+    "Full architecture-search optimizer/checkpoint tree (completed-fit pool, selected fit records and reviews included)",
+    "Python environment and unrelated trading project files"
+  ]
+}

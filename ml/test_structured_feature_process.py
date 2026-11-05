@@ -429,6 +429,7 @@ class StructuredFeatureProcessTest(unittest.TestCase):
         output_steps: int,
         *,
         linear_rank: int | None = None,
+        layer4_parallel_branches: dict[str, object] | None = None,
         layer8_attention: dict[str, int | str] | None = None,
         layer8_function_approximator: dict[str, object] | None = None,
         recurrent_memory: dict[str, object] | None = None,
@@ -457,6 +458,7 @@ class StructuredFeatureProcessTest(unittest.TestCase):
             minimum_radius=1e-4,
             learnable_centering=False,
             linear_rank=linear_rank,
+            layer4_parallel_branches=layer4_parallel_branches,
             layer8_attention=layer8_attention,
             layer8_function_approximator=layer8_function_approximator,
             recurrent_memory=recurrent_memory,
@@ -1573,6 +1575,70 @@ class StructuredFeatureProcessTest(unittest.TestCase):
             10: 3,
             11: 3,
         })
+
+    def test_five_parallel_layer4_branches_are_independent_and_shared_across_steps(
+        self,
+    ) -> None:
+        torch.manual_seed(184)
+        model = StructuredSharedIoFeatureProcess(
+            torch.zeros(5),
+            torch.ones(5),
+            torch.zeros(5),
+            torch.ones(5),
+            input_steps=3,
+            output_steps=4,
+            feature_width=12,
+            market_width=7,
+            prefix_width=12,
+            feature_distribution_width=12,
+            extended_prefix_width=10,
+            next_feature_distribution_width=12,
+            initial_radius=0.0031622776601683794,
+            minimum_radius=1e-4,
+            learnable_centering=False,
+            layer4_parallel_branches={
+                "type": "independent-current-feature-gnglu-v1",
+                "count": 5,
+                "width": 12,
+                "combination": "concatenate-into-shared-layer-4",
+            },
+        )
+        branches = tuple(model.layer4_source_branches)
+        self.assertEqual(len(branches), 3)
+        self.assertEqual(model.layer4.projection.in_features, 5 * 12)
+        self.assertEqual(
+            len({id(parameter) for branch in branches for parameter in branch.parameters()}),
+            sum(len(tuple(branch.parameters())) for branch in branches),
+        )
+        calls = [0, 0, 0]
+        handles = [
+            branch.register_forward_hook(
+                lambda _module, _inputs, _output, index=index: calls.__setitem__(
+                    index, calls[index] + 1
+                )
+            )
+            for index, branch in enumerate(branches)
+        ]
+        inputs = torch.randn(9, 3, 5)
+        targets = torch.randn(9, 4, 5)
+        prediction = model(inputs)
+        for handle in handles:
+            handle.remove()
+        self.assertEqual(prediction.shape, targets.shape)
+        # K1 initial/input updates plus K2-1 forecast transitions.
+        self.assertEqual(calls, [6, 6, 6])
+        weighted_standardized_mse(
+            prediction,
+            model.standardized_targets(targets),
+            torch.ones(9),
+        ).backward()
+        for branch in branches:
+            self.assertGreater(float(branch.output.weight.grad.norm()), 0)
+        muon, adamw = optimizer_parameter_groups(model)
+        self.assertEqual(
+            {id(parameter) for parameter in (*muon, *adamw)},
+            {id(parameter) for parameter in model.parameters() if parameter.requires_grad},
+        )
 
     def test_one_input_one_output_active_path_has_exact_gradient(self) -> None:
         torch.manual_seed(11)

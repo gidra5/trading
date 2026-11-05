@@ -80,6 +80,9 @@ def model_from_state(
             if architecture.get("linearFactorization") is None
             else int(architecture["linearFactorization"]["rank"])
         ),
+        layer4_parallel_branches=architecture.get(
+            "layer4ParallelBranches"
+        ),
         layer8_attention=architecture.get("layer8Attention"),
         layer8_function_approximator=architecture.get(
             "layer8FunctionApproximator"

@@ -1,0 +1,23 @@
+{
+  "chains": [
+    {
+      "id": "solana",
+      "adapter": "solana",
+      "urlEnv": "SOLANA_RPC_URL",
+      "genesisHash": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+    },
+    {
+      "id": "xrpl",
+      "adapter": "xrpl",
+      "urlEnv": "XRPL_RPC_URL",
+      "networkId": 0,
+      "confirmationLag": 2
+    },
+    {
+      "id": "tron",
+      "adapter": "tron",
+      "urlEnv": "TRON_RPC_URL",
+      "genesisHash": "00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc"
+    }
+  ]
+}

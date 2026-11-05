@@ -1,0 +1,2077 @@
+{
+  "version": 1,
+  "generatedAt": "2026-11-02T09:48:12.633Z",
+  "runtime": "v25.9.0",
+  "parameters": {
+    "maxRows": 40000,
+    "maxBytes": 33554432,
+    "maxSeconds": 3600
+  },
+  "preservation": "Every selected original JSONL byte is reconstructed, including raw wire text, unknown fields, whitespace, ordering, decimal spelling and unsafe integer lexemes. No event is dropped within a selected window.",
+  "limitations": [
+    "Legacy spot aggTrade differs from individual trade granularity; its ratio is only a conservative transfer comparison.",
+    "An hourly bucket is shorter than an hour when the source window/cap is shorter; spanSeconds is reported.35s/90s smoke is not an observed full hour.",
+    "Per-component1sgzip matches the previous conservative capacity calibration. Whole-actual-shard rows separately show genuine cross-stream/market amortization.",
+    "Short Sunday TradFi observations do not establish weekday activity, monthly entropy or spike behavior.",
+    "The lexical codec is experimental. Production archival needs bounded decode, checksums, source hashing, crash recovery, indexes and retention design; no files are deleted here."
+  ],
+  "chosenCandidate": "lexical-zstd19-3600s",
+  "componentRatios": [
+    {
+      "component": "spot/BBO",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 74012,
+      "encodedBytes": 16577,
+      "ratio": 0.22397719288763984,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/spot-public-000",
+          "role": "actual-full",
+          "rows": 2135,
+          "spanSeconds": 33.826,
+          "originalGzipBytes": 74012,
+          "encodedBytes": 16577,
+          "ratio": 0.22397719288763984,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "spot/depth-diff",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 66269,
+      "encodedBytes": 34590,
+      "ratio": 0.5219635123511748,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/spot-public-000",
+          "role": "actual-full",
+          "rows": 338,
+          "spanSeconds": 33.826,
+          "originalGzipBytes": 66269,
+          "encodedBytes": 34590,
+          "ratio": 0.5219635123511748,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "legacy/binance-spot-depth-diff",
+          "role": "actual-legacy",
+          "rows": 35978,
+          "spanSeconds": 3599.967,
+          "originalGzipBytes": 4170833,
+          "encodedBytes": 1871243,
+          "ratio": 0.4486497061857907,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "spot/trade",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 1253237,
+      "encodedBytes": 282185,
+      "ratio": 0.22516491294144683,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/spot-public-000",
+          "role": "actual-full",
+          "rows": 795,
+          "spanSeconds": 33.826,
+          "originalGzipBytes": 34214,
+          "encodedBytes": 6183,
+          "ratio": 0.18071549658034722,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "legacy/binance-spot-aggtrade",
+          "role": "actual-legacy",
+          "rows": 40000,
+          "spanSeconds": 1180.581,
+          "originalGzipBytes": 1253237,
+          "encodedBytes": 282185,
+          "ratio": 0.22516491294144683,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "usdm-futures/mark-price-funding",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 190917,
+      "encodedBytes": 29796,
+      "ratio": 0.15606782004745517,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/usdm-futures-market-000",
+          "role": "actual-full",
+          "rows": 31,
+          "spanSeconds": 30.308,
+          "originalGzipBytes": 15320,
+          "encodedBytes": 1693,
+          "ratio": 0.11050913838120105,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "multiasset-lossless-sample/usdm-futures-market-000",
+          "role": "actual-full",
+          "rows": 1780,
+          "spanSeconds": 88.793,
+          "originalGzipBytes": 190917,
+          "encodedBytes": 29796,
+          "ratio": 0.15606782004745517,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "legacy/binance-usdm-mark-price",
+          "role": "actual-legacy",
+          "rows": 3600,
+          "spanSeconds": 3598.992,
+          "originalGzipBytes": 746996,
+          "encodedBytes": 53343,
+          "ratio": 0.07141002093719377,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "usdm-futures/aggTrade",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 417863,
+      "encodedBytes": 97186,
+      "ratio": 0.23257862026549372,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/usdm-futures-market-000",
+          "role": "actual-full",
+          "rows": 203,
+          "spanSeconds": 30.308,
+          "originalGzipBytes": 21923,
+          "encodedBytes": 3346,
+          "ratio": 0.15262509693016466,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "multiasset-lossless-sample/usdm-futures-market-000",
+          "role": "actual-full",
+          "rows": 6108,
+          "spanSeconds": 88.793,
+          "originalGzipBytes": 417863,
+          "encodedBytes": 97186,
+          "ratio": 0.23257862026549372,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "usdm-futures/BBO",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 1094560,
+      "encodedBytes": 265367,
+      "ratio": 0.24244171173805,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/usdm-futures-public-000",
+          "role": "actual-full",
+          "rows": 8490,
+          "spanSeconds": 30.821,
+          "originalGzipBytes": 260816,
+          "encodedBytes": 53418,
+          "ratio": 0.2048110545365315,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "multiasset-lossless-sample/usdm-futures-public-000",
+          "role": "actual-full",
+          "rows": 30216,
+          "spanSeconds": 21.242,
+          "originalGzipBytes": 1094560,
+          "encodedBytes": 265367,
+          "ratio": 0.24244171173805,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "legacy/binance-usdm-book-ticker",
+          "role": "actual-legacy",
+          "rows": 18175,
+          "spanSeconds": 3599.972,
+          "originalGzipBytes": 1185128,
+          "encodedBytes": 234278,
+          "ratio": 0.19768160063723075,
+          "roundTripByteExact": true
+        }
+      ]
+    },
+    {
+      "component": "usdm-futures/depth-diff",
+      "candidate": "lexical-zstd19-3600s",
+      "originalGzipBytes": 162764,
+      "encodedBytes": 91993,
+      "ratio": 0.5651925487208473,
+      "roundTripByteExact": true,
+      "policy": "Worst observed candidate/baseline ratio across all corresponding actual windows; unmeasured components remain1.0",
+      "evidence": [
+        {
+          "dataset": "full-btc-smoke/usdm-futures-public-000",
+          "role": "actual-full",
+          "rows": 303,
+          "spanSeconds": 30.821,
+          "originalGzipBytes": 162764,
+          "encodedBytes": 91993,
+          "ratio": 0.5651925487208473,
+          "roundTripByteExact": true
+        },
+        {
+          "dataset": "multiasset-lossless-sample/usdm-futures-public-000",
+          "role": "actual-full",
+          "rows": 2060,
+          "spanSeconds": 21.242,
+          "originalGzipBytes": 732156,
+          "encodedBytes": 377814,
+          "ratio": 0.5160293707898317,
+          "roundTripByteExact": true
+        }
+      ]
+    }
+  ],
+  "shardCalibration": [
+    {
+      "dataset": "full-btc-smoke/spot-public-000",
+      "rows": 3268,
+      "separatedKindsGzip1sBytes": 174495,
+      "wholeShardGzip1sBytes": 154646,
+      "wholeToSeparatedRatio": 0.8862488896529986,
+      "encodedBytes": 58110,
+      "note": "Actual same-shard interleaving is retained. This comparison must not be multiplied independently into the component codec ratios."
+    },
+    {
+      "dataset": "full-btc-smoke/usdm-futures-market-000",
+      "rows": 234,
+      "separatedKindsGzip1sBytes": 37243,
+      "wholeShardGzip1sBytes": 26922,
+      "wholeToSeparatedRatio": 0.7228740971457723,
+      "encodedBytes": 4606,
+      "note": "Actual same-shard interleaving is retained. This comparison must not be multiplied independently into the component codec ratios."
+    },
+    {
+      "dataset": "full-btc-smoke/usdm-futures-public-000",
+      "rows": 8793,
+      "separatedKindsGzip1sBytes": 423580,
+      "wholeShardGzip1sBytes": 431271,
+      "wholeToSeparatedRatio": 1.0181571367864395,
+      "encodedBytes": 145844,
+      "note": "Actual same-shard interleaving is retained. This comparison must not be multiplied independently into the component codec ratios."
+    },
+    {
+      "dataset": "multiasset-lossless-sample/usdm-futures-market-000",
+      "rows": 7888,
+      "separatedKindsGzip1sBytes": 608780,
+      "wholeShardGzip1sBytes": 556096,
+      "wholeToSeparatedRatio": 0.9134597062978416,
+      "encodedBytes": 134568,
+      "note": "Actual same-shard interleaving is retained. This comparison must not be multiplied independently into the component codec ratios."
+    },
+    {
+      "dataset": "multiasset-lossless-sample/usdm-futures-public-000",
+      "rows": 32276,
+      "separatedKindsGzip1sBytes": 1826716,
+      "wholeShardGzip1sBytes": 1901474,
+      "wholeToSeparatedRatio": 1.040924807140245,
+      "encodedBytes": 649513,
+      "note": "Actual same-shard interleaving is retained. This comparison must not be multiplied independently into the component codec ratios."
+    }
+  ],
+  "unmappedComponentRatio": 1,
+  "datasets": [
+    {
+      "id": "full-btc-smoke/spot-public-000",
+      "file": "data/runtime-cache/collector-capacity/full-btc-smoke/binance-event-tape/spot-public-000/2026-11-01.8668f2fd-98dc-44e4-a8f3-00b72a3144c5.jsonl.gz",
+      "role": "actual-full",
+      "rows": 3268,
+      "spanSeconds": 33.826,
+      "selectedBytes": 2910708,
+      "originalSha256": "c6039dd6f2055e2cfc5708ffeb733c259909ad7bfac210af24ee41b05b05b5d9",
+      "streams": [
+        {
+          "kind": "spot/BBO",
+          "rows": 2135,
+          "baselineGzip1sBytes": 74012,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 57922,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.7826028211641356,
+              "encodeMs": 10.04479999999998,
+              "decodeMs": 1.8640000000000043,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 37351,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.5046614062584446,
+              "encodeMs": 13.415599999999984,
+              "decodeMs": 1.830500000000029,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 17383,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.23486731881316544,
+              "encodeMs": 154.14709999999997,
+              "decodeMs": 22.076300000000003,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 57922,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.7826028211641356,
+              "encodeMs": 9.404999999999973,
+              "decodeMs": 1.5440000000000396,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 37351,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.5046614062584446,
+              "encodeMs": 13.079800000000034,
+              "decodeMs": 1.5604999999999905,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 17383,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.23486731881316544,
+              "encodeMs": 142.43960000000004,
+              "decodeMs": 14.342200000000048,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 16577,
+              "originalGzipBytes": 74012,
+              "ratioToGzip1s": 0.22397719288763984,
+              "encodeMs": 158.92579999999998,
+              "decodeMs": 12.416399999999953,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "spot/depth-diff",
+          "rows": 338,
+          "baselineGzip1sBytes": 66269,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 45743,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.6902624153073081,
+              "encodeMs": 5.140599999999949,
+              "decodeMs": 0.6281999999999925,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 37792,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.5702817305225671,
+              "encodeMs": 7.171800000000076,
+              "decodeMs": 0.5584999999999809,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 36707,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.5539090675881634,
+              "encodeMs": 58.06219999999996,
+              "decodeMs": 10.716400000000021,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 45743,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.6902624153073081,
+              "encodeMs": 5.143299999999954,
+              "decodeMs": 0.7052999999999656,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 37792,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.5702817305225671,
+              "encodeMs": 7.299199999999928,
+              "decodeMs": 0.5720000000000027,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 36707,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.5539090675881634,
+              "encodeMs": 55.06290000000001,
+              "decodeMs": 10.392400000000066,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 34590,
+              "originalGzipBytes": 66269,
+              "ratioToGzip1s": 0.5219635123511748,
+              "encodeMs": 65.86449999999991,
+              "decodeMs": 10.534400000000005,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "spot/trade",
+          "rows": 795,
+          "baselineGzip1sBytes": 34214,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 20699,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.6049862629333022,
+              "encodeMs": 3.721499999999878,
+              "decodeMs": 0.6558999999999742,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 13468,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.39364003039691353,
+              "encodeMs": 4.9249999999999545,
+              "decodeMs": 0.6120999999998276,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 6349,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.18556731162681944,
+              "encodeMs": 61.12440000000015,
+              "decodeMs": 9.190399999999954,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 20699,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.6049862629333022,
+              "encodeMs": 4.386300000000119,
+              "decodeMs": 0.6352000000001681,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 13468,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.39364003039691353,
+              "encodeMs": 5.300200000000132,
+              "decodeMs": 0.7199000000000524,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 6349,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.18556731162681944,
+              "encodeMs": 53.02540000000022,
+              "decodeMs": 5.5948000000000775,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 6183,
+              "originalGzipBytes": 34214,
+              "ratioToGzip1s": 0.18071549658034722,
+              "encodeMs": 63.3266000000001,
+              "decodeMs": 6.026399999999967,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "whole-actual-shard",
+          "rows": 3268,
+          "baselineGzip1sBytes": 154646,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 132943,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.8596601269997284,
+              "encodeMs": 18.49389999999994,
+              "decodeMs": 3.1948999999999614,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 94759,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.612747824062698,
+              "encodeMs": 28.878400000000056,
+              "decodeMs": 2.656099999999924,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 61676,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.39882053205385204,
+              "encodeMs": 254.62210000000005,
+              "decodeMs": 28.73779999999988,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 132943,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.8596601269997284,
+              "encodeMs": 18.282600000000002,
+              "decodeMs": 2.997500000000173,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 94759,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.612747824062698,
+              "encodeMs": 29.275499999999965,
+              "decodeMs": 2.74369999999999,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 61676,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.39882053205385204,
+              "encodeMs": 251.9625000000001,
+              "decodeMs": 29.07459999999992,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 58110,
+              "originalGzipBytes": 154646,
+              "ratioToGzip1s": 0.3757614163961564,
+              "encodeMs": 278.8611999999998,
+              "decodeMs": 30.88630000000012,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "full-btc-smoke/usdm-futures-market-000",
+      "file": "data/runtime-cache/collector-capacity/full-btc-smoke/binance-event-tape/usdm-futures-market-000/2026-11-01.8668f2fd-98dc-44e4-a8f3-00b72a3144c5.jsonl.gz",
+      "role": "actual-full",
+      "rows": 234,
+      "spanSeconds": 30.308,
+      "selectedBytes": 211958,
+      "originalSha256": "88ea846b106bc6215cbf81b9f09e0c5b84e33186a3f5b06eee416745b9df8ee4",
+      "streams": [
+        {
+          "kind": "usdm-futures/mark-price-funding",
+          "rows": 31,
+          "baselineGzip1sBytes": 15320,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 2114,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.13798955613577024,
+              "encodeMs": 0.22109999999975116,
+              "decodeMs": 0.06569999999965148,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 1823,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.11899477806788512,
+              "encodeMs": 0.3951000000001841,
+              "decodeMs": 0.05940000000009604,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 1726,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.11266318537859007,
+              "encodeMs": 5.563200000000052,
+              "decodeMs": 0.5122000000001208,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 2114,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.13798955613577024,
+              "encodeMs": 0.2466999999996915,
+              "decodeMs": 0.04550000000017462,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 1823,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.11899477806788512,
+              "encodeMs": 0.3018000000001848,
+              "decodeMs": 0.0385999999998603,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 1726,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.11266318537859007,
+              "encodeMs": 4.517100000000028,
+              "decodeMs": 0.524000000000342,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 1693,
+              "originalGzipBytes": 15320,
+              "ratioToGzip1s": 0.11050913838120105,
+              "encodeMs": 5.559299999999894,
+              "decodeMs": 0.5088999999998123,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "usdm-futures/aggTrade",
+          "rows": 203,
+          "baselineGzip1sBytes": 21923,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 9675,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.44131733795557176,
+              "encodeMs": 1.3537999999998647,
+              "decodeMs": 0.22879999999986467,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 6653,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.3034712402499658,
+              "encodeMs": 3.283400000000256,
+              "decodeMs": 0.22879999999986467,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 3408,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.15545317702869133,
+              "encodeMs": 18.185899999999947,
+              "decodeMs": 2.8697000000001935,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 9675,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.44131733795557176,
+              "encodeMs": 1.2541999999998552,
+              "decodeMs": 0.2335000000002765,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 6653,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.3034712402499658,
+              "encodeMs": 3.2530000000001564,
+              "decodeMs": 0.25680000000011205,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 3408,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.15545317702869133,
+              "encodeMs": 15.852000000000317,
+              "decodeMs": 2.845900000000256,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 3346,
+              "originalGzipBytes": 21923,
+              "ratioToGzip1s": 0.15262509693016466,
+              "encodeMs": 18.115299999999934,
+              "decodeMs": 2.3596999999999753,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "whole-actual-shard",
+          "rows": 234,
+          "baselineGzip1sBytes": 26922,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 11588,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.43042864571725725,
+              "encodeMs": 1.4230000000002292,
+              "decodeMs": 0.3158999999996013,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 8161,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.3031349825421588,
+              "encodeMs": 3.6633999999999105,
+              "decodeMs": 0.2846999999997024,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 4735,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.17587846370997698,
+              "encodeMs": 18.642100000000028,
+              "decodeMs": 2.539099999999962,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 11588,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.43042864571725725,
+              "encodeMs": 1.5399999999999636,
+              "decodeMs": 0.2333000000003267,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 8161,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.3031349825421588,
+              "encodeMs": 3.5909999999998945,
+              "decodeMs": 0.2120999999997366,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 4735,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.17587846370997698,
+              "encodeMs": 16.698300000000017,
+              "decodeMs": 1.991399999999885,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 4606,
+              "originalGzipBytes": 26922,
+              "ratioToGzip1s": 0.17108684347373895,
+              "encodeMs": 21.239900000000034,
+              "decodeMs": 2.0524999999997817,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "full-btc-smoke/usdm-futures-public-000",
+      "file": "data/runtime-cache/collector-capacity/full-btc-smoke/binance-event-tape/usdm-futures-public-000/2026-11-01.8668f2fd-98dc-44e4-a8f3-00b72a3144c5.jsonl.gz",
+      "role": "actual-full",
+      "rows": 8793,
+      "spanSeconds": 30.821,
+      "selectedBytes": 8645950,
+      "originalSha256": "cb1002b3f210d4a4b0ff3457aea0be75d1d96cb9a8fac1f403cb7903bf138614",
+      "streams": [
+        {
+          "kind": "usdm-futures/BBO",
+          "rows": 8490,
+          "baselineGzip1sBytes": 260816,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 245045,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.9395320839212318,
+              "encodeMs": 42.327000000000226,
+              "decodeMs": 7.96120000000019,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 164921,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.6323270044782529,
+              "encodeMs": 73.42250000000013,
+              "decodeMs": 6.496600000000399,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 57845,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.2217847064597264,
+              "encodeMs": 624.2272000000003,
+              "decodeMs": 69.6850999999997,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 245045,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.9395320839212318,
+              "encodeMs": 41.21770000000015,
+              "decodeMs": 7.48739999999998,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 164921,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.6323270044782529,
+              "encodeMs": 71.04899999999998,
+              "decodeMs": 6.411399999999958,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 57845,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.2217847064597264,
+              "encodeMs": 616.9634999999998,
+              "decodeMs": 71.42119999999977,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 53418,
+              "originalGzipBytes": 260816,
+              "ratioToGzip1s": 0.2048110545365315,
+              "encodeMs": 640.2713000000003,
+              "decodeMs": 58.26919999999973,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "usdm-futures/depth-diff",
+          "rows": 303,
+          "baselineGzip1sBytes": 162764,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 135852,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.8346563122066305,
+              "encodeMs": 17.269099999999526,
+              "decodeMs": 1.6850000000004002,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 116316,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.714629770710968,
+              "encodeMs": 27.106399999999667,
+              "decodeMs": 1.5685999999996056,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 95369,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.5859342360718587,
+              "encodeMs": 150.04770000000008,
+              "decodeMs": 41.20060000000012,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 135852,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.8346563122066305,
+              "encodeMs": 17.151499999999942,
+              "decodeMs": 1.399199999999837,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 116316,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.714629770710968,
+              "encodeMs": 20.637299999999414,
+              "decodeMs": 1.2550000000001091,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 95369,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.5859342360718587,
+              "encodeMs": 148.02939999999944,
+              "decodeMs": 40.09309999999914,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 91993,
+              "originalGzipBytes": 162764,
+              "ratioToGzip1s": 0.5651925487208473,
+              "encodeMs": 179.75890000000072,
+              "decodeMs": 36.96680000000015,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "whole-actual-shard",
+          "rows": 8793,
+          "baselineGzip1sBytes": 431271,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 408379,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.946919686229772,
+              "encodeMs": 56.797599999999875,
+              "decodeMs": 10.397500000000036,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 296382,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.6872291436243104,
+              "encodeMs": 91.9988000000003,
+              "decodeMs": 7.819700000000012,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 153250,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.3553450150833235,
+              "encodeMs": 756.7401999999993,
+              "decodeMs": 110.95089999999982,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 408379,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.946919686229772,
+              "encodeMs": 55.94520000000011,
+              "decodeMs": 9.371999999999389,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 296382,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.6872291436243104,
+              "encodeMs": 101.35959999999977,
+              "decodeMs": 8.039700000000266,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 153250,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.3553450150833235,
+              "encodeMs": 764.3798999999999,
+              "decodeMs": 111.16180000000077,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 145844,
+              "originalGzipBytes": 431271,
+              "ratioToGzip1s": 0.3381725179759362,
+              "encodeMs": 805.5218999999997,
+              "decodeMs": 101.51200000000063,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multiasset-lossless-sample/usdm-futures-market-000",
+      "file": "data/runtime-cache/collector-capacity/multiasset-lossless-sample/binance-event-tape/usdm-futures-market-000/2026-11-02.4f873024-0cae-4bc3-9827-b0557b7300a1.jsonl.gz",
+      "role": "actual-full",
+      "rows": 7888,
+      "spanSeconds": 88.793,
+      "selectedBytes": 7678875,
+      "originalSha256": "7e962fd18853a9b846ee038b7c90d712f3dafd78183efd9aef35669debc55d02",
+      "streams": [
+        {
+          "kind": "usdm-futures/aggTrade",
+          "rows": 6108,
+          "baselineGzip1sBytes": 417863,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 352495,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.8435659534344989,
+              "encodeMs": 43.97100000000137,
+              "decodeMs": 6.736799999998766,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 224677,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.5376810102832746,
+              "encodeMs": 72.98670000000129,
+              "decodeMs": 5.226399999999558,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 109052,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.26097548718120533,
+              "encodeMs": 490.1714000000029,
+              "decodeMs": 57.22560000000158,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 350856,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.8396436152518888,
+              "encodeMs": 42.695299999999406,
+              "decodeMs": 6.653299999999945,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 230287,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.551106463123081,
+              "encodeMs": 74.08719999999994,
+              "decodeMs": 5.029099999999744,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 105919,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.25347781449901047,
+              "encodeMs": 498.09719999999834,
+              "decodeMs": 60.17239999999947,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 97186,
+              "originalGzipBytes": 417863,
+              "ratioToGzip1s": 0.23257862026549372,
+              "encodeMs": 521.4274000000005,
+              "decodeMs": 50.10959999999977,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "usdm-futures/mark-price-funding",
+          "rows": 1780,
+          "baselineGzip1sBytes": 190917,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 95387,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.4996254917058198,
+              "encodeMs": 12.14929999999913,
+              "decodeMs": 1.9172000000016851,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 62683,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.32832592173562336,
+              "encodeMs": 17.51890000000094,
+              "decodeMs": 1.6810000000004948,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 39171,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.2051729285501029,
+              "encodeMs": 133.64800000000105,
+              "decodeMs": 14.082299999998213,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 92595,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.48500133565895126,
+              "encodeMs": 11.852000000000771,
+              "decodeMs": 1.464799999999741,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 61820,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.3238056328142596,
+              "encodeMs": 15.610599999999977,
+              "decodeMs": 1.261900000001333,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 34799,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.18227292488358815,
+              "encodeMs": 132.1301000000003,
+              "decodeMs": 15.966099999999642,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 29796,
+              "originalGzipBytes": 190917,
+              "ratioToGzip1s": 0.15606782004745517,
+              "encodeMs": 149.84220000000096,
+              "decodeMs": 13.675500000001193,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "whole-actual-shard",
+          "rows": 7888,
+          "baselineGzip1sBytes": 556096,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 488910,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.879182731039245,
+              "encodeMs": 59.601700000001074,
+              "decodeMs": 9.038300000000163,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 291739,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.5246198498101047,
+              "encodeMs": 89.0648000000001,
+              "decodeMs": 7.179400000000896,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 156980,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.2822893888824951,
+              "encodeMs": 624.6268999999975,
+              "decodeMs": 71.79279999999744,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 487362,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.8763990390148464,
+              "encodeMs": 58.26080000000002,
+              "decodeMs": 9.405699999999342,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 296808,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.5337351824145471,
+              "encodeMs": 102.82879999999932,
+              "decodeMs": 7.1327000000001135,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 149730,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.26925207158476233,
+              "encodeMs": 660.8446000000004,
+              "decodeMs": 79.46619999999893,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 134568,
+              "originalGzipBytes": 556096,
+              "ratioToGzip1s": 0.24198699505121418,
+              "encodeMs": 717.0761000000002,
+              "decodeMs": 71.55790000000161,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multiasset-lossless-sample/usdm-futures-public-000",
+      "file": "data/runtime-cache/collector-capacity/multiasset-lossless-sample/binance-event-tape/usdm-futures-public-000/2026-11-02.4f873024-0cae-4bc3-9827-b0557b7300a1.jsonl.gz",
+      "role": "actual-full",
+      "rows": 32276,
+      "spanSeconds": 21.242,
+      "selectedBytes": 33554100,
+      "originalSha256": "99cc14731e2ed7734a3de91f95a91d9ce864ad2a7198dbe3280cd65d309cbb0b",
+      "streams": [
+        {
+          "kind": "usdm-futures/BBO",
+          "rows": 30216,
+          "baselineGzip1sBytes": 1094560,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 1078638,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.9854535155678994,
+              "encodeMs": 170.09720000000016,
+              "decodeMs": 34.97110000000066,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 668725,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.6109532597573454,
+              "encodeMs": 268.7662999999993,
+              "decodeMs": 22.72650000000067,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 286881,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.2620970983774302,
+              "encodeMs": 2360.6813999999977,
+              "decodeMs": 241.6091000000015,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 1077988,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.9848596696389417,
+              "encodeMs": 167.65299999999843,
+              "decodeMs": 30.666700000001583,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 668537,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.6107815012425084,
+              "encodeMs": 255.69540000000052,
+              "decodeMs": 22.85359999999855,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 284081,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.25953899283730447,
+              "encodeMs": 2469.7199,
+              "decodeMs": 221.09979999999996,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 265367,
+              "originalGzipBytes": 1094560,
+              "ratioToGzip1s": 0.24244171173805,
+              "encodeMs": 2634.2747000000018,
+              "decodeMs": 220.88110000000233,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "usdm-futures/depth-diff",
+          "rows": 2060,
+          "baselineGzip1sBytes": 732156,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 713135,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.9740205639235354,
+              "encodeMs": 72.8685000000005,
+              "decodeMs": 7.962899999998626,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 538009,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.7348283699102377,
+              "encodeMs": 124.95769999999902,
+              "decodeMs": 5.761900000001333,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 385926,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.5271089767754413,
+              "encodeMs": 603.8351000000002,
+              "decodeMs": 147.46180000000095,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 712422,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.9730467277465458,
+              "encodeMs": 73.11299999999756,
+              "decodeMs": 7.1987999999983,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 536398,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.7326280191653145,
+              "encodeMs": 107.78409999999712,
+              "decodeMs": 5.246400000003632,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 383381,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.5236329416135359,
+              "encodeMs": 592.2796999999991,
+              "decodeMs": 148.15649999999732,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 377814,
+              "originalGzipBytes": 732156,
+              "ratioToGzip1s": 0.5160293707898317,
+              "encodeMs": 678.4915999999976,
+              "decodeMs": 148.91960000000108,
+              "roundTripByteExact": true
+            }
+          ]
+        },
+        {
+          "kind": "whole-actual-shard",
+          "rows": 32276,
+          "baselineGzip1sBytes": 1901474,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 1885078,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.9913772157810204,
+              "encodeMs": 246.5111999999972,
+              "decodeMs": 38.83030000000144,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 1267666,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.6666754317965957,
+              "encodeMs": 385.06920000000173,
+              "decodeMs": 28.948199999998906,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 678016,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.3565739000375498,
+              "encodeMs": 2926.8943999999974,
+              "decodeMs": 358.6787000000004,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 1884443,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.9910432643307244,
+              "encodeMs": 252.95070000000123,
+              "decodeMs": 40.02880000000005,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 1267002,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.6663262290202232,
+              "encodeMs": 387.33599999999933,
+              "decodeMs": 25.55329999999958,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 676442,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.3557461211670525,
+              "encodeMs": 2926.2531000000017,
+              "decodeMs": 370.2824000000037,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 649513,
+              "originalGzipBytes": 1901474,
+              "ratioToGzip1s": 0.34158395013552645,
+              "encodeMs": 3221.494399999996,
+              "decodeMs": 360.75220000000263,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy/binance-spot-aggtrade",
+      "file": "data/market/mutable/external-live/binance-spot-aggtrade/2026-08-21.jsonl.gz",
+      "role": "actual-legacy",
+      "rows": 40000,
+      "spanSeconds": 1180.581,
+      "selectedBytes": 11142385,
+      "originalSha256": "5109c1a1a790009c9b74d49169b7086cda965223481da3274efde1d79316eaeb",
+      "streams": [
+        {
+          "kind": "spot/trade",
+          "rows": 40000,
+          "baselineGzip1sBytes": 1253237,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 1064430,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.8493445373859853,
+              "encodeMs": 119.95499999997992,
+              "decodeMs": 15.563200000025972,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 774249,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.617799346811497,
+              "encodeMs": 192.67109999999957,
+              "decodeMs": 11.335600000005797,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 390289,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.31142473450751934,
+              "encodeMs": 1176.730399999993,
+              "decodeMs": 125.53679999998712,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 1060644,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.8463235605077092,
+              "encodeMs": 112.54469999999856,
+              "decodeMs": 13.11529999999766,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 826432,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.6594379195634984,
+              "encodeMs": 238.47009999999864,
+              "decodeMs": 11.432600000000093,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 303529,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.24219600921453804,
+              "encodeMs": 1188.6722000000009,
+              "decodeMs": 139.32350000000588,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 282185,
+              "originalGzipBytes": 1253237,
+              "ratioToGzip1s": 0.22516491294144683,
+              "encodeMs": 1345.7108000000007,
+              "decodeMs": 154.11679999999615,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy/binance-spot-depth-diff",
+      "file": "data/market/mutable/external-live/binance-spot-depth-diff/2026-08-17.jsonl.gz",
+      "role": "actual-legacy",
+      "rows": 35978,
+      "spanSeconds": 3599.967,
+      "selectedBytes": 23729881,
+      "originalSha256": "da6dc0a4462782ffa2a21e7663912ef0dea8331b96a46e4484577a5dfc73ce04",
+      "streams": [
+        {
+          "kind": "spot/depth-diff",
+          "rows": 35978,
+          "baselineGzip1sBytes": 4170833,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 3103585,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.7441163431861213,
+              "encodeMs": 359.6942000000272,
+              "decodeMs": 40.83249999998225,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 2628762,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.6302726577640486,
+              "encodeMs": 592.4652000000133,
+              "decodeMs": 30.842500000035216,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 2937565,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.7043113449999077,
+              "encodeMs": 3108.7090999999637,
+              "decodeMs": 710.6565000000192,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 3076122,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.7375318071953493,
+              "encodeMs": 357.1692999999941,
+              "decodeMs": 40.08190000000468,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 2691954,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.6454235880458412,
+              "encodeMs": 666.402900000001,
+              "decodeMs": 23.135999999998603,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 2082396,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.4992758041379264,
+              "encodeMs": 3129.1247000000003,
+              "decodeMs": 459.6165999999939,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 1871243,
+              "originalGzipBytes": 4170833,
+              "ratioToGzip1s": 0.4486497061857907,
+              "encodeMs": 4039.624100000001,
+              "decodeMs": 460.8058999999994,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy/binance-usdm-book-ticker",
+      "file": "data/market/mutable/external-live/binance-usdm-book-ticker/2026-08-17.jsonl.gz",
+      "role": "actual-legacy",
+      "rows": 18175,
+      "spanSeconds": 3599.972,
+      "selectedBytes": 4999803,
+      "originalSha256": "27ddd4731b5bf3b134f6381c2d9a2f10ba15e195c41ab38d00ce52e95491e9ea",
+      "streams": [
+        {
+          "kind": "usdm-futures/BBO",
+          "rows": 18175,
+          "baselineGzip1sBytes": 1185128,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 627801,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.5297326533505241,
+              "encodeMs": 62.886500000000524,
+              "decodeMs": 8.736700000015844,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 494314,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.41709756245738855,
+              "encodeMs": 88.97590000001946,
+              "decodeMs": 6.883700000005774,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 296736,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.25038308098365747,
+              "encodeMs": 548.0306999999812,
+              "decodeMs": 55.694500000005064,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 617806,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.5212989651750697,
+              "encodeMs": 60.88760000000184,
+              "decodeMs": 6.609500000005937,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 550767,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.4647320795728394,
+              "encodeMs": 102.29349999999249,
+              "decodeMs": 5.716800000001967,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 249490,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.21051734496189442,
+              "encodeMs": 555.6771999999983,
+              "decodeMs": 67.47959999999875,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 234278,
+              "originalGzipBytes": 1185128,
+              "ratioToGzip1s": 0.19768160063723075,
+              "encodeMs": 609.5607999999993,
+              "decodeMs": 60.96940000000177,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "legacy/binance-usdm-mark-price",
+      "file": "data/market/mutable/external-live/binance-usdm-mark-price/2026-08-25.jsonl.gz",
+      "role": "actual-legacy",
+      "rows": 3600,
+      "spanSeconds": 3598.992,
+      "selectedBytes": 1058400,
+      "originalSha256": "994d0ce7fcf52cf67f02f34e7d040dabb2a2627020b70f84dfe7b97208d9f0e6",
+      "streams": [
+        {
+          "kind": "usdm-futures/mark-price-funding",
+          "rows": 3600,
+          "baselineGzip1sBytes": 746996,
+          "candidates": [
+            {
+              "name": "gzip6-60s",
+              "groupSeconds": 60,
+              "compression": "gzip6",
+              "encodedBytes": 138426,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.1853102292381753,
+              "encodeMs": 10.910500000041793,
+              "decodeMs": 2.771699999975681,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "zstd12",
+              "encodedBytes": 123890,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.16585095502519426,
+              "encodeMs": 20.733300000014424,
+              "decodeMs": 2.6225999999951455,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-60s",
+              "groupSeconds": 60,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 96738,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.1295027014870227,
+              "encodeMs": 131.0814000000246,
+              "decodeMs": 17.472799999974086,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "gzip6-3600s",
+              "groupSeconds": 3600,
+              "compression": "gzip6",
+              "encodedBytes": 127516,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.17070506401640706,
+              "encodeMs": 11.73120000000199,
+              "decodeMs": 1.5027000000045518,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "zstd12",
+              "encodedBytes": 116897,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.15648945911356954,
+              "encodeMs": 18.693500000001222,
+              "decodeMs": 1.2100999999966007,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd12-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd12",
+              "encodedBytes": 56058,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.07504457855196012,
+              "encodeMs": 112.4230000000025,
+              "decodeMs": 14.379899999999907,
+              "roundTripByteExact": true
+            },
+            {
+              "name": "lexical-zstd19-3600s",
+              "groupSeconds": 3600,
+              "compression": "lexical-zstd19",
+              "encodedBytes": 53343,
+              "originalGzipBytes": 746996,
+              "ratioToGzip1s": 0.07141002093719377,
+              "encodeMs": 125.69260000000213,
+              "decodeMs": 12.467499999998836,
+              "roundTripByteExact": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

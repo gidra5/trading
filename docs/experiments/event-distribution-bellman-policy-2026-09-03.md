@@ -4067,7 +4067,7 @@ node data/benchmarks/event-policy-fitted-value-shape-march-v212/check.cjs
 The previous gates mainly assessed one-event holding forecasts or forecasts
 under fitted future actions. A weak H1 forecast does not itself prove that
 longer holding value cannot be predicted. The local
-[`Position management`](../theory/Position%20management.md) discussion motivates
+[`Position management`](Position%20management.md) discussion motivates
 looking farther ahead when transaction costs make the immediate exit decision
 ambiguous. The options framework of
 [Sutton, Precup and Singh (1999)](https://people.cs.umass.edu/~barto/courses/cs687/Sutton-Precup-Singh-AIJ99.pdf)

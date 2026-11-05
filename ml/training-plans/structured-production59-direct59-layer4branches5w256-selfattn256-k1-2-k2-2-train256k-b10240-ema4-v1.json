@@ -1,0 +1,106 @@
+{
+  "id": "structured-production59-direct59-layer4branches5w256-selfattn256-k1-2-k2-2-train256k-b10240-ema4-v1",
+  "label": "Structured production59 direct feature process - five independent 256-wide branches concatenated into shared layer 4 - layer 8 causal self-attention Q256 K256 V256 O256 - K1 2x1s input x 59 - K2 2x1s output x 59 - W256 M128 P256 F256 PF256 NF256 - standardized feature MSE - 256k clean - batch 10240 train/evaluation - no regularization - EMA 4",
+  "datasetDir": "data/training/datasets/next-return-production-basis-history120-4l-train512k-v1",
+  "datasetContract": "structured-feature-sequence-v1",
+  "runDir": "data/training/runs/structured-production59-direct59-layer4branches5w256-selfattn256-k1-2-k2-2-train256k-b10240-ema4-v1",
+  "subset": {
+    "type": "fixed-clean-count",
+    "examples": 256000
+  },
+  "architecture": {
+    "contract": "structured-shared-io-feature-process-v1",
+    "inputSteps": 2,
+    "outputSteps": 2,
+    "returnCount": 2,
+    "inputFeatures": 59,
+    "outputFeatures": 59,
+    "featureWidth": 256,
+    "marketWidth": 128,
+    "prefixWidth": 256,
+    "featureDistributionWidth": 256,
+    "extendedPrefixWidth": 256,
+    "nextFeatureDistributionWidth": 256,
+    "layer4ParallelBranches": {
+      "type": "independent-current-feature-gnglu-v1",
+      "count": 5,
+      "width": 256,
+      "combination": "concatenate-into-shared-layer-4",
+      "parameterSharing": "each added branch owns independent parameters reused across input and forecast transitions",
+      "source": "current observed W embedding for input transitions and preceding generated NF state for forecast transitions"
+    },
+    "layer8Attention": {
+      "type": "causal-self-attention-v1",
+      "queryWidth": 256,
+      "keyWidth": 256,
+      "valueWidth": 256,
+      "outputWidth": 256,
+      "heads": 1,
+      "sequence": "generated-next-feature-distribution-prefix"
+    },
+    "numberedLayerSharing": "each parenthesized number is one exact shared module reused at every matching block; layers other than 8 remain GNGLUs; layer 8 is one shared causal self-attention module; added layer-4 source branches are independent of one another and reused across transitions",
+    "initialState": "branch 1 is the 256-wide P prefix, branch 2 is the 256-wide F feature-distribution state, and three independent W-to-256 GNGLUs form branches 3 through 5; their concatenation is consumed by shared layer 4",
+    "transitionState": "on observed-input transitions branches 3 through 5 consume the current W embedding; on forecast transitions they consume the preceding generated NF representation; every layer-4 contraction therefore receives five 256-wide inputs",
+    "outputState": "shared layer 7 maps PF to NF; shared layer 8 causally self-attends over the generated NF-state prefix to emit expected W; shared layer 2 decodes W directly to the complete next production59 feature state",
+    "latentSemantics": "P, F, the three added source branches, PF, and NF remain unconstrained latent embeddings",
+    "initialRadius": 0.0031622776601683794,
+    "minimumRadius": 0.0001,
+    "learnableCentering": false
+  },
+  "training": {
+    "epochs": 512,
+    "batchSize": 10240,
+    "evaluationBatchSize": 10240,
+    "epochTrainEvaluationExamples": 65536,
+    "learningRate": 0.0001,
+    "loss": {
+      "type": "mean-standardized-next-feature-mse-v1",
+      "description": "mean MSE over both future seconds and all 59 directly decoded features after per-feature training-split standardization"
+    },
+    "optimizer": {
+      "type": "hybrid-muon-adamw",
+      "muon": {
+        "momentum": 0.95,
+        "nesterov": true,
+        "newtonSchulzSteps": 3,
+        "adjustLearningRate": "match_rms_adamw",
+        "epsilon": 1e-7,
+        "weightDecay": 0
+      },
+      "adamw": {
+        "betas": [0.9, 0.999],
+        "epsilon": 1e-8,
+        "weightDecay": 0
+      }
+    },
+    "sam": null,
+    "inputDropoutProbability": 0,
+    "embeddingDropoutProbability": 0,
+    "adversarialInput": null,
+    "adversarialOutput": null,
+    "weightEma": {
+      "type": "optimizer-step-parameter-ema",
+      "halfLifeEpochs": 4,
+      "usedForEvaluationAndSelection": true
+    },
+    "gradientClip": 100,
+    "seed": 1337,
+    "device": "cuda",
+    "mixedPrecision": "float32"
+  },
+  "sampling": {
+    "description": "the exact original production59 dense chronological nonzero-target population",
+    "comparisonControl": "same direct-59 K1/K2 self-attention baseline, sample origins, optimizer, feature objective, training count, batch sizes, and EMA; only P/F widening and three extra layer-4 branches change"
+  },
+  "evaluation": {
+    "headline": "step-1 next completed 1s signed log return",
+    "perStepRows": [1, 2],
+    "checkpointSelection": "pooled two-step complete 59-feature state",
+    "comparableMetrics": "step-1 and per-step return metrics remain directly comparable to the direct-59 W256 self-attention control"
+  },
+  "alignment": {
+    "input": "the same two consecutive production59 timeline rows ending at each control example origin",
+    "target": "the same two complete chronological production59 rows at origin+1 and origin+2",
+    "attentionCausality": "output step s attends only to generated NF states at output steps less than or equal to s"
+  }
+}

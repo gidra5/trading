@@ -16,4 +16,7 @@ apps/*/dist
 packages/*/dist
 packages/bot-algo/native/cuda/build
 .env
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 .obsidian

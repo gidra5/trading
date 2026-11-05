@@ -1622,6 +1622,22 @@ def validate_plan(plan: dict) -> None:
                 or factorization.get("type") != "trainable-low-rank-v1" \
                 or int(factorization.get("rank", 0)) <= 0:
             raise ValueError("invalid structured low-rank linear factorization")
+    layer4_branches = architecture.get("layer4ParallelBranches")
+    if layer4_branches is not None:
+        branch_width = int(layer4_branches.get("width", 0)) \
+            if isinstance(layer4_branches, dict) else 0
+        if not isinstance(layer4_branches, dict) \
+                or layer4_branches.get("type") \
+                != "independent-current-feature-gnglu-v1" \
+                or layer4_branches.get("combination") \
+                != "concatenate-into-shared-layer-4" \
+                or int(layer4_branches.get("count", 0)) < 2 \
+                or branch_width <= 0 \
+                or any(int(architecture[name]) != branch_width for name in (
+                    "featureWidth", "prefixWidth", "featureDistributionWidth",
+                    "nextFeatureDistributionWidth",
+                )):
+            raise ValueError("invalid layer-4 parallel branch configuration")
     layer8_attention = architecture.get("layer8Attention")
     layer8_function = architecture.get("layer8FunctionApproximator")
     if layer8_attention is not None and layer8_function is not None:
@@ -2017,6 +2033,9 @@ def main() -> None:
                 None
                 if architecture.get("linearFactorization") is None
                 else int(architecture["linearFactorization"]["rank"])
+            ),
+            layer4_parallel_branches=architecture.get(
+                "layer4ParallelBranches"
             ),
             layer8_attention=architecture.get("layer8Attention"),
             layer8_function_approximator=architecture.get(

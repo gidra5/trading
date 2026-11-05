@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/oracle-rational.ts",
+    "src/oracle-execution.ts",
+    "src/oracle-conservative-maintenance.ts",
+    "src/oracle-crra-policy.ts",
+    "src/oracle-tail-bound.ts",
+    "src/oracle-shadow-tail.ts",
+    "src/oracle-log-policy.ts",
+    "src/oracle-crra-bot.ts"
+  ]
+}

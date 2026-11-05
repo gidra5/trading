@@ -8,6 +8,17 @@
     "packages/*"
   ],
   "scripts": {
+    "theory:setup": "node scripts/theory-lean.mjs setup",
+    "theory:check": "node scripts/theory-lean.mjs check",
+    "test:oracle-crra": "node --conditions=development --import tsx --test packages/bot-algo/test/oracle-execution.test.ts packages/bot-algo/test/oracle-crra-policy.test.ts apps/server/test/oracle-forecast-provider.test.ts apps/server/test/oracle-crra-bot.test.ts scripts/backtest-oracle-crra.test.ts scripts/backtest-oracle-endpoint-hold.test.ts",
+    "backtest:oracle-crra": "node --conditions=development --import tsx scripts/backtest-oracle-crra.ts",
+    "backtest:oracle-endpoint": "node --conditions=development --import tsx scripts/backtest-oracle-endpoint-hold.ts",
+    "train:oracle-horizons": "node scripts/run-ml-python.mjs ml/train_horizon_price_forecast.py",
+    "test:oracle-horizons": "node scripts/run-ml-python.mjs -m unittest ml.test_horizon_price_forecast",
+    "verify:oracle-crra": "node scripts/verify-oracle-crra.mjs",
+    "test:oracle-crra:proof": "node scripts/test-oracle-risk-certificates.mjs",
+    "train:oracle-forecast": "node scripts/run-ml-python.mjs ml/train_stochastic_price_forecast.py",
+    "experiment:oracle-crra": "node scripts/run-oracle-crra.mjs",
     "research:event-policy": "node --conditions=development --import tsx scripts/research-event-policy.ts",
     "research:event-policy:replay": "node --conditions=development --import tsx scripts/replay-event-policy.ts",
     "research:event-policy:audit": "node --conditions=development --import tsx scripts/audit-event-policy.ts",

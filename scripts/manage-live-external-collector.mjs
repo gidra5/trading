@@ -9,6 +9,7 @@ const runtimeRoot = path.join(repoRoot, "data/runtime-cache/external-live-collec
 const supervisorStatusFile = path.join(runtimeRoot, "supervisor-status.json");
 const collectorStatusFile = path.join(runtimeRoot, "collector-status.json");
 const stopRequestFile = path.join(runtimeRoot, "stop-request");
+const configFile = path.join(runtimeRoot, "collector-config.json");
 const command = process.argv[2] ?? "status";
 
 if (command === "start") await start();
@@ -24,6 +25,11 @@ async function start() {
     return;
   }
   await fsp.mkdir(runtimeRoot, { recursive: true });
+  const provided = process.argv.slice(3).filter((argument, index) => index !== 0 || argument !== "--");
+  const collectorArgs = provided.length > 0 ? provided : readJson(configFile)?.args ?? [];
+  if (!Array.isArray(collectorArgs) || collectorArgs.some((argument) => typeof argument !== "string")) throw new Error("Invalid saved collector args");
+  if (collectorArgs.includes("--status-file")) throw new Error("The managed collector owns --status-file");
+  await fsp.writeFile(configFile, `${JSON.stringify({ version: 1, args: collectorArgs }, null, 2)}\n`);
   await fsp.rm(stopRequestFile, { force: true });
   const output = fs.openSync(path.join(runtimeRoot, "collector.log"), "a");
   const child = spawn(process.execPath, [path.join(repoRoot, "scripts/supervise-live-external-collector.mjs")], {
@@ -73,6 +79,7 @@ function status() {
     running: isAlive(supervisor?.pid),
     supervisor,
     collector,
+    config: readJson(configFile),
   }, null, 2));
 }
 

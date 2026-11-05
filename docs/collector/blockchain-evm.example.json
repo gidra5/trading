@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "chains": [
+    {
+      "id": "ethereum-mainnet",
+      "adapter": "evm",
+      "chainId": "0x1",
+      "urlEnv": "ETHEREUM_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 12
+    },
+    {
+      "id": "bsc-mainnet",
+      "adapter": "evm",
+      "chainId": "0x38",
+      "urlEnv": "BSC_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 20
+    },
+    {
+      "id": "base-mainnet",
+      "adapter": "evm",
+      "chainId": "0x2105",
+      "urlEnv": "BASE_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 60
+    },
+    {
+      "id": "arbitrum-one",
+      "adapter": "evm",
+      "chainId": "0xa4b1",
+      "urlEnv": "ARBITRUM_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 128
+    },
+    {
+      "id": "polygon-pos",
+      "adapter": "evm",
+      "chainId": "0x89",
+      "urlEnv": "POLYGON_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 128
+    },
+    {
+      "id": "avalanche-c",
+      "adapter": "evm",
+      "chainId": "0xa86a",
+      "urlEnv": "AVALANCHE_C_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 20
+    },
+    {
+      "id": "op-mainnet",
+      "adapter": "evm",
+      "chainId": "0xa",
+      "urlEnv": "OPTIMISM_RPC_URL",
+      "evmReceiptMode": "block",
+      "confirmationLag": 60
+    }
+  ]
+}

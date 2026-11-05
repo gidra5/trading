@@ -1,0 +1,10 @@
+numpy>=2.0
+scipy>=1.13
+pandas>=2.2
+numba>=0.60
+matplotlib>=3.9
+pytest>=8.0
+# Optional for differentiable variational latent-channel inference:
+# torch>=2.5
+# jax>=0.4
+# jaxlib>=0.4

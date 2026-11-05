@@ -1,0 +1,62 @@
+{
+  "candidate": "lexical-zstd19-3600s",
+  "note": "Worst measured ratio per component across corresponding full-recorder and legacy windows. Legacy aggregate trades are a conservative granularity transfer, not a new individual-trade measurement. Unmeasured sources remain unchanged. No additional global multi-market baseline correction is credited.",
+  "measurements": [
+    {
+      "component": "spot/BBO",
+      "originalGzipBytes": 74012,
+      "encodedBytes": 16577,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/spot-public-000 (33.826s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "spot/depth-diff",
+      "originalGzipBytes": 66269,
+      "encodedBytes": 34590,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/spot-public-000 (33.826s); legacy/binance-spot-depth-diff (3599.967s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "spot/trade",
+      "originalGzipBytes": 1253237,
+      "encodedBytes": 282185,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/spot-public-000 (33.826s); legacy/binance-spot-aggtrade (1180.581s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "usdm-futures/mark-price-funding",
+      "originalGzipBytes": 190917,
+      "encodedBytes": 29796,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/usdm-futures-market-000 (30.308s); multiasset-lossless-sample/usdm-futures-market-000 (88.793s); legacy/binance-usdm-mark-price (3598.992s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "usdm-futures/aggTrade",
+      "originalGzipBytes": 417863,
+      "encodedBytes": 97186,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/usdm-futures-market-000 (30.308s); multiasset-lossless-sample/usdm-futures-market-000 (88.793s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "usdm-futures/BBO",
+      "originalGzipBytes": 1094560,
+      "encodedBytes": 265367,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/usdm-futures-public-000 (30.821s); multiasset-lossless-sample/usdm-futures-public-000 (21.242s); legacy/binance-usdm-book-ticker (3599.972s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    },
+    {
+      "component": "usdm-futures/depth-diff",
+      "originalGzipBytes": 162764,
+      "encodedBytes": 91993,
+      "roundTripByteExact": true,
+      "scope": "full-btc-smoke/usdm-futures-public-000 (30.821s); multiasset-lossless-sample/usdm-futures-public-000 (21.242s)",
+      "source": "docs/experiments/collector-lossless-codec-2026-11-02.json#componentRatios"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8"><title>BTCUSDT memory-law and realization study</title><style>body{font-family:system-ui;max-width:1050px;margin:40px auto;line-height:1.5;color:#181818}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #ddd;padding:7px;text-align:right}th:first-child,td:first-child{text-align:left}code{background:#f4f4f4;padding:2px 4px}img{max-width:100%}.note{background:#f5f7fa;padding:12px;border-left:4px solid #777}h2{margin-top:30px}</style></head><body>
+<h1>BTCUSDT memory law and finite-state realization</h1>
+<p>Data: 14,464,973 BTCUSDT spot aggregate trades, 1,114,521 seconds (~12.90 d). Total trade counts were binned at 1 s. The observed activity ACF was evaluated on 145 logarithmically distributed positive lags from 1 s to 6 h. Errors below are RMSE of log predicted ACF vs log empirical ACF; for small errors this is approximately RMS relative error.</p>
+<div class="note"><b>Scope.</b> This identifies the shape of the observed activity-memory curve. It is not yet the final latent covariance C(h): raw count covariance still mixes endogenous Hawkes excitation and exogenous/latent activity.</div>
+<h2>Compact law search</h2>
+<table><tr><th>Family</th><th>parameters</th><th>log-RMSE</th><th>approx RMS multiplicative error</th></tr>
+<tr><td>single shifted power law</td><td>3</td><td>0.0968</td><td>10.2%</td></tr>
+<tr><td>stretched exponential</td><td>3</td><td>0.0782</td><td>8.1%</td></tr>
+<tr><td>tempered shifted power law</td><td>4</td><td>0.0690</td><td>7.1%</td></tr>
+<tr><td>double/broken power law</td><td>5</td><td>0.0666</td><td>6.9%</td></tr>
+<tr><td>sum of two shifted power laws</td><td>6</td><td>0.0628</td><td>6.5%</td></tr>
+<tr><td>best optimized positive exponential mixture (6 states)</td><td>12 structural if free</td><td>0.0564</td><td>5.8%</td></tr>
+<tr><td>30-knot log-lag spline</td><td>30</td><td>0.0284</td><td>2.9%</td></tr></table>
+<img src="kernel_laws.png"><p>The failure of even a 30-knot spline to reach 1% indicates that small-scale irregularity/noise in the empirical ACF, rather than merely the choice of analytic family, dominates once errors are pushed below a few percent.</p>
+<h2>Finite exponential/state realization</h2>
+<table><tr><th>states</th><th>optimized log-RMSE</th></tr>
+<tr><td>1</td><td>0.3802</td></tr><tr><td>2</td><td>0.1435</td></tr><tr><td>3</td><td>0.0811</td></tr><tr><td>4</td><td>0.0600</td></tr><tr><td>5</td><td>0.0583</td></tr><tr><td>6</td><td>0.0564</td></tr><tr><td>7</td><td>0.0564</td></tr><tr><td>8</td><td>0.0564</td></tr></table>
+<img src="state_error.png"><p>The plateau after ~6 states is evidence that adding linear modes is fitting a smooth envelope while the remaining discrepancy is not representable as a stable positive exponential mixture (and is likely substantially sampling/nonstationarity noise).</p>
+<h2>Can nonlinear recurrence beat exponentials?</h2>
+<p>For one isolated event, a shifted power kernel q(t)=(1+t/tau)^(-gamma) obeys the exact scalar nonlinear ODE q' = -(gamma/tau) q^(1+1/gamma). But for a superposition x=sum_i q_i, x' depends on sum_i q_i^(1+1/gamma), not on x alone. Introducing moments M_p=sum_i q_i^p creates the hierarchy M_p' = -(p gamma/tau) M_(p+1/gamma), which does not close at finite order without an approximation. Thus the single-event nonlinear recurrence does not give an exact one-state aggregate convolution.</p>
+<p>A learned nonlinear recurrent state remains a legitimate approximate compressor. The fair target is therefore not kernel-value fitting alone but operator error over many event histories: generate/hold out histories u, compute exact convolution y=K*u, train a d-state recurrence z_{t+1}=F(z_t,u_t), yhat=G(z_t), and compare its held-out operator error against a d-state optimized linear realization. This avoids claiming compression from a recurrence that only reproduces the decay of one event.</p>
+<h2>Accuracy floor and what “sub-1%” should mean</h2>
+<p>A rough 12-block standard-error calculation gives ~0.107 RMS uncertainty in log-ACF across the selected lags; a split-half discrepancy is even larger (~0.44/sqrt(2) per half-comparison scale), reflecting strong nonstationarity at long lags. These are crude diagnostics rather than formal confidence intervals, but they are far above 0.01. Therefore fitting the empirical ACF to 0.1–1% would mostly fit realization-specific fluctuations.</p>
+<p>The useful sub-1% criterion is: after choosing/estimating a smooth latent law K(t;theta), require the numerical realization to satisfy ||Khat-K|| (or, better, held-out convolution-operator error) below 1%. Fractional kernels are nonlocal; published fast fractional solvers commonly obtain tractability by rational/sum-of-exponential compression of the history kernel.</p>
+<h2>Next identification step</h2><p>Estimate Hawkes response and residual latent covariance jointly/nonparametrically, with uncertainty. Fit laws to those denoised objects rather than raw ACF. For each accepted law, compile several realizations: optimized rational/exponential, fractional compressed-history, structured moment closure, and learned low-dimensional nonlinear recurrence. Compare dimensions at 5%, 1%, 0.5%, 0.1% held-out operator error and finally by point-process predictive likelihood.</p>
+</body></html>
