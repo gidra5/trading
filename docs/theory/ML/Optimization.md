@@ -87,8 +87,14 @@ We can separate this problem into broad-phase and narrow-phase:
 
 https://arxiv.org/abs/1803.02021?utm_source=chatgpt.com
 
-
 basin detection - take f and test point x, run de solution until found the minima, evaluate. If two points converge to the same minima they are the same basin.
+### Symmetry
+| Approach                                                                                                                                                                                | What it discovers or exploits                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[AI Feynman](https://pmc.ncbi.nlm.nih.gov/articles/PMC7159912/)**                                                                                                                     | Fits a neural surrogate and tests candidate transformations. For example, if shifting \(x_1\) and \(x_2\) by the same amount leaves the prediction unchanged, it tries rewriting the function in terms of \(x_1-x_2\). Its goal is symbolic regression, but the surrogate → symmetry test → reduced model loop is close to what you described. ([PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC7159912?utm_source=chatgpt.com "AI Feynman: A physics-inspired method for symbolic regression")) |
+| **[Gaussian processes with built-in dimensionality reduction](https://arxiv.org/abs/1602.04550)**                                                                                       | Learns a projection \(W^\top x\) from function values. In the exact model \(f(x)=g(W^\top x)\), every translation in \(\ker W^\top\) is a symmetry. This is a way to discover flat directions that aren’t aligned with the original axes. ([arxiv.org](https://arxiv.org/abs/1602.04550?utm_source=chatgpt.com "Gaussian processes with built-in dimensionality reduction: Applications in high-dimensional uncertainty propagation"))                                                          |
+| **[A Unified Framework to Enforce, Discover, and Promote Symmetry](https://jmlr.org/papers/v26/24-1315.html)**                                                                          | Studies how to recover continuous symmetry generators from a fitted model or data, and how to fit models that allow the data to break a candidate symmetry. This is the closest reference if you want to search for transformations beyond coordinate shifts. ([jmlr.org](https://jmlr.org/papers/v26/24-1315.html?utm_source=chatgpt.com "A Unified Framework to Enforce, Discover, and Promote Symmetry in Machine Learning"))                                                                |
+| **[Sample-efficient Bayesian Optimisation Using Known Invariances](https://proceedings.nips.cc/paper_files/paper/2024/hash/55aeba84b402008d3ed10440d906b4e1-Abstract-Conference.html)** | Builds a GP kernel that shares information across symmetry-related points. It gives sample-complexity bounds for BO when the invariance is supplied in advance. ([proceedings.nips.cc](https://proceedings.nips.cc/paper_files/paper/2024/hash/55aeba84b402008d3ed10440d906b4e1-Abstract-Conference.html?utm_source=chatgpt.com "Sample-efficient Bayesian Optimisation Using Known Invariances"))                                                                                              |
 ### Polynomial optimization
 https://epubs.siam.org/doi/10.1137/S1052623400366802?utm_source=chatgpt.com
 https://ir.cwi.nl/pub/25212?utm_source=chatgpt.com
@@ -434,16 +440,16 @@ This is particularly relevant to your goal of increasing the effective size of t
 
 The literature contains several approaches that correspond to different parts of what we discussed.
 
-|Research|Main idea|Relationship to your proposal|
-|---|---|---|
-|Basin-hopping|Collapse each basin to its minimum value|Almost exactly your \(g(x)=f(A(x))\)|
-|Filled-function methods|Modify the objective to escape known local minima|Very close to your basin inversion|
-|Tunneling methods|Construct a new search problem after finding a local minimum|Similar to eliminating the current basin|
-|Minima hopping|Explore neighboring minima using dynamically informed escape moves|Related to backward-flow exploration|
-|Gentlest ascent dynamics|Modify dynamics to converge to saddles separating basins|Directly relevant to boundary discovery|
-|Metadynamics|Progressively fill visited minima with a bias potential|Related to recursive basin flattening|
-|Graduated nonconvexity|Solve a sequence of increasingly difficult landscapes|Related to your hierarchical smoothing|
-|Simulated annealing|Use stochastic dynamics to escape local minima|Provides asymptotic global convergence guarantees|
+| Research                 | Main idea                                                          | Relationship to your proposal                     |
+| ------------------------ | ------------------------------------------------------------------ | ------------------------------------------------- |
+| Basin-hopping            | Collapse each basin to its minimum value                           | Almost exactly your \(g(x)=f(A(x))\)              |
+| Filled-function methods  | Modify the objective to escape known local minima                  | Very close to your basin inversion                |
+| Tunneling methods        | Construct a new search problem after finding a local minimum       | Similar to eliminating the current basin          |
+| Minima hopping           | Explore neighboring minima using dynamically informed escape moves | Related to backward-flow exploration              |
+| Gentlest ascent dynamics | Modify dynamics to converge to saddles separating basins           | Directly relevant to boundary discovery           |
+| Metadynamics             | Progressively fill visited minima with a bias potential            | Related to recursive basin flattening             |
+| Graduated nonconvexity   | Solve a sequence of increasingly difficult landscapes              | Related to your hierarchical smoothing            |
+| Simulated annealing      | Use stochastic dynamics to escape local minima                     | Provides asymptotic global convergence guarantees |
 
 Here are the papers I would prioritize.
 
@@ -565,3 +571,300 @@ trust-region methods. Tensor methods, higher-order Taylor optimization. Random s
 
 [A Hamilton–Jacobi-based Proximal Operator](https://pmc.ncbi.nlm.nih.gov/articles/PMC10083605/?utm_source=chatgpt.com)
 [Variational Characterizations of Local Entropy and Heat Regularization in Deep Learning](https://pmc.ncbi.nlm.nih.gov/articles/PMC7515000/?utm_source=chatgpt.com)
+
+### Tunneling and filling
+These are the most useful sources I found that expose actual formulas rather than only abstracts.
+
+[A novel parameter-free differentiable filled function (2026)](https://www.nature.com/articles/s41598-026-46030-x?utm_source=chatgpt.com)
+
+Full open-access paper. Particularly useful for its explicit construction, derivatives, and proofs of stationary-point elimination.
+
+[A New Parameterless Filled Function Method (2022)](https://www.mdpi.com/2075-1680/11/12/746?utm_source=chatgpt.com)
+
+Open access, with a historical review of filled functions and their parameter-selection problems.
+
+[Filled-function research paper (Optimization Online, PDF)](https://optimization-online.org/wp-content/uploads/2004/03/846.pdf?utm_source=chatgpt.com)
+
+Free PDF discussing globally concavized versus globally convexized filled functions, with mathematical definitions and constructions.
+
+[Tunneling algorithm with explicit formulas](https://pmc.ncbi.nlm.nih.gov/articles/PMC5621012/?utm_source=chatgpt.com)
+
+Open-access application reproducing the classical inverse-power tunneling function and modified variants.
+
+# Another formulation
+A useful necessary-and-sufficient condition is simply the convexity inequality:
+
+\[ \boxed{ \inf_y[f(y)+c(\theta x_1+(1-\theta)x_2,y)] \le \theta g(x_1)+(1-\theta)g(x_2) } \]
+
+for all \(x_1,x_2\) and \(\theta\in[0,1]\).
+
+But this is not yet a constructive condition on \(c\).
+
+A much more useful sufficient condition is that
+
+\[ \boxed{ (x,y)\mapsto f(y)+c(x,y) } \]
+
+is jointly convex.
+
+Then partial minimization over \(y\) preserves convexity, provided the feasible set is convex.
+## 1. Formal setup
+
+Assume \(f:\mathbb R^d\to\mathbb R\) is continuous, coercive, and has a unique global minimizer
+
+\[ a_*=\arg\min_y f(y). \]
+
+Let \(h\) be continuous and strictly increasing, and define
+
+\[ F(y)=h(f(y)). \]
+
+Then \(F\) has the same unique minimizer \(a_*\).
+
+Consider
+
+\[ \boxed{ g(x)=\inf_y\left[F(y)+c(x,y)\right]. } \]
+
+Suppose
+
+\[ c(x,y)\ge0,\qquad c(x,y)=0\iff x=y. \]
+
+Under suitable attainment and continuity assumptions, these conditions guarantee
+
+\[ \arg\min g=\{a_*\}. \]
+
+But they do not eliminate nonglobal stationary points.
+
+To achieve that, impose the stronger radial condition
+
+\[ \boxed{ \langle\nabla g(x),x-a_*\rangle>0, \qquad x\ne a_*. } \tag{1} \]
+
+This is sufficient for global attraction under gradient flow, assuming the dynamics are well-defined.
+
+In fact, if \(g\) is differentiable and (1) holds, then
+
+\[ \frac{d}{dt}\frac12\|x(t)-a_*\|^2 = -\langle\nabla g(x),x-a_*\rangle<0. \]
+
+Thus the squared distance to \(a_*\) is a strict Lyapunov function.
+
+## 2. Derive the condition directly on \(c\)
+
+Define the set of inner minimizers
+
+\[ Y(x)=\arg\min_y[F(y)+c(x,y)]. \]
+
+Assume for now that \(Y(x)=\{y_x\}\), with sufficient smoothness.
+
+By the envelope theorem,
+
+\[ \boxed{ \nabla g(x)=\nabla_xc(x,y_x). } \]
+
+The derivative of \(F(y_x)\) does not appear explicitly because the inner minimizer satisfies
+
+\[ \nabla F(y_x)+\nabla_yc(x,y_x)=0. \]
+
+Therefore, the global attraction condition becomes
+
+\[ \boxed{ \langle\nabla_xc(x,y_x),x-a_*\rangle>0. } \tag{2} \]
+
+This is the fundamental constraint.
+
+It depends only on the derivative of the transition cost at the optimal destination.
+
+If we want to eliminate the implicit minimizer \(y_x\), we can use softmin approximations.
+
+## 3. Replace the inner infimum with log-sum-exp
+
+Choose a reference measure \(\mu\) with positive density around the relevant minimizers.
+
+Define
+
+\[ \boxed{ g_\beta(x) = -\beta\log \int e^{-[F(y)+c(x,y)]/\beta}\,\mu(dy). } \]
+
+As \(\beta\to0\), under Laplace-principle assumptions,
+
+\[ g_\beta(x)\longrightarrow g(x). \]
+
+Define the conditional Gibbs distribution
+
+\[ \boxed{ \pi_\beta(dy\mid x) = \frac{ e^{-[F(y)+c(x,y)]/\beta}\mu(dy) }{ \int e^{-[F(z)+c(x,z)]/\beta}\mu(dz) }. } \]
+
+Differentiating under the integral,
+
+\[ \boxed{ \nabla g_\beta(x) = \mathbb E_{\pi_\beta(\cdot\mid x)} [\nabla_xc(x,Y)]. } \tag{3} \]
+
+This is exact.
+
+Therefore, a sufficient condition for global attraction of the softened objective is
+
+\[ \boxed{ \mathbb E_{\pi_\beta(\cdot\mid x)} \left[ \langle\nabla_xc(x,Y),x-a_*\rangle \right]>0. } \tag{4} \]
+
+This replaces the inner optimization with an expectation.
+
+Notice that \(h\) enters through the Gibbs weights, while \(c\) enters through both the weights and its gradient.
+
+## 4. Replace the global minimizer with a Gibbs expectation
+
+Now define a second Gibbs distribution, based only on \(f\):
+
+\[ \boxed{ \nu_\tau(dz) = \frac{e^{-f(z)/\tau}\mu(dz)} {\int e^{-f(w)/\tau}\mu(dw)}. } \]
+
+Let
+
+\[ \boxed{ a_\tau=\mathbb E_{\nu_\tau}[Z]. } \]
+
+For a unique global minimizer \(a_*\), suitable coercivity and integrability conditions imply
+
+\[ a_\tau\longrightarrow a_* \qquad(\tau\to0). \]
+
+This gives a soft approximation of the minimizer's location.
+
+Substituting into (4),
+
+\[ \boxed{ \lim_{\tau\to0} \mathbb E_{\pi_\beta(\cdot\mid x)} \left[ \left\langle \nabla_xc(x,Y),x-a_\tau \right\rangle \right]>0. } \tag{5} \]
+
+Equivalently, because the two Gibbs distributions are independent,
+
+\[ \boxed{ \lim_{\tau\to0} \mathbb E_{\substack{Y\sim\pi_\beta(\cdot\mid x)\\Z\sim\nu_\tau}} \left[ \langle\nabla_xc(x,Y),x-Z\rangle \right]>0. } \tag{6} \]
+
+This is an explicit integral constraint on \(c\) and \(h\), with no occurrence of \(\arg\min f\).
+
+## constraints on h
+Recall
+
+\[ g(x)=\inf_y\left[h(f(y))+c(x,y)\right], \]
+
+with unique global minimizer \(a_*\).
+
+For a smooth, uniquely attained inner minimum \(y_x\),
+
+\[ \nabla g(x)=\nabla_xc(x,y_x). \]
+
+The attraction condition is
+
+\[ \boxed{ \langle\nabla_xc(x,y_x),x-a_*\rangle>0. } \]
+
+Although \(h\) does not appear explicitly, it determines \(y_x\) through
+
+\[ \boxed{ h'(f(y_x))\nabla f(y_x)+\nabla_yc(x,y_x)=0. } \]
+
+Thus \(h'\) determines how strongly the objective pulls the optimal destination away from the transition-cost minimizer \(y=x\).
+
+
+I would distinguish two desirable properties of \(h\):
+
+Global separation: Make nonglobal low-valued regions expensive enough that the inner minimization prefers the true optimum.
+
+Local sharpness: Make the transformed objective grow sufficiently rapidly away from the optimum that the proximal destination contracts toward it.
+
+These are related, but not identical. A function that sharply separates objective values near \(m\) might compress differences farther away, and vice versa.
+
+A particularly interesting family is
+
+\[ \boxed{ h(z)=A(z-m)^q,\qquad 0<q\le1, } \]
+
+or its smooth approximations, with \(q\) adapted to the local growth exponent of \(f\).
+
+There is also a potentially more powerful construction: if we could estimate the global sublevel-volume function
+
+\[ V(s)=\mu\{y:f(y)\le s\}, \]
+
+then \(h\) could be designed using the distribution of objective values, not just their numerical scale. That would let us amplify precisely the objective ranges where competing near-optimal points are concentrated.
+
+# Bayesian Optimization
+
+Start with **Frazier’s tutorial** for the mechanics, then read **TuRBO**, **dimension-scaled vanilla BO**, and the **BBOB comparison** for your high-dimensional black-box optimization question. All the papers below have freely readable versions.
+
+## Foundations
+
+|Resource|What to read it for|
+|---|---|
+|**Frazier (2018), [A Tutorial on Bayesian Optimization](https://arxiv.org/abs/1807.02811?utm_source=chatgpt.com)**|The best starting point. Walks through Gaussian process regression and how expected improvement, entropy search, and knowledge gradient each decide where to evaluate next. [arxiv.org](https://arxiv.org/abs/1807.02811?utm_source=chatgpt.com)|
+|**Rasmussen & Williams, [Gaussian Processes for Machine Learning](https://gaussianprocess.org/gpml/chapters/?utm_source=chatgpt.com)**|Chapters 2 and 4 cover GP regression and covariance functions. Read these if you want to understand how a kernel determines what a new observation tells you about the rest of the domain. [gaussianprocess.org](https://gaussianprocess.org/gpml/chapters/?utm_source=chatgpt.com)|
+|**Jones, Schonlau & Welch (1998), [Efficient Global Optimization](https://www.schonlau.net/publication/jogo98.pdf?utm_source=chatgpt.com)**|The classic expected improvement paper. Read it for the original EGO algorithm and its worked examples. [schonlau.net](https://www.schonlau.net/publication/jogo98.pdf?utm_source=chatgpt.com)|
+|**Srinivas et al. (2010), [GP-UCB](https://www.dna.caltech.edu/Papers/Srinivas-2010-regret-ICML.pdf?utm_source=chatgpt.com)** and **Bull (2011), [Convergence Rates of Efficient Global Optimization Algorithms](https://jmlr.csail.mit.edu/beta/papers/v12/bull11a.html?utm_source=chatgpt.com)**|Two routes into the theory. GP-UCB bounds **cumulative regret** using information gain. Bull studies convergence for **the best point found** by expected improvement, which is closer to your goal if you only care about the final optimizer. [dna.caltech.edu](https://www.dna.caltech.edu/Papers/Srinivas-2010-regret-ICML.pdf?utm_source=chatgpt.com)|
+
+## High-dimensional global optimization
+
+|Paper|How it handles dimension|
+|---|---|
+|**Eriksson et al. (2019), [TuRBO](https://arxiv.org/abs/1910.01739?utm_source=chatgpt.com)**|Fits local GP models in adaptive trust regions and allocates evaluations across them. Closest to your basin-search interests, since it decides which local searches deserve more evaluations. [papers.neurips.cc](https://papers.neurips.cc/paper_files/paper/2019/hash/6c990b7aca7bc7058f5e98ea909e924b-Abstract.html?utm_source=chatgpt.com)|
+|**Eriksson & Jankowiak (2021), [SAASBO](https://proceedings.mlr.press/v161/eriksson21a.html?utm_source=chatgpt.com)**|Uses a sparsity prior on GP inverse length scales to learn which input coordinates matter. The structural assumption is that relatively few original coordinates drive the objective. [proceedings.mlr.press](https://proceedings.mlr.press/v161/eriksson21a.html?utm_source=chatgpt.com)|
+|**Hvarfner, Hellsten & Nardi (2024), [Vanilla Bayesian Optimization Performs Great in High Dimensions](https://proceedings.mlr.press/v235/hvarfner24a.html?utm_source=chatgpt.com)**|Scales the GP length-scale prior with dimension. A particularly relevant baseline alongside TuRBO and SAASBO because it isolates how much of the difficulty comes from the surrogate prior. [proceedings.mlr.press](https://proceedings.mlr.press/v235/hvarfner24a.html?utm_source=chatgpt.com)|
+|**Santoni et al., [Comparison of High-Dimensional Bayesian Optimization Algorithms on BBOB](https://arxiv.org/abs/2303.00890?utm_source=chatgpt.com)**|Compares BO variants with CMA-ES across 24 COCO functions at 10–60 dimensions. The authors report an advantage for BO at limited evaluation budgets, with performance varying by landscape and budget. The 2024 dimension-scaled baseline is worth reading alongside this comparison. [arxiv.org](https://arxiv.org/abs/2303.00890?utm_source=chatgpt.com)|
+
+## Information gain and implementation
+
+- **[Entropy Search](https://www.jmlr.org/beta/papers/v13/hennig12a.html?utm_source=chatgpt.com)** and **[Max-value Entropy Search](https://proceedings.mlr.press/v70/wang17e.html?utm_source=chatgpt.com)** connect directly to your idea of choosing where to sample based on uncertainty. The first asks how much an observation would tell you about **where** the global optimum is. The second asks how much it would tell you about **what value** the optimum attains. [jmlr.org](https://www.jmlr.org/beta/papers/v13/hennig12a.html?utm_source=chatgpt.com)
+- **[Unexpected Improvements to Expected Improvement](https://proceedings.neurips.cc/paper/2023/hash/419f72cbd568ad62183f8132a3605a2a-Abstract-Conference.html?utm_source=chatgpt.com)** explains why ordinary EI can become numerically hard to optimize and develops LogEI variants. The **[BoTorch closed-loop tutorial](https://botorch.org/docs/next/tutorials/closed_loop_botorch_only?utm_source=chatgpt.com)** gives runnable code for batch LogEI and noisy batch LogEI.
+
+# RL based optimization
+
+The most direct version is **train a policy to decide where to evaluate a black-box function next**. There are also methods where the policy controls an existing optimizer, and tree-search methods that learn where to focus within a single run.
+
+|Approach|What it learns or decides|Paper|
+|---|---|---|
+|**Learn the optimizer itself**|The policy observes the search history and proposes the next iterate. Training across objectives lets it learn search behavior that transfers to new instances.|Li & Malik, [Learning to Optimize](https://arxiv.org/abs/1606.01885?utm_source=chatgpt.com). An early formulation of the optimizer as an RL policy. [arxiv.org](https://arxiv.org/abs/1606.01885?utm_source=chatgpt.com)|
+|**Learn to control an existing optimizer**|An RL agent observes the state of a lower-level optimizer and adjusts how it searches. The lower-level optimizer still generates candidates.|Ma et al., [MetaBox](https://arxiv.org/abs/2310.08252?utm_source=chatgpt.com). A benchmark with learned and traditional baselines, plus [code and tutorials](https://metaevo.github.io/MetaBox/?utm_source=chatgpt.com). [arxiv.org](https://arxiv.org/abs/2310.08252?utm_source=chatgpt.com)|
+|**Learn where to search within one run**|LA-MCTS learns a partition from the current function’s evaluations, uses bandit-style tree traversal to choose a region, and runs a solver such as BO or TuRBO inside it.|Wang, Fonseca & Tian, [LA-MCTS](https://arxiv.org/abs/2007.00708?utm_source=chatgpt.com). The closest of these to your idea of allocating search effort across basins, although its learned regions need not coincide with actual attraction basins. [arxiv.org](https://arxiv.org/abs/2007.00708?utm_source=chatgpt.com)|
+
+### How the RL objective differs from expected improvement
+
+Suppose you’re minimizing a deterministic function with a budget of \(T\) evaluations. The policy sees the history \(H_t=\{(x_i,f(x_i))\}_{i=1}^t\), chooses \(x_{t+1}\), and gets reward \(r_t=b_t-b_{t+1}\), where \(b_t\) is the best value observed so far. The undiscounted return telescopes:
+
+\[ \sum_{t=t_0}^{T-1} r_t=b_{t_0}-b_T. \]
+
+So a policy trained on this return can learn to make a **probe that yields zero immediate improvement** if the result helps it find a better point later. Standard one-step expected improvement scores the immediate gain. The RL formulation gives credit for downstream gains over the remaining budget.
+
+For your basin-search idea, a natural action would be **continue refining this region, switch to a known region, or probe somewhere new**. The distinction I’d use to pick a paper is whether you have _one unknown objective_ or _a family of related objectives_. **LA-MCTS** is the more direct starting point for one objective because it learns the partition during the run. **MetaBox** is the better starting point if you want to train a search controller across instances and test whether it beats TuRBO or CMA-ES on held-out functions at the same evaluation budget. That comparison measures transfer, which is where the upfront RL training can pay off. [proceedings.neurips.cc](https://proceedings.neurips.cc/paper/2020/file/e2ce14e81dba66dbff9cbc35ecfdb704-Paper.pdf?utm_source=chatgpt.com)
+
+## Beam search
+
+Suppose a candidate is built through a sequence of decisions, such as composing a function one operation at a time. At each step, beam search expands the candidates it kept from the previous step, scores their children, and keeps only the best \(B\). The number \(B\) is the **beam width**.
+
+For example, with width 3 and 10 possible operations, you score up to 30 extensions per step and keep 3. Width 1 gives you greedy search. A wider beam gives a candidate that looks mediocre now a chance to become good after another step. Once its branch is pruned, though, the search can miss the best final composition.
+
+For continuous optimization, you have to **define what a branch means**. In your basin-search setup, you could keep \(B\) active local searches, advance each for a small evaluation budget, and periodically replace some with new starts. That’s closer to a beam-inspired multistart optimizer than classical beam search. The key choice is how to rank branches. If you rank solely by the best value seen so far, several starts in the same easy basin could crowd out a slower but more promising basin.
+
+## Latin hypercube sampling
+
+“Latin square search” most likely referred to **Latin hypercube sampling (LHS)**. If you have \(N\) evaluations to place in a \(d\)-dimensional box, split **each coordinate axis** into \(N\) equal intervals. Then choose \(N\) points so that, along every coordinate, exactly one point lands in each interval.
+
+For example, with 5 points in 2D, draw a \(5\times5\) grid and place one point in each row and each column. You get coverage of both axes with **5 evaluations**, while evaluating every cell would take 25. The guarantee is about each coordinate separately. A design could put all five points along the diagonal and still satisfy the rule, so the pairing of intervals matters for joint coverage.
+
+The names are related. A **Latin square** fills every cell with a symbol, with each symbol appearing once per row and column. A **2D Latin hypercube sample** marks one cell per row and column.
+
+### What the contour _can_ count
+
+There’s an exact version of your counting idea if you track **how many times the gradient direction rotates** around the loop. On a simple, regular level curve, the gradient is normal to the curve, so it makes one full turn whether the curve is convex or wavy. If the critical points inside are nondegenerate, the planar index theorem gives
+
+\[ \#\text{minima}+\#\text{maxima}-\#\text{saddles}=1. \]
+
+A minimum and a saddle cancel in this count. That’s exactly what happens in the circular example, where \(2+0-1=1\).
+
+**Multiparameter continuation** is the established version of tangent-tracing idea. **Sublevel merge trees** capture your idea of raising the contour level and watching wells merge. If you want the actual boundary between attraction basins, the relevant methods compute **stable manifolds of saddles**.
+
+|What you want to recover|Existing method|Starting point|
+|---|---|---|
+|**The geometry of one surface \(f(x)=c\)**|**Multiparameter continuation.** Extend a collection of overlapping local patches across the implicit surface. This is the higher-dimensional analogue of stepping tangentially and correcting back onto the contour.|Henderson, [Multiple Parameter Continuation: Computing Implicitly Defined \(k\)-Manifolds](https://research.ibm.com/publications/multiple-parameter-continuation-computing-implicitly-defined-k-manifolds?utm_source=chatgpt.com). [IBM Research](https://research.ibm.com/publications/multiple-parameter-continuation-computing-implicitly-defined-k-manifolds?utm_source=chatgpt.com)|
+|**Which wells merge as \(c\) rises**|**Sublevel merge trees**, also called **join trees**. Sweep through the values of a sampled function on a mesh and track which connected components appear and merge. The output is a hierarchy of wells and their merge levels.|Carr, Snoeyink & Axen, [Computing Contour Trees in All Dimensions](https://www.cs.ubc.ca/tr/1999/tr-99-09?utm_source=chatgpt.com). Look for the join-tree construction. [Computer Science at UBC](https://www.cs.ubc.ca/tr/1999/tr-99-09?utm_source=chatgpt.com)|
+|**A barrier hierarchy without meshing the entire domain**|**Disconnectivity graphs.** Build a network of discovered minima and transition states, then group minima by the lowest energy threshold at which the network connects them. Missed transition states can make an estimated barrier too high.|Wales group, [PATHSAMPLE disconnectivity graph example](https://www-wales.ch.cam.ac.uk/examples/PATHSAMPLE/DisconnectivityGraphs/?utm_source=chatgpt.com). [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC10523320/?utm_source=chatgpt.com)|
+|**The actual boundary between gradient-flow basins**|**Stable-manifold computation.** When a saddle with one unstable direction separates two minima, points on its stable manifold flow _toward the saddle_. Nearby points on opposite sides can flow to different minima. One numerical approach starts near the saddle and extends the manifold backward along the flow.|Kuznetsov, [Elements of Applied Bifurcation Theory](https://www.ma.imperial.ac.uk/~dturaev/kuznetsov.pdf?utm_source=chatgpt.com), on computing invariant manifolds. [ma.imperial.ac.uk](https://www.ma.imperial.ac.uk/~dturaev/kuznetsov.pdf?utm_source=chatgpt.com)|
+
+The double well from earlier makes the distinction concrete. For \(f(x,y)=(x^2-1)^2+y^2\), the **merge tree** tells you the two wells connect at energy \(1\). The **stable manifold** tells you their basin boundary is the entire line \(x=0\). Along that line, \(f(0,y)=1+y^2\), so a single contour only intersects the boundary at a few points.
+
+There’s also a direct connection to your idea of **running descent backward to expand a basin**. Let \(C\) be a small trapped sublevel component around a minimum \(m\), with \(m\) in its interior, and let \(\Phi_t\) be the gradient flow. Then
+
+\[ B(m)=\bigcup_{t\ge 0}\{x:\Phi_t(x)\in C\}. \]
+
+Every point converging to \(m\) eventually enters \(C\), and every point that enters \(C\) converges to \(m\). So backward expansion of a certified core recovers the basin _in principle_. Numerically, the choice is what to represent. **Continuation** follows the surface, a **disconnectivity graph** compresses the barrier information to minima and transitions, and **stable-manifold computation** targets the separator directly.
+
+| Global optimizer                                                                                                                       | How the information changes the search                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **[Pure Adaptive Search](https://deepblue.lib.umich.edu/bitstream/handle/2027.42/47920/10107_2005_Article_BF01582296.pdf?sequence=1)** | Given the current best value \(b\), sample uniformly from the entire improving region \(\{x:f(x)<b\}\), including disconnected components. This directly exploits sublevel geometry. The hard part is drawing that sample. Tracing the contour of one component gives only local information about where improvements are possible. ([deepblue.lib.umich.edu](https://deepblue.lib.umich.edu/bitstream/handle/2027.42/47920/10107_2005_Article_BF01582296.pdf?sequence=1&utm_source=chatgpt.com "Mathematical Programming 43 (1988) 317-328"))       |
+| **[Minima Hopping](https://edoc.unibas.ch/entities/publication/a571b9bc-a627-4e05-8066-cd710ae4ef02)**                                 | Start at a known minimum, launch a molecular-dynamics trajectory biased toward soft directions, then minimize from the endpoint. It adapts the escape energy when it revisits known minima. The goal is to cross a nearby low barrier without having to reconstruct the basin boundary. ([edoc.unibas.ch](https://edoc.unibas.ch/entities/publication/a571b9bc-a627-4e05-8066-cd710ae4ef02?utm_source=chatgpt.com "Minima hopping: An efficient search method for the global minimum of the potential energy surface of complex molecular systems")) |
+| **[Multilevel Single Linkage](https://mathopt.zib.de/COAL-Issues/COAL11.pdf)**                                                         | Sample candidate starts and skip a local solve when a nearby, better sample suggests it would be redundant. It uses proximity as a proxy for sharing a basin. Your proposal would replace that heuristic, wherever possible, with a region that is certified to drain to a known minimum. ([mathopt.zib.de](https://mathopt.zib.de/COAL-Issues/COAL11.pdf?utm_source=chatgpt.com "THE MULTI LEVEL SINGLE LINKAGE METHOD FOR GLOBAL OPTIMIZATION"))                                                                                                   |
+
+[Stochastic Adaptive Search Methods](https://web.archive.org/web/20180712174243/http://ie.sharif.edu/~so/(International%20Series%20in%20Operations%20Research%20&%20Management%20Science%20216)%20Michael%20C%20Fu%20(eds.)-Handbook%20of%20Simulation%20Optimization-Springer-Verlag%20New%20York%20(2015).pdf)
+[Segment Tracing Using Local Lipschitz Bounds](https://hal.science/hal-02507361)
+[Forward inclusion functions for ray-tracing implicit surfaces](https://inria.hal.science/hal-04129922/file/Preprint-2.pdf)
+[global opt at work](https://edepot.wur.nl/201647)
+
