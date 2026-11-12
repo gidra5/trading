@@ -1,4 +1,15 @@
 
+RL techniques/learning methods
+https://youtu.be/wh8DyGSttig?si=LN5L3LEa0rxIwjSk
+
+RL action-value function marginalization
+https://chatgpt.com/c/6af21f86-aae0-83ed-ab21-2a8cb4a2b7e3
+
+Functional ANOVA (Analysis of Variance)
+
+[IQN](https://proceedings.mlr.press/v80/dabney18a.html?utm_source=chatgpt.com) 
+https://chatgpt.com/c/6af33da8-7690-83eb-9465-ce2e47799ada
+
 https://www.youtube.com/watch?v=NFo9v_yKQXA
 The dynamics of the environment are described by a (transition) distribution function $p(s',r\ |\ s,a)$ - a probability of transitioning to $s'$ with a reward $r$ given current state $s$ and an action $a$. In our setup it represents how much return and what portfolio we will get, given our current portfolio and a chosen portfolio change.
 

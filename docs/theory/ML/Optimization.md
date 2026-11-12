@@ -88,6 +88,12 @@ We can separate this problem into broad-phase and narrow-phase:
 https://arxiv.org/abs/1803.02021?utm_source=chatgpt.com
 
 basin detection - take f and test point x, run de solution until found the minima, evaluate. If two points converge to the same minima they are the same basin.
+
+annealing and tempering
+https://chatgpt.com/c/6af4c9ed-5048-83ed-a172-25a4957e9031
+A useful heuristic is therefore
+
+$$ \boxed{ \Delta\beta \sim \frac{c}{\sqrt{\operatorname{Var}_{\pi_\beta}(f)}}}$$
 ### Symmetry
 | Approach                                                                                                                                                                                | What it discovers or exploits                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -138,6 +144,14 @@ Expectations also optimize a loss, which means we can transform any loss into st
 https://arxiv.org/abs/1611.01838?utm_source=chatgpt.com
 [hj mad](https://arxiv.org/pdf/2202.11014)
 Adam, muon
+
+antithetic sampling
+
+Quasi-Monte Carlo. Choose points that cover the integration domain systematically rather than independently. For sufficiently regular functions, randomized QMC can achieve substantially better rates than ordinary Monte Carlo, and deterministic QMC has error bounds approaching \(O(N^{-1})\) for certain function classes.
+
+Higher-order quadrature. If the function is smooth, polynomial or spectral approximations can converge much faster, sometimes exponentially in the approximation order for analytic functions.
+
+Multilevel Monte Carlo. Construct increasingly accurate approximations \(f_\ell\) and estimate differences between levels. These differences become progressively smaller, allowing fewer samples on expensive levels.
 #### Averaging as optimization
 https://arxiv.org/abs/2012.12762?utm_source=chatgpt.com
 https://arxiv.org/html/2301.10980v2
@@ -156,6 +170,8 @@ https://doi.org/10.1137/140984798?utm_source=chatgpt.com
 ### Convexification
 We can find a convex loss whose optimum coincides with original ones.
 For that we can smooth out with gaussian and sharpen with softmax. in the limit it approaches the minimum.
+https://chatgpt.com/c/6ad63b91-80a8-83eb-84d7-6a1c9be7c831
+
 [On Graduated Optimization for Stochastic Non-Convex Problems](https://proceedings.mlr.press/v48/hazanb16.html?utm_source=chatgpt.com)
 2. [A Theoretical Analysis of Optimization by Gaussian Continuation](https://people.csail.mit.edu/hmobahi/?utm_source=chatgpt.com)
 3. [On the Link Between Gaussian Homotopy Continuation and Convex Envelopes](https://people.csail.mit.edu/hmobahi/pubs/gaussian_convenv_2015.pdf?utm_source=chatgpt.com)
@@ -284,6 +300,7 @@ https://arxiv.org/html/2103.15130v4
 | SHADE                              |      2013 | Adapt DE parameters using historical successful values                | [Tanabe & Fukunaga (2013)](https://doi.org/10.1109/CEC.2013.6557555?utm_source=chatgpt.com)     |
 | L-SHADE                            |      2014 | SHADE with linear population-size reduction                           | [Tanabe & Fukunaga (2014)](https://doi.org/10.1109/CEC.2014.6900380?utm_source=chatgpt.com)     |
 | Natural Evolution Strategies (NES) |      2009 | Optimize parameters of a search distribution using natural gradients  | [Wierstra et al. (2009)](https://arxiv.org/abs/1106.4487?utm_source=chatgpt.com)                |
+https://chatgpt.com/c/6af09320-9380-83ed-9113-ad53098030a0
 ### Surrogate-based optimization
 | Algorithm                           | Year | Main idea                                                       | Original paper                                                                                        |
 | ----------------------------------- | ---: | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |

@@ -57,3 +57,8 @@ Weierstrass factorization theorem
 While complete functional basis is useful for finding a representation of the target solution itself, this solution may be suboptimal for many reasons, like storage and computational efficiency cost, interpolation and extrapolation characteristics, overall generalization to unseen datapoints.
 
 This creates justification for overcomplete basis, and general computational graphs. They are redundant for function representation, yet crucial for further optimization.
+
+Platonic representation hypothesis
+https://youtu.be/u8cxqSPyT8s?si=L-kpF9A7-rJJiHhY
+
+[chirplets](https://chatgpt.com/c/6aef7db9-a130-83eb-99a8-bbe367ea78da)
