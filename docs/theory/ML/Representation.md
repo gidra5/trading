@@ -46,6 +46,92 @@ $$ \nabla L(f)=J_\theta\Delta\theta_\lambda$$
 If no tested damping value produces an acceptable direction, the algorithm attempts to grow the representation.
 
 
+3 dimentions of representation:
+1. width - how many terms in a basis
+2. depth - how many composition components
+3. latent dimension - dimensionality of intermediate components.
+
+We can extend/shrink each dimension with function preserving changes under this representation:
+$$f=g_k \quad g_{i+1}(x)=g_i(P_ix+h_i(x)) \quad g_1(x)=h_0(x)\\
+g_i:X_{i-1}\to X_{i} \quad f: X\to Y \quad X_0=X \quad X_{k}=Y\\
+h_k(x)=\sum_i a_i\phi_i(x) \quad \phi_i(x): X_{i-1}\to\mathbb R \quad a_i\in X_i\\
+$$
+Where $X_i=\mathbb R^{n_i}$ are intermediate domains, $P_i$ simply drops coordinates (projects) or pads them with 0 (embeds) to match the required domain, $h_k$ are the residual transforms, $g_i$ are the composition components, $\phi_i$ are the functional basis terms and $a_i$ are their corresponding coefficients/values.
+
+ 3. Exact interaction expansion using parameter multi-indices
+
+Collect all residual coefficients into one vector
+
+\[ b=(b_{11},b_{21},\ldots,b_{1L},b_{2L},\ldots). \]
+
+At \(b=0\), every residual layer is the identity:
+
+\[ f(x;0)=g(x). \]
+
+Assuming analyticity in the parameters near zero, we have
+
+\[ \boxed{ f(x;b)= \sum_{\alpha\in\mathbb N^N} \frac{b^\alpha}{\alpha!} \left. \partial_b^\alpha f(x;b) \right|_{b=0}. } \]
+
+This is the most general interaction expansion.
+
+Define
+
+\[ \boxed{ \Phi_\alpha(x)= \left. \partial_b^\alpha f(x;b) \right|_{b=0}. } \]
+
+Then
+
+\[ \boxed{ f(x;b)= \sum_\alpha \underbrace{\frac{b^\alpha}{\alpha!}}_{c_\alpha} \underbrace{\Phi_\alpha(x)}_{\text{effective basis function}}. } \]
+
+Because \(g\) is itself expanded in \(\phi_{i0}\), we can separate its coefficients:
+
+\[ \boxed{ f(x;b) = \sum_i a_i \sum_\alpha \frac{b^\alpha}{\alpha!} \Phi_{i,\alpha}(x), } \]
+
+where
+
+\[ \boxed{ \Phi_{i,\alpha}(x)= \left. \partial_b^\alpha \left[ \phi_{i0}\circ h_L\circ\cdots\circ h_1 \right](x) \right|_{b=0}. } \]
+
+Therefore, the effective coefficient of each indexed interaction is
+
+\[ \boxed{ c_{i,\alpha} = a_i\frac{b^\alpha}{\alpha!}. } \]
+
+This formula works at arbitrary depth and arbitrary interaction order.
+
+**The depth-dependent complexity is entirely contained in the ==effective basis== functions \(\Phi_{i,\alpha}\).**
+
+With this representation we can conservatively mutate the representation without affecting the resulting function:
+1. Add or remove a term with 0 value
+2. Add or remove a composition component with 0 residual
+3. Add or remove a dimension for internal components with independent variables manipulated through embedding-projection pairs, merged into adjacent components.
+
+
+
+Whats important is that new degrees of freedom have a gradient flowing through them even when they generally preserve the function. This creates complications for dimension expansion, because naive embed-project pair will keep this new variable hidden from the gradient, as it did not yet contribute anything to the computation. For that reason we treat new embeded state as a new basis term, that we are not yet folding into expansion.
+
+For an existing residual transform $g(x)=x+h(x)$ ordinary basis expansion introduces $g'(x)=x+h(x)+a\phi(x)$. We instead interpret it as introducing a latent domain $W$ and separates the new term into two operations:
+1. **Expansion:**
+$$ \boxed{ e_\phi(x)=(h(x),\phi(x)) } $$
+2. **Projection:**
+$$ \boxed{ p_a(x,w)=x+aw } $$
+Then
+$$ \boxed{ p_a\circ e_\phi(x)=x+aL(\phi(x))=g' } $$
+This exactly reproduces ordinary basis expansion, while actually introducing another internal dimension.
+
+for $f=g_1\circ g_2$ with $f: X\to Z$, $g_1: X\to Y$, $g_2: Y\to Z$ we expand intermediate $Y=\mathbb R^n$ into $(Y=\mathbb R^n,\mathbb R)\cong \mathbb W=R^{n+1}$:
+$$f=g_1\circ g_2=g_1\circ p\circ e\circ g_2=(g_1\circ p)\circ (e\circ g_2)=g_1'\circ g_2'$$
+With $g_1':X\to W$, $g_2': W\to Z$ now.
+
+Note that projection here is not simple discarding of a dimension, but a linear combination. To represent within the proposed framework we must split these further into computation and projection, and similarly into embedding and computation as we can basically treat now the new dimension as truly independent before/after the transformation. But either way we must merge these with adjacent components to preserve component count. we can, right?
+
+
+We expand terms to support approximation rate.
+We expand composition to new directions along the gradients of basis functions.
+We expand dimension to reuse values.
+Try to match basis expansion to the first order.
+
+We can treat choice of a particular expansion method as RL action, with reward being (future) improvement. While jacobian technically already shows us that effective degree of freedom only increases as much as we add new parameters, but some choices may yield faster converges as they correlate efficiently?
+
+decomposition can be understood as sharing a restricted domain.
+
 Weierstrass factorization theorem
 
 - **Functional analysis:** classifying spaces of functions.
