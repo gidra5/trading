@@ -1383,6 +1383,194 @@ https://chatgpt.com/c/6af4c9ed-5048-83ed-a172-25a4957e9031
 A useful heuristic is therefore
 
 $$ \boxed{ \Delta\beta \sim \frac{c}{\sqrt{\operatorname{Var}_{\pi_\beta}(f)}}}$$
+### Gibbs distribution
+
+Even if we know where all minima are, the Gibbs distribution becomes increasingly concentrated as \(\beta\) increases.
+
+Near a nondegenerate minimum \(x^*\),
+
+\[ f(x)\approx f(x^*)+\frac12f''(x^*)(x-x^*)^2. \]
+
+Therefore,
+
+\[ p_\beta(x)\propto \exp\left( -\frac{\beta f''(x^*)}{2}(x-x^*)^2 \right). \]
+
+The peak width scales as
+
+\[ \boxed{\sigma\sim\frac1{\sqrt{\beta f''(x^*)}}.} \]
+
+A uniform integration grid must resolve that width. For fixed curvature, this requires \(N=O(\sqrt{\beta})\) points over a fixed one-dimensional domain.
+
+Adaptive quadrature can reduce this cost dramatically if it can locate the peaks first.
+
+Inverse CDF sampling works on unbounded intervals as well. The main difference is that we must handle infinite integration limits and ensure that the Gibbs distribution is normalizable.
+
+For \(x\in\mathbb R\),
+
+\[ p_\beta(x)=\frac{e^{-\beta f(x)}}{Z_\beta}, \qquad Z_\beta=\int_{-\infty}^{\infty}e^{-\beta f(t)}\,dt. \]
+
+The CDF is
+
+\[ F_\beta(x)= \frac{\int_{-\infty}^{x}e^{-\beta f(t)}\,dt} {Z_\beta}. \]
+
+As before, sample \(u\sim U(0,1)\) and solve \(F_\beta(x)=u\).
+
+#### 1. First requirement: finite partition function
+
+We need
+
+\[ \boxed{Z_\beta<\infty.} \]
+
+This is not guaranteed merely because \(f\) has a global minimum or grows toward infinity.
+
+For example:
+
+|Objective \(f(x)\)|Normalizable on \(\mathbb R\)?|
+|---|---|
+|\(x^2\)|Yes, for \(\beta>0\)|
+|\(\lvert x\rvert\)|Yes, for \(\beta>0\)|
+|\(\log(1+x^2)\)|Only for \(\beta>1/2\)|
+|\(\log\log(e+\lvert x\rvert)\)|No, for any finite \(\beta>0\)|
+|\(\sin x\)|No|
+
+The important property is how rapidly \(e^{-\beta f(x)}\) decays compared with the volume of the domain.
+
+In \(d\) dimensions, even logarithmic growth can suffice, but it must overcome the increasing volume:
+
+\[ f(x)\sim c\log\|x\| \quad\Longrightarrow\quad Z_\beta<\infty \ \text{if }\beta c>d, \]
+
+under suitable regularity assumptions on the asymptotic behavior.
+#### probabilistic characterization of global optimality
+Define
+
+\[ \boxed{ I_q(x)=\Pr_{Y\sim q(\cdot\mid x)}[f(Y)<f(x)]. } \]
+
+This is the probability of finding a better point with one proposal.
+
+If \(q\) has full support and \(f\) is continuous on a suitable domain, then
+
+\[ I_q(x)=0 \quad\Longleftrightarrow\quad x\text{ is a global minimizer}, \]
+
+assuming every nonglobal point has a positive-measure region of strictly better values.
+
+This is a probabilistic characterization of global optimality.
+
+And with \(n\) independent proposals, the probability of missing every improvement is
+
+\[ \boxed{ \Pr(\text{no improvement in }n\text{ trials}) = (1-I_q(x))^n. } \]
+
+So if we can lower-bound the probability of proposing an improvement whenever the current point is more than \(\varepsilon\) from optimality, we can obtain finite-sample guarantees.
+
+For example, if
+
+\[ f(x)-f^*>\varepsilon \implies I_q(x)\ge c_\varepsilon>0, \]
+
+then observing no improvements in \(n\) independent proposals has probability at most
+
+\[ (1-c_\varepsilon)^n \]
+
+whenever the point is not \(\varepsilon\)-optimal.
+#### 2. Numerical approach: truncate the tails
+
+The simplest approach is to find \(a,b\) such that
+
+\[ P(X<a)+P(X>b)\leq\varepsilon. \]
+
+Then compute the CDF on \([a,b]\).
+
+If we sample from the truncated distribution, its total variation distance from the original distribution is exactly the excluded tail probability.
+
+The challenge is determining \(a,b\) reliably.
+
+If we know a lower bound on the growth of \(f\), we can bound the omitted mass.
+
+For example, suppose
+
+\[ f(x)\geq c|x|^p+C \]
+
+for sufficiently large \(|x|\), with \(c,p>0\).
+
+Then
+
+\[ \int_R^\infty e^{-\beta f(x)}dx \leq e^{-\beta C} \int_R^\infty e^{-\beta cx^p}dx. \]
+
+The right-hand side is expressible through the incomplete gamma function:
+
+\[ \int_R^\infty e^{-\beta cx^p}dx = \frac{\Gamma(1/p,\beta cR^p)} {p(\beta c)^{1/p}}. \]
+
+So we can choose \(R\) to achieve a specified tail-mass error, provided we also have a suitable lower bound on \(Z_\beta\).
+
+#### 3. Alternative: map the infinite domain to a finite interval
+
+We can transform \(x\in\mathbb R\) into \(t\in(0,1)\).
+
+For example,
+
+\[ x(t)=\tan\left(\pi(t-\tfrac12)\right). \]
+
+Then
+
+\[ \frac{dx}{dt} = \pi\sec^2\left(\pi(t-\tfrac12)\right). \]
+
+The partition function becomes
+
+\[ Z_\beta= \int_0^1 e^{-\beta f(x(t))} \pi\sec^2\left(\pi(t-\tfrac12)\right)\,dt. \]
+
+Now we can use ordinary finite-interval quadrature and inverse CDF sampling in \(t\).
+
+The transformed density is
+
+\[ \boxed{ p_T(t)\propto e^{-\beta f(x(t))} \left|\frac{dx}{dt}\right|. } \]
+
+This is exact mathematically, but it doesn't automatically make integration easy.
+
+The Jacobian can create strong endpoint behavior, and a poor transformation can concentrate nearly all the probability in a tiny part of \((0,1)\).
+
+A better transformation should approximately match the tails of the target Gibbs distribution.
+
+For example, a Gaussian reference distribution is often preferable when \(f(x)\) grows quadratically.
+
+#### 4. A more useful approach: choose a reference distribution
+
+Let \(q(x)\) be a distribution with a known inverse CDF \(Q^{-1}\).
+
+Set
+
+\[ x=Q^{-1}(u),\qquad u\in(0,1). \]
+
+Since
+
+\[ \frac{dx}{du}=\frac1{q(x)}, \]
+
+the transformed Gibbs density is
+
+\[ \boxed{ p_U(u)\propto \frac{e^{-\beta f(Q^{-1}(u))}} {q(Q^{-1}(u))}. } \]
+
+If \(q\) is close to the Gibbs distribution, this transformed density is approximately uniform.
+
+In the ideal case \(q=p_\beta\), it is exactly uniform, and sampling requires no further correction.
+
+This gives us a useful interpretation:
+
+Inverse CDF sampling is easiest when we can find a reference distribution that already captures most of the target's structure.
+
+For instance, if
+
+\[ f(x)=\frac{x^2}{2}+\epsilon\sin x, \]
+
+we can choose
+
+\[ q(x)=\mathcal N(0,1/\beta). \]
+
+Then
+
+\[ p_U(u)\propto \exp\left[-\beta\epsilon \sin\left(Q^{-1}(u)\right)\right]. \]
+
+The quadratic component disappears completely from the transformed integration problem.
+
+We only need to integrate the residual correction.
+
+This is closely related to importance sampling and transport methods.
 ### Symmetry
 | Approach                                                                                                                                                                                | What it discovers or exploits                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1441,6 +1629,13 @@ Quasi-Monte Carlo. Choose points that cover the integration domain systematicall
 Higher-order quadrature. If the function is smooth, polynomial or spectral approximations can converge much faster, sometimes exponentially in the approximation order for analytic functions.
 
 Multilevel Monte Carlo. Construct increasingly accurate approximations \(f_\ell\) and estimate differences between levels. These differences become progressively smaller, allowing fewer samples on expensive levels.
+
+sampling corresponding gibbs distribution with temp approaching 0.
+
+[inverse cdf sampling](https://chatgpt.com/c/6afb13ef-fc54-83ed-8239-510cc25217cc?no_universal_links=1)
+[distribution decomposition](https://chatgpt.com/c/6afb19a7-a554-83ed-bef5-1b9504204e49?no_universal_links=1)
+[moment generating function (MFG)](https://chatgpt.com/c/6afb5a92-e0bc-83eb-8fc5-c6074520fc83?no_universal_links=1)
+[levelset curvature and implicit methods for constrained optimization](https://chatgpt.com/c/6afc08a2-18f4-83eb-a6c5-706baff0af72?no_universal_links=1)
 #### Averaging as optimization
 https://arxiv.org/abs/2012.12762?utm_source=chatgpt.com
 https://arxiv.org/html/2301.10980v2
@@ -2174,3 +2369,764 @@ Every point converging to \(m\) eventually enters \(C\), and every point that en
 [Forward inclusion functions for ray-tracing implicit surfaces](https://inria.hal.science/hal-04129922/file/Preprint-2.pdf)
 [global opt at work](https://edepot.wur.nl/201647)
 
+# metropolis acceptance and greedy opt
+
+Your observation suggests a useful unification:
+
+\[ \boxed{ \text{Optimization algorithm} = \text{Proposal mechanism} + \text{Selection mechanism}. } \]
+
+The selection mechanism can be interpreted thermodynamically:
+
+\[ \alpha_\beta(x,y)=\min(1,e^{-\beta\Delta f}). \]
+
+At finite \(\beta\), it allows uphill moves.
+
+At infinite \(\beta\), it becomes greedy optimization.
+
+The proposal mechanism determines the geometry and reachability of the search.
+
+This means many evolutionary algorithms can indeed be interpreted as zero-temperature Metropolis-like processes, even though they do not necessarily sample the canonical zero-temperature Gibbs measure.
+
+coupling of proposal and current state - we can design proposal distribution to target specific behavior relative to current state, like exploration, exploitation, or independence.
+## 3. Choosing the coupling by optimization
+
+We could optimize the coupling itself.
+
+For example, suppose we want proposals that improve the objective:
+
+\[ \boxed{ \min_{C\in\Pi(p,r)} \mathbb E_{(X,Y)\sim C}[f(Y)-f(X)]_+. } \]
+
+Here \(\Pi(p,r)\) is the set of all couplings with marginals \(p,r\).
+
+But there's a surprising issue:
+
+\[ \mathbb E_C[f(Y)-f(X)] = \mathbb E_r[f(Y)]-\mathbb E_p[f(X)]. \]
+
+The expected signed improvement is independent of the coupling.
+
+Therefore, optimizing the coupling only matters for nonlinear objectives such as:
+
+\[ \mathbb E_C[(f(Y)-f(X))_+], \]
+
+\[ \Pr_C(f(Y)<f(X)), \]
+
+or expected accepted movement.
+
+For a greedy optimizer, a particularly natural objective is
+
+\[ \boxed{ \max_{C\in\Pi(p,r)} \Pr_C(f(Y)<f(X)). } \]
+
+This is an optimal transport problem with cost
+
+\[ c(x,y)=-\mathbf1_{\{f(y)<f(x)\}}. \]
+
+It chooses how to pair current states and proposals so that as many pairs as possible represent improvements.
+
+Importantly, this can change the distribution of accepted states even though the proposal marginal \(r\) is fixed.
+## 4. For Gibbs sampling, optimize accepted movement instead
+
+If our target is Gibbs,
+
+\[ \pi_\beta(x)\propto e^{-\beta f(x)}, \]
+
+we must include the MH correction.
+
+For a coupling \(C\) whose first marginal is \(\pi_\beta\), its conditional proposal is
+
+\[ q_C(y\mid x)=\frac{C(x,y)}{\pi_\beta(x)}. \]
+
+Then
+
+\[ \pi_\beta(x)q_C(y\mid x)=C(x,y). \]
+
+The MH accepted flow is
+
+\[ \boxed{ S_C(x,y)=\min(C(x,y),C(y,x)). } \]
+
+Thus, the expected accepted squared jumping distance is
+
+\[ \boxed{ J(C)= \iint\|x-y\|^2\min(C(x,y),C(y,x))\,dx\,dy. } \]
+
+We can therefore formulate coupling design as
+
+\[ \boxed{ \max_{C\in\Pi(\pi_\beta,r)}J(C). } \]
+
+This is an interesting constrained optimization problem over joint distributions.
+
+It tries to construct a proposal that moves far while preserving the desired stationary distribution after acceptance.
+
+However, maximizing jump distance alone does not necessarily maximize mixing or the spectral gap. A deterministic oscillation between two regions can have large jumps while exploring poorly.
+# Population based and bayesian opt connection
+There is a genuine connection here, and it is stronger than merely saying that Bayesian optimization and population optimization both maintain distributions. But the Gibbs correspondence is exact only under certain conditions, and it does not generally make the joint law redundant.
+
+## 1. Gibbs gives a correspondence between objectives and distributions
+
+For a fixed reference measure \(m\), define
+
+\[ p_f(x)=\frac{e^{-\beta f(x)}}{Z_f}, \qquad Z_f=\int e^{-\beta f(x)}m(dx). \]
+
+Conversely, for a strictly positive density \(p\) with respect to \(m\),
+
+\[ \boxed{ f(x)=-\frac1\beta\log p(x)+C. } \]
+
+Therefore, modulo additive constants, Gibbs gives a one-to-one correspondence between suitable objectives and strictly positive probability densities.
+
+So your observation is correct in this sense:
+
+\[ \boxed{ \text{Objective functions modulo constants} \;\longleftrightarrow\; \text{Positive Gibbs densities}. } \]
+
+And this extends to uncertainty over objectives.
+
+If Bayesian optimization maintains a posterior
+
+\[ P_t(df), \]
+
+we can push it through the Gibbs map \(G_\beta:f\mapsto p_f\):
+
+\[ \boxed{ Q_t=(G_\beta)_\#P_t. } \]
+
+Now \(Q_t\) is a distribution over probability distributions:
+
+\[ Q_t\in\mathcal P(\mathcal P(E)). \]
+
+Thus, a Bayesian posterior over objective functions can indeed be represented as a distribution over Gibbs distributions, without losing information about the objective modulo additive constants.
+
+This is precisely the kind of higher-order probability object we encountered in population optimization.
+
+## 2. But the two distributions over distributions are not generally the same
+
+The distinction is what their randomness represents.
+
+For Bayesian optimization,
+
+\[ Q_t=\operatorname{Law}(G_\beta(F)\mid D_t). \]
+
+It represents uncertainty about the unknown objective, expressed as uncertainty about its Gibbs distribution.
+
+For population optimization,
+
+\[ \Pi_t^N=\operatorname{Law}(\mu_t^N). \]
+
+It represents randomness in the population generated by the algorithm.
+
+Even when the objective \(f\) is known and fixed, \(\Pi_t^N\) can remain nondegenerate.
+
+Conversely, even when the population is completely deterministic, the Bayesian posterior \(Q_t\) can remain highly uncertain.
+
+So these are generally different probability measures on the same space.
+
+The Gibbs transformation does not by itself identify them.
+
+## 3. There is nevertheless a natural way to make them coincide
+
+Suppose the objective is random:
+
+\[ F\sim P_t. \]
+
+Given \(F=f\), independently sample a population from its Gibbs distribution:
+
+\[ X_1,\ldots,X_N\mid F=f \overset{\mathrm{iid}}{\sim}G_\beta(f). \]
+
+Then define
+
+\[ \mu^N=\frac1N\sum_i\delta_{X_i}. \]
+
+We obtain a hierarchical model:
+
+\[ F\longrightarrow G_\beta(F)\longrightarrow\mu^N. \]
+
+As \(N\to\infty\),
+
+\[ \mu^N\to G_\beta(F) \]
+
+almost surely, conditional on \(F\), under standard assumptions.
+
+Consequently,
+
+\[ \boxed{ \operatorname{Law}(\mu^N) \Rightarrow (G_\beta)_\#P_t=Q_t. } \]
+
+This is an exact connection between the two representations in the infinite-population limit.
+
+For finite populations, the empirical distribution introduces additional sampling noise.
+
+However, ordinary evolutionary algorithms do not generally generate conditionally independent Gibbs samples. Their population laws need not satisfy this relationship.
+
+## 4. What this means for optimization algorithms
+
+Your interpretation suggests treating the Gibbs distribution as the common underlying state:
+
+\[ p_f(x)\propto e^{-\beta f(x)}. \]
+
+Then different algorithms can be understood as manipulating different representations of it.
+
+For example:
+
+|Algorithm|Representation|
+|---|---|
+|Bayesian optimization|Posterior over \(f\), hence posterior over \(p_f\)|
+|Gibbs sampling / MCMC|Particles approximating \(p_f\)|
+|Variational inference|Parametric approximation \(q_\theta\approx p_f\)|
+|Population optimization|Evolving empirical distribution \(\mu_t^N\), potentially toward \(p_f\)|
+|Transport / diffusion|Transformations mapping a simple distribution toward \(p_f\)|
+
+This is a useful unification, but there is a crucial distinction: not every population optimizer is actually approximating the Gibbs distribution.
+
+For example, greedy DE tends to eliminate worse candidates and may collapse its population. Its limiting distribution can differ substantially from any finite-temperature Gibbs distribution.
+
+Nevertheless, we can interpret its population as an approximation to some effective objective:
+
+\[ \boxed{ f_t^{\mathrm{eff}}(x) = -\frac1\beta\log p_t(x)+C_t. } \]
+
+This works whenever \(p_t\) has a strictly positive density.
+
+Then the population optimizer induces an evolution of effective objectives:
+
+\[ p_{t+1}=\mathcal T(p_t) \]
+
+corresponding to
+
+\[ \boxed{ f_{t+1}^{\mathrm{eff}} = G_\beta^{-1}\circ\mathcal T\circ G_\beta (f_t^{\mathrm{eff}}). } \]
+
+This is a conjugation of the distributional evolution by the Gibbs transformation.
+
+It allows us to reinterpret population dynamics as dynamics over functions.
+
+But \(f_t^{\mathrm{eff}}\) is generally not the true objective \(f\), nor a Bayesian estimate of it. It describes the current search distribution.
+
+## 5. The deeper connection: optimization as evolution of an effective energy
+
+This is where I think your idea becomes particularly useful.
+
+Instead of treating the objective \(f\) and the population distribution \(p_t\) as unrelated objects, define the effective energy
+
+\[ E_t(x)=-\frac1\beta\log p_t(x). \]
+
+Then ask how a population optimizer transforms \(E_t\).
+
+For example, consider pure Gibbs reweighting:
+
+\[ p_{t+1}(x) = \frac{p_t(x)e^{-\eta f(x)}} {\int p_t(y)e^{-\eta f(y)}dy}. \]
+
+Taking negative logarithms,
+
+\[ -\log p_{t+1}(x) = -\log p_t(x)+\eta f(x)+C_t. \]
+
+Therefore,
+
+\[ \boxed{ E_{t+1}(x) = E_t(x)+\frac{\eta}{\beta}f(x)+C_t'. } \]
+
+So multiplicative selection in probability space becomes additive accumulation of objective information in energy space.
+
+If initially \(p_0\) is uniform on a bounded domain, then after \(t\) such updates,
+
+\[ p_t(x)\propto e^{-t\eta f(x)}. \]
+
+This is exactly a Gibbs distribution with increasing inverse temperature.
+
+Other population operators give different energy transformations.
+
+For example, convolution mutation gives
+
+\[ E_{t+1}(x) = -\frac1\beta \log\left[ p_t*k_t \right](x)+C, \]
+
+which is a log-convolution or soft-min operation.
+
+That connects directly to the Moreau/Hamilton–Jacobi smoothing you have been investigating.
+
+Thus, population mutation and selection can be viewed as alternating smoothing and sharpening operations on an effective energy landscape.
+
+## 6. Where your proposed equivalence is strongest
+
+The strongest common representation is not simply a distribution over distributions, but a probability measure over energy landscapes modulo additive constants.
+
+Through Gibbs, this is equivalent to a measure over strictly positive probability densities.
+
+Bayesian optimization evolves such a measure by conditioning on observed objective values.
+
+Population-based optimization evolves a random empirical measure through stochastic search operators.
+
+When population particles are explicitly interpreted as samples from uncertain Gibbs distributions, these representations can be connected through a hierarchical sampling model.
+
+But without that assumption, their laws are different.
+
+There is also a subtle issue with normalization: Gibbs removes additive constants from \(f\). If Bayesian observations contain absolute objective values, those constants matter to the likelihood. To preserve the full Bayesian posterior, we must either retain the additive constant or explicitly work with objectives modulo constants.
+
+The useful unification is therefore an algebra of transformations on energy landscapes and probability measures, rather than an unconditional identification of Bayesian posteriors with population laws.
+
+This gives a concrete way to compare algorithms: translate each population operation into its induced transformation of the effective energy, then compare that transformation with Bayesian updating, Gibbs reweighting, and Moreau smoothing.
+
+# moreau envelope generalization
+
+We generalized the Moreau envelope by replacing its quadratic distance penalty with an arbitrary two-point cost:
+
+\[ \boxed{ M_cf(x)=\inf_{y\in\mathcal X} \left[f(y)+c(x,y)\right]. } \]
+
+The main idea was to find conditions on \(c(x,y)\) that preserve the global optimum while making the transformed objective easier to optimize, ideally convex or at least pseudoconvex.
+
+We identified several levels of conditions.
+
+## 1. Preserve the global minimum value
+
+We required
+
+\[ \boxed{c(x,y)\ge0,\qquad c(x,x)=0.} \]
+
+These guarantee
+
+\[ \min_x M_cf(x)=\min_y f(y), \]
+
+assuming the minima exist.
+
+The reasoning is straightforward:
+
+- Nonnegative cost prevents the envelope from going below \(f^*\).
+    
+- Zero diagonal cost lets us recover \(f^*\) at any global minimizer.
+    
+
+## 2. Preserve exactly the global minimizers
+
+We strengthened the condition to
+
+\[ \boxed{c(x,y)=0\iff x=y.} \]
+
+Then, assuming the relevant infima are attained,
+
+\[ \boxed{\arg\min M_cf=\arg\min f.} \]
+
+This was important because a cost that vanishes at distinct points can introduce additional global minimizers.
+
+Strict positivity away from the diagonal is sufficient, although not necessary for a particular objective.
+
+## 3. Make the transformed objective convex
+
+We considered
+
+\[ M_cf(x)=\inf_y F(x,y), \qquad F(x,y)=f(y)+c(x,y). \]
+
+A sufficient condition is that \(F(x,y)\) be jointly convex in \((x,y)\), because partial minimization preserves convexity.
+
+However, this is generally too restrictive when \(f\) is nonconvex.
+
+We also established a fundamental limitation: if \(f\) has multiple separated global minimizers, exact preservation of its minimizer set is incompatible with convexity of \(M_cf\).
+
+This motivated looking for weaker properties, such as pseudoconvexity.
+
+## 4. Make every point move toward the global minimizer
+
+For a unique minimizer \(x^*\), we considered the envelope gradient.
+
+If
+
+\[ y_x\in\arg\min_y[f(y)+c(x,y)] \]
+
+is unique and sufficient differentiability conditions hold, Danskin's theorem gives
+
+\[ \nabla M_cf(x)=\nabla_xc(x,y_x). \]
+
+We derived a sufficient directional condition:
+
+\[ \boxed{ \left\langle \nabla_xc(x,y_x),x-x^* \right\rangle>0 \quad\forall x\ne x^*. } \]
+
+This guarantees that the negative gradient points inward relative to \(x^*\), so gradient flow decreases the squared distance to the optimum.
+
+It is stronger than merely requiring pseudoconvexity, but gives a useful geometric guarantee.
+
+For the soft envelope,
+
+\[ M_{c,\beta}f(x) =-\frac1\beta\log \int e^{-\beta[f(y)+c(x,y)]}\,dy, \]
+
+the corresponding condition becomes
+
+\[ \boxed{ \left\langle \mathbb E_{Y\mid x}[\nabla_xc(x,Y)], x-x^* \right\rangle>0. } \]
+
+This connects directly to our Gibbs-sampling discussion.
+
+## 5. Relate the cost to growth of the objective
+
+In our more recent discussion, we examined when the ordinary quadratic Moreau cost can completely eliminate nonglobal minima.
+
+We found that an upper Lipschitz bound alone is insufficient. What matters is a lower growth bound around the global minimizer:
+
+\[ f(y)-f^*\ge\omega(\|y-x^*\|). \]
+
+For a domain contained in a ball of radius \(R\) around \(x^*\), we obtained the sufficient quadratic-cost condition
+
+\[ \lambda\ge \sup_{0<r\le R} \frac{(2Rr-r^2)_+}{2\omega(r)}. \]
+
+Under this condition,
+
+\[ M_\lambda f(x) =f^*+\frac{\|x-x^*\|^2}{2\lambda}. \]
+
+Thus the envelope becomes exactly quadratic, not merely convex.
+
+For linear growth \(\omega(r)=\mu r\), the simpler sufficient bound is
+
+\[ \lambda\ge\frac R\mu. \]
+
+## 6. Higher-order costs
+
+We also considered extending the quadratic penalty with higher-order terms:
+
+\[ c_t(x,y)= \frac{\|x-y\|^2}{2t} +\sum_{j=3}^{k}t^{-\alpha_j}C_j(x,y). \]
+
+The motivation was to cancel higher-order terms in local expansions, potentially producing an envelope closer to a quadratic around the optimum.
+
+But these corrections must preserve the nonnegativity and zero-set conditions if we want exact preservation of global minimizers.
+
+## Where this leaves us with pseudoconvexity
+
+We can now state a less restrictive target than convexification:
+
+\[ \boxed{ \begin{aligned} &c(x,y)\ge0,\\ &c(x,y)=0\iff x=y,\\ &M_cf\text{ is pseudoconvex}. \end{aligned} } \]
+
+For differentiable \(M_cf\), the last condition can be expressed directly in terms of the cost:
+
+\[ \boxed{ \langle\nabla_xc(x,y_x),z-x\rangle\ge0 \implies M_cf(z)\ge M_cf(x). } \]
+
+This is a condition on the resulting envelope, not a simple pointwise condition on \(c\) alone.
+
+The remaining research question is whether we can derive tractable sufficient conditions directly on \(c(x,y)\) that guarantee pseudoconvexity without requiring joint convexity of \(f(y)+c(x,y)\).
+
+That would be especially valuable because it could retain the global optimization guarantees we want while allowing much more flexible two-point costs than the quadratic Moreau penalty.
+
+We can formulate this as a minimum-cost convexification or pseudoconvexification problem: find the smallest two-point cost \(c(x,y)\) that makes the soft envelope satisfy the desired gradient condition.
+
+Recall the soft envelope:
+
+\[ F_{c,\beta}(x) =-\frac1\beta\log\int_{\mathcal X} e^{-\beta[f(y)+c(x,y)]}\,dy. \]
+
+Its gradient is
+
+\[ \nabla F_{c,\beta}(x) =\mathbb E_{Y\sim q_c(\cdot\mid x)} [\nabla_xc(x,Y)], \]
+
+where
+
+\[ q_c(y\mid x)= \frac{e^{-\beta[f(y)+c(x,y)]}} {\int e^{-\beta[f(z)+c(x,z)]}\,dz}. \]
+
+For a known unique global minimizer \(x^*\), our earlier directional condition was
+
+\[ \boxed{ \left\langle \mathbb E_{q_c}[\nabla_xc(x,Y)], x-x^* \right\rangle>0 \quad (x\ne x^*). } \]
+
+We want the smallest cost satisfying this condition.
+
+There is an important distinction: minimizing the magnitude of \(c\) is not necessarily equivalent to minimizing how much the envelope changes \(f\).
+
+## 1. The minimum-magnitude formulation
+
+A natural optimization problem is
+
+\[ \boxed{ \begin{aligned} \min_{c}\quad &\|c\|\\ \text{s.t.}\quad &c(x,y)\ge0,\\ &c(x,x)=0,\\ &\langle\nabla F_{c,\beta}(x),x-x^*\rangle>0 \quad(x\ne x^*). \end{aligned} } \]
+
+Here \(\|c\|\) could be a supremum norm, an integral norm, or an expected cost.
+
+However, this problem generally has no nonzero minimum.
+
+Consider the quadratic cost
+
+\[ c_\varepsilon(x,y)=\frac{\varepsilon}{2}\|x-y\|^2. \]
+
+For arbitrarily small \(\varepsilon>0\), the cost approaches zero. On a compact domain, its soft envelope approaches a constant, but its gradient can still point toward the optimum.
+
+For example, with \(f(y)=y^2/2\) on \(\mathbb R\), direct integration gives
+
+\[ F_{c_\varepsilon,\beta}(x) =\text{constant}+ \frac{\varepsilon}{2(1+\varepsilon)}x^2. \]
+
+Therefore,
+
+\[ xF'_{c_\varepsilon,\beta}(x) =\frac{\varepsilon}{1+\varepsilon}x^2>0 \]
+
+for every \(x\ne0\), regardless of how small \(\varepsilon\) is.
+
+So the infimum cost is zero, but the limiting envelope is constant and no longer satisfies the strict condition.
+
+We need a quantitative condition, not just a positive gradient direction.
+
+## 2. Require a minimum strength of convergence
+
+One possibility is
+
+\[ \boxed{ \langle\nabla F_{c,\beta}(x),x-x^*\rangle \ge\mu\|x-x^*\|^2 } \]
+
+for some prescribed \(\mu>0\).
+
+This ensures that gradient flow converges toward \(x^*\) at least exponentially in distance:
+
+\[ \|x_t-x^*\|\le e^{-\mu t}\|x_0-x^*\|. \]
+
+Now minimizing the cost is meaningful because arbitrarily weak costs cannot satisfy a fixed positive \(\mu\).
+
+For the Gaussian example above, the condition requires
+
+\[ \frac{\varepsilon}{1+\varepsilon}\ge\mu, \]
+
+so, for \(0<\mu<1\),
+
+\[ \boxed{\varepsilon_{\min}=\frac{\mu}{1-\mu}.} \]
+
+This gives an exact minimum within the quadratic-cost family.
+
+## 3. But minimizing distortion of \(f\) is more interesting
+
+Suppose we want the envelope to remain as close as possible to the original objective.
+
+Instead of minimizing \(\|c\|\), we could solve
+
+\[ \boxed{ \begin{aligned} \min_c\quad& \|F_{c,\beta}-f\|_{L^2(\rho)}^2\\ \text{s.t.}\quad& \langle\nabla F_{c,\beta}(x),x-x^*\rangle \ge\mu\|x-x^*\|^2. \end{aligned} } \]
+
+Here \(\rho\) is a reference distribution over the domain.
+
+We might also allow an additive constant, since constants do not affect optimization:
+
+\[ \min_{c,a}\|F_{c,\beta}-f-a\|_{L^2(\rho)}^2. \]
+
+This is closer to your original goal: remove only the parts of \(f\) that prevent global convergence, preserving everything else.
+
+There is an important complication: the soft envelope does not generally preserve minimizers merely because \(c\ge0\) and \(c(x,x)=0\). Those conditions work for the hard infimum, but integration introduces entropy effects. We therefore need to impose mode preservation separately, or ensure it through additional assumptions.
+
+## 4. The ideal transformed function can be characterized directly
+
+We can first optimize over the transformed function \(F\), without restricting it to a particular two-point cost.
+
+For example, define
+
+\[ \boxed{ \begin{aligned} F^*=\arg\min_F\quad& \frac12\|F-f\|_{L^2(\rho)}^2\\ \text{s.t.}\quad& \langle\nabla F(x),x-x^*\rangle \ge\mu\|x-x^*\|^2. \end{aligned} } \]
+
+This has a useful property: the optimization problem is convex in \(F\).
+
+The objective is quadratic, and the gradient inequality is a linear constraint on \(F\).
+
+In a suitable Sobolev function space, with appropriate boundary and regularity assumptions, this becomes a projection problem onto a convex set of functions.
+
+It tells us the minimum distortion required to obtain the desired directional geometry.
+
+We could then investigate which two-point costs realize or approximate that projection.
+
+## 5. What about pseudoconvexity instead?
+
+For pseudoconvexity, we can use the weaker condition
+
+\[ \nabla F(x)^\top(y-x)\ge0 \implies F(y)\ge F(x). \]
+
+But unlike the fixed directional condition, this constraint is generally nonconvex in \(F\).
+
+A practical alternative is to require only that no nonglobal stationary points exist, supplemented by a quantitative gradient condition to prevent arbitrarily slow convergence.
+
+That leads to three different optimization targets:
+
+|Target|What it minimizes|Main difficulty|
+|---|---|---|
+|Minimum \(\\|c\\|\)|Size of the two-point penalty|Degenerate zero-cost limit|
+|Minimum \(\\|F-f\\|\)|Distortion of the original objective|Realizing \(F\) as a soft envelope|
+|Minimum change subject to pseudoconvexity|Modification of optimization geometry|Nonconvex feasibility condition|
+
+The second formulation is particularly promising because we can characterize the optimal transformed function independently of how we implement it.
+
+One further possibility is to minimize the change in the Gibbs distribution itself:
+
+\[ \boxed{ \min_c D_{\mathrm{KL}}\left( p_{\beta,f}\,\|\,p_{\beta,F_{c,\beta}} \right) } \]
+
+subject to the same directional condition.
+
+That would preserve the original distribution as much as possible while changing its optimization geometry.
+
+The central insight is that the smallest useful cost is determined by the strength of the convergence guarantee we demand. Without specifying that strength, the cost can often approach zero while the transformed objective becomes arbitrarily flat.
+
+Yes. The quadratic (Gaussian) cost is only one possibility. We can derive entire families of costs from the geometry we want the soft envelope to have.
+
+The most interesting alternatives are nonquadratic radial costs, anisotropic costs, Bregman divergences, and costs designed directly from the gradient condition.
+
+## 1. General framework
+
+Recall
+
+\[ F_{c,\beta}(x) =-\frac1\beta\log\int e^{-\beta[f(y)+c(x,y)]}\,dy. \]
+
+The induced conditional distribution is
+
+\[ q_c(y\mid x)\propto e^{-\beta[f(y)+c(x,y)]}. \]
+
+And the envelope gradient is
+
+\[ \boxed{ \nabla F_{c,\beta}(x) =\mathbb E_{q_c}[\nabla_xc(x,Y)]. } \]
+
+We want a cost that is nonnegative, vanishes on the diagonal, and makes this gradient point toward the global minimizer.
+
+## 2. Families worth considering
+
+|Cost \(c(x,y)\)|Induced kernel|Main characteristic|
+|---|---|---|
+|\(\frac{\lambda}{2}\\|x-y\\|^2\)|Gaussian|Smooth, analytically convenient|
+|\(\lambda\\|x-y\\|\)|Laplace-type|Heavier tails than Gaussian|
+|\(\frac{\lambda}{p}\\|x-y\\|^p\)|Generalized Gaussian|Adjustable tail decay|
+|\(\lambda\log(1+\\|x-y\\|^2/s^2)\)|Student-type|Polynomial tails|
+|\(\frac12(x-y)^\top A(x-y)\)|Anisotropic Gaussian|Direction-dependent smoothing|
+|\(D_\phi(y,x)\)|Bregman kernel|Non-Euclidean geometry|
+|Huber\((\\|x-y\\|)\)|Hybrid|Quadratic locally, linear in tails|
+
+How different costs change the sampling kernel
+
+Power \(p\)
+
+3.0
+
+Unnormalized kernels \(e^{-|x-y|^p/p}\), with a Gaussian reference. Larger \(p\) produces flatter centers and faster tail decay.
+
+## 3. Derive the cost from a desired gradient
+
+Rather than choosing a kernel and hoping it works, we can reverse the problem.
+
+Suppose we want
+
+\[ \nabla F_{c,\beta}(x)=g(x) \]
+
+for a prescribed vector field \(g\).
+
+Then the cost must satisfy
+
+\[ \boxed{ \frac{\int\nabla_xc(x,y)e^{-\beta[f(y)+c(x,y)]}\,dy} {\int e^{-\beta[f(y)+c(x,y)]}\,dy} =g(x). } \]
+
+This is a nonlinear integral equation for \(c\).
+
+If we choose
+
+\[ g(x)=\mu(x-x^*), \]
+
+the desired envelope is quadratic:
+
+\[ F(x)=\frac{\mu}{2}\|x-x^*\|^2+C. \]
+
+That is the strongest possible form of the directional condition, but requires knowing \(x^*\).
+
+A more practical approach is to parameterize \(c\) and minimize the violation of the gradient condition.
+
+## 4. Radial costs give a useful simplification
+
+Let
+
+\[ c(x,y)=h(\|x-y\|). \]
+
+Writing \(r=\|x-y\|\), we obtain
+
+\[ \nabla_xc(x,y) =\frac{h'(r)}{r}(x-y). \]
+
+Therefore,
+
+\[ \boxed{ \nabla F_{c,\beta}(x) =\mathbb E_{q_c} \left[ \frac{h'(R)}{R}(x-Y) \right]. } \]
+
+Define
+
+\[ w(r)=\frac{h'(r)}r. \]
+
+Then
+
+\[ \nabla F_{c,\beta}(x) =\mathbb E[w(R)(x-Y)]. \]
+
+This makes the design problem particularly clear: the radial cost determines how strongly samples at different distances influence the gradient.
+
+For a quadratic cost, \(w(r)=\lambda\), so all distances receive the same gradient coefficient.
+
+For \(h(r)=\lambda r^p/p\),
+
+\[ w(r)=\lambda r^{p-2}. \]
+
+- \(p<2\): relatively greater influence from nearby samples.
+    
+- \(p=2\): distance-independent coefficient.
+    
+- \(p>2\): relatively greater influence from distant samples.
+    
+
+These are gradient coefficients; the actual sampling probabilities also change with \(p\).
+
+## 5. An especially interesting alternative: Bregman costs
+
+Given a differentiable strictly convex function \(\phi\), define
+
+\[ D_\phi(y,x) =\phi(y)-\phi(x)-\nabla\phi(x)^\top(y-x). \]
+
+Then
+
+\[ c(x,y)=\lambda D_\phi(y,x). \]
+
+Its gradient is
+
+\[ \boxed{ \nabla_xc(x,y) =\lambda\nabla^2\phi(x)(x-y). } \]
+
+Thus
+
+\[ \nabla F_{c,\beta}(x) =\lambda\nabla^2\phi(x) \left(x-\mathbb E[Y\mid x]\right). \]
+
+The Hessian of \(\phi\) acts as a position-dependent metric.
+
+This is useful when the objective is highly anisotropic or when Euclidean distance poorly represents its geometry.
+
+For example, choosing \(\phi\) to approximate local curvature could produce a cost adapted to the shape of \(f\), rather than using isotropic Gaussian smoothing.
+
+However, the orientation of the Bregman divergence matters: \(D_\phi(x,y)\) produces a different gradient.
+
+## 6. Can we derive a minimum-distortion cost?
+
+There is another approach that connects directly to your previous question.
+
+Choose a baseline cost \(c_0\) and perturb it:
+
+\[ c_\varepsilon(x,y)=c_0(x,y)+\varepsilon h(x,y). \]
+
+Differentiating the soft envelope with respect to \(\varepsilon\) gives
+
+\[ \boxed{ \left.\frac{\partial F_{c_\varepsilon,\beta}(x)} {\partial\varepsilon}\right|_{\varepsilon=0} =\mathbb E_{q_{c_0}}[h(x,Y)]. } \]
+
+And the first-order change in its gradient is
+
+\[ \boxed{ \delta\nabla F(x) = \mathbb E[\nabla_xh(x,Y)] -\beta\operatorname{Cov} \left(\nabla_xc_0(x,Y),h(x,Y)\right). } \]
+
+This formula is especially useful.
+
+It tells us exactly how a small modification of the cost changes the optimization geometry.
+
+We could select \(h\) to maximize improvement in the directional condition per unit cost perturbation.
+
+For example, define
+
+\[ G_c(x)= \langle\nabla F_{c,\beta}(x),x-x^*\rangle. \]
+
+We could solve the local problem
+
+\[ \boxed{ \begin{aligned} \min_h\quad&\|h\|^2\\ \text{s.t.}\quad& \delta G_c(x)\ge \mu\|x-x^*\|^2-G_c(x) \end{aligned} } \]
+
+for points where the constraint is violated.
+
+Because \(\delta G_c\) is linear in \(h\), this is a convex quadratic problem for an appropriate Hilbert-space norm.
+
+It provides a principled way to learn the cost rather than select one from a fixed family.
+
+There are still constraints to enforce, such as \(h(x,x)=0\) and \(c_0+\varepsilon h\ge0\), and the first-order approximation must be checked against the full nonlinear envelope.
+
+## 7. One subtlety: soft-envelope normalization
+
+A cost \(c(x,y)\) also determines the mass of its kernel:
+
+\[ A_c(x)=\int e^{-\beta c(x,y)}\,dy. \]
+
+For translation-invariant costs on \(\mathbb R^d\), this is constant in \(x\).
+
+For position-dependent costs, it generally is not.
+
+Consequently, even with \(f\equiv0\), the unnormalized soft envelope may have a nonzero gradient.
+
+To avoid artificial drift, we can instead use the normalized kernel
+
+\[ K_c(y\mid x) =\frac{e^{-\beta c(x,y)}}{A_c(x)} \]
+
+and define
+
+\[ \widetilde F_{c,\beta}(x) =-\frac1\beta\log \mathbb E_{Y\sim K_c(\cdot\mid x)} [e^{-\beta f(Y)}]. \]
+
+This is a different envelope, but it cleanly separates smoothing of \(f\) from changes in kernel volume.
+
+My preferred direction would be to start with radial costs \(h(r)\), derive their influence function \(w(r)=h'(r)/r\), and optimize that function directly. This reduces the search over arbitrary two-point costs to a one-dimensional functional optimization problem.
+
+Then, if radial costs are insufficient, extend the same construction to anisotropic or Bregman costs.
+
+The main question is whether the cost should be designed to achieve pseudoconvexity, the stronger inward-gradient condition, or a quantitative convergence rate. These are different constraints and can lead to substantially different optimal kernels.

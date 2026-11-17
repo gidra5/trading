@@ -19,3 +19,5 @@ https://youtu.be/sQ3JCxcQ-Gs?si=gOPbap7fWX0v3bfE
 and Mixture of experts
 
 [generalizetion definition and statistical approach](https://chatgpt.com/c/6af1dd52-5f68-83ed-b8c4-842e4537ea17)
+
+[distribution shift](https://chatgpt.com/c/6afc128e-2ac8-83eb-b840-fcaace99b1de?no_universal_links=1)
