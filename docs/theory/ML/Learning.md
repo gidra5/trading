@@ -8,6 +8,11 @@ Suppose we have an objective $L$ and the ability to sample it at any point. We c
 
 One of the fundamental issues of this approach is catastrophic forgetting - as we observe new inputs, accuracy at earlier learned terms degrades. To avoid that we must regularly refresh old knowledge to preserve accuracy, while also exploring other areas where we didnt have enough data to be able to represent the domain. ideally we want to minimize expected error on future observations, while also minimizing error on already observed points.
 
+[prequential learning](https://chatgpt.com/c/6afd495e-c6d8-83eb-abf3-edb1d42c8157?no_universal_links=1)
+[hierarchical continual learning](https://chatgpt.com/c/6afd702d-50b0-83eb-8d29-3332e3bf5715?no_universal_links=1)
+
+continual learning as optimal control
+
 bayesian networks
 https://youtu.be/8UE0IdCyg6Y?si=E8zxz0RXNQGqmS9S
 

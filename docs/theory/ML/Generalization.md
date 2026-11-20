@@ -21,3 +21,6 @@ and Mixture of experts
 [generalizetion definition and statistical approach](https://chatgpt.com/c/6af1dd52-5f68-83ed-b8c4-842e4537ea17)
 
 [distribution shift](https://chatgpt.com/c/6afc128e-2ac8-83eb-b840-fcaace99b1de?no_universal_links=1)
+
+[sample complexity](https://chatgpt.com/c/6afab893-8dc0-83eb-b216-ec0136891a88?no_universal_links=1)
+

@@ -148,3 +148,11 @@ Platonic representation hypothesis
 https://youtu.be/u8cxqSPyT8s?si=L-kpF9A7-rJJiHhY
 
 [chirplets](https://chatgpt.com/c/6aef7db9-a130-83eb-99a8-bbe367ea78da)
+
+https://chatgpt.com/c/6ae28181-c82c-83ed-bccf-4fe709ebe200
+https://chatgpt.com/c/6ae338a6-cb74-83ed-856d-27cedbba9590
+https://chatgpt.com/c/6ac1480a-a6d8-83ed-b54a-a5ba7df0f712
+
+quantization
+[1.51 bit models (old microsoft thing)](https://youtu.be/VZfuShX693Q?si=TLBuGhBU2KDiuqAi)
+[0.1 bit models (samsung labs littlebit thing)](https://arxiv.org/abs/2506.13771)

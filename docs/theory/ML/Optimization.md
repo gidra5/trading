@@ -1,13 +1,34 @@
-Suppose we are optimizing a loss function $L(x)$. 
+Suppose we are optimizing a loss function $L(x): \mathbb R^n \to \mathbb R^m$.
 
 It might be constrained to solutions that must satisfy some condition $\phi(x)\le0$
 The function loss observations might be noisy, with some distribution $\epsilon \approx p_{\epsilon}(x)$ with $\mathbb E_x[\epsilon]=0$
 We might assume a certain distribution $X \approx p_X(x)$ of observations under which the loss is tested as well.
+
+For a point in global optimum set we use $x^* \in \arg\min L(x)$ and $L^*=L(x^*)$ for its value.
+
+multi objective
+https://chatgpt.com/c/6aff2f52-d41c-83eb-b9ea-3137b667f9e7?no_universal_links=1
 # Characterization
+The basic characterization is is within $\delta$-neighborhood of the optimum and the suboptimality/$\varepsilon$-optimality:
+$$ \|L(x)-L^*\|<\varepsilon \\ \|x-x^*\|<\delta$$
+But this is a bit restrictive, as this is most suitable for characterizing local optimization.
+
+For global optimization a more natural thing is a probability of a specific optimality condition being met at some step $k$:
+$$ P_\varepsilon(k) = \Pr(\|L(x_k)-L^*\|\leq\varepsilon) \\ P_\delta(k) = \Pr(\|x_k-x^*\|\leq\delta)$$
+because we cant really guarantee them over the whole space by checking everything.
+We can then characterize performance using the expected hitting time $\tau$:
+$$\tau = \mathbb E[k] $$
+
+Global optimization can be split into search and convergence. So we must have a guarantee that we eventually improve, and that every improvement is sufficiently strong to always converge to the global optimum
+## Local optimization
 Suppose we want to find a minima of the loss function. At any minima we necessarily must have these conditions be true:
 $$L'(x)=0 \quad L''(x)>0$$
 The first means we must find a saddle point, and the second one means that any further movement will only increase the loss, because it curves upward. While this is true for all global minima, not every point satisfying these conditions is a global minima. Instead, the points satisfying these conditions are not necessarily globally optimal, and we call locally optimal, as they consider only local information to decide that we cannot improve anymore further.
 
+For local optimization we can characterize how quickly do we converge to a local minima by error order $p$ and rate constant $C$:
+$$\varepsilon=O(h^p)\\ \delta_{k+1}=C\|x_{k}-x^*\|$$
+Order characterizes improvement rate relative to the step size, while rate $C$ characterizes base of the exponential convergence to the optimum.
+## Convexity
 Notably, there is a class of functions for which every local optimum must be global. Such function are called convex, and they satisfy this property:
 $$L(tx+(1-t)y)\le tL(x)+(1-t)L(y)$$
 This inequality basically says that for any two points, if we evaluate at any point inbetween, the loss will be lower than simple mix of the endpoints.
@@ -18,13 +39,9 @@ We could also say the function is $\mu$-strongly or $\rho$-weakly convex (aka se
 $$\nabla^2 L>\mu \qquad \nabla^2 L>-\rho$$
 These are basically the same as simple convexity, but more specific about how much convexity there is.
 
-Generally what we want is a kind of certificate of how close we are to the minimum, preferably in terms of the objective value. That means for every $\epsilon$ we can find $x$ such that its loss is within this distance of global optimum $x^*=\arg\min L(x)$:
-$$||L^*-L(x)||<\varepsilon$$
-with $L^*=L(x^*)$. 
-
 This characterizes how optimal the current value is, and within what bound. Note that parameter distance to the optimum can be arbitrary in general - any point in the domain can be arbitrarily close to the optimal value. If the certified bound on the loss is enough for us, then this can be treated as sufficient.
 
-We can bound upon this in a few ways. First interesting case is when $\varepsilon$ related to the gradient, as in Polyak–Łojasiewicz (PL) inequality:
+We can bound upon this in a few ways. First interesting case is when $\varepsilon$ related to the gradient, as in Polyak–Łojasiewicz inequality:
 $$ \boxed{ \frac12\|\nabla L(x)\|^2 \geq\mu||L^*-L(x)||. } $$
 where $\mu$ is some global constant. It effectively states a bound on variation of the loss through the gradient - rate of change should generally be stronger than root of the suboptimality of the solution.
 
@@ -33,46 +50,390 @@ $$||f(x_2)-f(x_1)||<L||x_1-x_2||$$
 It also bounds variation, but does so through a relation to parameter distance, rather than gradient.
 
 Another more direct condition on gradient direction is this:
-$$ \boxed{ \langle\nabla L(x),x-x^*\rangle>0 \quad\forall x\neq x^* } $$
+$$ \boxed{ \langle\nabla L(x),x-x^*\rangle\geq0 \quad\forall x\neq x^* } $$
 Which means that gradient at any point should move us towards $x^*$. It can even be extended to general iterations by replacing $\nabla L$ with $\Delta x_k$, meaning that any update must move us in the direction of optimum. That is quite flexible, as it doesnt require us to constrain the target function at all, but then actual set of globally solvable objectives heavily depends on the iteration procedure.
 
 We can even combine all of these into a composite condition, that is more flexible than any one by itself, and may even cover new possibilities for optimization.
 
 All of these are weaker than convexity.
-
+## Surrogates
 We can also study any related functions that share optimizers within some bounds. If we specifically want global optimums to match, we dont need arbitrary uniform accuracy between two functions, only that it preserves the global minima specifically:
 $$ |\min g-\min f|<\varepsilon \\ |\arg\min g-\arg\min f|<\delta$$
-
 Then if finding optimum of $g$ is simpler in any sense, we can instead solve for its global optimum. Moreover, even if we restrict $g$ to be convex, $f$ still can be arbitrarily nonconvex.
 
+## Constrained
 When optimizing with constraints, we can make generally two choices:
 1. Project any moves onto a subset that preserves the constraints.
 2. Use Lagrange multipliers to modify the loss and optimize a tradeoff between constraint satisfaction and target loss optimization softly.
 
+## Noisy
 When optimizing with noise, we can only optimize up to noise strength, as at some point we cannot distinguish truly suboptimal local point from a noisy observation of the optimal local point.
 
+## RL
+Generally global optimization is more suitably characterized by RL formulation - we can describe objective improvement as reward, and then choose action (point eval) that would yield the best improvement. Note that even if the algorithm chose best point just with a few iterations, it still needs to prove optimality bounds on it. So the best action boils down to the one that would narrow it down the most.
 
+## Basin graph
+Yes. In fact, representing optimization as movement between basins gives us a much richer characterization of global optimization performance than convergence rates alone.
 
-If the loss has bounded variation, in a sense that its a L-lipschitz function with:
-$$||f(x_2)-f(x_1)||<L||x_1-x_2||$$
-then we can have globally optimizable method with accuracy guarantees.
+We can separate optimization into two processes:
 
-Optimization performance can be characterized along several independent dimensions. The most important distinction is between local convergence, which describes behavior near a solution, and global performance, which describes the ability to find a good solution from arbitrary initial conditions.
+1. Intra-basin optimization: convergence toward a local minimum.
+    
+2. Inter-basin optimization: exploration and transitions between basins.
+    
 
-There is also an important distinction between convergence guarantees, convergence rates, and computational efficiency.
+The second process can be modeled as a graph search, Markov chain, or optimal-control problem. This connects directly to energy landscapes, metastability, transition path theory, and basin-hopping optimization.
 
+### 1. Constructing the basin graph
+
+Let \(f:\mathcal X\to\mathbb R\), and let \(L(x)\) be a deterministic local optimizer that maps an initial point to its limiting local minimum.
+
+Define an equivalence relation:
+
+\[ x\sim y \iff L(x)=L(y). \]
+
+Each equivalence class is a basin:
+
+\[ \boxed{B_i=\{x:L(x)=m_i\}} \]
+
+where \(m_i\) is a local minimum.
+
+We can then construct a graph
+
+\[ G=(V,E) \]
+
+with one vertex for each basin.
+
+Illustrative basin-transition graph
+
+There are several possible definitions of an edge:
+
+- Geometric adjacency: two basins share a boundary.
+    
+- Transition accessibility: a particular perturbation mechanism can move from one basin to another.
+    
+- Energy barrier: two minima are connected through a saddle or minimum-energy path.
+    
+- Probabilistic transition: the optimizer has nonzero probability of moving between the basins.
+    
+
+These definitions produce different graphs. For evaluating an actual algorithm, transition probabilities are often the most informative.
+
+### 2. Performance as a Markov chain over basins
+
+Suppose we run a local optimizer, perturb the resulting point, and optimize again.
+
+This is the basic structure of basin hopping.
+
+Let
+
+\[ P_{ij}=\Pr(\text{next basin}=B_j\mid\text{current basin}=B_i). \]
+
+If the transition mechanism depends only on the current basin, we obtain a Markov chain:
+
+\[ \boxed{p_{k+1}=p_kP} \]
+
+where \(p_k\) is the distribution over basins after \(k\) transitions.
+
+Example transition matrix
+
+\[ P= \begin{pmatrix} 0.7&0.2&0.1\\ 0.3&0.5&0.2\\ 0.1&0.2&0.7 \end{pmatrix}. \]
+
+Transition simulation
+
+Start in B₁
+
+Number of transitions
+
+3
+
+B1
+
+48.8%
+
+B2
+
+27.8%
+
+B3
+
+23.4%
+
+Illustrative three-basin process. B₃ is designated as the global-optimum basin.
+
+This immediately gives us new optimization performance metrics.
+
+### 3. Hitting time of the global optimum
+
+Let \(B_*\) denote the basin containing the global minimum.
+
+Define
+
+\[ \tau_*=\inf\{k:X_k=B_*\}. \]
+
+The expected hitting time
+
+\[ \boxed{H_i=\mathbb E[\tau_*\mid X_0=B_i]} \]
+
+characterizes how difficult it is to reach the global optimum from each basin.
+
+For a Markov chain,
+
+\[ H_*=0, \]
+
+and for every other basin,
+
+\[ \boxed{ H_i=1+\sum_jP_{ij}H_j. } \]
+
+This is a linear system.
+
+If \(Q\) is the transition submatrix over non-target basins, then
+
+\[ H=(I-Q)^{-1}\mathbf 1 \]
+
+when the expected hitting times are finite.
+
+This is a powerful characterization because it incorporates the entire graph structure rather than just local convergence rates.
+
+We can also calculate the probability of finding the global basin within \(k\) transitions:
+
+\[ \boxed{ \Pr(\tau_*\leq k) = 1-p_0^{\neg *}Q^k\mathbf 1. } \]
+
+This is the basin-level equivalent of the success probability discussed earlier.
+
+### 4. Barrier heights and transition difficulty
+
+For a continuous objective, basin transitions may require crossing regions of higher objective value.
+
+Define the communication height
+
+\[ \Phi(i,j)= \inf_{\gamma:m_i\to m_j} \max_{t\in[0,1]}f(\gamma(t)). \]
+
+The barrier for escaping basin \(i\) toward basin \(j\) is
+
+\[ \boxed{ \Delta_{ij}=\Phi(i,j)-f(m_i). } \]
+
+For small-noise gradient dynamics under suitable assumptions, transition rates often have Arrhenius-type behavior:
+
+\[ k_{ij}\asymp A_{ij}e^{-\Delta_{ij}/T}. \]
+
+Here \(T\) controls noise intensity.
+
+This reveals something important: the objective difference between minima does not determine transition difficulty.
+
+Two minima may have similar objective values but be separated by a large barrier. Conversely, a substantially better minimum might be accessible through a small barrier.
+
+The graph should therefore carry more information than just the value of each minimum.
+
+### 5. Global optimization as graph search
+
+Once the basin graph is defined, optimization resembles a search problem with unknown structure.
+
+A transition has a cost \(c_{ij}\), potentially including:
+
+- Perturbation and proposal generation.
+    
+- Objective evaluations needed to cross between basins.
+    
+- Local optimization after entering a new basin.
+    
+- Probability of a failed transition.
+    
+
+If the graph and costs were known, we could formulate an optimal-control problem.
+
+Let \(a\) denote an action, such as a perturbation scale, search direction, or temperature.
+
+Then
+
+\[ P_{ij}(a) \]
+
+describes how that action changes the transition probabilities.
+
+The optimal expected cost to reach the global basin satisfies a Bellman equation:
+
+\[ \boxed{ V(i)= \min_a \left[ c(i,a)+\sum_jP_{ij}(a)V(j) \right] } \]
+
+with \(V(*)=0\).
+
+This suggests an interesting distinction:
+
+An optimizer should not necessarily maximize its probability of improving the objective on the next transition. It should minimize the expected cost of reaching a sufficiently good basin.
+
+Sometimes that requires moving temporarily into a worse basin because it provides better access to other regions.
+
+### 6. Graph-theoretic performance characteristics
+
+We can now characterize an optimization landscape using graph properties.
+
+|Characteristic|Optimization interpretation|
+|---|---|
+|Basin volume|Probability of entering a basin under random initialization|
+|Node degree|Number of accessible neighboring basins|
+|Edge transition probability|Ease of moving between basins|
+|Barrier height|Difficulty of crossing between minima|
+|Hitting time|Expected effort to reach a target basin|
+|Conductance|Ease of escaping a group of basins|
+|Spectral gap|Rate of mixing across the landscape|
+|Bottlenecks|Regions that trap the optimizer|
+|Effective resistance|A measure related to commute times for reversible random walks|
+|Graph diameter|Maximum shortest-path distance between basins|
+|Connectivity|Whether every basin can eventually be reached|
+
+Two especially useful characteristics deserve attention.
+
+#### Conductance
+
+For a reversible Markov chain with stationary distribution \(\pi\), define
+
+\[ \Phi(S)= \frac{\sum_{i\in S,j\notin S}\pi_iP_{ij}} {\pi(S)} \]
+
+for a subset \(S\) of basins.
+
+Low conductance indicates that the optimizer is likely to remain trapped in \(S\) for a long time.
+
+This is a more general notion of trapping than considering individual local minima.
+
+An entire collection of basins can form a metastable region.
+
+#### Spectral gap
+
+For an irreducible reversible Markov chain, the spectral gap
+
+\[ \gamma=1-\lambda_2(P) \]
+
+characterizes mixing speed, where \(\lambda_2\) is the second-largest eigenvalue.
+
+A small spectral gap often indicates slow exploration due to bottlenecks.
+
+However, mixing rapidly is not necessarily equivalent to finding the global optimum rapidly. An algorithm might mix efficiently while spending very little time in the global basin.
+
+Therefore, target hitting times and mixing times should be characterized separately.
+
+### 7. Basins at multiple scales
+
+There is another extension that I think is particularly relevant: a basin graph need not have a fixed resolution.
+
+At a fine scale, each local minimum is a separate node.
+
+At a coarser scale, several nearby minima can be grouped into a larger metastable region.
+
+Conceptual hierarchy: fine basins can be grouped into larger regions with slower transitions between them.
+
+This connects to:
+
+- Disconnectivity graphs and energy-landscape analysis.
+    
+- Morse theory and merge trees.
+    
+- Markov state models and metastability.
+    
+- Hierarchical basin hopping.
+    
+- Multiscale optimization and coarse-graining.
+    
+
+A hierarchy lets us distinguish fast transitions within a cluster of basins from slow transitions between clusters.
+
+One can also define a scale-dependent basin graph \(G_\lambda\), where the scale controls smoothing, perturbation size, or the transition-time resolution.
+
+This may be more informative than a single graph because the effective optimization landscape changes with the algorithm's exploration scale.
+
+### 8. Constraints can be incorporated into the graph
+
+For constrained optimization, the graph can represent feasible basins or regions.
+
+Let
+
+\[ \mathcal C=\{x:g_i(x)\leq0\}. \]
+
+There are two fundamentally different transition models.
+
+Feasibility-preserving transitions: every intermediate state must remain in \(\mathcal C\). The graph may become disconnected even if the unconstrained basin graph is connected.
+
+Endpoint-feasible transitions: intermediate states may violate constraints, but the accepted destination must be feasible.
+
+The latter can introduce edges that are impossible under feasibility-preserving movement.
+
+We can assign an edge a feasibility cost:
+
+\[ c_{ij}^{\mathrm{viol}} = \inf_{\gamma:i\to j} \int_0^1 V(\gamma(t))\,dt. \]
+
+Or characterize the smallest unavoidable maximum violation:
+
+\[ \boxed{ b_{ij}^{\mathrm{viol}} = \inf_{\gamma:i\to j} \max_t V(\gamma(t)). } \]
+
+This is analogous to an energy barrier, but for constraint violation.
+
+It provides a direct way to characterize the difficulty of transitioning between feasible regions when temporary infeasibility is permitted.
+
+For algorithms that can jump directly between endpoints without evaluating the intervening path, geometric path barriers may not represent the actual transition cost. In that case, proposal probabilities and endpoint feasibility are more relevant.
+
+### 9. An important limitation: basins are not always Markov states
+
+The basin index alone may not contain enough information to predict the next transition.
+
+For example, if the perturbation is applied to the current point before local optimization, different points inside the same basin can have very different probabilities of escaping.
+
+Thus
+
+\[ \Pr(B_{k+1}\mid B_k) \]
+
+may depend on the optimizer's history or its precise location within \(B_k\).
+
+A basin-level Markov model is exact only when the transition distribution depends solely on the current basin, or under a suitable state-resetting or lumpability condition.
+
+Otherwise, we can:
+
+- Include additional state variables such as position, momentum, temperature, or step size.
+    
+- Use semi-Markov models that account for transition durations.
+    
+- Refine the partition until the dynamics are approximately Markovian.
+    
+- Estimate effective transitions after local equilibration inside each basin.
+    
+
+This is especially important for noisy optimizers, where trajectories may spend significant time exploring a basin before escaping.
+
+### 10. A unified performance measure
+
+We can combine local convergence, graph transitions, and computational cost.
+
+Let \(B_k\) denote the basin occupied after \(k\) transitions, and \(x_k\) the current point.
+
+Then define
+
+\[ \boxed{ R(B)= \mathbb E\left[ f(x_B)-f^* \right] } \]
+
+where \(B\) is total computational budget, including local optimization and basin transitions.
+
+We can decompose the objective gap:
+
+\[ \begin{aligned} f(x_B)-f^* ={}& \underbrace{f(x_B)-f(m_{B_B})}_{\text{within-basin error}}\\ &+ \underbrace{f(m_{B_B})-f^*}_{\text{basin-selection error}}. \end{aligned} \]
+
+Here \(m_{B_B}\) is the local minimum associated with the basin containing the final point. This decomposition assumes the basin map is well defined and that the local minimum is no worse than the current point.
+
+The first term characterizes local optimization quality.
+
+The second characterizes global exploration quality.
+
+This is a particularly useful separation because improvements to the local optimizer primarily reduce the first term, while better exploration policies primarily reduce the second.
+
+The most interesting implication is that global optimization can be characterized as a stochastic shortest-path problem over a graph that is generally unknown and must itself be learned. The algorithm is simultaneously discovering the basin structure, estimating transition probabilities, and choosing where to search next.
+
+That suggests evaluating global optimizers not only by objective regret, but also by how efficiently they learn and exploit the transition structure of the landscape.
 ### 1. Main performance characteristics
 
-|Characteristic|What it measures|Typical quantities|
-|---|---|---|
-|Local convergence|Speed near a solution|Order \(p\), rate constant \(C\)|
-|Global convergence|Behavior from arbitrary initialization|Basin of attraction, success probability|
-|Solution quality|How close the result is to optimal|Objective gap, distance, stationarity|
-|Complexity|Work required to achieve accuracy|Iterations, evaluations, FLOPs|
-|Robustness|Sensitivity to perturbations|Stability region, noise amplification|
-|Scalability|Dependence on problem dimension|Complexity in \(n\), conditioning|
-|Exploration|Ability to escape local minima|Hitting time, barrier crossing|
-|Asymptotic accuracy|Best attainable precision|Error floor, convergence bias|
+| Characteristic      | What it measures                       | Typical quantities                       |
+| ------------------- | -------------------------------------- | ---------------------------------------- |
+| Local convergence   | Speed near a solution                  | Order \(p\), rate constant \(C\)         |
+| Global convergence  | Behavior from arbitrary initialization | Basin of attraction, success probability |
+| Solution quality    | How close the result is to optimal     | Objective gap, distance, stationarity    |
+| Robustness          | Sensitivity to perturbations           | Stability region, noise amplification    |
+| Scalability         | Dependence on problem dimension        | Complexity in \(n\), conditioning        |
+| Exploration         | Ability to escape local minima         | Hitting time, barrier crossing           |
+| Asymptotic accuracy | Best attainable precision              | Error floor, convergence bias            |
 
 These characteristics are not interchangeable. For example, Newton's method has excellent local convergence but can fail globally, while gradient descent often has slower local convergence but stronger guarantees from arbitrary starting points under convexity assumptions.
 
@@ -159,11 +520,11 @@ The radius \(r\) is another important performance characteristic.
 
 For differentiable iteration maps, linearization gives
 
-\[ e_{k+1}^{\mathrm{vec}}\approx DT(x^*)e_k^{\mathrm{vec}}. \]
+$$ e_{k+1}^{\mathrm{vec}}\approx DT(x^*)e_k^{\mathrm{vec}}. $$
 
 If
 
-\[ \rho(DT(x^*))<1, \]
+$$ \rho(DT(x^*))<1, $$
 
 the fixed point is locally asymptotically stable.
 
@@ -173,67 +534,25 @@ For Newton's method at a regular root, \(DT(x^*)=0\), explaining why its converg
 
 ### 3. Global convergence
 
-Here the terminology is slightly misleading.
-
-In numerical optimization, global convergence often means convergence to a stationary point from arbitrary initialization, not necessarily convergence to a global minimum.
-
-We should distinguish three properties.
-
-#### 3.1 Global stationarity
-
-A typical guarantee is
-
-\[ \lim_{k\to\infty}\|\nabla f(x_k)\|=0. \]
-
-This does not distinguish local minima, saddle points, or global minima.
-
-For smooth nonconvex optimization, gradient descent can achieve
-
-\[ \min_{0\leq k<K}\|\nabla f(x_k)\|^2 \leq \frac{2L(f(x_0)-f_{\inf})}{K} \]
-
-using step size \(1/L\), assuming a finite lower bound \(f_{\inf}\).
-
-Thus obtaining \(\|\nabla f\|\leq\epsilon\) takes \(O(\epsilon^{-2})\) iterations in this guarantee.
-
 #### 3.2 Global optimality
 
 For minimization, define the objective gap
 
-\[ \boxed{\Delta_k=f(x_k)-f^*} \]
+$$ \boxed{\Delta_k=f(x_k)-f^*} $$
 
-where \(f^*=\inf_x f(x)\).
-
-Global optimization performance can be characterized by how quickly \(\Delta_k\) approaches zero.
+Global optimization performance can be characterized by how quickly $\Delta_k$ approaches zero.
 
 Examples:
 
-|Function class / method|Typical objective-gap guarantee|
-|---|---|
-|Convex, gradient descent|\(O(1/k)\)|
-|Convex, accelerated gradient|\(O(1/k^2)\)|
-|Strongly convex, gradient descent|\(O(q^k)\)|
-|Strongly convex, accelerated|\(O((1-1/\sqrt{\kappa})^k)\)|
-|General nonconvex|No universal global-optimum rate without additional assumptions|
+| Function class / method           | Typical objective-gap guarantee                                 |
+| --------------------------------- | --------------------------------------------------------------- |
+| Convex, gradient descent          | $O(1/k)$                                                        |
+| Convex, accelerated gradient      | $O(1/k^2)$                                                      |
+| Strongly convex, gradient descent | $O(q^k)$                                                        |
+| Strongly convex, accelerated      | $O((1-1/\sqrt{\kappa})^k)$                                      |
+| General nonconvex                 | No universal global-optimum rate without additional assumptions |
 
 The first four are worst-case upper bounds under standard smoothness assumptions.
-
-#### 3.3 Probability of finding the global optimum
-
-For randomized algorithms, a natural characterization is
-
-\[ P_\epsilon(k) = \Pr(f(x_k)-f^*\leq\epsilon). \]
-
-This measures the probability that the algorithm has produced an \(\epsilon\)-optimal solution after \(k\) iterations.
-
-For algorithms that remember their best point, it is more natural to define
-
-\[ P_\epsilon(k) = \Pr\left(\min_{0\leq j\leq k}f(x_j)-f^*\leq\epsilon\right). \]
-
-We can then characterize performance using the expected hitting time
-
-\[ \tau_\epsilon = \inf\{k:\Delta_k\leq\epsilon\}, \qquad \mathbb E[\tau_\epsilon]. \]
-
-This is especially relevant to simulated annealing, evolutionary algorithms, multistart methods, and other stochastic global optimizers.
 
 ### 4. Computational complexity
 
@@ -268,19 +587,19 @@ An optimizer may converge rapidly on exact functions but perform poorly under no
 
 Suppose
 
-\[ \widehat{\nabla f}(x)=\nabla f(x)+\xi. \]
+$$ \widehat{\nabla f}(x)=\nabla f(x)+\xi. $$
 
 We can characterize performance by the sensitivity of the result to \(\xi\).
 
 Relevant quantities include the stationary error floor
 
-\[ \limsup_{k\to\infty}\mathbb E\|x_k-x^*\|^2, \]
+$$ \limsup_{k\to\infty}\mathbb E\|x_k-x^*\|^2, $$
 
 the variance of the iterates, and the probability of divergence.
 
 For stochastic optimization, one often obtains bounds resembling
 
-\[ \mathbb E[\Delta_k] \leq A e^{-ck}+B\sigma^2, \]
+$$ \mathbb E[\Delta_k] \leq A e^{-ck}+B\sigma^2, $$
 
 where \(\sigma^2\) characterizes gradient noise and \(B\sigma^2\) is a noise-dependent error floor. The precise form depends on the method, step-size schedule, and assumptions.
 
@@ -349,7 +668,7 @@ There is no single scalar metric that captures all aspects of optimization perfo
 
 A reasonably complete characterization for an optimizer \(A\) over a function class \(\mathcal F\) would be its anytime performance distribution:
 
-\[ \boxed{ \Pr\left( \min_{j:\,\mathrm{cost}(j)\leq B} f(x_j)-f^* \leq\epsilon \;\middle|\; f,p_0,A \right). } \]
+$$ \boxed{ \Pr\left( \min_{j:\,\mathrm{cost}(j)\leq B} f(x_j)-f^* \leq\epsilon \;\middle|\; f,p_0,A \right). } $$
 
 Here:
 
@@ -1380,6 +1699,20 @@ basin detection - take f and test point x, run de solution until found the minim
 
 annealing and tempering
 https://chatgpt.com/c/6af4c9ed-5048-83ed-a172-25a4957e9031
+https://www.semanticscholar.org/paper/Collective-Annealing-by-Switching-Temperatures%3A-a-Blondeel-Pareschi/6b3b7512d74d964b4988fcc39c4321ad92d3afa2
+
+tunneling
+https://www.semanticscholar.org/paper/The-Tunneling-Algorithm-for-the-Global-Minimization-Levy-Montalvo/3da72047ef0687e917cdad2a7c9971126c1a82e8
+
+[Global optimization in Hilbert space](https://link.springer.com/article/10.1007/s10107-017-1215-7?fromPaywallRec=true)
+[A novel parameter-free differentiable filled function for global optimization](https://link.springer.com/article/10.1038/s41598-026-46030-x?fromPaywallRec=true)
+paywalled https://www.semanticscholar.org/paper/Novel-Global-Optimization-Algorithm-with-a-Curve-Wang-Yang/3a76d7e262b097c9cccc8fb7fd1c9546cc210de6
+paywalled https://www.semanticscholar.org/paper/The-parallel-tunneling-method-G%C3%B3mez-Castillo/6fb8a9c7fad15cb20d1203e1ee40d50fb76308c8
+paywalled https://www.semanticscholar.org/paper/A-Transformation-Function-for-Finding-Better-Minima-Wang-Shang/61626dc05ce49807421b74c2dd4268b12016b4ad
+paywalled https://www.semanticscholar.org/paper/New-Classes-of-Globally-Convexized-Filled-Functions-Lucidi-Piccialli/15600389d1f7ef02d22da7c6dbb003322c297acf
+paywalled https://www.semanticscholar.org/paper/Finding-Global-Minima-with-a-Computable-Filled-Liu/4dbd9e60b24c6d7b6acf758449faeaefcd491def
+paywalled https://www.semanticscholar.org/paper/An-Evolutionary-Algorithm-for-Global-Optimization-Wang-Dang/3b131f176da316f2251f8feaba1547c32f0e44f2
+
 A useful heuristic is therefore
 
 $$ \boxed{ \Delta\beta \sim \frac{c}{\sqrt{\operatorname{Var}_{\pi_\beta}(f)}}}$$
@@ -1440,6 +1773,11 @@ In \(d\) dimensions, even logarithmic growth can suffice, but it must overcome t
 \[ f(x)\sim c\log\|x\| \quad\Longrightarrow\quad Z_\beta<\infty \ \text{if }\beta c>d, \]
 
 under suitable regularity assumptions on the asymptotic behavior.
+
+[gibbs corrections](https://chatgpt.com/c/6aff60ec-cb90-83eb-8513-c4ba9e8e5418?no_universal_links=1)
+[infinum principles](https://chatgpt.com/c/6aff63ff-0e00-83ed-9c40-c160ef307229?no_universal_links=1)
+[ball proximal and convexity](https://chatgpt.com/c/6affee69-31a8-83eb-9fd2-a4a2eed5bcec?no_universal_links=1)
+[cbo non unique optimums](https://chatgpt.com/c/6affeb74-2464-83ed-a041-f4e35313c636)
 #### probabilistic characterization of global optimality
 Define
 
@@ -1774,6 +2112,64 @@ This illustrates the tradeoff: convexification preserves the optimal value but m
 ### Consensus based methods
 
 https://arxiv.org/html/2103.15130v4
+https://chatgpt.com/c/6aff3a6d-ce64-83ed-9ef1-1f06bf6df42f?no_universal_links=1
+[distribution of "where to sample next"](https://chatgpt.com/c/6aff1ed2-a7fc-83eb-9d9c-a2b448dfbcf6?no_universal_links=1)
+
+https://www.semanticscholar.org/paper/The-Tunneling-Algorithm-for-the-Global-Minimization-Levy-Montalvo/3da72047ef0687e917cdad2a7c9971126c1a82e8
+https://www.semanticscholar.org/paper/GTCOA%3A-a-novel-golden-t-distribution-chaotic-and-in-Liu-Wang/ca1809a1882ffe4d4a569ba5316484439268eda7
+https://www.semanticscholar.org/paper/CBO-algorithm-with-average-drift-and-applications-Bae-Ha/da11ea94cb9c6d3cc82a1aa1e786b11c9b1aa429
+https://www.semanticscholar.org/paper/Swarm-based-optimization-with-jumps%3A-a-kinetic-BGK-Borghi-Im/6c776c9d67fb6e1cc96ecc0bf0baebf342ef4961
+[adaptive importance sampling](https://www.semanticscholar.org/paper/Consensus-based-rare-event-estimation-Althaus-Papaioannou/7ebc5bc2da5d0f9c4f52e1f27ee68753ce516100)
+https://www.semanticscholar.org/paper/Adaptive-State-Dependent-Diffusion-for-Optimization-Engquist-Ren/67bf0bea4ab441e1b4cbb14d9852b63d6813eaab
+https://www.semanticscholar.org/paper/Adaptive-State-Dependent-Diffusion-for-Optimization-Engquist-Ren/67bf0bea4ab441e1b4cbb14d9852b63d6813eaab
+Tensor Cross Interpolation
+https://www.semanticscholar.org/paper/Kinetic-models-for-optimization%3A-a-unified-for-Borghi-Herty/9597ca9d7e4727e578db92a235ab87c789308015
+https://www.semanticscholar.org/paper/Kinetic-description-and-convergence-analysis-of-for-Borghi-Pareschi/9858ff923b2d4067e64daab22b24b4cf6ec76fad
+https://www.semanticscholar.org/paper/Binary-Interaction-Methods-for-High-Dimensional-and-Benfenati-Borghi/3d4e681fe3bd77c678b96acc6e2bbefbd9c41701
+https://chatgpt.com/c/6aff5314-46c0-83eb-952a-18647f48cfe5?no_universal_links=1
+https://www.semanticscholar.org/paper/Convergence-of-Anisotropic-Consensus-Based-in-Law-Fornasier-Klock/a33b7aca0c39b694f7a0ed48f4381f2ece16986d
+https://www.semanticscholar.org/paper/Enhancing-Exploration-in-Global-Optimization-by-in-Serr%C3%A9-Germain/76468582cc075ed06ed47612fe55e560059c6f43
+https://www.semanticscholar.org/paper/Importance-Sampling-Optimization-with-Laplace-Dragomir-Portier/c80d58d2d46b239a23d58f252e35831a5e795242
+https://www.semanticscholar.org/paper/Consensus-based-optimization-with-%24/alpha%24-stable-Aceves-S%C3%A1nchez-Albi/31fb269aef2851c65232f11e4d7a0c71105dd96b
+https://www.semanticscholar.org/paper/Strong-Global-Convergence-of-the-Consensus-Based-Bonandin-Riedl/7b24308b057113f62d7b92bdc005ee4414753c03
+https://www.semanticscholar.org/paper/A-modified-Consensus-Based-Optimization-model%3A-and-Choi-Lee/76bd40f0cab5d72e8ed8dd3bf31b41907921f03b
+https://www.semanticscholar.org/paper/Consensus-Based-Optimization-Beyond-Finite-Time-Bianchi-Dragomir/e4856697fce97f0a5024bb9a3605336319c70b55
+https://www.semanticscholar.org/paper/Model-predictive-control-strategies-using-Borghi-Herty/e43d9d92a125b35d8bb991d4315fe12e854f8ef7
+https://www.semanticscholar.org/paper/Consensus-Based-Stochastic-Control-Lyu-Chen/25bf18839006da55b0dea7c1c29f6856037534d1
+https://www.semanticscholar.org/paper/A-Unifying-Framework-for-Global-Optimization%3A-From-Serr%C3%A9-Kalogeratos/20ea596b0997dce26b7db1c945350c4d5179ada1
+https://www.semanticscholar.org/paper/A-Consensus-Based-Algorithm-for-Multi-Objective-and-Borghi-Herty/595fc8f9031de3574848aa31776a1d9b5aaeec09
+https://www.semanticscholar.org/paper/Convergence-of-time-discrete-finite-particle-based-Herty-Huang/5581ef3dda27ddc772fdf5c7bfa8f2b687ef06fd
+https://www.semanticscholar.org/paper/An-Optimal-Structured-Zeroth-order-Algorithm-for-Rando-Molinari/048d457ec432ecfcbc090a1d92478410e7be9fe5
+https://www.semanticscholar.org/paper/Consensus-Based-Optimization-of-Path-Integral-Free-Inoue-Huang/2ac83e0917924869aa536648fd6dac096e925f4f
+https://www.semanticscholar.org/paper/Uniform-in-time-propagation-of-chaos-for-Gerber-Hoffmann/807f504655e991782327c711d4efbdae913d7b7c
+https://www.semanticscholar.org/paper/A-consensus-based-optimization-method-for-nonsmooth-Wei-Wu/20ed12588f15df8dcad6b56bca47354769ddebc6
+https://www.semanticscholar.org/paper/A-discrete-Consensus-Based-Global-Optimization-with-Bellavia-Malaspina/6017c955fe322d0cb75a22795f0a995b7285fe28
+https://www.semanticscholar.org/paper/Consensus-based-optimization-with-memory-effects%3A-Borghi-Grassi/51318b09746da8ae9e3d3883838e8f8a20f7300c
+https://www.semanticscholar.org/paper/Consensus-based-optimization-for-multi-objective-a-Klamroth-Stiglmayr/a5e01da689baa5b569b98cdd12712ceee6a87fdb
+[CB2O](https://arxiv.org/abs/2411.13394)
+https://www.semanticscholar.org/paper/Fast-and-Robust-Consensus-Based-Optimization-via-Huang-Herty/adac321f7a13388e44fdf7d8fb2c9fa4cc401154
+https://www.semanticscholar.org/paper/Consensus-Based-Algorithms-for-Stochastic-Problems-Bonandin-Herty/9c750a9ded4fd494f670f1a2351cd7d556766115
+https://www.semanticscholar.org/paper/Ensemble-based-gradient-inference-for-particle-in-Schillings-Totzeck/d8bd62c4f2c2cf746b85981343b6663c10f03b24
+https://www.semanticscholar.org/paper/Constrained-consensus-based-optimization-Borghi-Herty/668077e10838c9492912fb79d8be52157b7f194a
+https://www.semanticscholar.org/paper/Proximal-basin-hopping%3A-global-optimization-with-Lauga-Molinari/4e4fd2d0800c8b6eed93b2d8bd12e195dad121b0
+https://www.semanticscholar.org/paper/Broximal-Alignment-for-Global-Non-Convex-Gruntkowska-Li/05edb0531c78426bda10637f3bb09f7c1e060203
+https://www.semanticscholar.org/paper/Global-Optimization-via-Softmin-Energy-Minimization-Agazzi-Carlei/6ca140322fdace44fcce1596c93742efdb9bea6d
+https://www.semanticscholar.org/paper/Kinetic-simulated-annealing-optimization-with-rate-Herty-Zanella/00448bff1d965d0bf93f982d04d28014e169ece6
+https://www.semanticscholar.org/paper/Swarm-based-gradient-descent-meets-simulated-Ding-Guerra/b79d9574dfc91258d1a0b683e00ccf99c4cfb1e1
+https://www.semanticscholar.org/paper/Stein-Boltzmann-Sampling%3A-A-Variational-Approach-Serr%C3%A9-Kalogeratos/70c211d3a150a2ee3e7b8f759381f99ff4247a23
+[sample where it matters and cbo](https://www.semanticscholar.org/paper/SCHOOL-OF-COMPUTATION%2C-INFORMATION-AND-TECHNOLOGY-%E2%80%94/56aed06929239304e33c77cd7a00297d52fb33a0)
+https://www.semanticscholar.org/paper/Discrete-Consensus-Based-Optimization-Byeon-Ha/5d3cb1a06f322305c857bd6242c1fe3bc0ab2433
+https://www.semanticscholar.org/paper/Gradient-Is-All-You-Need-How-Consensus-Based-Can-Be-Riedl-Klock/af9a09f94c8b4f74181e939dfe08bedcc1a18b1d
+https://www.semanticscholar.org/paper/Constrained-consensus-based-optimization-and-for-Beddrich-Chenchene/a39da437e5b828f8a72196e296284f3d722a8f0c
+https://www.semanticscholar.org/paper/Exploiting-Structure-with-Anisotropic-Optimization-Bonandin-Riedl/a3b33d19327b25efb532404c26a29e68967cd26c
+https://www.semanticscholar.org/paper/Exploiting-Structure-with-Anisotropic-Optimization-Bonandin-Riedl/a3b33d19327b25efb532404c26a29e68967cd26c
+https://www.semanticscholar.org/paper/A-PDE-framework-of-consensus-based-optimization-for-Fornasier-Sun/8dcb17dd7339dc66f6c34e5e24cc23fff4335ec4
+combining with adam seems to improve empirical risk in nn quite significantly [link](https://www.semanticscholar.org/paper/Mean-Field-Model-for-Two-Layer-Neural-Networks-with-Deyn-Herty/4938c968853f79e6d32e1bd6abf375f02c8cec66)
+[binary interaction methods](https://chatgpt.com/c/6aff5314-46c0-83eb-952a-18647f48cfe5?no_universal_links=1)
+[cbo perf and dynamic population counts](https://chatgpt.com/c/6aff3a6d-ce64-83ed-9ef1-1f06bf6df42f)
+### Composite optimization
+https://www.semanticscholar.org/paper/ProxiCBO%3A-A-Provably-Convergent-Consensus-Based-for-Zhang-Ma/e236d39885bd1f07467de9e429c49c069506ac54
+
 ### Population-based and evolutionary methods
 | Algorithm                          |      Year | Main idea                                                             | Original paper                                                                                  |
 | ---------------------------------- | --------: | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
@@ -3130,3 +3526,126 @@ My preferred direction would be to start with radial costs \(h(r)\), derive thei
 Then, if radial costs are insufficient, extend the same construction to anisotropic or Bregman costs.
 
 The main question is whether the cost should be designed to achieve pseudoconvexity, the stronger inward-gradient condition, or a quantitative convergence rate. These are different constraints and can lead to substantially different optimal kernels.
+
+# Multistart methods for global optimization
+
+Multistart optimization is a family of global optimization methods that repeatedly run a local optimizer from different initial points, attempting to discover multiple basins of attraction and ultimately the global minimum.
+
+The central idea is to turn global optimization into two subproblems:
+
+1. Exploration: choose promising starting points across the search domain.
+    
+2. Exploitation: use a local optimizer to converge from each starting point to a nearby local minimum.
+    
+
+Consider
+
+\[ \min_{x\in\Omega} f(x). \]
+
+Let \(L(x)\) denote the result of running a local optimizer initialized at \(x\). A multistart method generates \(x_1,\ldots,x_N\) and returns
+
+\[ \boxed{x_{\mathrm{best}}=\arg\min_{i=1,\ldots,N}f(L(x_i)).} \]
+
+## 1. Why multistart works
+
+Every local minimum \(x_j^*\) has a basin of attraction
+
+\[ B_j=\{x\in\Omega:L(x)=x_j^*\}. \]
+
+If starting points are sampled independently from a distribution \(q\), the probability of reaching minimum \(j\) in one run is
+
+\[ p_j=\int_{B_j}q(x)\,dx. \]
+
+For the global minimum, the probability of discovering it after \(N\) starts is
+
+\[ \boxed{P_N=1-(1-p_*)^N.} \]
+
+For example, if its basin occupies 1% of the sampling distribution:
+
+![Chart](data:image/png;base64,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u3bt0q9iHgEEEEAAAQQQQAAB/xDw41IQoPpx41C0nBHYHxOn6XNW6daBn6hOl5Hq/drX+uGXf2RP5rUjREaEqUn9ynr1oau0+L1uGvbgVWp8YSVFJC+39emHk046SYMGDdLMmTP17LPP6v7779cTTzyhsWPHavLkybr00kvT78I8AggggAACCCCAAAIIZEIgGALUTFSTTUJNIC4+QbN+XKN7XpjpgtL7XpqtL39ap/iEREcRHuZRw5oVNPjeK5KD0lv11uPN1eKSKoqOSnlSr9voOIldTW3durW6d++uzp07q06dOsfZg9UIIIAAAggggAACCCBwLAEC1GPpsE5S4CAkJCZp7tINenjYV7rgppG647nP9PF3f+jAwXhXCbtLt071cup/x6VaMKqrxg5oqfaNz1bRQlFuPQkCCCCAAAIIIIAAAgjkrwABav76c/RsCiQlSYtWbFK/N+eo3i3v6qZ+M/Thl79rz/5YX85nVz5Jj3a5SPPevlmTB7XVzdfUUOniBX3r83WCgyOAAAIIIIAAAggggIBPgADVR8FEIAksX/ufnh/9gxrePkZtH52s0Z/8om27DviqUKl8Cd13w4X6+vVO+uzlG3RX2wtU/qQi4l9oCVBbBBBAAAEEEEAAgcASIEANrPYK6dKu+3eXXpn4k668e5ya3z9Rb0xZrH+27vGZnFK6iG5vVUsfDWmvb5ID014d66lycqDq24AJBBDISQHyQgABBBBAAAEEclyAADXHSckwJwU2b9+nt6YtVYsHPtBld47V0HEL9OffO3yHKFUsWp2bnacPnmut79+5WU90baAaZ5bxrWcCAQQQCEwBSo0AAggggEBoChCghma7+3Wtd+6J0djPflX73lP1v26j9My78/TLn1t9ZS5SKEptr6iu0f1a6KfR3TTwzkaqd0552UOQfBsxgQACCCCAwNEEWI4AAggg4LcCBKh+2zShVbB9B+I0+euVurn/R6p787vq88a3WrB8o+whSCYRHRWh5hefqTcea6bFY7rppfuuVKMLTpd1F2PrGRBAAAEEEEDAPwQoBQIIIJAdAQLU7Oixb7YEDsYm6LPv/9Rdgz7XBV3e0YMvf6FvF//l66s0IjxMl9epqKG9GmvRe930f49erasvOkNRkeHZOi47I4AAAggggAACASpAsREIegEC1KBvYv+qYHxCor5ZtF4PDP3C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+77lXWdjPrMO65iHd8DtsAvn3pT3Wk5+f/N4PO67tL3e0r/WDstLYaln/GHauo2x35DaJWC7RJ26TPbUXps/7bTTbJThYMGn3d7bvHlzt96unlofqPaX/ho1asgC1ypVqmjFihXy5uc2zOXEPlCsyxy7BflY5c/lYpA9AggggAACIS5A9RFAAAEE/FnA7wJUu03Vbh+wp/mmDyDtvnf7a4b3ymh6WNvHrk62bNnSXUm19XYrr/1uxfbz/rXMHq5kPyJP/5sR254BAQQQQAABBBBA4AQF2A0BBBDIpoDfBah2Gdl+S2o/xP/ll1981bPgc926dbKuZipXruxb7p2whyvZ7z3r1q3rrpJ6l9vvPuzqaeorshb4ZtSNjXcfxggggAACCCCAAAII+JsA5UEgFAT8LkA19HPPPVd16tTRnDlztHbtWvdAo08++cR1P9O6dWt377Jtl3rw3sZrD05Kvdzj8ah+/fratWuX7OmtdhV25cqVsh+B29Xa1NsyjQACCCCAAAIIIIAAAiEpQKX9RMAvA1SPx6POnTvLupEZOnSoe/quPdK9d+/eOuOMM46gs6DTHoRkT/D1eDxHrK9Vq5batGmj0aNH6+mnn5Y9NcqerGtXa4/YmAUIIIAAAggggAACCCCAAAI5KJD5rMIyv2nebmm/F73uuutkT+i1LmR69uypMmXKZFiI8uXLq0ePHipcuHCG6z0ejy655BINGTLEdUdz9913H3XbDDNgIQIIIIAAAggggAACCCCAQK4L+G2Amus1z8YB2BUBBBBAAAEEEEAAAQQQQCDnBQhQc96UHLMnwN4IIIAAAggggAACCCAQogIEqCHa8FQ7VAWoNwIIIIAAAggggAAC/itAgOq/bUPJEEAg0AQoLwIIIIAAAggggEC2BAhQs8XHzggggAACeSXAcRBAAAEEEEAg+AUIUPOojePj4/Xjjz+6bm5Wr16dR0flMDklkJSUpPXr18u6PZo+ffpRsz148KCmTZsme+q0PS3ankK9Y8eOo27PivwRsPb8/vvv9dhjj6l79+665557NGrUKO3fvz/DAq1bt851d2XbeocBAwZo3759GW7PwvwTyGxbWddl9v686667XNva+9rO0/lX8nw/sl8UwN6bmTnXZrb9EhMTNWfOHD3wwAOytn7mmWf0999/+0VdQ6EQMTExev/9991nop07H374Ydce1i7p62/LMttW9hqxbgPvvPNOWZ5z586VvXbS58l87gjYe8jrb9913nrrLe3ZsyfDg2W2rfj+lCFfni60Nhg8eLD7XmTvVxvuvfderVixIk05bLvMfNfNyns6zQGSZwhQkxFy+/9vv/3mTtCTJk2Sfajm9vHIP2cFtm3bpsmTJ+u9995zb1J7w2V0BPtya33tLliwwAU+L730kqKiolxQ+99//2W0C8vySeCHH37QhAkTXNdV5557rsLCwmTLLGDJKOj86aefZP0mFy9eXN7h4osvpruqfGq/Yx02M221efNm974sUKCAXn75ZT344IOy9+2YMWOUkJBwrOxZl4sCmT3XZrb9LGCZMWOGpk6dqttvv12vvvqqqlev7rqcW7NmTS7WJKOsQ2+ZfSbae2rRokXOvWLFitq7d6/GjRsnaxdrH6+KTduyzLTVqlWr3PvWzt3/93//p1tuucW18ccff+zNjnEuCvz55596++23Vbt2bbVr104nnXSSFi5cKPsjb/rzZ2bbyl4rfH/KxUbLZNZr166VnYe933NsbOfMypUr+3LIbFtl5T3tyzzVBAFqKozcmrST6M0336wLLrggtw5BvrkoULp0aXcSbt26tSIjI496pO+++07Lli1z21rfvNHR0WrVqpUOHDgg++C0N+tRd2ZFngnYFe358+friSeecIGJXe22qyqVKlWSnZytHVMXZtOmTdq4caP69+8v+8uid2jcuHHqzZj2A4HMtJV9uE6cOFEej0ft27eXBamnnXaamjZtqsWLF+vnn3/2g5qEZhEyc67NSvvZH4e//PJLNWnSRGeffbasf/Wrr75aJUqUcAGNXQUITem8qbW9l+wPe3bOtL7qH3/8cXcltWDBgu4qql2F85Yks221e/dujR8/XqeccoquueYa98dF+45Vv359ff311+5OJ2+ejHNewN5/v//+u7tqfe2118o+Bx955BGdfvrp7s6EXbt2+Q6albayz12+P/no8mXC/rjw7bffqmvXrmm+69gVcvuc9BYqs22V2fe0N9/0YwLU9CK5OG8n5VzMnqxzWcCuhtqVtowOY0Go3TJatGhRpf5LU5kyZXTqqafK3qj2V/+M9mVZ3gpYO9iHatmyZX0HtnazAMXad926db7lNmFBS5UqVbhaahh+PmSmreyPEH/88Yf7QlWyZElfjayN7Y9K9uFr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)
+
+Assumes independent starting points and deterministic local convergence.
+
+This gives a simple probabilistic convergence guarantee, provided the global optimum's basin has positive sampling probability and local optimization reliably converges within it.
+
+However, it also exposes the central limitation: a very narrow global basin can be exceptionally difficult to discover, even when local optimization is nearly free.
+
+## 2. Main variants
+
+|Method|How it selects starts|Main advantage|
+|---|---|---|
+|Random multistart|Independent random points|Simple, parallelizable|
+|Sobol / Latin hypercube multistart|Space-filling samples|Better initial coverage|
+|MLSL|Samples points, filters redundant local searches using proximity and objective values|Avoids repeatedly exploring the same minima|
+|APOSMM|Coordinates sampling and multiple local runs|Efficient parallel exploration|
+|Basin-hopping|Perturbs an existing minimum and locally optimizes again|Can move between neighboring basins|
+|Surrogate-guided multistart|Uses a learned approximation of the objective to suggest starts|Potentially reduces expensive evaluations|
+
+Two particularly interesting methods are:
+
+Multi-Level Single-Linkage (MLSL). Instead of blindly optimizing every sampled point, MLSL uses clustering-like rules to avoid redundant searches. Under suitable regularity assumptions, it can identify all local minima almost surely while initiating only finitely many local optimization runs. This is a stronger efficiency result than ordinary random multistart.
+
+NLopt Documentation+1
+
+APOSMM (Asynchronously Parallel Optimization Solver for Finding Multiple Minima). It evaluates candidate points and advances multiple local searches concurrently. It also uses information from previously evaluated points to decide which local searches are worthwhile.
+
+DOI+1
+
+## 3. Connection to basin mapping
+
+There is a useful mathematical interpretation.
+
+Define the locally minimized objective:
+
+\[ \boxed{F(x)=f(L(x)).} \]
+
+If the local optimizer converges to a fixed minimum throughout each basin, \(F\) is constant on the interior of that basin.
+
+Conceptual illustration: local optimization maps every starting point to the minimum of its basin. The transformed landscape is piecewise constant.
+
+Multistart can therefore be viewed as searching over the discrete set of local minima, using continuous points to discover them.
+
+This suggests more advanced approaches: estimate basin membership from observed optimization trajectories, learn the boundaries between basins, or construct proposals that preferentially enter previously unexplored basins.
+
+An important caveat is that Euclidean proximity alone does not determine basin membership: nearby points can converge to different minima, while distant points can reach the same one.
+
+## 4. Comparison with other global methods
+
+- Multistart: global exploration is mostly about locating new basins.
+    
+- Basin-hopping: explicitly explores transitions between local minima, often with a Metropolis acceptance rule.
+    
+    SciPy v1.18.0 Manual
+    
+- Parallel tempering: maintains samples at different temperatures and exchanges them to improve mixing.
+    
+- Bayesian optimization: models the objective to decide where evaluations are most valuable.
+    
+- Differential evolution / CMA-ES: adapt populations or search distributions rather than relying primarily on separate local optimizations.
+    
+
+The main advantage of multistart is that it can exploit an excellent local optimizer without requiring a sophisticated global model.
+
+Its main weakness is sample complexity: in high dimensions, narrow basins can have exponentially small sampling probabilities.
+
+## 5. Practical implementation
+
+For a first experiment, I would compare three methods using the same local optimizer and total function-evaluation budget:
+
+1. Sobol-sequence multistart.
+    
+2. MLSL with redundant-start filtering.
+    
+3. Basin-hopping with adaptive perturbation scale.
+    
+
+These are available through established implementations:
+
+- [NLopt — MLSL and MLSL-LDS](https://nlopt.readthedocs.io/en/stable/NLopt_Algorithms/?utm_source=chatgpt.com#mlsl-multi-level-single-linkage)
+    
+- [libEnsemble — APOSMM](https://libensemble.readthedocs.io/en/main/examples/aposmm.html?utm_source=chatgpt.com)
+    
+- [SciPy — Basin-hopping](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.basinhopping.html?utm_source=chatgpt.com)
+    
+
+The particularly interesting research direction is adaptive multistart based on learned basin structure: instead of independently sampling points, use accumulated optimization trajectories to estimate where undiscovered minima are most likely to exist, while preserving sufficient global exploration for convergence guarantees.
